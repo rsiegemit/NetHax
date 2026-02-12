@@ -160,6 +160,7 @@ def generate_lava_crossing(rng, params, static_params):
         seen_map=visible_map,
         visible_map=visible_map,
         timestep=0,
+        prev_action=0,
         terminal=False,
         state_rng=rng,
     )

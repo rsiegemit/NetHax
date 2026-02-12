@@ -116,6 +116,7 @@ def generate_zombie_horde(rng, params, static_params):
         score=jnp.int32(0),
         monsters_killed=jnp.int32(0),
         timestep=jnp.int32(0),
+        prev_action=0,
         terminal=False,
         state_rng=state_rng,
     )

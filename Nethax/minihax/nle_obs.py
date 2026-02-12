@@ -407,7 +407,7 @@ def build_blstats_sokoban(state):
 # Per-tier top-level render functions
 # ============================================================================
 
-def render_nle_navigation(state, static_params, crop_size=DEFAULT_CROP_SIZE):
+def render_nle_navigation(state, static_params, crop_size=DEFAULT_CROP_SIZE, prev_action=0):
     """Render Tier 1 navigation state as NLE-style dict."""
     glyphs = build_glyph_map(
         state.map, state.seen_map, state.visible_map, state.player_position,
@@ -418,10 +418,11 @@ def render_nle_navigation(state, static_params, crop_size=DEFAULT_CROP_SIZE):
     )
     obs = _build_obs_dict(glyphs, state.player_position, crop_size)
     obs["blstats"] = build_blstats_navigation(state)
+    obs["prev_actions"] = jnp.int32(prev_action)
     return obs
 
 
-def render_nle_hazard(state, static_params, crop_size=DEFAULT_CROP_SIZE):
+def render_nle_hazard(state, static_params, crop_size=DEFAULT_CROP_SIZE, prev_action=0):
     """Render Tier 2 hazard state as NLE-style dict."""
     glyphs = build_glyph_map(
         state.map, state.seen_map, state.visible_map, state.player_position,
@@ -436,10 +437,11 @@ def render_nle_hazard(state, static_params, crop_size=DEFAULT_CROP_SIZE):
     )
     obs = _build_obs_dict(glyphs, state.player_position, crop_size)
     obs["blstats"] = build_blstats_hazard(state)
+    obs["prev_actions"] = jnp.int32(prev_action)
     return obs
 
 
-def render_nle_combat(state, static_params, crop_size=DEFAULT_CROP_SIZE):
+def render_nle_combat(state, static_params, crop_size=DEFAULT_CROP_SIZE, prev_action=0):
     """Render Tier 3 combat state as NLE-style dict."""
     glyphs = build_glyph_map(
         state.map, state.seen_map, state.visible_map, state.player_position,
@@ -458,10 +460,11 @@ def render_nle_combat(state, static_params, crop_size=DEFAULT_CROP_SIZE):
     )
     obs = _build_obs_dict(glyphs, state.player_position, crop_size)
     obs["blstats"] = build_blstats_combat(state)
+    obs["prev_actions"] = jnp.int32(prev_action)
     return obs
 
 
-def render_nle_zombie_horde(state, static_params, crop_size=DEFAULT_CROP_SIZE):
+def render_nle_zombie_horde(state, static_params, crop_size=DEFAULT_CROP_SIZE, prev_action=0):
     """Render ZombieHorde (legacy EnvState) as NLE-style dict."""
     glyphs = build_glyph_map(
         state.map, state.seen_map, state.visible_map, state.player_position,
@@ -472,16 +475,18 @@ def render_nle_zombie_horde(state, static_params, crop_size=DEFAULT_CROP_SIZE):
     )
     obs = _build_obs_dict(glyphs, state.player_position, crop_size)
     obs["blstats"] = build_blstats_zombie_horde(state)
+    obs["prev_actions"] = jnp.int32(prev_action)
     return obs
 
 
-def render_nle_sokoban(state, static_params, crop_size=DEFAULT_CROP_SIZE):
+def render_nle_sokoban(state, static_params, crop_size=DEFAULT_CROP_SIZE, prev_action=0):
     """Render Tier 4 Sokoban state as NLE-style dict."""
     glyphs = build_glyph_map(
         state.map, state.seen_map, state.visible_map, state.player_position,
     )
     obs = _build_obs_dict(glyphs, state.player_position, crop_size)
     obs["blstats"] = build_blstats_sokoban(state)
+    obs["prev_actions"] = jnp.int32(prev_action)
     return obs
 
 
@@ -502,4 +507,5 @@ def nle_observation_space(map_height, map_width, crop_size=DEFAULT_CROP_SIZE):
         "chars_crop": {"shape": (crop_size, crop_size), "dtype": jnp.uint8},
         "colors_crop": {"shape": (crop_size, crop_size), "dtype": jnp.uint8},
         "specials_crop": {"shape": (crop_size, crop_size), "dtype": jnp.uint8},
+        "prev_actions": {"shape": (), "dtype": jnp.int32},
     }

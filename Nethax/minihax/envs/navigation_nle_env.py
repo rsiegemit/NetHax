@@ -45,6 +45,9 @@ class NavigationNLEEnv(EnvironmentNoAutoReset):
 
         new_state = navigation_step(rng_step, state, action, params, self.static_params)
 
+        # Store prev_action in state for observation
+        new_state = new_state.replace(prev_action=action)
+
         # Reward: +1 on successful completion (terminal and not timed out)
         won = new_state.terminal & (new_state.timestep < params.max_timesteps)
         reward = jnp.where(won, 1.0, 0.0)
@@ -73,7 +76,7 @@ class NavigationNLEEnv(EnvironmentNoAutoReset):
 
     def get_obs(self, state: NavigationState) -> dict:
         from Nethax.minihax.nle_obs import render_nle_navigation
-        return render_nle_navigation(state, self.static_params, self.crop_size)
+        return render_nle_navigation(state, self.static_params, self.crop_size, prev_action=state.prev_action)
 
     def is_terminal(self, state: NavigationState, params: EnvParams) -> bool:
         return state.terminal
@@ -131,7 +134,7 @@ class ExploreMazeNLENavEnv(NavigationNLEEnv):
         # Override terminal: timeout only (ExploreMaze never ends on stair)
         new_timestep = new_state.timestep
         timeout = new_timestep >= params.max_timesteps
-        new_state = new_state.replace(terminal=timeout)
+        new_state = new_state.replace(terminal=timeout, prev_action=action)
 
         # --- EAT action: eat apple at player position ---
         is_eat = (action == Action.EAT)

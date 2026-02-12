@@ -119,6 +119,7 @@ class Soko1aPixelsEnv(SokobanPixelsEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -142,6 +143,7 @@ class Soko1bPixelsEnv(SokobanPixelsEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -165,6 +167,7 @@ class Soko2aPixelsEnv(SokobanPixelsEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -188,6 +191,7 @@ class Soko2bPixelsEnv(SokobanPixelsEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -211,6 +215,7 @@ class Soko3aPixelsEnv(SokobanPixelsEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -234,6 +239,7 @@ class Soko3bPixelsEnv(SokobanPixelsEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -257,6 +263,7 @@ class Soko4aPixelsEnv(SokobanPixelsEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -280,6 +287,7 @@ class Soko4bPixelsEnv(SokobanPixelsEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )

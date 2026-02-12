@@ -73,6 +73,7 @@ def empty_combat_state(static_params, rng):
         score=jnp.int32(0),
         monsters_killed=jnp.int32(0),
         timestep=jnp.int32(0),
+        prev_action=0,
         terminal=False,
         state_rng=rng,
     )

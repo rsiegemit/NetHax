@@ -66,6 +66,7 @@ class NavigationState:
     seen_map: jnp.ndarray        # [map_h, map_w] bool — tiles ever seen
     visible_map: jnp.ndarray     # [map_h, map_w] bool — tiles currently visible
     timestep: int
+    prev_action: int
     terminal: bool
     state_rng: Any
 
@@ -84,6 +85,7 @@ class SokobanState:
     seen_map: jnp.ndarray        # [map_h, map_w] bool — tiles ever seen
     visible_map: jnp.ndarray     # [map_h, map_w] bool — tiles currently visible
     timestep: int
+    prev_action: int
     terminal: bool
     state_rng: Any
 
@@ -108,6 +110,7 @@ class HazardState:
     seen_map: jnp.ndarray        # [map_h, map_w] bool — tiles ever seen
     visible_map: jnp.ndarray     # [map_h, map_w] bool — tiles currently visible
     timestep: int
+    prev_action: int
     terminal: bool
     state_rng: Any
 
@@ -140,6 +143,7 @@ class CombatState:
     score: int
     monsters_killed: int
     timestep: int
+    prev_action: int
     terminal: bool
     state_rng: Any
 

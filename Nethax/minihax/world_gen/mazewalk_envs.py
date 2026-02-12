@@ -241,6 +241,7 @@ def generate_mazewalk(rng, params, static_params):
         seen_map=visible_map,
         visible_map=visible_map,
         timestep=0,
+        prev_action=0,
         terminal=False,
         state_rng=rng,
     )
@@ -363,6 +364,7 @@ def generate_explore_maze_easy(rng, params, static_params):
         seen_map=visible_map,
         visible_map=visible_map,
         timestep=0,
+        prev_action=0,
         terminal=False,
         state_rng=rng_rest,
     )
@@ -480,6 +482,7 @@ def generate_explore_maze_hard(rng, params, static_params):
         seen_map=visible_map,
         visible_map=visible_map,
         timestep=0,
+        prev_action=0,
         terminal=False,
         state_rng=rng_rest,
     )

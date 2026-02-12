@@ -40,6 +40,9 @@ class SokobanNLEEnv(EnvironmentNoAutoReset):
         # Execute step
         new_state = sokoban_step(rng_step, state, action, params, self.static_params)
 
+        # Store prev_action in state for observation
+        new_state = new_state.replace(prev_action=action)
+
         # Reward matching original MiniHack Sokoban:
         # Win: +1.0, Death/Timeout: 0.0, Running: -0.001 per step + 0.1 per pit filled
         actually_won = (new_state.pits_remaining == 0) & check_stair_goal(
@@ -79,7 +82,7 @@ class SokobanNLEEnv(EnvironmentNoAutoReset):
 
     def get_obs(self, state: SokobanState) -> dict:
         from Nethax.minihax.nle_obs import render_nle_sokoban
-        return render_nle_sokoban(state, self.static_params, self.crop_size)
+        return render_nle_sokoban(state, self.static_params, self.crop_size, prev_action=state.prev_action)
 
     def is_terminal(self, state: SokobanState, params: EnvParams) -> bool:
         return state.terminal
@@ -117,6 +120,7 @@ class Soko1aNLEEnv(SokobanNLEEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -140,6 +144,7 @@ class Soko1bNLEEnv(SokobanNLEEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -163,6 +168,7 @@ class Soko2aNLEEnv(SokobanNLEEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -186,6 +192,7 @@ class Soko2bNLEEnv(SokobanNLEEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -209,6 +216,7 @@ class Soko3aNLEEnv(SokobanNLEEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -232,6 +240,7 @@ class Soko3bNLEEnv(SokobanNLEEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -255,6 +264,7 @@ class Soko4aNLEEnv(SokobanNLEEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -278,6 +288,7 @@ class Soko4bNLEEnv(SokobanNLEEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )

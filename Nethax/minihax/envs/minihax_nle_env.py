@@ -29,6 +29,10 @@ class MinihaxZombieHordeNLEEnv(EnvironmentNoAutoReset):
         self, rng: jax.Array, state: EnvState, action: int, params: EnvParams
     ) -> Tuple[jax.Array, EnvState, float, bool, dict]:
         state, reward = minihax_step(rng, state, action, params, self.static_env_params)
+
+        # Store prev_action in state for observation
+        state = state.replace(prev_action=action)
+
         done = self.is_terminal(state, params)
         info = log_zombie_info(state, done)
         info["discount"] = self.discount(state, params)
@@ -50,7 +54,7 @@ class MinihaxZombieHordeNLEEnv(EnvironmentNoAutoReset):
 
     def get_obs(self, state: EnvState) -> dict:
         from Nethax.minihax.nle_obs import render_nle_zombie_horde
-        return render_nle_zombie_horde(state, self.static_env_params, self.crop_size)
+        return render_nle_zombie_horde(state, self.static_env_params, self.crop_size, prev_action=state.prev_action)
 
     def is_terminal(self, state: EnvState, params: EnvParams) -> bool:
         return is_game_over(state, params, self.static_env_params)

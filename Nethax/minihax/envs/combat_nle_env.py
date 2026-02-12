@@ -50,6 +50,9 @@ class CombatNLEEnv(EnvironmentNoAutoReset):
             rng_step, state, action, params, self.static_params
         )
 
+        # Store prev_action in state for observation
+        new_state = new_state.replace(prev_action=action)
+
         # Win = terminal and not timed out and not dead
         won = new_state.terminal & (new_state.timestep < params.max_timesteps) & (new_state.player_hp > 0)
 
@@ -79,7 +82,7 @@ class CombatNLEEnv(EnvironmentNoAutoReset):
 
     def get_obs(self, state: CombatState) -> dict:
         from Nethax.minihax.nle_obs import render_nle_combat
-        return render_nle_combat(state, self.static_params, self.crop_size)
+        return render_nle_combat(state, self.static_params, self.crop_size, prev_action=state.prev_action)
 
     def is_terminal(self, state: CombatState, params: EnvParams) -> bool:
         return state.terminal

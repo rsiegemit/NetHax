@@ -116,6 +116,7 @@ def _make_locked_door_state(rng, params, static_params, player_pos, stair_pos):
         seen_map=visible_map,
         visible_map=visible_map,
         timestep=0,
+        prev_action=0,
         terminal=False,
         state_rng=rng,
     )

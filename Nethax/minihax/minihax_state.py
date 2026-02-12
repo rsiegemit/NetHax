@@ -40,6 +40,7 @@ class EnvState:
     score: int
     monsters_killed: int
     timestep: int
+    prev_action: int
     terminal: bool
 
     state_rng: Any

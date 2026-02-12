@@ -124,6 +124,7 @@ class Soko1aEnv(SokobanEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -147,6 +148,7 @@ class Soko1bEnv(SokobanEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -170,6 +172,7 @@ class Soko2aEnv(SokobanEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -193,6 +196,7 @@ class Soko2bEnv(SokobanEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -216,6 +220,7 @@ class Soko3aEnv(SokobanEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -239,6 +244,7 @@ class Soko3bEnv(SokobanEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -262,6 +268,7 @@ class Soko4aEnv(SokobanEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )
@@ -285,6 +292,7 @@ class Soko4bEnv(SokobanEnv):
             seen_map=visible_map,
             visible_map=visible_map,
             timestep=0,
+            prev_action=0,
             terminal=False,
             state_rng=rng,
         )

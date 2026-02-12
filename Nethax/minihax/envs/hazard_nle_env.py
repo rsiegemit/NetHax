@@ -48,6 +48,9 @@ class HazardNLEEnv(EnvironmentNoAutoReset):
             rng_step, state, action, params, self.static_params
         )
 
+        # Store prev_action in state for observation
+        new_state = new_state.replace(prev_action=action)
+
         # Win = terminal and not timed out and not dead
         won = new_state.terminal & (new_state.timestep < params.max_timesteps) & (new_state.player_hp > 0)
 
@@ -75,7 +78,7 @@ class HazardNLEEnv(EnvironmentNoAutoReset):
         return self.get_obs(state), state
 
     def get_obs(self, state: HazardState) -> jax.Array:
-        return render_nle_hazard(state, self.static_params, self.crop_size)
+        return render_nle_hazard(state, self.static_params, self.crop_size, prev_action=state.prev_action)
 
     def is_terminal(self, state: HazardState, params: EnvParams) -> bool:
         return state.terminal
@@ -229,6 +232,10 @@ class TreasureDashNLEEnv(HazardNLEEnv):
         new_state, reward = treasure_dash_step(
             rng_step, state, action, params, self.static_params
         )
+
+        # Store prev_action in state for observation
+        new_state = new_state.replace(prev_action=action)
+
         done = new_state.terminal
         won = done & (new_state.timestep < params.max_timesteps)
         info = {

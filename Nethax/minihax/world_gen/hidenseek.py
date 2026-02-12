@@ -167,6 +167,7 @@ def _generate_hidenseek_common(rng, params, static_params, active_h, active_w, h
         seen_map=visible_map,
         visible_map=visible_map,
         timestep=0,
+        prev_action=0,
         terminal=False,
         state_rng=rng,
     )

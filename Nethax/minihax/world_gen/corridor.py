@@ -43,6 +43,7 @@ def _generate_corridor(rng, params, static_params, num_rooms):
         seen_map=visible_map,
         visible_map=visible_map,
         timestep=0,
+        prev_action=0,
         terminal=False,
         state_rng=rng,
     )
