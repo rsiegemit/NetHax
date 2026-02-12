@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: Nethax
+Version: 0.1.0
+Summary: JAX re-implementation of NetHack and MiniHack environments
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: jax>=0.4.0
+Requires-Dist: jaxlib>=0.4.0
+Requires-Dist: numpy
+Requires-Dist: flax
+Requires-Dist: gymnax
+Provides-Extra: scripts
+Requires-Dist: imageio; extra == "scripts"
+Requires-Dist: Pillow; extra == "scripts"

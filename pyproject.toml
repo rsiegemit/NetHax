@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Nethax"
+version = "0.1.0"
+description = "JAX re-implementation of NetHack and MiniHack environments"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "jax>=0.4.0",
+    "jaxlib>=0.4.0",
+    "numpy",
+    "flax",
+    "gymnax",
+]
+
+[project.optional-dependencies]
+scripts = [
+    "imageio",
+    "Pillow",
+]
+
+[tool.setuptools.packages.find]
+include = ["Nethax*"]
+
+[tool.setuptools.package-data]
+Nethax = ["tiles/*.npy"]

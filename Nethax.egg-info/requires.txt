@@ -1,0 +1,9 @@
+jax>=0.4.0
+jaxlib>=0.4.0
+numpy
+flax
+gymnax
+
+[scripts]
+imageio
+Pillow

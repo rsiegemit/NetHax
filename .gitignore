@@ -1,2 +1,7 @@
 Craftax/
 NetHack-NetHack-3.7/
+minihack-main/
+*.pyc
+sol-main/
+videos/
+.omc/
