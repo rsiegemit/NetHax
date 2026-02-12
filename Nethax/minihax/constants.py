@@ -241,9 +241,9 @@ XP_TABLE = jnp.array([
     90000000, 100000000,                                        # L29-L30: newuexp(28..29)
 ], dtype=jnp.int32)
 
-# Score for killing a zombie (NetHack score: difficulty * 4 + 1)
-# Human zombie difficulty ~5 -> score ~21
-ZOMBIE_KILL_SCORE = 5
+# Score for killing a zombie (NetHack exper.c + more_experienced)
+# experience() = 1 + level^2 = 1 + 4^2 = 17, score = 4 * experience() = 68
+ZOMBIE_KILL_SCORE = 68
 
 
 # ============================================================================

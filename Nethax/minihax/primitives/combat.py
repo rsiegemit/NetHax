@@ -9,9 +9,10 @@ from Nethax.minihax.util.game_logic_utils import get_xp_for_level
 
 
 def do_melee_attack(rng, state, target_pos, static_params):
-    """Attack a monster at target_pos with bare hands (1d2 damage).
+    """Attack a monster at target_pos with monk martial arts.
 
-    No weapons in ZombieHorde — player is unarmed.
+    Monk bare-handed: 1d4 base + 3 skill bonus (Basic martial arts).
+    To-hit: monster_AC + 10 + player_level > d20 (symmetric with monster formula).
     On kill: grant XP, check level-up, increment score and kills.
     """
     max_m = static_params.max_monsters
@@ -29,10 +30,26 @@ def do_melee_attack(rng, state, target_pos, static_params):
     found = target_idx < max_m
     safe_idx = jnp.where(found, target_idx, 0)
 
-    # Monk martial arts: 1d4 base damage (uhitm.c: rnd(4) when martial_bonus())
-    rng, rng_dmg, rng_lvlup = jax.random.split(rng, 3)
-    damage = jax.random.randint(rng_dmg, (), 1, 5)  # 1-4
-    damage = jnp.where(found, damage, 0)
+    rng, rng_dmg, rng_hit, rng_hit_ac, rng_lvlup = jax.random.split(rng, 5)
+
+    # To-hit roll: monster_AC + 10 + player_level > d20
+    # Mirrors monster to-hit in monster_ai.py (AC_VALUE + 10 + level > rnd(20))
+    mon_type = state.monsters.type_id[safe_idx]
+    mon_ac = MONSTER_STATS[mon_type, 2]
+    ac_value = jnp.where(
+        mon_ac >= 0,
+        mon_ac,
+        -jax.random.randint(rng_hit_ac, (), 1, jnp.maximum(-mon_ac, 1) + 1),
+    )
+    hit_tmp = ac_value + 10 + state.player_xp_level
+    hit_roll = jax.random.randint(rng_hit, (), 1, 21)  # d20
+    hits = hit_tmp > hit_roll
+
+    # Monk martial arts: 1d4 base (uhitm.c:849) + 3 skill bonus (weapon.c:1691)
+    MARTIAL_ARTS_BONUS = 3  # Basic bare-handed combat skill damage bonus
+    base_damage = jax.random.randint(rng_dmg, (), 1, 5)  # 1d4
+    damage = base_damage + MARTIAL_ARTS_BONUS  # 4-7, avg 5.5
+    damage = jnp.where(found & hits, damage, 0)
 
     # Apply damage
     old_hp = state.monsters.health[safe_idx]
