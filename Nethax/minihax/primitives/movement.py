@@ -55,7 +55,7 @@ def check_stair_goal(player_pos, stair_pos):
     return (player_pos[0] == stair_pos[0]) & (player_pos[1] == stair_pos[1])
 
 
-def push_boulder(game_map, player_pos, action, map_h, map_w, pits_remaining):
+def push_boulder(game_map, player_pos, action, map_h, map_w, pits_remaining, restrict_diagonal=False):
     """Boulder push logic for Sokoban. Pure map operations, no lax.scan.
 
     If player moves into a BOULDER tile and the tile beyond is FLOOR or PIT:
@@ -71,6 +71,7 @@ def push_boulder(game_map, player_pos, action, map_h, map_w, pits_remaining):
         action: int
         map_h, map_w: int
         pits_remaining: int
+        restrict_diagonal: bool — if True, diagonal boulder pushes are forbidden (Sokoban rule)
 
     Returns:
         new_map: jnp.ndarray [map_h, map_w]
@@ -81,6 +82,9 @@ def push_boulder(game_map, player_pos, action, map_h, map_w, pits_remaining):
     delta = DIRECTION_VECTORS[action]
     target_pos = player_pos + delta
     beyond_pos = target_pos + delta
+
+    # Check if diagonal push (both row and column change)
+    is_diagonal = (delta[0] != 0) & (delta[1] != 0)
 
     # Safe indexing for target
     t_r = jnp.clip(target_pos[0], 0, map_h - 1)
@@ -103,7 +107,9 @@ def push_boulder(game_map, player_pos, action, map_h, map_w, pits_remaining):
     beyond_downstair = beyond_tile == TileType.DOWNSTAIR
     beyond_pushable = beyond_floor | beyond_pit | beyond_open_door | beyond_pit_filled | beyond_downstair
 
-    can_push = target_valid & beyond_valid & is_boulder & beyond_pushable
+    # Apply diagonal restriction if enabled
+    diagonal_blocked = restrict_diagonal & is_diagonal
+    can_push = target_valid & beyond_valid & is_boulder & beyond_pushable & jnp.logical_not(diagonal_blocked)
 
     # Compute new map for push case
     # Remove boulder from target position -> becomes FLOOR

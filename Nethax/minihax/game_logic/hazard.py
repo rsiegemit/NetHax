@@ -9,13 +9,15 @@ from jax import lax
 
 from Nethax.minihax.constants import (
     Action, TileType, DIRECTION_VECTORS, MONSTER_STATS, MONSTER_FLAGS,
-    MF_HOSTILE, PLAYER_START_HP,
+    MF_HOSTILE, ABON_STR, ABON_DEX, DBON_STR, MONK_MARTIAL_SIDES,
+    MONK_MARTIAL_BONUS, MONSTER_XP_SCORE, RoleType,
 )
 from Nethax.minihax.primitives.movement import move_player, check_stair_goal
 from Nethax.minihax.primitives.terrain import apply_terrain_damage
 from Nethax.minihax.primitives.visibility import compute_visible, update_seen_map
 from Nethax.minihax.primitives.items import pickup_item, use_first_item
 from Nethax.minihax.primitives.doors import kick_door
+from Nethax.minihax.primitives.leveling import check_multi_levelup
 from Nethax.minihax.util.game_logic_utils import (
     is_solid, in_bounds, dist2, compute_monster_damage,
 )
@@ -27,22 +29,27 @@ _ALL_DELTAS = jnp.array([
 ])
 
 
-def _simple_bump_attack(rng, monsters, target_pos, max_m):
-    """Simple melee attack against a monster at target_pos.
+def _simple_bump_attack(rng, state, target_pos, max_m):
+    """Melee attack against a monster at target_pos with full stat system.
 
-    Simplified for Tier 2: 1d4 damage, no XP system.
+    Uses player_stats for to-hit, damage, XP, and leveling.
+    Works with SimpleMonsters (Tier 2 — no movement points).
 
     Args:
         rng: JAX PRNG key
-        monsters: SimpleMonsters struct
+        state: HazardState (reads .monsters and .player_stats)
         target_pos: jnp.ndarray [2] — position to attack
         max_m: int — max monsters
 
     Returns:
         new_monsters: SimpleMonsters with damaged/killed monster
+        new_stats: PlayerStats (updated XP, level, score, kills on kill)
         hit_monster: bool — whether a monster was present and attacked
         new_rng: JAX PRNG key
     """
+    monsters = state.monsters
+    stats = state.player_stats
+
     pos_r = monsters.position[:, 0] == target_pos[0]
     pos_c = monsters.position[:, 1] == target_pos[1]
     at_dest = pos_r & pos_c & monsters.mask
@@ -50,9 +57,36 @@ def _simple_bump_attack(rng, monsters, target_pos, max_m):
     idx = jnp.argmax(at_dest)
     safe_idx = jnp.where(any_mon, idx, 0)
 
-    rng, rng_dmg = jax.random.split(rng)
-    damage = jax.random.randint(rng_dmg, (), 1, 5)  # 1d4
-    new_hp = monsters.health[safe_idx] - jnp.where(any_mon, damage, 0)
+    rng, rng_dmg, rng_dmg2, rng_hit, rng_hit_ac, rng_lvl = jax.random.split(rng, 6)
+
+    # To-hit: NetHack formula
+    mon_type = monsters.type_id[safe_idx]
+    mon_ac = MONSTER_STATS[mon_type, 2]
+    ac_value = jnp.where(
+        mon_ac >= 0, mon_ac,
+        -jax.random.randint(rng_hit_ac, (), 1, jnp.maximum(-mon_ac, 1) + 1),
+    )
+    str_bonus = ABON_STR[jnp.clip(stats.strength, 0, 25)]
+    dex_bonus = ABON_DEX[jnp.clip(stats.dexterity, 0, 25)]
+    low_level_bonus = jnp.where(stats.xp_level < 3, 1, 0)
+    to_hit = 1 + str_bonus + dex_bonus + low_level_bonus + ac_value + stats.xp_level
+    hit_roll = jax.random.randint(rng_hit, (), 1, 21)
+    hits = to_hit > hit_roll
+
+    # Damage: role-dependent
+    is_monk = (stats.role_id == RoleType.MONK)
+    bracket = jnp.minimum((stats.xp_level - 1) // 4, 4)
+    monk_sides = MONK_MARTIAL_SIDES[bracket]
+    monk_damage = jax.random.randint(rng_dmg, (), 1, monk_sides + 1) + MONK_MARTIAL_BONUS
+    non_monk_damage = jax.random.randint(rng_dmg2, (), 1, 5)
+    base_damage = jnp.where(is_monk, monk_damage, non_monk_damage)
+    str_dmg = DBON_STR[jnp.clip(stats.strength, 0, 25)]
+    damage = base_damage + str_dmg
+    damage = jnp.maximum(damage, 1)
+    damage = jnp.where(any_mon & hits, damage, 0)
+
+    # Apply damage
+    new_hp = monsters.health[safe_idx] - damage
     killed = any_mon & (new_hp <= 0)
 
     new_health = monsters.health.at[safe_idx].set(
@@ -63,7 +97,17 @@ def _simple_bump_attack(rng, monsters, target_pos, max_m):
     )
     new_monsters = monsters.replace(health=new_health, mask=new_mask)
 
-    return new_monsters, any_mon, rng
+    # XP on kill + multi-level-up
+    xp_gain = jnp.where(killed, MONSTER_STATS[mon_type, 7], 0)
+    score_gain = jnp.where(killed, MONSTER_XP_SCORE[mon_type], 0)
+    new_stats = stats.replace(
+        xp=stats.xp + xp_gain,
+        score=stats.score + score_gain,
+        monsters_killed=stats.monsters_killed + jnp.where(killed, 1, 0),
+    )
+    new_stats = check_multi_levelup(rng_lvl, new_stats)
+
+    return new_monsters, new_stats, any_mon, rng
 
 
 def _simple_monster_ai(rng, monsters, player_pos, game_map, max_m, map_h, map_w):
@@ -272,9 +316,9 @@ def hazard_step(rng, state, action, params, static_params):
     mon_at_target = mon_pos_r & mon_pos_c & state.monsters.mask
     has_monster_at_target = is_move & jnp.any(mon_at_target)
 
-    # Do bump attack if monster at target
-    bumped_monsters, did_bump, rng_bump = _simple_bump_attack(
-        rng_bump, state.monsters, target_pos, max_m
+    # Do bump attack if monster at target (now returns updated stats too)
+    bumped_monsters, bumped_stats, did_bump, rng_bump = _simple_bump_attack(
+        rng_bump, state, target_pos, max_m
     )
 
     # Movement (only if no monster at target)
@@ -324,7 +368,7 @@ def hazard_step(rng, state, action, params, static_params):
     # --- Use item ---
     new_inv_use, map_after_use, hp_after_use, got_levitation, got_key = use_first_item(
         state.inventory, map_after_autodoor, final_move_pos,
-        state.player_hp, map_h, map_w,
+        state.player_stats.hp, map_h, map_w,
     )
 
     # --- Kick ---
@@ -363,8 +407,10 @@ def hazard_step(rng, state, action, params, static_params):
         new_ground_pickup, state.ground_items,
     )
 
-    # HP: only use_item can change HP (apple heal)
-    new_hp = jnp.where(is_use, hp_after_use, state.player_hp)
+    # HP: use_item can heal (apple), bump attack can level-up (changing HP)
+    # After bump: bumped_stats.hp may differ from state.player_stats.hp due to level-up
+    base_hp = jnp.where(has_monster_at_target, bumped_stats.hp, state.player_stats.hp)
+    new_hp = jnp.where(is_use, hp_after_use, base_hp)
 
     # Levitation: from use_item
     new_levitating = state.player_levitating | (is_use & got_levitation)
@@ -378,7 +424,7 @@ def hazard_step(rng, state, action, params, static_params):
     # Phase 2: Terrain damage
     # ================================================================
     hp_after_terrain, rng_terrain = apply_terrain_damage(
-        new_pos, new_hp, new_map, new_levitating, rng_terrain
+        new_pos, new_hp, new_map, new_levitating, state.player_stats.intrinsics, rng_terrain
     )
 
     # ================================================================
@@ -419,10 +465,18 @@ def hazard_step(rng, state, action, params, static_params):
     visible_map = compute_visible(new_pos, new_map, map_h, map_w)
     new_seen_map = update_seen_map(state.seen_map, visible_map)
 
+    # Build final player_stats: conditionally select bumped_stats if bump happened
+    final_stats = jax.tree.map(
+        lambda b, o: jnp.where(has_monster_at_target, b, o),
+        bumped_stats, state.player_stats,
+    )
+    # Set final HP (after terrain damage, monster attacks, item use)
+    final_stats = final_stats.replace(hp=hp_after_attacks)
+
     new_state = state.replace(
         map=new_map,
         player_position=new_pos,
-        player_hp=hp_after_attacks,
+        player_stats=final_stats,
         player_levitating=final_levitating,
         levitation_turns=final_lev_turns,
         inventory=new_inv,

@@ -10,12 +10,13 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.minihax.constants import (
-    TileType, ItemType, MonsterType, PLAYER_START_HP, MONSTER_MAX_HP,
+    TileType, ItemType, MonsterType, MONSTER_MAX_HP, RoleType, RaceType,
 )
 from Nethax.minihax.states import (
     HazardState, HazardStaticParams, Inventory, SimpleMonsters, GroundItems,
 )
 from Nethax.minihax.primitives.visibility import compute_visible
+from Nethax.minihax.primitives.leveling import compute_initial_stats
 
 
 # Active map: 13 wide x 7 tall
@@ -75,8 +76,10 @@ def generate_lava_crossing(rng, params, static_params):
     max_items = static_params.max_items
     max_gi = static_params.max_ground_items
 
-    rng, rng_player, rng_stair, rng_item_branch, rng_item_sub, rng_item_sub2 = \
-        jax.random.split(rng, 6)
+    rng, rng_player, rng_stair, rng_item_branch, rng_item_sub, rng_item_sub2, rng_stats = \
+        jax.random.split(rng, 7)
+
+    player_stats = compute_initial_stats(rng_stats, RoleType.MONK, RaceType.HUMAN)
 
     game_map = _make_lava_crossing_map()
 
@@ -150,8 +153,7 @@ def generate_lava_crossing(rng, params, static_params):
         map=padded_map,
         player_position=player_pos,
         downstair_position=stair_pos,
-        player_hp=PLAYER_START_HP,
-        player_max_hp=PLAYER_START_HP,
+        player_stats=player_stats,
         player_levitating=False,
         levitation_turns=0,
         inventory=inv,

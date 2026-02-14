@@ -16,7 +16,7 @@ from Nethax.minihax.util.game_logic_utils import is_solid, in_bounds
 def is_game_over(state, params, static_params):
     """Terminal: player death or max timesteps."""
     done_steps = state.timestep >= params.max_timesteps
-    is_dead = state.player_hp <= 0
+    is_dead = state.player_stats.hp <= 0
     return done_steps | is_dead
 
 
@@ -83,7 +83,7 @@ def minihax_step(rng, state, action, params, static_params):
     rng, _rng_action, _rng_monsters, _rng_attacks = jax.random.split(rng, 4)
 
     state = state.replace(timestep=state.timestep + 1)
-    old_score = state.score
+    old_score = state.player_stats.score
 
     # 1. Player action
     is_move = action <= Action.MOVE_SW  # Actions 0-7 are movement
@@ -112,7 +112,7 @@ def minihax_step(rng, state, action, params, static_params):
     state = state.replace(seen_map=new_seen_map, visible_map=visible_map)
 
     # 5. Reward = score delta (matches ScoreScore from sol-main)
-    reward = (state.score - old_score).astype(jnp.float32)
+    reward = (state.player_stats.score - old_score).astype(jnp.float32)
 
     # Zero reward on terminal (matches ScoreScore behavior)
     done = is_game_over(state, params, static_params)

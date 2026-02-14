@@ -51,11 +51,11 @@ def combat_step(rng, state, action, params, static_params):
     map_h = static_params.map_height
     map_w = static_params.map_width
 
-    rng_action, rng_bump, rng_monsters, rng_attacks, rng_terrain, rng_kick, rng_next = \
-        jax.random.split(rng, 7)
+    rng_action, rng_bump, rng_monsters, rng_attacks, rng_terrain, rng_kick, rng_traps, rng_next = \
+        jax.random.split(rng, 8)
 
     new_timestep = state.timestep + 1
-    old_score = state.score
+    old_score = state.player_stats.score
 
     is_move = action < 8
     is_downstair = action == Action.GO_DOWN_STAIRS
@@ -126,7 +126,7 @@ def combat_step(rng, state, action, params, static_params):
     # --- Use item ---
     new_inv_use, map_after_use, hp_after_use, got_levitation, got_key = use_first_item(
         state.inventory, map_after_autodoor, final_move_pos,
-        state.player_hp, map_h, map_w,
+        state.player_stats.hp, map_h, map_w,
     )
 
     # --- Kick ---
@@ -174,16 +174,16 @@ def combat_step(rng, state, action, params, static_params):
         new_ground_pickup, state.ground_items,
     )
 
-    # HP: from attack_state if bump, or use_item if USE, else original
-    new_hp = jnp.where(has_monster_at_target, phase1_state.player_hp,
-             jnp.where(is_use, hp_after_use, state.player_hp))
+    # Player stats: from attack_state if bump, else original
+    # Use tree_map to conditionally select between the two PlayerStats structs
+    new_stats = jax.tree.map(
+        lambda a, o: jnp.where(has_monster_at_target, a, o),
+        phase1_state.player_stats, state.player_stats,
+    )
 
-    # XP, level, score, kills: from attack state if bump, else original
-    new_xp = jnp.where(has_monster_at_target, phase1_state.player_xp, state.player_xp)
-    new_xp_level = jnp.where(has_monster_at_target, phase1_state.player_xp_level, state.player_xp_level)
-    new_score = jnp.where(has_monster_at_target, phase1_state.score, state.score)
-    new_max_hp = jnp.where(has_monster_at_target, phase1_state.player_max_hp, state.player_max_hp)
-    new_kills = jnp.where(has_monster_at_target, phase1_state.monsters_killed, state.monsters_killed)
+    # HP: override if use_item action (use_item returns updated HP)
+    new_hp = jnp.where(has_monster_at_target, new_stats.hp,
+             jnp.where(is_use, hp_after_use, state.player_stats.hp))
 
     # Levitation: from use_item
     new_levitating = state.player_levitating | (is_use & got_levitation)
@@ -199,14 +199,22 @@ def combat_step(rng, state, action, params, static_params):
     # ================================================================
     # Phase 2: Trap check
     # ================================================================
-    trap_hp_delta, new_traps = check_traps(new_pos, state.traps)
+    trap_hp_delta, new_traps, noise = check_traps(new_pos, state.traps, rng_traps)
     hp_after_traps = new_hp + trap_hp_delta
+
+    # Wake nearby monsters on squeaky board noise (Chebyshev distance <= 5)
+    mon_dist_r = jnp.abs(state.monsters.position[:, 0] - new_pos[0])
+    mon_dist_c = jnp.abs(state.monsters.position[:, 1] - new_pos[1])
+    mon_dist = jnp.maximum(mon_dist_r, mon_dist_c)
+    wake_mask = noise & state.monsters.mask & (mon_dist <= 5)
+    new_sleeping = jnp.where(wake_mask, False, state.monsters.is_sleeping)
+    new_monsters = new_monsters.replace(is_sleeping=new_sleeping)
 
     # ================================================================
     # Phase 3: Terrain damage
     # ================================================================
     hp_after_terrain, rng_terrain = apply_terrain_damage(
-        new_pos, hp_after_traps, new_map, new_levitating, rng_terrain
+        new_pos, hp_after_traps, new_map, new_levitating, state.player_stats.intrinsics, rng_terrain
     )
 
     # ================================================================
@@ -217,16 +225,15 @@ def combat_step(rng, state, action, params, static_params):
     final_levitating = new_levitating & jnp.logical_not(lev_expired)
     final_lev_turns = jnp.where(lev_expired, 0, new_lev_turns_tick)
 
+    # Build final player_stats: start from new_stats (attack or original),
+    # then override HP with the value that has been through traps + terrain
+    mid_stats = new_stats.replace(hp=hp_after_terrain)
+
     # Build intermediate state for monster AI
     mid_state = state.replace(
         map=new_map,
         player_position=new_pos,
-        player_hp=hp_after_terrain,
-        player_max_hp=new_max_hp,
-        player_xp=new_xp,
-        player_xp_level=new_xp_level,
-        player_ac=state.player_ac,
-        player_strength=state.player_strength,
+        player_stats=mid_stats,
         player_levitating=final_levitating,
         levitation_turns=final_lev_turns,
         player_has_key=new_has_key,
@@ -234,8 +241,6 @@ def combat_step(rng, state, action, params, static_params):
         monsters=new_monsters,
         traps=new_traps,
         ground_items=new_ground,
-        score=new_score,
-        monsters_killed=new_kills,
         timestep=new_timestep,
         terminal=state.terminal,
         state_rng=rng_next,
@@ -265,7 +270,7 @@ def combat_step(rng, state, action, params, static_params):
     # Goal type 1: kill target monster (e.g., grid bug in Memento)
     target_dead = ~mid_state.monsters.mask[static_params.goal_monster_idx]
     won = jnp.where(static_params.goal_type == 0, stair_won, target_dead)
-    dead = mid_state.player_hp <= 0
+    dead = mid_state.player_stats.hp <= 0
     timeout = new_timestep >= params.max_timesteps
     terminal = won | dead | timeout
 

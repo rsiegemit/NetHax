@@ -15,12 +15,13 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.minihax.constants import (
-    TileType, MonsterType, PLAYER_START_HP, MONSTER_MAX_HP, ItemType,
+    TileType, MonsterType, MONSTER_MAX_HP, ItemType, RoleType, RaceType,
 )
 from Nethax.minihax.states import (
     HazardState, HazardStaticParams, Inventory, SimpleMonsters, GroundItems,
 )
 from Nethax.minihax.primitives.visibility import compute_visible
+from Nethax.minihax.primitives.leveling import compute_initial_stats
 from Nethax.minihax.world_gen.procedural import replace_terrain_random, randline
 
 
@@ -54,8 +55,10 @@ def _generate_hidenseek_common(rng, params, static_params, active_h, active_w, h
     map_h = static_params.map_height
     map_w = static_params.map_width
 
-    rng, rng_cloud, rng_tree, rng_lava, rng_line1, rng_line2, rng_monster, rng_shuffle, rng_pos = \
-        jax.random.split(rng, 9)
+    rng, rng_cloud, rng_tree, rng_lava, rng_line1, rng_line2, rng_monster, rng_shuffle, rng_pos, rng_stats = \
+        jax.random.split(rng, 10)
+
+    player_stats = compute_initial_stats(rng_stats, RoleType.MONK, RaceType.HUMAN)
 
     # Start with all-floor map (active area)
     game_map = jnp.full((map_h, map_w), TileType.VOID, dtype=jnp.int32)
@@ -157,8 +160,7 @@ def _generate_hidenseek_common(rng, params, static_params, active_h, active_w, h
         map=game_map,
         player_position=player_pos,
         downstair_position=stair_pos,
-        player_hp=PLAYER_START_HP,
-        player_max_hp=PLAYER_START_HP,
+        player_stats=player_stats,
         player_levitating=False,
         levitation_turns=0,
         inventory=inv,

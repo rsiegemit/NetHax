@@ -223,7 +223,8 @@ def render_hazard_symbolic(state, static_params):
     4. Monster presence (only on visible tiles) [map_h * map_w]
     5. Visibility channels: seen_map + visible_map [2 * map_h * map_w]
     6. Inventory encoding [max_items] (item_id / NUM_ITEM_TYPES, 0 if empty)
-    7. Stats: [hp_norm, max_hp_norm, levitating, timestep_norm]
+    7. Stats: [hp_norm, max_hp_norm, xp_level, ac, str, dex, con, int, wis, cha,
+              energy, max_energy, levitating, timestep_norm]
 
     Args:
         state: HazardState
@@ -282,9 +283,20 @@ def render_hazard_symbolic(state, static_params):
     )
 
     # Stats
+    ps = state.player_stats
     stats = jnp.array([
-        state.player_hp / jnp.maximum(state.player_max_hp, 1),
-        state.player_max_hp / 50.0,
+        ps.hp / jnp.maximum(ps.max_hp, 1),
+        ps.max_hp / 50.0,
+        ps.xp_level / 30.0,
+        ps.ac / 20.0,
+        ps.strength / 25.0,
+        ps.dexterity / 25.0,
+        ps.constitution / 25.0,
+        ps.intelligence / 25.0,
+        ps.wisdom / 25.0,
+        ps.charisma / 25.0,
+        ps.energy / jnp.maximum(ps.max_energy, 1),
+        ps.max_energy / 50.0,
         jnp.float32(state.player_levitating),
         state.timestep / 1500.0,
     ], dtype=jnp.float32)
@@ -304,8 +316,8 @@ def render_combat_symbolic(state, static_params):
     5. Trap presence (only on seen tiles) [map_h * map_w]
     6. Visibility channels: seen_map + visible_map [2 * map_h * map_w]
     7. Inventory encoding [max_items] (item_id / NUM_ITEM_TYPES, 0 if empty)
-    8. Stats: [hp_norm, max_hp_norm, xp_level_norm, ac_norm, strength_norm,
-              levitating, has_key, score_norm, kills_norm, timestep_norm]
+    8. Stats: [hp_norm, max_hp_norm, xp_level, ac, str, dex, con, int, wis, cha,
+              energy, max_energy, levitating, has_key, score, kills, timestep_norm]
 
     Args:
         state: CombatState
@@ -380,16 +392,24 @@ def render_combat_symbolic(state, static_params):
     )
 
     # Stats
+    ps = state.player_stats
     stats = jnp.array([
-        state.player_hp / jnp.maximum(state.player_max_hp, 1),
-        state.player_max_hp / 50.0,
-        state.player_xp_level / 30.0,
-        state.player_ac / 20.0,
-        state.player_strength / 25.0,
+        ps.hp / jnp.maximum(ps.max_hp, 1),
+        ps.max_hp / 50.0,
+        ps.xp_level / 30.0,
+        ps.ac / 20.0,
+        ps.strength / 25.0,
+        ps.dexterity / 25.0,
+        ps.constitution / 25.0,
+        ps.intelligence / 25.0,
+        ps.wisdom / 25.0,
+        ps.charisma / 25.0,
+        ps.energy / jnp.maximum(ps.max_energy, 1),
+        ps.max_energy / 50.0,
         jnp.float32(state.player_levitating),
         jnp.float32(state.player_has_key),
-        state.score / 100.0,
-        state.monsters_killed / 16.0,
+        ps.score / 100.0,
+        ps.monsters_killed / 16.0,
         state.timestep / 1500.0,
     ], dtype=jnp.float32)
 

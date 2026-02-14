@@ -341,33 +341,54 @@ def build_blstats_navigation(state):
 
 
 def build_blstats_hazard(state):
-    """Tier 2 hazard: + hp, levitation status."""
+    """Tier 2 hazard: + hp, levitation status, full player stats."""
+    ps = state.player_stats
     bl = jnp.zeros(BLSTATS_SIZE, dtype=jnp.int32)
     bl = bl.at[BL_X].set(state.player_position[1])
     bl = bl.at[BL_Y].set(state.player_position[0])
-    bl = bl.at[BL_HP].set(state.player_hp)
-    bl = bl.at[BL_HPMAX].set(state.player_max_hp)
+    bl = bl.at[BL_STR25].set(ps.strength)
+    bl = bl.at[BL_STR125].set(ps.strength)
+    bl = bl.at[BL_DEX].set(ps.dexterity)
+    bl = bl.at[BL_CON].set(ps.constitution)
+    bl = bl.at[BL_INT].set(ps.intelligence)
+    bl = bl.at[BL_WIS].set(ps.wisdom)
+    bl = bl.at[BL_CHA].set(ps.charisma)
+    bl = bl.at[BL_HP].set(ps.hp)
+    bl = bl.at[BL_HPMAX].set(ps.max_hp)
+    bl = bl.at[BL_ENE].set(ps.energy)
+    bl = bl.at[BL_ENEMAX].set(ps.max_energy)
+    bl = bl.at[BL_AC].set(ps.ac)
+    bl = bl.at[BL_XP].set(ps.xp_level)
+    bl = bl.at[BL_EXP].set(ps.xp)
     bl = bl.at[BL_DEPTH].set(1)
     bl = bl.at[BL_TIME].set(state.timestep)
     return bl
 
 
 def build_blstats_combat(state):
-    """Tier 3 combat: full stats."""
+    """Tier 3 combat: full stats via player_stats."""
+    ps = state.player_stats
     bl = jnp.zeros(BLSTATS_SIZE, dtype=jnp.int32)
     bl = bl.at[BL_X].set(state.player_position[1])
     bl = bl.at[BL_Y].set(state.player_position[0])
-    bl = bl.at[BL_STR25].set(state.player_strength)
-    bl = bl.at[BL_STR125].set(state.player_strength)
-    bl = bl.at[BL_SCORE].set(state.score)
-    bl = bl.at[BL_HP].set(state.player_hp)
-    bl = bl.at[BL_HPMAX].set(state.player_max_hp)
+    bl = bl.at[BL_STR25].set(ps.strength)
+    bl = bl.at[BL_STR125].set(ps.strength)
+    bl = bl.at[BL_DEX].set(ps.dexterity)
+    bl = bl.at[BL_CON].set(ps.constitution)
+    bl = bl.at[BL_INT].set(ps.intelligence)
+    bl = bl.at[BL_WIS].set(ps.wisdom)
+    bl = bl.at[BL_CHA].set(ps.charisma)
+    bl = bl.at[BL_SCORE].set(ps.score)
+    bl = bl.at[BL_HP].set(ps.hp)
+    bl = bl.at[BL_HPMAX].set(ps.max_hp)
+    bl = bl.at[BL_ENE].set(ps.energy)
+    bl = bl.at[BL_ENEMAX].set(ps.max_energy)
     bl = bl.at[BL_DEPTH].set(1)
-    bl = bl.at[BL_AC].set(state.player_ac)
-    bl = bl.at[BL_XP].set(state.player_xp_level)
-    bl = bl.at[BL_EXP].set(state.player_xp)
+    bl = bl.at[BL_AC].set(ps.ac)
+    bl = bl.at[BL_XP].set(ps.xp_level)
+    bl = bl.at[BL_EXP].set(ps.xp)
     bl = bl.at[BL_TIME].set(state.timestep)
-    bl = bl.at[BL_MONSTERS_KILLED].set(state.monsters_killed)
+    bl = bl.at[BL_MONSTERS_KILLED].set(ps.monsters_killed)
     return bl
 
 

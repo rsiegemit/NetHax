@@ -18,12 +18,13 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.minihax.constants import (
-    TileType, ItemType, MonsterType, PLAYER_START_HP, MONSTER_MAX_HP,
+    TileType, ItemType, MonsterType, MONSTER_MAX_HP, RoleType, RaceType,
 )
 from Nethax.minihax.states import (
     HazardState, HazardStaticParams, Inventory, SimpleMonsters, GroundItems,
 )
 from Nethax.minihax.primitives.visibility import compute_visible
+from Nethax.minihax.primitives.leveling import compute_initial_stats
 
 _ACTIVE_H = 7
 _ACTIVE_W = 29
@@ -119,8 +120,10 @@ def generate_quest_easy(rng, params, static_params):
     map_h = static_params.map_height
     map_w = static_params.map_width
 
-    rng, rng_stair, rng_mon1, rng_mon2, rng_mon1t, rng_mon2t, rng_mon1p, rng_mon2p = \
-        jax.random.split(rng, 8)
+    rng, rng_stair, rng_mon1, rng_mon2, rng_mon1t, rng_mon2t, rng_mon1p, rng_mon2p, rng_stats = \
+        jax.random.split(rng, 9)
+
+    player_stats = compute_initial_stats(rng_stats, RoleType.MONK, RaceType.HUMAN)
 
     game_map = _build_quest_easy_map()
 
@@ -209,8 +212,7 @@ def generate_quest_easy(rng, params, static_params):
         map=padded_map,
         player_position=player_pos,
         downstair_position=stair_pos,
-        player_hp=PLAYER_START_HP,
-        player_max_hp=PLAYER_START_HP,
+        player_stats=player_stats,
         player_levitating=False,
         levitation_turns=0,
         inventory=inv,

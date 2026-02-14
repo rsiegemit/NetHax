@@ -7,17 +7,17 @@ from typing import Tuple, Optional
 from Nethax.environment_base.environment_bases import EnvironmentNoAutoReset
 from Nethax.minihax.constants import NUM_ACTIONS
 from Nethax.minihax.game_logic.zombie_horde import minihax_step, is_game_over
-from Nethax.minihax.minihax_state import EnvState, EnvParams, StaticEnvParams
+from Nethax.minihax.states import CombatState, CombatStaticParams, EnvParams
 from Nethax.minihax.world_gen.zombie_horde import generate_zombie_horde
 from Nethax.minihax.envs.common import log_zombie_info
 
 
 class MinihaxZombieHordeNLEEnv(EnvironmentNoAutoReset):
-    def __init__(self, static_env_params: Optional[StaticEnvParams] = None,
+    def __init__(self, static_env_params: Optional[CombatStaticParams] = None,
                  crop_size: int = 9):
         super().__init__()
         if static_env_params is None:
-            static_env_params = StaticEnvParams()
+            static_env_params = CombatStaticParams(has_temple=True)
         self.static_env_params = static_env_params
         self.crop_size = crop_size
 
@@ -26,8 +26,8 @@ class MinihaxZombieHordeNLEEnv(EnvironmentNoAutoReset):
         return EnvParams()
 
     def step_env(
-        self, rng: jax.Array, state: EnvState, action: int, params: EnvParams
-    ) -> Tuple[jax.Array, EnvState, float, bool, dict]:
+        self, rng: jax.Array, state: CombatState, action: int, params: EnvParams
+    ) -> Tuple[jax.Array, CombatState, float, bool, dict]:
         state, reward = minihax_step(rng, state, action, params, self.static_env_params)
 
         # Store prev_action in state for observation
@@ -47,16 +47,16 @@ class MinihaxZombieHordeNLEEnv(EnvironmentNoAutoReset):
 
     def reset_env(
         self, rng: jax.Array, params: EnvParams
-    ) -> Tuple[jax.Array, EnvState]:
+    ) -> Tuple[jax.Array, CombatState]:
         rng, _rng = jax.random.split(rng)
         state = generate_zombie_horde(_rng, params, self.static_env_params)
         return self.get_obs(state), state
 
-    def get_obs(self, state: EnvState) -> dict:
-        from Nethax.minihax.nle_obs import render_nle_zombie_horde
-        return render_nle_zombie_horde(state, self.static_env_params, self.crop_size, prev_action=state.prev_action)
+    def get_obs(self, state: CombatState) -> dict:
+        from Nethax.minihax.nle_obs import render_nle_combat
+        return render_nle_combat(state, self.static_env_params, self.crop_size, prev_action=state.prev_action)
 
-    def is_terminal(self, state: EnvState, params: EnvParams) -> bool:
+    def is_terminal(self, state: CombatState, params: EnvParams) -> bool:
         return is_game_over(state, params, self.static_env_params)
 
     @property

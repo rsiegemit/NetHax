@@ -48,14 +48,14 @@ class CombatEnv(EnvironmentNoAutoReset):
         )
 
         # Win = terminal and not timed out and not dead
-        won = new_state.terminal & (new_state.timestep < params.max_timesteps) & (new_state.player_hp > 0)
+        won = new_state.terminal & (new_state.timestep < params.max_timesteps) & (new_state.player_stats.hp > 0)
 
         done = new_state.terminal
         info = {
             "timestep": new_state.timestep,
             "won": won,
-            "player_hp": new_state.player_hp,
-            "score": new_state.score,
+            "player_hp": new_state.player_stats.hp,
+            "score": new_state.player_stats.score,
             "discount": self.discount(new_state, params),
         }
 
@@ -103,7 +103,7 @@ class CombatEnv(EnvironmentNoAutoReset):
                     map_h * map_w +      # traps
                     2 * map_h * map_w +  # seen_map + visible_map
                     max_items +          # inventory
-                    10)                  # stats
+                    17)                  # stats
         return Box(0.0, 1.0, (obs_size,), dtype=jnp.float32)
 
     @property

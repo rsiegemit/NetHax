@@ -3,6 +3,7 @@
 All maps are fixed (from .des files), not procedural.
 Maps stored as string arrays, converted to JAX arrays at init.
 """
+import jax
 import jax.numpy as jnp
 from Nethax.minihax.constants import TileType
 
@@ -23,14 +24,22 @@ def _finalize_map(tile_map, branch_colrow, stair_colrow, static_params):
     Args:
         tile_map: jnp.ndarray [H, W] tile map
         branch_colrow: (col, row) player start from .des BRANCH directive
-        stair_colrow: (col, row) downstair position from .des STAIR directive
+        stair_colrow: (col, row) or jnp.ndarray [2] downstair position from .des STAIR directive
         static_params: StaticParams with map_height, map_width
 
     Returns:
         tile_map, player_pos [row, col], stair_pos [row, col]
     """
+    # Handle both tuple and array input for stair_colrow
+    # For arrays: stair_colrow is [col, row] from the options array
+    # For tuples: stair_colrow is (col, row) as before
+    if isinstance(stair_colrow, tuple):
+        stair_col, stair_row = stair_colrow[0], stair_colrow[1]
+    else:
+        # It's a jnp.array [col, row]
+        stair_col, stair_row = stair_colrow[0], stair_colrow[1]
+
     # Place downstair on map (before padding, coords are in original map space)
-    stair_row, stair_col = stair_colrow[1], stair_colrow[0]
     tile_map = tile_map.at[stair_row, stair_col].set(TileType.DOWNSTAIR)
 
     # Pad to static_params dimensions
@@ -390,16 +399,27 @@ SOKO4A_PITS = [
     (16, 1), (17, 1), (18, 1), (19, 1), (20, 1), (21, 1), (22, 1), (23, 1),
 ]
 
-SOKO4A_STAIR = (16, 11)  # Using first SHUFFLE position as default
 SOKO4A_BRANCH = (1, 1)
 
 
 def make_soko4a(rng, static_params):
-    """Generate soko4a initial state."""
+    """Generate soko4a initial state.
+
+    Stair position is randomly selected from 3 options: (16,11), (16,13), (16,15)
+    """
+    # Define stair options locally to avoid tracer leaks
+    stair_options = jnp.array([[16, 11], [16, 13], [16, 15]], dtype=jnp.int32)
+
+    rng, rng_stair = jax.random.split(rng)
+    stair_idx = jax.random.randint(rng_stair, (), 0, 3)
+    stair_coords = stair_options[stair_idx]
+    # Pass array directly - _finalize_map handles it
+    stair_colrow = stair_coords
+
     tile_map = parse_map(SOKO4A_MAP)
     tile_map, pits_remaining = place_objects(tile_map, SOKO4A_BOULDERS, SOKO4A_PITS)
     tile_map, player_pos, stair_pos = _finalize_map(
-        tile_map, SOKO4A_BRANCH, SOKO4A_STAIR, static_params)
+        tile_map, SOKO4A_BRANCH, stair_colrow, static_params)
     return tile_map, player_pos, stair_pos, pits_remaining
 
 
@@ -439,14 +459,25 @@ SOKO4B_PITS = [
     (21, 1), (22, 1),
 ]
 
-SOKO4B_STAIR = (16, 10)  # Using first SHUFFLE position as default
 SOKO4B_BRANCH = (6, 15)
 
 
 def make_soko4b(rng, static_params):
-    """Generate soko4b initial state."""
+    """Generate soko4b initial state.
+
+    Stair position is randomly selected from 3 options: (16,10), (16,12), (16,14)
+    """
+    # Define stair options locally to avoid tracer leaks
+    stair_options = jnp.array([[16, 10], [16, 12], [16, 14]], dtype=jnp.int32)
+
+    rng, rng_stair = jax.random.split(rng)
+    stair_idx = jax.random.randint(rng_stair, (), 0, 3)
+    stair_coords = stair_options[stair_idx]
+    # Pass array directly - _finalize_map handles it
+    stair_colrow = stair_coords
+
     tile_map = parse_map(SOKO4B_MAP)
     tile_map, pits_remaining = place_objects(tile_map, SOKO4B_BOULDERS, SOKO4B_PITS)
     tile_map, player_pos, stair_pos = _finalize_map(
-        tile_map, SOKO4B_BRANCH, SOKO4B_STAIR, static_params)
+        tile_map, SOKO4B_BRANCH, stair_colrow, static_params)
     return tile_map, player_pos, stair_pos, pits_remaining

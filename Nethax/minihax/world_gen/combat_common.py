@@ -1,13 +1,12 @@
 """Shared helpers for Tier 3 combat world generators."""
+import jax
 import jax.numpy as jnp
 
-from Nethax.minihax.constants import (
-    TileType, PLAYER_START_HP, PLAYER_START_MAX_HP,
-    PLAYER_START_AC, PLAYER_START_STRENGTH, PLAYER_START_XP_LEVEL,
-)
+from Nethax.minihax.constants import TileType, RoleType, RaceType
 from Nethax.minihax.states import (
     CombatState, Inventory, Monsters, Traps, GroundItems,
 )
+from Nethax.minihax.primitives.leveling import compute_initial_stats
 
 
 def pad_map(game_map, static_params):
@@ -25,6 +24,9 @@ def empty_combat_state(static_params, rng):
 
     Caller should replace fields as needed.
     """
+    rng, rng_stats = jax.random.split(rng)
+    player_stats = compute_initial_stats(rng_stats, RoleType.MONK, RaceType.HUMAN)
+
     max_m = static_params.max_monsters
     max_items = static_params.max_items
     max_gi = static_params.max_ground_items
@@ -36,12 +38,7 @@ def empty_combat_state(static_params, rng):
         map=jnp.full((sh, sw), TileType.VOID, dtype=jnp.int32),
         player_position=jnp.zeros(2, dtype=jnp.int32),
         downstair_position=jnp.zeros(2, dtype=jnp.int32),
-        player_hp=PLAYER_START_HP,
-        player_max_hp=PLAYER_START_MAX_HP,
-        player_xp=jnp.int32(0),
-        player_xp_level=PLAYER_START_XP_LEVEL,
-        player_ac=PLAYER_START_AC,
-        player_strength=PLAYER_START_STRENGTH,
+        player_stats=player_stats,
         player_levitating=False,
         levitation_turns=jnp.int32(0),
         player_has_key=False,
@@ -70,8 +67,6 @@ def empty_combat_state(static_params, rng):
         ),
         seen_map=jnp.zeros((sh, sw), dtype=jnp.bool_),
         visible_map=jnp.zeros((sh, sw), dtype=jnp.bool_),
-        score=jnp.int32(0),
-        monsters_killed=jnp.int32(0),
         timestep=jnp.int32(0),
         prev_action=0,
         terminal=False,

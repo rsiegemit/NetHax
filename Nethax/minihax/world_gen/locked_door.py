@@ -20,12 +20,13 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.minihax.constants import (
-    TileType, ItemType, PLAYER_START_HP,
+    TileType, ItemType, RoleType, RaceType,
 )
 from Nethax.minihax.states import (
     HazardState, HazardStaticParams, Inventory, SimpleMonsters, GroundItems,
 )
 from Nethax.minihax.primitives.visibility import compute_visible
+from Nethax.minihax.primitives.leveling import compute_initial_stats
 
 _ACTIVE_H = 7
 _ACTIVE_W = 13
@@ -67,6 +68,9 @@ def _build_locked_door_map():
 
 def _make_locked_door_state(rng, params, static_params, player_pos, stair_pos):
     """Common state construction for both locked door variants."""
+    rng, rng_stats = jax.random.split(rng)
+    player_stats = compute_initial_stats(rng_stats, RoleType.MONK, RaceType.HUMAN)
+
     max_m = static_params.max_monsters
     max_items = static_params.max_items
     max_gi = static_params.max_ground_items
@@ -106,8 +110,7 @@ def _make_locked_door_state(rng, params, static_params, player_pos, stair_pos):
         map=padded_map,
         player_position=player_pos,
         downstair_position=stair_pos,
-        player_hp=PLAYER_START_HP,
-        player_max_hp=PLAYER_START_HP,
+        player_stats=player_stats,
         player_levitating=False,
         levitation_turns=0,
         inventory=inv,

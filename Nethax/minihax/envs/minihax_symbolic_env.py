@@ -5,30 +5,37 @@ from jax import lax
 from typing import Tuple, Optional
 
 from Nethax.environment_base.environment_bases import EnvironmentNoAutoReset
-from Nethax.minihax.constants import NUM_ACTIONS, NUM_TILE_TYPES
+from Nethax.minihax.constants import NUM_ACTIONS, NUM_TILE_TYPES, NUM_ITEM_TYPES
 from Nethax.minihax.game_logic.zombie_horde import minihax_step, is_game_over
-from Nethax.minihax.minihax_state import EnvState, EnvParams, StaticEnvParams
-from Nethax.minihax.renderer import render_minihax_symbolic
+from Nethax.minihax.states import CombatState, CombatStaticParams, EnvParams
+from Nethax.minihax.renderer import render_combat_symbolic
 from Nethax.minihax.world_gen.zombie_horde import generate_zombie_horde
 from Nethax.minihax.envs.common import log_zombie_info
 
 
 def get_obs_shape(static_params=None):
     if static_params is None:
-        static_params = StaticEnvParams()
+        static_params = CombatStaticParams(has_temple=True)
     map_h = static_params.map_height
     map_w = static_params.map_width
-    # map_onehot + player_pos + monster_presence + seen_map + visible_map + stats
-    map_obs = map_h * map_w * NUM_TILE_TYPES + map_h * map_w + map_h * map_w + 2 * map_h * map_w
-    stats_obs = 8
-    return map_obs + stats_obs
+    max_items = static_params.max_items
+    # map_onehot + player + stair + monsters + traps + seen + visible + inventory + stats
+    obs_size = (map_h * map_w * NUM_TILE_TYPES +
+                map_h * map_w +      # player
+                map_h * map_w +      # stair
+                map_h * map_w +      # monsters
+                map_h * map_w +      # traps
+                2 * map_h * map_w +  # seen_map + visible_map
+                max_items +          # inventory
+                17)                  # stats
+    return obs_size
 
 
 class MinihaxZombieHordeSymbolicEnv(EnvironmentNoAutoReset):
-    def __init__(self, static_env_params: Optional[StaticEnvParams] = None):
+    def __init__(self, static_env_params: Optional[CombatStaticParams] = None):
         super().__init__()
         if static_env_params is None:
-            static_env_params = StaticEnvParams()
+            static_env_params = CombatStaticParams(has_temple=True)
         self.static_env_params = static_env_params
 
     @property
@@ -36,8 +43,8 @@ class MinihaxZombieHordeSymbolicEnv(EnvironmentNoAutoReset):
         return EnvParams()
 
     def step_env(
-        self, rng: jax.Array, state: EnvState, action: int, params: EnvParams
-    ) -> Tuple[jax.Array, EnvState, float, bool, dict]:
+        self, rng: jax.Array, state: CombatState, action: int, params: EnvParams
+    ) -> Tuple[jax.Array, CombatState, float, bool, dict]:
         state, reward = minihax_step(rng, state, action, params, self.static_env_params)
         done = self.is_terminal(state, params)
         info = log_zombie_info(state, done)
@@ -53,15 +60,15 @@ class MinihaxZombieHordeSymbolicEnv(EnvironmentNoAutoReset):
 
     def reset_env(
         self, rng: jax.Array, params: EnvParams
-    ) -> Tuple[jax.Array, EnvState]:
+    ) -> Tuple[jax.Array, CombatState]:
         rng, _rng = jax.random.split(rng)
         state = generate_zombie_horde(_rng, params, self.static_env_params)
         return self.get_obs(state), state
 
-    def get_obs(self, state: EnvState) -> jax.Array:
-        return render_minihax_symbolic(state, self.static_env_params)
+    def get_obs(self, state: CombatState) -> jax.Array:
+        return render_combat_symbolic(state, self.static_env_params)
 
-    def is_terminal(self, state: EnvState, params: EnvParams) -> bool:
+    def is_terminal(self, state: CombatState, params: EnvParams) -> bool:
         return is_game_over(state, params, self.static_env_params)
 
     @property

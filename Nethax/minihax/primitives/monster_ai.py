@@ -218,7 +218,7 @@ def do_monster_attacks(rng, state, static_params):
     Only awake, alive, hostile, adjacent monsters can attack.
     """
     max_m = static_params.max_monsters
-    player_ac = state.player_ac
+    player_ac = state.player_stats.ac
 
     rngs = jax.random.split(rng, max_m + 1)
 
@@ -270,6 +270,6 @@ def do_monster_attacks(rng, state, static_params):
         new_hp = hp - actual_damage
         return new_hp, None
 
-    new_hp, _ = lax.scan(attack_step, state.player_hp, jnp.arange(max_m))
-    state = state.replace(player_hp=new_hp)
+    new_hp, _ = lax.scan(attack_step, state.player_stats.hp, jnp.arange(max_m))
+    state = state.replace(player_stats=state.player_stats.replace(hp=new_hp))
     return state

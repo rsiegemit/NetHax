@@ -37,10 +37,12 @@ def sokoban_step(rng, state, action, params, static_params):
     is_move = action < 8
 
     # Try boulder push first (only on movement actions)
+    # Sokoban rule: no diagonal boulder pushing
     new_map_push, new_pos_push, new_pits_push, pushed = push_boulder(
         state.map, state.player_position, action,
         static_params.map_height, static_params.map_width,
-        state.pits_remaining
+        state.pits_remaining,
+        restrict_diagonal=True
     )
 
     # Try normal movement (no boulder push)

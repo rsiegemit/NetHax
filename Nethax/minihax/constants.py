@@ -93,9 +93,9 @@ MONSTER_STATS = jnp.array([
     # [level, speed, ac, mr, atk_dice, atk_sides, max_hp, xp_value]
     [0, 0, 10, 0, 0, 0, 0, 0],       # NONE
     [4, 6, 8, 0, 1, 8, 18, 20],      # HUMAN_ZOMBIE
-    [5, 12, 2, 0, 1, 6, 25, 0],      # PRIEST (peaceful, no XP)
+    [12, 12, 10, 50, 4, 10, 54, 0],  # PRIEST (level 12, AC 10, MR 50, 4d10 attack, peaceful, no XP)
     [1, 12, 7, 0, 1, 3, 5, 2],       # GIANT_RAT
-    [5, 6, 6, 30, 1, 6, 25, 50],     # COCKATRICE
+    [5, 6, 6, 30, 1, 3, 23, 50],     # COCKATRICE (1d3 bite + petrification special)
     [3, 10, 6, 0, 1, 4, 15, 20],     # NAGA_HATCHLING
     [6, 12, 6, 0, 3, 10, 50, 100],   # MINOTAUR
     [5, 9, 5, 0, 2, 6, 30, 60],      # OGRE
@@ -244,6 +244,285 @@ XP_TABLE = jnp.array([
 # Score for killing a zombie (NetHack exper.c + more_experienced)
 # experience() = 1 + level^2 = 1 + 4^2 = 17, score = 4 * experience() = 68
 ZOMBIE_KILL_SCORE = 68
+
+
+# ============================================================================
+# Player Roles (Classes) — from NetHack 3.7 role.c
+# ============================================================================
+class RoleType(IntEnum):
+    ARCHEOLOGIST = 0
+    BARBARIAN = 1
+    CAVEMAN = 2
+    HEALER = 3
+    KNIGHT = 4
+    MONK = 5
+    PRIEST = 6
+    RANGER = 7
+    ROGUE = 8
+    SAMURAI = 9
+    TOURIST = 10
+    VALKYRIE = 11
+    WIZARD = 12
+
+NUM_ROLES = 13
+
+
+class RaceType(IntEnum):
+    HUMAN = 0
+    ELF = 1
+    DWARF = 2
+    GNOME = 3
+    ORC = 4
+
+NUM_RACES = 5
+
+
+# Base stats per role: [STR, INT, WIS, DEX, CON, CHA] — from role.c
+ROLE_BASE_STATS = jnp.array([
+    [7, 10, 10, 7, 7, 7],    # Archeologist
+    [16, 7, 7, 15, 16, 6],   # Barbarian
+    [10, 7, 7, 7, 8, 6],     # Caveman
+    [7, 7, 13, 7, 11, 16],   # Healer
+    [13, 7, 14, 8, 10, 17],  # Knight
+    [10, 7, 8, 8, 7, 7],     # Monk
+    [7, 7, 10, 7, 7, 7],     # Priest
+    [13, 13, 13, 9, 13, 7],  # Ranger
+    [7, 7, 7, 10, 7, 6],     # Rogue
+    [10, 8, 7, 10, 17, 6],   # Samurai
+    [7, 10, 6, 7, 7, 10],    # Tourist
+    [10, 7, 7, 7, 10, 7],    # Valkyrie
+    [7, 10, 7, 7, 7, 7],     # Wizard
+], dtype=jnp.int32)
+
+
+# HP advancement per role: [infix, inrnd, lofix, lornd, hifix, hirnd]
+# in = initial, lo = per-level below xlev, hi = per-level at/above xlev
+# HP = fix + rnd(rnd_value) for each tier — from role.c hpadv fields
+ROLE_HP_ADV = jnp.array([
+    [11, 0, 0, 8, 1, 0],     # Archeologist
+    [14, 0, 0, 10, 2, 0],    # Barbarian
+    [14, 0, 0, 8, 2, 0],     # Caveman
+    [11, 0, 0, 8, 1, 0],     # Healer
+    [14, 0, 0, 8, 2, 0],     # Knight
+    [12, 0, 0, 8, 1, 0],     # Monk
+    [12, 0, 0, 8, 1, 0],     # Priest
+    [13, 0, 0, 6, 1, 0],     # Ranger
+    [10, 0, 0, 8, 1, 0],     # Rogue
+    [13, 0, 0, 8, 1, 0],     # Samurai
+    [8, 0, 0, 8, 0, 0],      # Tourist
+    [14, 0, 0, 8, 2, 0],     # Valkyrie
+    [10, 0, 0, 8, 1, 0],     # Wizard
+], dtype=jnp.int32)
+
+
+# Power/Energy advancement per role: [infix, inrnd, lofix, lornd, hifix, hirnd]
+ROLE_PW_ADV = jnp.array([
+    [1, 0, 0, 1, 0, 1],      # Archeologist
+    [1, 0, 0, 1, 0, 1],      # Barbarian
+    [1, 0, 0, 1, 0, 1],      # Caveman
+    [1, 4, 0, 1, 0, 2],      # Healer
+    [1, 4, 0, 1, 0, 2],      # Knight
+    [2, 2, 0, 2, 0, 2],      # Monk
+    [4, 3, 0, 2, 0, 2],      # Priest
+    [1, 0, 0, 1, 0, 1],      # Ranger
+    [1, 0, 0, 1, 0, 1],      # Rogue
+    [1, 0, 0, 1, 0, 1],      # Samurai
+    [1, 0, 0, 1, 0, 1],      # Tourist
+    [1, 0, 0, 1, 0, 1],      # Valkyrie
+    [4, 3, 0, 2, 0, 3],      # Wizard
+], dtype=jnp.int32)
+
+
+# Level threshold where HP/PW advancement switches from lo to hi tier
+ROLE_XLEV = jnp.array([14, 10, 10, 20, 10, 10, 10, 12, 11, 11, 14, 10, 12], dtype=jnp.int32)
+
+# Energy modifier percentage per role (applied to power gain)
+# Priest/Wizard=200, Healer/Knight=150, Barbarian/Valkyrie=75, others=100
+ROLE_ENERMOD = jnp.array([100, 75, 100, 150, 150, 100, 200, 100, 100, 100, 100, 75, 200], dtype=jnp.int32)
+
+
+# ============================================================================
+# Race data — from NetHack 3.7 role.c races[]
+# ============================================================================
+
+# Max stat values per race: [max_STR, max_INT, max_WIS, max_DEX, max_CON, max_CHA]
+# Note: STR caps use our linear encoding (18=18, 18/50=23, 18/100=24)
+RACE_STAT_CAPS = jnp.array([
+    [18, 18, 18, 18, 18, 18],  # Human (STR 18/100 -> handled by RACE_STR_MAX)
+    [18, 20, 20, 18, 16, 18],  # Elf
+    [18, 16, 16, 20, 20, 16],  # Dwarf (STR 18/100)
+    [18, 19, 18, 18, 18, 18],  # Gnome (STR 18/50)
+    [18, 16, 16, 18, 18, 16],  # Orc (STR 18/50)
+], dtype=jnp.int32)
+
+# Maximum exceptional STR per race (in our linear encoding: 18/100=24, 18/50=23)
+RACE_STR_MAX = jnp.array([24, 18, 24, 23, 23], dtype=jnp.int32)
+
+# Race HP advancement: [infix, inrnd, lofix, lornd, hifix, hirnd]
+RACE_HP_ADV = jnp.array([
+    [2, 0, 0, 2, 1, 0],      # Human
+    [1, 0, 0, 1, 1, 0],      # Elf
+    [4, 0, 0, 3, 2, 0],      # Dwarf
+    [1, 0, 0, 1, 0, 0],      # Gnome
+    [1, 0, 0, 1, 0, 0],      # Orc
+], dtype=jnp.int32)
+
+# Race Power advancement: [infix, inrnd, lofix, lornd, hifix, hirnd]
+RACE_PW_ADV = jnp.array([
+    [1, 0, 0, 2, 0, 2],      # Human
+    [2, 0, 0, 3, 0, 3],      # Elf
+    [0, 0, 0, 0, 0, 0],      # Dwarf
+    [2, 0, 0, 2, 0, 2],      # Gnome
+    [1, 0, 0, 1, 0, 1],      # Orc
+], dtype=jnp.int32)
+
+
+# ============================================================================
+# Combat bonus lookup tables — from NetHack 3.7 weapon.c
+# ============================================================================
+
+# STR to-hit bonus (abon() in weapon.c:950-984)
+# Index by STR value (0-25). Values < 3 are unused but included for safe indexing.
+# Indices 19-22 (18/01-18/50) get +1, only 23+ (18/51+) gets +2
+ABON_STR = jnp.array([
+    # 0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16
+     -2, -2, -2, -2, -2, -2, -1, -1,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    # 17  18  19  20  21  22  23  24  25
+      1,  1,  1,  1,  1,  1,  2,  3,  3,
+], dtype=jnp.int32)
+
+# DEX to-hit modifier (abon() in weapon.c:950-984)
+# Index by DEX value (0-25).
+ABON_DEX = jnp.array([
+    # 0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  18  19  20  21  22  23  24  25
+     -3, -3, -3, -3, -2, -2, -1, -1,  0,  0,  0,  0,  0,  0,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11,
+], dtype=jnp.int32)
+
+# STR damage bonus (dbon() in weapon.c:988-1011)
+# Index by STR value (0-25).
+DBON_STR = jnp.array([
+    # 0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16
+     -1, -1, -1, -1, -1, -1,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,
+    # 17  18  19  20  21  22  23  24  25
+      1,  2,  3,  3,  3,  4,  5,  6,  6,
+], dtype=jnp.int32)
+
+# CON bonus to HP per level (newhp() in attrib.c:1076-1139)
+# Index by CON value (0-25).
+CON_HP_BONUS = jnp.array([
+    # 0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  18  19  20  21  22  23  24  25
+     -2, -2, -2, -2, -1, -1, -1,  0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  2,  3,  4,  4,  4,  4,  4,  4,  4,
+], dtype=jnp.int32)
+
+
+# ============================================================================
+# Monk martial arts damage scaling — from NetHack 3.7 uhitm.c
+# ============================================================================
+
+# Damage die sides by level bracket: L1-4=d4, L5-8=d6, L9-12=d8, L13-16=d10, L17+=d12
+# bracket = min((level - 1) // 4, 4)
+MONK_MARTIAL_SIDES = jnp.array([4, 6, 8, 10, 12], dtype=jnp.int32)
+
+# Martial arts skill bonus (Basic bare-handed combat)
+MONK_MARTIAL_BONUS = 3
+
+
+# ============================================================================
+# Intrinsic abilities — bitmask constants
+# ============================================================================
+
+INTRINSIC_POISON_RES = 1 << 0
+INTRINSIC_FIRE_RES = 1 << 1
+INTRINSIC_COLD_RES = 1 << 2
+INTRINSIC_SLEEP_RES = 1 << 3
+INTRINSIC_SHOCK_RES = 1 << 4
+INTRINSIC_SEE_INVISIBLE = 1 << 5
+INTRINSIC_STEALTH = 1 << 6
+INTRINSIC_FAST = 1 << 7
+INTRINSIC_WARNING = 1 << 8
+INTRINSIC_SEARCH = 1 << 9
+INTRINSIC_TELEPORT_CONTROL = 1 << 10
+INTRINSIC_INFRAVISION = 1 << 11
+
+NUM_INTRINSICS = 12
+
+
+# Cumulative intrinsic bitmask per role at each level (0-30).
+# ROLE_INTRINSICS[role_id, level] = bitmask of all intrinsics gained by that level.
+# Level 0 is unused (placeholder), levels 1-30 are active.
+def _build_role_intrinsics():
+    """Build cumulative role intrinsic tables from NetHack 3.7 attrib.c."""
+    import numpy as np
+    table = np.zeros((13, 31), dtype=np.int32)
+
+    # Per-role intrinsic gain levels (from attrib.c role_abil arrays):
+    role_gains = {
+        0: [(1, INTRINSIC_SEARCH), (5, INTRINSIC_STEALTH), (10, INTRINSIC_FAST)],  # Archeologist
+        1: [(1, INTRINSIC_POISON_RES), (7, INTRINSIC_FAST), (15, INTRINSIC_STEALTH)],  # Barbarian
+        2: [(7, INTRINSIC_FAST), (15, INTRINSIC_WARNING)],  # Caveman
+        3: [(1, INTRINSIC_POISON_RES), (15, INTRINSIC_WARNING)],  # Healer
+        4: [(7, INTRINSIC_FAST)],  # Knight
+        5: [(1, INTRINSIC_FAST | INTRINSIC_SLEEP_RES | INTRINSIC_SEE_INVISIBLE),  # Monk L1
+            (3, INTRINSIC_POISON_RES), (5, INTRINSIC_STEALTH),
+            (7, INTRINSIC_WARNING), (9, INTRINSIC_SEARCH),
+            (11, INTRINSIC_FIRE_RES), (13, INTRINSIC_COLD_RES),
+            (15, INTRINSIC_SHOCK_RES), (17, INTRINSIC_TELEPORT_CONTROL)],
+        6: [(15, INTRINSIC_WARNING), (20, INTRINSIC_FIRE_RES)],  # Priest
+        7: [(1, INTRINSIC_SEARCH), (7, INTRINSIC_STEALTH), (15, INTRINSIC_SEE_INVISIBLE)],  # Ranger
+        8: [(1, INTRINSIC_STEALTH), (10, INTRINSIC_SEARCH)],  # Rogue
+        9: [(1, INTRINSIC_FAST), (15, INTRINSIC_STEALTH)],  # Samurai
+        10: [(10, INTRINSIC_SEARCH), (20, INTRINSIC_POISON_RES)],  # Tourist
+        11: [(1, INTRINSIC_COLD_RES), (4, INTRINSIC_STEALTH), (7, INTRINSIC_FAST)],  # Valkyrie
+        12: [(15, INTRINSIC_WARNING), (17, INTRINSIC_TELEPORT_CONTROL)],  # Wizard
+    }
+
+    for role_id, gains in role_gains.items():
+        cumulative = 0
+        for level in range(31):
+            for gain_level, bits in gains:
+                if level >= gain_level:
+                    cumulative |= bits
+            table[role_id, level] = cumulative
+
+    return jnp.array(table, dtype=jnp.int32)
+
+ROLE_INTRINSICS = _build_role_intrinsics()
+
+# Cumulative racial intrinsic bitmask per race at each level (0-30).
+def _build_race_intrinsics():
+    """Build cumulative race intrinsic tables from NetHack 3.7 attrib.c."""
+    import numpy as np
+    table = np.zeros((5, 31), dtype=np.int32)
+
+    race_gains = {
+        0: [],  # Human: no racial intrinsics
+        1: [(1, INTRINSIC_INFRAVISION), (4, INTRINSIC_SLEEP_RES)],  # Elf
+        2: [(1, INTRINSIC_INFRAVISION)],  # Dwarf
+        3: [(1, INTRINSIC_INFRAVISION)],  # Gnome
+        4: [(1, INTRINSIC_INFRAVISION | INTRINSIC_POISON_RES)],  # Orc
+    }
+
+    for race_id, gains in race_gains.items():
+        cumulative = 0
+        for level in range(31):
+            for gain_level, bits in gains:
+                if level >= gain_level:
+                    cumulative |= bits
+            table[race_id, level] = cumulative
+
+    return jnp.array(table, dtype=jnp.int32)
+
+RACE_INTRINSICS = _build_race_intrinsics()
+
+
+# ============================================================================
+# Per-monster-type score — NetHack score = 4 * experience(monster)
+# experience() = 1 + level^2 + various adjustments
+# ============================================================================
+
+# Simplified: score = 4 * (1 + level^2) for each monster type
+# Uses MONSTER_STATS[:, 0] for level
+MONSTER_XP_SCORE = 4 * (1 + MONSTER_STATS[:, 0] ** 2)
 
 
 # ============================================================================

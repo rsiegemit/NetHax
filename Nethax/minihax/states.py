@@ -52,6 +52,36 @@ class Traps:
     mask: jnp.ndarray           # [max_traps] — exists flag (bool)
 
 
+@struct.dataclass
+class PlayerStats:
+    """Full player stat block for Tier 2/3 — matches NetHack 3.7 player state."""
+    role_id: int                    # RoleType enum value (0-12)
+    race_id: int                    # RaceType enum value (0-4)
+    # 6 base attributes
+    strength: int                   # STR (3-24, with exceptional encoding)
+    intelligence: int               # INT
+    wisdom: int                     # WIS
+    dexterity: int                  # DEX
+    constitution: int               # CON
+    charisma: int                   # CHA
+    # Progression
+    xp: int                         # Accumulated experience points
+    xp_level: int                   # Experience level (1-30)
+    hp: int                         # Current hit points
+    max_hp: int                     # Maximum hit points
+    energy: int                     # Current energy/mana
+    max_energy: int                 # Maximum energy
+    ac: int                         # Armor class (lower = better)
+    # Per-level gain history (for level drain reversal)
+    hp_inc: jnp.ndarray             # [30] — HP gained at each level
+    en_inc: jnp.ndarray             # [30] — Energy gained at each level
+    # Intrinsic abilities
+    intrinsics: int                 # Bitmask of active intrinsic abilities
+    # Combat tracking
+    score: int
+    monsters_killed: int
+
+
 # ============================================================================
 # Tier 1: Navigation State (minimal)
 # ============================================================================
@@ -100,8 +130,7 @@ class HazardState:
     map: jnp.ndarray
     player_position: jnp.ndarray
     downstair_position: jnp.ndarray
-    player_hp: int
-    player_max_hp: int
+    player_stats: PlayerStats        # Full player stat block
     player_levitating: bool
     levitation_turns: int
     inventory: Inventory
@@ -125,12 +154,7 @@ class CombatState:
     map: jnp.ndarray
     player_position: jnp.ndarray
     downstair_position: jnp.ndarray
-    player_hp: int
-    player_max_hp: int
-    player_xp: int
-    player_xp_level: int
-    player_ac: int
-    player_strength: int
+    player_stats: PlayerStats        # Full player stat block
     player_levitating: bool
     levitation_turns: int
     player_has_key: bool
@@ -140,8 +164,6 @@ class CombatState:
     ground_items: GroundItems
     seen_map: jnp.ndarray        # [map_h, map_w] bool — tiles ever seen
     visible_map: jnp.ndarray     # [map_h, map_w] bool — tiles currently visible
-    score: int
-    monsters_killed: int
     timestep: int
     prev_action: int
     terminal: bool
@@ -156,6 +178,8 @@ class CombatState:
 class EnvParams:
     """Runtime parameters shared across all tiers."""
     max_timesteps: int = 1500
+    role_id: int = 5     # Default: Monk (RoleType.MONK)
+    race_id: int = 0     # Default: Human (RaceType.HUMAN)
 
 
 # ============================================================================

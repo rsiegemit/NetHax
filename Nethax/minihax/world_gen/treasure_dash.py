@@ -9,12 +9,13 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.minihax.constants import (
-    TileType, ItemType, PLAYER_START_HP, MONSTER_MAX_HP,
+    TileType, ItemType, RoleType, RaceType,
 )
 from Nethax.minihax.states import (
     HazardState, HazardStaticParams, Inventory, SimpleMonsters, GroundItems,
 )
 from Nethax.minihax.primitives.visibility import compute_visible
+from Nethax.minihax.primitives.leveling import compute_initial_stats
 
 
 # Active map: 73 wide x 3 tall
@@ -75,6 +76,9 @@ def generate_treasure_dash(rng, params, static_params):
     max_items = static_params.max_items
     max_gi = static_params.max_ground_items
 
+    rng, rng_stats = jax.random.split(rng)
+    player_stats = compute_initial_stats(rng_stats, RoleType.MONK, RaceType.HUMAN)
+
     game_map = _make_treasure_dash_map()
 
     # Player start: (row=1, col=5) — .des BRANCH:(5,1,5,1)
@@ -124,8 +128,7 @@ def generate_treasure_dash(rng, params, static_params):
         map=padded_map,
         player_position=player_pos,
         downstair_position=stair_pos,
-        player_hp=PLAYER_START_HP,
-        player_max_hp=PLAYER_START_HP,
+        player_stats=player_stats,
         player_levitating=False,
         levitation_turns=0,
         inventory=inv,

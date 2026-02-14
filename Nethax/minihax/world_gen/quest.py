@@ -49,22 +49,22 @@ def _make_quest_map():
     game_map = jnp.where(r1_lava, TileType.LAVA, game_map)
 
     # Room 2: rows 1-5, cols 16-22
-    r2_wall_top = (rows == 0) & (cols >= 16) & (cols <= 22)
-    r2_wall_bot = (rows == 6) & (cols >= 16) & (cols <= 22)
-    r2_wall_l = (cols == 16) & (rows >= 1) & (rows <= 5)
-    r2_wall_r = (cols == 22) & (rows >= 1) & (rows <= 5)
-    r2_floor = (rows >= 1) & (rows <= 5) & (cols >= 17) & (cols <= 21)
+    r2_wall_top = (rows == 1) & (cols >= 16) & (cols <= 22)
+    r2_wall_bot = (rows == 5) & (cols >= 16) & (cols <= 22)
+    r2_wall_l = (cols == 16) & (rows >= 2) & (rows <= 4)
+    r2_wall_r = (cols == 22) & (rows >= 2) & (rows <= 4)
+    r2_floor = (rows >= 2) & (rows <= 4) & (cols >= 17) & (cols <= 21)
 
     game_map = jnp.where(r2_wall_top | r2_wall_bot, TileType.HWALL, game_map)
     game_map = jnp.where(r2_wall_l | r2_wall_r, TileType.VWALL, game_map)
     game_map = jnp.where(r2_floor, TileType.FLOOR, game_map)
 
     # Room 3: rows 2-4, cols 40-65
-    r3_wall_top = (rows == 1) & (cols >= 40) & (cols <= 65)
-    r3_wall_bot = (rows == 5) & (cols >= 40) & (cols <= 65)
-    r3_wall_l = (cols == 40) & (rows >= 2) & (rows <= 4)
-    r3_wall_r = (cols == 65) & (rows >= 2) & (rows <= 4)
-    r3_floor = (rows >= 2) & (rows <= 4) & (cols >= 41) & (cols <= 64)
+    r3_wall_top = (rows == 2) & (cols >= 40) & (cols <= 65)
+    r3_wall_bot = (rows == 4) & (cols >= 40) & (cols <= 65)
+    r3_wall_l = (cols == 40) & (rows == 3)
+    r3_wall_r = (cols == 65) & (rows == 3)
+    r3_floor = (rows == 3) & (cols >= 41) & (cols <= 64)
 
     game_map = jnp.where(r3_wall_top | r3_wall_bot, TileType.HWALL, game_map)
     game_map = jnp.where(r3_wall_l | r3_wall_r, TileType.VWALL, game_map)
@@ -121,12 +121,17 @@ def generate_quest(rng, params, static_params):
     ri_r = jax.random.randint(rng_ri_r, (), 1, 6)
     ri_c = jax.random.randint(rng_ri_c, (), 1, 6)
 
-    # Ground items: [0] = skeleton key, [1] = random item, [2] = wand_death (in room 2)
+    # Wand of death in entry_room (rows 3-6, cols 3-6 per quest_hard.des)
+    rng, rng_wd_r, rng_wd_c = jax.random.split(rng, 3)
+    wd_r = jax.random.randint(rng_wd_r, (), 3, 7)
+    wd_c = jax.random.randint(rng_wd_c, (), 3, 7)
+
+    # Ground items: [0] = skeleton key, [1] = random item, [2] = wand_death
     max_gi = static_params.max_ground_items
     gi_positions = jnp.zeros((max_gi, 2), dtype=jnp.int32)
     gi_positions = gi_positions.at[0].set(jnp.array([key_r, key_c]))
     gi_positions = gi_positions.at[1].set(jnp.array([ri_r, ri_c]))
-    gi_positions = gi_positions.at[2].set(jnp.array([3, 19]))  # wand in room 2 center
+    gi_positions = gi_positions.at[2].set(jnp.array([wd_r, wd_c]))
 
     gi_types = jnp.zeros(max_gi, dtype=jnp.int32)
     gi_types = gi_types.at[0].set(ItemType.SKELETON_KEY)

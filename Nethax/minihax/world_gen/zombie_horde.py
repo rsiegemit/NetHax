@@ -4,10 +4,11 @@ import jax.numpy as jnp
 
 from Nethax.minihax.constants import (
     TileType, MonsterType, MONSTER_MAX_HP,
-    PLAYER_START_HP, PLAYER_START_MAX_HP, PLAYER_START_AC,
-    PLAYER_START_STRENGTH, PLAYER_START_XP_LEVEL,
 )
-from Nethax.minihax.minihax_state import EnvState, EnvParams, StaticEnvParams, Monsters
+from Nethax.minihax.states import (
+    CombatState, Monsters, Inventory, GroundItems, Traps, EnvParams,
+)
+from Nethax.minihax.primitives.leveling import compute_initial_stats
 from Nethax.minihax.primitives.visibility import compute_visible
 
 
@@ -21,34 +22,37 @@ def generate_zombie_horde(rng, params, static_params):
     - Upstaircase at (2, 1) - from BRANCH:(1,2,1,2)
     - Temple region at (1,1)-(3,3) with priest at (2,3)
     - 16 human zombies randomly placed in rect (6,6)-(12,12)
-    - Player starts at position (2, 1) — BRANCH:(1,2,1,2) means col=1, row=2
+    - Player starts at position (2, 1) -- BRANCH:(1,2,1,2) means col=1, row=2
 
     Note: .des uses (col, row) coordinates. We use (row, col) internally.
     """
-    map_h = static_params.map_height  # 15
-    map_w = static_params.map_width   # 18
     max_m = static_params.max_monsters  # 17
 
-    # Build map: walls on border, floor inside
-    game_map = jnp.full((map_h, map_w), TileType.FLOOR, dtype=jnp.int32)
+    # Build original 18-wide map in local variables
+    local_h, local_w = 15, 18
+    local_map = jnp.full((local_h, local_w), TileType.FLOOR, dtype=jnp.int32)
 
     # Top and bottom walls (horizontal)
-    game_map = game_map.at[0, :].set(TileType.HWALL)
-    game_map = game_map.at[map_h - 1, :].set(TileType.HWALL)
+    local_map = local_map.at[0, :].set(TileType.HWALL)
+    local_map = local_map.at[local_h - 1, :].set(TileType.HWALL)
     # Left and right walls (vertical)
-    game_map = game_map.at[:, 0].set(TileType.VWALL)
-    game_map = game_map.at[:, map_w - 1].set(TileType.VWALL)
+    local_map = local_map.at[:, 0].set(TileType.VWALL)
+    local_map = local_map.at[:, local_w - 1].set(TileType.VWALL)
     # Corners
-    game_map = game_map.at[0, 0].set(TileType.TLCORN)
-    game_map = game_map.at[0, map_w - 1].set(TileType.TRCORN)
-    game_map = game_map.at[map_h - 1, 0].set(TileType.BLCORN)
-    game_map = game_map.at[map_h - 1, map_w - 1].set(TileType.BRCORN)
+    local_map = local_map.at[0, 0].set(TileType.TLCORN)
+    local_map = local_map.at[0, local_w - 1].set(TileType.TRCORN)
+    local_map = local_map.at[local_h - 1, 0].set(TileType.BLCORN)
+    local_map = local_map.at[local_h - 1, local_w - 1].set(TileType.BRCORN)
 
-    # Altar at (row=2, col=2) — from .des ALTAR:(2,2) which is col=2, row=2
-    game_map = game_map.at[2, 2].set(TileType.ALTAR)
+    # Altar at (row=2, col=2) -- from .des ALTAR:(2,2) which is col=2, row=2
+    local_map = local_map.at[2, 2].set(TileType.ALTAR)
 
-    # Upstaircase at (row=2, col=1) — from .des BRANCH:(1,2,1,2)
-    game_map = game_map.at[2, 1].set(TileType.UPSTAIR)
+    # Upstaircase at (row=2, col=1) -- from .des BRANCH:(1,2,1,2)
+    local_map = local_map.at[2, 1].set(TileType.UPSTAIR)
+
+    # Embed into full-size map
+    game_map = jnp.full((static_params.map_height, static_params.map_width), TileType.VOID, dtype=jnp.int32)
+    game_map = jax.lax.dynamic_update_slice(game_map, local_map, (0, 0))
 
     # Place 16 zombies randomly in rect (6,6)-(12,12) in .des coords
     # .des uses (col, row), so fillrect(6,6,12,12) = cols 6-12, rows 6-12
@@ -79,7 +83,7 @@ def generate_zombie_horde(rng, params, static_params):
     # Movement points: start at 0 (monsters accumulate via mcalcmove each turn)
     mon_movement = jnp.zeros((max_m,), dtype=jnp.int32)
 
-    # Sleep: all monsters start awake (NetHack default — no asleep attribute in .des)
+    # Sleep: all monsters start awake (NetHack default -- no asleep attribute in .des)
     mon_sleeping = jnp.concatenate([
         jnp.zeros((num_zombies,), dtype=jnp.bool_),   # zombies start awake (NetHack default)
         jnp.zeros((1,), dtype=jnp.bool_),              # priest awake
@@ -97,24 +101,43 @@ def generate_zombie_horde(rng, params, static_params):
     # Player starts at BRANCH:(1,2,1,2) -> col=1, row=2 -> (row=2, col=1)
     player_position = jnp.array([2, 1], dtype=jnp.int32)
 
-    rng, state_rng = jax.random.split(rng)
+    # Player stats from role/race
+    rng, rng_stats, state_rng = jax.random.split(rng, 3)
+    player_stats = compute_initial_stats(rng_stats, params.role_id, params.race_id)
 
-    visible_map = compute_visible(player_position, game_map, map_h, map_w)
+    # Empty sub-structures
+    inventory = Inventory(
+        item_ids=jnp.zeros(static_params.max_items, dtype=jnp.int32),
+        item_mask=jnp.zeros(static_params.max_items, dtype=jnp.bool_),
+    )
+    ground_items = GroundItems(
+        position=jnp.zeros((static_params.max_ground_items, 2), dtype=jnp.int32),
+        type_id=jnp.zeros(static_params.max_ground_items, dtype=jnp.int32),
+        mask=jnp.zeros(static_params.max_ground_items, dtype=jnp.bool_),
+    )
+    traps = Traps(
+        position=jnp.zeros((static_params.max_traps, 2), dtype=jnp.int32),
+        type_id=jnp.zeros(static_params.max_traps, dtype=jnp.int32),
+        triggered=jnp.zeros(static_params.max_traps, dtype=jnp.bool_),
+        mask=jnp.zeros(static_params.max_traps, dtype=jnp.bool_),
+    )
 
-    state = EnvState(
+    visible_map = compute_visible(player_position, game_map, static_params.map_height, static_params.map_width)
+
+    state = CombatState(
         map=game_map,
         player_position=player_position,
-        player_hp=PLAYER_START_HP,
-        player_max_hp=PLAYER_START_MAX_HP,
-        player_xp=jnp.int32(0),
-        player_xp_level=PLAYER_START_XP_LEVEL,
-        player_ac=PLAYER_START_AC,
-        player_strength=PLAYER_START_STRENGTH,
+        downstair_position=jnp.array([0, 0], dtype=jnp.int32),  # No downstair in ZombieHorde
+        player_stats=player_stats,
+        player_levitating=False,
+        levitation_turns=0,
+        player_has_key=False,
+        inventory=inventory,
         monsters=monsters,
+        traps=traps,
+        ground_items=ground_items,
         seen_map=visible_map,
         visible_map=visible_map,
-        score=jnp.int32(0),
-        monsters_killed=jnp.int32(0),
         timestep=jnp.int32(0),
         prev_action=0,
         terminal=False,

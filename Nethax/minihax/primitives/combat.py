@@ -3,17 +3,22 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.minihax.constants import (
-    MONSTER_STATS, MAX_PLAYER_LEVEL, ZOMBIE_KILL_SCORE,
+    MONSTER_STATS, MONSTER_XP_SCORE,
+    ABON_STR, ABON_DEX, DBON_STR,
+    MONK_MARTIAL_SIDES, MONK_MARTIAL_BONUS,
+    RoleType,
 )
-from Nethax.minihax.util.game_logic_utils import get_xp_for_level
+from Nethax.minihax.primitives.leveling import check_multi_levelup
 
 
 def do_melee_attack(rng, state, target_pos, static_params):
-    """Attack a monster at target_pos with monk martial arts.
+    """Attack a monster at target_pos with full NetHack to-hit and damage.
 
-    Monk bare-handed: 1d4 base + 3 skill bonus (Basic martial arts).
-    To-hit: monster_AC + 10 + player_level > d20 (symmetric with monster formula).
-    On kill: grant XP, check level-up, increment score and kills.
+    To-hit: 1 + abon(STR) + abon(DEX) + low_level_bonus + monk_hit_bonus + ac + xp_level > d20.
+    Monk martial arts: to-hit bonus (level/3 + 2), damage scales by bracket (d4/d6/d8/d10/d12).
+    Non-monk bare-handed: 1d2 (no skill bonus).
+    STR damage bonus from dbon() table.
+    On kill: grant XP with multi-level-up, per-monster scoring.
     """
     max_m = static_params.max_monsters
 
@@ -30,28 +35,46 @@ def do_melee_attack(rng, state, target_pos, static_params):
     found = target_idx < max_m
     safe_idx = jnp.where(found, target_idx, 0)
 
-    rng, rng_dmg, rng_hit, rng_hit_ac, rng_lvlup = jax.random.split(rng, 5)
+    rng, rng_dmg, rng_dmg2, rng_hit, rng_lvl = jax.random.split(rng, 5)
 
-    # To-hit roll: monster_AC + 10 + player_level > d20
-    # Mirrors monster to-hit in monster_ai.py (AC_VALUE + 10 + level > rnd(20))
+    stats = state.player_stats
+
+    # --- To-hit roll (weapon.c abon + hitval) ---
     mon_type = state.monsters.type_id[safe_idx]
     mon_ac = MONSTER_STATS[mon_type, 2]
-    ac_value = jnp.where(
-        mon_ac >= 0,
-        mon_ac,
-        -jax.random.randint(rng_hit_ac, (), 1, jnp.maximum(-mon_ac, 1) + 1),
-    )
-    hit_tmp = ac_value + 10 + state.player_xp_level
-    hit_roll = jax.random.randint(rng_hit, (), 1, 21)  # d20
-    hits = hit_tmp > hit_roll
 
-    # Monk martial arts: 1d4 base (uhitm.c:849) + 3 skill bonus (weapon.c:1691)
-    MARTIAL_ARTS_BONUS = 3  # Basic bare-handed combat skill damage bonus
-    base_damage = jax.random.randint(rng_dmg, (), 1, 5)  # 1d4
-    damage = base_damage + MARTIAL_ARTS_BONUS  # 4-7, avg 5.5
+    str_bonus = ABON_STR[jnp.clip(stats.strength, 0, 25)]
+    dex_bonus = ABON_DEX[jnp.clip(stats.dexterity, 0, 25)]
+    low_level_bonus = jnp.where(stats.xp_level < 3, 1, 0)
+
+    # Monk martial arts to-hit bonus (uhitm.c:400)
+    is_monk = (stats.role_id == RoleType.MONK)
+    monk_hit_bonus = jnp.where(is_monk, stats.xp_level // 3 + 2, 0)
+
+    # To-hit: 1 + abon + low_level_bonus + monk_hit_bonus + ac + level > d20
+    to_hit = 1 + str_bonus + dex_bonus + low_level_bonus + monk_hit_bonus + mon_ac + stats.xp_level
+    hit_roll = jax.random.randint(rng_hit, (), 1, 21)  # d20
+    hits = to_hit > hit_roll
+
+    # --- Damage calculation ---
+    # Monk martial arts: damage die scales by level bracket
+    bracket = jnp.minimum((stats.xp_level - 1) // 4, 4)
+    monk_sides = MONK_MARTIAL_SIDES[bracket]
+    monk_damage = jax.random.randint(rng_dmg, (), 1, monk_sides + 1) + MONK_MARTIAL_BONUS
+
+    # Non-monk bare-handed: 1d2
+    non_monk_damage = jax.random.randint(rng_dmg2, (), 1, 3)  # 1d2
+
+    base_damage = jnp.where(is_monk, monk_damage, non_monk_damage)
+
+    # STR damage bonus
+    str_dmg = DBON_STR[jnp.clip(stats.strength, 0, 25)]
+    damage = base_damage + str_dmg
+    damage = jnp.maximum(damage, 1)  # Minimum 1 on hit
+
     damage = jnp.where(found & hits, damage, 0)
 
-    # Apply damage
+    # --- Apply damage to monster ---
     old_hp = state.monsters.health[safe_idx]
     new_hp = old_hp - damage
     killed = jnp.logical_and(found, new_hp <= 0)
@@ -64,36 +87,21 @@ def do_melee_attack(rng, state, target_pos, static_params):
     )
     monsters = state.monsters.replace(health=new_health, mask=new_mask)
 
-    # XP on kill
-    mon_type = state.monsters.type_id[safe_idx]
+    # --- XP gain and multi-level-up on kill ---
     xp_gain = jnp.where(killed, MONSTER_STATS[mon_type, 7], 0)
-    new_xp = state.player_xp + xp_gain
+    new_stats = stats.replace(xp=stats.xp + xp_gain)
+    new_stats = check_multi_levelup(rng_lvl, new_stats)
 
-    # Level-up check
-    old_level = state.player_xp_level
-    next_level_xp = get_xp_for_level(old_level + 1)
-    leveled_up = jnp.logical_and(killed, new_xp >= next_level_xp)
-    new_xp_level = jnp.where(leveled_up, old_level + 1, old_level)
-    new_xp_level = jnp.minimum(new_xp_level, MAX_PLAYER_LEVEL)
-
-    # HP gain on level up: 1d8
-    hp_gain = jnp.where(leveled_up, jax.random.randint(rng_lvlup, (), 1, 9), 0)
-    new_max_hp = state.player_max_hp + hp_gain
-    new_player_hp = state.player_hp + hp_gain
-
-    # Score and kill count
-    score_gain = jnp.where(killed, ZOMBIE_KILL_SCORE, 0)
-    new_score = state.score + score_gain
-    new_kills = state.monsters_killed + jnp.where(killed, 1, 0)
+    # --- Per-monster scoring ---
+    score_gain = jnp.where(killed, MONSTER_XP_SCORE[mon_type], 0)
+    new_stats = new_stats.replace(
+        score=new_stats.score + score_gain,
+        monsters_killed=new_stats.monsters_killed + jnp.where(killed, 1, 0),
+    )
 
     state = state.replace(
         monsters=monsters,
-        player_xp=new_xp,
-        player_xp_level=new_xp_level,
-        player_hp=new_player_hp,
-        player_max_hp=new_max_hp,
-        score=new_score,
-        monsters_killed=new_kills,
+        player_stats=new_stats,
     )
 
     return state
