@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.minihax.states import NavigationState, NavigationStaticParams, GroundItems
-from Nethax.minihax.primitives.visibility import compute_visible
+from Nethax.minihax.primitives.visibility import compute_visible, compute_lit_map
 from Nethax.minihax.world_gen.procedural import random_corridors
 
 
@@ -34,7 +34,8 @@ def _generate_corridor(rng, params, static_params, num_rooms):
         gen_rng, num_rooms,
         static_params.map_height, static_params.map_width,
     )
-    visible_map = compute_visible(player_pos, game_map, static_params.map_height, static_params.map_width)
+    lit_map = compute_lit_map(game_map)
+    visible_map = compute_visible(player_pos, game_map, static_params.map_height, static_params.map_width, lit_map)
     return NavigationState(
         map=game_map,
         player_position=player_pos,
@@ -42,6 +43,7 @@ def _generate_corridor(rng, params, static_params, num_rooms):
         ground_items=_empty_ground_items(static_params.max_ground_items),
         seen_map=visible_map,
         visible_map=visible_map,
+        lit_map=lit_map,
         timestep=0,
         prev_action=0,
         terminal=False,

@@ -12,8 +12,10 @@ _DOOR_DELTAS = jnp.array([
 ], dtype=jnp.int32)
 
 
-def kick_door(rng, game_map, player_pos, map_h, map_w):
-    """Kick the nearest adjacent locked door. 1/4 chance to break it open.
+def kick_door(rng, game_map, player_pos, map_h, map_w, player_strength=10):
+    """Kick the nearest adjacent locked door. Success chance scales with STR.
+
+    Base 25% at STR 10, up to ~69% at STR 24+.
 
     Scans all 8 adjacent tiles for a DOOR_LOCKED and attempts to kick
     the first one found.
@@ -24,6 +26,7 @@ def kick_door(rng, game_map, player_pos, map_h, map_w):
         player_pos: jnp.ndarray [2] — (row, col)
         map_h: int
         map_w: int
+        player_strength: int — player's STR attribute (default 10)
 
     Returns:
         new_map: jnp.ndarray [map_h, map_w]
@@ -49,9 +52,12 @@ def kick_door(rng, game_map, player_pos, map_h, map_w):
     sr = jnp.clip(door_pos[0], 0, map_h - 1)
     sc = jnp.clip(door_pos[1], 0, map_w - 1)
 
+    # STR-scaled kick: base 25% at STR 10, up to ~69% at STR 24+
+    str_bonus = jnp.clip(player_strength - 10, 0, 14)
+    threshold = jnp.clip(4 + str_bonus // 2, 4, 12)
     rng, rng_kick = jax.random.split(rng)
-    roll = jax.random.randint(rng_kick, (), 0, 4)
-    success = any_locked & (roll == 0)  # 1/4 chance
+    roll = jax.random.randint(rng_kick, (), 0, 16)
+    success = any_locked & (roll < threshold)
 
     tile = game_map[sr, sc]
     new_tile = jnp.where(success, TileType.DOOR_OPEN, tile)

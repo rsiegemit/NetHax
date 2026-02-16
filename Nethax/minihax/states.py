@@ -49,6 +49,7 @@ class Traps:
     position: jnp.ndarray       # [max_traps, 2] — row, col
     type_id: jnp.ndarray        # [max_traps] — trap type (0=none, 1=board, 2=pit)
     triggered: jnp.ndarray      # [max_traps] — already triggered flag (bool)
+    hidden: jnp.ndarray         # [max_traps] — hidden until searched/triggered (bool)
     mask: jnp.ndarray           # [max_traps] — exists flag (bool)
 
 
@@ -95,6 +96,7 @@ class NavigationState:
     ground_items: GroundItems    # [max_ground_items] — apples in ExploreMaze, empty elsewhere
     seen_map: jnp.ndarray        # [map_h, map_w] bool — tiles ever seen
     visible_map: jnp.ndarray     # [map_h, map_w] bool — tiles currently visible
+    lit_map: jnp.ndarray         # [map_h, map_w] bool — True = lit (rooms), False = dark (corridors)
     timestep: int
     prev_action: int
     terminal: bool
@@ -114,6 +116,7 @@ class SokobanState:
     pits_remaining: int          # count of unfilled PIT tiles
     seen_map: jnp.ndarray        # [map_h, map_w] bool — tiles ever seen
     visible_map: jnp.ndarray     # [map_h, map_w] bool — tiles currently visible
+    lit_map: jnp.ndarray         # [map_h, map_w] bool — True = lit (rooms), False = dark (corridors)
     timestep: int
     prev_action: int
     terminal: bool
@@ -138,6 +141,7 @@ class HazardState:
     ground_items: GroundItems
     seen_map: jnp.ndarray        # [map_h, map_w] bool — tiles ever seen
     visible_map: jnp.ndarray     # [map_h, map_w] bool — tiles currently visible
+    lit_map: jnp.ndarray         # [map_h, map_w] bool — True = lit (rooms), False = dark (corridors)
     timestep: int
     prev_action: int
     terminal: bool
@@ -164,6 +168,7 @@ class CombatState:
     ground_items: GroundItems
     seen_map: jnp.ndarray        # [map_h, map_w] bool — tiles ever seen
     visible_map: jnp.ndarray     # [map_h, map_w] bool — tiles currently visible
+    lit_map: jnp.ndarray         # [map_h, map_w] bool — True = lit (rooms), False = dark (corridors)
     timestep: int
     prev_action: int
     terminal: bool
@@ -180,6 +185,7 @@ class EnvParams:
     max_timesteps: int = 1500
     role_id: int = 5     # Default: Monk (RoleType.MONK)
     race_id: int = 0     # Default: Human (RaceType.HUMAN)
+    auto_descend: bool = True  # True: win on stair contact (MiniHack); False: require GO_DOWN_STAIRS
 
 
 # ============================================================================

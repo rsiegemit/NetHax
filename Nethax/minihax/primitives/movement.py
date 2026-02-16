@@ -36,7 +36,22 @@ def move_player(player_pos, action, game_map, map_h, map_w):
     target_tile = game_map[safe_r, safe_c]
     walkable = jnp.logical_not(is_solid(target_tile))
 
-    can_move = valid & walkable
+    # Diagonal door constraint (NetHack hack.c:1120,1188)
+    is_diagonal = (delta[0] != 0) & (delta[1] != 0)
+    source_tile = game_map[player_pos[0], player_pos[1]]
+    source_is_door = (
+        (source_tile == TileType.DOOR_OPEN) |
+        (source_tile == TileType.DOOR_CLOSED) |
+        (source_tile == TileType.DOOR_LOCKED)
+    )
+    target_is_door = (
+        (target_tile == TileType.DOOR_OPEN) |
+        (target_tile == TileType.DOOR_CLOSED) |
+        (target_tile == TileType.DOOR_LOCKED)
+    )
+    diagonal_door_blocked = is_diagonal & (source_is_door | target_is_door)
+
+    can_move = valid & walkable & jnp.logical_not(diagonal_door_blocked)
     final_pos = jnp.where(can_move, new_pos, player_pos)
 
     return final_pos, can_move

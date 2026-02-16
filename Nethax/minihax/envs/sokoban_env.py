@@ -115,7 +115,8 @@ class Soko1aEnv(SokobanEnv):
         from Nethax.minihax.world_gen.sokoban import make_soko1a
         tile_map, player_pos, stair_pos, pits_remaining = make_soko1a(rng, static_params)
         from Nethax.minihax.primitives.visibility import compute_visible
-        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width)
+        lit_map = jnp.ones((static_params.map_height, static_params.map_width), dtype=jnp.bool_)
+        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width, lit_map)
         return SokobanState(
             map=tile_map,
             player_position=player_pos,
@@ -123,6 +124,7 @@ class Soko1aEnv(SokobanEnv):
             pits_remaining=pits_remaining,
             seen_map=visible_map,
             visible_map=visible_map,
+            lit_map=lit_map,
             timestep=0,
             prev_action=0,
             terminal=False,
@@ -139,7 +141,8 @@ class Soko1bEnv(SokobanEnv):
         from Nethax.minihax.world_gen.sokoban import make_soko1b
         tile_map, player_pos, stair_pos, pits_remaining = make_soko1b(rng, static_params)
         from Nethax.minihax.primitives.visibility import compute_visible
-        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width)
+        lit_map = jnp.ones((static_params.map_height, static_params.map_width), dtype=jnp.bool_)
+        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width, lit_map)
         return SokobanState(
             map=tile_map,
             player_position=player_pos,
@@ -147,6 +150,7 @@ class Soko1bEnv(SokobanEnv):
             pits_remaining=pits_remaining,
             seen_map=visible_map,
             visible_map=visible_map,
+            lit_map=lit_map,
             timestep=0,
             prev_action=0,
             terminal=False,
@@ -163,7 +167,8 @@ class Soko2aEnv(SokobanEnv):
         from Nethax.minihax.world_gen.sokoban import make_soko2a
         tile_map, player_pos, stair_pos, pits_remaining = make_soko2a(rng, static_params)
         from Nethax.minihax.primitives.visibility import compute_visible
-        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width)
+        lit_map = jnp.ones((static_params.map_height, static_params.map_width), dtype=jnp.bool_)
+        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width, lit_map)
         return SokobanState(
             map=tile_map,
             player_position=player_pos,
@@ -171,6 +176,7 @@ class Soko2aEnv(SokobanEnv):
             pits_remaining=pits_remaining,
             seen_map=visible_map,
             visible_map=visible_map,
+            lit_map=lit_map,
             timestep=0,
             prev_action=0,
             terminal=False,
@@ -187,7 +193,8 @@ class Soko2bEnv(SokobanEnv):
         from Nethax.minihax.world_gen.sokoban import make_soko2b
         tile_map, player_pos, stair_pos, pits_remaining = make_soko2b(rng, static_params)
         from Nethax.minihax.primitives.visibility import compute_visible
-        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width)
+        lit_map = jnp.ones((static_params.map_height, static_params.map_width), dtype=jnp.bool_)
+        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width, lit_map)
         return SokobanState(
             map=tile_map,
             player_position=player_pos,
@@ -195,6 +202,7 @@ class Soko2bEnv(SokobanEnv):
             pits_remaining=pits_remaining,
             seen_map=visible_map,
             visible_map=visible_map,
+            lit_map=lit_map,
             timestep=0,
             prev_action=0,
             terminal=False,
@@ -211,7 +219,8 @@ class Soko3aEnv(SokobanEnv):
         from Nethax.minihax.world_gen.sokoban import make_soko3a
         tile_map, player_pos, stair_pos, pits_remaining = make_soko3a(rng, static_params)
         from Nethax.minihax.primitives.visibility import compute_visible
-        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width)
+        lit_map = jnp.ones((static_params.map_height, static_params.map_width), dtype=jnp.bool_)
+        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width, lit_map)
         return SokobanState(
             map=tile_map,
             player_position=player_pos,
@@ -219,6 +228,7 @@ class Soko3aEnv(SokobanEnv):
             pits_remaining=pits_remaining,
             seen_map=visible_map,
             visible_map=visible_map,
+            lit_map=lit_map,
             timestep=0,
             prev_action=0,
             terminal=False,
@@ -235,7 +245,8 @@ class Soko3bEnv(SokobanEnv):
         from Nethax.minihax.world_gen.sokoban import make_soko3b
         tile_map, player_pos, stair_pos, pits_remaining = make_soko3b(rng, static_params)
         from Nethax.minihax.primitives.visibility import compute_visible
-        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width)
+        lit_map = jnp.ones((static_params.map_height, static_params.map_width), dtype=jnp.bool_)
+        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width, lit_map)
         return SokobanState(
             map=tile_map,
             player_position=player_pos,
@@ -243,6 +254,7 @@ class Soko3bEnv(SokobanEnv):
             pits_remaining=pits_remaining,
             seen_map=visible_map,
             visible_map=visible_map,
+            lit_map=lit_map,
             timestep=0,
             prev_action=0,
             terminal=False,
@@ -259,7 +271,8 @@ class Soko4aEnv(SokobanEnv):
         from Nethax.minihax.world_gen.sokoban import make_soko4a
         tile_map, player_pos, stair_pos, pits_remaining = make_soko4a(rng, static_params)
         from Nethax.minihax.primitives.visibility import compute_visible
-        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width)
+        lit_map = jnp.ones((static_params.map_height, static_params.map_width), dtype=jnp.bool_)
+        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width, lit_map)
         return SokobanState(
             map=tile_map,
             player_position=player_pos,
@@ -267,6 +280,7 @@ class Soko4aEnv(SokobanEnv):
             pits_remaining=pits_remaining,
             seen_map=visible_map,
             visible_map=visible_map,
+            lit_map=lit_map,
             timestep=0,
             prev_action=0,
             terminal=False,
@@ -283,7 +297,8 @@ class Soko4bEnv(SokobanEnv):
         from Nethax.minihax.world_gen.sokoban import make_soko4b
         tile_map, player_pos, stair_pos, pits_remaining = make_soko4b(rng, static_params)
         from Nethax.minihax.primitives.visibility import compute_visible
-        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width)
+        lit_map = jnp.ones((static_params.map_height, static_params.map_width), dtype=jnp.bool_)
+        visible_map = compute_visible(player_pos, tile_map, static_params.map_height, static_params.map_width, lit_map)
         return SokobanState(
             map=tile_map,
             player_position=player_pos,
@@ -291,6 +306,7 @@ class Soko4bEnv(SokobanEnv):
             pits_remaining=pits_remaining,
             seen_map=visible_map,
             visible_map=visible_map,
+            lit_map=lit_map,
             timestep=0,
             prev_action=0,
             terminal=False,

@@ -72,7 +72,7 @@ def sokoban_step(rng, state, action, params, static_params):
     terminal = won | timeout
 
     # Visibility update (use final_map since boulders may have moved)
-    visible_map = compute_visible(final_pos, final_map, static_params.map_height, static_params.map_width)
+    visible_map = compute_visible(final_pos, final_map, static_params.map_height, static_params.map_width, state.lit_map)
     new_seen_map = update_seen_map(state.seen_map, visible_map)
 
     new_state = state.replace(

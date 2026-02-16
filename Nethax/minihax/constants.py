@@ -85,31 +85,32 @@ MONSTER_SYMBOLS = {
     int(MonsterType.GRID_BUG): 'x',
 }
 
-# Stats: [level, speed, ac, mr, atk_dice, atk_sides, max_hp, xp_value]
+# Stats: [level, speed, ac, mr, atk1_dice, atk1_sides, atk2_dice, atk2_sides, atk3_dice, atk3_sides, atk4_dice, atk4_sides, max_hp, xp_value]
 # Human zombie from NetHack 3.7: level 4, speed 6, AC 8, MR 0, attack 1d8
 # HD 4 -> avg HP ~= 4*4.5 = 18, XP ~20
 # Priest from NetHack: level 5, speed 12, AC 2, attack 1d6, peaceful temple guardian
+# Minotaur: level 15 (NetHack monst.c), 3 attacks: claw 3d10, claw 3d10, butt 2d8
 MONSTER_STATS = jnp.array([
-    # [level, speed, ac, mr, atk_dice, atk_sides, max_hp, xp_value]
-    [0, 0, 10, 0, 0, 0, 0, 0],       # NONE
-    [4, 6, 8, 0, 1, 8, 18, 20],      # HUMAN_ZOMBIE
-    [12, 12, 10, 50, 4, 10, 54, 0],  # PRIEST (level 12, AC 10, MR 50, 4d10 attack, peaceful, no XP)
-    [1, 12, 7, 0, 1, 3, 5, 2],       # GIANT_RAT
-    [5, 6, 6, 30, 1, 3, 23, 50],     # COCKATRICE (1d3 bite + petrification special)
-    [3, 10, 6, 0, 1, 4, 15, 20],     # NAGA_HATCHLING
-    [6, 12, 6, 0, 3, 10, 50, 100],   # MINOTAUR
-    [5, 9, 5, 0, 2, 6, 30, 60],      # OGRE
-    [5, 9, 2, 20, 2, 6, 40, 60],     # BABY_RED_DRAGON
-    [7, 12, 4, 0, 3, 6, 50, 80],     # TROLL
-    [4, 0, 8, 10, 0, 0, 20, 15],     # BLUE_JELLY (passive)
-    [5, 0, 8, 10, 0, 0, 25, 20],     # SPOTTED_JELLY (passive)
-    [0, 1, 9, 0, 0, 0, 5, 1],        # LICHEN
-    [1, 0, 9, 0, 0, 0, 10, 5],       # RED_MOLD (sessile)
-    [1, 0, 9, 0, 0, 0, 10, 5],       # GREEN_MOLD (sessile)
-    [0, 12, 9, 0, 1, 1, 1, 1],       # GRID_BUG
+    #  lvl spd  ac  mr  a1d a1s a2d a2s a3d a3s a4d a4s  hp  xp
+    [  0,  0, 10,  0,  0, 0,  0, 0,  0, 0,  0, 0,   0,  0],  # 0  NONE
+    [  4,  6,  8,  0,  1, 8,  0, 0,  0, 0,  0, 0,  18, 20],  # 1  HUMAN_ZOMBIE
+    [ 12, 12, 10, 50,  4,10,  0, 0,  0, 0,  0, 0,  54,  0],  # 2  PRIEST
+    [  1, 12,  7,  0,  1, 3,  0, 0,  0, 0,  0, 0,   5,  2],  # 3  GIANT_RAT
+    [  5,  6,  6, 30,  1, 3,  0, 0,  0, 0,  0, 0,  23, 50],  # 4  COCKATRICE (bite 1d3, petrify deferred)
+    [  3, 10,  6,  0,  1, 4,  0, 0,  0, 0,  0, 0,  15, 20],  # 5  NAGA_HATCHLING
+    [ 15, 12,  6,  0,  3,10,  3,10,  2, 8,  0, 0,  50,100],  # 6  MINOTAUR (claw 3d10, claw 3d10, butt 2d8)
+    [  5,  9,  5,  0,  2, 6,  0, 0,  0, 0,  0, 0,  30, 60],  # 7  OGRE
+    [  5,  9,  2, 20,  2, 6,  1, 4,  1, 4,  0, 0,  40, 60],  # 8  BABY_RED_DRAGON (bite 2d6, claw 1d4, claw 1d4)
+    [  7, 12,  4,  0,  2, 6,  1, 4,  1, 6,  0, 0,  50, 80],  # 9  TROLL (weapon 2d6, claw 1d4, bite 1d6)
+    [  4,  0,  8, 10,  0, 0,  0, 0,  0, 0,  0, 0,  20, 15],  # 10 BLUE_JELLY
+    [  5,  0,  8, 10,  0, 0,  0, 0,  0, 0,  0, 0,  25, 20],  # 11 SPOTTED_JELLY
+    [  0,  1,  9,  0,  0, 0,  0, 0,  0, 0,  0, 0,   5,  1],  # 12 LICHEN
+    [  1,  0,  9,  0,  0, 0,  0, 0,  0, 0,  0, 0,  10,  5],  # 13 RED_MOLD
+    [  1,  0,  9,  0,  0, 0,  0, 0,  0, 0,  0, 0,  10,  5],  # 14 GREEN_MOLD
+    [  0, 12,  9,  0,  1, 1,  0, 0,  0, 0,  0, 0,   1,  1],  # 15 GRID_BUG
 ], dtype=jnp.int32)
 
-MONSTER_MAX_HP = MONSTER_STATS[:, 6]
+MONSTER_MAX_HP = MONSTER_STATS[:, 12]
 
 # Flags
 MF_HOSTILE = 0x020

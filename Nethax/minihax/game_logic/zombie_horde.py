@@ -107,6 +107,7 @@ def minihax_step(rng, state, action, params, static_params):
     visible_map = compute_visible(
         state.player_position, state.map,
         static_params.map_height, static_params.map_width,
+        state.lit_map,
     )
     new_seen_map = update_seen_map(state.seen_map, visible_map)
     state = state.replace(seen_map=new_seen_map, visible_map=visible_map)

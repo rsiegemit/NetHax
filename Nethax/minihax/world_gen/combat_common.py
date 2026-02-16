@@ -58,6 +58,7 @@ def empty_combat_state(static_params, rng):
             position=jnp.zeros((max_traps, 2), dtype=jnp.int32),
             type_id=jnp.zeros(max_traps, dtype=jnp.int32),
             triggered=jnp.zeros(max_traps, dtype=jnp.bool_),
+            hidden=jnp.zeros(max_traps, dtype=jnp.bool_),
             mask=jnp.zeros(max_traps, dtype=jnp.bool_),
         ),
         ground_items=GroundItems(
@@ -67,6 +68,7 @@ def empty_combat_state(static_params, rng):
         ),
         seen_map=jnp.zeros((sh, sw), dtype=jnp.bool_),
         visible_map=jnp.zeros((sh, sw), dtype=jnp.bool_),
+        lit_map=jnp.ones((sh, sw), dtype=jnp.bool_),
         timestep=jnp.int32(0),
         prev_action=0,
         terminal=False,

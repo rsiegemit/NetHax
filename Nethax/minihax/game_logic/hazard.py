@@ -98,7 +98,7 @@ def _simple_bump_attack(rng, state, target_pos, max_m):
     new_monsters = monsters.replace(health=new_health, mask=new_mask)
 
     # XP on kill + multi-level-up
-    xp_gain = jnp.where(killed, MONSTER_STATS[mon_type, 7], 0)
+    xp_gain = jnp.where(killed, MONSTER_STATS[mon_type, 13], 0)
     score_gain = jnp.where(killed, MONSTER_XP_SCORE[mon_type], 0)
     new_stats = stats.replace(
         xp=stats.xp + xp_gain,
@@ -336,27 +336,21 @@ def hazard_step(rng, state, action, params, static_params):
     )
 
     # --- Auto-open closed doors on move ---
-    # If the tile we're moving onto is DOOR_CLOSED, open it
-    safe_mr = jnp.clip(move_pos[0], 0, map_h - 1)
-    safe_mc = jnp.clip(move_pos[1], 0, map_w - 1)
-    tile_at_dest = state.map[safe_mr, safe_mc]
-    is_closed_door = (tile_at_dest == TileType.DOOR_CLOSED) & is_move
-    map_after_autodoor = state.map.at[safe_mr, safe_mc].set(
-        jnp.where(is_closed_door, TileType.DOOR_OPEN, state.map[safe_mr, safe_mc])
+    target_r = jnp.clip(state.player_position[0] + delta[0], 0, map_h - 1)
+    target_c = jnp.clip(state.player_position[1] + delta[1], 0, map_w - 1)
+    target_in_bounds = in_bounds(state.player_position + delta, map_h, map_w)
+    tile_at_target = state.map[target_r, target_c]
+    is_diagonal = (delta[0] != 0) & (delta[1] != 0)
+    is_closed_door = (tile_at_target == TileType.DOOR_CLOSED) & is_move & target_in_bounds & jnp.logical_not(is_diagonal)
+    map_after_autodoor = state.map.at[target_r, target_c].set(
+        jnp.where(is_closed_door, TileType.DOOR_OPEN, state.map[target_r, target_c])
     )
 
-    # Also: if door was closed and we tried to move into it, the move_player
-    # would have failed (DOOR_CLOSED is solid). We need to allow the move
-    # if we auto-opened the door.
-    # Re-check: can we move into the tile now that door is open?
-    door_opened_move = is_closed_door & in_bounds(move_pos, map_h, map_w)
-    # If it was a closed door, move_player returned old position. Override:
     auto_door_pos = jnp.where(
         is_move & is_closed_door & jnp.logical_not(has_monster_at_target),
-        state.player_position + delta,
+        jnp.array([target_r, target_c]),
         move_pos,
     )
-    # Validate the auto-door position is in bounds
     auto_valid = in_bounds(auto_door_pos, map_h, map_w)
     final_move_pos = jnp.where(auto_valid, auto_door_pos, move_pos)
 
@@ -373,7 +367,7 @@ def hazard_step(rng, state, action, params, static_params):
 
     # --- Kick ---
     map_after_kick, kick_success, rng_kick = kick_door(
-        rng_kick, map_after_autodoor, final_move_pos, map_h, map_w
+        rng_kick, map_after_autodoor, final_move_pos, map_h, map_w, player_strength=state.player_stats.strength
     )
 
     # ================================================================
@@ -454,7 +448,8 @@ def hazard_step(rng, state, action, params, static_params):
     # Phase 6: Goal check
     # ================================================================
     on_stair = check_stair_goal(new_pos, state.downstair_position)
-    won = on_stair & is_downstair
+    go_down = (action == 10)  # Action.GO_DOWN_STAIRS
+    won = jnp.where(params.auto_descend, on_stair, on_stair & go_down)
     dead = hp_after_attacks <= 0
     timeout = new_timestep >= params.max_timesteps
     terminal = won | dead | timeout
@@ -462,7 +457,7 @@ def hazard_step(rng, state, action, params, static_params):
     reward = jnp.where(won, 1.0, 0.0)
 
     # Visibility update
-    visible_map = compute_visible(new_pos, new_map, map_h, map_w)
+    visible_map = compute_visible(new_pos, new_map, map_h, map_w, state.lit_map)
     new_seen_map = update_seen_map(state.seen_map, visible_map)
 
     # Build final player_stats: conditionally select bumped_stats if bump happened

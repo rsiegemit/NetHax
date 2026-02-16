@@ -54,14 +54,14 @@ class CombatNLEEnv(EnvironmentNoAutoReset):
         new_state = new_state.replace(prev_action=action)
 
         # Win = terminal and not timed out and not dead
-        won = new_state.terminal & (new_state.timestep < params.max_timesteps) & (new_state.player_hp > 0)
+        won = new_state.terminal & (new_state.timestep < params.max_timesteps) & (new_state.player_stats.hp > 0)
 
         done = new_state.terminal
         info = {
             "timestep": new_state.timestep,
             "won": won,
-            "player_hp": new_state.player_hp,
-            "score": new_state.score,
+            "player_hp": new_state.player_stats.hp,
+            "score": new_state.player_stats.score,
             "discount": self.discount(new_state, params),
         }
 

@@ -11,7 +11,7 @@ def check_traps(player_pos, traps, rng):
 
     Args:
         player_pos: jnp.ndarray [2]
-        traps: Traps struct (position, type_id, triggered, mask)
+        traps: Traps struct (position, type_id, triggered, hidden, mask)
         rng: JAX PRNG key
 
     Returns:
@@ -47,4 +47,40 @@ def check_traps(player_pos, traps, rng):
     )
     new_traps = traps.replace(triggered=new_triggered)
 
+    # Also reveal hidden trap on trigger
+    new_hidden = new_traps.hidden.at[safe_idx].set(
+        jnp.where(any_trap, False, new_traps.hidden[safe_idx])
+    )
+    new_traps = new_traps.replace(hidden=new_hidden)
+
     return hp_delta, new_traps, noise
+
+
+def search_traps(rng, player_pos, traps):
+    """SEARCH action: attempt to reveal hidden traps within Chebyshev distance 1.
+
+    Each hidden trap in range has 1/5 chance of being revealed.
+
+    Args:
+        rng: JAX PRNG key
+        player_pos: jnp.ndarray [2]
+        traps: Traps struct (with hidden field)
+
+    Returns:
+        new_traps: Traps with some hidden flags cleared
+    """
+    max_traps = traps.position.shape[0]
+    rngs = jax.random.split(rng, max_traps)
+
+    # For each trap: check range, check hidden, roll 1/5
+    dr = jnp.abs(traps.position[:, 0] - player_pos[0])
+    dc = jnp.abs(traps.position[:, 1] - player_pos[1])
+    in_range = (dr <= 1) & (dc <= 1)
+    can_reveal = traps.mask & traps.hidden & in_range
+
+    # Roll 1/5 chance per trap
+    rolls = jax.vmap(lambda r: jax.random.randint(r, (), 0, 5))(rngs)
+    revealed = can_reveal & (rolls == 0)
+
+    new_hidden = jnp.where(revealed, False, traps.hidden)
+    return traps.replace(hidden=new_hidden)

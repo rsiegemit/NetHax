@@ -9,7 +9,7 @@ from Nethax.minihax.states import (
     CombatState, Monsters, Inventory, GroundItems, Traps, EnvParams,
 )
 from Nethax.minihax.primitives.leveling import compute_initial_stats
-from Nethax.minihax.primitives.visibility import compute_visible
+from Nethax.minihax.primitives.visibility import compute_visible, compute_lit_map
 
 
 def generate_zombie_horde(rng, params, static_params):
@@ -119,10 +119,12 @@ def generate_zombie_horde(rng, params, static_params):
         position=jnp.zeros((static_params.max_traps, 2), dtype=jnp.int32),
         type_id=jnp.zeros(static_params.max_traps, dtype=jnp.int32),
         triggered=jnp.zeros(static_params.max_traps, dtype=jnp.bool_),
+        hidden=jnp.zeros(static_params.max_traps, dtype=jnp.bool_),
         mask=jnp.zeros(static_params.max_traps, dtype=jnp.bool_),
     )
 
-    visible_map = compute_visible(player_position, game_map, static_params.map_height, static_params.map_width)
+    lit_map = compute_lit_map(game_map)
+    visible_map = compute_visible(player_position, game_map, static_params.map_height, static_params.map_width, lit_map)
 
     state = CombatState(
         map=game_map,
@@ -138,6 +140,7 @@ def generate_zombie_horde(rng, params, static_params):
         ground_items=ground_items,
         seen_map=visible_map,
         visible_map=visible_map,
+        lit_map=lit_map,
         timestep=jnp.int32(0),
         prev_action=0,
         terminal=False,

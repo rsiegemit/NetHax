@@ -88,7 +88,7 @@ def do_melee_attack(rng, state, target_pos, static_params):
     monsters = state.monsters.replace(health=new_health, mask=new_mask)
 
     # --- XP gain and multi-level-up on kill ---
-    xp_gain = jnp.where(killed, MONSTER_STATS[mon_type, 7], 0)
+    xp_gain = jnp.where(killed, MONSTER_STATS[mon_type, 13], 0)
     new_stats = stats.replace(xp=stats.xp + xp_gain)
     new_stats = check_multi_levelup(rng_lvl, new_stats)
 

@@ -39,11 +39,36 @@ def roll_dice(rng, num_dice, die_sides):
 
 
 def compute_monster_damage(rng, monster_type):
-    """Compute damage dealt by a monster."""
+    """Compute total damage from all attack slots of a monster.
+
+    Each monster has up to 4 attack slots (columns 4-11 of MONSTER_STATS).
+    Slots with dice=0 are skipped. Total damage = sum of all slot rolls.
+    """
     from Nethax.minihax.constants import MONSTER_STATS
-    atk_dice = MONSTER_STATS[monster_type, 4]
-    atk_sides = MONSTER_STATS[monster_type, 5]
-    return roll_dice(rng, atk_dice, atk_sides)
+
+    rng1, rng2, rng3, rng4 = jax.random.split(rng, 4)
+
+    # Attack slot 1
+    a1_dice = MONSTER_STATS[monster_type, 4]
+    a1_sides = MONSTER_STATS[monster_type, 5]
+    d1 = jnp.where(a1_dice > 0, roll_dice(rng1, a1_dice, a1_sides), 0)
+
+    # Attack slot 2
+    a2_dice = MONSTER_STATS[monster_type, 6]
+    a2_sides = MONSTER_STATS[monster_type, 7]
+    d2 = jnp.where(a2_dice > 0, roll_dice(rng2, a2_dice, a2_sides), 0)
+
+    # Attack slot 3
+    a3_dice = MONSTER_STATS[monster_type, 8]
+    a3_sides = MONSTER_STATS[monster_type, 9]
+    d3 = jnp.where(a3_dice > 0, roll_dice(rng3, a3_dice, a3_sides), 0)
+
+    # Attack slot 4
+    a4_dice = MONSTER_STATS[monster_type, 10]
+    a4_sides = MONSTER_STATS[monster_type, 11]
+    d4 = jnp.where(a4_dice > 0, roll_dice(rng4, a4_dice, a4_sides), 0)
+
+    return d1 + d2 + d3 + d4
 
 
 def get_xp_for_level(level):

@@ -19,7 +19,7 @@ from Nethax.minihax.primitives.movement import move_player, check_stair_goal
 from Nethax.minihax.primitives.terrain import apply_terrain_damage
 from Nethax.minihax.primitives.items import pickup_item, use_first_item
 from Nethax.minihax.primitives.doors import kick_door, open_door_adjacent, unlock_door_adjacent
-from Nethax.minihax.primitives.traps import check_traps
+from Nethax.minihax.primitives.traps import check_traps, search_traps
 from Nethax.minihax.util.game_logic_utils import in_bounds
 
 
@@ -51,8 +51,8 @@ def combat_step(rng, state, action, params, static_params):
     map_h = static_params.map_height
     map_w = static_params.map_width
 
-    rng_action, rng_bump, rng_monsters, rng_attacks, rng_terrain, rng_kick, rng_traps, rng_next = \
-        jax.random.split(rng, 8)
+    rng_action, rng_bump, rng_monsters, rng_attacks, rng_terrain, rng_kick, rng_traps, rng_search, rng_next = \
+        jax.random.split(rng, 9)
 
     new_timestep = state.timestep + 1
     old_score = state.player_stats.score
@@ -64,6 +64,7 @@ def combat_step(rng, state, action, params, static_params):
     is_kick = action == Action.KICK
     is_open = action == Action.OPEN_DOOR
     is_unlock = action == Action.UNLOCK_DOOR
+    is_search = action == Action.SEARCH
 
     # ================================================================
     # Phase 1: Player Action
@@ -100,19 +101,22 @@ def combat_step(rng, state, action, params, static_params):
     )
 
     # --- Auto-open closed doors on move ---
-    safe_mr = jnp.clip(phase1_state.player_position[0], 0, map_h - 1)
-    safe_mc = jnp.clip(phase1_state.player_position[1], 0, map_w - 1)
-    tile_at_dest = state.map[safe_mr, safe_mc]
-    is_closed_door = (tile_at_dest == TileType.DOOR_CLOSED) & is_move
-    map_after_autodoor = state.map.at[safe_mr, safe_mc].set(
-        jnp.where(is_closed_door, TileType.DOOR_OPEN, state.map[safe_mr, safe_mc])
+    # Check the INTENDED target tile, not the resolved position
+    target_r = jnp.clip(state.player_position[0] + delta[0], 0, map_h - 1)
+    target_c = jnp.clip(state.player_position[1] + delta[1], 0, map_w - 1)
+    target_in_bounds = in_bounds(state.player_position + delta, map_h, map_w)
+    tile_at_target = state.map[target_r, target_c]
+    is_diagonal = (delta[0] != 0) & (delta[1] != 0)
+    is_closed_door = (tile_at_target == TileType.DOOR_CLOSED) & is_move & target_in_bounds & jnp.logical_not(is_diagonal)
+    map_after_autodoor = state.map.at[target_r, target_c].set(
+        jnp.where(is_closed_door, TileType.DOOR_OPEN, state.map[target_r, target_c])
     )
 
     # If door was closed, move_player would have rejected (DOOR_CLOSED is solid).
     # Override position if we auto-opened the door.
     auto_door_pos = jnp.where(
         is_move & is_closed_door & jnp.logical_not(has_monster_at_target),
-        state.player_position + delta,
+        jnp.array([target_r, target_c]),
         phase1_state.player_position,
     )
     auto_valid = in_bounds(auto_door_pos, map_h, map_w)
@@ -131,7 +135,7 @@ def combat_step(rng, state, action, params, static_params):
 
     # --- Kick ---
     map_after_kick, kick_success, rng_kick = kick_door(
-        rng_kick, map_after_autodoor, final_move_pos, map_h, map_w
+        rng_kick, map_after_autodoor, final_move_pos, map_h, map_w, player_strength=state.player_stats.strength
     )
 
     # --- Open door ---
@@ -210,6 +214,13 @@ def combat_step(rng, state, action, params, static_params):
     new_sleeping = jnp.where(wake_mask, False, state.monsters.is_sleeping)
     new_monsters = new_monsters.replace(is_sleeping=new_sleeping)
 
+    # --- Search action: reveal hidden traps ---
+    searched_traps = search_traps(rng_search, new_pos, new_traps)
+    new_traps = jax.tree.map(
+        lambda s, o: jnp.where(is_search, s, o),
+        searched_traps, new_traps,
+    )
+
     # ================================================================
     # Phase 3: Terrain damage
     # ================================================================
@@ -266,7 +277,8 @@ def combat_step(rng, state, action, params, static_params):
     # ================================================================
     # Goal type 0: reach downstair
     on_stair = check_stair_goal(new_pos, state.downstair_position)
-    stair_won = on_stair & is_downstair
+    go_down = (action == 10)  # Action.GO_DOWN_STAIRS
+    stair_won = jnp.where(params.auto_descend, on_stair, on_stair & go_down)
     # Goal type 1: kill target monster (e.g., grid bug in Memento)
     target_dead = ~mid_state.monsters.mask[static_params.goal_monster_idx]
     won = jnp.where(static_params.goal_type == 0, stair_won, target_dead)
@@ -288,7 +300,7 @@ def combat_step(rng, state, action, params, static_params):
     reward = jnp.where(non_trap_death | timeout, 0.0, reward)
 
     # Visibility update
-    visible_map = compute_visible(new_pos, new_map, map_h, map_w)
+    visible_map = compute_visible(new_pos, new_map, map_h, map_w, state.lit_map)
     new_seen_map = update_seen_map(state.seen_map, visible_map)
 
     final_state = mid_state.replace(

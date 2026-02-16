@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.minihax.constants import TileType
-from Nethax.minihax.primitives.visibility import compute_visible
+from Nethax.minihax.primitives.visibility import compute_visible, compute_lit_map
 from Nethax.minihax.world_gen.combat_common import (
     pad_map, empty_combat_state,
 )
@@ -80,7 +80,8 @@ def generate_closed_door(rng, params, static_params):
 
     padded_map = pad_map(game_map, static_params)
 
-    visible_map = compute_visible(player_pos, padded_map, static_params.map_height, static_params.map_width)
+    lit_map = compute_lit_map(padded_map)
+    visible_map = compute_visible(player_pos, padded_map, static_params.map_height, static_params.map_width, lit_map)
     state = empty_combat_state(static_params, rng_state)
     state = state.replace(
         map=padded_map,
@@ -88,5 +89,6 @@ def generate_closed_door(rng, params, static_params):
         downstair_position=stair_pos,
         seen_map=visible_map,
         visible_map=visible_map,
+        lit_map=lit_map,
     )
     return state

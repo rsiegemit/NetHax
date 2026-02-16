@@ -20,7 +20,42 @@ def _blocks_vision(tile_type):
     return BLOCKS_VISION_TABLE[tile_type]
 
 
-def compute_visible(player_position, game_map, map_height, map_width):
+def compute_lit_map(game_map):
+    """Compute lighting map from tile types.
+
+    Room tiles (FLOOR, stairs, lava, doors, etc.) are lit.
+    CORRIDOR tiles are dark.
+    Wall tiles are lit if adjacent to a room tile.
+    """
+    # Room tiles are inherently lit
+    is_room_tile = (
+        (game_map == TileType.FLOOR) |
+        (game_map == TileType.DOWNSTAIR) | (game_map == TileType.UPSTAIR) |
+        (game_map == TileType.LAVA) | (game_map == TileType.ALTAR) |
+        (game_map == TileType.DOOR_OPEN) | (game_map == TileType.DOOR_CLOSED) |
+        (game_map == TileType.DOOR_LOCKED) |
+        (game_map == TileType.PIT) | (game_map == TileType.PIT_FILLED) |
+        (game_map == TileType.BOULDER) | (game_map == TileType.TRAP_BOARD)
+    )
+
+    # Wall tiles: lit if any 8-neighbor is a room tile
+    is_wall = (
+        (game_map == TileType.VWALL) | (game_map == TileType.HWALL) |
+        (game_map == TileType.TLCORN) | (game_map == TileType.TRCORN) |
+        (game_map == TileType.BLCORN) | (game_map == TileType.BRCORN)
+    )
+    padded = jnp.pad(is_room_tile, 1, constant_values=False)
+    has_room_neighbor = (
+        padded[:-2, :-2] | padded[:-2, 1:-1] | padded[:-2, 2:] |
+        padded[1:-1, :-2] | padded[1:-1, 2:] |
+        padded[2:, :-2] | padded[2:, 1:-1] | padded[2:, 2:]
+    )
+    wall_lit = is_wall & has_room_neighbor
+
+    return is_room_tile | wall_lit
+
+
+def compute_visible(player_position, game_map, map_height, map_width, lit_map=None):
     """Compute which tiles are currently visible from the player position.
 
     Uses ray-casting (DDA) from the player to every tile on the map.
@@ -86,6 +121,17 @@ def compute_visible(player_position, game_map, map_height, map_width):
 
     # VOID tiles are never considered visible (always render as black)
     visible_map = visible_map & (game_map != TileType.VOID)
+
+    # Apply room lighting if lit_map provided
+    # visible = (in_LOS AND lit) OR (in_LOS AND adjacent)
+    if lit_map is not None:
+        rows = jnp.arange(map_height)[:, None]
+        cols = jnp.arange(map_width)[None, :]
+        cheb_dr = jnp.abs(rows - pr)
+        cheb_dc = jnp.abs(cols - pc)
+        cheb_dist = jnp.maximum(cheb_dr, cheb_dc)
+        adjacent = cheb_dist <= 1
+        visible_map = visible_map & (lit_map | adjacent)
 
     return visible_map
 

@@ -25,7 +25,7 @@ from Nethax.minihax.constants import (
 from Nethax.minihax.states import (
     HazardState, HazardStaticParams, Inventory, SimpleMonsters, GroundItems,
 )
-from Nethax.minihax.primitives.visibility import compute_visible
+from Nethax.minihax.primitives.visibility import compute_visible, compute_lit_map
 from Nethax.minihax.primitives.leveling import compute_initial_stats
 
 _ACTIVE_H = 7
@@ -105,7 +105,8 @@ def _make_locked_door_state(rng, params, static_params, player_pos, stair_pos):
         mask=jnp.zeros(max_gi, dtype=jnp.bool_),
     )
 
-    visible_map = compute_visible(player_pos, padded_map, map_h, map_w)
+    lit_map = compute_lit_map(padded_map)
+    visible_map = compute_visible(player_pos, padded_map, map_h, map_w, lit_map)
     return HazardState(
         map=padded_map,
         player_position=player_pos,
@@ -118,6 +119,7 @@ def _make_locked_door_state(rng, params, static_params, player_pos, stair_pos):
         ground_items=ground_items,
         seen_map=visible_map,
         visible_map=visible_map,
+        lit_map=lit_map,
         timestep=0,
         prev_action=0,
         terminal=False,

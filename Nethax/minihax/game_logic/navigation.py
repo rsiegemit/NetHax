@@ -40,13 +40,12 @@ def navigation_step(rng, state, action, params, static_params):
     )
 
     # SEARCH/wait (8) does nothing
-    # GO_DOWN_STAIRS (10) requires being on stair
     final_pos = jnp.where(is_move, new_pos, state.player_position)
 
-    # Check win condition: GO_DOWN_STAIRS action while on stair
+    # Check win condition
     on_stair = check_stair_goal(final_pos, state.downstair_position)
-    go_down_action = action == 10  # GO_DOWN_STAIRS
-    won = on_stair & go_down_action
+    go_down = (action == 10)  # Action.GO_DOWN_STAIRS
+    won = jnp.where(params.auto_descend, on_stair, on_stair & go_down)
 
     # Terminal: win or max timesteps
     new_timestep = state.timestep + 1
@@ -54,7 +53,7 @@ def navigation_step(rng, state, action, params, static_params):
     terminal = won | timeout
 
     # Visibility update
-    visible_map = compute_visible(final_pos, state.map, static_params.map_height, static_params.map_width)
+    visible_map = compute_visible(final_pos, state.map, static_params.map_height, static_params.map_width, state.lit_map)
     new_seen_map = update_seen_map(state.seen_map, visible_map)
 
     new_state = state.replace(

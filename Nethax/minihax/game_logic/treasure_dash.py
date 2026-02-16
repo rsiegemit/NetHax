@@ -79,7 +79,7 @@ def treasure_dash_step(rng, state, action, params, static_params):
     # ================================================================
     # Visibility update
     # ================================================================
-    visible_map = compute_visible(new_pos, state.map, map_h, map_w)
+    visible_map = compute_visible(new_pos, state.map, map_h, map_w, state.lit_map)
     new_seen_map = update_seen_map(state.seen_map, visible_map)
 
     new_state = state.replace(

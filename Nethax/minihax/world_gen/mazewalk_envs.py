@@ -14,7 +14,7 @@ import jax.numpy as jnp
 
 from Nethax.minihax.constants import TileType, ItemType
 from Nethax.minihax.states import NavigationState, NavigationStaticParams, GroundItems
-from Nethax.minihax.primitives.visibility import compute_visible
+from Nethax.minihax.primitives.visibility import compute_visible, compute_lit_map
 from Nethax.minihax.world_gen.procedural import mazewalk, wallification
 
 
@@ -232,7 +232,8 @@ def generate_mazewalk(rng, params, static_params):
     upstair_pos = upstair_pos + offset
     downstair_pos = downstair_pos + offset
 
-    visible_map = compute_visible(upstair_pos, game_map, static_params.map_height, static_params.map_width)
+    lit_map = compute_lit_map(game_map)
+    visible_map = compute_visible(upstair_pos, game_map, static_params.map_height, static_params.map_width, lit_map)
     return NavigationState(
         map=game_map,
         player_position=upstair_pos,
@@ -240,6 +241,7 @@ def generate_mazewalk(rng, params, static_params):
         ground_items=_empty_ground_items(static_params.max_ground_items),
         seen_map=visible_map,
         visible_map=visible_map,
+        lit_map=lit_map,
         timestep=0,
         prev_action=0,
         terminal=False,
@@ -355,7 +357,8 @@ def generate_explore_maze_easy(rng, params, static_params):
     ground_items = _place_apples(rng_apples, game_map, col=19, row_min=1, row_max=9,
                                   num_apples=4, map_w=active_w, offset=offset)
 
-    visible_map = compute_visible(upstair_pos, game_map, static_params.map_height, static_params.map_width)
+    lit_map = compute_lit_map(game_map)
+    visible_map = compute_visible(upstair_pos, game_map, static_params.map_height, static_params.map_width, lit_map)
     return NavigationState(
         map=game_map,
         player_position=upstair_pos,
@@ -363,6 +366,7 @@ def generate_explore_maze_easy(rng, params, static_params):
         ground_items=ground_items,
         seen_map=visible_map,
         visible_map=visible_map,
+        lit_map=lit_map,
         timestep=0,
         prev_action=0,
         terminal=False,
@@ -473,7 +477,8 @@ def generate_explore_maze_hard(rng, params, static_params):
     ground_items = _place_apples(rng_apples, game_map, col=27, row_min=1, row_max=13,
                                   num_apples=4, map_w=active_w, offset=offset)
 
-    visible_map = compute_visible(upstair_pos, game_map, static_params.map_height, static_params.map_width)
+    lit_map = compute_lit_map(game_map)
+    visible_map = compute_visible(upstair_pos, game_map, static_params.map_height, static_params.map_width, lit_map)
     return NavigationState(
         map=game_map,
         player_position=upstair_pos,
@@ -481,6 +486,7 @@ def generate_explore_maze_hard(rng, params, static_params):
         ground_items=ground_items,
         seen_map=visible_map,
         visible_map=visible_map,
+        lit_map=lit_map,
         timestep=0,
         prev_action=0,
         terminal=False,

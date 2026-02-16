@@ -47,6 +47,13 @@ class NavigationEnv(EnvironmentNoAutoReset):
         won = new_state.terminal & (new_state.timestep < params.max_timesteps)
         reward = jnp.where(won, 1.0, 0.0)
 
+        # Frozen step penalty: -0.01 when move action but position didn't change
+        # (matches MiniHack penalty_step for invalid moves like walking into walls)
+        is_move = action < 8
+        moved = jnp.any(new_state.player_position != state.player_position)
+        frozen = is_move & ~moved
+        reward = reward + jnp.where(frozen, -0.01, 0.0)
+
         done = new_state.terminal
         info = {
             "timestep": new_state.timestep,
@@ -106,6 +113,10 @@ class MazewalkEnv(NavigationEnv):
         from Nethax.minihax.world_gen.mazewalk_envs import generate_mazewalk
         super().__init__("Mazewalk", generate_mazewalk)
 
+    @property
+    def default_params(self) -> EnvParams:
+        return EnvParams(max_timesteps=1000)
+
 
 class ExploreMazeNavEnv(NavigationEnv):
     """Base for ExploreMaze envs: repeatable stair reward + apple eating, timeout-only terminal.
@@ -156,6 +167,12 @@ class ExploreMazeNavEnv(NavigationEnv):
         stair_reward = jnp.where(on_stair, 1.0, 0.0)
         reward = eat_reward + stair_reward
 
+        # Frozen step penalty
+        is_move = action < 8
+        moved = jnp.any(new_state.player_position != state.player_position)
+        frozen = is_move & ~moved
+        reward = reward + jnp.where(frozen, -0.01, 0.0)
+
         done = new_state.terminal
         info = {
             "timestep": new_state.timestep,
@@ -198,33 +215,41 @@ class ExploreMazeHardPremappedEnv(ExploreMazeNavEnv):
 
 # ============================================================================
 # Corridor environments (RANDOM_CORRIDORS)
+# max_episode_steps=1000 matching MiniHack MiniHackCorridor
 # ============================================================================
 
-class Corridor2Env(NavigationEnv):
+class CorridorEnvBase(NavigationEnv):
+    """Base for corridor envs with max_timesteps=1000 (matching MiniHack)."""
+    @property
+    def default_params(self) -> EnvParams:
+        return EnvParams(max_timesteps=1000)
+
+
+class Corridor2Env(CorridorEnvBase):
     def __init__(self):
         from Nethax.minihax.world_gen.corridor import generate_corridor2
         super().__init__("Corridor2", generate_corridor2)
 
 
-class Corridor3Env(NavigationEnv):
+class Corridor3Env(CorridorEnvBase):
     def __init__(self):
         from Nethax.minihax.world_gen.corridor import generate_corridor3
         super().__init__("Corridor3", generate_corridor3)
 
 
-class Corridor5Env(NavigationEnv):
+class Corridor5Env(CorridorEnvBase):
     def __init__(self):
         from Nethax.minihax.world_gen.corridor import generate_corridor5
         super().__init__("Corridor5", generate_corridor5)
 
 
-class Corridor8Env(NavigationEnv):
+class Corridor8Env(CorridorEnvBase):
     def __init__(self):
         from Nethax.minihax.world_gen.corridor import generate_corridor8
         super().__init__("Corridor8", generate_corridor8)
 
 
-class Corridor10Env(NavigationEnv):
+class Corridor10Env(CorridorEnvBase):
     def __init__(self):
         from Nethax.minihax.world_gen.corridor import generate_corridor10
         super().__init__("Corridor10", generate_corridor10)
