@@ -307,6 +307,11 @@ _EXTRA_BASE = _EXTRA_COUNT_IDX + 1                  # extra corridor keys start 
 _STAIR_BASE = _EXTRA_BASE + _MAX_EXTRA_CORRIDORS * _EXTRA_CORR_KEYS_PER  # stair keys
 
 
+def _is_door(tile):
+    """Check if a tile is any type of door."""
+    return (tile == TileType.DOOR_OPEN) | (tile == TileType.DOOR_CLOSED) | (tile == TileType.DOOR_LOCKED)
+
+
 def _bydoor(game_map, r, c, map_h, map_w):
     """Check if any adjacent tile is already a door (NetHack's bydoor()).
 
@@ -314,10 +319,10 @@ def _bydoor(game_map, r, c, map_h, map_w):
     """
     sr = jnp.clip(r, 0, map_h - 1)
     sc = jnp.clip(c, 0, map_w - 1)
-    above = game_map[jnp.clip(r - 1, 0, map_h - 1), sc] == TileType.DOOR_OPEN
-    below = game_map[jnp.clip(r + 1, 0, map_h - 1), sc] == TileType.DOOR_OPEN
-    left = game_map[sr, jnp.clip(c - 1, 0, map_w - 1)] == TileType.DOOR_OPEN
-    right = game_map[sr, jnp.clip(c + 1, 0, map_w - 1)] == TileType.DOOR_OPEN
+    above = _is_door(game_map[jnp.clip(r - 1, 0, map_h - 1), sc])
+    below = _is_door(game_map[jnp.clip(r + 1, 0, map_h - 1), sc])
+    left = _is_door(game_map[sr, jnp.clip(c - 1, 0, map_w - 1)])
+    right = _is_door(game_map[sr, jnp.clip(c + 1, 0, map_w - 1)])
     return above | below | left | right
 
 
@@ -337,13 +342,19 @@ def _okdoor(game_map, r, c, map_h, map_w):
 def _dodoor_tile(rng):
     """Determine door tile type per NetHack's dodoor()/dosdoor() probabilities.
 
-    NetHack: 2/3 D_NODOOR, 1/3 has door (D_ISOPEN/D_CLOSED/D_LOCKED).
-    In NetHack, D_NODOOR still renders as S_ndoor (visible doorway opening),
-    NOT as plain floor. All corridor-room junctions have visible doorway sprites.
-    We use DOOR_OPEN for all cases since the visual difference is minimal
-    and Tier 1 navigation has no door mechanics.
+    NetHack mkroom.c dodoor():
+      2/3 D_NODOOR (open doorway, walkable)
+      1/6 D_ISOPEN (open door, walkable)
+      1/6 D_CLOSED (closed door, requires OPEN action)
+
+    Both D_NODOOR and D_ISOPEN map to DOOR_OPEN (walkable).
+    D_CLOSED maps to DOOR_CLOSED (blocks movement until opened).
     """
-    return jnp.int32(TileType.DOOR_OPEN)
+    rng1, rng2 = jax.random.split(rng)
+    has_door = jax.random.randint(rng1, (), 0, 3) == 0  # 1/3 chance of actual door
+    is_closed = jax.random.randint(rng2, (), 0, 2) == 0  # 50/50 open vs closed
+    tile = jnp.where(has_door & is_closed, TileType.DOOR_CLOSED, TileType.DOOR_OPEN)
+    return jnp.int32(tile)
 
 
 def _dig_corridor(rng, game_map, org_r, org_c, dest_r, dest_c, map_h, map_w,

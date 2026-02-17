@@ -9,7 +9,7 @@ from jax import lax
 from typing import Tuple, Optional, Callable
 
 from Nethax.environment_base.environment_bases import EnvironmentNoAutoReset
-from Nethax.minihax.constants import NUM_ACTIONS_TIER1, Action, ItemType
+from Nethax.minihax.constants import NUM_ACTIONS_TIER1, NUM_ACTIONS_TIER1_EXPLORE, ItemType
 from Nethax.minihax.game_logic.navigation import navigation_step
 from Nethax.minihax.primitives.movement import check_stair_goal
 from Nethax.minihax.states import NavigationState, EnvParams, NavigationStaticParams
@@ -52,10 +52,15 @@ class NavigationNLEEnv(EnvironmentNoAutoReset):
         won = new_state.terminal & (new_state.timestep < params.max_timesteps)
         reward = jnp.where(won, 1.0, 0.0)
 
-        # Frozen step penalty: -0.01 when move action but position didn't change
+        # Frozen step penalty (NetHack turn consumption rules)
         is_move = action < 8
         moved = jnp.any(new_state.player_position != state.player_position)
-        frozen = is_move & ~moved
+        map_changed = jnp.any(new_state.map != state.map)
+        turn_consumed = ((is_move & moved)
+                         | ((action == 8) & map_changed)
+                         | (action == 9)
+                         | (action == 10))
+        frozen = ~turn_consumed
         reward = reward + jnp.where(frozen, -0.01, 0.0)
 
         done = new_state.terminal
@@ -128,11 +133,21 @@ class ExploreMazeNLENavEnv(NavigationNLEEnv):
       - +0.5 per apple eaten (EAT action while on apple tile)
       - max_episode_steps=500
       - Never terminates on task success, only timeout
+
+    Action space: Tier 1 base (0-10) + EAT(11) = 12 actions.
     """
 
     @property
     def default_params(self) -> EnvParams:
         return EnvParams(max_timesteps=500)
+
+    @property
+    def num_actions(self) -> int:
+        return NUM_ACTIONS_TIER1_EXPLORE
+
+    def action_space(self, params=None):
+        from gymnax.environments.spaces import Discrete
+        return Discrete(NUM_ACTIONS_TIER1_EXPLORE)
 
     def step_env(
         self, rng: jax.Array, state: NavigationState, action: int, params: EnvParams
@@ -147,7 +162,7 @@ class ExploreMazeNLENavEnv(NavigationNLEEnv):
         new_state = new_state.replace(terminal=timeout, prev_action=action)
 
         # --- EAT action: eat apple at player position ---
-        is_eat = (action == Action.EAT)
+        is_eat = (action == 11)  # EAT action in Tier 1 ExploreMaze
         player_pos = new_state.player_position
         gi = state.ground_items  # use pre-step ground items
         at_player = ((gi.position[:, 0] == player_pos[0]) &
@@ -169,10 +184,16 @@ class ExploreMazeNLENavEnv(NavigationNLEEnv):
         stair_reward = jnp.where(on_stair, 1.0, 0.0)
         reward = eat_reward + stair_reward
 
-        # Frozen step penalty
+        # Frozen step penalty (NetHack turn consumption rules)
         is_move = action < 8
         moved = jnp.any(new_state.player_position != state.player_position)
-        frozen = is_move & ~moved
+        map_changed = jnp.any(new_state.map != state.map)
+        turn_consumed = ((is_move & moved)
+                         | ((action == 8) & map_changed)
+                         | (action == 9)
+                         | (action == 10)
+                         | ate)
+        frozen = ~turn_consumed
         reward = reward + jnp.where(frozen, -0.01, 0.0)
 
         done = new_state.terminal

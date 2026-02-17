@@ -161,7 +161,8 @@ class Action(IntEnum):
 NUM_ACTIONS = len(Action)
 
 # Per-tier action counts
-NUM_ACTIONS_TIER1 = 11   # Movement (0-7) + SEARCH(8) + EAT(9) + GO_DOWN_STAIRS(10)
+NUM_ACTIONS_TIER1 = 11   # Movement (0-7) + OPEN(8) + KICK(9) + SEARCH/WAIT(10)  [matches MiniHack NAVIGATE_ACTIONS]
+NUM_ACTIONS_TIER1_EXPLORE = 12  # Tier1 + EAT(11) for ExploreMaze envs
 NUM_ACTIONS_TIER2 = 14   # Tier 1 + PICKUP(11) + USE_ITEM(12) + KICK(13)
 NUM_ACTIONS_TIER3 = 16   # Tier 2 + OPEN_DOOR(14) + UNLOCK_DOOR(15)
 NUM_ACTIONS_TIER4 = 9    # Movement (0-7) + SEARCH/WAIT(8)
