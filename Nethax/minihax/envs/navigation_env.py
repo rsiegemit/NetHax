@@ -62,7 +62,7 @@ class NavigationEnv(EnvironmentNoAutoReset):
                          | (action == 9)                   # KICK always costs a turn
                          | (action == 10))                 # SEARCH always costs a turn
         frozen = ~turn_consumed
-        reward = reward + jnp.where(frozen, -0.01, 0.0)
+        reward = reward + jnp.where(frozen, params.frozen_penalty, 0.0)
 
         done = new_state.terminal
         info = {
@@ -197,7 +197,7 @@ class ExploreMazeNavEnv(NavigationEnv):
                          | (action == 10)   # SEARCH
                          | ate)             # EAT (eating costs a turn)
         frozen = ~turn_consumed
-        reward = reward + jnp.where(frozen, -0.01, 0.0)
+        reward = reward + jnp.where(frozen, params.frozen_penalty, 0.0)
 
         done = new_state.terminal
         info = {

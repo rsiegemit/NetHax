@@ -186,6 +186,7 @@ class EnvParams:
     role_id: int = 5     # Default: Monk (RoleType.MONK)
     race_id: int = 0     # Default: Human (RaceType.HUMAN)
     auto_descend: bool = True  # True: win on stair contact (MiniHack); False: require GO_DOWN_STAIRS
+    frozen_penalty: float = -0.01  # Reward penalty when action doesn't consume a game turn (0.0 to disable)
 
 
 # ============================================================================

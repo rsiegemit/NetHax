@@ -61,7 +61,7 @@ class NavigationNLEEnv(EnvironmentNoAutoReset):
                          | (action == 9)
                          | (action == 10))
         frozen = ~turn_consumed
-        reward = reward + jnp.where(frozen, -0.01, 0.0)
+        reward = reward + jnp.where(frozen, params.frozen_penalty, 0.0)
 
         done = new_state.terminal
         info = {
@@ -194,7 +194,7 @@ class ExploreMazeNLENavEnv(NavigationNLEEnv):
                          | (action == 10)
                          | ate)
         frozen = ~turn_consumed
-        reward = reward + jnp.where(frozen, -0.01, 0.0)
+        reward = reward + jnp.where(frozen, params.frozen_penalty, 0.0)
 
         done = new_state.terminal
         info = {
