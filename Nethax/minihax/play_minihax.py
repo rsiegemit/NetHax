@@ -215,24 +215,28 @@ def main():
     print("Loading tiles...")
     tiles_array = load_tiles()
 
-    # Build JIT-compiled render function based on tier
+    # Build JIT-compiled render function (includes upscaling for zero-copy display)
+    scale = args.scale
     if tier in (1, 4):
         @jax.jit
         def render_fn(state):
-            return render_pixels_no_monsters(state, static_params, tiles_array)
+            pixels = render_pixels_no_monsters(state, static_params, tiles_array)
+            return jnp.repeat(jnp.repeat(pixels, scale, axis=0), scale, axis=1)
     else:
         max_monsters = static_params.max_monsters
         if args.wizard and tier == 3:
             @jax.jit
             def render_fn(state):
-                return render_pixels_with_monsters(
+                pixels = render_pixels_with_monsters(
                     state, static_params, tiles_array, max_monsters,
                     wizard_mode=True, traps=state.traps)
+                return jnp.repeat(jnp.repeat(pixels, scale, axis=0), scale, axis=1)
         else:
             @jax.jit
             def render_fn(state):
-                return render_pixels_with_monsters(
+                pixels = render_pixels_with_monsters(
                     state, static_params, tiles_array, max_monsters)
+                return jnp.repeat(jnp.repeat(pixels, scale, axis=0), scale, axis=1)
 
     # Env params with higher timestep limit for human play
     env_params = env.default_params.replace(max_timesteps=args.max_steps)
@@ -246,9 +250,15 @@ def main():
     rng, _rng = jax.random.split(rng)
     obs, state = env.reset(_rng, env_params)
 
-    # Initial render (triggers JIT compilation)
+    # Warmup: compile render + step before game loop starts
     print("Compiling renderer (first render)...")
     pixels = render_fn(state)
+    pixels.block_until_ready()
+
+    print("Compiling step function (first step)...")
+    _warmup = env.step(jax.random.PRNGKey(0), state, jnp.int32(0), env_params)
+    _warmup[0].block_until_ready()
+    del _warmup
 
     print(f"\nPlaying: {full_name} (Tier {tier})")
     print(f"Seed: {seed}")
@@ -286,10 +296,8 @@ def main():
     last_action_name = "---"
 
     while running:
-        # Render pixels to screen
+        # Render pixels to screen (upscaling already done in JIT render_fn)
         pixels_np = np.asarray(pixels)
-        if scale > 1:
-            pixels_np = np.repeat(np.repeat(pixels_np, scale, axis=0), scale, axis=1)
         # Transpose [H, W, 3] -> [W, H, 3] for pygame
         surface = pygame.surfarray.make_surface(pixels_np.transpose(1, 0, 2))
 

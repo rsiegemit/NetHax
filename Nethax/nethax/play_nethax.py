@@ -185,9 +185,23 @@ def play(seed=0, god_mode=False, fps=30, save_trajectories=False, debug=False):
     params = EnvParams(god_mode=god_mode)
     static_params = StaticEnvParams()
 
+    # JIT-compile step and game-over check (params/static_params are static)
+    step_fn = jax.jit(nethax_step, static_argnums=(3, 4))
+    done_fn = jax.jit(is_game_over, static_argnums=(1, 2))
+
     rng = jax.random.PRNGKey(seed)
     rng, _rng = jax.random.split(rng)
+    print("Generating world...")
     state = generate_world(_rng, params, static_params)
+
+    # Warmup: compile step + done check before game loop
+    print("Compiling step function (first step)...")
+    _ws, _wr = step_fn(jax.random.PRNGKey(0), state, 0, params, static_params)
+    _wr.block_until_ready()
+    print("Compiling done check...")
+    _wd = done_fn(state, params, static_params)
+    jnp.array(_wd).block_until_ready()
+    del _ws, _wr, _wd
 
     print(f"Playing Nethax (seed={seed}, god_mode={god_mode})")
     print()
@@ -307,7 +321,7 @@ def play(seed=0, god_mode=False, fps=30, save_trajectories=False, debug=False):
         if action is not None and not game_over:
             last_action_name = Action(int(action)).name
             rng, _rng = jax.random.split(rng)
-            state, reward = nethax_step(_rng, state, action, params, static_params)
+            state, reward = step_fn(_rng, state, action, params, static_params)
             last_reward = float(reward)
             cumulative_reward += last_reward
 
@@ -316,7 +330,7 @@ def play(seed=0, god_mode=False, fps=30, save_trajectories=False, debug=False):
                 history["reward"].append(float(reward))
                 history["done"].append(False)
 
-            if is_game_over(state, params, static_params):
+            if done_fn(state, params, static_params):
                 game_over = True
                 if save_trajectories:
                     history["done"][-1] = True
