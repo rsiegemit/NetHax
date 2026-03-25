@@ -1,7 +1,8 @@
 """Game logic for Tier 3 Combat environments.
 
 Supports: movement with bump-attack (do_melee_attack), trap checking,
-item pickup/use (levitation, freeze lava, key, apple), door operations
+item pickup/use (levitation, freeze lava, key, apple), directional zap
+(3-step: ZAP → slot select → direction), door operations
 (open, kick, unlock), terrain damage (lava), levitation tick,
 full monster AI (movement points, sleeping, pursuit, temple),
 monster attacks with AC system (do_monster_attacks), goal check.
@@ -10,16 +11,22 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.minihax.constants import (
-    Action, TileType, DIRECTION_VECTORS,
+    Action, TileType, DIRECTION_VECTORS, ItemType,
+    MONSTER_STATS, MONSTER_XP_SCORE,
 )
 from Nethax.minihax.primitives.combat import do_melee_attack
 from Nethax.minihax.primitives.monster_ai import full_monster_ai, do_monster_attacks
 from Nethax.minihax.primitives.visibility import compute_visible, update_seen_map
 from Nethax.minihax.primitives.movement import move_player, check_stair_goal
 from Nethax.minihax.primitives.terrain import apply_terrain_damage
-from Nethax.minihax.primitives.items import pickup_item, use_first_item
+from Nethax.minihax.primitives.items import (
+    pickup_item, use_first_item,
+    has_any_zappable, check_zap_slot, consume_zap_item,
+    apply_death_ray, apply_cold_ray,
+)
 from Nethax.minihax.primitives.doors import kick_door, open_door_adjacent, unlock_door_adjacent
 from Nethax.minihax.primitives.traps import check_traps, search_traps
+from Nethax.minihax.primitives.leveling import check_multi_levelup
 from Nethax.minihax.util.game_logic_utils import in_bounds
 
 
@@ -27,20 +34,24 @@ def combat_step(rng, state, action, params, static_params):
     """Tier 3 combat step function.
 
     Phases:
-    1. Player action: move (with bump attack via do_melee_attack), pickup,
-       use_item, kick, open_door, unlock_door
+    0. Zap handling (3-step state machine):
+       - zap_phase 0 + ZAP action → phase 1 (awaiting slot), skip game tick
+       - zap_phase 1 + SLOT_N action → phase 2 (awaiting direction), skip game tick
+       - zap_phase 2 + direction (0-7) → fire wand, consume item, game tick continues
+       - Any invalid action during phase 1 or 2 → cancel, skip game tick
+    1. Player action: move (with bump attack), pickup, use_item, kick, open, unlock
     2. Auto-open closed doors on move
     3. Trap check at new position
     4. Terrain damage (lava)
     5. Levitation tick
-    6. Full monster AI (via full_monster_ai from primitives)
-    7. Monster attacks (via do_monster_attacks from primitives)
+    6. Full monster AI
+    7. Monster attacks
     8. Goal check + reward
 
     Args:
         rng: JAX PRNG key
         state: CombatState
-        action: int (0-15)
+        action: int (0-19)
         params: EnvParams
         static_params: CombatStaticParams
 
@@ -51,9 +62,105 @@ def combat_step(rng, state, action, params, static_params):
     map_h = static_params.map_height
     map_w = static_params.map_width
 
-    rng_action, rng_bump, rng_monsters, rng_attacks, rng_terrain, rng_kick, rng_traps, rng_search, rng_next = \
-        jax.random.split(rng, 9)
+    rng_action, rng_bump, rng_monsters, rng_attacks, rng_terrain, rng_kick, \
+        rng_traps, rng_search, rng_zap, rng_next = jax.random.split(rng, 10)
 
+    # Save original state for skip_game_tick path
+    orig_state = state
+
+    # ================================================================
+    # Phase 0: Zap handling (3-step state machine)
+    # ================================================================
+    zap_phase = state.zap_phase
+    is_direction = action < 8
+    is_zap_action = action == Action.ZAP
+    is_slot_action = (action == Action.SLOT_0) | (action == Action.SLOT_1) | (action == Action.SLOT_2)
+    slot_idx = action - Action.SLOT_0  # 0, 1, or 2 (only valid when is_slot_action)
+    safe_slot_idx = jnp.where(is_slot_action, slot_idx, 0)
+
+    # --- Phase 0 → 1: ZAP action starts slot selection ---
+    has_zappable = has_any_zappable(state.inventory)
+    start_zap = (zap_phase == 0) & is_zap_action & has_zappable
+
+    # --- Phase 1 → 2: SLOT_N selects an inventory slot ---
+    slot_valid, slot_item_type = check_zap_slot(state.inventory, safe_slot_idx)
+    select_slot = (zap_phase == 1) & is_slot_action & slot_valid
+    cancel_phase1 = (zap_phase == 1) & ~(is_slot_action & slot_valid)
+
+    # --- Phase 2 → 0: Direction fires the wand ---
+    resolve_zap = (zap_phase == 2) & is_direction
+    cancel_phase2 = (zap_phase == 2) & ~is_direction
+
+    # Determine skip_game_tick (no monster AI, no terrain, no timestep advance)
+    skip_game_tick = start_zap | select_slot | cancel_phase1 | cancel_phase2
+
+    # Compute new zap_phase
+    new_zap_phase = jnp.where(start_zap, 1,
+                    jnp.where(select_slot, 2,
+                    jnp.where(resolve_zap | cancel_phase1 | cancel_phase2, 0,
+                              zap_phase)))
+
+    # Track which slot is pending (only updated on select_slot)
+    new_pending_slot = jnp.where(select_slot, safe_slot_idx, state.pending_zap_slot)
+
+    # --- Resolve zap: fire wand from pending_zap_slot ---
+    zap_dir = DIRECTION_VECTORS[jnp.where(is_direction, action, 0)]
+    pending_slot = state.pending_zap_slot
+    pending_item_type = state.inventory.item_ids[pending_slot]
+    is_death_zap = resolve_zap & (pending_item_type == ItemType.WAND_DEATH)
+    is_cold_zap = resolve_zap & (pending_item_type != ItemType.WAND_DEATH)
+
+    # Death ray
+    zapped_monsters, death_killed, death_killed_idx, death_killed_type = \
+        apply_death_ray(state.player_position, zap_dir, state.monsters, state.map, map_h, map_w)
+
+    # Cold ray
+    zapped_map = apply_cold_ray(state.player_position, zap_dir, state.map, map_h, map_w)
+
+    # Consume the zapped item
+    zapped_inv = consume_zap_item(state.inventory, pending_slot, resolve_zap)
+
+    # XP and score from death ray kill
+    xp_gain = jnp.where(is_death_zap & death_killed, MONSTER_STATS[death_killed_type, 13], 0)
+    score_gain = jnp.where(is_death_zap & death_killed, MONSTER_XP_SCORE[death_killed_type], 0)
+    kill_count = jnp.where(is_death_zap & death_killed, 1, 0)
+    post_zap_stats = state.player_stats.replace(
+        xp=state.player_stats.xp + xp_gain,
+        score=state.player_stats.score + score_gain,
+        monsters_killed=state.player_stats.monsters_killed + kill_count,
+    )
+    post_zap_stats = check_multi_levelup(rng_zap, post_zap_stats)
+
+    # Conditionally apply zap effects
+    post_zap_mons = jax.tree.map(
+        lambda z, o: jnp.where(is_death_zap, z, o),
+        zapped_monsters, state.monsters,
+    )
+    post_zap_map = jnp.where(is_cold_zap, zapped_map, state.map)
+    post_zap_inv = jax.tree.map(
+        lambda z, o: jnp.where(resolve_zap, z, o),
+        zapped_inv, state.inventory,
+    )
+    post_zap_player_stats = jax.tree.map(
+        lambda z, o: jnp.where(resolve_zap, z, o),
+        post_zap_stats, state.player_stats,
+    )
+
+    # Replace state with post-zap version for subsequent phases
+    state = state.replace(
+        monsters=post_zap_mons,
+        map=post_zap_map,
+        inventory=post_zap_inv,
+        player_stats=post_zap_player_stats,
+    )
+
+    # Override action: if resolving zap, treat as no-op (EAT=9) so player
+    # doesn't move or trigger other actions
+    action = jnp.where(resolve_zap, jnp.int32(Action.EAT), action)
+
+    # ================================================================
+    # Phase 1: Player Action (uses post-zap state and effective action)
+    # ================================================================
     new_timestep = state.timestep + 1
     old_score = state.player_stats.score
 
@@ -65,10 +172,6 @@ def combat_step(rng, state, action, params, static_params):
     is_open = action == Action.OPEN_DOOR
     is_unlock = action == Action.UNLOCK_DOOR
     is_search = action == Action.SEARCH
-
-    # ================================================================
-    # Phase 1: Player Action
-    # ================================================================
 
     # --- Movement + bump attack ---
     delta = DIRECTION_VECTORS[action]
@@ -101,7 +204,6 @@ def combat_step(rng, state, action, params, static_params):
     )
 
     # --- Auto-open closed doors on move ---
-    # Check the INTENDED target tile, not the resolved position
     target_r = jnp.clip(state.player_position[0] + delta[0], 0, map_h - 1)
     target_c = jnp.clip(state.player_position[1] + delta[1], 0, map_w - 1)
     target_in_bounds = in_bounds(state.player_position + delta, map_h, map_w)
@@ -112,8 +214,6 @@ def combat_step(rng, state, action, params, static_params):
         jnp.where(is_closed_door, TileType.DOOR_OPEN, state.map[target_r, target_c])
     )
 
-    # If door was closed, move_player would have rejected (DOOR_CLOSED is solid).
-    # Override position if we auto-opened the door.
     auto_door_pos = jnp.where(
         is_move & is_closed_door & jnp.logical_not(has_monster_at_target),
         jnp.array([target_r, target_c]),
@@ -152,52 +252,42 @@ def combat_step(rng, state, action, params, static_params):
     # Combine action results
     # ================================================================
 
-    # Position
     new_pos = final_move_pos
 
-    # Map: depends on action taken
     new_map = jnp.where(is_use, map_after_use,
               jnp.where(is_kick, map_after_kick,
               jnp.where(is_open, map_after_open,
               jnp.where(is_unlock, map_after_unlock,
                         map_after_autodoor))))
 
-    # Monsters: from phase1_state (may have been attacked)
     new_monsters = phase1_state.monsters
 
-    # Inventory: depends on pickup vs use_item
     new_inv = jax.tree.map(
         lambda p, u, o: jnp.where(is_pickup, p,
                         jnp.where(is_use, u, o)),
         new_inv_pickup, new_inv_use, state.inventory,
     )
 
-    # Ground items: only change on pickup
     new_ground = jax.tree.map(
         lambda p, o: jnp.where(is_pickup, p, o),
         new_ground_pickup, state.ground_items,
     )
 
-    # Player stats: from attack_state if bump, else original
-    # Use tree_map to conditionally select between the two PlayerStats structs
     new_stats = jax.tree.map(
         lambda a, o: jnp.where(has_monster_at_target, a, o),
         phase1_state.player_stats, state.player_stats,
     )
 
-    # HP: override if use_item action (use_item returns updated HP)
     new_hp = jnp.where(has_monster_at_target, new_stats.hp,
              jnp.where(is_use, hp_after_use, state.player_stats.hp))
 
-    # Levitation: from use_item
     new_levitating = state.player_levitating | (is_use & got_levitation)
     new_lev_turns = jnp.where(
         is_use & got_levitation,
-        state.levitation_turns + 100,  # 100 turns of levitation
+        state.levitation_turns + 100,
         state.levitation_turns,
     )
 
-    # Key: from use_item
     new_has_key = state.player_has_key | (is_use & got_key)
 
     # ================================================================
@@ -206,7 +296,6 @@ def combat_step(rng, state, action, params, static_params):
     trap_hp_delta, new_traps, noise = check_traps(new_pos, state.traps, rng_traps)
     hp_after_traps = new_hp + trap_hp_delta
 
-    # Wake nearby monsters on squeaky board noise (Chebyshev distance <= 5)
     mon_dist_r = jnp.abs(state.monsters.position[:, 0] - new_pos[0])
     mon_dist_c = jnp.abs(state.monsters.position[:, 1] - new_pos[1])
     mon_dist = jnp.maximum(mon_dist_r, mon_dist_c)
@@ -214,7 +303,6 @@ def combat_step(rng, state, action, params, static_params):
     new_sleeping = jnp.where(wake_mask, False, state.monsters.is_sleeping)
     new_monsters = new_monsters.replace(is_sleeping=new_sleeping)
 
-    # --- Search action: reveal hidden traps ---
     searched_traps = search_traps(rng_search, new_pos, new_traps)
     new_traps = jax.tree.map(
         lambda s, o: jnp.where(is_search, s, o),
@@ -236,11 +324,8 @@ def combat_step(rng, state, action, params, static_params):
     final_levitating = new_levitating & jnp.logical_not(lev_expired)
     final_lev_turns = jnp.where(lev_expired, 0, new_lev_turns_tick)
 
-    # Build final player_stats: start from new_stats (attack or original),
-    # then override HP with the value that has been through traps + terrain
     mid_stats = new_stats.replace(hp=hp_after_terrain)
 
-    # Build intermediate state for monster AI
     mid_state = state.replace(
         map=new_map,
         player_position=new_pos,
@@ -248,6 +333,8 @@ def combat_step(rng, state, action, params, static_params):
         player_levitating=final_levitating,
         levitation_turns=final_lev_turns,
         player_has_key=new_has_key,
+        zap_phase=jnp.int32(0),
+        pending_zap_slot=state.pending_zap_slot,
         inventory=new_inv,
         monsters=new_monsters,
         traps=new_traps,
@@ -260,7 +347,6 @@ def combat_step(rng, state, action, params, static_params):
     # ================================================================
     # Phase 5: Full monster AI
     # ================================================================
-    # Temple params: zeros for non-temple envs
     _zero2 = jnp.zeros(2, dtype=jnp.int32)
     mid_state = full_monster_ai(
         rng_monsters, mid_state, static_params,
@@ -275,38 +361,47 @@ def combat_step(rng, state, action, params, static_params):
     # ================================================================
     # Phase 7: Goal check + reward
     # ================================================================
-    # Goal type 0: reach downstair
     on_stair = check_stair_goal(new_pos, state.downstair_position)
     go_down = (action == 10)  # Action.GO_DOWN_STAIRS
     stair_won = jnp.where(params.auto_descend, on_stair, on_stair & go_down)
-    # Goal type 1: kill target monster (e.g., grid bug in Memento)
     target_dead = ~mid_state.monsters.mask[static_params.goal_monster_idx]
     won = jnp.where(static_params.goal_type == 0, stair_won, target_dead)
     dead = mid_state.player_stats.hp <= 0
     timeout = new_timestep >= params.max_timesteps
     terminal = won | dead | timeout
 
-    # Detect board trap trigger for Memento envs (goal_type==1)
     trap_triggered = trap_hp_delta < 0
     memento_trap = (static_params.goal_type == 1) & trap_triggered
 
-    # Reward: +1 on goal, -1 on trap (Memento only), 0 otherwise
     goal_reward = jnp.where(won, 1.0, 0.0)
     trap_penalty = jnp.where(memento_trap, -1.0, 0.0)
     reward = goal_reward + trap_penalty
 
-    # Zero reward on non-trap death or timeout
     non_trap_death = dead & ~memento_trap
     reward = jnp.where(non_trap_death | timeout, 0.0, reward)
 
-    # Visibility update
     visible_map = compute_visible(new_pos, new_map, map_h, map_w, state.lit_map)
     new_seen_map = update_seen_map(state.seen_map, visible_map)
 
-    final_state = mid_state.replace(
+    normal_state = mid_state.replace(
         terminal=terminal,
         seen_map=new_seen_map,
         visible_map=visible_map,
     )
 
-    return final_state, reward
+    # ================================================================
+    # Phase 8: Select between skip (zap phases) and normal tick
+    # ================================================================
+    # Skip state: original state with zap_phase and pending_zap_slot updated
+    skip_state = orig_state.replace(
+        zap_phase=new_zap_phase,
+        pending_zap_slot=new_pending_slot,
+    )
+
+    output_state = jax.tree.map(
+        lambda s, n: jnp.where(skip_game_tick, s, n),
+        skip_state, normal_state,
+    )
+    output_reward = jnp.where(skip_game_tick, 0.0, reward)
+
+    return output_state, output_reward

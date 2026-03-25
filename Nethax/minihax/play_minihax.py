@@ -120,6 +120,10 @@ def build_key_maps():
         pygame.K_a: Action.USE_ITEM,
         pygame.K_f: Action.KICK,
         pygame.K_o: Action.OPEN_DOOR,
+        pygame.K_z: Action.ZAP,
+        pygame.K_1: Action.SLOT_0,
+        pygame.K_2: Action.SLOT_1,
+        pygame.K_3: Action.SLOT_2,
     }
 
     # Unicode map for shift-modified keys (checked first)
@@ -170,7 +174,15 @@ def draw_hud(screen, font, env_name, tier, state, last_reward, cumulative_reward
             hp_color = (255, 255, 0)
         else:
             hp_color = (255, 0, 0)
-        line2 = f"HP:{hp}/{max_hp}  Lv:{xlev}  AC:{ac}  Score:{score}  Kills:{killed}"
+        # Zap phase indicator (Tier 3 only)
+        zap_str = ""
+        if tier == 3 and hasattr(state, 'zap_phase'):
+            zp = int(state.zap_phase)
+            if zp == 1:
+                zap_str = "  [ZAP: select slot 1/2/3]"
+            elif zp == 2:
+                zap_str = "  [ZAP: select direction]"
+        line2 = f"HP:{hp}/{max_hp}  Lv:{xlev}  AC:{ac}  Score:{score}  Kills:{killed}{zap_str}"
         surf2 = font.render(line2, True, hp_color)
         screen.blit(surf2, (10, y_offset + 18))
     elif tier == 4:
@@ -268,6 +280,7 @@ def main():
     print("Controls:")
     print("  Movement:  arrow keys or hjkl (cardinal), yubn (diagonal)")
     print("  s=search  e=eat  >=stairs  ,=pickup  a=use item")
+    print("  z=zap wand  1/2/3=select slot  (then direction to fire)")
     print("  f=kick  o=open door  U(shift+u)=unlock door")
     print("  ESC=quit")
     print()

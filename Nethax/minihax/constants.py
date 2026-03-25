@@ -157,6 +157,10 @@ class Action(IntEnum):
     KICK = 13
     OPEN_DOOR = 14
     UNLOCK_DOOR = 15
+    ZAP = 16             # Zap a wand/horn — enters slot selection (Tier 3 only)
+    SLOT_0 = 17          # Select inventory slot 0 (during zap slot selection)
+    SLOT_1 = 18          # Select inventory slot 1
+    SLOT_2 = 19          # Select inventory slot 2
 
 NUM_ACTIONS = len(Action)
 
@@ -164,7 +168,7 @@ NUM_ACTIONS = len(Action)
 NUM_ACTIONS_TIER1 = 11   # Movement (0-7) + OPEN(8) + KICK(9) + SEARCH/WAIT(10)  [matches MiniHack NAVIGATE_ACTIONS]
 NUM_ACTIONS_TIER1_EXPLORE = 12  # Tier1 + EAT(11) for ExploreMaze envs
 NUM_ACTIONS_TIER2 = 14   # Tier 1 + PICKUP(11) + USE_ITEM(12) + KICK(13)
-NUM_ACTIONS_TIER3 = 16   # Tier 2 + OPEN_DOOR(14) + UNLOCK_DOOR(15)
+NUM_ACTIONS_TIER3 = 20   # Tier 2 + OPEN_DOOR(14) + UNLOCK_DOOR(15) + ZAP(16) + SLOT_0/1/2(17-19)
 NUM_ACTIONS_TIER4 = 9    # Movement (0-7) + SEARCH/WAIT(8)
 
 # Direction vectors for movement actions [row_delta, col_delta]
@@ -186,6 +190,10 @@ DIRECTION_VECTORS = jnp.array([
     [0, 0],    # KICK (direction-dependent, handled separately)
     [0, 0],    # OPEN_DOOR (direction-dependent)
     [0, 0],    # UNLOCK_DOOR (direction-dependent)
+    [0, 0],    # ZAP (no movement — enters slot selection)
+    [0, 0],    # SLOT_0 (no movement — inventory slot select)
+    [0, 0],    # SLOT_1
+    [0, 0],    # SLOT_2
 ], dtype=jnp.int32)
 
 
@@ -217,6 +225,13 @@ LEVITATION_ITEMS = jnp.array([
 COLD_ITEMS = jnp.array([
     ItemType.WAND_COLD,
     ItemType.FROST_HORN,
+], dtype=jnp.int32)
+
+# Items that require directional zap (wands and horns)
+DIRECTIONAL_ITEMS = jnp.array([
+    ItemType.WAND_COLD,
+    ItemType.FROST_HORN,
+    ItemType.WAND_DEATH,
 ], dtype=jnp.int32)
 
 

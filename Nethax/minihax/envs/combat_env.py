@@ -103,7 +103,7 @@ class CombatEnv(EnvironmentNoAutoReset):
                     map_h * map_w +      # traps
                     2 * map_h * map_w +  # seen_map + visible_map
                     max_items +          # inventory
-                    17)                  # stats
+                    19)                  # stats (includes zap_phase, pending_zap_slot)
         return Box(0.0, 1.0, (obs_size,), dtype=jnp.float32)
 
     @property

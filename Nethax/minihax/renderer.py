@@ -408,6 +408,8 @@ def render_combat_symbolic(state, static_params):
         ps.max_energy / 50.0,
         jnp.float32(state.player_levitating),
         jnp.float32(state.player_has_key),
+        state.zap_phase / 2.0,
+        state.pending_zap_slot / 2.0,
         ps.score / 100.0,
         ps.monsters_killed / 16.0,
         state.timestep / 1500.0,
