@@ -185,6 +185,27 @@ def draw_hud(screen, font, env_name, tier, state, last_reward, cumulative_reward
         line2 = f"HP:{hp}/{max_hp}  Lv:{xlev}  AC:{ac}  Score:{score}  Kills:{killed}{zap_str}"
         surf2 = font.render(line2, True, hp_color)
         screen.blit(surf2, (10, y_offset + 18))
+
+        # Line 3: Inventory
+        if hasattr(state, 'inventory'):
+            from Nethax.minihax.constants import ItemType
+            inv_parts = []
+            for i in range(state.inventory.item_mask.shape[0]):
+                if bool(state.inventory.item_mask[i]):
+                    item_id = int(state.inventory.item_ids[i])
+                    name = ItemType(item_id).name.replace('_', ' ').title()
+                    inv_parts.append(f"{i+1}:{name}")
+                else:
+                    inv_parts.append(f"{i+1}:---")
+            inv_str = "Inv: " + "  ".join(inv_parts)
+            lev_str = ""
+            if hasattr(state, 'player_levitating') and bool(state.player_levitating):
+                lev_str = f"  [LEV:{int(state.levitation_turns)}t]"
+            key_str = ""
+            if hasattr(state, 'player_has_key') and bool(state.player_has_key):
+                key_str = "  [KEY]"
+            surf3 = font.render(inv_str + lev_str + key_str, True, (180, 180, 255))
+            screen.blit(surf3, (10, y_offset + 36))
     elif tier == 4:
         pits = int(state.pits_remaining)
         line2 = f"Pits remaining: {pits}"
@@ -290,7 +311,7 @@ def main():
     scale = args.scale
     pixel_h = static_params.map_height * TILE_SIZE * scale
     pixel_w = static_params.map_width * TILE_SIZE * scale
-    hud_height = 50
+    hud_height = 70
     screen = pygame.display.set_mode((pixel_w, pixel_h + hud_height))
     pygame.display.set_caption(f"MiniHax - {args.env}")
 
