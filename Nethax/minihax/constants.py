@@ -595,7 +595,7 @@ MONSTER_SPRITES = jnp.array([
     191,  # GIANT_RAT (placeholder)
     134,  # COCKATRICE (placeholder)
     166,  # NAGA_HATCHLING (placeholder)
-    115,  # MINOTAUR (placeholder)
+    256,  # MINOTAUR — brown bull-headed humanoid (glyph 250)
     175,  # OGRE (placeholder)
     62,   # BABY_RED_DRAGON (placeholder)
     219,  # TROLL (placeholder)
