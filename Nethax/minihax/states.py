@@ -162,8 +162,8 @@ class CombatState:
     player_levitating: bool
     levitation_turns: int
     player_has_key: bool
-    zap_phase: int                   # 0=normal, 1=awaiting slot, 2=awaiting direction
-    pending_zap_slot: int            # Inventory slot selected for zap (valid when zap_phase==2)
+    item_phase: int                  # 0=normal, 1=zap_slot, 2=zap_dir, 3=apply_slot, 4=eat_slot
+    pending_item_slot: int           # Inventory slot selected (valid when item_phase==2)
     inventory: Inventory
     monsters: Monsters
     traps: Traps

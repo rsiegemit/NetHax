@@ -153,12 +153,12 @@ class Action(IntEnum):
     EAT = 9
     GO_DOWN_STAIRS = 10
     PICKUP = 11
-    USE_ITEM = 12
+    APPLY = 12           # Apply self-targeted item — enters slot selection (Tier 3: 2-step, Tier 2: auto-select)
     KICK = 13
     OPEN_DOOR = 14
     UNLOCK_DOOR = 15
     ZAP = 16             # Zap a wand/horn — enters slot selection (Tier 3 only)
-    SLOT_0 = 17          # Select inventory slot 0 (during zap slot selection)
+    SLOT_0 = 17          # Select inventory slot 0 (during item slot selection)
     SLOT_1 = 18          # Select inventory slot 1
     SLOT_2 = 19          # Select inventory slot 2
 
@@ -167,7 +167,7 @@ NUM_ACTIONS = len(Action)
 # Per-tier action counts
 NUM_ACTIONS_TIER1 = 11   # Movement (0-7) + OPEN(8) + KICK(9) + SEARCH/WAIT(10)  [matches MiniHack NAVIGATE_ACTIONS]
 NUM_ACTIONS_TIER1_EXPLORE = 12  # Tier1 + EAT(11) for ExploreMaze envs
-NUM_ACTIONS_TIER2 = 14   # Tier 1 + PICKUP(11) + USE_ITEM(12) + KICK(13)
+NUM_ACTIONS_TIER2 = 14   # Tier 1 + PICKUP(11) + APPLY(12) + KICK(13)
 NUM_ACTIONS_TIER3 = 20   # Tier 2 + OPEN_DOOR(14) + UNLOCK_DOOR(15) + ZAP(16) + SLOT_0/1/2(17-19)
 NUM_ACTIONS_TIER4 = 9    # Movement (0-7) + SEARCH/WAIT(8)
 
@@ -186,7 +186,7 @@ DIRECTION_VECTORS = jnp.array([
     [0, 0],    # EAT (no movement)
     [0, 0],    # GO_DOWN_STAIRS (no movement)
     [0, 0],    # PICKUP (no movement)
-    [0, 0],    # USE_ITEM (no movement)
+    [0, 0],    # APPLY (no movement)
     [0, 0],    # KICK (direction-dependent, handled separately)
     [0, 0],    # OPEN_DOOR (direction-dependent)
     [0, 0],    # UNLOCK_DOOR (direction-dependent)
@@ -232,6 +232,19 @@ DIRECTIONAL_ITEMS = jnp.array([
     ItemType.WAND_COLD,
     ItemType.FROST_HORN,
     ItemType.WAND_DEATH,
+], dtype=jnp.int32)
+
+# Items usable via APPLY (self-targeted: potions, rings, boots, key)
+APPLY_ITEMS = jnp.array([
+    ItemType.POTION_LEVITATION,
+    ItemType.RING_LEVITATION,
+    ItemType.BOOTS_LEVITATION,
+    ItemType.SKELETON_KEY,
+], dtype=jnp.int32)
+
+# Items usable via EAT (food)
+FOOD_ITEMS = jnp.array([
+    ItemType.APPLE,
 ], dtype=jnp.int32)
 
 

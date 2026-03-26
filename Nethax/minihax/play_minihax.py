@@ -117,7 +117,7 @@ def build_key_maps():
         pygame.K_s: Action.SEARCH,
         pygame.K_e: Action.EAT,
         pygame.K_COMMA: Action.PICKUP,
-        pygame.K_a: Action.USE_ITEM,
+        pygame.K_a: Action.APPLY,
         pygame.K_f: Action.KICK,
         pygame.K_o: Action.OPEN_DOOR,
         pygame.K_z: Action.ZAP,
@@ -174,14 +174,18 @@ def draw_hud(screen, font, env_name, tier, state, last_reward, cumulative_reward
             hp_color = (255, 255, 0)
         else:
             hp_color = (255, 0, 0)
-        # Zap phase indicator (Tier 3 only)
+        # Item phase indicator (Tier 3 only)
         zap_str = ""
-        if tier == 3 and hasattr(state, 'zap_phase'):
-            zp = int(state.zap_phase)
-            if zp == 1:
+        if tier == 3 and hasattr(state, 'item_phase'):
+            ip = int(state.item_phase)
+            if ip == 1:
                 zap_str = "  [ZAP: select slot 1/2/3]"
-            elif zp == 2:
+            elif ip == 2:
                 zap_str = "  [ZAP: select direction]"
+            elif ip == 3:
+                zap_str = "  [APPLY: select slot 1/2/3]"
+            elif ip == 4:
+                zap_str = "  [EAT: select slot 1/2/3]"
         line2 = f"HP:{hp}/{max_hp}  Lv:{xlev}  AC:{ac}  Score:{score}  Kills:{killed}{zap_str}"
         surf2 = font.render(line2, True, hp_color)
         screen.blit(surf2, (10, y_offset + 18))
@@ -300,8 +304,9 @@ def main():
     print()
     print("Controls:")
     print("  Movement:  arrow keys or hjkl (cardinal), yubn (diagonal)")
-    print("  s=search  e=eat  >=stairs  ,=pickup  a=use item")
-    print("  z=zap wand  1/2/3=select slot  (then direction to fire)")
+    print("  s=search  >=stairs  ,=pickup")
+    print("  a=apply (potions/rings/boots/key)  e=eat  z=zap wand")
+    print("  1/2/3=select slot  (then direction for zap)")
     print("  f=kick  o=open door  U(shift+u)=unlock door")
     print("  ESC=quit")
     print()

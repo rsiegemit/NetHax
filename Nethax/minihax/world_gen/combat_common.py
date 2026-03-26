@@ -42,8 +42,8 @@ def empty_combat_state(static_params, rng):
         player_levitating=False,
         levitation_turns=jnp.int32(0),
         player_has_key=False,
-        zap_phase=jnp.int32(0),
-        pending_zap_slot=jnp.int32(0),
+        item_phase=jnp.int32(0),
+        pending_item_slot=jnp.int32(0),
         inventory=Inventory(
             item_ids=jnp.zeros(max_items, dtype=jnp.int32),
             item_mask=jnp.zeros(max_items, dtype=jnp.bool_),

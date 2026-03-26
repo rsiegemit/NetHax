@@ -4,6 +4,7 @@ import jax.numpy as jnp
 
 from Nethax.minihax.constants import (
     ItemType, LEVITATION_ITEMS, COLD_ITEMS, DIRECTIONAL_ITEMS,
+    APPLY_ITEMS, FOOD_ITEMS,
     TileType, SOLID_TILES, DIRECTION_VECTORS,
 )
 
@@ -82,7 +83,7 @@ def use_first_item(inventory, game_map, player_pos, player_hp, map_h, map_w):
     """
     from Nethax.minihax.primitives.terrain import freeze_lava_around
 
-    # Find first occupied slot that is usable by USE_ITEM
+    # Find first occupied slot that is usable by APPLY (Tier 2 single-step)
     # (skip WAND_DEATH which requires ZAP + direction)
     usable_mask = inventory.item_mask & (inventory.item_ids != ItemType.WAND_DEATH)
     has_item = jnp.any(usable_mask)
@@ -147,6 +148,106 @@ def check_zap_slot(inventory, slot_idx):
     item_type = inventory.item_ids[slot_idx]
     is_directional = jnp.isin(item_type, DIRECTIONAL_ITEMS)
     return has_item & is_directional, item_type
+
+
+def has_any_applicable(inventory):
+    """Check if inventory contains any self-targeted item (potion/ring/boots/key)."""
+    is_applicable = jnp.isin(inventory.item_ids, APPLY_ITEMS) & inventory.item_mask
+    return jnp.any(is_applicable)
+
+
+def has_any_food(inventory):
+    """Check if inventory contains any food item."""
+    is_food = jnp.isin(inventory.item_ids, FOOD_ITEMS) & inventory.item_mask
+    return jnp.any(is_food)
+
+
+def check_apply_slot(inventory, slot_idx):
+    """Check if the given inventory slot contains a valid self-targeted item.
+
+    Returns:
+        valid: bool — True if slot has an APPLY-compatible item
+        item_type: int — ItemType at slot (only meaningful if valid)
+    """
+    has_item = inventory.item_mask[slot_idx]
+    item_type = inventory.item_ids[slot_idx]
+    is_applicable = jnp.isin(item_type, APPLY_ITEMS)
+    return has_item & is_applicable, item_type
+
+
+def check_food_slot(inventory, slot_idx):
+    """Check if the given inventory slot contains a food item.
+
+    Returns:
+        valid: bool — True if slot has a food item
+        item_type: int — ItemType at slot (only meaningful if valid)
+    """
+    has_item = inventory.item_mask[slot_idx]
+    item_type = inventory.item_ids[slot_idx]
+    is_food = jnp.isin(item_type, FOOD_ITEMS)
+    return has_item & is_food, item_type
+
+
+def apply_item_at_slot(inventory, slot_idx, valid):
+    """Apply a self-targeted item at slot_idx. Consume it and return effects.
+
+    Handles: levitation items → levitating=True, skeleton key → has_key=True.
+
+    Args:
+        inventory: Inventory struct
+        slot_idx: int — slot to use
+        valid: bool — whether to actually apply (False = no-op)
+
+    Returns:
+        new_inventory: Inventory with item consumed
+        got_levitation: bool
+        got_key: bool
+    """
+    item_type = inventory.item_ids[slot_idx]
+    is_lev = jnp.any(item_type == LEVITATION_ITEMS)
+    is_key = item_type == ItemType.SKELETON_KEY
+
+    got_levitation = valid & is_lev
+    got_key = valid & is_key
+
+    # Consume item
+    new_ids = inventory.item_ids.at[slot_idx].set(
+        jnp.where(valid, ItemType.NONE, inventory.item_ids[slot_idx])
+    )
+    new_mask = inventory.item_mask.at[slot_idx].set(
+        jnp.where(valid, False, inventory.item_mask[slot_idx])
+    )
+    new_inv = inventory.replace(item_ids=new_ids, item_mask=new_mask)
+
+    return new_inv, got_levitation, got_key
+
+
+def eat_item_at_slot(inventory, slot_idx, player_hp, valid):
+    """Eat a food item at slot_idx. Consume it and heal.
+
+    Args:
+        inventory: Inventory struct
+        slot_idx: int — slot to eat from
+        player_hp: int — current HP
+        valid: bool — whether to actually eat (False = no-op)
+
+    Returns:
+        new_inventory: Inventory with item consumed
+        new_hp: int — healed HP (apple = +5)
+    """
+    # Heal 5 HP for apple
+    new_hp = jnp.where(valid, player_hp + 5, player_hp)
+
+    # Consume item
+    new_ids = inventory.item_ids.at[slot_idx].set(
+        jnp.where(valid, ItemType.NONE, inventory.item_ids[slot_idx])
+    )
+    new_mask = inventory.item_mask.at[slot_idx].set(
+        jnp.where(valid, False, inventory.item_mask[slot_idx])
+    )
+    new_inv = inventory.replace(item_ids=new_ids, item_mask=new_mask)
+
+    return new_inv, new_hp
 
 
 def consume_zap_item(inventory, slot_idx, valid):

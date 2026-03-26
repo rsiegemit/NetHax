@@ -1,11 +1,16 @@
 """Game logic for Tier 3 Combat environments.
 
 Supports: movement with bump-attack (do_melee_attack), trap checking,
-item pickup/use (levitation, freeze lava, key, apple), directional zap
-(3-step: ZAP → slot select → direction), door operations
-(open, kick, unlock), terrain damage (lava), levitation tick,
-full monster AI (movement points, sleeping, pursuit, temple),
-monster attacks with AC system (do_monster_attacks), goal check.
+multi-step item actions (ZAP 3-step, APPLY 2-step, EAT 2-step),
+door operations (open, kick, unlock), terrain damage (lava), levitation tick,
+full monster AI, monster attacks, goal check.
+
+Item phase state machine:
+  0 = normal play
+  1 = awaiting slot for ZAP
+  2 = awaiting direction for ZAP
+  3 = awaiting slot for APPLY
+  4 = awaiting slot for EAT
 """
 import jax
 import jax.numpy as jnp
@@ -20,9 +25,12 @@ from Nethax.minihax.primitives.visibility import compute_visible, update_seen_ma
 from Nethax.minihax.primitives.movement import move_player, check_stair_goal
 from Nethax.minihax.primitives.terrain import apply_terrain_damage
 from Nethax.minihax.primitives.items import (
-    pickup_item, use_first_item,
+    pickup_item,
     has_any_zappable, check_zap_slot, consume_zap_item,
     apply_death_ray, apply_cold_ray,
+    has_any_applicable, has_any_food,
+    check_apply_slot, check_food_slot,
+    apply_item_at_slot, eat_item_at_slot,
 )
 from Nethax.minihax.primitives.doors import kick_door, open_door_adjacent, unlock_door_adjacent
 from Nethax.minihax.primitives.traps import check_traps, search_traps
@@ -34,19 +42,16 @@ def combat_step(rng, state, action, params, static_params):
     """Tier 3 combat step function.
 
     Phases:
-    0. Zap handling (3-step state machine):
-       - zap_phase 0 + ZAP action → phase 1 (awaiting slot), skip game tick
-       - zap_phase 1 + SLOT_N action → phase 2 (awaiting direction), skip game tick
-       - zap_phase 2 + direction (0-7) → fire wand, consume item, game tick continues
-       - Any invalid action during phase 1 or 2 → cancel, skip game tick
-    1. Player action: move (with bump attack), pickup, use_item, kick, open, unlock
+    0. Item phase state machine (ZAP/APPLY/EAT multi-step handling)
+    1. Player action: move (with bump attack), pickup, kick, open, unlock
     2. Auto-open closed doors on move
-    3. Trap check at new position
+    3. Trap check
     4. Terrain damage (lava)
     5. Levitation tick
     6. Full monster AI
     7. Monster attacks
     8. Goal check + reward
+    9. Select skip vs normal tick
 
     Args:
         rng: JAX PRNG key
@@ -65,62 +70,74 @@ def combat_step(rng, state, action, params, static_params):
     rng_action, rng_bump, rng_monsters, rng_attacks, rng_terrain, rng_kick, \
         rng_traps, rng_search, rng_zap, rng_next = jax.random.split(rng, 10)
 
-    # Save original state for skip_game_tick path
     orig_state = state
 
     # ================================================================
-    # Phase 0: Zap handling (3-step state machine)
+    # Phase 0: Item phase state machine
     # ================================================================
-    zap_phase = state.zap_phase
+    phase = state.item_phase
     is_direction = action < 8
-    is_zap_action = action == Action.ZAP
-    is_slot_action = (action == Action.SLOT_0) | (action == Action.SLOT_1) | (action == Action.SLOT_2)
-    slot_idx = action - Action.SLOT_0  # 0, 1, or 2 (only valid when is_slot_action)
-    safe_slot_idx = jnp.where(is_slot_action, slot_idx, 0)
+    is_zap = action == Action.ZAP
+    is_apply = action == Action.APPLY
+    is_eat = action == Action.EAT
+    is_slot = (action == Action.SLOT_0) | (action == Action.SLOT_1) | (action == Action.SLOT_2)
+    slot_idx = action - Action.SLOT_0
+    safe_slot_idx = jnp.where(is_slot, slot_idx, 0)
 
-    # --- Phase 0 → 1: ZAP action starts slot selection ---
-    has_zappable = has_any_zappable(state.inventory)
-    start_zap = (zap_phase == 0) & is_zap_action & has_zappable
+    # --- Phase 0 → 1: ZAP starts slot selection ---
+    start_zap = (phase == 0) & is_zap & has_any_zappable(state.inventory)
+    # --- Phase 0 → 3: APPLY starts slot selection ---
+    start_apply = (phase == 0) & is_apply & has_any_applicable(state.inventory)
+    # --- Phase 0 → 4: EAT starts slot selection ---
+    start_eat = (phase == 0) & is_eat & has_any_food(state.inventory)
 
-    # --- Phase 1 → 2: SLOT_N selects an inventory slot ---
-    slot_valid, slot_item_type = check_zap_slot(state.inventory, safe_slot_idx)
-    select_slot = (zap_phase == 1) & is_slot_action & slot_valid
-    cancel_phase1 = (zap_phase == 1) & ~(is_slot_action & slot_valid)
+    # --- Phase 1 → 2: SLOT_N selects zap slot ---
+    zap_slot_valid, zap_slot_item = check_zap_slot(state.inventory, safe_slot_idx)
+    select_zap_slot = (phase == 1) & is_slot & zap_slot_valid
+    cancel_phase1 = (phase == 1) & ~(is_slot & zap_slot_valid)
 
     # --- Phase 2 → 0: Direction fires the wand ---
-    resolve_zap = (zap_phase == 2) & is_direction
-    cancel_phase2 = (zap_phase == 2) & ~is_direction
+    resolve_zap = (phase == 2) & is_direction
+    cancel_phase2 = (phase == 2) & ~is_direction
 
-    # Determine skip_game_tick (no monster AI, no terrain, no timestep advance)
-    skip_game_tick = start_zap | select_slot | cancel_phase1 | cancel_phase2
+    # --- Phase 3 → 0: SLOT_N applies self-targeted item ---
+    apply_slot_valid, apply_slot_item = check_apply_slot(state.inventory, safe_slot_idx)
+    resolve_apply = (phase == 3) & is_slot & apply_slot_valid
+    cancel_phase3 = (phase == 3) & ~(is_slot & apply_slot_valid)
 
-    # Compute new zap_phase
-    new_zap_phase = jnp.where(start_zap, 1,
-                    jnp.where(select_slot, 2,
-                    jnp.where(resolve_zap | cancel_phase1 | cancel_phase2, 0,
-                              zap_phase)))
+    # --- Phase 4 → 0: SLOT_N eats food ---
+    food_slot_valid, food_slot_item = check_food_slot(state.inventory, safe_slot_idx)
+    resolve_eat = (phase == 4) & is_slot & food_slot_valid
+    cancel_phase4 = (phase == 4) & ~(is_slot & food_slot_valid)
 
-    # Track which slot is pending (only updated on select_slot)
-    new_pending_slot = jnp.where(select_slot, safe_slot_idx, state.pending_zap_slot)
+    # Compute new item_phase
+    new_item_phase = jnp.where(start_zap, 1,
+                     jnp.where(select_zap_slot, 2,
+                     jnp.where(start_apply, 3,
+                     jnp.where(start_eat, 4,
+                     jnp.where(resolve_zap | resolve_apply | resolve_eat
+                               | cancel_phase1 | cancel_phase2 | cancel_phase3 | cancel_phase4, 0,
+                               phase)))))
 
-    # --- Resolve zap: fire wand from pending_zap_slot ---
+    new_pending_slot = jnp.where(select_zap_slot, safe_slot_idx, state.pending_item_slot)
+
+    # Skip game tick: initiating any multi-step action, selecting zap slot, or cancelling
+    skip_game_tick = (start_zap | start_apply | start_eat
+                      | select_zap_slot
+                      | cancel_phase1 | cancel_phase2 | cancel_phase3 | cancel_phase4)
+
+    # --- Resolve ZAP: fire wand from pending slot ---
     zap_dir = DIRECTION_VECTORS[jnp.where(is_direction, action, 0)]
-    pending_slot = state.pending_zap_slot
+    pending_slot = state.pending_item_slot
     pending_item_type = state.inventory.item_ids[pending_slot]
     is_death_zap = resolve_zap & (pending_item_type == ItemType.WAND_DEATH)
     is_cold_zap = resolve_zap & (pending_item_type != ItemType.WAND_DEATH)
 
-    # Death ray
     zapped_monsters, death_killed, death_killed_idx, death_killed_type = \
         apply_death_ray(state.player_position, zap_dir, state.monsters, state.map, map_h, map_w)
-
-    # Cold ray
     zapped_map = apply_cold_ray(state.player_position, zap_dir, state.map, map_h, map_w)
+    zap_consumed_inv = consume_zap_item(state.inventory, pending_slot, resolve_zap)
 
-    # Consume the zapped item
-    zapped_inv = consume_zap_item(state.inventory, pending_slot, resolve_zap)
-
-    # XP and score from death ray kill
     xp_gain = jnp.where(is_death_zap & death_killed, MONSTER_STATS[death_killed_type, 13], 0)
     score_gain = jnp.where(is_death_zap & death_killed, MONSTER_XP_SCORE[death_killed_type], 0)
     kill_count = jnp.where(is_death_zap & death_killed, 1, 0)
@@ -133,41 +150,59 @@ def combat_step(rng, state, action, params, static_params):
 
     # Conditionally apply zap effects
     post_zap_mons = jax.tree.map(
-        lambda z, o: jnp.where(is_death_zap, z, o),
-        zapped_monsters, state.monsters,
-    )
+        lambda z, o: jnp.where(is_death_zap, z, o), zapped_monsters, state.monsters)
     post_zap_map = jnp.where(is_cold_zap, zapped_map, state.map)
     post_zap_inv = jax.tree.map(
-        lambda z, o: jnp.where(resolve_zap, z, o),
-        zapped_inv, state.inventory,
-    )
+        lambda z, o: jnp.where(resolve_zap, z, o), zap_consumed_inv, state.inventory)
     post_zap_player_stats = jax.tree.map(
-        lambda z, o: jnp.where(resolve_zap, z, o),
-        post_zap_stats, state.player_stats,
-    )
+        lambda z, o: jnp.where(resolve_zap, z, o), post_zap_stats, state.player_stats)
 
-    # Replace state with post-zap version for subsequent phases
+    # --- Resolve APPLY: self-targeted item effect ---
+    applied_inv, got_levitation, got_key = apply_item_at_slot(
+        state.inventory, safe_slot_idx, resolve_apply)
+    post_apply_inv = jax.tree.map(
+        lambda a, o: jnp.where(resolve_apply, a, o), applied_inv, post_zap_inv)
+
+    apply_levitating = state.player_levitating | got_levitation
+    apply_lev_turns = jnp.where(got_levitation, state.levitation_turns + 100, state.levitation_turns)
+    apply_has_key = state.player_has_key | got_key
+
+    # --- Resolve EAT: consume food ---
+    eaten_inv, hp_after_eat = eat_item_at_slot(
+        state.inventory, safe_slot_idx, state.player_stats.hp, resolve_eat)
+    post_eat_inv = jax.tree.map(
+        lambda e, o: jnp.where(resolve_eat, e, o), eaten_inv, post_apply_inv)
+    post_eat_hp = jnp.where(resolve_eat, hp_after_eat, state.player_stats.hp)
+
+    # Build post-resolution state
+    resolved_any = resolve_zap | resolve_apply | resolve_eat
+    final_inv = post_eat_inv
+    final_stats = post_zap_player_stats.replace(hp=jnp.where(resolve_eat, post_eat_hp, post_zap_player_stats.hp))
+    final_levitating = jnp.where(resolve_apply, apply_levitating, state.player_levitating)
+    final_lev_turns = jnp.where(resolve_apply, apply_lev_turns, state.levitation_turns)
+    final_has_key = jnp.where(resolve_apply, apply_has_key, state.player_has_key)
+
     state = state.replace(
         monsters=post_zap_mons,
         map=post_zap_map,
-        inventory=post_zap_inv,
-        player_stats=post_zap_player_stats,
+        inventory=final_inv,
+        player_stats=final_stats,
+        player_levitating=final_levitating,
+        levitation_turns=final_lev_turns,
+        player_has_key=final_has_key,
     )
 
-    # Override action: if resolving zap, treat as no-op (EAT=9) so player
-    # doesn't move or trigger other actions
-    action = jnp.where(resolve_zap, jnp.int32(Action.EAT), action)
+    # Override action: resolved phases should not trigger movement/pickup/etc.
+    # Use SLOT_2 (19) as no-op sentinel — it doesn't match any Phase 1 handler
+    action = jnp.where(resolved_any, jnp.int32(Action.SLOT_2), action)
 
     # ================================================================
-    # Phase 1: Player Action (uses post-zap state and effective action)
+    # Phase 1: Player Action
     # ================================================================
     new_timestep = state.timestep + 1
-    old_score = state.player_stats.score
 
     is_move = action < 8
-    is_downstair = action == Action.GO_DOWN_STAIRS
     is_pickup = action == Action.PICKUP
-    is_use = action == Action.USE_ITEM
     is_kick = action == Action.KICK
     is_open = action == Action.OPEN_DOOR
     is_unlock = action == Action.UNLOCK_DOOR
@@ -177,27 +212,21 @@ def combat_step(rng, state, action, params, static_params):
     delta = DIRECTION_VECTORS[action]
     target_pos = state.player_position + delta
 
-    # Check for monster at target position (for bump attack)
     mon_pos_r = state.monsters.position[:, 0] == target_pos[0]
     mon_pos_c = state.monsters.position[:, 1] == target_pos[1]
     mon_at_target = mon_pos_r & mon_pos_c & state.monsters.mask
     has_monster_at_target = is_move & jnp.any(mon_at_target)
 
-    # Do bump attack if monster at target (uses full do_melee_attack with XP/score)
     attack_state = do_melee_attack(rng_bump, state, target_pos, static_params)
 
-    # Movement (only if no monster at target)
     moved_pos, can_move = move_player(
         state.player_position, action, state.map, map_h, map_w
     )
 
-    # If bump attack: don't move, just attack (take attack_state)
-    # If no monster: move normally (keep original state + new position)
     move_pos = jnp.where(is_move & jnp.logical_not(has_monster_at_target),
                          moved_pos, state.player_position)
     move_state = state.replace(player_position=move_pos)
 
-    # Select: attack state if monster at target, else move state
     phase1_state = jax.tree.map(
         lambda a, m: jnp.where(has_monster_at_target, a, m),
         attack_state, move_state,
@@ -227,12 +256,6 @@ def combat_step(rng, state, action, params, static_params):
         state.ground_items, final_move_pos, state.inventory
     )
 
-    # --- Use item ---
-    new_inv_use, map_after_use, hp_after_use, got_levitation, got_key = use_first_item(
-        state.inventory, map_after_autodoor, final_move_pos,
-        state.player_stats.hp, map_h, map_w,
-    )
-
     # --- Kick ---
     map_after_kick, kick_success, rng_kick = kick_door(
         rng_kick, map_after_autodoor, final_move_pos, map_h, map_w, player_strength=state.player_stats.strength
@@ -251,21 +274,18 @@ def combat_step(rng, state, action, params, static_params):
     # ================================================================
     # Combine action results
     # ================================================================
-
     new_pos = final_move_pos
 
-    new_map = jnp.where(is_use, map_after_use,
-              jnp.where(is_kick, map_after_kick,
+    new_map = jnp.where(is_kick, map_after_kick,
               jnp.where(is_open, map_after_open,
               jnp.where(is_unlock, map_after_unlock,
-                        map_after_autodoor))))
+                        map_after_autodoor)))
 
     new_monsters = phase1_state.monsters
 
     new_inv = jax.tree.map(
-        lambda p, u, o: jnp.where(is_pickup, p,
-                        jnp.where(is_use, u, o)),
-        new_inv_pickup, new_inv_use, state.inventory,
+        lambda p, o: jnp.where(is_pickup, p, o),
+        new_inv_pickup, state.inventory,
     )
 
     new_ground = jax.tree.map(
@@ -278,17 +298,11 @@ def combat_step(rng, state, action, params, static_params):
         phase1_state.player_stats, state.player_stats,
     )
 
-    new_hp = jnp.where(has_monster_at_target, new_stats.hp,
-             jnp.where(is_use, hp_after_use, state.player_stats.hp))
+    new_hp = jnp.where(has_monster_at_target, new_stats.hp, state.player_stats.hp)
 
-    new_levitating = state.player_levitating | (is_use & got_levitation)
-    new_lev_turns = jnp.where(
-        is_use & got_levitation,
-        state.levitation_turns + 100,
-        state.levitation_turns,
-    )
-
-    new_has_key = state.player_has_key | (is_use & got_key)
+    new_levitating = state.player_levitating
+    new_lev_turns = state.levitation_turns
+    new_has_key = state.player_has_key
 
     # ================================================================
     # Phase 2: Trap check
@@ -333,8 +347,8 @@ def combat_step(rng, state, action, params, static_params):
         player_levitating=final_levitating,
         levitation_turns=final_lev_turns,
         player_has_key=new_has_key,
-        zap_phase=jnp.int32(0),
-        pending_zap_slot=state.pending_zap_slot,
+        item_phase=jnp.int32(0),
+        pending_item_slot=state.pending_item_slot,
         inventory=new_inv,
         monsters=new_monsters,
         traps=new_traps,
@@ -362,7 +376,7 @@ def combat_step(rng, state, action, params, static_params):
     # Phase 7: Goal check + reward
     # ================================================================
     on_stair = check_stair_goal(new_pos, state.downstair_position)
-    go_down = (action == 10)  # Action.GO_DOWN_STAIRS
+    go_down = (action == 10)
     stair_won = jnp.where(params.auto_descend, on_stair, on_stair & go_down)
     target_dead = ~mid_state.monsters.mask[static_params.goal_monster_idx]
     won = jnp.where(static_params.goal_type == 0, stair_won, target_dead)
@@ -390,12 +404,11 @@ def combat_step(rng, state, action, params, static_params):
     )
 
     # ================================================================
-    # Phase 8: Select between skip (zap phases) and normal tick
+    # Phase 8: Select skip vs normal tick
     # ================================================================
-    # Skip state: original state with zap_phase and pending_zap_slot updated
     skip_state = orig_state.replace(
-        zap_phase=new_zap_phase,
-        pending_zap_slot=new_pending_slot,
+        item_phase=new_item_phase,
+        pending_item_slot=new_pending_slot,
     )
 
     output_state = jax.tree.map(

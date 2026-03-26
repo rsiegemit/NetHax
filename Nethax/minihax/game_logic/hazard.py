@@ -298,7 +298,7 @@ def hazard_step(rng, state, action, params, static_params):
     is_move = action < 8
     is_downstair = action == Action.GO_DOWN_STAIRS
     is_pickup = action == Action.PICKUP
-    is_use = action == Action.USE_ITEM
+    is_use = action == Action.APPLY
     is_kick = action == Action.KICK
 
     # ================================================================
