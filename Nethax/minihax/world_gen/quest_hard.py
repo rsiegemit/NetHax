@@ -78,6 +78,21 @@ def generate_quest_hard(rng, params, static_params):
     # Left border (VWALL) -- no right border since MAP extends to col 79
     game_map = game_map.at[1:level_h - 1, 0].set(TileType.VWALL)
 
+    # Block VOID tiles inside the MAP footprint so mazewalk DFS stays outside.
+    # The MAP contains 202 space chars that parse to VOID. Without blocking,
+    # the DFS enters them and may route left-side maze connections through the
+    # MAP region. The later re-stamp then severs those paths, disconnecting
+    # parts of the maze (~20% of seeds).
+    map_region = game_map[
+        _MAP_ROW_OFFSET:_MAP_ROW_OFFSET + fixed_h,
+        _MAP_COL_OFFSET:_MAP_COL_OFFSET + fixed_w
+    ]
+    blocked_region = jnp.where(map_region == TileType.VOID, TileType.HWALL, map_region)
+    game_map = game_map.at[
+        _MAP_ROW_OFFSET:_MAP_ROW_OFFSET + fixed_h,
+        _MAP_COL_OFFSET:_MAP_COL_OFFSET + fixed_w
+    ].set(blocked_region)
+
     # Generate maze via MAZEWALK filling all void areas
     # .des: MAZEWALK:(00,06),west -- start at MAP (col=0, row=6) going west
     # MAP (row=6, col=0) = level (row=10, col=31) is a DOOR_CLOSED
