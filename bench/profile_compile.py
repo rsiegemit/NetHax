@@ -91,6 +91,35 @@ def _compile_scan(state, action, key, n_steps: int = 16) -> float:
     return _wall(t0)
 
 
+def _compile_vmap_scan(state, key, n_steps: int = 16, batch: int = 4) -> float:
+    """Cold-compile ``jit(vmap(scan(_step_impl, ...)))``.
+
+    This is the PPO-style training shape: batch of envs each stepping a
+    fixed-length rollout.  Previously unbounded (>30 min, killed); the
+    Wave 8 refactor brings it down to tens of seconds.
+    """
+
+    def _body(carry, _):
+        s, k = carry
+        k, sub = jax.random.split(k)
+        ns, _obs, _r, _d = _step_impl(s, jnp.int32(0), sub)
+        return (ns, k), None
+
+    def _rollout(s, k):
+        (final_s, _), _ = jax.lax.scan(_body, (s, k), None, length=n_steps)
+        return final_s
+
+    fn = jax.jit(jax.vmap(_rollout))
+    batched_state = jax.tree_util.tree_map(
+        lambda x: jnp.broadcast_to(x, (batch,) + x.shape), state
+    )
+    keys = jax.random.split(key, batch)
+    t0 = time.perf_counter()
+    out = fn(batched_state, keys)
+    jax.block_until_ready(out)
+    return _wall(t0)
+
+
 def _build_state():
     env = NethaxEnv()
     state, _obs = env.reset(jax.random.PRNGKey(0))
@@ -106,6 +135,10 @@ def main() -> None:
     ap.add_argument(
         "--skip-scan", action="store_true",
         help="Skip the scan measurement (debug; scan can dwarf single-jit).",
+    )
+    ap.add_argument(
+        "--skip-vmap-scan", action="store_true",
+        help="Skip the vmap(scan(...)) PPO-shape measurement.",
     )
     ap.add_argument(
         "--scan-steps", type=int, default=16,
@@ -150,13 +183,26 @@ def main() -> None:
         print(f"      {t_vmap:7.2f}s")
 
     if args.skip_scan:
-        print("\n[3/3] scan: SKIPPED")
+        print("\n[3/4] scan: SKIPPED")
     else:
-        print(f"\n[3/3] jit(scan(_step_impl, length={args.scan_steps})) cold compile ...", flush=True)
+        print(f"\n[3/4] jit(scan(_step_impl, length={args.scan_steps})) cold compile ...", flush=True)
         t_scan = _compile_scan(state, action, key, n_steps=args.scan_steps)
         results["jit_scan_s"] = t_scan
         results["scan_length"] = args.scan_steps
         print(f"      {t_scan:7.2f}s")
+
+    if args.skip_vmap_scan:
+        print("\n[4/4] vmap(scan): SKIPPED")
+    else:
+        print(
+            f"\n[4/4] jit(vmap(scan(_step_impl, length={args.scan_steps}, batch={args.vmap_batch}))) "
+            f"cold compile ...", flush=True,
+        )
+        t_vs = _compile_vmap_scan(
+            state, key, n_steps=args.scan_steps, batch=args.vmap_batch,
+        )
+        results["jit_vmap_scan_s"] = t_vs
+        print(f"      {t_vs:7.2f}s")
 
     out_path = _PROJECT_ROOT / args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)
