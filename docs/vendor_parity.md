@@ -13,7 +13,7 @@ For the higher-level architecture, see [`architecture.md`](architecture.md). For
 | Subsystem | nethax module | Parity | Vendor source |
 |---|---|---|---|
 | Env step (moveloop) | `Nethax/nethax/env.py::_step_impl` | full | `vendor/nethack/src/allmain.c::moveloop` lines ~200-360 |
-| Action dispatch | `Nethax/nethax/subsystems/action_dispatch.py::_HANDLERS` | full surface (43 slots) | `vendor/nethack/src/cmd.c` (per-handler citations inline) |
+| Action dispatch | `Nethax/nethax/subsystems/action_dispatch.py::_HANDLERS` | full surface (43 slots; internally compacted to 29 via direction-shared move/run for compile-time, Wave 8 #1) | `vendor/nethack/src/cmd.c` (per-handler citations inline) |
 | RNG primitives | `Nethax/nethax/rng.py` (`rn2`, `rnd`, `rn1`, `dice_roll`, `weighted_choice`) | full | `vendor/nethack/src/rnd.c` |
 
 ---

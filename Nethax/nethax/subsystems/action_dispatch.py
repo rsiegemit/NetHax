@@ -139,6 +139,24 @@ _DELTAS = {
     "SW": ( 1, -1),
 }
 
+# Direction-indexed table: dir_idx ∈ [0,7] → (dy, dx).
+# Order matches _SLOT_MOVE_* / _SLOT_RUN_* (N=0, E=1, S=2, W=3, NE=4, SE=5, SW=6, NW=7).
+# Used by the compact movement/run handlers (Wave 8 compile-time refactor) so
+# all 8 directions share a single jaxpr instead of being traced 8 times.
+_DIR_TABLE: jnp.ndarray = jnp.array(
+    [
+        _DELTAS["N"],
+        _DELTAS["E"],
+        _DELTAS["S"],
+        _DELTAS["W"],
+        _DELTAS["NE"],
+        _DELTAS["SE"],
+        _DELTAS["SW"],
+        _DELTAS["NW"],
+    ],
+    dtype=jnp.int32,
+)
+
 # ---------------------------------------------------------------------------
 # Solid-tile mask  (precomputed as a constant bool array indexed by TileType)
 # For a tile value t, _IS_SOLID[t] == True means movement is blocked.
@@ -474,6 +492,51 @@ _run_ne = _make_run(*_DELTAS["NE"])
 _run_se = _make_run(*_DELTAS["SE"])
 _run_sw = _make_run(*_DELTAS["SW"])
 _run_nw = _make_run(*_DELTAS["NW"])
+
+
+# ---------------------------------------------------------------------------
+# Direction-shared move / run handlers (Wave 8 compile-time refactor).
+#
+# The per-direction _move_n/_move_e/.../_run_n/.../ handlers above each get
+# fully traced into the IR when wired through ``lax.switch`` (16 × ~3700 ops
+# = ~60K eqns).  These shared variants take a runtime ``dir_idx`` and look up
+# the (dy, dx) delta from ``_DIR_TABLE`` so only ONE move body and ONE run
+# body are traced into the dispatch graph.
+#
+# Behavior is byte-identical to the per-direction variants when invoked with
+# the matching ``dir_idx``; vendor reference unchanged
+# (hack.c::domove / hack.c::test_move).
+# ---------------------------------------------------------------------------
+
+def _move_shared(state, rng, dir_idx):
+    """Single-step move in ``dir_idx`` ∈ [0,7] (see _DIR_TABLE ordering)."""
+    dy = _DIR_TABLE[dir_idx, 0]
+    dx = _DIR_TABLE[dir_idx, 1]
+    return _try_step(state, dy, dx, rng)
+
+
+def _run_shared(state, rng, dir_idx):
+    """Run in ``dir_idx`` ∈ [0,7].  Mirrors _make_run's while-loop body but
+    closes over the traced ``dir_idx`` instead of compile-time constants."""
+    dy = _DIR_TABLE[dir_idx, 0]
+    dx = _DIR_TABLE[dir_idx, 1]
+
+    def cond(carry):
+        s, step_count, prev_pos, _rng = carry
+        moved = ~jnp.array_equal(s.player_pos, prev_pos)
+        first = step_count == 0
+        return (first | moved) & (step_count < _RUN_MAX_STEPS)
+
+    def body(carry):
+        s, step_count, _prev_pos, rng_cur = carry
+        prev_pos = s.player_pos
+        sub_rng, next_rng = jax.random.split(rng_cur)
+        new_s = _try_step(s, dy, dx, sub_rng)
+        return new_s, step_count + 1, prev_pos, next_rng
+
+    init = (state, jnp.int32(0), state.player_pos, rng)
+    final_state, _, _, _ = jax.lax.while_loop(cond, body, init)
+    return final_state
 
 
 # ---------------------------------------------------------------------------
@@ -1258,6 +1321,184 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
 _ACTION_TO_HANDLER_IDX: jnp.ndarray = _build_action_to_handler_idx()
 
 # ---------------------------------------------------------------------------
+# Compact dispatch table (Wave 8 compile-time refactor).
+#
+# The legacy ``_HANDLERS`` tuple has 43 entries; 16 of them are
+# direction-specialized move/run handlers that all trace ~3700 ops each into
+# the ``lax.switch`` IR (~60K eqns total → dominates compile time).
+#
+# The compact table folds those 16 into 2 direction-shared handlers
+# (_move_shared / _run_shared) and looks up the direction from a small
+# integer ``dir_idx`` passed alongside (state, rng).  All other handlers are
+# wrapped to accept the unused ``dir_idx`` so the switch branches share a
+# common signature.
+#
+# Legacy ``_HANDLERS`` and the per-direction ``_move_n`` ... ``_run_nw``
+# names are preserved unchanged for tests / external callers; only the
+# ``dispatch_action`` body is rerouted through the compact path.
+# ---------------------------------------------------------------------------
+
+
+def _wrap_no_dir(fn):
+    """Wrap a 2-arg handler (state, rng) into a 3-arg (state, rng, dir_idx).
+
+    The ``dir_idx`` operand is required by ``lax.switch`` since every branch
+    must share a signature; non-movement handlers simply ignore it.
+    """
+
+    def _w(state, rng, _dir_idx):
+        return fn(state, rng)
+
+    _w.__name__ = f"_compat_{fn.__name__}"
+    return _w
+
+
+# Compact slot indices used internally by dispatch_action.  These are an
+# implementation detail — external tests reference the legacy _SLOT_*
+# constants on the public _HANDLERS tuple, which is preserved separately.
+_COMPACT_NOOP       = 0
+_COMPACT_MOVE       = 1
+_COMPACT_RUN        = 2
+_COMPACT_STAIR_UP   = 3
+_COMPACT_STAIR_DOWN = 4
+_COMPACT_WAIT       = 5
+_COMPACT_EAT        = 6
+_COMPACT_QUAFF      = 7
+_COMPACT_READ       = 8
+_COMPACT_ZAP        = 9
+_COMPACT_CAST       = 10
+_COMPACT_PICKUP     = 11
+_COMPACT_DROP       = 12
+_COMPACT_WIELD      = 13
+_COMPACT_WEAR       = 14
+_COMPACT_PUTON      = 15
+_COMPACT_REMOVE     = 16
+_COMPACT_OPEN       = 17
+_COMPACT_CLOSE      = 18
+_COMPACT_KICK       = 19
+_COMPACT_FIGHT      = 20
+_COMPACT_SEARCH     = 21
+_COMPACT_PRAY       = 22
+_COMPACT_TWOWEAPON  = 23
+_COMPACT_THROW      = 24
+_COMPACT_LOOT       = 25
+_COMPACT_APPLY      = 26
+_COMPACT_ENGRAVE    = 27
+_COMPACT_NAME       = 28
+
+
+def _build_compact_handlers():
+    """Return the 29-entry tuple of ``(state, rng, dir_idx) -> state`` handlers."""
+    return (
+        _wrap_no_dir(_noop),          # 0  COMPACT_NOOP
+        _move_shared,                 # 1  COMPACT_MOVE  (dir_idx ∈ [0,7])
+        _run_shared,                  # 2  COMPACT_RUN   (dir_idx ∈ [0,7])
+        _wrap_no_dir(_stair_up),      # 3
+        _wrap_no_dir(_stair_down),    # 4
+        _wrap_no_dir(_wait),          # 5
+        _wrap_no_dir(_handle_eat),    # 6
+        _wrap_no_dir(_handle_quaff),  # 7
+        _wrap_no_dir(_handle_read),   # 8
+        _wrap_no_dir(_handle_zap),    # 9
+        _wrap_no_dir(_handle_cast),   # 10
+        _wrap_no_dir(_handle_pickup), # 11
+        _wrap_no_dir(_handle_drop),   # 12
+        _wrap_no_dir(_handle_wield),  # 13
+        _wrap_no_dir(_handle_wear),   # 14
+        _wrap_no_dir(_handle_put_on), # 15
+        _wrap_no_dir(_handle_remove), # 16
+        _wrap_no_dir(_handle_open),   # 17
+        _wrap_no_dir(_handle_close),  # 18
+        _wrap_no_dir(_handle_kick),   # 19
+        _wrap_no_dir(_handle_fight),  # 20
+        _wrap_no_dir(_handle_search), # 21
+        _wrap_no_dir(_handle_pray),   # 22
+        _wrap_no_dir(_handle_twoweapon),  # 23
+        _wrap_no_dir(_handle_throw),  # 24
+        _wrap_no_dir(_handle_loot),   # 25
+        _wrap_no_dir(_handle_apply),  # 26
+        _wrap_no_dir(_handle_engrave),# 27
+        _wrap_no_dir(_handle_name),   # 28
+    )
+
+
+_COMPACT_HANDLERS: tuple = _build_compact_handlers()
+
+
+def _build_slot_to_compact() -> jnp.ndarray:
+    """Map legacy handler slot (0..42) → compact slot (0..28)."""
+    table = [0] * 43
+    # Movement slots 1..8 → COMPACT_MOVE.
+    for s in (_SLOT_MOVE_N, _SLOT_MOVE_E, _SLOT_MOVE_S, _SLOT_MOVE_W,
+              _SLOT_MOVE_NE, _SLOT_MOVE_SE, _SLOT_MOVE_SW, _SLOT_MOVE_NW):
+        table[s] = _COMPACT_MOVE
+    # Run slots 9..16 → COMPACT_RUN.
+    for s in (_SLOT_RUN_N, _SLOT_RUN_E, _SLOT_RUN_S, _SLOT_RUN_W,
+              _SLOT_RUN_NE, _SLOT_RUN_SE, _SLOT_RUN_SW, _SLOT_RUN_NW):
+        table[s] = _COMPACT_RUN
+    table[_SLOT_NOOP]       = _COMPACT_NOOP
+    table[_SLOT_STAIR_UP]   = _COMPACT_STAIR_UP
+    table[_SLOT_STAIR_DOWN] = _COMPACT_STAIR_DOWN
+    table[_SLOT_WAIT]       = _COMPACT_WAIT
+    table[_SLOT_EAT]        = _COMPACT_EAT
+    table[_SLOT_QUAFF]      = _COMPACT_QUAFF
+    table[_SLOT_READ]       = _COMPACT_READ
+    table[_SLOT_ZAP]        = _COMPACT_ZAP
+    table[_SLOT_CAST]       = _COMPACT_CAST
+    table[_SLOT_PICKUP]     = _COMPACT_PICKUP
+    table[_SLOT_DROP]       = _COMPACT_DROP
+    table[_SLOT_WIELD]      = _COMPACT_WIELD
+    table[_SLOT_WEAR]       = _COMPACT_WEAR
+    table[_SLOT_PUTON]      = _COMPACT_PUTON
+    table[_SLOT_REMOVE]     = _COMPACT_REMOVE
+    table[_SLOT_OPEN]       = _COMPACT_OPEN
+    table[_SLOT_CLOSE]      = _COMPACT_CLOSE
+    table[_SLOT_KICK]       = _COMPACT_KICK
+    table[_SLOT_FIGHT]      = _COMPACT_FIGHT
+    table[_SLOT_SEARCH]     = _COMPACT_SEARCH
+    table[_SLOT_PRAY]       = _COMPACT_PRAY
+    table[_SLOT_TWOWEAPON]  = _COMPACT_TWOWEAPON
+    table[_SLOT_THROW]      = _COMPACT_THROW
+    table[_SLOT_LOOT]       = _COMPACT_LOOT
+    table[_SLOT_APPLY]      = _COMPACT_APPLY
+    table[_SLOT_ENGRAVE]    = _COMPACT_ENGRAVE
+    table[_SLOT_NAME]       = _COMPACT_NAME
+    return jnp.array(table, dtype=jnp.int32)
+
+
+def _build_slot_to_dir_idx() -> jnp.ndarray:
+    """Map legacy handler slot → direction index in ``_DIR_TABLE`` (0..7).
+
+    Non-movement slots map to 0 (the direction is unused for those branches).
+    The order matches ``_DIR_TABLE``: N=0, E=1, S=2, W=3, NE=4, SE=5, SW=6, NW=7.
+    """
+    table = [0] * 43
+    # Move slots.
+    table[_SLOT_MOVE_N]  = 0
+    table[_SLOT_MOVE_E]  = 1
+    table[_SLOT_MOVE_S]  = 2
+    table[_SLOT_MOVE_W]  = 3
+    table[_SLOT_MOVE_NE] = 4
+    table[_SLOT_MOVE_SE] = 5
+    table[_SLOT_MOVE_SW] = 6
+    table[_SLOT_MOVE_NW] = 7
+    # Run slots — same direction order.
+    table[_SLOT_RUN_N]  = 0
+    table[_SLOT_RUN_E]  = 1
+    table[_SLOT_RUN_S]  = 2
+    table[_SLOT_RUN_W]  = 3
+    table[_SLOT_RUN_NE] = 4
+    table[_SLOT_RUN_SE] = 5
+    table[_SLOT_RUN_SW] = 6
+    table[_SLOT_RUN_NW] = 7
+    return jnp.array(table, dtype=jnp.int32)
+
+
+_SLOT_TO_COMPACT: jnp.ndarray = _build_slot_to_compact()
+_SLOT_TO_DIR_IDX: jnp.ndarray = _build_slot_to_dir_idx()
+
+
+# ---------------------------------------------------------------------------
 # Legacy compact index table (Wave 1 — kept for backward compat)
 # ---------------------------------------------------------------------------
 
@@ -1292,18 +1533,19 @@ def dispatch_action(state, action: jnp.int32, rng: jax.Array):
     Implementation
     --------------
     Uses a 256-entry lookup table ``_ACTION_TO_HANDLER_IDX`` to map the
-    action's ASCII value to a handler-slot index, then dispatches via
-    ``jax.lax.switch``.  All 256 table entries and all handler functions are
-    compiled; the switch selects one at runtime with no Python control flow,
-    keeping the step function fully JIT-compatible.
+    action's ASCII value to a 43-slot legacy handler index.  That index is
+    then compressed through ``_SLOT_TO_COMPACT`` (29 slots) so the 16
+    per-direction move/run handlers share two branches in the underlying
+    ``lax.switch`` — reducing XLA compile time roughly 5× (Wave 8 refactor).
 
     JAX primitives used: jax.lax.switch, jax.lax.while_loop, jnp.where,
     jnp.clip, jnp.array_equal.
     """
-    # Clamp action value to [0, 255] for safe table lookup.
     action_val = jnp.clip(jnp.int32(action), 0, 255)
     handler_idx = _ACTION_TO_HANDLER_IDX[action_val].astype(jnp.int32)
-    return jax.lax.switch(handler_idx, _HANDLERS, state, rng)
+    compact_idx = _SLOT_TO_COMPACT[handler_idx]
+    dir_idx     = _SLOT_TO_DIR_IDX[handler_idx]
+    return jax.lax.switch(compact_idx, _COMPACT_HANDLERS, state, rng, dir_idx)
 
 
 def _action_value_to_index(action_value: jnp.int32) -> jnp.int32:
