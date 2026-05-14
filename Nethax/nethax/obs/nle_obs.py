@@ -783,16 +783,17 @@ def build_program_state(env_state) -> jnp.ndarray:
         [4] something_worth_saving — 1 once the game has begun
         [5] 0 reserved
 
-    nethax has no menus or panic states; we report in_moveloop=1 once
-    state.timestep > 0 (game started), something_worth_saving=1 likewise.
+    nethax has no menus or panic states; in_moveloop=1 and
+    something_worth_saving=1 are set as soon as env.reset() has produced
+    a state (i.e., always after reset — matching NLE's behavior on
+    `update_program_state` from the first turn).
 
     Returns:
         int32[6]
     """
-    started = (env_state.timestep > 0).astype(jnp.int32)
     out = jnp.zeros((6,), dtype=jnp.int32)
-    out = out.at[3].set(started)
-    out = out.at[4].set(started)
+    out = out.at[3].set(jnp.int32(1))   # in_moveloop
+    out = out.at[4].set(jnp.int32(1))   # something_worth_saving
     return out
 
 
@@ -841,22 +842,22 @@ def build_tty_colors(env_state) -> jnp.ndarray:
 def build_inv_glyphs(env_state) -> jnp.ndarray:
     """Glyph for each inventory slot. Shape (55,) int16.
 
-    Formula: glyph = GLYPH_OBJ_OFF + type_id for occupied slots.
-    Empty slots (category == 0) yield glyph 0.
-
-    Wave 3 note: InventoryState.items is a scalar stub (single Item, not a
-    52-element array). Slot 0 reflects the stub item when category != 0;
-    all other slots are 0.  Full per-slot wiring requires the Wave 3 inventory
-    array migration.
+    Vendor parity (vendor/nle/win/rl/winrl.cc::observation_glyphs ~line 379):
+      Occupied slots  : glyph = GLYPH_OBJ_OFF + otyp
+      Empty slots     : NO_GLYPH (MAX_GLYPH = 5976)
 
     Returns:
         int16[55]
     """
-    inv = jnp.zeros((55,), dtype=jnp.int16)
-    items = env_state.inventory.items  # batched Item: each field shape (52,)
+    inv = jnp.full((55,), jnp.int16(NO_GLYPH & 0xFFFF), dtype=jnp.int16)
+    items = env_state.inventory.items
     cat = items.category.astype(jnp.int16)
     typ = items.type_id.astype(jnp.int16)
-    glyphs_52 = jnp.where(cat != 0, jnp.int16(GLYPH_OBJ_OFF) + typ, jnp.int16(0))
+    glyphs_52 = jnp.where(
+        cat != 0,
+        jnp.int16(GLYPH_OBJ_OFF) + typ,
+        jnp.int16(NO_GLYPH & 0xFFFF),
+    )
     inv = inv.at[:52].set(glyphs_52)
     return inv
 
@@ -864,28 +865,42 @@ def build_inv_glyphs(env_state) -> jnp.ndarray:
 def build_inv_letters(env_state) -> jnp.ndarray:
     """ASCII letter for each inventory slot. Shape (55,) uint8.
 
-    Mapping: slot 0 -> ord('a'), ..., slot 25 -> ord('z'),
-             slot 26 -> ord('A'), ..., slot 51 -> ord('Z'),
-             slots 52-54 -> 0.
+    Vendor parity (vendor/nle/win/rl/winrl.cc::observation_letters ~line 396):
+      Occupied slots  : obj->invlet  (i.e. 'a'..'z', 'A'..'Z')
+      Empty slots     : 0
 
     Returns:
         uint8[55]
     """
-    return _INV_LETTERS
+    cat = env_state.inventory.items.category
+    occupied = (cat != 0)
+    letters_52 = jnp.where(occupied, _INV_LETTERS[:52], jnp.uint8(0))
+    inv = jnp.zeros((55,), dtype=jnp.uint8)
+    inv = inv.at[:52].set(letters_52)
+    return inv
+
+
+# ObjectClass enum max value + 1; matches vendor MAXOCLASSES in objclass.h.
+_MAXOCLASSES: int = 18
 
 
 def build_inv_oclasses(env_state) -> jnp.ndarray:
     """ObjectClass enum value for each inventory slot. Shape (55,) uint8.
 
-    Wave 3 note: InventoryState.items is a scalar stub. Slot 0 reflects
-    the stub item's category; all other slots are 0.
+    Vendor parity (vendor/nle/win/rl/winrl.cc::observation_oclasses ~line 413):
+      Occupied slots  : obj->oclass  (ObjectClass enum)
+      Empty slots     : MAXOCLASSES (=18, the past-end sentinel)
 
     Returns:
         uint8[55]
     """
-    inv = jnp.zeros((55,), dtype=jnp.uint8)
-    cat_52 = env_state.inventory.items.category.astype(jnp.uint8)
-    inv = inv.at[:52].set(cat_52)
+    inv = jnp.full((55,), jnp.uint8(_MAXOCLASSES), dtype=jnp.uint8)
+    cat = env_state.inventory.items.category
+    occupied = (cat != 0)
+    oclass_52 = jnp.where(occupied,
+                          cat.astype(jnp.uint8),
+                          jnp.uint8(_MAXOCLASSES))
+    inv = inv.at[:52].set(oclass_52)
     return inv
 
 
@@ -968,8 +983,14 @@ def build_blstats(env_state) -> jnp.ndarray:
     # Condition bitmask: placeholder 0 (Wave 3 wires status flags)
     result = result.at[BL_CONDITION].set(jnp.int64(0))
 
-    # Alignment (-1=chaotic, 0=neutral, 1=lawful — matches botl.c)
-    result = result.at[BL_ALIGN].set(jnp.int64(env_state.player_align))
+    # Alignment.  Vendor (botl.c::status_bl_init) uses u.ualign.type:
+    #     A_LAWFUL  =  1
+    #     A_NEUTRAL =  0
+    #     A_CHAOTIC = -1
+    # Our state stores 0=lawful, 1=neutral, 2=chaotic.  Map via 1 - x.
+    result = result.at[BL_ALIGN].set(
+        jnp.int64(1) - jnp.int64(env_state.player_align)
+    )
 
     return result
 
