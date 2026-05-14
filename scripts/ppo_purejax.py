@@ -223,14 +223,19 @@ def make_train_fn(env):
             _flat(advs), _flat(returns),
         )
 
-        # 4. Multi-epoch minibatch SGD
+        # 4. Multi-epoch minibatch SGD.
+        # JAX requires static slice bounds, so we pre-reshape the permutation
+        # to (num_minibatches, mb_size) and index by mb_idx instead of slicing.
+        n_total = args.rollout_steps * args.num_envs
+        mb_size = n_total // args.num_minibatches
         def epoch_body(carry, _):
             ts, rng = carry
             rng, perm_rng = jax.random.split(rng)
-            perm = jax.random.permutation(perm_rng, args.rollout_steps * args.num_envs)
-            mb_size = (args.rollout_steps * args.num_envs) // args.num_minibatches
+            # Shape (num_minibatches, mb_size).
+            perm = jax.random.permutation(perm_rng, n_total)
+            perm_mb = perm.reshape(args.num_minibatches, mb_size)
             def mb_body(ts, mb_idx):
-                idx = perm[mb_idx * mb_size:(mb_idx + 1) * mb_size]
+                idx = perm_mb[mb_idx]                          # (mb_size,)
                 mb = tuple(b[idx] for b in batch)
                 grads, aux = jax.grad(ppo_loss, has_aux=True)(ts.params, mb)
                 ts = ts.apply_gradients(grads=grads)
