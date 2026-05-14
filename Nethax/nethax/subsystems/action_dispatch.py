@@ -521,7 +521,14 @@ def _stair_down(state, rng):
         state.dungeon.current_level,
     )
     new_dungeon = state.dungeon.replace(current_level=new_level)
-    new_state   = state.replace(dungeon=new_dungeon)
+    # Wave 8 vendor parity: track deepest_lev_reached as the max level ever
+    # visited (dungeon.c:deepest_lev_reached).  This drives internal[0] and
+    # the end-of-game scoring bonus.
+    new_deepest = jnp.maximum(
+        state.scoring.deepest_level, new_level.astype(jnp.int8)
+    )
+    new_scoring = state.scoring.replace(deepest_level=new_deepest)
+    new_state   = state.replace(dungeon=new_dungeon, scoring=new_scoring)
     return _apply_fov(new_state)
 
 

@@ -160,6 +160,30 @@ _HUNGER_NAMES = {0: "Satiated", 1: "Not Hungry", 2: "Hungry",
 
 
 # ---------------------------------------------------------------------------
+# Player-name autogen (vendor parity).  Vendor NetHack picks a default name
+# from the user's login when none is given (config.c::askname).  In our
+# self-contained env we have no login, so seed-derive a stable name.
+# ---------------------------------------------------------------------------
+
+_NAME_PREFIXES = (
+    "Adventurer", "Hero", "Wanderer", "Pilgrim", "Seeker", "Voyager",
+    "Champion", "Knight", "Mystic", "Rogue", "Sage", "Scout",
+)
+
+
+def autogen_player_name(seed: int) -> str:
+    """Generate a stable nethack-like default name from an int seed.
+
+    Mirrors vendor `config.c::askname` fallback behavior (use the OS login
+    when no name is supplied).  Produces e.g. "Hero742".
+    """
+    s = abs(int(seed))
+    prefix = _NAME_PREFIXES[s % len(_NAME_PREFIXES)]
+    suffix = s % 1000
+    return f"{prefix}{suffix}"
+
+
+# ---------------------------------------------------------------------------
 # Render helpers
 # ---------------------------------------------------------------------------
 
@@ -181,11 +205,20 @@ def _render_tile_pane(obs, tiles_array):
 _ALIGN_NAMES = {1: "Lawful", 0: "Neutral", -1: "Chaotic"}
 
 
-def _format_status_lines(obs, last_action_name=None):
+def _format_status_lines(obs, last_action_name=None, role_idx=None, player_name=None):
     """Return (name_title_stats, dungeon_stats, message, action_label).
 
     Mirrors vendor/nethack/src/botl.c::do_statusline1 / do_statusline2.
     Pure Python, used by both the live HUD and the parity tests.
+
+    Parameters
+    ----------
+    obs : NLE observation dict
+    last_action_name : str | None — appended to dlvl_line for debugging
+    role_idx : int | None — role index into _ROLE_RANK_TITLES (Valkyrie=10
+        by default).  If None, falls back to 0 (Archeologist) for back-compat
+        with callers that don't supply state.player_role.
+    player_name : str | None — overrides the default "Player" name prefix.
     """
     blstats = np.asarray(obs["blstats"])
     message_bytes = np.asarray(obs["message"])
@@ -210,14 +243,16 @@ def _format_status_lines(obs, last_action_name=None):
     align_name = _ALIGN_NAMES.get(align, "Unaligned")
 
     # Resolve role rank title (Python-only lookup, not JIT-traced).
+    # Wave 8 fix: use the actual role_idx passed in.  Previously the call
+    # site hard-coded role=0, producing "Digger" for a level-1 Valkyrie
+    # instead of the correct "Stripling".
     from Nethax.nethax.obs.nle_obs import role_rank_title
     try:
-        # role/xlevel live on the env state, not the obs dict, so we approximate
-        # via blstats[BL_XP] (xlevel) and surface a generic title when unknown.
-        title = role_rank_title(0, xp)  # role 0 = Archeologist as a stable default
+        title = role_rank_title(int(role_idx) if role_idx is not None else 0, xp)
     except Exception:
         title = "Adventurer"
-    name_line = (f"Player the {title}    "
+    name_prefix = player_name if player_name else "Player"
+    name_line = (f"{name_prefix} the {title}    "
                  f"St:{st} Dx:{dx} Co:{co} In:{in_} Wi:{wi} Ch:{ch}  "
                  f"{align_name}")
 
@@ -228,9 +263,12 @@ def _format_status_lines(obs, last_action_name=None):
     return name_line, dlvl_line, msg_text
 
 
-def _draw_status_panel(screen, font, font_large, obs, last_action_name, y_offset):
+def _draw_status_panel(screen, font, font_large, obs, last_action_name, y_offset,
+                       role_idx=None, player_name=None):
     """Draw the bottom status panel onto screen, mirroring the NLE bot lines."""
-    name_line, dlvl_line, msg_text = _format_status_lines(obs, last_action_name)
+    name_line, dlvl_line, msg_text = _format_status_lines(
+        obs, last_action_name, role_idx=role_idx, player_name=player_name
+    )
 
     blstats = np.asarray(obs["blstats"])
     hp = int(blstats[BL_HP])
@@ -331,6 +369,9 @@ def main():
     state, obs = env.reset(init_rng)
     print("Ready.")
 
+    # Seed-derived player name (vendor parity for config.c::askname fallback).
+    player_name = autogen_player_name(0)
+
     show_inventory = False
     last_action_name = "---"
     running = True
@@ -382,8 +423,14 @@ def main():
         tile_surface = pygame.surfarray.make_surface(pixels.transpose(1, 0, 2))
         screen.blit(tile_surface, (0, 0))
 
-        # Status panel
-        _draw_status_panel(screen, font, font_large, obs, last_action_name, TILE_PANE_H)
+        # Status panel — pass real role index (from env state) so rank
+        # titles render correctly (e.g. Stripling, not Digger, for a
+        # level-1 Valkyrie).
+        role_idx = int(np.asarray(state.player_role))
+        _draw_status_panel(
+            screen, font, font_large, obs, last_action_name, TILE_PANE_H,
+            role_idx=role_idx, player_name=player_name,
+        )
 
         # Inventory overlay (toggled with 'i')
         if show_inventory:

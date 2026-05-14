@@ -751,14 +751,14 @@ def build_internal(env_state) -> jnp.ndarray:
 
     Field layout per vendor/nle/win/rl/winrl.cc:278-287
     (called from NetHackRL::update_observation):
-        [0] deepest_lev_reached   — max level depth ever visited
+        [0] deepest_lev_reached   — max level depth ever visited (Wave 8: vendor parity)
         [1] in_yn_function        — always 0 in nethax (no y/n prompts)
         [2] in_getlin             — always 0 in nethax (no text-input prompts)
         [3] xwaitingforspace      — always 0 in nethax (no --More-- pauses)
         [4] stairs_down           — 1 if player is standing on a down-stair
         [5] 0 (legacy core RNG seed slot)
         [6] 0 (legacy display RNG seed slot)
-        [7] uhunger               — raw hunger counter (0..2000 typical)
+        [7] uhunger               — raw nutrition counter (Wave 8: vendor parity)
         [8] urexp                 — total experience score
 
     Returns:
@@ -772,25 +772,25 @@ def build_internal(env_state) -> jnp.ndarray:
     cur_tile = env_state.terrain[branch, level_idx, pr, pc]
     stairs_down = (cur_tile == jnp.int8(TileType.STAIRCASE_DOWN)).astype(jnp.int32)
 
-    cur_level = jnp.int32(env_state.dungeon.current_level)
+    # Vendor parity (Wave 8): deepest_lev_reached comes from
+    # scoring.deepest_level (record_deepest_level is called from action_dispatch
+    # whenever the player advances to a previously-unvisited level).  Falls
+    # back to current_level when the tracker hasn't been initialized.
+    deepest = jnp.maximum(
+        jnp.int32(env_state.scoring.deepest_level),
+        jnp.int32(env_state.dungeon.current_level),
+    )
 
     out = jnp.zeros((9,), dtype=jnp.int32)
-    # DIVERGENCE: vendor writes deepest_lev_reached(FALSE) here (the max
-    # level the player has ever visited).  nethax has no per-game "deepest
-    # reached" tracker, so we pass current_level.  Agents trained on NLE
-    # see a monotonically non-decreasing value while ours can decrease if
-    # the player goes back upstairs.  Documented; not a blocker for RL parity.
-    out = out.at[0].set(cur_level)                                 # current depth
+    out = out.at[0].set(deepest)                                   # deepest_lev_reached
     out = out.at[1].set(jnp.int32(0))                              # in_yn_function
     out = out.at[2].set(jnp.int32(0))                              # in_getlin
     out = out.at[3].set(jnp.int32(0))                              # xwaitingforspace
     out = out.at[4].set(stairs_down)                               # stairs_down
     out = out.at[5].set(jnp.int32(0))                              # legacy core seed
     out = out.at[6].set(jnp.int32(0))                              # legacy disp seed
-    # NLE puts raw hunger counter (uhunger) here; nethax stores hunger as an
-    # enum state in status.hunger_state — pass that through (close-enough for
-    # agent parity, since uhunger is mainly a derived signal).
-    out = out.at[7].set(jnp.int32(env_state.status.hunger_state))
+    # Vendor parity (Wave 8): raw u.uhunger nutrition counter (0..2000+).
+    out = out.at[7].set(jnp.int32(env_state.status.nutrition))
     out = out.at[8].set(jnp.int32(env_state.scoring.score))
     return out
 
@@ -1257,8 +1257,37 @@ def build_blstats(env_state) -> jnp.ndarray:
     result = result.at[BL_DNUM].set(jnp.int64(env_state.dungeon.current_branch))
     result = result.at[BL_DLEVEL].set(jnp.int64(env_state.dungeon.current_level))
 
-    # Condition bitmask: placeholder 0 (Wave 3 wires status flags)
-    result = result.at[BL_CONDITION].set(jnp.int64(0))
+    # Condition bitmask — vendor botl.c::do_statusline2 + botl.h:107-134.
+    # Wave 8 parity: derive BL_MASK_* bits from StatusState.timed_statuses
+    # countdowns.  A status is "active" when its remaining-turns counter > 0.
+    # Cite: vendor/nethack/include/botl.h:107-134 (BL_MASK_* constants),
+    #       vendor/nethack/src/botl.c::do_statusline2 (condition rendering).
+    from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS
+    from Nethax.nethax.constants.blstats import (
+        BL_MASK_BLIND, BL_MASK_CONF, BL_MASK_DEAF, BL_MASK_FOODPOIS,
+        BL_MASK_HALLU, BL_MASK_SLIME, BL_MASK_STONE, BL_MASK_STRNGL,
+        BL_MASK_STUN, BL_MASK_TERMILL, BL_MASK_PARLYZ, BL_MASK_LEV,
+        BL_MASK_FLY,
+    )
+    ts = env_state.status.timed_statuses
+    cond = jnp.int64(0)
+    cond = cond | jnp.where(ts[int(_TS.BLIND)]      > 0, jnp.int64(BL_MASK_BLIND),    jnp.int64(0))
+    cond = cond | jnp.where(ts[int(_TS.CONFUSION)]  > 0, jnp.int64(BL_MASK_CONF),     jnp.int64(0))
+    cond = cond | jnp.where(ts[int(_TS.STUNNED)]    > 0, jnp.int64(BL_MASK_STUN),     jnp.int64(0))
+    cond = cond | jnp.where(ts[int(_TS.HALLUCINATION)] > 0, jnp.int64(BL_MASK_HALLU), jnp.int64(0))
+    cond = cond | jnp.where(ts[int(_TS.DEAF)]       > 0, jnp.int64(BL_MASK_DEAF),     jnp.int64(0))
+    cond = cond | jnp.where(ts[int(_TS.STONED)]     > 0, jnp.int64(BL_MASK_STONE),    jnp.int64(0))
+    cond = cond | jnp.where(ts[int(_TS.SLIMED)]     > 0, jnp.int64(BL_MASK_SLIME),    jnp.int64(0))
+    cond = cond | jnp.where(ts[int(_TS.STRANGLED)]  > 0, jnp.int64(BL_MASK_STRNGL),   jnp.int64(0))
+    cond = cond | jnp.where(ts[int(_TS.FROZEN)]     > 0, jnp.int64(BL_MASK_PARLYZ),   jnp.int64(0))
+    cond = cond | jnp.where(ts[int(_TS.LEVITATION_TMP)] > 0, jnp.int64(BL_MASK_LEV),  jnp.int64(0))
+    cond = cond | jnp.where(ts[int(_TS.FLYING_TMP)] > 0, jnp.int64(BL_MASK_FLY),      jnp.int64(0))
+    # SICK with food-poisoning kind -> FOODPOIS; chronic illness -> TERMILL.
+    sick_active = ts[int(_TS.SICK)] > 0
+    is_foodpois = env_state.status.sick_kind == jnp.int8(1)
+    cond = cond | jnp.where(sick_active & is_foodpois, jnp.int64(BL_MASK_FOODPOIS), jnp.int64(0))
+    cond = cond | jnp.where(sick_active & ~is_foodpois, jnp.int64(BL_MASK_TERMILL), jnp.int64(0))
+    result = result.at[BL_CONDITION].set(cond)
 
     # Alignment.  Vendor (botl.c::status_bl_init) uses u.ualign.type:
     #     A_LAWFUL  =  1
