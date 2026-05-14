@@ -17,10 +17,18 @@ BENCH_SCRIPT = Path(__file__).parent.parent / "bench" / "throughput.py"
 RESULTS_JSON = Path(__file__).parent.parent / "bench" / "results" / "throughput.json"
 
 
+# The smoke test launches a subprocess that JIT-compiles the env (~30-90 s on
+# CPU).  That's too slow for inclusion in the default regression suite — the
+# JIT cache state can also occasionally deadlock under XLA, defeating
+# pytest-timeout (which can't reach into XLA's C++ thread).  Opt-in only:
+#
+#     BENCH_SMOKE=1 pytest tests/test_benchmark_smoke.py
+#
 @pytest.mark.skipif(
-    os.environ.get("BENCH_SMOKE", "1") == "0",
-    reason="BENCH_SMOKE=0 — benchmark smoke test disabled",
+    os.environ.get("BENCH_SMOKE") != "1",
+    reason="set BENCH_SMOKE=1 to run the benchmark smoke test (~80 s subprocess)",
 )
+@pytest.mark.timeout(600)
 def test_benchmark_smoke(tmp_path):
     """Run benchmark in smoke mode; assert non-empty JSON output."""
     # JIT compile of env._step_jit happens on first call inside the subprocess
