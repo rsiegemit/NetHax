@@ -111,22 +111,22 @@ def _reset_one(env, rng):
 
 
 def _step_one(env, state, action, rng, prev_score):
+    """One vmap-friendly env.step.
+
+    NOTE: env.reset is *not* vmap-safe (character creation has Python-level
+    int() casts).  So we don't auto-reset on done inside the rollout — the
+    env's done flag is sticky, GAE handles the discount masking, and the
+    outer loop re-seeds with a fresh sequential reset between training
+    sessions.  Per-episode resets in the middle of training would require
+    making create_character jit-friendly first (Wave 7 work).
+    """
     new_state, obs, _r0, done, _info = env.step(state, action, rng)
     g, b = _obs_to_tensors(obs)
     score = jnp.int32(obs["blstats"][BL_SCORE])
-    # NLE-style: reward is score delta; clip done-step delta to score itself.
     reward = (score - prev_score).astype(jnp.float32)
-    # On done, auto-reset; reward already counted; new prev_score = 0.
-    def _auto_reset(_):
-        rng_r = jax.random.fold_in(rng, 7)
-        return _reset_one(env, rng_r)
-    rs = _auto_reset(None)
-    new_state = jax.tree.map(
-        lambda a, b: jnp.where(done, a, b), rs[0], new_state
-    )
-    g = jnp.where(done, rs[1], g)
-    b = jnp.where(done, rs[2], b)
-    score = jnp.where(done, rs[3], score)
+    # Mask reward to 0 on terminal step (we don't reset, so score wouldn't
+    # actually drop — but we do want to stop accumulating reward on dead envs).
+    reward = jnp.where(done, jnp.float32(0.0), reward)
     return new_state, g, b, score, reward, done
 
 
@@ -145,8 +145,10 @@ class Transition(NamedTuple):
 
 
 def make_train_fn(env):
-    vstep  = jax.vmap(_step_one,  in_axes=(None, 0, 0, 0, 0))
-    vreset = jax.vmap(_reset_one, in_axes=(None, 0))
+    # env.step is fully jit-safe → safe under vmap.
+    # env.reset is NOT vmap-safe (Python int() casts in create_character),
+    # so the caller does N sequential resets and stacks the result manually.
+    vstep = jax.vmap(_step_one, in_axes=(None, 0, 0, 0, 0))
 
     def rollout(carry, _):
         train_state, state, glyphs, blstats, score, rng = carry
@@ -244,7 +246,7 @@ def make_train_fn(env):
         mean_step_reward = traj.reward.mean()
         return train_state, (state, g, b, score, rng), mean_step_reward
 
-    return train_iter, vreset
+    return train_iter
 
 
 # ---------------------------------------------------------------------------
@@ -285,8 +287,18 @@ def main():
     # Init parallel envs
     rng, reset_rng = jax.random.split(rng)
     reset_rngs = jax.random.split(reset_rng, args.num_envs)
-    train_iter, vreset = make_train_fn(env)
-    state, g, b, score = vreset(env, reset_rngs)
+    train_iter = make_train_fn(env)
+    # Sequential reset (env.reset is not vmap-safe — see _step_one docstring).
+    # One-shot cost: ~num_envs * (env JIT compile / num_envs) seconds.
+    print(f"Resetting {args.num_envs} envs sequentially …")
+    t_reset = time.perf_counter()
+    states_l, g_l, b_l, sc_l = [], [], [], []
+    for i in range(args.num_envs):
+        s, gi, bi, sci = _reset_one(env, reset_rngs[i])
+        states_l.append(s); g_l.append(gi); b_l.append(bi); sc_l.append(sci)
+    state = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states_l)
+    g = jnp.stack(g_l); b = jnp.stack(b_l); score = jnp.stack(sc_l)
+    print(f"  done in {time.perf_counter() - t_reset:.1f}s")
     env_carry = (state, g, b, score, rng)
 
     # Warm-up compile
