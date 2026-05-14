@@ -83,6 +83,19 @@ class NethaxEnv:
         # Populate level 1 with monsters after dungeon gen.
         state = populate_level_with_monsters(state, rng_monsters, n_monsters=5)
 
+        # Seed the explored mask via FOV so the player can see their starting
+        # room on the very first frame.  Without this the initial obs is all
+        # NO_GLYPH and the UI shows an empty screen.
+        from Nethax.nethax.fov import compute_fov
+        vis = compute_fov(
+            state.terrain[0, 0, :, :],
+            state.player_pos.astype(jnp.int32),
+        )                                                  # bool[MAP_H, MAP_W]
+        new_explored = state.explored.at[0, 0].set(
+            state.explored[0, 0] | vis
+        )
+        state = state.replace(explored=new_explored)
+
         obs = build_nle_observation(state)
         return state, obs
 
