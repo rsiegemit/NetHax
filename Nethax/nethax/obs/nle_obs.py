@@ -32,8 +32,77 @@ from Nethax.nethax.constants.blstats import (
     BL_AC, BL_HD, BL_XP, BL_EXP, BL_TIME, BL_HUNGER, BL_CAP,
     BL_DNUM, BL_DLEVEL, BL_CONDITION, BL_ALIGN,
 )
-from Nethax.nethax.constants.glyphs import GLYPH_MON_OFF, GLYPH_CMAP_OFF, GLYPH_OBJ_OFF, NO_GLYPH
+from Nethax.nethax.constants.glyphs import (
+    GLYPH_MON_OFF, GLYPH_PET_OFF, GLYPH_INVIS_OFF, GLYPH_DETECT_OFF,
+    GLYPH_BODY_OFF, GLYPH_RIDDEN_OFF, GLYPH_OBJ_OFF, GLYPH_CMAP_OFF,
+    GLYPH_EXPLODE_OFF, GLYPH_ZAP_OFF, GLYPH_SWALLOW_OFF,
+    GLYPH_WARNING_OFF, GLYPH_STATUE_OFF, MAX_GLYPH, NO_GLYPH,
+)
 from Nethax.nethax.constants import NUM_TILE_TYPES
+
+
+# ---------------------------------------------------------------------------
+# Monster-symbol → char  (vendor/nethack/include/monsym.h ::: S_*)
+# Index = MonsterSymbol value (0..60), entry = ASCII char.
+# ---------------------------------------------------------------------------
+
+def _build_mon_sym_to_char() -> jnp.ndarray:
+    table = [ord(' ')] + [0] * 60
+    # Lowercase a-z (1..26)
+    for i in range(26):
+        table[1 + i] = ord('a') + i
+    # Uppercase A-Z (27..52)
+    for i in range(26):
+        table[27 + i] = ord('A') + i
+    table[53] = ord('@')   # S_HUMAN
+    table[54] = ord(' ')   # S_GHOST
+    table[55] = ord("'")   # S_GOLEM
+    table[56] = ord('&')   # S_DEMON
+    table[57] = ord(';')   # S_EEL
+    table[58] = ord(':')   # S_LIZARD
+    table[59] = ord('~')   # S_WORM_TAIL
+    table[60] = ord(']')   # S_MIMIC_DEF
+    return jnp.array(table, dtype=jnp.uint8)
+
+
+_MON_SYM_TO_CHAR = _build_mon_sym_to_char()
+
+
+# Monster-index → char  (resolves MONSTERS[idx].symbol → MON_SYM_TO_CHAR).
+# Built once at module-load; 381-entry uint8 table.
+def _build_mon_idx_to_char() -> jnp.ndarray:
+    from Nethax.nethax.constants.monsters import MONSTERS
+    sym_to_char_py = bytes(int(_MON_SYM_TO_CHAR[i]) for i in range(61))
+    arr = []
+    for m in MONSTERS:
+        if m is None:
+            arr.append(ord(' '))
+        else:
+            s = int(m.symbol)
+            arr.append(sym_to_char_py[s] if 0 <= s < 61 else ord('?'))
+    return jnp.array(arr, dtype=jnp.uint8)
+
+
+_MON_IDX_TO_CHAR = _build_mon_idx_to_char()
+
+
+# Object-index → char  (resolves OBJECTS[idx].class_ → def_oc_syms char).
+# vendor/nethack/src/objects.c::def_oc_syms.
+def _build_obj_idx_to_char() -> jnp.ndarray:
+    from Nethax.nethax.constants.objects import OBJECTS
+    _CLASS_CHAR = {
+        0: '*', 1: ']', 2: ')', 3: '[', 4: '=', 5: '"', 6: '(', 7: '%',
+        8: '!', 9: '?', 10: '+', 11: '/', 12: '$', 13: '*', 14: '`',
+        15: '0', 16: '_', 17: '.',
+    }
+    arr = []
+    for o in OBJECTS:
+        c = ord(_CLASS_CHAR.get(int(o.class_), '?')) if o is not None else ord(' ')
+        arr.append(c)
+    return jnp.array(arr, dtype=jnp.uint8)
+
+
+_OBJ_IDX_TO_CHAR = _build_obj_idx_to_char()
 
 # ---------------------------------------------------------------------------
 # Key registry — 17 keys, matches vendor/nle/nle/nethack/nethack.py exactly
@@ -938,12 +1007,29 @@ def build_glyphs(env_state) -> jnp.ndarray:
     glyphs = jnp.where(explored, terrain_glyphs, no_glyph_val)
 
     # Overlay player at player_pos (row, col).
-    # Player is monster type 0 in NLE (GLYPH_MON_OFF + 0).
+    # The player's display glyph is their race's monster type (human=256,
+    # elf=260, dwarf=43, gnome=162, orc=71 in our MONSTERS table), unless
+    # they are polymorphed (then it's the polymorph form).
+    #
+    # Citation: vendor/nethack/src/display.c::display_self / show_glyph
+    #   uses `u.umonnum` (the player's current monster type).
     player_row = jnp.int32(env_state.player_pos[0])
     player_col = jnp.int32(env_state.player_pos[1])
-    # Clamp col to [0,78] since glyphs is 79 wide, terrain is 80 wide
+    # Clamp col to [0,78] since glyphs is 79 wide, terrain is 80 wide.
     player_col_clamped = jnp.clip(player_col, 0, 78)
-    player_glyph = jnp.int16(GLYPH_MON_OFF)
+
+    # Race -> base monster index in MONSTERS.  Order matches Race enum:
+    #   HUMAN=0, ELF=1, DWARF=2, GNOME=3, ORC=4
+    _RACE_TO_MON_IDX = jnp.array([256, 260, 43, 162, 71], dtype=jnp.int32)
+    race_idx = jnp.clip(jnp.int32(env_state.player_race), 0, 4)
+    base_mon = _RACE_TO_MON_IDX[race_idx]
+
+    # If polymorphed, use the polymorph form instead.
+    is_poly = env_state.polymorph.is_polymorphed
+    poly_form = jnp.int32(env_state.polymorph.current_form_idx)
+    mon_idx = jnp.where(is_poly, poly_form, base_mon)
+
+    player_glyph = (jnp.int32(GLYPH_MON_OFF) + mon_idx).astype(jnp.int16)
     glyphs = glyphs.at[player_row, player_col_clamped].set(player_glyph)
 
     return glyphs
@@ -1050,23 +1136,74 @@ def build_tty(env_state) -> dict[str, jnp.ndarray]:
 def _build_chars(glyphs: jnp.ndarray) -> jnp.ndarray:
     """Derive the chars (21x79 uint8) map from the glyph grid.
 
-    chars[r,c] is the ASCII character corresponding to glyphs[r,c].
-    Uses the same glyph->cmap->char pipeline as tty rendering.
+    chars[r,c] is the ASCII character corresponding to glyphs[r,c]:
+      - Monster / pet / ridden / detected / statue → MonsterSymbol char
+      - Object                                     → ObjectClass char
+      - Cmap (terrain)                             → defsym char
+      - Body / corpse                              → '%'
+      - Invis monster                              → 'I'
+      - Warning                                    → '0'-'5'
+      - Unexplored (NO_GLYPH)                      → ' '
+
+    Citation: vendor/nethack/include/monsym.h + defsym.h + vendor/nethack/
+              src/objects.c::def_oc_syms.
 
     Returns:
         uint8[21, 79]
     """
-    no_glyph_val = jnp.int16(NO_GLYPH & 0xFFFF)
-    player_glyph_val = jnp.int16(GLYPH_MON_OFF)
+    g = glyphs.astype(jnp.int32)
+    no_glyph_val = jnp.int32(NO_GLYPH)
 
-    cmap_idx = (glyphs.astype(jnp.int32) - GLYPH_CMAP_OFF).astype(jnp.int32)
-    cmap_idx_clamped = jnp.clip(cmap_idx, 0, len(_CMAP_TO_CHAR) - 1)
-    terrain_chars = _CMAP_TO_CHAR[cmap_idx_clamped]
+    # ---- per-glyph category resolution (jit-safe via lookup tables) ----
+    cmap_idx = jnp.clip(g - GLYPH_CMAP_OFF, 0, len(_CMAP_TO_CHAR) - 1)
+    terrain_chars = _CMAP_TO_CHAR[cmap_idx]
 
-    is_player = glyphs == player_glyph_val
-    is_unexplored = glyphs == no_glyph_val
+    # Monster / pet / ridden / detected → use MONSTERS[idx].symbol → char
+    mon_idx_raw = jnp.where(g < GLYPH_PET_OFF, g - GLYPH_MON_OFF,
+                  jnp.where(g < GLYPH_INVIS_OFF, g - GLYPH_PET_OFF,
+                  jnp.where(g < GLYPH_BODY_OFF, g - GLYPH_DETECT_OFF,
+                  jnp.where(g < GLYPH_OBJ_OFF, g - GLYPH_RIDDEN_OFF, 0))))
+    mon_idx = jnp.clip(mon_idx_raw, 0, _MON_IDX_TO_CHAR.shape[0] - 1)
+    mon_chars = _MON_IDX_TO_CHAR[mon_idx]
 
-    chars = jnp.where(is_player, jnp.uint8(ord('@')), terrain_chars)
+    # Object → OBJECTS[idx].class_ → def_oc_syms char
+    obj_idx = jnp.clip(g - GLYPH_OBJ_OFF, 0, _OBJ_IDX_TO_CHAR.shape[0] - 1)
+    obj_chars = _OBJ_IDX_TO_CHAR[obj_idx]
+
+    # Statue glyph → '`'  (vendor S_grave-ish; just shows as backtick)
+    statue_char = jnp.uint8(ord('`'))
+
+    # Body / corpse → '%'
+    body_char = jnp.uint8(ord('%'))
+
+    # Invisible monster → 'I'
+    invis_char = jnp.uint8(ord('I'))
+
+    # Warning → '0'-'5' (6 levels)
+    warn_idx = jnp.clip(g - GLYPH_WARNING_OFF, 0, 5)
+    warn_chars = (jnp.uint8(ord('0')) + warn_idx).astype(jnp.uint8)
+
+    # ---- category masks ----
+    is_mon       = (g >= GLYPH_MON_OFF)     & (g < GLYPH_INVIS_OFF)
+    is_invis     = (g >= GLYPH_INVIS_OFF)   & (g < GLYPH_DETECT_OFF)
+    is_detect    = (g >= GLYPH_DETECT_OFF)  & (g < GLYPH_BODY_OFF)
+    is_body      = (g >= GLYPH_BODY_OFF)    & (g < GLYPH_RIDDEN_OFF)
+    is_ridden    = (g >= GLYPH_RIDDEN_OFF)  & (g < GLYPH_OBJ_OFF)
+    is_obj       = (g >= GLYPH_OBJ_OFF)     & (g < GLYPH_CMAP_OFF)
+    is_cmap      = (g >= GLYPH_CMAP_OFF)    & (g < GLYPH_EXPLODE_OFF)
+    is_warn      = (g >= GLYPH_WARNING_OFF) & (g < GLYPH_STATUE_OFF)
+    is_statue    = (g >= GLYPH_STATUE_OFF)  & (g < MAX_GLYPH)
+    is_unexplored = (g == no_glyph_val)
+
+    # Default to space (covers EXPLODE / ZAP / SWALLOW / unmapped).
+    chars = jnp.full(g.shape, jnp.uint8(ord(' ')))
+    chars = jnp.where(is_cmap,    terrain_chars, chars)
+    chars = jnp.where(is_obj,     obj_chars,     chars)
+    chars = jnp.where(is_mon | is_detect | is_ridden, mon_chars, chars)
+    chars = jnp.where(is_body,    body_char,     chars)
+    chars = jnp.where(is_invis,   invis_char,    chars)
+    chars = jnp.where(is_warn,    warn_chars,    chars)
+    chars = jnp.where(is_statue,  statue_char,   chars)
     chars = jnp.where(is_unexplored, jnp.uint8(ord(' ')), chars)
     return chars
 
