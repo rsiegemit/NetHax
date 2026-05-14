@@ -169,16 +169,6 @@ Acknowledgments:
 - [MiniHack](https://github.com/facebookresearch/minihack) for the curriculum-style env registry.
 - The JAX, Flax, and Gymnasium projects.
 
-## Roadmap
-
-Nethax landed full vendor parity at the close of **Wave 6** (the current state). Remaining work is opt-in expansion, not core fidelity:
-
-- **GPU benchmark sweep.** Throughput on a CUDA box at batch sizes 512 / 4096 / 16 384 — the headline number for the "vmap wins" story. See [`docs/benchmark.md`](docs/benchmark.md).
-- **Shopkeepers + bones (full fidelity).** Currently simplified by design (deliberate divergence — see [`docs/vendor_parity.md`](docs/vendor_parity.md)); promoting these to byte-equal vendor parity is a discrete next-wave task.
-- **Licensing audit.** The verbatim vendor `MAP` strings ship under NGPL; a clean audit of the boundary between ported algorithms (BSD-friendly) and verbatim vendor data (NGPL) is deferred.
-- **Tile-art uplift.** The current `assets/screenshot.png` uses the NLE vendor tile atlas. A nethax-native atlas + an SVG/PNG glyph-mode renderer for inline-in-browser docs would be a nice quality-of-life win.
-- **Lua / wizard-mode / mail / music.** Out of scope by design — not on the roadmap.
-
 ## Citation
 
 If you use Nethax in research, please cite both the original NetHack DevTeam and the NLE paper, alongside this implementation:
