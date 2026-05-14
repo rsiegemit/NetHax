@@ -775,7 +775,12 @@ def build_internal(env_state) -> jnp.ndarray:
     cur_level = jnp.int32(env_state.dungeon.current_level)
 
     out = jnp.zeros((9,), dtype=jnp.int32)
-    out = out.at[0].set(cur_level)                                 # deepest known
+    # DIVERGENCE: vendor writes deepest_lev_reached(FALSE) here (the max
+    # level the player has ever visited).  nethax has no per-game "deepest
+    # reached" tracker, so we pass current_level.  Agents trained on NLE
+    # see a monotonically non-decreasing value while ours can decrease if
+    # the player goes back upstairs.  Documented; not a blocker for RL parity.
+    out = out.at[0].set(cur_level)                                 # current depth
     out = out.at[1].set(jnp.int32(0))                              # in_yn_function
     out = out.at[2].set(jnp.int32(0))                              # in_getlin
     out = out.at[3].set(jnp.int32(0))                              # xwaitingforspace
