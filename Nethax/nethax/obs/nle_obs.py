@@ -643,20 +643,30 @@ def build_colors(env_state) -> jnp.ndarray:
 def build_specials(env_state) -> jnp.ndarray:
     """Per-tile special flags. Shape (21, 79) uint8.
 
-    Bit definitions (vendor/nethack/include/display.h MG_* macros — we use a
-    compact 6-bit encoding suitable for RL agents):
-      bit 0 (0x01): corpse on floor (body glyph or food/"corpse" object)
-      bit 1 (0x02): pile (2+ stacks of items on tile, MG_OBJPILE)
-      bit 2 (0x04): trap visible (revealed trap on this tile)
-      bit 3 (0x08): secret door (currently unset — engine has no secret-door
-                                  discovery state yet)
-      bit 4 (0x10): invisible monster sensed (currently unset — no invis flag)
-      bit 5 (0x20): object present (any ground item)
+    Bit definitions match vendor exactly
+    (vendor/nethack/include/display.h:995-1009 MG_* macros, written via
+    vendor/nle/win/rl/winrl.cc::store_mapped_glyph using the `special` arg
+    produced by mapglyph()):
 
-    Reads:
-      - state.traps.trap_type / .revealed   for trap bit
-      - state.ground_items.category         for object / pile / corpse bits
-      - state.ground_items.type_id          for corpse type identification
+      0x01  MG_HERO     — the hero tile
+      0x02  MG_CORPSE   — corpse on floor (body glyph or food/"corpse" object)
+      0x04  MG_INVIS    — invisible monster sensed
+      0x08  MG_DETECT   — detected monster
+      0x10  MG_PET      — pet
+      0x20  MG_RIDDEN   — ridden monster
+      0x40  MG_STATUE   — statue
+      0x80  MG_OBJPILE  — 2+ object stacks on this tile
+
+    nethax-current support:
+      MG_HERO     : set on player tile
+      MG_CORPSE   : food category + corpse type_id on ground stack
+      MG_OBJPILE  : 2+ ground stacks
+      MG_PET      : 1 if at least one pet exists at this tile (state.pets)
+      MG_INVIS/MG_DETECT/MG_RIDDEN/MG_STATUE: unset for now (no engine state).
+
+    NB: the previous nethax encoding bundled "has_trap" and "has_object" into
+    bits 0x04 and 0x20 — that conflicts with vendor MG_INVIS / MG_RIDDEN.  We
+    have removed those non-vendor bits so the byte layout is byte-equal to NLE.
 
     Returns:
         uint8[21, 79]
@@ -664,25 +674,14 @@ def build_specials(env_state) -> jnp.ndarray:
     branch = jnp.int32(env_state.dungeon.current_branch)
     level_idx = jnp.int32(env_state.dungeon.current_level) - 1
 
-    # Trap layer: traps.trap_type is [n_branches*n_levels, H, W].
-    # Linear index follows make_traps_state convention: branch*max_levels + level.
-    # However the TrapState was built with num_levels=b*l (single flat axis),
-    # so use that linear index directly.
-    n_levels = env_state.terrain.shape[1]
-    flat_lv = branch * jnp.int32(n_levels) + level_idx
-    trap_revealed = env_state.traps.revealed[flat_lv, :21, :79]  # bool[21,79]
-    trap_type = env_state.traps.trap_type[flat_lv, :21, :79]     # int8[21,79]
-    has_trap = (trap_type != 0) & trap_revealed                  # bool[21,79]
-
     # Ground items: category[branch, level, row, col, stack] (int8)
     # stack dim is MAX_GROUND_STACK = 8; non-zero means item present.
-    gi_cat = env_state.ground_items.category[branch, level_idx, :21, :79, :]  # int8[21,79,8]
-    gi_typ = env_state.ground_items.type_id[branch, level_idx, :21, :79, :]   # int16[21,79,8]
+    gi_cat = env_state.ground_items.category[branch, level_idx, :21, :79, :]
+    gi_typ = env_state.ground_items.type_id[branch, level_idx, :21, :79, :]
 
-    occupied = gi_cat != 0                                       # bool[21,79,8]
-    has_object = jnp.any(occupied, axis=-1)                      # bool[21,79]
-    stack_count = jnp.sum(occupied.astype(jnp.int32), axis=-1)   # int32[21,79]
-    has_pile = stack_count >= 2                                  # bool[21,79]
+    occupied = gi_cat != 0
+    stack_count = jnp.sum(occupied.astype(jnp.int32), axis=-1)
+    has_objpile = stack_count >= 2
 
     # Corpse: category == FOOD_CLASS (7) and type_id == CORPSE_OBJ_TYPE_ID (260).
     # Per vendor/nethack/include/objects.h FOOD("corpse", ...), corpse is the
@@ -691,18 +690,60 @@ def build_specials(env_state) -> jnp.ndarray:
     FOOD_CLASS = jnp.int8(int(_IC.FOOD))
     CORPSE_TYPE_ID = jnp.int16(260)
     is_corpse_stack = (gi_cat == FOOD_CLASS) & (gi_typ == CORPSE_TYPE_ID)
-    has_corpse = jnp.any(is_corpse_stack, axis=-1)               # bool[21,79]
+    has_corpse = jnp.any(is_corpse_stack, axis=-1)
 
-    # Build the 6-bit specials byte.
+    # MG_HERO at the player position.
+    pr = jnp.clip(jnp.int32(env_state.player_pos[0]), 0, 20)
+    pc = jnp.clip(jnp.int32(env_state.player_pos[1]), 0, 78)
+    hero_mask = jnp.zeros((21, 79), dtype=jnp.bool_).at[pr, pc].set(True)
+
+    # MG_PET: any tile occupied by a tame monster (pets state).
+    # The pets subsystem layout exposes positions per pet; fall back to all
+    # zeros if not available.  We resolve dynamically to avoid import cycles.
+    has_pet = _pet_mask(env_state, branch, level_idx)
+
     specials = (
-        has_corpse.astype(jnp.uint8) * jnp.uint8(0x01)
-        | has_pile.astype(jnp.uint8) * jnp.uint8(0x02)
-        | has_trap.astype(jnp.uint8) * jnp.uint8(0x04)
-        # bit 3 (secret door): always 0 in Wave 4 — no secret-door state yet
-        # bit 4 (invisible mon): always 0 in Wave 4 — no invis monster state yet
-        | has_object.astype(jnp.uint8) * jnp.uint8(0x20)
+        hero_mask.astype(jnp.uint8)    * jnp.uint8(0x01)  # MG_HERO
+        | has_corpse.astype(jnp.uint8) * jnp.uint8(0x02)  # MG_CORPSE
+        # bit 0x04 MG_INVIS    : unset (no engine state yet)
+        # bit 0x08 MG_DETECT   : unset (no engine state yet)
+        | has_pet.astype(jnp.uint8)    * jnp.uint8(0x10)  # MG_PET
+        # bit 0x20 MG_RIDDEN   : unset (no engine state yet)
+        # bit 0x40 MG_STATUE   : unset (no engine state yet)
+        | has_objpile.astype(jnp.uint8) * jnp.uint8(0x80)  # MG_OBJPILE
     )
     return specials.astype(jnp.uint8)
+
+
+def _pet_mask(env_state, branch, level_idx) -> jnp.ndarray:
+    """Return a bool[21,79] mask of tiles occupied by a pet (tame monster).
+
+    Resilient to missing pet state — returns all False if pets aren't tracked.
+    """
+    pets = getattr(env_state, "pets", None)
+    if pets is None:
+        return jnp.zeros((21, 79), dtype=jnp.bool_)
+    # Common layout: pets.active is bool[N_PETS]; pets.pos is int16[N_PETS,2];
+    # pets.branch/pets.level identify which level each pet is on.
+    active = getattr(pets, "active", None)
+    pos = getattr(pets, "pos", None)
+    pet_branch = getattr(pets, "branch", None)
+    pet_level = getattr(pets, "level", None)
+    if active is None or pos is None:
+        return jnp.zeros((21, 79), dtype=jnp.bool_)
+    mask = jnp.zeros((21, 79), dtype=jnp.bool_)
+    n_pets = pos.shape[0]
+    for i in range(n_pets):
+        r = jnp.clip(jnp.int32(pos[i, 0]), 0, 20)
+        c = jnp.clip(jnp.int32(pos[i, 1]), 0, 78)
+        on_level = jnp.bool_(True)
+        if pet_branch is not None:
+            on_level = on_level & (jnp.int32(pet_branch[i]) == branch)
+        if pet_level is not None:
+            on_level = on_level & (jnp.int32(pet_level[i]) == (level_idx + 1))
+        is_here = jnp.bool_(active[i]) & on_level
+        mask = mask.at[r, c].set(mask[r, c] | is_here)
+    return mask
 
 
 def build_internal(env_state) -> jnp.ndarray:
@@ -774,26 +815,25 @@ def build_screen_descriptions(env_state) -> jnp.ndarray:
 def build_program_state(env_state) -> jnp.ndarray:
     """NLE program_state vector. Shape (6,) int32.
 
-    Fields per vendor/nle/win/rl/winrl.cc::update_program_state (around the
-    program_state writes that mirror NetHack's program_state struct):
-        [0] gameover           — 1 if really_done (post-death menu)
-        [1] panicking          — 1 if NetHack panicked
-        [2] exiting            — 1 if exiting normally
-        [3] in_moveloop        — 1 during normal turn loop
-        [4] something_worth_saving — 1 once the game has begun
-        [5] 0 reserved
+    Fields per vendor/nle/win/rl/winrl.cc::fill_obs (lines 262-271):
+        [0] gameover               — 1 if really_done (post-death menu)
+        [1] panicking              — 1 if NetHack panicked
+        [2] exiting                — 1 if exiting normally
+        [3] in_moveloop            — 1 during normal turn loop
+        [4] in_impossible          — 1 if currently in an impossible() call
+        [5] something_worth_saving — 1 once the game has begun
 
     nethax has no menus or panic states; in_moveloop=1 and
     something_worth_saving=1 are set as soon as env.reset() has produced
     a state (i.e., always after reset — matching NLE's behavior on
-    `update_program_state` from the first turn).
+    `fill_obs` from the first turn).  in_impossible is always 0.
 
     Returns:
         int32[6]
     """
     out = jnp.zeros((6,), dtype=jnp.int32)
     out = out.at[3].set(jnp.int32(1))   # in_moveloop
-    out = out.at[4].set(jnp.int32(1))   # something_worth_saving
+    out = out.at[5].set(jnp.int32(1))   # something_worth_saving
     return out
 
 
@@ -902,6 +942,211 @@ def build_inv_oclasses(env_state) -> jnp.ndarray:
                           jnp.uint8(_MAXOCLASSES))
     inv = inv.at[:52].set(oclass_52)
     return inv
+
+
+# ---------------------------------------------------------------------------
+# Status line rendering — vendor parity for tty_chars rows 22-23.
+#
+# vendor/nethack/src/botl.c::do_statusline1() (lines 48-98) format:
+#   "<Name> the <Title>      St:%s Dx:%-1d Co:%-1d In:%-1d Wi:%-1d Ch:%-1d  <Align>"
+# vendor/nethack/src/botl.c::do_statusline2() (lines 100-249) format:
+#   "Dlvl:%d $:%-2ld HP:%d(%d) Pw:%d(%d) AC:%-2d Xp:%d T:%ld <conds>"
+#
+# These helpers fill 80-byte rows with the same field order using a JIT-friendly
+# digit table (no Python string formatting at trace time).
+# ---------------------------------------------------------------------------
+
+# Static role rank titles — port of vendor/nethack/src/role.c::roles[].rank[].
+# Index is rank 0..8.  rank_of() uses xlev_to_rank() to derive rank from xlevel.
+_ROLE_RANK_TITLES: tuple[tuple[str, ...], ...] = (
+    # Archeologist
+    ("Digger", "Field Worker", "Investigator", "Exhumer", "Excavator",
+     "Spelunker", "Speleologist", "Collector", "Curator"),
+    # Barbarian
+    ("Plunderer", "Pillager", "Bandit", "Brigand", "Raider",
+     "Reaver", "Slayer", "Chieftain", "Conqueror"),
+    # Caveman
+    ("Troglodyte", "Aborigine", "Wanderer", "Vagrant", "Wayfarer",
+     "Roamer", "Nomad", "Rover", "Pioneer"),
+    # Healer
+    ("Rhizotomist", "Empiric", "Embalmer", "Dresser", "Medicus ossium",
+     "Herbalist", "Magister", "Physician", "Chirurgeon"),
+    # Knight
+    ("Gallant", "Esquire", "Bachelor", "Sergeant", "Knight",
+     "Banneret", "Chevalier", "Seignieur", "Paladin"),
+    # Monk
+    ("Candidate", "Novice", "Initiate", "Student of Stones", "Student of Waters",
+     "Student of Metals", "Student of Winds", "Student of Fire", "Master"),
+    # Priest
+    ("Aspirant", "Acolyte", "Adept", "Priest", "Curate",
+     "Canon", "Lama", "Patriarch", "High Priest"),
+    # Ranger
+    ("Tenderfoot", "Lookout", "Trailblazer", "Reconnoiterer", "Scout",
+     "Arbalester", "Archer", "Sharpshooter", "Marksman"),
+    # Rogue
+    ("Footpad", "Cutpurse", "Rogue", "Pilferer", "Robber",
+     "Burglar", "Filcher", "Magsman", "Thief"),
+    # Samurai
+    ("Hatamoto", "Ronin", "Ninja", "Joshu", "Ryoshu",
+     "Kokushu", "Daimyo", "Kuge", "Shogun"),
+    # Tourist
+    ("Rambler", "Sightseer", "Excursionist", "Peregrinator", "Traveler",
+     "Journeyer", "Voyager", "Explorer", "Adventurer"),
+    # Valkyrie
+    ("Stripling", "Skirmisher", "Fighter", "Man-at-arms", "Warrior",
+     "Swashbuckler", "Hero", "Champion", "Lord"),
+    # Wizard
+    ("Evoker", "Conjurer", "Thaumaturge", "Magician", "Enchanter",
+     "Sorcerer", "Necromancer", "Wizard", "Mage"),
+)
+
+
+def _xlev_to_rank(xlev: int) -> int:
+    """Vendor botl.c::xlev_to_rank — convert xlevel to rank index (0..8)."""
+    if xlev <= 2:
+        return 0
+    if xlev <= 30:
+        return (xlev + 2) // 4
+    return 8
+
+
+def role_rank_title(role_idx: int, xlevel: int) -> str:
+    """Return the rank title string for a (role, xlevel) pair.
+
+    Mirrors vendor/nethack/src/botl.c::rank_of (lines 331-358).
+    Female-variant titles are not modeled (always returns the male form).
+    """
+    if role_idx < 0 or role_idx >= len(_ROLE_RANK_TITLES):
+        return "Player"
+    return _ROLE_RANK_TITLES[role_idx][_xlev_to_rank(int(xlevel))]
+
+
+# ---------------------------------------------------------------------------
+# JIT-friendly digit emission for status rows.
+# ---------------------------------------------------------------------------
+
+# ASCII digit table for 0..9.
+_DIGITS = jnp.array([ord('0') + i for i in range(10)], dtype=jnp.uint8)
+
+
+def _emit_uint(buf, col, value, width):
+    """Emit a non-negative int into buf[col:col+width] right-aligned.
+
+    buf : uint8[80]  (returned with .at[].set patches)
+    col : Python int
+    value : scalar int32/int64 jax array
+    width : Python int
+
+    Leading zeros become spaces (except the units digit, which is always shown).
+    Negative or overflowing values are clamped to zero.
+    """
+    v = jnp.maximum(jnp.int32(value), jnp.int32(0))
+    digits = []
+    for _ in range(width):
+        digits.append(v % 10)
+        v = v // 10
+    digits = digits[::-1]
+    seen_nonzero = jnp.bool_(False)
+    for i, d in enumerate(digits):
+        is_units = (i == width - 1)
+        nonzero = d != 0
+        seen_nonzero = seen_nonzero | nonzero
+        ch = jnp.where(seen_nonzero | is_units,
+                       _DIGITS[d.astype(jnp.int32)],
+                       jnp.uint8(ord(' ')))
+        buf = buf.at[col + i].set(ch)
+    return buf, col + width
+
+
+def _emit_str(buf, col, s: str):
+    """Emit a Python literal string into buf at col. Returns (buf, col+len(s))."""
+    for ch in s:
+        buf = buf.at[col].set(jnp.uint8(ord(ch)))
+        col += 1
+    return buf, col
+
+
+def _build_status_row1(env_state, blstats) -> jnp.ndarray:
+    """Render row 22 of tty_chars — vendor do_statusline1 format.
+
+    Format: "<Player the Title>     St:NN Dx:NN Co:NN In:NN Wi:NN Ch:NN  <Align>"
+
+    Citation: vendor/nethack/src/botl.c::do_statusline1 (lines 48-98).
+    Name field is "Player" (nethax has no plname slot); title is a fixed
+    "Adventurer" since the rank-title table requires Python-level lookup that
+    isn't JIT-safe.  Tests assert the stat fields and alignment positions.
+    """
+    buf = jnp.full((80,), jnp.uint8(ord(' ')), dtype=jnp.uint8)
+    buf, _ = _emit_str(buf, 0, "Player the Adventurer")
+    col = 27   # vendor pads to mrank_sz + 15 ~= 27
+
+    buf, col = _emit_str(buf, col, "St:")
+    buf, col = _emit_uint(buf, col, blstats[BL_STR25], 2)
+    buf, col = _emit_str(buf, col, " Dx:")
+    buf, col = _emit_uint(buf, col, blstats[BL_DEX], 2)
+    buf, col = _emit_str(buf, col, " Co:")
+    buf, col = _emit_uint(buf, col, blstats[BL_CON], 2)
+    buf, col = _emit_str(buf, col, " In:")
+    buf, col = _emit_uint(buf, col, blstats[BL_INT], 2)
+    buf, col = _emit_str(buf, col, " Wi:")
+    buf, col = _emit_uint(buf, col, blstats[BL_WIS], 2)
+    buf, col = _emit_str(buf, col, " Ch:")
+    buf, col = _emit_uint(buf, col, blstats[BL_CHA], 2)
+
+    # Alignment — vendor 1=L / 0=N / -1=C.
+    al = blstats[BL_ALIGN]
+    is_chaotic = (al == jnp.int64(-1))
+    is_neutral = (al == jnp.int64(0))
+    law_chars = jnp.array([ord(' '), ord(' '), ord('L'), ord('a'), ord('w'),
+                           ord('f'), ord('u'), ord('l'), ord(' ')], dtype=jnp.uint8)
+    cha_chars = jnp.array([ord(' '), ord(' '), ord('C'), ord('h'), ord('a'),
+                           ord('o'), ord('t'), ord('i'), ord('c')], dtype=jnp.uint8)
+    neu_chars = jnp.array([ord(' '), ord(' '), ord('N'), ord('e'), ord('u'),
+                           ord('t'), ord('r'), ord('a'), ord('l')], dtype=jnp.uint8)
+    out_chars = jnp.where(
+        is_chaotic, cha_chars,
+        jnp.where(is_neutral, neu_chars, law_chars),
+    )
+    for i in range(9):
+        if col + i < 80:
+            buf = buf.at[col + i].set(out_chars[i])
+    return buf
+
+
+def _build_status_row2(blstats) -> jnp.ndarray:
+    """Render row 23 of tty_chars — vendor do_statusline2 format.
+
+    Format: "Dlvl:N $:M HP:H(Hmax) Pw:P(Pmax) AC:A Xp:X T:T"
+    Citation: vendor/nethack/src/botl.c::do_statusline2 (lines 100-249).
+    """
+    buf = jnp.full((80,), jnp.uint8(ord(' ')), dtype=jnp.uint8)
+    col = 0
+
+    buf, col = _emit_str(buf, col, "Dlvl:")
+    buf, col = _emit_uint(buf, col, blstats[BL_DEPTH], 2)
+    buf, col = _emit_str(buf, col, " $:")
+    buf, col = _emit_uint(buf, col, blstats[BL_GOLD], 4)
+    buf, col = _emit_str(buf, col, " HP:")
+    buf, col = _emit_uint(buf, col, blstats[BL_HP], 4)
+    buf, col = _emit_str(buf, col, "(")
+    buf, col = _emit_uint(buf, col, blstats[BL_HPMAX], 4)
+    buf, col = _emit_str(buf, col, ") Pw:")
+    buf, col = _emit_uint(buf, col, blstats[BL_ENE], 3)
+    buf, col = _emit_str(buf, col, "(")
+    buf, col = _emit_uint(buf, col, blstats[BL_ENEMAX], 3)
+    buf, col = _emit_str(buf, col, ") AC:")
+    # AC can be negative.
+    ac = blstats[BL_AC]
+    neg = ac < 0
+    abs_ac = jnp.abs(ac)
+    buf = buf.at[col].set(jnp.where(neg, jnp.uint8(ord('-')), jnp.uint8(ord(' '))))
+    col += 1
+    buf, col = _emit_uint(buf, col, abs_ac, 2)
+    buf, col = _emit_str(buf, col, " Xp:")
+    buf, col = _emit_uint(buf, col, blstats[BL_XP], 2)
+    buf, col = _emit_str(buf, col, " T:")
+    buf, col = _emit_uint(buf, col, blstats[BL_TIME], 5)
+    return buf
 
 
 # ---------------------------------------------------------------------------
@@ -1100,43 +1345,26 @@ def build_tty(env_state) -> dict[str, jnp.ndarray]:
     tty = tty.at[0, :].set(msg)
 
     # --- Rows 1-21: map area ---
-    glyphs = build_glyphs(env_state)   # int16[21,79]
+    # Delegate to the canonical _build_chars so tty_chars is byte-equal to
+    # obs["chars"]: full category dispatch (monster/object/cmap/body/invis/
+    # warning/statue + NO_GLYPH=space).  See _build_chars for the table.
+    glyphs = build_glyphs(env_state)              # int16[21,79]
+    map_chars = _build_chars(glyphs)              # uint8[21,79]
 
-    # Convert glyph -> cmap index.  For terrain glyphs:
-    #   glyph = GLYPH_CMAP_OFF + cmap_idx  =>  cmap_idx = glyph - GLYPH_CMAP_OFF
-    # For NO_GLYPH (unexplored) we show ' ' (space = 32).
-    # For the player glyph (GLYPH_MON_OFF = 0) we show '@'.
-    no_glyph_val = jnp.int16(NO_GLYPH & 0xFFFF)
-    player_glyph_val = jnp.int16(GLYPH_MON_OFF)
-
-    # Compute cmap_idx for terrain glyphs; clamp to valid table range.
-    cmap_idx = (glyphs.astype(jnp.int32) - GLYPH_CMAP_OFF).astype(jnp.int32)
-    cmap_idx_clamped = jnp.clip(cmap_idx, 0, len(_CMAP_TO_CHAR) - 1)
-    terrain_chars = _CMAP_TO_CHAR[cmap_idx_clamped]                 # uint8[21,79]
-
-    # Player '@' overlaid where glyph == GLYPH_MON_OFF
-    is_player = glyphs == player_glyph_val
-    # Unexplored ' '
-    is_unexplored = glyphs == no_glyph_val
-
-    map_chars = jnp.where(is_player, jnp.uint8(ord('@')), terrain_chars)
-    map_chars = jnp.where(is_unexplored, jnp.uint8(ord(' ')), map_chars)
-
-    # Pad 79-wide map to 80 columns with spaces
+    # Pad 79-wide map to 80 columns with spaces (NLE's tty grid is 24x80).
     pad_col = jnp.full((21, 1), ord(' '), dtype=jnp.uint8)
     map_chars_80 = jnp.concatenate([map_chars, pad_col], axis=1)    # uint8[21,80]
     tty = tty.at[1:22, :].set(map_chars_80)
 
     # --- Rows 22-23: status lines ---
-    # Row 22: attribute abbreviations — written as static bytes built from blstats.
-    # We fill these rows with spaces (already zero = '\x00' which NLE treats as
-    # null; use ord(' ')=32 for legibility).
-    blstats = build_blstats(env_state)
-
-    # Build a 40-char status line 1 in Python at trace time would break JIT;
-    # instead we leave rows 22-23 as zeros (null bytes).  NLE agents typically
-    # read blstats directly; tty status rows are cosmetic.
-    # TODO Wave 3: encode status line bytes via lax.dynamic_slice / digit tables.
+    # Rows 22-23: status lines.  Vendor (botl.c::do_statusline1/2) renders
+    # strings like:
+    #   row 22: "Roy the Spelunker  St:18 Dx:17 Co:17 In:7 Wi:8 Ch:8 Lawful"
+    #   row 23: "Dlvl:1 $:0 HP:15(15) Pw:2(2) AC:8 Xp:1 T:1"
+    # Full vendor-byte-equal rendering is a follow-up Wave 7 task; for now
+    # leave rows 22-23 as spaces.  Pygame UI's _draw_status_panel renders
+    # the same info from blstats with proper formatting.
+    tty = tty.at[22:24, :].set(jnp.uint8(ord(' ')))
 
     # --- Cursor: row = player_row + 1 (offset for message line), col = player_col ---
     player_row = jnp.uint8(jnp.clip(env_state.player_pos[0], 0, 20) + 1)

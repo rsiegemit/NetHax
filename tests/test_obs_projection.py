@@ -149,13 +149,22 @@ def test_blstats_shape_and_dtype():
 # ---------------------------------------------------------------------------
 
 def test_glyphs_player_visible():
-    """Player position should have the player glyph (GLYPH_MON_OFF = 0)."""
+    """Player position must overlay the race's monster glyph.
+
+    Vendor (display.c::display_self) uses u.umonnum.  For our default state
+    (Race.HUMAN, no polymorph) that maps to GLYPH_MON_OFF + 256 (the "human"
+    entry in MONSTERS).  The exact race->index mapping lives in
+    Nethax/nethax/obs/nle_obs.py::build_glyphs::_RACE_TO_MON_IDX.
+    """
     state = _default_state()
-    # Place player at (10, 40), which is within the 21x79 NLE grid
     state = state.replace(player_pos=jnp.array([10, 40], dtype=jnp.int16))
     obs = build_nle_observation(state)
     player_glyph = int(obs["glyphs"][10, 40])
-    assert player_glyph == GLYPH_MON_OFF
+    _RACE_HUMAN_MON_IDX = 256
+    assert player_glyph == GLYPH_MON_OFF + _RACE_HUMAN_MON_IDX, (
+        f"player glyph {player_glyph} != expected human monster glyph "
+        f"{GLYPH_MON_OFF + _RACE_HUMAN_MON_IDX}"
+    )
 
 
 def test_glyphs_player_not_zero():
@@ -436,40 +445,40 @@ def test_tty_colors_player_tile_is_bright_yellow():
 # Wave 3: inventory
 # ---------------------------------------------------------------------------
 
-def test_inv_letters_slot0_is_a():
-    """inv_letters[0] must be ord('a') = 97."""
+def test_inv_letters_empty_slots_are_zero():
+    """Empty inv slots must emit letter 0 (vendor winrl.cc:396)."""
+    state = _default_state()
+    inv_letters = build_inv_letters(state)
+    # _default_state has empty inventory → every slot must be 0.
+    for i in range(55):
+        assert int(inv_letters[i]) == 0, f"slot {i} letter != 0"
+
+
+def test_inv_letters_occupied_slots_are_letters():
+    """When a slot is occupied, letter follows the 'a'..'z','A'..'Z' table."""
+    from Nethax.nethax.subsystems.inventory import Item
+    state = _default_state()
+    new_item = Item(
+        category=jnp.int8(2), type_id=jnp.int16(0),
+        buc_status=jnp.int8(0), enchantment=jnp.int8(0),
+        charges=jnp.int8(0), identified=jnp.bool_(False),
+        quantity=jnp.int16(1), weight=jnp.int32(0),
+        ac_bonus=jnp.int8(0), is_two_handed=jnp.bool_(False),
+    )
+    new_inv = state.inventory.replace(items=new_item)
+    state = state.replace(inventory=new_inv)
+    inv_letters = build_inv_letters(state)
+    assert int(inv_letters[0]) == ord('a')
+
+
+def test_inv_oclasses_empty_slots_are_max_oclasses():
+    """Empty inv -> oclasses[i] == MAXOCLASSES = 18 (vendor winrl.cc:413)."""
     state = _default_state()
     obs = build_nle_observation(state)
-    assert int(obs["inv_letters"][0]) == ord('a')
-
-
-def test_inv_letters_slot25_is_z():
-    """inv_letters[25] must be ord('z') = 122."""
-    state = _default_state()
-    inv_letters = build_inv_letters(state)
-    assert int(inv_letters[25]) == ord('z')
-
-
-def test_inv_letters_slot26_is_A():
-    """inv_letters[26] must be ord('A') = 65."""
-    state = _default_state()
-    inv_letters = build_inv_letters(state)
-    assert int(inv_letters[26]) == ord('A')
-
-
-def test_inv_letters_slot51_is_Z():
-    """inv_letters[51] must be ord('Z') = 90."""
-    state = _default_state()
-    inv_letters = build_inv_letters(state)
-    assert int(inv_letters[51]) == ord('Z')
-
-
-def test_inv_oclasses_empty_slots_zero():
-    """Empty inventory (default state) -> all oclasses zero."""
-    state = _default_state()
-    obs = build_nle_observation(state)
-    assert int(obs["inv_oclasses"][0]) == 0
-    assert int(jnp.sum(obs["inv_oclasses"])) == 0
+    _MAXOCLASSES = 18
+    assert int(obs["inv_oclasses"][0]) == _MAXOCLASSES
+    # Every slot should equal MAXOCLASSES for an empty inventory.
+    assert int(jnp.all(obs["inv_oclasses"] == _MAXOCLASSES)) == 1
 
 
 def test_inv_oclasses_occupied_slot_matches_category():
@@ -495,11 +504,12 @@ def test_inv_oclasses_occupied_slot_matches_category():
     assert int(inv_oclasses[0]) == 2
 
 
-def test_inv_glyphs_empty_is_zero():
-    """Empty inventory -> all inv_glyphs zero."""
+def test_inv_glyphs_empty_is_no_glyph():
+    """Empty inv -> all inv_glyphs == NO_GLYPH = MAX_GLYPH (vendor winrl.cc:379)."""
     state = _default_state()
     obs = build_nle_observation(state)
-    assert int(jnp.sum(obs["inv_glyphs"])) == 0
+    no_glyph_int = NO_GLYPH & 0xFFFF
+    assert int(jnp.all(obs["inv_glyphs"].astype(jnp.int32) == no_glyph_int)) == 1
 
 
 def test_inv_glyphs_occupied_slot_matches_obj_table():
