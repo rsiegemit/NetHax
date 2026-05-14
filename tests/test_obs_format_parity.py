@@ -105,13 +105,23 @@ def test_blstats_index_xp_at_position_18():
 
 
 def test_blstats_index_align_at_position_26():
-    """nleobs.h:43 — #define NLE_BL_ALIGN 26. Alignment at blstats[26]."""
+    """nleobs.h:43 — #define NLE_BL_ALIGN 26. Alignment at blstats[26].
+
+    Vendor (botl.c::status_bl_init) writes u.ualign.type: 1=Lawful, 0=Neutral,
+    -1=Chaotic.  Our state uses 0=L/1=N/2=C; build_blstats applies 1 - x.
+    """
     from Nethax.nethax.constants.blstats import BL_ALIGN
     assert BL_ALIGN == 26
 
-    state = EnvState.default(rng=_RNG).replace(player_align=jnp.int8(-1))
+    # Chaotic in state-internal encoding (=2) maps to vendor -1.
+    state = EnvState.default(rng=_RNG).replace(player_align=jnp.int8(2))
     obs = build_nle_observation(state)
     assert int(obs["blstats"][26]) == -1
+
+    # Lawful (state 0) -> vendor 1
+    state = EnvState.default(rng=_RNG).replace(player_align=jnp.int8(0))
+    obs = build_nle_observation(state)
+    assert int(obs["blstats"][26]) == 1
 
 
 def test_message_shape_256_uint8():

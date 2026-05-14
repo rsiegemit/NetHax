@@ -178,8 +178,15 @@ def _render_tile_pane(obs, tiles_array):
     return np.asarray(pixels_jax)
 
 
-def _draw_status_panel(screen, font, font_large, obs, last_action_name, y_offset):
-    """Draw the bottom status panel onto screen."""
+_ALIGN_NAMES = {1: "Lawful", 0: "Neutral", -1: "Chaotic"}
+
+
+def _format_status_lines(obs, last_action_name=None):
+    """Return (name_title_stats, dungeon_stats, message, action_label).
+
+    Mirrors vendor/nethack/src/botl.c::do_statusline1 / do_statusline2.
+    Pure Python, used by both the live HUD and the parity tests.
+    """
     blstats = np.asarray(obs["blstats"])
     message_bytes = np.asarray(obs["message"])
     msg_text = bytes(message_bytes[message_bytes != 0]).decode("ascii", errors="replace")
@@ -192,12 +199,42 @@ def _draw_status_panel(screen, font, font_large, obs, last_action_name, y_offset
     xp     = int(blstats[BL_XP])
     depth  = int(blstats[BL_DEPTH])
     gold   = int(blstats[BL_GOLD])
-    score  = int(blstats[BL_SCORE])
-    time   = int(blstats[BL_TIME])
-    hunger_idx = int(blstats[BL_HUNGER])
-    hunger = _HUNGER_NAMES.get(hunger_idx, str(hunger_idx))
+    time_  = int(blstats[BL_TIME])
+    st     = int(blstats[BL_STR25])
+    dx     = int(blstats[BL_DEX])
+    co     = int(blstats[BL_CON])
+    in_    = int(blstats[BL_INT])
+    wi     = int(blstats[BL_WIS])
+    ch     = int(blstats[BL_CHA])
+    align  = int(blstats[26])    # BL_ALIGN
+    align_name = _ALIGN_NAMES.get(align, "Unaligned")
 
-    # HP colour
+    # Resolve role rank title (Python-only lookup, not JIT-traced).
+    from Nethax.nethax.obs.nle_obs import role_rank_title
+    try:
+        # role/xlevel live on the env state, not the obs dict, so we approximate
+        # via blstats[BL_XP] (xlevel) and surface a generic title when unknown.
+        title = role_rank_title(0, xp)  # role 0 = Archeologist as a stable default
+    except Exception:
+        title = "Adventurer"
+    name_line = (f"Player the {title}    "
+                 f"St:{st} Dx:{dx} Co:{co} In:{in_} Wi:{wi} Ch:{ch}  "
+                 f"{align_name}")
+
+    dlvl_line = (f"Dlvl:{depth} $:{gold} HP:{hp}({hpmax}) "
+                 f"Pw:{pw}({pwmax}) AC:{ac} Xp:{xp} T:{time_}")
+    if last_action_name:
+        dlvl_line += f"  Last:{last_action_name}"
+    return name_line, dlvl_line, msg_text
+
+
+def _draw_status_panel(screen, font, font_large, obs, last_action_name, y_offset):
+    """Draw the bottom status panel onto screen, mirroring the NLE bot lines."""
+    name_line, dlvl_line, msg_text = _format_status_lines(obs, last_action_name)
+
+    blstats = np.asarray(obs["blstats"])
+    hp = int(blstats[BL_HP])
+    hpmax = int(blstats[BL_HPMAX])
     if hpmax > 0:
         ratio = hp / hpmax
     else:
@@ -212,20 +249,14 @@ def _draw_status_panel(screen, font, font_large, obs, last_action_name, y_offset
     panel_rect = pygame.Rect(0, y_offset, WINDOW_W, STATUS_PANEL_H)
     pygame.draw.rect(screen, (20, 20, 30), panel_rect)
 
-    # Message line
     if msg_text:
         msg_surf = font.render(msg_text[:120], True, (230, 230, 180))
         screen.blit(msg_surf, (8, y_offset + 4))
 
-    # Stat line 1
-    stat1 = (f"HP:{hp}/{hpmax}  PW:{pw}/{pwmax}  AC:{ac}  XP:{xp}"
-             f"  Dlvl:{depth}  Gold:{gold}  {hunger}")
-    surf1 = font.render(stat1, True, hp_color)
+    surf1 = font.render(name_line, True, (200, 200, 230))
     screen.blit(surf1, (8, y_offset + 26))
 
-    # Stat line 2
-    stat2 = f"Score:{score}  T:{time}  Last:{last_action_name}"
-    surf2 = font.render(stat2, True, (170, 170, 170))
+    surf2 = font.render(dlvl_line, True, hp_color)
     screen.blit(surf2, (8, y_offset + 48))
 
 

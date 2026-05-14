@@ -1023,94 +1023,121 @@ def role_rank_title(role_idx: int, xlevel: int) -> str:
 
 # ---------------------------------------------------------------------------
 # JIT-friendly digit emission for status rows.
+#
+# We avoid long chains of `.at[].set()` (which XLA's algebraic simplifier
+# can spend many passes folding).  Instead, build a single uint8[80] array
+# via concatenation of small pieces.  All string literals are precomputed
+# at module load.
 # ---------------------------------------------------------------------------
 
-# ASCII digit table for 0..9.
 _DIGITS = jnp.array([ord('0') + i for i in range(10)], dtype=jnp.uint8)
 
 
-def _emit_uint(buf, col, value, width):
-    """Emit a non-negative int into buf[col:col+width] right-aligned.
+def _str_to_bytes(s: str) -> jnp.ndarray:
+    """Precompute a uint8 byte-array for a literal string (module load only)."""
+    return jnp.array([ord(c) for c in s], dtype=jnp.uint8)
 
-    buf : uint8[80]  (returned with .at[].set patches)
-    col : Python int
-    value : scalar int32/int64 jax array
-    width : Python int
+
+def _uint_to_bytes(value, width):
+    """Return a uint8[width] array of right-aligned digit bytes for `value`.
 
     Leading zeros become spaces (except the units digit, which is always shown).
-    Negative or overflowing values are clamped to zero.
     """
     v = jnp.maximum(jnp.int32(value), jnp.int32(0))
-    digits = []
+    digit_arrs = []
     for _ in range(width):
-        digits.append(v % 10)
+        digit_arrs.append((v % 10).astype(jnp.int32))
         v = v // 10
-    digits = digits[::-1]
-    seen_nonzero = jnp.bool_(False)
-    for i, d in enumerate(digits):
+    # digit_arrs is LSB-first; reverse to MSB-first.
+    digit_arrs = digit_arrs[::-1]
+
+    # Build a boolean "seen_nonzero" prefix for each position.
+    nonzero_flags = [d != 0 for d in digit_arrs]
+    # cumulative OR
+    cum = []
+    acc = jnp.bool_(False)
+    for f in nonzero_flags:
+        acc = acc | f
+        cum.append(acc)
+
+    chars = []
+    for i, (d, seen) in enumerate(zip(digit_arrs, cum)):
         is_units = (i == width - 1)
-        nonzero = d != 0
-        seen_nonzero = seen_nonzero | nonzero
-        ch = jnp.where(seen_nonzero | is_units,
-                       _DIGITS[d.astype(jnp.int32)],
+        ch = jnp.where(seen | is_units,
+                       _DIGITS[d],
                        jnp.uint8(ord(' ')))
-        buf = buf.at[col + i].set(ch)
-    return buf, col + width
+        chars.append(ch.reshape(1))
+    return jnp.concatenate(chars).astype(jnp.uint8)
 
 
-def _emit_str(buf, col, s: str):
-    """Emit a Python literal string into buf at col. Returns (buf, col+len(s))."""
-    for ch in s:
-        buf = buf.at[col].set(jnp.uint8(ord(ch)))
-        col += 1
-    return buf, col
+# Precomputed static byte sequences for status rows (module-load).
+_S_NAME_PREFIX  = _str_to_bytes("Player the Adventurer")
+_S_ST           = _str_to_bytes("St:")
+_S_SP_DX        = _str_to_bytes(" Dx:")
+_S_SP_CO        = _str_to_bytes(" Co:")
+_S_SP_IN        = _str_to_bytes(" In:")
+_S_SP_WI        = _str_to_bytes(" Wi:")
+_S_SP_CH        = _str_to_bytes(" Ch:")
+_S_ALIGN_LAW    = _str_to_bytes("  Lawful ")
+_S_ALIGN_NEU    = _str_to_bytes("  Neutral")
+_S_ALIGN_CHA    = _str_to_bytes("  Chaotic")
+
+_S_DLVL         = _str_to_bytes("Dlvl:")
+_S_SP_DOLLAR    = _str_to_bytes(" $:")
+_S_SP_HP        = _str_to_bytes(" HP:")
+_S_OPEN         = _str_to_bytes("(")
+_S_CLOSE_SP_PW  = _str_to_bytes(") Pw:")
+_S_CLOSE_SP_AC  = _str_to_bytes(") AC:")
+_S_SP_XP        = _str_to_bytes(" Xp:")
+_S_SP_T         = _str_to_bytes(" T:")
+_S_PAD80        = jnp.full((80,), ord(' '), dtype=jnp.uint8)
+
+
+def _pad_to(arr: jnp.ndarray, n: int) -> jnp.ndarray:
+    """Right-pad `arr` with spaces up to `n` bytes (truncate if too long)."""
+    if arr.shape[0] >= n:
+        return arr[:n]
+    return jnp.concatenate([arr, jnp.full((n - arr.shape[0],), ord(' '), dtype=jnp.uint8)])
 
 
 def _build_status_row1(env_state, blstats) -> jnp.ndarray:
     """Render row 22 of tty_chars — vendor do_statusline1 format.
 
-    Format: "<Player the Title>     St:NN Dx:NN Co:NN In:NN Wi:NN Ch:NN  <Align>"
+    Format: "Player the Adventurer    St:NN Dx:NN Co:NN In:NN Wi:NN Ch:NN  <Align>"
 
     Citation: vendor/nethack/src/botl.c::do_statusline1 (lines 48-98).
-    Name field is "Player" (nethax has no plname slot); title is a fixed
-    "Adventurer" since the rank-title table requires Python-level lookup that
-    isn't JIT-safe.  Tests assert the stat fields and alignment positions.
     """
-    buf = jnp.full((80,), jnp.uint8(ord(' ')), dtype=jnp.uint8)
-    buf, _ = _emit_str(buf, 0, "Player the Adventurer")
-    col = 27   # vendor pads to mrank_sz + 15 ~= 27
-
-    buf, col = _emit_str(buf, col, "St:")
-    buf, col = _emit_uint(buf, col, blstats[BL_STR25], 2)
-    buf, col = _emit_str(buf, col, " Dx:")
-    buf, col = _emit_uint(buf, col, blstats[BL_DEX], 2)
-    buf, col = _emit_str(buf, col, " Co:")
-    buf, col = _emit_uint(buf, col, blstats[BL_CON], 2)
-    buf, col = _emit_str(buf, col, " In:")
-    buf, col = _emit_uint(buf, col, blstats[BL_INT], 2)
-    buf, col = _emit_str(buf, col, " Wi:")
-    buf, col = _emit_uint(buf, col, blstats[BL_WIS], 2)
-    buf, col = _emit_str(buf, col, " Ch:")
-    buf, col = _emit_uint(buf, col, blstats[BL_CHA], 2)
-
-    # Alignment — vendor 1=L / 0=N / -1=C.
     al = blstats[BL_ALIGN]
+    # Select alignment bytes (length 9).
     is_chaotic = (al == jnp.int64(-1))
     is_neutral = (al == jnp.int64(0))
-    law_chars = jnp.array([ord(' '), ord(' '), ord('L'), ord('a'), ord('w'),
-                           ord('f'), ord('u'), ord('l'), ord(' ')], dtype=jnp.uint8)
-    cha_chars = jnp.array([ord(' '), ord(' '), ord('C'), ord('h'), ord('a'),
-                           ord('o'), ord('t'), ord('i'), ord('c')], dtype=jnp.uint8)
-    neu_chars = jnp.array([ord(' '), ord(' '), ord('N'), ord('e'), ord('u'),
-                           ord('t'), ord('r'), ord('a'), ord('l')], dtype=jnp.uint8)
-    out_chars = jnp.where(
-        is_chaotic, cha_chars,
-        jnp.where(is_neutral, neu_chars, law_chars),
+    align_bytes = jnp.where(
+        is_chaotic, _S_ALIGN_CHA,
+        jnp.where(is_neutral, _S_ALIGN_NEU, _S_ALIGN_LAW),
     )
-    for i in range(9):
-        if col + i < 80:
-            buf = buf.at[col + i].set(out_chars[i])
-    return buf
+
+    # Header: name + padding to col 27.
+    header = _pad_to(_S_NAME_PREFIX, 27)
+
+    # Stats fragment.
+    parts = [
+        header,
+        _S_ST,                                       # 3
+        _uint_to_bytes(blstats[BL_STR25], 2),
+        _S_SP_DX,
+        _uint_to_bytes(blstats[BL_DEX], 2),
+        _S_SP_CO,
+        _uint_to_bytes(blstats[BL_CON], 2),
+        _S_SP_IN,
+        _uint_to_bytes(blstats[BL_INT], 2),
+        _S_SP_WI,
+        _uint_to_bytes(blstats[BL_WIS], 2),
+        _S_SP_CH,
+        _uint_to_bytes(blstats[BL_CHA], 2),
+        align_bytes,
+    ]
+    row = jnp.concatenate(parts)
+    return _pad_to(row, 80)
 
 
 def _build_status_row2(blstats) -> jnp.ndarray:
@@ -1119,34 +1146,34 @@ def _build_status_row2(blstats) -> jnp.ndarray:
     Format: "Dlvl:N $:M HP:H(Hmax) Pw:P(Pmax) AC:A Xp:X T:T"
     Citation: vendor/nethack/src/botl.c::do_statusline2 (lines 100-249).
     """
-    buf = jnp.full((80,), jnp.uint8(ord(' ')), dtype=jnp.uint8)
-    col = 0
-
-    buf, col = _emit_str(buf, col, "Dlvl:")
-    buf, col = _emit_uint(buf, col, blstats[BL_DEPTH], 2)
-    buf, col = _emit_str(buf, col, " $:")
-    buf, col = _emit_uint(buf, col, blstats[BL_GOLD], 4)
-    buf, col = _emit_str(buf, col, " HP:")
-    buf, col = _emit_uint(buf, col, blstats[BL_HP], 4)
-    buf, col = _emit_str(buf, col, "(")
-    buf, col = _emit_uint(buf, col, blstats[BL_HPMAX], 4)
-    buf, col = _emit_str(buf, col, ") Pw:")
-    buf, col = _emit_uint(buf, col, blstats[BL_ENE], 3)
-    buf, col = _emit_str(buf, col, "(")
-    buf, col = _emit_uint(buf, col, blstats[BL_ENEMAX], 3)
-    buf, col = _emit_str(buf, col, ") AC:")
-    # AC can be negative.
     ac = blstats[BL_AC]
     neg = ac < 0
     abs_ac = jnp.abs(ac)
-    buf = buf.at[col].set(jnp.where(neg, jnp.uint8(ord('-')), jnp.uint8(ord(' '))))
-    col += 1
-    buf, col = _emit_uint(buf, col, abs_ac, 2)
-    buf, col = _emit_str(buf, col, " Xp:")
-    buf, col = _emit_uint(buf, col, blstats[BL_XP], 2)
-    buf, col = _emit_str(buf, col, " T:")
-    buf, col = _emit_uint(buf, col, blstats[BL_TIME], 5)
-    return buf
+    sign_byte = jnp.where(neg, jnp.uint8(ord('-')), jnp.uint8(ord(' '))).reshape(1)
+
+    parts = [
+        _S_DLVL,
+        _uint_to_bytes(blstats[BL_DEPTH], 2),
+        _S_SP_DOLLAR,
+        _uint_to_bytes(blstats[BL_GOLD], 4),
+        _S_SP_HP,
+        _uint_to_bytes(blstats[BL_HP], 4),
+        _S_OPEN,
+        _uint_to_bytes(blstats[BL_HPMAX], 4),
+        _S_CLOSE_SP_PW,
+        _uint_to_bytes(blstats[BL_ENE], 3),
+        _S_OPEN,
+        _uint_to_bytes(blstats[BL_ENEMAX], 3),
+        _S_CLOSE_SP_AC,
+        sign_byte,
+        _uint_to_bytes(abs_ac, 2),
+        _S_SP_XP,
+        _uint_to_bytes(blstats[BL_XP], 2),
+        _S_SP_T,
+        _uint_to_bytes(blstats[BL_TIME], 5),
+    ]
+    row = jnp.concatenate(parts)
+    return _pad_to(row, 80)
 
 
 # ---------------------------------------------------------------------------
@@ -1357,14 +1384,16 @@ def build_tty(env_state) -> dict[str, jnp.ndarray]:
     tty = tty.at[1:22, :].set(map_chars_80)
 
     # --- Rows 22-23: status lines ---
-    # Rows 22-23: status lines.  Vendor (botl.c::do_statusline1/2) renders
-    # strings like:
-    #   row 22: "Roy the Spelunker  St:18 Dx:17 Co:17 In:7 Wi:8 Ch:8 Lawful"
+    # Vendor (botl.c::do_statusline1/2) renders strings like:
+    #   row 22: "Player the Adventurer  St:18 Dx:17 Co:17 In:7 Wi:8 Ch:8  Lawful"
     #   row 23: "Dlvl:1 $:0 HP:15(15) Pw:2(2) AC:8 Xp:1 T:1"
-    # Full vendor-byte-equal rendering is a follow-up Wave 7 task; for now
-    # leave rows 22-23 as spaces.  Pygame UI's _draw_status_panel renders
-    # the same info from blstats with proper formatting.
-    tty = tty.at[22:24, :].set(jnp.uint8(ord(' ')))
+    # We render the same field order using a JIT-friendly digit table; see
+    # _build_status_row1 / _build_status_row2 for vendor citations.
+    blstats = build_blstats(env_state)
+    row22 = _build_status_row1(env_state, blstats)
+    row23 = _build_status_row2(blstats)
+    tty = tty.at[22, :].set(row22)
+    tty = tty.at[23, :].set(row23)
 
     # --- Cursor: row = player_row + 1 (offset for message line), col = player_col ---
     player_row = jnp.uint8(jnp.clip(env_state.player_pos[0], 0, 20) + 1)

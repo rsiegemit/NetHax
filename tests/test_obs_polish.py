@@ -92,26 +92,11 @@ def test_colors_lava_is_red():
 # specials — trap / pile / corpse / object flags
 # ---------------------------------------------------------------------------
 
-def test_specials_trap_flag_set_when_trap_visible():
-    """A revealed trap must set bit 2 (0x04) in specials."""
-    from Nethax.nethax.subsystems.traps import TrapType
-    state = _default_state()
-    branch = int(state.dungeon.current_branch)
-    level = int(state.dungeon.current_level) - 1
-    n_levels = state.terrain.shape[1]
-    flat_lv = branch * n_levels + level
-
-    new_trap_type = state.traps.trap_type.at[flat_lv, 6, 7].set(jnp.int8(TrapType.ARROW_TRAP))
-    new_revealed = state.traps.revealed.at[flat_lv, 6, 7].set(True)
-    new_traps = state.traps.replace(trap_type=new_trap_type, revealed=new_revealed)
-    state = state.replace(traps=new_traps)
-
-    specials = build_specials(state)
-    assert (int(specials[6, 7]) & 0x04) != 0, f"expected trap bit set, got {int(specials[6,7])}"
-
-
 def test_specials_pile_flag_set_when_multiple_items():
-    """Two+ items at same tile must set bit 1 (0x02 pile) and bit 5 (object)."""
+    """Two+ stacks at same tile must set MG_OBJPILE (0x80).
+
+    Vendor bits (display.h:1002): MG_OBJPILE = 0x80.
+    """
     state = _default_state()
     branch = int(state.dungeon.current_branch)
     level = int(state.dungeon.current_level) - 1
@@ -125,12 +110,14 @@ def test_specials_pile_flag_set_when_multiple_items():
 
     specials = build_specials(state)
     val = int(specials[9, 10])
-    assert (val & 0x02) != 0, f"pile bit not set, got {val}"
-    assert (val & 0x20) != 0, f"object bit not set, got {val}"
+    assert (val & 0x80) != 0, f"MG_OBJPILE bit not set, got {val}"
 
 
 def test_specials_corpse_flag():
-    """A corpse on the floor must set bit 0 (0x01) of specials."""
+    """A corpse on the floor must set MG_CORPSE (0x02).
+
+    Vendor bits (display.h:996): MG_CORPSE = 0x02.
+    """
     state = _default_state()
     branch = int(state.dungeon.current_branch)
     level = int(state.dungeon.current_level) - 1
@@ -144,7 +131,20 @@ def test_specials_corpse_flag():
 
     specials = build_specials(state)
     val = int(specials[4, 4])
-    assert (val & 0x01) != 0, f"corpse bit not set, got {val}"
+    assert (val & 0x02) != 0, f"MG_CORPSE bit not set, got {val}"
+
+
+def test_specials_hero_bit_at_player_position():
+    """The player tile must set MG_HERO (0x01).
+
+    Vendor bits (display.h:995): MG_HERO = 0x01.
+    """
+    state = _default_state().replace(
+        player_pos=jnp.array([10, 12], dtype=jnp.int16),
+    )
+    specials = build_specials(state)
+    val = int(specials[10, 12])
+    assert (val & 0x01) != 0, f"MG_HERO bit not set at player pos, got {val}"
 
 
 def test_specials_shape_and_dtype():
