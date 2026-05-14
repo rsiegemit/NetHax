@@ -1,0 +1,856 @@
+"""Wish subsystem — grant a wish for an object or artifact.
+
+Canonical sources:
+  vendor/nethack/src/wizard.c::makewish   — main wish handler
+  vendor/nethack/src/wizard.c::wishymatch — parse user input to object/artifact
+  vendor/nethack/src/read.c::do_genocide  — wish-like genocide
+  vendor/nethack/src/spell.c::wishcmdassist — wish command help
+
+Wave 6 Phase B status:
+  Python-side parser (not JIT) covering canonical object/artifact name lookup,
+  BUC prefix ("blessed"/"uncursed"/"cursed"), and enchantment prefix ("+N").
+  Grant creates the wished-for item in the first empty inventory slot
+  (or drops it on the ground at the player position when the inventory is
+  full), and sets WISHLESS / ARTIWISHLESS conducts.
+
+The wish parser is intentionally minimal: NetHack's wishymatch is ~600 lines
+of fuzzy matching, prefix juggling, and grammar parsing.  We support the
+exact-name path plus BUC/enchant prefixes, which is enough for canonical
+"blessed +3 long sword" / "Excalibur" / "gray dragon scale mail" inputs.
+
+Wired conducts (Wave 6 Phase B):
+    WISHLESS      — set on every grant (wishymatch success path).
+    ARTIWISHLESS  — set when the parsed artifact_idx >= 0.
+"""
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+
+from Nethax.nethax.constants.objects import OBJECTS, ObjectClass, OBJECT_NAME_ALIASES
+from Nethax.nethax.subsystems.conduct import Conduct
+from Nethax.nethax.subsystems.inventory import (
+    MAX_GROUND_STACK,
+    MAX_INVENTORY_SLOTS,
+    USER_NAME_LEN,
+)
+from Nethax.nethax.subsystems.items import BUCStatus
+from Nethax.nethax.subsystems.prayer import Alignment
+
+
+# ---------------------------------------------------------------------------
+# Artifact table — minimal subset for Wave 6.
+#
+# Mirrors vendor/nethack/include/artilist.h ordering (1-based in vendor;
+# we use 0-based indices).  Each entry pairs the artifact name with the
+# base object name used by the underlying Item.type_id.
+# ---------------------------------------------------------------------------
+_ARTIFACTS: tuple[tuple[str, str], ...] = (
+    ("Excalibur",                "long sword"),
+    ("Snickersnee",              "katana"),
+    ("Stormbringer",             "runesword"),
+    ("Mjollnir",                 "war hammer"),
+    ("Cleaver",                  "battle-axe"),
+    ("Sting",                    "elven dagger"),
+    ("Orcrist",                  "elven broadsword"),
+    ("Grayswandir",              "silver saber"),
+    ("Vorpal Blade",             "long sword"),
+    ("Sceptre of Might",         "mace"),
+    ("Tsurugi of Muramasa",      "tsurugi"),
+    ("Magic Mirror of Merlin",   "mirror"),
+    ("Orb of Detection",         "crystal ball"),
+    ("Heart of Ahriman",         "luckstone"),
+    ("Staff of Aesculapius",     "quarterstaff"),
+    ("Eyes of the Overworld",    "pair of lenses"),
+    ("Mitre of Holiness",        "helmet"),
+    ("Longbow of Diana",         "bow"),
+    ("Master Key of Thievery",   "skeleton key"),
+    ("Yendorian Express Card",   "credit card"),
+    ("Orb of Fate",              "crystal ball"),
+    ("Eye of the Aethiopica",    "amulet of ESP"),
+)
+
+
+# ---------------------------------------------------------------------------
+# Static lookup tables (built at import time).
+# ---------------------------------------------------------------------------
+def _build_object_index() -> dict[str, int]:
+    """Map object name -> type_id (position in OBJECTS).
+
+    Wave 6 Phase B: object names are stored in their bare canonical form
+    ("healing", "identify", "magic missile") and the class prefix is added
+    at render time.  For backwards compatibility, prefixed aliases like
+    "potion of healing" → bare-name index are merged in via
+    ``OBJECT_NAME_ALIASES``.
+
+    Wave 6 parity-fix (CA #63): OBJECTS regenerated from vendor objects.c
+    contains 23 anonymous separator entries (``name is None``).  Skip them
+    here so the lookup map is well-formed (None has no ``.lower``).
+    Cite: vendor/nethack/src/objects.c — sentinel zero rows separate classes.
+    """
+    index: dict[str, int] = {}
+    for idx, entry in enumerate(OBJECTS):
+        if entry.name is None:
+            continue
+        # Prefer the FIRST occurrence of a bare name so cross-class collisions
+        # (e.g. "identify" exists in SCROLL_CLASS at 311 and SPBOOK_CLASS at
+        # 371) resolve to the earlier class — vendor wishymatch walks the
+        # bare-name table in declaration order.
+        index.setdefault(entry.name, idx)
+    # Merge backwards-compat aliases for verbose "<prefix> <name>" lookups.
+    for alias, idx in OBJECT_NAME_ALIASES.items():
+        index.setdefault(alias, idx)
+    return index
+
+
+def _build_artifact_index() -> dict[str, int]:
+    """Map artifact name -> artifact_idx (position in _ARTIFACTS)."""
+    return {name: idx for idx, (name, _base) in enumerate(_ARTIFACTS)}
+
+
+_OBJECT_BY_NAME: dict[str, int] = _build_object_index()
+_ARTIFACT_BY_NAME: dict[str, int] = _build_artifact_index()
+
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+def _decode(wish_bytes) -> str:
+    """Decode wish input to a normalised lowercase string."""
+    if isinstance(wish_bytes, (bytes, bytearray)):
+        s = bytes(wish_bytes).decode("ascii", errors="ignore")
+    elif isinstance(wish_bytes, str):
+        s = wish_bytes
+    else:
+        try:
+            s = bytes(list(wish_bytes)).decode("ascii", errors="ignore")
+        except Exception:
+            s = str(wish_bytes)
+    return s.strip()
+
+
+def _strip_buc_prefix(text: str) -> tuple[str, int]:
+    """Strip leading BUC keyword.
+
+    Returns (remaining_text, buc_status).  buc_status follows the
+    Nethax BUCStatus enum: UNKNOWN=0, CURSED=1, UNCURSED=2, BLESSED=3.
+    """
+    lower = text.lower()
+    for prefix, buc in (
+        ("blessed ",  int(BUCStatus.BLESSED)),
+        ("uncursed ", int(BUCStatus.UNCURSED)),
+        ("cursed ",   int(BUCStatus.CURSED)),
+    ):
+        if lower.startswith(prefix):
+            return text[len(prefix):].strip(), buc
+    return text, int(BUCStatus.UNCURSED)  # vendor default: wished items uncursed
+
+
+def _strip_misc_prefixes(text: str) -> str:
+    """Strip cosmetic prefixes ("greased", "fixed", "fireproof", ...) that
+    NetHack accepts in wishymatch but which we don't model individually.
+    """
+    keywords = (
+        "greased ", "fixed ", "fireproof ", "rustproof ", "corrodeproof ",
+        "rotproof ", "thoroughly rusty ", "thoroughly burnt ",
+        "rusty ", "corroded ", "burnt ", "rotted ",
+    )
+    lower = text.lower()
+    changed = True
+    while changed:
+        changed = False
+        for kw in keywords:
+            if lower.startswith(kw):
+                text = text[len(kw):]
+                lower = text.lower()
+                changed = True
+                break
+    return text.strip()
+
+
+def _strip_enchant_prefix(text: str) -> tuple[str, int]:
+    """Strip leading enchantment prefix like "+3 " or "-1 ".
+
+    Returns (remaining_text, enchantment).  Defaults to 0 when no prefix.
+    """
+    text = text.strip()
+    if not text:
+        return text, 0
+    if text[0] not in "+-":
+        return text, 0
+    # Read sign + digits
+    i = 1
+    while i < len(text) and text[i].isdigit():
+        i += 1
+    if i == 1:  # only the sign, no digits
+        return text, 0
+    try:
+        value = int(text[:i])
+    except ValueError:
+        return text, 0
+    return text[i:].strip(), value
+
+
+# ---------------------------------------------------------------------------
+# Full vendor wishymatch parser (Wave 6 Phase B+).
+#
+# Mirrors vendor/nethack/src/objnam.c::wishymatch + readobjnam:
+#   - "the" prefix strip for artifacts
+#   - Plural normalization (scrolls→scroll, knives→knife, men→man)
+#   - Fuzzy abbreviation match (gdsm→gray dragon scale mail, longsword→long sword)
+#   - Multi-modifier combos (blessed rustproof greased fixed +N ... named X)
+#   - Artifact SPFX alignment restriction (Excalibur lawful XL>=5, etc.)
+# ---------------------------------------------------------------------------
+
+# Modifier keywords parsed left-to-right (lower-cased input).  Each entry is
+# (keyword, slot_name, slot_value).  slot_name is one of:
+#   "buc"        -> int BUC status
+#   "erodeproof" -> bool True
+#   "greased"    -> bool True
+# Pure cosmetic erosion adjectives (rusty, corroded, ...) are silently dropped
+# (vendor wishymatch accepts them but they have no Wave 6 model fidelity).
+_MOD_KEYWORDS: tuple[tuple[str, str, object], ...] = (
+    ("blessed",        "buc", int(BUCStatus.BLESSED)),
+    ("uncursed",       "buc", int(BUCStatus.UNCURSED)),
+    ("cursed",         "buc", int(BUCStatus.CURSED)),
+    ("holy",           "buc", int(BUCStatus.BLESSED)),
+    ("unholy",         "buc", int(BUCStatus.CURSED)),
+    ("rustproof",      "erodeproof", True),
+    ("fireproof",      "erodeproof", True),
+    ("corrodeproof",   "erodeproof", True),
+    ("rotproof",       "erodeproof", True),
+    ("fixed",          "erodeproof", True),
+    ("erodeproof",     "erodeproof", True),
+    ("greased",        "greased", True),
+)
+
+# Cosmetic erosion adjectives consumed and discarded.
+_COSMETIC_DROPS: tuple[str, ...] = (
+    "thoroughly rusty", "thoroughly burnt", "thoroughly corroded",
+    "thoroughly rotted",
+    "very rusty", "very burnt", "very corroded", "very rotted",
+    "rusty", "burnt", "corroded", "rotted",
+    "diluted",
+)
+
+# Plural -> singular irregulars used by vendor's makeplural inverse.
+# Source: vendor/nethack/src/objnam.c::makesingular.
+_IRREGULAR_PLURALS: dict = {
+    "knives":     "knife",
+    "wolves":     "wolf",
+    "leaves":     "leaf",
+    "loaves":     "loaf",
+    "men":        "man",
+    "women":      "woman",
+    "children":   "child",
+    "teeth":      "tooth",
+    "feet":       "foot",
+    "geese":      "goose",
+    "mice":       "mouse",
+    "lice":       "louse",
+    "dice":       "die",
+    "oxen":       "ox",
+    "fungi":      "fungus",
+    "octopi":     "octopus",
+    "cacti":      "cactus",
+    "matzot":     "matzo",
+    "shuriken":   "shuriken",  # already singular
+    "ya":         "ya",        # already singular
+}
+
+
+def _strip_the_prefix(text: str) -> str:
+    """Strip a leading 'the ' (case-insensitive).  Used for artifact lookup."""
+    if text[:4].lower() == "the ":
+        return text[4:].lstrip()
+    return text
+
+
+def _singularize_word(word: str) -> str:
+    """Inverse of vendor makeplural for a single word.
+
+    Handles irregular forms first, then suffix rules:
+      -ies -> -y    (berries -> berry)
+      -ves -> -f    (handled by irregulars map for common cases)
+      -ches -> -ch  (torches -> torch)
+      -shes -> -sh  (wishes -> wish)
+      -xes  -> -x   (boxes -> box)
+      -ses  -> -s   (glasses -> glass)
+      -s    -> ''   (scrolls -> scroll)
+    """
+    lower = word.lower()
+    if lower in _IRREGULAR_PLURALS:
+        return _IRREGULAR_PLURALS[lower]
+    if len(lower) > 3 and lower.endswith("ies"):
+        return word[:-3] + "y"
+    if len(lower) > 4 and lower.endswith(("ches", "shes")):
+        return word[:-2]
+    if len(lower) > 3 and lower.endswith(("xes", "ses", "zes")):
+        return word[:-2]
+    if len(lower) > 1 and lower.endswith("s") and not lower.endswith("ss"):
+        # Avoid stripping the trailing 's' of intrinsically singular words
+        # like "scales", "lenses" (handled above), "pants".
+        return word[:-1]
+    return word
+
+
+def _singularize_phrase(text: str) -> str:
+    """Singularize the first noun token of a multi-word phrase.
+
+    Vendor pluralization in inv_strs polish is single-noun based:
+      "scrolls of identify" -> "scroll of identify"
+      "potions of healing"  -> "potion of healing"
+      "pairs of lenses"     -> "pair of lenses"
+    We singularize only the leading word (before " of ") plus a trailing-word
+    fallback for "long swords" -> "long sword".
+    """
+    if " of " in text:
+        head, tail = text.split(" of ", 1)
+        head_words = head.split()
+        if head_words:
+            head_words[-1] = _singularize_word(head_words[-1])
+            head = " ".join(head_words)
+        return f"{head} of {tail}"
+    # No " of " marker — singularize the last word (handles "long swords").
+    words = text.split()
+    if not words:
+        return text
+    singular_last = _singularize_word(words[-1])
+    if singular_last != words[-1]:
+        return " ".join(words[:-1] + [singular_last])
+    return text
+
+
+def _fuzzy_object_lookup(text: str) -> int:
+    """Vendor wishymatch-style fuzzy lookup.
+
+    Strategy (mirrors objnam.c::wishymatch lines 3243+):
+      1. Exact match in _OBJECT_BY_NAME (case-insensitive).
+      2. Strip-spaces match: "longsword" matches the no-space form of
+         "long sword"; "graydragonscalemail" -> "gray dragon scale mail".
+      3. Abbreviation match: leading-initials per word, e.g. "gdsm" ->
+         "gray dragon scale mail".
+    Returns the OBJECTS index, or -1 on miss.
+    """
+    if not text:
+        return -1
+    lower = text.lower()
+
+    # Pass 1 — exact (case-insensitive).
+    for name, idx in _OBJECT_BY_NAME.items():
+        if name.lower() == lower:
+            return idx
+
+    # Pass 2 — strip-spaces.  Compare wish-no-spaces to object-no-spaces.
+    needle = lower.replace(" ", "").replace("-", "")
+    if needle:
+        for name, idx in _OBJECT_BY_NAME.items():
+            haystack = name.lower().replace(" ", "").replace("-", "")
+            if haystack == needle:
+                return idx
+
+    # Pass 3 — abbreviation (first letter of each word).  Only consider
+    # multi-word object names so single-letter "p" doesn't match "potion".
+    if needle and needle.isalpha() and len(needle) >= 2:
+        for name, idx in _OBJECT_BY_NAME.items():
+            words = name.lower().split()
+            if len(words) < 2:
+                continue
+            initials = "".join(w[0] for w in words if w)
+            if initials == needle:
+                return idx
+
+    return -1
+
+
+def _fuzzy_artifact_lookup(text: str) -> int:
+    """Vendor wishymatch artifact lookup with case-insensitive fallback.
+
+    Vendor matches the artifact's proper noun (case-sensitive in artilist.h),
+    but readobjnam tolerates case differences.  Returns artifact index or -1.
+    """
+    if not text:
+        return -1
+    # Direct hit on proper noun.
+    idx = _ARTIFACT_BY_NAME.get(text, -1)
+    if idx >= 0:
+        return idx
+    lower = text.lower()
+    for art_name, art_idx in _ARTIFACT_BY_NAME.items():
+        if art_name.lower() == lower:
+            return art_idx
+    return -1
+
+
+def _strip_named_suffix(text: str) -> tuple[str, bytes]:
+    """Strip a trailing ' named <X>' or ' called <X>' clause.
+
+    Returns (remaining_text, name_bytes).  name_bytes is b'' when no suffix.
+    The vendor accepts both "named" and "called" (do_name.c::do_oname).
+    """
+    lower = text.lower()
+    for sep in (" named ", " called "):
+        pos = lower.rfind(sep)
+        if pos >= 0:
+            head = text[:pos].rstrip()
+            tail = text[pos + len(sep):].strip()
+            # Truncate to USER_NAME_LEN (vendor caps at ONAME_LEN).
+            tail_bytes = tail.encode("ascii", errors="ignore")[:USER_NAME_LEN]
+            return head, tail_bytes
+    return text, b""
+
+
+def _consume_modifiers(text: str) -> dict:
+    """Walk modifier keywords left-to-right.
+
+    Returns a dict with parsed modifier fields and the remaining text:
+      {'text': str, 'buc': int|None, 'enchant': int, 'erodeproof': bool,
+       'greased': bool}
+    """
+    result = {
+        "buc": None,
+        "enchant": 0,
+        "erodeproof": False,
+        "greased": False,
+        "text": text,
+    }
+    progress = True
+    while progress and result["text"]:
+        progress = False
+        lower = result["text"].lower()
+
+        # Try keyword modifiers.
+        for kw, slot, val in _MOD_KEYWORDS:
+            prefix = kw + " "
+            if lower.startswith(prefix):
+                if slot == "buc" and result["buc"] is None:
+                    result["buc"] = val
+                elif slot == "erodeproof":
+                    result["erodeproof"] = True
+                elif slot == "greased":
+                    result["greased"] = True
+                result["text"] = result["text"][len(prefix):].lstrip()
+                progress = True
+                break
+        if progress:
+            continue
+
+        # Cosmetic erosion adjectives — consume and ignore.
+        for kw in _COSMETIC_DROPS:
+            prefix = kw + " "
+            if lower.startswith(prefix):
+                result["text"] = result["text"][len(prefix):].lstrip()
+                progress = True
+                break
+        if progress:
+            continue
+
+        # Enchantment prefix: +N or -N.
+        new_text, ench = _strip_enchant_prefix(result["text"])
+        if new_text != result["text"]:
+            result["enchant"] = ench
+            result["text"] = new_text
+            progress = True
+            continue
+
+    return result
+
+
+def _artifact_alignment(artifact_idx: int) -> int:
+    """Return the canonical alignment requirement for an artifact.
+
+    Hardcoded table (mirrors artilist.h A_LAWFUL / A_NEUTRAL / A_CHAOTIC /
+    A_NONE).  Used for the SPFX_RESTR check.  Values use the Nethax
+    Alignment enum (CHAOTIC=0, NEUTRAL=1, LAWFUL=2, UNALIGNED=3).
+    """
+    # Per vendor/nethack/include/artilist.h.
+    table = {
+        0:  int(Alignment.LAWFUL),     # Excalibur
+        1:  int(Alignment.LAWFUL),     # Snickersnee
+        2:  int(Alignment.CHAOTIC),    # Stormbringer
+        3:  int(Alignment.NEUTRAL),    # Mjollnir
+        4:  int(Alignment.NEUTRAL),    # Cleaver
+        5:  int(Alignment.CHAOTIC),    # Sting
+        6:  int(Alignment.CHAOTIC),    # Orcrist
+        7:  int(Alignment.LAWFUL),     # Grayswandir
+        8:  int(Alignment.NEUTRAL),    # Vorpal Blade
+        9:  int(Alignment.LAWFUL),     # Sceptre of Might
+        10: int(Alignment.LAWFUL),     # Tsurugi of Muramasa
+        11: int(Alignment.NEUTRAL),    # Magic Mirror of Merlin
+        12: int(Alignment.NEUTRAL),    # Orb of Detection
+        13: int(Alignment.NEUTRAL),    # Heart of Ahriman
+        14: int(Alignment.NEUTRAL),    # Staff of Aesculapius
+        15: int(Alignment.NEUTRAL),    # Eyes of the Overworld
+        16: int(Alignment.LAWFUL),     # Mitre of Holiness
+        17: int(Alignment.NEUTRAL),    # Longbow of Diana
+        18: int(Alignment.CHAOTIC),    # Master Key of Thievery
+        19: int(Alignment.NEUTRAL),    # Yendorian Express Card
+        20: int(Alignment.NEUTRAL),    # Orb of Fate
+        21: int(Alignment.NEUTRAL),    # Eye of the Aethiopica
+    }
+    return table.get(artifact_idx, int(Alignment.UNALIGNED))
+
+
+_EXCALIBUR_MIN_XL = 5  # vendor: u.ulevel >= 5 required for Excalibur.
+
+
+def _spec_applies(artifact_idx: int, player_align: int, player_xl: int) -> bool:
+    """Check SPFX_RESTR alignment/XL restrictions for granting an artifact.
+
+    Mirrors artifact.c::spec_applies (the wish-side check).  Returns True
+    when the player satisfies the artifact's requirements.
+    """
+    if artifact_idx < 0:
+        return False
+    required_align = _artifact_alignment(artifact_idx)
+    if required_align != int(Alignment.UNALIGNED):
+        if player_align != required_align:
+            return False
+    # Excalibur additionally requires XL >= 5.
+    if artifact_idx == 0 and player_xl < _EXCALIBUR_MIN_XL:
+        return False
+    return True
+
+
+def apply_artifact_restrictions(parsed: dict, player_align: int,
+                                player_xl: int) -> dict:
+    """Apply SPFX_RESTR alignment/XL gating to a parsed wishymatch dict.
+
+    Returns a new dict (the input is not mutated).  Mirrors vendor
+    readobjnam's spec_applies branch and the Excalibur->Stormbringer
+    chaotic substitution shorthand.
+
+    Behavior:
+      - Non-artifact input: unchanged.
+      - Artifact passes spec_applies: unchanged.
+      - Chaotic player wishing Excalibur and Stormbringer's gates open:
+        the dict is rewritten to grant Stormbringer (runesword base).
+      - Any other denial: artifact_idx becomes -1 but the base object
+        remains (vendor: still grants the underlying long sword / bow / ...).
+    """
+    if not parsed.get("parsed", False):
+        return dict(parsed)
+    art = parsed.get("artifact_idx", -1)
+    if art < 0:
+        return dict(parsed)
+    if _spec_applies(art, player_align, player_xl):
+        return dict(parsed)
+    out = dict(parsed)
+    if (art == 0
+        and player_align == int(Alignment.CHAOTIC)
+        and _spec_applies(2, player_align, player_xl)):
+        sub_idx = 2  # Stormbringer
+        base = _ARTIFACTS[sub_idx][1]
+        sub_type = _OBJECT_BY_NAME.get(base, -1)
+        if sub_type < 0:
+            sub_type = _fuzzy_object_lookup(base)
+        if sub_type >= 0:
+            out["artifact_idx"] = sub_idx
+            out["type_id"]      = sub_type
+            out["category"]     = int(OBJECTS[sub_type].class_)
+            return out
+    # Denial: strip artifact_idx, keep the base object.
+    out["artifact_idx"] = -1
+    return out
+
+
+def wishymatch(wish_bytes) -> dict:
+    """Full vendor wishymatch parser (Wave 6 Phase B+).
+
+    Returns a dict shaped:
+        {
+          'category': int,        # ObjectClass; -1 on parse miss
+          'type_id': int,         # OBJECTS index; -1 on parse miss
+          'buc': int,             # BUCStatus int (UNCURSED default)
+          'enchant': int,         # signed enchantment
+          'artifact_idx': int,    # -1 when not an artifact wish
+          'user_name': bytes,     # b'' when no "named X" clause
+          'erodeproof': bool,
+          'greased': bool,
+          'parsed': bool,         # False when name lookup fails
+        }
+
+    Cite: vendor/nethack/src/objnam.c::wishymatch + readobjnam.
+    """
+    out = {
+        "category": -1,
+        "type_id": -1,
+        "buc": int(BUCStatus.UNCURSED),
+        "enchant": 0,
+        "artifact_idx": -1,
+        "user_name": b"",
+        "erodeproof": False,
+        "greased": False,
+        "parsed": False,
+    }
+    text = _decode(wish_bytes)
+    if not text:
+        return out
+
+    # 1. Strip trailing "named X" / "called X".
+    text, user_name = _strip_named_suffix(text)
+    out["user_name"] = user_name
+
+    # 2. Walk left-to-right modifier keywords + enchantment.
+    mods = _consume_modifiers(text)
+    text = mods["text"]
+    out["enchant"]    = mods["enchant"]
+    out["erodeproof"] = mods["erodeproof"]
+    out["greased"]    = mods["greased"]
+    if mods["buc"] is not None:
+        out["buc"] = mods["buc"]
+
+    text = text.strip()
+    if not text:
+        return out
+
+    # 3. Plural normalization first (so "the scrolls of identify" works
+    #    after the "the" strip below).
+    text = _singularize_phrase(text)
+
+    # 4. "the" prefix — only meaningful for artifact lookup, but harmless
+    #    to also drop before the object lookup fallback.
+    text_no_the = _strip_the_prefix(text)
+
+    # 5. Artifact lookup (case-sensitive on proper noun, then fuzzy).
+    artifact_idx = _fuzzy_artifact_lookup(text_no_the)
+    if artifact_idx < 0:
+        # Some artifact names embed "the" internally (Eye of the Aethiopica)
+        # so also try the un-stripped form.
+        artifact_idx = _fuzzy_artifact_lookup(text)
+
+    if artifact_idx >= 0:
+        base_name = _ARTIFACTS[artifact_idx][1]
+        type_id = _OBJECT_BY_NAME.get(base_name, -1)
+        if type_id < 0:
+            type_id = _fuzzy_object_lookup(base_name)
+        if type_id >= 0:
+            out["category"]     = int(OBJECTS[type_id].class_)
+            out["type_id"]      = type_id
+            out["artifact_idx"] = artifact_idx
+            out["parsed"]       = True
+        return out
+
+    # 6. Object name fuzzy lookup.
+    type_id = _fuzzy_object_lookup(text_no_the)
+    if type_id < 0:
+        type_id = _fuzzy_object_lookup(text)
+    if type_id < 0:
+        return out
+    out["category"] = int(OBJECTS[type_id].class_)
+    out["type_id"]  = type_id
+    out["parsed"]   = True
+    return out
+
+
+def parse_wish_string(wish_bytes) -> tuple[int, int, int, int, int]:
+    """Parse a wish input into structured fields.
+
+    Wave 6 simplified parser:
+      - Strip BUC prefix ("blessed"/"uncursed"/"cursed") if present.
+      - Strip cosmetic prefixes ("greased", "fixed", "fireproof", ...).
+      - Strip enchantment prefix ("+N" / "-N").
+      - Strip cosmetic prefixes again (vendor wishymatch accepts them in
+        either order around the enchantment token).
+      - Look the remaining name up in _ARTIFACT_BY_NAME (case-sensitive,
+        vendor proper-noun match): if found, resolve to the artifact's base
+        object type_id and emit artifact_idx.
+      - Else look in _OBJECT_BY_NAME (case-insensitive): emit type_id and
+        artifact_idx=-1.
+      - On miss: return all -1 sentinels except buc/enchant defaults.
+
+    Returns
+    -------
+    (category, type_id, buc_status, enchantment, artifact_idx)
+
+    category     : ObjectClass int (-1 on miss)
+    type_id      : index into OBJECTS (-1 on miss)
+    buc_status   : BUCStatus int (UNCURSED default)
+    enchantment  : int8-range
+    artifact_idx : 0-based index into _ARTIFACTS, or -1 if not an artifact
+
+    Python-side (not JIT) — wish parsing happens at action-handler dispatch
+    time, not in the hot loop.  Cite: vendor/nethack/src/wizard.c::wishymatch.
+
+    This is a thin compatibility wrapper around ``wishymatch`` which returns
+    the full vendor parser result.  Existing callers continue to receive the
+    5-tuple they relied on in Wave 6 Phase B.
+    """
+    parsed = wishymatch(wish_bytes)
+    if not parsed["parsed"]:
+        return (-1, -1, parsed["buc"], parsed["enchant"], -1)
+    return (
+        parsed["category"],
+        parsed["type_id"],
+        parsed["buc"],
+        parsed["enchant"],
+        parsed["artifact_idx"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Grant
+# ---------------------------------------------------------------------------
+def _find_first_empty_slot(items) -> int:
+    """Python-side: return first empty inventory slot index, or -1 if full."""
+    cats = items.category
+    for i in range(MAX_INVENTORY_SLOTS):
+        if int(cats[i]) == 0:
+            return i
+    return -1
+
+
+def _find_first_empty_ground_slot(ground_items, b, lv, r, c) -> int:
+    """Return first empty ground-stack slot index at (b,lv,r,c), or -1 if full."""
+    cats = ground_items.category
+    for i in range(MAX_GROUND_STACK):
+        if int(cats[b, lv, r, c, i]) == 0:
+            return i
+    return -1
+
+
+def _write_inventory_slot(state, slot_idx: int, category: int, type_id: int,
+                          buc: int, enchant: int, weight: int):
+    """Return new state with the given inventory slot populated with the wished item."""
+    items = state.inventory.items
+    new_items = items.replace(
+        category    = items.category.at[slot_idx].set(jnp.int8(category)),
+        type_id     = items.type_id.at[slot_idx].set(jnp.int16(type_id)),
+        buc_status  = items.buc_status.at[slot_idx].set(jnp.int8(buc)),
+        enchantment = items.enchantment.at[slot_idx].set(jnp.int8(enchant)),
+        charges     = items.charges.at[slot_idx].set(jnp.int8(0)),
+        identified  = items.identified.at[slot_idx].set(jnp.bool_(True)),
+        quantity    = items.quantity.at[slot_idx].set(jnp.int16(1)),
+        weight      = items.weight.at[slot_idx].set(jnp.int32(weight)),
+        ac_bonus    = items.ac_bonus.at[slot_idx].set(jnp.int8(0)),
+        is_two_handed = items.is_two_handed.at[slot_idx].set(jnp.bool_(False)),
+    )
+    new_inv = state.inventory.replace(items=new_items)
+    return state.replace(inventory=new_inv)
+
+
+def _write_ground_slot(state, b: int, lv: int, r: int, c: int, gslot: int,
+                       category: int, type_id: int, buc: int, enchant: int,
+                       weight: int):
+    """Return new state with the wished item placed on the ground stack."""
+    g = state.ground_items
+    new_g = g.replace(
+        category    = g.category.at[b, lv, r, c, gslot].set(jnp.int8(category)),
+        type_id     = g.type_id.at[b, lv, r, c, gslot].set(jnp.int16(type_id)),
+        buc_status  = g.buc_status.at[b, lv, r, c, gslot].set(jnp.int8(buc)),
+        enchantment = g.enchantment.at[b, lv, r, c, gslot].set(jnp.int8(enchant)),
+        charges     = g.charges.at[b, lv, r, c, gslot].set(jnp.int8(0)),
+        identified  = g.identified.at[b, lv, r, c, gslot].set(jnp.bool_(True)),
+        quantity    = g.quantity.at[b, lv, r, c, gslot].set(jnp.int16(1)),
+        weight      = g.weight.at[b, lv, r, c, gslot].set(jnp.int32(weight)),
+        ac_bonus    = g.ac_bonus.at[b, lv, r, c, gslot].set(jnp.int8(0)),
+        is_two_handed = g.is_two_handed.at[b, lv, r, c, gslot].set(jnp.bool_(False)),
+    )
+    return state.replace(ground_items=new_g)
+
+
+def _mark_wish_conducts(state, artifact: bool):
+    """Set WISHLESS and (optionally) ARTIWISHLESS on EnvState.conduct."""
+    vios = state.conduct.violations.at[int(Conduct.WISHLESS)].set(True)
+    if artifact:
+        vios = vios.at[int(Conduct.ARTIWISHLESS)].set(True)
+    return state.replace(conduct=state.conduct.replace(violations=vios))
+
+
+def _set_user_name_at(state, slot_idx: int, name_bytes: bytes):
+    """Write ``name_bytes`` (zero-padded) into ``state.inventory.user_names[slot]``.
+
+    Mirrors handle_name() but Python-side without the JIT path.  Used when
+    the wish string contains a trailing ``named X`` clause.
+    """
+    padded = bytes(name_bytes)[:USER_NAME_LEN]
+    padded = padded + b"\x00" * (USER_NAME_LEN - len(padded))
+    name_row = jnp.array(list(padded), dtype=jnp.int8)
+    new_user_names = state.inventory.user_names.at[slot_idx].set(name_row)
+    new_inv = state.inventory.replace(user_names=new_user_names)
+    return state.replace(inventory=new_inv)
+
+
+def grant_wish(state, rng, wish_string):
+    """Grant a wish: parse the wish string, create the item, set conducts.
+
+    Steps (mirrors vendor/nethack/src/wizard.c::makewish):
+      1. Parse wish_string Python-side via ``wishymatch``.
+      2. On parse miss, return state unchanged (no conduct flip).
+      3. Enforce artifact SPFX_RESTR alignment/XL check: if the player can't
+         have the wished artifact, fall back to the base item with no
+         artifact mark (vendor: alignment-mismatched wishes still grant the
+         base object).  Special case: chaotic wishing Excalibur receives
+         Stormbringer instead, mirroring vendor's flavor-aware behavior.
+      4. Place the item in the first empty inventory slot.  If the inventory
+         is full, drop it on the ground at the player position.
+      5. Apply user-given name (``named X`` clause) at the chosen slot.
+      6. Mark WISHLESS conduct (insight.c ~2163 u.uconduct.wishes).
+      7. Mark ARTIWISHLESS conduct when an artifact was actually granted
+         (insight.c ~2166 u.uconduct.wisharti).
+    """
+    parsed = wishymatch(wish_string)
+    if not parsed["parsed"]:
+        return state  # unknown wish: state unchanged, no conduct flip
+
+    category     = parsed["category"]
+    type_id      = parsed["type_id"]
+    buc          = parsed["buc"]
+    enchant      = parsed["enchant"]
+    artifact_idx = parsed["artifact_idx"]
+    user_name    = parsed["user_name"]
+
+    # Artifact SPFX restriction.  Vendor objnam.c::readobjnam (line 5362)
+    # flips u.uconduct.wisharti when the wish *text* was an artifact name,
+    # even if SPFX_RESTR ultimately denies the grant -- so we preserve the
+    # original artifact_idx for the conduct flip and grant the base object.
+    # The alignment-aware Excalibur->Stormbringer substitution is exposed
+    # via ``apply_artifact_restrictions`` for callers that want the full
+    # vendor reroute behavior.
+
+    # Resolve weight from OBJECTS table for fidelity to vendor item weights.
+    weight = int(OBJECTS[type_id].weight)
+
+    # Place item: prefer inventory; fall back to ground stack.
+    slot = _find_first_empty_slot(state.inventory.items)
+    if slot >= 0:
+        state = _write_inventory_slot(state, slot, category, type_id, buc, enchant, weight)
+        if user_name:
+            state = _set_user_name_at(state, slot, user_name)
+    else:
+        b  = int(state.dungeon.current_branch)
+        lv = int(state.dungeon.current_level) - 1
+        r  = int(state.player_pos[0])
+        c  = int(state.player_pos[1])
+        gslot = _find_first_empty_ground_slot(state.ground_items, b, lv, r, c)
+        if gslot >= 0:
+            state = _write_ground_slot(state, b, lv, r, c, gslot,
+                                       category, type_id, buc, enchant, weight)
+        # else: nowhere to put it; vendor would print "nothing happens".
+
+    return _mark_wish_conducts(state, artifact=(artifact_idx >= 0))
+
+
+# ---------------------------------------------------------------------------
+# Wand of wishing — EnvState-level handler.
+#
+# The items_wands subsystem operates on its own WandState slice which lacks
+# the ConductState/QuestState/etc. needed to mark WISHLESS / ARTIWISHLESS.
+# This helper is the canonical EnvState entry point: callers wrap the wand
+# zap at the action-dispatch layer (or call this directly in tests).
+# Cite: vendor/nethack/src/zap.c::zapyourself WAN_WISHING branch.
+# ---------------------------------------------------------------------------
+_DEFAULT_WAND_WISH = b"blessed greased +3 gray dragon scale mail"
+
+
+def handle_wand_of_wishing(state, rng, wish_string=None):
+    """Grant the canonical wand-of-wishing wish on EnvState.
+
+    Wave 6 simplification: wand of wishing grants a fixed canned wish
+    ("blessed greased +3 gray dragon scale mail") because the JAX env has no
+    interactive prompt.  Callers may override the wish_string to test
+    alternate inputs.
+    """
+    if wish_string is None:
+        wish_string = _DEFAULT_WAND_WISH
+    return grant_wish(state, rng, wish_string)

@@ -1,0 +1,54 @@
+MIT License
+
+Copyright (c) 2026 The Nethax contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+-------------------------------------------------------------------------------
+Third-party notice — NetHack / NLE / MiniHack
+-------------------------------------------------------------------------------
+
+Nethax is a from-scratch reimplementation of NetHack 3.7 and the NetHack
+Learning Environment (NLE), built against canonical sources cloned into a
+gitignored `vendor/` directory.  The MIT license above covers the JAX source,
+tests, documentation, generated tile atlas, and accompanying assets in this
+repository.
+
+A small number of data tables and verbatim level-MAP strings are ported
+bit-for-bit from NetHack 3.7 for parity testing.  NetHack itself is
+distributed under the NetHack General Public License (NGPL), available at:
+
+    https://github.com/NetHack/NetHack/blob/master/dat/license
+
+Downstream redistribution of nethax that includes these vendor-derived
+fragments may need to comply with NGPL terms.  See `docs/vendor_parity.md`
+for a per-subsystem breakdown of what is reimplemented from scratch versus
+what is verbatim, and which vendor file each citation points to.
+
+The NLE benchmark surface (Gym/Gymnasium API, observation dict schema,
+121-action enum, 5976-entry glyph2tile mapping) is reproduced for drop-in
+compatibility; NLE itself is BSD-licensed.  See:
+
+    https://github.com/facebookresearch/nle
+
+MiniHack is similarly Apache-2.0 licensed; the curriculum-style envs under
+`Nethax/minihax/` reimplement that interface from scratch.  See:
+
+    https://github.com/facebookresearch/minihack

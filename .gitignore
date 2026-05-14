@@ -1,7 +1,38 @@
-Craftax/
+# --- vendor / reference clones (gitignored, must be cloned locally) ---
+vendor/
 NetHack-NetHack-3.7/
+Craftax/
 minihack-main/
-*.pyc
 sol-main/
-videos/
+
+# --- python ---
+*.pyc
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# --- virtualenvs ---
+.venv/
+venv/
+env/
+
+# --- editor / system ---
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# --- claude / agent state ---
+.claude/
 .omc/
+
+# --- runtime artefacts ---
+videos/
+bench/results/
+*.npz
+!Nethax/tiles/*.npy

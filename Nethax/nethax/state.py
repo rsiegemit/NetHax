@@ -1,0 +1,237 @@
+"""Master ``EnvState`` for the JAX NetHack reimplementation.
+
+Composes every subsystem's state slice into a single Flax pytree, so the entire
+game state can be passed through ``jax.jit`` and ``jax.lax.scan`` as one value.
+
+Wave 1 status:
+    Slices for all stubbed subsystems are wired in.  ``EnvState.default()``
+    returns a fresh zero-initialised game (no map, no monsters, no items)
+    suitable for proving the API surface and running pytest.
+
+Canonical source: vendor/nethack/src/decl.c (global state declarations),
+                  vendor/nethack/include/you.h (player struct),
+                  vendor/nethack/include/flag.h (game flags).
+"""
+from __future__ import annotations
+from typing import Any
+
+import jax
+import jax.numpy as jnp
+from flax import struct
+
+from Nethax.nethax.subsystems.combat import CombatState
+from Nethax.nethax.subsystems.magic import MagicState
+from Nethax.nethax.subsystems.monster_ai import MonsterAIState, make_monster_ai_state
+from Nethax.nethax.subsystems.polymorph import PolymorphState, make_polymorph_state
+from Nethax.nethax.subsystems.inventory import (
+    InventoryState,
+    _empty_ground_items_array,
+    BASE_AC,
+)
+from Nethax.nethax.subsystems.identification import IdentificationState
+from Nethax.nethax.subsystems.traps import TrapState
+from Nethax.nethax.subsystems.features import FeaturesState
+from Nethax.nethax.subsystems.prayer import PrayerState
+from Nethax.nethax.subsystems.conduct import ConductState
+from Nethax.nethax.subsystems.shop import ShopState
+from Nethax.nethax.subsystems.quest import QuestState
+from Nethax.nethax.subsystems.status_effects import StatusState
+from Nethax.nethax.subsystems.scoring import ScoringState
+from Nethax.nethax.subsystems.messages import MessageState
+from Nethax.nethax.subsystems.containers import ContainerState
+from Nethax.nethax.subsystems.engrave import EngraveState
+
+from Nethax.nethax.dungeon.branches import (
+    DungeonState,
+    N_BRANCHES,
+    MAX_LEVELS_PER_BRANCH,
+    MAP_H,
+    MAP_W,
+)
+from Nethax.nethax.dungeon.level_memory import LevelMemoryState, make_empty_level_memory
+
+
+@struct.dataclass
+class StaticParams:
+    """Compile-time game-shape parameters.
+
+    These determine pytree shapes and therefore JIT trace identity.  Changing
+    one of these invalidates compiled functions.
+
+    Defaults match NLE conventions:
+        - map: 21 rows x 80 cols (NetHack's ROWNO=21, COLNO=80)
+        - dungeon: 7 branches x 32 max levels per branch
+    """
+    map_h: int = MAP_H
+    map_w: int = MAP_W
+    n_branches: int = N_BRANCHES
+    max_levels_per_branch: int = MAX_LEVELS_PER_BRANCH
+
+
+@struct.dataclass
+class EnvState:
+    """Master game state — every subsystem slice plus core player fields.
+
+    Composition principle: each subsystem owns a Flax ``struct.dataclass``
+    defined in its own module.  ``EnvState`` simply aggregates them, so adding
+    a new subsystem only requires (a) defining its slice and (b) adding a
+    field here.
+
+    Per-tile state lives in two places:
+        * ``terrain`` / ``glyphs`` / ``explored`` arrays here  (dungeon map)
+        * ``traps`` and ``features`` slices  (overlay layers)
+    """
+    # ---- Subsystem slices ----
+    combat: CombatState
+    magic: MagicState
+    monster_ai: MonsterAIState
+    polymorph: PolymorphState
+    inventory: InventoryState
+    identification: IdentificationState
+    traps: TrapState
+    features: FeaturesState
+    prayer: PrayerState
+    conduct: ConductState
+    shop: ShopState
+    quest: QuestState
+    status: StatusState
+    scoring: ScoringState
+    messages: MessageState
+    dungeon: DungeonState
+    level_memory: LevelMemoryState
+    containers: ContainerState
+    engrave: EngraveState
+
+    # ---- Player core (kept here for fast access; not part of any subsystem) ----
+    player_pos: jax.Array       # int16[2]  (row, col)
+    player_hp: jax.Array        # int32
+    player_hp_max: jax.Array    # int32
+    player_pw: jax.Array        # int32
+    player_pw_max: jax.Array    # int32
+    player_xp: jax.Array        # int32  experience points
+    player_xl: jax.Array        # int32  experience level
+    player_role: jax.Array      # int8   Role enum value
+    player_race: jax.Array      # int8   Race enum value
+    player_align: jax.Array     # int8   Alignment enum value
+    player_str: jax.Array       # int16  raw strength (0..125)
+    player_dex: jax.Array       # int8
+    player_con: jax.Array       # int8
+    player_int: jax.Array       # int8
+    player_wis: jax.Array       # int8
+    player_cha: jax.Array       # int8
+    player_gold: jax.Array      # int32
+    player_ac: jax.Array        # int32  armor class (10 = unarmored, lower = better)
+
+    # ---- Player core (Wave 6 closing-audit additions; vendor u.* parity) ----
+    # Citations refer to vendor/nethack/include/you.h::struct you (lines 360-510).
+    player_luck:      jax.Array  # int8   u.uluck   (you.h line 460); range [-10,10]
+    player_moreluck:  jax.Array  # int8   u.moreluck (you.h line 460); luckstone bonus
+    player_in_water:  jax.Array  # bool   u.uinwater (you.h line 431)
+    player_buried:    jax.Array  # bool   u.uburied  (you.h line 436)
+    player_steed_mid: jax.Array  # uint32 u.usteed_mid (you.h line 494); 0 = not riding
+    player_killer_mid: jax.Array # uint32 last-attacker monster id (you.h: svk.killer)
+    player_mortality: jax.Array  # int32  u.umortality (you.h line 497); deaths so far
+    # TODO (post-Wave-6): mirror u.uintrinsic[] timed-intrinsic array and
+    # u.uprops[LAST_PROP+1] property timers — currently fielded indirectly
+    # through StatusState (status_effects.py); revisit when an end-to-end
+    # property-timer simulation is needed.
+
+    # ---- Terrain layers (kept at top level; subsystems read but rarely write) ----
+    terrain: jax.Array          # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]  tile type
+    explored: jax.Array         # bool[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]
+    visible: jax.Array          # bool[MAP_H, MAP_W]  FOV for current level only
+
+    # ---- Ground items (item stack per tile) ----
+    # Item[N_BRANCHES, MAX_LEVELS, MAP_H, MAP_W, MAX_GROUND_STACK]
+    # Each field is an array of that shape; category==0 means empty stack entry.
+    ground_items: Any  # Item pytree (flax struct)
+
+    # ---- Game-loop bookkeeping ----
+    rng: Any                    # jax.random.PRNGKey
+    timestep: jax.Array         # int32
+    done: jax.Array             # bool
+
+    @classmethod
+    def default(
+        cls,
+        rng: Any,
+        static: StaticParams = StaticParams(),
+    ) -> "EnvState":
+        """Return a freshly initialised game state.
+
+        Wave 1: all arrays zero-initialised, player at (0,0), no map content.
+        Later waves wire in role/race choice and dungeon generation.
+        """
+        b, l, h, w = static.n_branches, static.max_levels_per_branch, static.map_h, static.map_w
+        return cls(
+            # subsystem slices
+            combat=CombatState.default(),
+            magic=MagicState.default(),
+            monster_ai=make_monster_ai_state(),
+            polymorph=make_polymorph_state(),
+            inventory=InventoryState.empty(),
+            identification=IdentificationState.unshuffled(),
+            traps=TrapState.default(num_levels=b * l, map_h=h, map_w=w),
+            features=FeaturesState.default(num_levels=b * l, map_h=h, map_w=w),
+            prayer=PrayerState.default(),
+            conduct=ConductState.default(),
+            shop=ShopState.default(),
+            quest=QuestState.default(),
+            status=StatusState.default(),
+            scoring=ScoringState.default(),
+            messages=MessageState.default(),
+            dungeon=_default_dungeon_state(b, l),
+            level_memory=make_empty_level_memory(),
+            containers=ContainerState.empty(),
+            engrave=EngraveState.default(map_h=h, map_w=w),
+            # player core
+            player_pos=jnp.zeros((2,), dtype=jnp.int16),
+            player_hp=jnp.int32(10),
+            player_hp_max=jnp.int32(10),
+            player_pw=jnp.int32(0),
+            player_pw_max=jnp.int32(0),
+            player_xp=jnp.int32(0),
+            player_xl=jnp.int32(1),
+            player_role=jnp.int8(0),
+            player_race=jnp.int8(0),
+            player_align=jnp.int8(0),
+            player_str=jnp.int16(18),
+            player_dex=jnp.int8(10),
+            player_con=jnp.int8(10),
+            player_int=jnp.int8(10),
+            player_wis=jnp.int8(10),
+            player_cha=jnp.int8(10),
+            player_gold=jnp.int32(0),
+            player_ac=jnp.int32(BASE_AC),
+            # Wave 6 closing-audit additions (vendor u.* parity).
+            player_luck=jnp.int8(0),
+            player_moreluck=jnp.int8(0),
+            player_in_water=jnp.bool_(False),
+            player_buried=jnp.bool_(False),
+            player_steed_mid=jnp.uint32(0),
+            player_killer_mid=jnp.uint32(0),
+            player_mortality=jnp.int32(0),
+            # terrain layers
+            terrain=jnp.zeros((b, l, h, w), dtype=jnp.int8),
+            explored=jnp.zeros((b, l, h, w), dtype=jnp.bool_),
+            visible=jnp.zeros((h, w), dtype=jnp.bool_),
+            # ground items
+            ground_items=_empty_ground_items_array(b, l, h, w),
+            # game loop
+            rng=rng,
+            timestep=jnp.int32(0),
+            done=jnp.bool_(False),
+        )
+
+
+def _default_dungeon_state(n_branches: int, max_levels: int) -> DungeonState:
+    """Build a fresh DungeonState with empty branch graph."""
+    return DungeonState(
+        branch_levels=jnp.zeros((n_branches,), dtype=jnp.int8),
+        current_branch=jnp.int8(0),
+        current_level=jnp.int8(1),
+        stair_links=jnp.full((n_branches, max_levels, 2, 2), -1, dtype=jnp.int8),
+        level_rng_seeds=jnp.zeros((n_branches, max_levels), dtype=jnp.uint32),
+        vibrating_square_revealed=jnp.bool_(False),
+        lit_radius_until_turn=jnp.int32(-1),
+    )

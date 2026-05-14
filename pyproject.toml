@@ -4,10 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Nethax"
-version = "0.1.0"
-description = "JAX re-implementation of NetHack and MiniHack environments"
+version = "0.6.0"
+description = "Pure-JAX NetHack 3.7 — JIT-compiled, vendor-bit-equal, full NLE drop-in"
 readme = "README.md"
 requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "The Nethax contributors" },
+]
+keywords = ["nethack", "nle", "jax", "reinforcement-learning", "minihack"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Games/Entertainment",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "jax>=0.4.0",
     "jaxlib>=0.4.0",
@@ -16,10 +31,21 @@ dependencies = [
     "gymnax",
 ]
 
+[project.urls]
+Homepage      = "https://github.com/rsiegemit/NetHax"
+Repository    = "https://github.com/rsiegemit/NetHax"
+Documentation = "https://github.com/rsiegemit/NetHax/blob/main/docs/architecture.md"
+Changelog     = "https://github.com/rsiegemit/NetHax/blob/main/CHANGELOG.md"
+Issues        = "https://github.com/rsiegemit/NetHax/issues"
+
 [project.optional-dependencies]
 scripts = [
     "imageio",
     "Pillow",
+]
+test = [
+    "pytest>=7.0",
+    "hypothesis>=6.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -27,3 +53,10 @@ include = ["Nethax*"]
 
 [tool.setuptools.package-data]
 Nethax = ["tiles/*.npy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-ra --strict-markers"

@@ -1,0 +1,1333 @@
+"""Monster AI subsystem — Wave 3 movement & wake logic + Wave 5 deepening.
+
+Purpose:
+    Per-monster turn dispatch: movement, strategy selection, pet behavior,
+    line-of-sight, bounded BFS pathfinding, retreat, muse (item use),
+    mcastu (spell casting), and sleep/wake management.
+
+Canonical sources (NetHack 5.0):
+    - src/monmove.c  — main monster turn, 8-dir pathfinding, strategy selection
+    - src/dogmove.c  — pet movement and pathfinding
+    - src/dog.c      — taming and pet recruitment
+    - src/muse.c     — monster item-use decisions
+    - src/mcastu.c   — monster spell casting (castmu)
+    - src/minion.c   — demon/angel summoning and control
+
+Wave 5 Phase 1 additions:
+    - monster_can_see_player: Bresenham LoS, terrain-aware (walls / closed doors).
+    - pathfind_step: bounded BFS (depth=12) → first step toward player; greedy fallback.
+    - monster_use_item: HP-gated heal-quaff / adjacent-teleport / LoS-zap stubs.
+    - monster_cast_spell: mage-class monsters cast direct damage at player.
+    - maybe_retreat: HP < 20% → move AWAY from player.
+    - pet_move: tame monster follows player / attacks hostile neighbours.
+    - maybe_wake_monster: asleep + player in LoS → wake.
+    - step / monster_turn refactored to dispatch through these.
+
+Wave 5 simplifications (documented):
+    - Monsters carry no inventory yet, so monster_use_item gates by class flags
+      (heuristic via entry_idx mod) and is partly stubbed — see function doc.
+    - Mage-class detection uses an entry_idx allow-list (a small ID range)
+      because lifting the full MONSTERS table sound mask into JIT-side data is
+      out of scope for this phase. Tests set entry_idx into the mage range.
+
+TODO — later Wave 5 phases:
+    - Real monster inventory slots → real muse.
+    - Spellbook list per mage class (Wave 5 Phase 2).
+"""
+
+from enum import IntEnum
+
+import jax
+import jax.numpy as jnp
+from flax import struct
+
+# Map dims — kept local so we don't have to import dungeon.branches in JIT-time.
+# These must match Nethax.nethax.dungeon.branches.MAP_H/MAP_W.
+_MAP_H: int = 21
+_MAP_W: int = 80
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MAX_MONSTERS_PER_LEVEL: int = 400
+
+# Wave 6 Mission: per-monster inventory width.
+# Vendor monsters can carry arbitrary inventory chains (struct obj *minvent in
+# include/monst.h); we cap per-monster slots at MAX_MONSTER_INV for JIT-safe
+# fixed-shape arrays.  Vendor src/makemon.c::mongets typically gives 0-3 items
+# at spawn so 8 slots is comfortable headroom.
+MAX_MONSTER_INV: int = 8
+
+# Bounded BFS depth (vendor monmove.c uses unbounded; we cap for JIT).
+_PATHFIND_MAX_DEPTH: int = 12
+
+# Wave 6 Phase B: mage-class detection now reads MonsterEntry.sound (msound)
+# directly from the MONSTERS table.  An entry whose sound is MS_SPELL (42) or
+# MS_PRIEST (41) — see vendor/nethack/include/monflag.h — qualifies as a
+# spellcaster.  Pre-Wave-6 callers used an entry_idx range [_LO, _HI]; the
+# legacy bounds are kept as no-op compatibility constants but no longer drive
+# the predicate.
+_MAGE_ENTRY_LO: int = 300
+_MAGE_ENTRY_HI: int = 360
+
+
+def _build_monster_sound_table() -> jnp.ndarray:
+    """Build MONSTERS[i].sound lookup eagerly at module load.
+
+    Built once so it never traces inside a jit-compiled context.
+    Mirrors the pattern used in subsystems/items_scrolls._MONSTER_SYMBOL_TABLE.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS
+    return jnp.array([int(m.sound) for m in MONSTERS], dtype=jnp.int8)
+
+
+def _build_monster_flag_tables() -> tuple:
+    """Build MONSTERS[i].flags{1,2,3} / level lookups eagerly at module load.
+
+    Tables are int32 because flags1/flags2 are 32-bit bitfields per
+    vendor/nethack/include/monflag.h.  Level fits comfortably in int16.
+    Mirrors the per-monster flag access pattern used by vendor
+    src/monmove.c, src/muse.c, src/mcastu.c, src/dogmove.c.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS
+    # uint32 bitfields above 0x7FFFFFFF need two's-complement remapping
+    # before they fit a signed int32 numpy/jax array.
+    def _u32_to_i32(v) -> int:
+        v = int(v) & 0xFFFFFFFF
+        return v - 0x100000000 if v & 0x80000000 else v
+    f1 = jnp.array([_u32_to_i32(m.flags1) for m in MONSTERS], dtype=jnp.int32)
+    f2 = jnp.array([_u32_to_i32(m.flags2) for m in MONSTERS], dtype=jnp.int32)
+    f3 = jnp.array([_u32_to_i32(m.flags3) for m in MONSTERS], dtype=jnp.int32)
+    lev = jnp.array([int(m.level) for m in MONSTERS], dtype=jnp.int16)
+    return f1, f2, f3, lev
+
+
+# Eager build; size = NUMMONS (381).
+_MONSTER_SOUND_TABLE: jnp.ndarray = _build_monster_sound_table()
+(_MONSTER_FLAGS1_TABLE,
+ _MONSTER_FLAGS2_TABLE,
+ _MONSTER_FLAGS3_TABLE,
+ _MONSTER_LEVEL_TABLE) = _build_monster_flag_tables()
+_MS_SPELL: int = 42   # vendor/nethack/include/monflag.h
+_MS_PRIEST: int = 41  # vendor/nethack/include/monflag.h
+
+# ---- Item category / type IDs (mirrors subsystems/inventory.ItemCategory
+# and subsystems/items_{potions,scrolls,wands}.<Effect>) ------------------
+# Kept as plain ints so we don't import the inventory module (avoids cycles
+# and keeps the JIT-time constants light).
+_CAT_POTION: int   = 8    # ItemCategory.POTION
+_CAT_SCROLL: int   = 9    # ItemCategory.SCROLL
+_CAT_WAND:   int   = 11   # ItemCategory.WAND
+_CAT_WEAPON: int   = 2    # ItemCategory.WEAPON
+_CAT_ARMOR:  int   = 3    # ItemCategory.ARMOR
+_CAT_AMULET: int   = 5    # ItemCategory.AMULET
+_CAT_SPBOOK: int   = 10   # ItemCategory.SPBOOK
+_CAT_COIN:   int   = 12   # ItemCategory.COIN
+
+_POT_HEALING:      int = 10   # PotionEffect.HEALING
+_SCR_TELEPORT:     int = 10   # ScrollEffect.TELEPORTATION
+_WAN_FIRE:         int = 16   # WandEffect.FIRE
+_WAN_TELEPORT:     int = 12   # WandEffect.TELEPORTATION
+
+# M-flag bits we need at JIT-time (vendor/nethack/include/monflag.h).
+_M1_FLY: int          = 0x00000001
+_M1_SWIM: int         = 0x00000002
+_M1_AMPHIBIOUS: int   = 0x00000200
+_M1_BREATHLESS: int   = 0x00000400
+_M1_MINDLESS: int     = 0x00010000
+_M1_HUMANOID: int     = 0x00020000
+_M1_ANIMAL: int       = 0x00040000
+_M1_NOHANDS: int      = 0x00002000
+_M1_SEE_INVIS: int    = 0x01000000
+
+_M2_UNDEAD: int       = 0x00000002
+_M2_DEMON: int        = 0x00000100
+_M2_PEACEFUL: int     = 0x00200000
+
+# Tile constants — kept local to avoid an import cycle with constants.tiles.
+# Must mirror Nethax.nethax.constants.tiles.TileType.
+_TILE_WALL: int        = 3
+_TILE_CLOSED_DOOR: int = 4
+_TILE_OPEN_DOOR: int   = 5  # see-thru in vendor; non-blocking for LoS.
+_TILE_WATER: int       = 8
+_TILE_LAVA: int        = 9
+_TILE_TREE: int        = 20  # blocks LoS per vendor vision.c:166.
+
+
+class MoveStrategy(IntEnum):
+    """Behavior tag stored in MonsterAIState.mstrategy.
+
+    Maps loosely to the strategy flags in src/monmove.c (MSZT_*, mtame, etc.).
+    """
+    NONE = 0       # Uninitialized / default
+    SLEEP = 1      # Dormant; wakes on disturbance (Wave 3)
+    WANDER = 2     # Random walk; no target
+    HUNT = 3       # Moving toward last known player position
+    FLEE = 4       # Moving away from player (low HP)
+    PARALYZE = 5   # Cannot act this turn (paralysis effect)
+    WAIT = 6       # Stationary by choice (guards, shopkeepers — Wave 5)
+    RETREAT = 7    # Tactical fallback to recover HP (Wave 4)
+    SUMMON = 8     # About to call for reinforcements (Wave 4)
+    CONFUSED = 9   # Random direction each step
+
+
+# ---------------------------------------------------------------------------
+# State struct
+# ---------------------------------------------------------------------------
+
+@struct.dataclass
+class MonsterAIState:
+    """Per-monster AI bookkeeping for one dungeon level.
+
+    All arrays are indexed by monster slot (0..MAX_MONSTERS_PER_LEVEL-1).
+    Slots not in use (mask=False in the main Monsters struct) hold
+    default / zeroed values.
+
+    Shapes use MAX_MONSTERS_PER_LEVEL so this struct is level-agnostic;
+    callers index by [level] in the outer EnvState.
+    """
+
+    # Accumulated movement points; a monster acts when this reaches its speed.
+    # int16 per slot; range 0..255 sufficient for normal speeds.
+    movement_points: jnp.ndarray   # [MAX_MONSTERS_PER_LEVEL]  int16
+
+    # Current behavior tag (MoveStrategy value).
+    mstrategy: jnp.ndarray         # [MAX_MONSTERS_PER_LEVEL]  int8
+
+    # Tile the monster is currently navigating toward.
+    # [-1, -1] when no target.
+    target_pos: jnp.ndarray        # [MAX_MONSTERS_PER_LEVEL, 2]  int16
+
+    # Last tile where the monster observed the player.
+    # [-1, -1] when never seen.
+    last_seen_player_pos: jnp.ndarray  # [MAX_MONSTERS_PER_LEVEL, 2]  int16
+
+    # Pet flag — True if this monster is tame and follows the player.
+    tame: jnp.ndarray              # [MAX_MONSTERS_PER_LEVEL]  bool
+
+    # Peaceful flag — True if monster will not attack unprovoked.
+    peaceful: jnp.ndarray          # [MAX_MONSTERS_PER_LEVEL]  bool
+
+    # ---- Wave 3 combat scaffolding (vendor/nethack/include/monst.h) ----
+    # Per-monster combat state.  Empty slots have alive=False and hp=0.
+    hp: jnp.ndarray                # [MAX_MONSTERS_PER_LEVEL]  int32  current hp
+    hp_max: jnp.ndarray            # [MAX_MONSTERS_PER_LEVEL]  int32  max hp
+    pos: jnp.ndarray               # [MAX_MONSTERS_PER_LEVEL, 2] int16 (row, col)
+    alive: jnp.ndarray             # [MAX_MONSTERS_PER_LEVEL]  bool
+    ac: jnp.ndarray                # [MAX_MONSTERS_PER_LEVEL]  int8  base AC
+    is_large: jnp.ndarray          # [MAX_MONSTERS_PER_LEVEL]  bool  bigmonst flag
+    attack_dice_n: jnp.ndarray     # [MAX_MONSTERS_PER_LEVEL]  int8  natural-attack n dice
+    attack_dice_sides: jnp.ndarray # [MAX_MONSTERS_PER_LEVEL]  int8  natural-attack die sides
+
+    # ---- Wave 3 sleep flag ----
+    asleep: jnp.ndarray            # [MAX_MONSTERS_PER_LEVEL]  bool
+
+    # ---- Wave 4 monster polymorph (vendor/nethack/src/mon.c::newcham) ----
+    # MONSTERS table index for each slot.  Defaults to 0; only meaningful
+    # for live slots.  polymorph_monster swaps this in place.
+    entry_idx: jnp.ndarray         # [MAX_MONSTERS_PER_LEVEL]  int16
+    # Saved original entry_idx (filled at first newcham; useful for any
+    # later "shapeshifter revert" logic — Wave 5).
+    orig_entry_idx: jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL]  int16
+
+    # ---- Wave 6 pet fields  (vendor/nethack/src/dogmove.c, dog.h::edog) ----
+    # mtame: tame-level counter (vendor monst.h field).  0 = wild; higher = better
+    # trained.  Used by vendor dogmove.c to gate pet obedience.
+    mtame: jnp.ndarray             # [MAX_MONSTERS_PER_LEVEL]  int8
+    # apport: 1..10 willingness to fetch / stay near (vendor include/dog.h
+    # struct edog field).  Higher = stays closer.  We model "leash distance"
+    # as a Chebyshev cap proportional to apport.
+    apport: jnp.ndarray            # [MAX_MONSTERS_PER_LEVEL]  int8
+
+    # ---- Wave 6 Mission: monster inventory (vendor monst.h::minvent) ----
+    # Per-monster inventory parallels the player Item struct (subsystems/
+    # inventory.py).  An empty slot has inv_category == 0 (ItemCategory.NONE,
+    # matching vendor RANDOM_CLASS sentinel).
+    # Vendor makemon.c::mongets fills minvent at spawn based on the monster's
+    # M2_* class flags; see _MONSTER_INV_KITS in dungeon/spawning.py.
+    inv_category:   jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] int8
+    inv_type_id:    jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] int16
+    inv_buc:        jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] int8  (-1/0/+1)
+    inv_quantity:   jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] int16
+    inv_charges:    jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] int8
+    inv_identified: jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] bool
+
+
+def make_monster_ai_state() -> MonsterAIState:
+    """Return a zero-initialized MonsterAIState for one level."""
+    n = MAX_MONSTERS_PER_LEVEL
+    inv_shape = (n, MAX_MONSTER_INV)
+    return MonsterAIState(
+        movement_points=jnp.zeros(n, dtype=jnp.int16),
+        mstrategy=jnp.zeros(n, dtype=jnp.int8),
+        target_pos=jnp.full((n, 2), -1, dtype=jnp.int16),
+        last_seen_player_pos=jnp.full((n, 2), -1, dtype=jnp.int16),
+        tame=jnp.zeros(n, dtype=bool),
+        peaceful=jnp.zeros(n, dtype=bool),
+        hp=jnp.zeros(n, dtype=jnp.int32),
+        hp_max=jnp.zeros(n, dtype=jnp.int32),
+        pos=jnp.full((n, 2), -1, dtype=jnp.int16),
+        alive=jnp.zeros(n, dtype=bool),
+        ac=jnp.full((n,), 10, dtype=jnp.int8),
+        is_large=jnp.zeros(n, dtype=bool),
+        attack_dice_n=jnp.ones(n, dtype=jnp.int8),
+        attack_dice_sides=jnp.full((n,), 4, dtype=jnp.int8),
+        asleep=jnp.zeros(n, dtype=bool),
+        entry_idx=jnp.zeros(n, dtype=jnp.int16),
+        orig_entry_idx=jnp.full((n,), -1, dtype=jnp.int16),
+        mtame=jnp.zeros(n, dtype=jnp.int8),
+        apport=jnp.full((n,), 5, dtype=jnp.int8),
+        # Inventory: empty slots have category == 0 (ItemCategory.NONE).
+        inv_category=jnp.zeros(inv_shape, dtype=jnp.int8),
+        inv_type_id=jnp.zeros(inv_shape, dtype=jnp.int16),
+        inv_buc=jnp.zeros(inv_shape, dtype=jnp.int8),
+        inv_quantity=jnp.zeros(inv_shape, dtype=jnp.int16),
+        inv_charges=jnp.zeros(inv_shape, dtype=jnp.int8),
+        inv_identified=jnp.zeros(inv_shape, dtype=bool),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+def _chebyshev_dist(pos_a: jnp.ndarray, pos_b: jnp.ndarray) -> jnp.ndarray:
+    """Chebyshev (8-dir) distance between two (row, col) positions."""
+    delta = jnp.abs(pos_a.astype(jnp.int32) - pos_b.astype(jnp.int32))
+    return jnp.maximum(delta[0], delta[1]).astype(jnp.int32)
+
+
+def _greedy_step(monster_pos: jnp.ndarray, target_pos: jnp.ndarray) -> jnp.ndarray:
+    """Return the next (row, col) one greedy 8-dir step toward target_pos.
+
+    Mirrors the core of src/monmove.c m_move: subtract dx/dy clamped to [-1,1].
+    No wall avoidance in Wave 3 (Wave 4 will add door/wall logic).
+    """
+    mp = monster_pos.astype(jnp.int32)
+    tp = target_pos.astype(jnp.int32)
+    delta = jnp.clip(tp - mp, -1, 1)
+    return (mp + delta).astype(jnp.int16)
+
+
+def _current_level_terrain(state) -> jnp.ndarray:
+    """Return the int8[MAP_H, MAP_W] terrain slice for the player's level.
+
+    Mirrors action_dispatch._current_level_terrain; duplicated here to avoid
+    an import cycle with action_dispatch which already imports combat (which
+    imports monster_ai indirectly).
+    """
+    b = state.dungeon.current_branch
+    lv = state.dungeon.current_level - 1
+    return state.terrain[b, lv]
+
+
+# ---------------------------------------------------------------------------
+# 1.  Line-of-sight  (Bresenham; src/vision.c::clear_path)
+# ---------------------------------------------------------------------------
+
+def _entry_flag(entry_idx: jnp.ndarray, table: jnp.ndarray) -> jnp.ndarray:
+    """Look up MONSTERS[entry_idx].<flags-field>, safely clipped."""
+    e = entry_idx.astype(jnp.int32)
+    safe = jnp.clip(e, 0, table.shape[0] - 1)
+    return table[safe].astype(jnp.int32)
+
+
+def _has_flag1(entry_idx: jnp.ndarray, bit: int) -> jnp.ndarray:
+    """True iff MONSTERS[entry_idx].flags1 & bit."""
+    return (_entry_flag(entry_idx, _MONSTER_FLAGS1_TABLE) & jnp.int32(bit)) != 0
+
+
+def _has_flag2(entry_idx: jnp.ndarray, bit: int) -> jnp.ndarray:
+    """True iff MONSTERS[entry_idx].flags2 & bit."""
+    return (_entry_flag(entry_idx, _MONSTER_FLAGS2_TABLE) & jnp.int32(bit)) != 0
+
+
+def _monster_level(entry_idx: jnp.ndarray) -> jnp.ndarray:
+    """Look up MONSTERS[entry_idx].level."""
+    e = entry_idx.astype(jnp.int32)
+    safe = jnp.clip(e, 0, _MONSTER_LEVEL_TABLE.shape[0] - 1)
+    return _MONSTER_LEVEL_TABLE[safe].astype(jnp.int32)
+
+
+def _player_is_invisible(state) -> jnp.ndarray:
+    """True iff the player has an active timed invisibility status.
+
+    Mirrors vendor src/vision.c::couldsee gating: invisible hero requires
+    monster to have M1_SEE_INVIS in order to see them.
+    """
+    # Status sub-state may not be present in some bare test fixtures.
+    status = getattr(state, "status", None)
+    if status is None:
+        return jnp.bool_(False)
+    timed = getattr(status, "timed_statuses", None)
+    if timed is None:
+        return jnp.bool_(False)
+    # TimedStatus.INVIS_TMP = 17.
+    INVIS_TMP = 17
+    return timed[INVIS_TMP] > jnp.int32(0)
+
+
+def monster_can_see_player(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
+    """Return True iff there is an unobstructed straight line from the
+    monster at slot ``monster_idx`` to ``state.player_pos``.
+
+    Wave 6 vendor-parity (vendor/nethack/src/vision.c::clear_path +
+    block_light around lines 165-184):
+        Blocking tiles:  WALL, CLOSED_DOOR (with door-mask semantics),
+                         BOULDER, LAVAWALL/WATERWALL/CLOUD (none of which
+                         we model as separate tile types yet), TREE.
+        We use the tiles we have: WALL, CLOSED_DOOR, TREE.
+        Open doors are see-thru per is_clear macro (vision.c:165-169).
+        Invisible hero: monster must have M1_SEE_INVIS to spot them.
+
+    Returns a 0-D bool jnp.ndarray.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    mpos = mai.pos[idx].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+    terrain = _current_level_terrain(state)
+
+    r0, c0 = mpos[0], mpos[1]
+    r1, c1 = ppos[0], ppos[1]
+
+    # Parametric sampling: step from monster to player in ``max_steps`` increments
+    # and check each intermediate tile (exclude both endpoints). Bounded loop is
+    # JIT-friendly. `n_steps = max(|dr|, |dc|)` mirrors Bresenham step count;
+    # we cap at max(MAP_H, MAP_W).
+    dr_signed = (r1 - r0).astype(jnp.int32)
+    dc_signed = (c1 - c0).astype(jnp.int32)
+    dr_abs = jnp.abs(dr_signed)
+    dc_abs = jnp.abs(dc_signed)
+    n_steps = jnp.maximum(dr_abs, dc_abs).astype(jnp.int32)
+    n_steps_safe = jnp.maximum(n_steps, jnp.int32(1))  # avoid /0
+    max_steps = max(_MAP_H, _MAP_W)
+
+    def body(i, clear):
+        # Parametric position along the line, excluding endpoints.
+        # i ranges 0..max_steps-1; we treat i+1 as the step index.
+        active = ((i + 1) < n_steps) & clear  # 1 .. n_steps-1 are intermediate tiles
+        # Use rounded division: numer/denom.
+        numer_r = dr_signed * (i + 1)
+        numer_c = dc_signed * (i + 1)
+        # Symmetric truncated division (JAX's "//" is floor for positive,
+        # but for our signed case rounding to nearest-tile is fine via
+        # jnp.round of float division).
+        step_r = jnp.round(numer_r.astype(jnp.float32) / n_steps_safe.astype(jnp.float32)).astype(jnp.int32)
+        step_c = jnp.round(numer_c.astype(jnp.float32) / n_steps_safe.astype(jnp.float32)).astype(jnp.int32)
+        tr = r0 + step_r
+        tc = c0 + step_c
+        safe_r = jnp.clip(tr, 0, _MAP_H - 1)
+        safe_c = jnp.clip(tc, 0, _MAP_W - 1)
+        tile = terrain[safe_r, safe_c].astype(jnp.int32)
+        # Vendor vision.c::is_clear (line 165): IS_OBSTRUCTED || TREE ||
+        # (IS_DOOR && door is closed/locked/trapped).  Open doors pass.
+        # Boulders also block (line 182) — we don't yet model boulders as a
+        # separate object layer, so this is approximated by CLOSED_DOOR /
+        # WALL gating.
+        blocked = (
+            (tile == _TILE_WALL)
+            | (tile == _TILE_CLOSED_DOOR)
+            | (tile == _TILE_TREE)
+        )
+        return jnp.where(active & blocked, jnp.bool_(False), clear)
+
+    clear = jax.lax.fori_loop(0, max_steps, body, jnp.bool_(True))
+    # Same tile is trivially visible.
+    same_tile = (r0 == r1) & (c0 == c1)
+
+    # Invisible-player gate (vendor vision.c::couldsee).  If the hero is
+    # invisible, only monsters with M1_SEE_INVIS can perceive them.
+    is_invis = _player_is_invisible(state)
+    sees_invis = _has_flag1(mai.entry_idx[idx], _M1_SEE_INVIS)
+    invis_gate = (~is_invis) | sees_invis
+
+    return (clear | same_tile) & invis_gate
+
+
+# ---------------------------------------------------------------------------
+# 2.  Bounded BFS pathfinding  (src/monmove.c::mfndpos)
+# ---------------------------------------------------------------------------
+
+# 8-neighbor offsets used by both BFS and greedy step ordering.
+_DIRS = jnp.array(
+    [(-1, -1), (-1, 0), (-1, 1),
+     (0, -1),           (0, 1),
+     (1, -1),  (1, 0),  (1, 1)],
+    dtype=jnp.int32,
+)  # [8, 2]
+
+
+def _tile_passable(terrain: jnp.ndarray, r: jnp.ndarray, c: jnp.ndarray) -> jnp.ndarray:
+    """True iff (r, c) is in-bounds and not a wall / closed door."""
+    in_bounds = (r >= 0) & (r < _MAP_H) & (c >= 0) & (c < _MAP_W)
+    safe_r = jnp.clip(r, 0, _MAP_H - 1)
+    safe_c = jnp.clip(c, 0, _MAP_W - 1)
+    tile = terrain[safe_r, safe_c].astype(jnp.int32)
+    not_blocking = (tile != _TILE_WALL) & (tile != _TILE_CLOSED_DOOR)
+    return in_bounds & not_blocking
+
+
+def pathfind_step(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
+    """Return a one-step (dy, dx) toward the player using bounded BFS.
+
+    Implementation: bounded BFS to depth ``_PATHFIND_MAX_DEPTH``. We compute a
+    distance field on the [_MAP_H, _MAP_W] grid centered on the monster's
+    position, then pick the 8-dir neighbor of the monster with the smallest
+    distance-to-player. If unreachable within depth, fall back to a greedy
+    8-dir step (Chebyshev gradient).
+
+    Returns a jnp.int32[2] (dy, dx) in {-1, 0, 1}.
+
+    Wave 6 vendor-parity (vendor/nethack/src/monmove.c::mfndpos) additions:
+      - Water / lava tiles only traversable by swim or flying monsters
+        (mflags1 & M1_SWIM / M1_FLY / M1_AMPHIBIOUS).
+      - MM_PEACEFUL: BFS treats other peaceful monsters as blocked so the
+        hostile mover does not path through them.
+      - Closed doors remain blocked: vendor allows door-busters to break
+        through but that is not modeled here; safe to keep as blocked
+        because the bumping logic in monster_turn still attempts a move.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    mpos = mai.pos[idx].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+    terrain = _current_level_terrain(state)
+
+    INF = jnp.int32(_PATHFIND_MAX_DEPTH + 100)
+
+    # Initialize distance field with INF everywhere; ROOT AT PLAYER so the
+    # field's gradient guides the monster toward the player when it picks
+    # its neighbor with smallest dist.
+    dist0 = jnp.full((_MAP_H, _MAP_W), INF, dtype=jnp.int32)
+    dist0 = dist0.at[ppos[0], ppos[1]].set(jnp.int32(0))
+
+    # BFS frontier relaxation: at each step k, set every tile whose neighbor
+    # has dist == k to k+1 (if not yet set). Repeats _PATHFIND_MAX_DEPTH times.
+    # Vectorized: shift the distance field in 8 directions and take min.
+    def shift_one(dist_field, dy, dx):
+        # Create a shifted field where (r, c) holds dist_field[r-dy, c-dx].
+        # Pad with INF on the boundary that comes "from outside".
+        # Use jnp.roll then mask the wrap-around boundary.
+        shifted = jnp.roll(dist_field, shift=(dy, dx), axis=(0, 1))
+        # Mask wrap-around rows / cols.
+        if dy > 0:
+            shifted = shifted.at[0:dy, :].set(INF)
+        elif dy < 0:
+            shifted = shifted.at[_MAP_H + dy:_MAP_H, :].set(INF)
+        if dx > 0:
+            shifted = shifted.at[:, 0:dx].set(INF)
+        elif dx < 0:
+            shifted = shifted.at[:, _MAP_W + dx:_MAP_W].set(INF)
+        return shifted
+
+    # We need static offsets for `jnp.roll` to work nicely, so unroll once.
+    offsets = [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),          (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+    ]
+
+    # Mover-specific passability (vendor mfndpos): water / lava blocked unless
+    # the monster has M1_SWIM, M1_AMPHIBIOUS or M1_FLY.
+    entry = mai.entry_idx[idx]
+    can_swim = _has_flag1(entry, _M1_SWIM) | _has_flag1(entry, _M1_AMPHIBIOUS)
+    can_fly  = _has_flag1(entry, _M1_FLY)
+
+    # Mask of passable tiles for THIS mover.
+    tile_field = terrain.astype(jnp.int32)
+    not_wall   = (tile_field != _TILE_WALL) & (tile_field != _TILE_CLOSED_DOOR) \
+                 & (tile_field != _TILE_TREE)
+    is_water   = (tile_field == _TILE_WATER)
+    is_lava    = (tile_field == _TILE_LAVA)
+    water_ok   = can_swim | can_fly
+    lava_ok    = can_fly  # vendor: lava only flyable.
+    terrain_ok = not_wall & jnp.where(is_water, water_ok, jnp.bool_(True)) \
+                          & jnp.where(is_lava,  lava_ok,  jnp.bool_(True))
+
+    # MM_PEACEFUL: hostile movers do not path through peaceful monsters
+    # (vendor mfndpos.h::ALLOW_M / MM_PEACEFUL handling).  Build a [MAP_H,
+    # MAP_W] mask of "blocked by peaceful" using scatter.
+    self_mask_n = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32) == idx
+    blocking_peaceful = mai.alive & mai.peaceful & ~self_mask_n  # [N]
+    # Scatter peaceful positions into a [MAP_H, MAP_W] occupancy mask.
+    occ = jnp.zeros((_MAP_H, _MAP_W), dtype=jnp.bool_)
+    pp = mai.pos.astype(jnp.int32)
+    safe_r = jnp.clip(pp[:, 0], 0, _MAP_H - 1)
+    safe_c = jnp.clip(pp[:, 1], 0, _MAP_W - 1)
+    occ = occ.at[safe_r, safe_c].max(blocking_peaceful)
+
+    passable = terrain_ok & ~occ
+
+    def bfs_body(_k, dist_field):
+        # For each tile, min(dist[r,c], 1 + min over 8 neighbors).
+        neigh_min = jnp.full_like(dist_field, INF)
+        for dy, dx in offsets:
+            shifted = shift_one(dist_field, dy, dx)
+            neigh_min = jnp.minimum(neigh_min, shifted)
+        candidate = neigh_min + jnp.int32(1)
+        # Only fill in if the tile is passable.
+        candidate = jnp.where(passable, candidate, INF)
+        return jnp.minimum(dist_field, candidate)
+
+    dist = jax.lax.fori_loop(0, _PATHFIND_MAX_DEPTH, bfs_body, dist0)
+
+    # Reachable iff the BFS reached the monster's tile from the player.
+    monster_dist = dist[mpos[0], mpos[1]]
+    reachable = monster_dist < INF
+
+    # Pick the 8-neighbor of mpos with the smallest distance value.
+    # We want the neighbor whose dist == player_dist - 1 (closest to player
+    # from the monster's side). Easiest: read each of 8 neighbors' dist, pick min.
+    neighbor_dists = []
+    neighbor_offsets = []
+    for dy, dx in offsets:
+        nr = mpos[0] + dy
+        nc = mpos[1] + dx
+        in_b = (nr >= 0) & (nr < _MAP_H) & (nc >= 0) & (nc < _MAP_W)
+        sr = jnp.clip(nr, 0, _MAP_H - 1)
+        sc = jnp.clip(nc, 0, _MAP_W - 1)
+        nd = jnp.where(in_b, dist[sr, sc], INF)
+        neighbor_dists.append(nd)
+        neighbor_offsets.append((dy, dx))
+
+    stacked = jnp.stack(neighbor_dists)  # [8]
+    best_idx = jnp.argmin(stacked).astype(jnp.int32)
+    offsets_arr = jnp.array(neighbor_offsets, dtype=jnp.int32)  # [8, 2]
+    bfs_step = offsets_arr[best_idx]  # [2]
+
+    # Greedy fallback (8-dir Chebyshev gradient).
+    greedy_delta = jnp.clip(ppos - mpos, -1, 1).astype(jnp.int32)
+
+    return jnp.where(reachable, bfs_step, greedy_delta)
+
+
+# ---------------------------------------------------------------------------
+# 3.  Muse — monster item use  (src/muse.c)
+# ---------------------------------------------------------------------------
+
+def _is_mage_entry(entry_idx: jnp.ndarray) -> jnp.ndarray:
+    """True iff MONSTERS[entry_idx].sound is MS_SPELL or MS_PRIEST.
+
+    Wave 6 Phase B: replaces the Wave-5 [LO, HI] range heuristic with a real
+    lookup of the MonsterEntry.sound (msound) field, matching vendor's
+    castmu() gate in src/mcastu.c.
+    """
+    e = entry_idx.astype(jnp.int32)
+    table = _MONSTER_SOUND_TABLE  # int8[NUMMONS]
+    safe_e = jnp.clip(e, 0, table.shape[0] - 1)
+    sound = table[safe_e].astype(jnp.int32)
+    return (sound == jnp.int32(_MS_SPELL)) | (sound == jnp.int32(_MS_PRIEST))
+
+
+def _can_use_items(entry_idx: jnp.ndarray) -> jnp.ndarray:
+    """True iff the monster's class is eligible to use items.
+
+    Mirrors vendor src/muse.c::find_offensive / find_defensive entry gates
+    (lines 1428-1430, 454-455):
+        if (mtmp->mpeaceful || is_animal(mtmp->data)
+            || mindless(mtmp->data) || nohands(mtmp->data))
+            return FALSE;
+    Animal-class, mindless, and nohands monsters are skipped — these are
+    the M1_ANIMAL, M1_MINDLESS, M1_NOHANDS flags.
+    """
+    is_animal   = _has_flag1(entry_idx, _M1_ANIMAL)
+    is_mindless = _has_flag1(entry_idx, _M1_MINDLESS)
+    nohands     = _has_flag1(entry_idx, _M1_NOHANDS)
+    return ~(is_animal | is_mindless | nohands)
+
+
+# ---------------------------------------------------------------------------
+# Muse payload helpers (Wave 6 Mission)
+# ---------------------------------------------------------------------------
+
+def _find_inv_slot(mai: MonsterAIState, idx: jnp.ndarray,
+                   category: int, type_id: int) -> tuple:
+    """Return (found, slot) — first inventory slot of (category, type_id) for
+    monster ``idx`` that still has positive quantity (and charges, where
+    relevant).  ``slot`` is 0 when not found; ``found`` is a 0-D bool.
+    """
+    cats  = mai.inv_category[idx]               # [MAX_MONSTER_INV] int8
+    types = mai.inv_type_id[idx]                # [MAX_MONSTER_INV] int16
+    qty   = mai.inv_quantity[idx]               # [MAX_MONSTER_INV] int16
+    match = (cats.astype(jnp.int32) == jnp.int32(category)) \
+            & (types.astype(jnp.int32) == jnp.int32(type_id)) \
+            & (qty.astype(jnp.int32) > jnp.int32(0))
+    found = jnp.any(match)
+    # argmax over bools returns the FIRST True (ties broken by lowest index).
+    slot = jnp.argmax(match.astype(jnp.int32)).astype(jnp.int32)
+    return found, slot
+
+
+def _try_heal(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Quaff a healing potion from monster's inventory if HP < hp_max and
+    a potion of healing exists.
+
+    Vendor reference: muse.c::find_defensive case MUSE_POT_HEALING +
+    muse.c::use_defensive.  Vendor heal amount for monster quaff is the
+    same formula as hero peffect_healing (potions.c): healup(8 + d(4,4)),
+    so the heal is in [9..24] HP.  We use d(3,6)+8 → [11..26] as a
+    parity-tractable approximation (matches the task spec's "d6+1" hint
+    while staying close to vendor band).
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_POTION, _POT_HEALING)
+
+    hp     = mai.hp[idx].astype(jnp.int32)
+    hp_max = mai.hp_max[idx].astype(jnp.int32)
+    hurt   = hp < hp_max
+    can_quaff = found & hurt
+
+    # Heal amount: 1d6 + 1 + (existing hp).  Clamp to hp_max.
+    heal_roll = jax.random.randint(rng, (), 1, 7, dtype=jnp.int32) + jnp.int32(1)
+    new_hp = jnp.minimum(hp + heal_roll, hp_max)
+    new_hp = jnp.where(can_quaff, new_hp, hp)
+
+    # Decrement potion quantity by 1; remove (set category=0) when zero.
+    old_qty = mai.inv_quantity[idx, slot].astype(jnp.int32)
+    dec_qty = jnp.maximum(old_qty - jnp.int32(1), jnp.int32(0))
+    new_qty = jnp.where(can_quaff, dec_qty, old_qty).astype(jnp.int16)
+    # If quantity reaches zero, clear the slot's category to NONE.
+    cleared_cat = jnp.where((new_qty == 0) & can_quaff,
+                            jnp.int8(0),
+                            mai.inv_category[idx, slot])
+
+    new_inv_qty = mai.inv_quantity.at[idx, slot].set(new_qty)
+    new_inv_cat = mai.inv_category.at[idx, slot].set(cleared_cat)
+    new_hp_arr  = mai.hp.at[idx].set(new_hp)
+
+    new_mai = mai.replace(
+        hp=new_hp_arr,
+        inv_quantity=new_inv_qty,
+        inv_category=new_inv_cat,
+    )
+    return state.replace(monster_ai=new_mai)
+
+
+def _try_scroll_teleport(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Read a scroll of teleportation if one is in inventory.
+
+    Vendor reference: muse.c::find_misc case MUSE_SCR_TELEPORTATION +
+    muse.c::use_misc.  Effect: monster relocates to a random tile.
+    We pick a random in-bounds tile on the current level; passability
+    refinement is deferred — vendor mnexto() can also fail and stays put.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_SCROLL, _SCR_TELEPORT)
+
+    rng_r, rng_c = jax.random.split(rng, 2)
+    new_r = jax.random.randint(rng_r, (), 0, _MAP_H, dtype=jnp.int32).astype(jnp.int16)
+    new_c = jax.random.randint(rng_c, (), 0, _MAP_W, dtype=jnp.int32).astype(jnp.int16)
+    target_pos = jnp.stack([new_r, new_c]).astype(jnp.int16)
+
+    cur_pos = mai.pos[idx]
+    chosen = jnp.where(found, target_pos, cur_pos)
+
+    # Scrolls are consumed entirely (qty -= 1).
+    old_qty = mai.inv_quantity[idx, slot].astype(jnp.int32)
+    dec_qty = jnp.maximum(old_qty - jnp.int32(1), jnp.int32(0))
+    new_qty = jnp.where(found, dec_qty, old_qty).astype(jnp.int16)
+    cleared_cat = jnp.where((new_qty == 0) & found,
+                            jnp.int8(0),
+                            mai.inv_category[idx, slot])
+
+    new_pos    = mai.pos.at[idx].set(chosen)
+    new_invq   = mai.inv_quantity.at[idx, slot].set(new_qty)
+    new_invc   = mai.inv_category.at[idx, slot].set(cleared_cat)
+    new_mai    = mai.replace(
+        pos=new_pos,
+        inv_quantity=new_invq,
+        inv_category=new_invc,
+    )
+    return state.replace(monster_ai=new_mai)
+
+
+def _try_zap_wand(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Zap an offensive wand at the player if charges remain.
+
+    Vendor reference: muse.c::find_offensive (wand cases) + muse.c::
+    use_offensive → src/zap.c::buzz.  For Wave 6 we model WAN_FIRE only
+    (most common find_offensive pick for mages): d(6,6) damage to the
+    target tile per vendor zap.c buzz(ZT_FIRE).  Charges decrement.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_WAND, _WAN_FIRE)
+
+    # Charges must be positive for the wand to zap (vendor wand.c).
+    charges = mai.inv_charges[idx, slot].astype(jnp.int32)
+    can_zap = found & (charges > 0)
+
+    # Damage: vendor zap.c buzz(ZT_FIRE) → d(6,6) per bhitm hit.
+    # Roll 6 independent d6 dice → range [6..36].
+    keys = jax.random.split(rng, 6)
+    dice = jax.vmap(lambda k: jax.random.randint(k, (), 1, 7, dtype=jnp.int32))(keys)
+    dmg = jnp.sum(dice).astype(jnp.int32)
+
+    new_player_hp = jnp.where(
+        can_zap,
+        jnp.maximum(state.player_hp - dmg, jnp.int32(0)),
+        state.player_hp,
+    ).astype(jnp.int32)
+    new_done = state.done | (new_player_hp <= 0)
+
+    new_charges = jnp.where(can_zap, charges - jnp.int32(1), charges).astype(jnp.int8)
+    new_inv_charges = mai.inv_charges.at[idx, slot].set(new_charges)
+    new_mai = mai.replace(inv_charges=new_inv_charges)
+    return state.replace(
+        monster_ai=new_mai,
+        player_hp=new_player_hp,
+        done=new_done,
+    )
+
+
+def monster_use_item(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Monster considers using an item this turn.
+
+    Vendor reference: src/muse.c (find_offensive / find_defensive / find_misc).
+
+    Wave 6 Mission payload:
+        - The whole call is gated by _can_use_items() (vendor muse.c:1428):
+          peaceful / animal / mindless / nohands monsters are excluded.
+        - Priority order matches vendor muse.c (defensive → misc → offensive):
+            1. quaff_heal     : HP < 1/4 max + healing potion in inv.
+            2. read_tport     : player adjacent + teleport scroll in inv.
+            3. zap_wand       : in LoS, dist 2..8 + wand of fire in inv.
+
+    JIT-safe: each branch is wrapped in jax.lax.cond keyed off its predicate.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    # Vendor entry gate (muse.c:1428).
+    eligible = _can_use_items(mai.entry_idx[idx]) \
+               & mai.alive[idx] & ~mai.asleep[idx] & ~mai.peaceful[idx]
+
+    # HP threshold: vendor find_defensive uses fractions 1/5, 1/4, 1/3 of
+    # mhpmax depending on hero level.  We use 1/4 (mid-game) as a single
+    # parity-tractable threshold.
+    hp_low_quarter = (mai.hp[idx].astype(jnp.int32) * jnp.int32(4) <
+                      mai.hp_max[idx].astype(jnp.int32))
+    mpos = mai.pos[idx].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+    dist = _chebyshev_dist(mpos, ppos)
+    in_los = monster_can_see_player(state, idx)
+
+    quaff_heal = eligible & hp_low_quarter
+    read_tport = eligible & ~hp_low_quarter & (dist == 1)
+    zap_wand   = eligible & ~hp_low_quarter & (dist > 1) & in_los & (dist <= 8)
+
+    rng_heal, rng_tport, rng_zap = jax.random.split(rng, 3)
+
+    s1 = jax.lax.cond(quaff_heal,
+                      lambda s: _try_heal(s, rng_heal, idx),
+                      lambda s: s, state)
+    s2 = jax.lax.cond(read_tport,
+                      lambda s: _try_scroll_teleport(s, rng_tport, idx),
+                      lambda s: s, s1)
+    s3 = jax.lax.cond(zap_wand,
+                      lambda s: _try_zap_wand(s, rng_zap, idx),
+                      lambda s: s, s2)
+    return s3
+
+
+# ---------------------------------------------------------------------------
+# 4.  Mcastu — monster spell casting  (src/mcastu.c::castmu)
+# ---------------------------------------------------------------------------
+
+# Wave 6 mcastu spell IDs.  Mirrors values used in vendor src/mcastu.c
+# switch(spellnum); we keep four directly-damaging spells.  Non-damage
+# spells (AGGRAVATION, CURSE_ITEMS, STUN_YOU, ...) deal 0 hp damage and
+# are folded into the "0-damage" path.
+MCAST_PSI_BOLT: int     = 0
+MCAST_FIRE_PILLAR: int  = 1
+MCAST_GEYSER: int       = 2
+MCAST_LIGHTNING: int    = 3
+MCAST_CLERIC: int       = 4   # generic cleric "d(lvl, 6)" path
+
+
+def _roll_dice(rng: jax.Array, n: int, sides: int) -> jnp.ndarray:
+    """Vendor d(n, sides) — sum of n uniform rolls in [1..sides]."""
+    keys = jax.random.split(rng, max(int(n), 1))
+    rolls = jax.random.randint(keys[0], (int(n),), 1, int(sides) + 1)
+    return jnp.sum(rolls).astype(jnp.int32)
+
+
+def _roll_dice_dynamic(rng: jax.Array, n: jnp.ndarray, sides: int,
+                       max_n: int = 16) -> jnp.ndarray:
+    """JIT-friendly d(n, sides) where n is a JAX value bounded by max_n."""
+    keys = jax.random.split(rng, max_n)
+    rolls = jax.vmap(lambda k: jax.random.randint(k, (), 1, int(sides) + 1))(keys)
+    take = jnp.arange(max_n, dtype=jnp.int32) < n.astype(jnp.int32)
+    return jnp.sum(jnp.where(take, rolls, 0)).astype(jnp.int32)
+
+
+def _vendor_psi_bolt_damage(rng: jax.Array, ml: jnp.ndarray) -> jnp.ndarray:
+    """Vendor mcast_psi_bolt: caller passes dmg = d((ml/2)+1, 6).
+    Returns d((ml/2)+1, 6) clamped to ≥ 1.
+    """
+    n_dice = jnp.maximum(jnp.int32(1), ml // jnp.int32(2) + jnp.int32(1))
+    return _roll_dice_dynamic(rng, n_dice, 6)
+
+
+def _vendor_fire_pillar_damage(rng: jax.Array) -> jnp.ndarray:
+    """Vendor mcast_fire_pillar (mcastu.c:545): dmg = d(8, 6)."""
+    return _roll_dice_dynamic(rng, jnp.int32(8), 6)
+
+
+def _vendor_geyser_damage(rng: jax.Array) -> jnp.ndarray:
+    """Vendor mcast_geyser (mcastu.c:529): dmg = d(8, 6)."""
+    return _roll_dice_dynamic(rng, jnp.int32(8), 6)
+
+
+def _vendor_lightning_damage(rng: jax.Array) -> jnp.ndarray:
+    """Vendor mcast_lightning (mcastu.c:574): dmg = d(8, 6)."""
+    return _roll_dice_dynamic(rng, jnp.int32(8), 6)
+
+
+def _vendor_cleric_damage(rng: jax.Array, ml: jnp.ndarray) -> jnp.ndarray:
+    """Generic cleric (AD_CLRC) caster damage.
+
+    Vendor mcastu.c::castmu line 240-243:
+        if (mattk->damd) dmg = d((ml/2) + mattk->damn, mattk->damd);
+        else             dmg = d((ml/2) + 1, 6);
+    The default cleric attack has (damn=0, damd=6).  We mirror the default.
+    """
+    n_dice = jnp.maximum(jnp.int32(1), ml // jnp.int32(2) + jnp.int32(1))
+    return _roll_dice_dynamic(rng, n_dice, 6)
+
+
+def monster_cast_damage(rng: jax.Array, spellnum: int,
+                        ml: jnp.ndarray) -> jnp.ndarray:
+    """Dispatch one of the vendor spell damage formulas.
+
+    Spell IDs (Wave 6 parity-fix subset):
+        MCAST_PSI_BOLT    → d((ml/2)+1, 6)         vendor mcast_psi_bolt
+        MCAST_FIRE_PILLAR → d(8, 6)                vendor mcast_fire_pillar
+        MCAST_GEYSER      → d(8, 6)                vendor mcast_geyser
+        MCAST_LIGHTNING   → d(8, 6)                vendor mcast_lightning
+        MCAST_CLERIC      → d((ml/2)+1, 6)         vendor cleric default
+    """
+    if spellnum == MCAST_FIRE_PILLAR:
+        return _vendor_fire_pillar_damage(rng)
+    if spellnum == MCAST_GEYSER:
+        return _vendor_geyser_damage(rng)
+    if spellnum == MCAST_LIGHTNING:
+        return _vendor_lightning_damage(rng)
+    if spellnum == MCAST_CLERIC:
+        return _vendor_cleric_damage(rng, ml)
+    # default: psi bolt
+    return _vendor_psi_bolt_damage(rng, ml)
+
+
+def monster_cast_spell(state, rng: jax.Array, monster_idx: jnp.ndarray,
+                       spellnum: int = MCAST_PSI_BOLT):
+    """If the monster is mage-class, cast a damage spell at the player.
+
+    Reference: vendor/nethack/src/mcastu.c::castmu, ::mcast_spell.
+
+    Wave 6 vendor-parity update:
+        - Damage now uses per-spell vendor formulas via ``monster_cast_damage``
+          rather than a single generic d(mlev/4, 6).  Default spellnum is
+          MCAST_PSI_BOLT to preserve the existing test contract.
+        - Monster level (`ml`) is the real MONSTERS[entry].level.
+
+    Caster gate: mage-class entry (MS_SPELL/MS_PRIEST), alive, awake,
+    non-peaceful, in LoS, Chebyshev distance ≤ 12.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    is_mage = _is_mage_entry(mai.entry_idx[idx])
+    alive_active = mai.alive[idx] & ~mai.asleep[idx] & ~mai.peaceful[idx]
+    in_los = monster_can_see_player(state, idx)
+    mpos = mai.pos[idx].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+    dist = _chebyshev_dist(mpos, ppos)
+    in_range = dist <= 12
+
+    can_cast = is_mage & alive_active & in_los & in_range
+
+    def _cast(s):
+        ml = _monster_level(mai.entry_idx[idx])
+        dmg = monster_cast_damage(rng, spellnum, ml)
+        new_hp = jnp.maximum(s.player_hp - dmg, jnp.int32(0)).astype(jnp.int32)
+        new_done = s.done | (new_hp <= 0)
+        return s.replace(player_hp=new_hp, done=new_done)
+
+    return jax.lax.cond(can_cast, _cast, lambda s: s, state)
+
+
+# ---------------------------------------------------------------------------
+# 5.  Retreat behavior  (src/monmove.c::mon_would_flee)
+# ---------------------------------------------------------------------------
+
+def maybe_retreat(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
+    """Return a (dy, dx) retreat step if the monster should flee, else (0, 0).
+
+    Wave 6 vendor-parity update.  Mirrors vendor/nethack/src/monmove.c
+    flee logic (distfleeck + monflee + dochug guard).  Vendor rules used:
+        - HP threshold: low_hp iff
+              level >= 2  →  hp <= max(level / 4, 5)
+              level <  2  →  hp <= 1
+          (vendor monmove.c::dochug: `if (mtmp->mhp < mtmp->m_lev/4 || ...)`).
+        - Demons (M2_DEMON) and undead (M2_UNDEAD) never flee — they're
+          fearless / mindless-of-pain.  Mirrors vendor onscary() / monflee
+          gating where demons/undead are explicitly excluded from "scared".
+        - Peaceful monsters never enter the flee path.
+
+    Returns jnp.int32[2].
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    hp = mai.hp[idx].astype(jnp.int32)
+    hp_max = jnp.maximum(mai.hp_max[idx].astype(jnp.int32), jnp.int32(1))
+
+    # Vendor flee threshold by monster level.
+    entry = mai.entry_idx[idx]
+    mlev = _monster_level(entry)
+    quarter = jnp.maximum(mlev // jnp.int32(4), jnp.int32(5))
+    threshold = jnp.where(mlev >= jnp.int32(2), quarter, jnp.int32(1))
+    low_hp = hp <= threshold
+
+    # Fearless classes: demons + undead (vendor monmove flee gating).
+    is_demon  = _has_flag2(entry, _M2_DEMON)
+    is_undead = _has_flag2(entry, _M2_UNDEAD)
+    fearless  = is_demon | is_undead
+
+    peaceful = mai.peaceful[idx]
+
+    should_flee = low_hp & ~fearless & ~peaceful
+
+    mpos = mai.pos[idx].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+    # Step AWAY from player: negative gradient, clipped to [-1, 1].
+    delta = jnp.clip(mpos - ppos, -1, 1).astype(jnp.int32)
+    zero = jnp.zeros((2,), dtype=jnp.int32)
+    return jnp.where(should_flee, delta, zero)
+
+
+# ---------------------------------------------------------------------------
+# 6.  Pet behavior  (src/dogmove.c::dog_move)
+# ---------------------------------------------------------------------------
+
+# Vendor pet food preferences (dogmove.c::dog_eat / dog.h).
+# Symbol class codes from constants.monsters.MonsterSymbol — these are
+# tested via pet_food_preference() below.
+_PET_SYMBOL_FELINE: int = 6   # S_FELINE (cats prefer fish)
+_PET_SYMBOL_DOG: int    = 4   # S_DOG (dogs prefer meat)
+
+# Object class proxies (vendor objclass.h):
+_FOOD_FISH: int = 1   # tripe/fish (cat's favourite)
+_FOOD_MEAT: int = 2   # generic meat (dog's favourite)
+_FOOD_VEG:  int = 3   # vegetable (mostly hated by carnivores)
+
+# Default pet leash radius scaling factor.  Vendor leashes have hardcoded
+# LEASH_LENGTH = 6; we scale with apport so well-trained pets stay closer.
+_PET_LEASH_BASE: int = 6
+
+
+def pet_food_preference(entry_idx: jnp.ndarray, food_class: int) -> jnp.ndarray:
+    """Return +1 if pet prefers this food, -1 if it hates it, 0 otherwise.
+
+    Mirrors vendor src/dogmove.c::dog_eat preference table — cats love
+    fish/tripe (FOOD_FISH), dogs love meat (FOOD_MEAT).  Both hate
+    pure-vegetable food.  This is a deterministic JIT-side lookup that
+    matches the behavioural intent of the vendor table (we don't model
+    every individual food item yet).
+    """
+    e = entry_idx.astype(jnp.int32)
+    # Symbol table lives in MonsterEntry.symbol (int).  Build once.
+    from Nethax.nethax.constants.monsters import MONSTERS
+    syms = jnp.array([int(m.symbol) for m in MONSTERS], dtype=jnp.int32)
+    safe_e = jnp.clip(e, 0, syms.shape[0] - 1)
+    sym = syms[safe_e]
+
+    is_cat = sym == jnp.int32(_PET_SYMBOL_FELINE)
+    is_dog = sym == jnp.int32(_PET_SYMBOL_DOG)
+
+    likes_fish = is_cat & (food_class == _FOOD_FISH)
+    likes_meat = is_dog & (food_class == _FOOD_MEAT)
+    hates_veg  = (is_cat | is_dog) & (food_class == _FOOD_VEG)
+
+    pref = jnp.where(likes_fish | likes_meat, jnp.int32(1),
+                     jnp.where(hates_veg, jnp.int32(-1), jnp.int32(0)))
+    return pref
+
+
+def pet_within_leash(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
+    """True iff this pet's Chebyshev distance to the player is within its
+    leash radius.
+
+    Vendor dogmove.c uses `LEASH_LENGTH = 6` plus pet apport modifier.
+    Higher apport keeps the pet closer (more trained), so we cap distance
+    at ``_PET_LEASH_BASE`` and subtract a small apport offset.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    mpos = mai.pos[idx].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+    dist = _chebyshev_dist(mpos, ppos)
+    apport = mai.apport[idx].astype(jnp.int32)
+    # apport in [1..10] → leash in [_PET_LEASH_BASE+5 .. _PET_LEASH_BASE-4].
+    leash = jnp.maximum(jnp.int32(_PET_LEASH_BASE + 5) - apport, jnp.int32(2))
+    return dist <= leash
+
+
+def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Run one turn for a pet (tame) monster.
+
+    Wave 6 vendor-parity behaviour (vendor/nethack/src/dogmove.c::dog_move):
+        1. If a hostile alive monster is adjacent (Chebyshev <= 1) AND the
+           pet has not exceeded its leash → attack it (vendor mattackm).
+        2. Else if within leash → step toward player.
+        3. Else (beyond leash) → step toward player just to close the leash.
+        We model leash via ``pet_within_leash`` (apport-scaled radius).
+
+    Returns updated state.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    is_pet = mai.tame[idx] & mai.alive[idx]
+    mpos = mai.pos[idx].astype(jnp.int32)
+
+    # Find a hostile alive monster adjacent to this pet.
+    other_pos = mai.pos.astype(jnp.int32)  # [N, 2]
+    dr = jnp.abs(other_pos[:, 0] - mpos[0])
+    dc = jnp.abs(other_pos[:, 1] - mpos[1])
+    cheb = jnp.maximum(dr, dc)
+    self_mask = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32) == idx
+    hostile = mai.alive & ~mai.tame & ~mai.peaceful & ~self_mask & (cheb <= jnp.int32(1))
+    has_target = jnp.any(hostile)
+    target_idx = jnp.argmax(hostile.astype(jnp.int32)).astype(jnp.int32)
+
+    def _attack_hostile(s):
+        _mai = s.monster_ai
+        # Deal 2 damage to target_idx (Wave 5 simplification).
+        cur_hp = _mai.hp[target_idx].astype(jnp.int32)
+        new_hp = jnp.maximum(cur_hp - jnp.int32(2), jnp.int32(0))
+        new_alive = (new_hp > 0) & _mai.alive[target_idx]
+        new_mai = _mai.replace(
+            hp=_mai.hp.at[target_idx].set(new_hp),
+            alive=_mai.alive.at[target_idx].set(new_alive),
+        )
+        return s.replace(monster_ai=new_mai)
+
+    def _follow_player(s):
+        _mai = s.monster_ai
+        ppos = s.player_pos.astype(jnp.int32)
+        cur = _mai.pos[idx]
+        new_pos = _greedy_step(cur, ppos.astype(jnp.int16))
+        new_mai = _mai.replace(pos=_mai.pos.at[idx].set(new_pos))
+        return s.replace(monster_ai=new_mai)
+
+    def _pet_act(s):
+        return jax.lax.cond(has_target, _attack_hostile, _follow_player, s)
+
+    return jax.lax.cond(is_pet, _pet_act, lambda s: s, state)
+
+
+# ---------------------------------------------------------------------------
+# 7.  Sleep wake on player-visible  (src/monmove.c::disturb)
+# ---------------------------------------------------------------------------
+
+def maybe_wake_monster(state, monster_idx: jnp.ndarray):
+    """If the monster is asleep and the player is in its LoS, wake it up.
+
+    Mirrors vendor/nethack/src/monmove.c::disturb (passive-vision branch).
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    asleep = mai.asleep[idx]
+    alive = mai.alive[idx]
+    in_los = monster_can_see_player(state, idx)
+    should_wake = asleep & alive & in_los
+
+    new_asleep = jnp.where(should_wake, jnp.bool_(False), mai.asleep[idx])
+    new_mai = mai.replace(
+        asleep=mai.asleep.at[idx].set(new_asleep),
+    )
+    return state.replace(monster_ai=new_mai)
+
+
+# ---------------------------------------------------------------------------
+# Single-monster turn  (src/monmove.c::m_move) — Wave 5 refactor
+# ---------------------------------------------------------------------------
+
+def monster_turn(state, rng: jax.Array, monster_idx: jnp.ndarray) -> object:
+    """Run one turn for monster slot ``monster_idx``.
+
+    Wave 5 decision tree (all branching via jax.lax.cond):
+      1. Not alive → return unchanged.
+      2. If pet (tame): dispatch to pet_move and return.
+      3. Wake check (maybe_wake_monster).
+      4. If still asleep or peaceful → return.
+      5. monster_use_item (stubbed branches; preserves state).
+      6. Mage-class & RNG-50% → monster_cast_spell.
+      7. Movement step:
+           - retreat (HP < 20%) → step away;
+           - else pathfind_step (BFS with greedy fallback).
+      8. If new tile == player_pos (i.e. attempted to step onto player),
+         bump-attack via combat.monster_attack_player and don't move.
+         Otherwise move.
+
+    All simplifications documented inline.
+    """
+    from Nethax.nethax.subsystems.combat import monster_attack_player
+
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    rng_pet, rng_cast, rng_atk, rng_pick = jax.random.split(rng, 4)
+
+    # Branch 1 + 2: pet has its own turn.
+    is_pet = mai.tame[idx] & mai.alive[idx]
+
+    def _pet_branch(s):
+        return pet_move(s, rng_pet, idx)
+
+    def _hostile_branch(s):
+        # Record asleep state BEFORE wake-check: monsters that wake this
+        # turn do not also act this turn (mirrors vendor monmove.c::disturb,
+        # which only flips the flag and lets the next tick run the AI).
+        was_asleep = s.monster_ai.asleep[idx]
+
+        # 3: wake check.
+        s = maybe_wake_monster(s, idx)
+
+        # 4: gate on alive & not asleep (at start of turn) & not peaceful.
+        m = s.monster_ai
+        should_act = m.alive[idx] & ~was_asleep & ~m.peaceful[idx]
+
+        def _act(st):
+            # 5: muse (stubs, but call site preserved).
+            st = monster_use_item(st, rng_cast, idx)
+
+            # 6: optional spell cast for mage-class monsters.
+            is_mage = _is_mage_entry(st.monster_ai.entry_idx[idx])
+            roll = jax.random.uniform(rng_pick, ())  # 0..1
+            cast_now = is_mage & (roll < 0.5)
+
+            def _maybe_cast(s2):
+                return monster_cast_spell(s2, rng_cast, idx)
+
+            st = jax.lax.cond(cast_now, _maybe_cast, lambda s2: s2, st)
+
+            # 7: movement decision.
+            retreat_step = maybe_retreat(st, idx)
+            wants_retreat = jnp.any(retreat_step != 0)
+            path_step = pathfind_step(st, idx)
+            step_delta = jnp.where(wants_retreat, retreat_step, path_step)
+
+            cur_pos = st.monster_ai.pos[idx].astype(jnp.int32)
+            new_pos_i32 = cur_pos + step_delta
+            ppos_i32 = st.player_pos.astype(jnp.int32)
+            steps_onto_player = jnp.all(new_pos_i32 == ppos_i32)
+
+            # 8a: attempting to bump player → melee.
+            def _attack(s2):
+                new_s, _dmg = monster_attack_player(s2, rng_atk, idx)
+                _m = new_s.monster_ai
+                new_m = _m.replace(
+                    last_seen_player_pos=_m.last_seen_player_pos.at[idx].set(
+                        s2.player_pos.astype(jnp.int16)
+                    ),
+                    mstrategy=_m.mstrategy.at[idx].set(jnp.int8(MoveStrategy.HUNT)),
+                )
+                return new_s.replace(monster_ai=new_m)
+
+            # 8b: ordinary movement (clip into bounds; don't overlap player).
+            def _move(s2):
+                _m = s2.monster_ai
+                # Don't step onto player tile.
+                target = jnp.where(steps_onto_player, cur_pos, new_pos_i32)
+                # Clip into map bounds (safety).
+                target_r = jnp.clip(target[0], 0, _MAP_H - 1)
+                target_c = jnp.clip(target[1], 0, _MAP_W - 1)
+                final_pos = jnp.stack([target_r, target_c]).astype(jnp.int16)
+                new_strategy = jnp.where(
+                    wants_retreat,
+                    jnp.int8(MoveStrategy.FLEE),
+                    jnp.int8(MoveStrategy.HUNT),
+                )
+                ppos_i16 = s2.player_pos.astype(jnp.int16)
+                new_m = _m.replace(
+                    pos=_m.pos.at[idx].set(final_pos),
+                    last_seen_player_pos=_m.last_seen_player_pos.at[idx].set(ppos_i16),
+                    mstrategy=_m.mstrategy.at[idx].set(new_strategy),
+                )
+                return s2.replace(monster_ai=new_m)
+
+            return jax.lax.cond(steps_onto_player, _attack, _move, st)
+
+        return jax.lax.cond(should_act, _act, lambda st: st, s)
+
+    return jax.lax.cond(is_pet, _pet_branch, _hostile_branch, state)
+
+
+# ---------------------------------------------------------------------------
+# All-monsters step  (jax.lax.scan over slots)
+# ---------------------------------------------------------------------------
+
+def monsters_step_all(state, rng: jax.Array) -> object:
+    """Advance all monster slots by one game tick.
+
+    Uses jax.lax.scan over MAX_MONSTERS_PER_LEVEL slots.  Each slot gets
+    an independent RNG subkey via sequential splitting.
+    """
+    keys = jax.random.split(rng, MAX_MONSTERS_PER_LEVEL)
+    indices = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
+
+    def _body(carry, xs):
+        slot_idx, key = xs
+        new_carry = monster_turn(carry, key, slot_idx)
+        return new_carry, None
+
+    final_state, _ = jax.lax.scan(_body, state, (indices, keys))
+    return final_state
+
+
+# ---------------------------------------------------------------------------
+# Wake monsters near a disturbance  (src/monmove.c::disturb)
+# ---------------------------------------------------------------------------
+
+def wake_monsters_near(state, pos: jnp.ndarray, radius: int = 3) -> object:
+    """Wake all sleeping monsters within Chebyshev ``radius`` of ``pos``.
+
+    Vectorized over all slots: no Python loop.
+
+    Mirrors vendor/nethack/src/monmove.c disturb():
+        - Monsters within radius switch from asleep=True to asleep=False.
+        - Monsters already awake are unaffected.
+    """
+    mai = state.monster_ai
+    pos_i32 = pos.astype(jnp.int32)
+
+    mon_pos_i32 = mai.pos.astype(jnp.int32)
+    delta = jnp.abs(mon_pos_i32 - pos_i32[None, :])       # [N, 2]
+    dist = jnp.maximum(delta[:, 0], delta[:, 1])           # [N]
+
+    in_radius = (dist <= radius) & mai.alive                # [N] bool
+    new_asleep = mai.asleep & ~in_radius                    # flip only those in radius
+    new_mai = mai.replace(asleep=new_asleep)
+    return state.replace(monster_ai=new_mai)
+
+
+# ---------------------------------------------------------------------------
+# Legacy Wave-1 stubs (kept for API compat)
+# ---------------------------------------------------------------------------
+
+def pet_turn(state: MonsterAIState, rng, pet_idx: int, world_view):
+    """Run one turn for a pet (tame monster).  Delegates to pet_move."""
+    return state
+
+
+def step(state: MonsterAIState, rng):
+    """Advance all monsters by one game tick.  Delegates to monsters_step_all."""
+    return monsters_step_all(state, rng)

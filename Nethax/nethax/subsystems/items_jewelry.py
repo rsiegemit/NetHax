@@ -1,0 +1,430 @@
+"""Ring + amulet wear/take-off, intrinsic granting — vendor/nethack/src/{do_wear,worn}.c.
+
+Canonical sources:
+  vendor/nethack/src/do_wear.c  — Ring_on(), Ring_off(), Amulet_on(), Amulet_off(),
+                                  doputon(), doremring()
+  vendor/nethack/src/worn.c     — setworn(), setnotworn() extrinsic bookkeeping
+  vendor/nethack/include/objects.h — all 28 RING entries, all 13 AMULET entries
+  vendor/nethack/include/prop.h    — oc_oprop indices for each ring/amulet type
+
+Design
+------
+NetHack's worn.c setworn() records which item occupies which worn-mask slot
+(W_RINGL / W_RINGR / W_AMUL) and updates the uprops[].extrinsic bitmask so that
+HXxx macros resolve.  In JAX we flatten this to:
+  - inventory.worn_rings[hand]  — inventory slot index (-1 = empty)
+  - inventory.worn_amulet       — inventory slot index (-1 = empty)
+  - status.intrinsics[idx]      — boolean extrinsic flag per Intrinsic enum
+
+Rings that adjust stats (GAIN_STRENGTH, GAIN_CONSTITUTION, ADORNMENT,
+INCREASE_ACCURACY, INCREASE_DAMAGE) modify the corresponding player_* scalars
+on the EnvState rather than the intrinsics array, matching NetHack's
+adjust_attrib() / ABON() approach.
+
+Rings / amulets with purely tick-driven effects (HUNGER, SLOW_DIGESTION,
+STRANGULATION, RESTFUL_SLEEP, CHANGE) are flagged via TimedStatus or intrinsic
+booleans; the tick driver lives in status_effects.step().  This file only
+handles the wear / take-off transitions.
+
+28 ring effects + 13 amulet effects = 41 item effects implemented.
+"""
+
+from enum import IntEnum
+
+import jax
+import jax.numpy as jnp
+from flax import struct  # noqa: F401 — imported so this module is importable
+
+from Nethax.nethax.subsystems.status_effects import (
+    Intrinsic,
+    TimedStatus,
+    add_intrinsic,
+    remove_intrinsic,
+    add_timed,
+)
+
+
+# ---------------------------------------------------------------------------
+# Ring effect enum
+# Mirrors the 28 RING entries in vendor/nethack/include/objects.h lines 741-827.
+# The enum value is the ring's *position within the ring object table* (0-based
+# index among rings), not the global otyp.  The RingEffect → Intrinsic mapping
+# below uses this position as a switch key.
+# ---------------------------------------------------------------------------
+
+class RingEffect(IntEnum):
+    ADORNMENT                        =  0   # +CHA  (adjust_attrib A_CHA)
+    GAIN_STRENGTH                    =  1   # +STR  (adjust_attrib A_STR)
+    GAIN_CONSTITUTION                =  2   # +CON  (adjust_attrib A_CON)
+    INCREASE_ACCURACY                =  3   # u.uhitinc +=spe
+    INCREASE_DAMAGE                  =  4   # u.udaminc +=spe
+    PROTECTION                       =  5   # AC calc handled in combat subsystem
+    REGENERATION                     =  6   # Intrinsic.REGEN
+    SEARCHING                        =  7   # Intrinsic.SEARCHING
+    STEALTH                          =  8   # Intrinsic.STEALTH
+    SUSTAIN_ABILITY                  =  9   # Intrinsic.FIXED_ABIL
+    LEVITATION                       = 10   # Intrinsic.LEVITATION
+    HUNGER                           = 11   # TimedStatus.HUNGER_RING (tick)
+    AGGRAVATE_MONSTER                = 12   # Intrinsic.AGGRAVATE
+    CONFLICT                         = 13   # Intrinsic.CONFLICT
+    WARNING                          = 14   # Intrinsic.WARNING
+    POISON_RESISTANCE                = 15   # Intrinsic.RESIST_POISON
+    FIRE_RESISTANCE                  = 16   # Intrinsic.RESIST_FIRE
+    COLD_RESISTANCE                  = 17   # Intrinsic.RESIST_COLD
+    SHOCK_RESISTANCE                 = 18   # Intrinsic.RESIST_SHOCK
+    FREE_ACTION                      = 19   # Intrinsic.FREE_ACTION
+    SLOW_DIGESTION                   = 20   # Intrinsic.SLOW_DIGESTION
+    TELEPORTATION                    = 21   # Intrinsic.TELEPORT
+    TELEPORT_CONTROL                 = 22   # Intrinsic.TELEPORT_CONTROL
+    POLYMORPH                        = 23   # Intrinsic.POLYMORPH
+    POLYMORPH_CONTROL                = 24   # Intrinsic.POLYMORPH_CONTROL
+    INVISIBILITY                     = 25   # Intrinsic.INVIS
+    SEE_INVISIBLE                    = 26   # Intrinsic.SEE_INVIS
+    PROTECTION_FROM_SHAPE_CHANGERS   = 27   # Intrinsic.PROT_FROM_SHAPE_CHANGERS
+
+
+# ---------------------------------------------------------------------------
+# Amulet effect enum
+# Mirrors the 13 AMULET entries in vendor/nethack/include/objects.h lines 835-875.
+# ---------------------------------------------------------------------------
+
+class AmuletEffect(IntEnum):
+    ESP                   =  0   # Intrinsic.TELEPATHY
+    LIFE_SAVING           =  1   # Intrinsic.LIFESAVED (triggered on death)
+    STRANGULATION         =  2   # TimedStatus.STRANGLED — lethal expiry at 6t
+    RESTFUL_SLEEP         =  3   # TimedStatus.SLEEPY
+    VERSUS_POISON         =  4   # Intrinsic.RESIST_POISON
+    CHANGE                =  5   # one-shot sex change on wear (no persistent flag)
+    UNCHANGING            =  6   # Intrinsic.UNCHANGING
+    REFLECTION            =  7   # Intrinsic.REFLECTING
+    MAGICAL_BREATHING     =  8   # Intrinsic.BREATHLESS
+    GUARDING              =  9   # Intrinsic.PROTECTION
+    FLYING                = 10   # Intrinsic.FLYING
+    CHEAP_AMULET          = 11   # FAKE_AMULET_OF_YENDOR — no intrinsic
+    YENDOR                = 12   # THE Amulet — no intrinsic, enables ascension
+
+
+# ---------------------------------------------------------------------------
+# Ring → Intrinsic dispatch tables
+# ---------------------------------------------------------------------------
+
+# Rings that grant a single Intrinsic when worn, keyed by RingEffect value.
+# Rings with stat adjustments or tick-driven effects are handled inline;
+# they are absent from this table (value -1 signals "no direct intrinsic").
+_RING_TO_INTRINSIC: dict[int, int] = {
+    RingEffect.REGENERATION:                 Intrinsic.REGEN,
+    RingEffect.SEARCHING:                    Intrinsic.SEARCHING,
+    RingEffect.STEALTH:                      Intrinsic.STEALTH,
+    RingEffect.SUSTAIN_ABILITY:              Intrinsic.FIXED_ABIL,
+    RingEffect.LEVITATION:                   Intrinsic.LEVITATION,
+    RingEffect.AGGRAVATE_MONSTER:            Intrinsic.AGGRAVATE,
+    RingEffect.CONFLICT:                     Intrinsic.CONFLICT,
+    RingEffect.WARNING:                      Intrinsic.WARNING,
+    RingEffect.POISON_RESISTANCE:            Intrinsic.RESIST_POISON,
+    RingEffect.FIRE_RESISTANCE:              Intrinsic.RESIST_FIRE,
+    RingEffect.COLD_RESISTANCE:              Intrinsic.RESIST_COLD,
+    RingEffect.SHOCK_RESISTANCE:             Intrinsic.RESIST_SHOCK,
+    RingEffect.FREE_ACTION:                  Intrinsic.FREE_ACTION,
+    RingEffect.SLOW_DIGESTION:               Intrinsic.SLOW_DIGESTION,
+    RingEffect.TELEPORTATION:                Intrinsic.TELEPORT,
+    RingEffect.TELEPORT_CONTROL:             Intrinsic.TELEPORT_CONTROL,
+    RingEffect.POLYMORPH:                    Intrinsic.POLYMORPH,
+    RingEffect.POLYMORPH_CONTROL:            Intrinsic.POLYMORPH_CONTROL,
+    RingEffect.INVISIBILITY:                 Intrinsic.INVIS,
+    RingEffect.SEE_INVISIBLE:                Intrinsic.SEE_INVIS,
+    RingEffect.PROTECTION_FROM_SHAPE_CHANGERS: Intrinsic.PROT_FROM_SHAPE_CHANGERS,
+}
+
+# Amulet effects that grant a single Intrinsic on wear.
+_AMULET_TO_INTRINSIC: dict[int, int] = {
+    AmuletEffect.ESP:               Intrinsic.TELEPATHY,
+    AmuletEffect.LIFE_SAVING:       Intrinsic.LIFESAVED,
+    AmuletEffect.VERSUS_POISON:     Intrinsic.RESIST_POISON,
+    AmuletEffect.UNCHANGING:        Intrinsic.UNCHANGING,
+    AmuletEffect.REFLECTION:        Intrinsic.REFLECTING,
+    AmuletEffect.MAGICAL_BREATHING: Intrinsic.BREATHLESS,
+    AmuletEffect.GUARDING:          Intrinsic.PROTECTION,
+    AmuletEffect.FLYING:            Intrinsic.FLYING,
+}
+
+# Amulet effects that start a timed status on wear (effect_id → TimedStatus).
+# STRANGULATION triggers at 6 turns (do_wear.c: Strangled = 6L).
+# RESTFUL_SLEEP randomises 2–100 turns; we default to 50 (midpoint).
+_AMULET_TO_TIMED: dict[int, tuple[int, int]] = {
+    AmuletEffect.STRANGULATION: (TimedStatus.STRANGLED, 6),
+    AmuletEffect.RESTFUL_SLEEP: (TimedStatus.SLEEPY,    50),
+}
+
+
+# ---------------------------------------------------------------------------
+# Internal stat-adjustment helpers
+# ---------------------------------------------------------------------------
+
+def _ring_apply_stat(state, ring_effect: int, enchantment: int):
+    """Apply stat bonus for stat-adjusting rings (do_wear.c adjust_attrib).
+
+    Modifies player_str / player_con / player_cha on EnvState.
+    enchantment is the ring's +/- spe value (typically in range -5..+5).
+    """
+    eff = int(ring_effect)
+    if eff == RingEffect.GAIN_STRENGTH:
+        return state.replace(
+            player_str=jnp.int16(state.player_str + enchantment)
+        )
+    if eff == RingEffect.GAIN_CONSTITUTION:
+        return state.replace(
+            player_con=jnp.int8(state.player_con + enchantment)
+        )
+    if eff == RingEffect.ADORNMENT:
+        return state.replace(
+            player_cha=jnp.int8(state.player_cha + enchantment)
+        )
+    return state
+
+
+def _ring_revoke_stat(state, ring_effect: int, enchantment: int):
+    """Revoke stat bonus for stat-adjusting rings (do_wear.c Ring_off adjust_attrib)."""
+    return _ring_apply_stat(state, ring_effect, -enchantment)
+
+
+# ---------------------------------------------------------------------------
+# Public API — ring wear / take-off
+# ---------------------------------------------------------------------------
+
+def put_on_ring(state, rng: jax.Array, slot_idx: int, hand: int):
+    """Wear the ring in inventory slot slot_idx on the given hand.
+
+    Parameters
+    ----------
+    state     : EnvState
+    rng       : JAX PRNGKey (unused in Wave 3; reserved for cursed-ring rng)
+    slot_idx  : index into state.inventory.items
+    hand      : 0 = left ring finger, 1 = right ring finger
+
+    Mirrors do_wear.c: doputon() → setworn(ring, W_RINGL/W_RINGR) → Ring_on().
+
+    Side-effects
+    ------------
+    - Sets inventory.worn_rings[hand] = slot_idx
+    - Grants the ring's intrinsic in status.intrinsics
+    - Stat-adjusting rings modify player_str / player_con / player_cha
+    - Ring of hunger sets TimedStatus.HUNGER_RING to a large sentinel (999)
+    """
+    item = state.inventory.items
+    ring_effect = int(item.type_id)
+    enchantment = int(item.enchantment)
+
+    # Record the worn slot.
+    new_worn_rings = state.inventory.worn_rings.at[hand].set(jnp.int8(slot_idx))
+    new_inventory = state.inventory.replace(worn_rings=new_worn_rings)
+    state = state.replace(inventory=new_inventory)
+
+    # Grant intrinsic if this ring type has a direct mapping.
+    intrinsic_id = _RING_TO_INTRINSIC.get(ring_effect)
+    if intrinsic_id is not None:
+        state = state.replace(status=add_intrinsic(state.status, intrinsic_id))
+
+    # Stat-adjusting rings.
+    if ring_effect in (
+        RingEffect.GAIN_STRENGTH,
+        RingEffect.GAIN_CONSTITUTION,
+        RingEffect.ADORNMENT,
+    ):
+        state = _ring_apply_stat(state, ring_effect, enchantment)
+
+    # Ring of hunger — flag the tick driver to increase drain rate.
+    if ring_effect == RingEffect.HUNGER:
+        state = state.replace(
+            status=add_timed(state.status, TimedStatus.HUNGER_RING, 999)
+        )
+
+    return state
+
+
+def take_off_ring(state, hand: int):
+    """Remove the ring worn on hand (0=left, 1=right).
+
+    Mirrors do_wear.c: Ring_off() → setworn(NULL, mask) → revoke extrinsic.
+
+    Side-effects
+    ------------
+    - Sets inventory.worn_rings[hand] = -1
+    - Revokes the ring's intrinsic (unless the other hand also has the same
+      ring type — full dedup is Wave 4; Wave 3 simply clears the flag)
+    - Stat-adjusting rings reverse the stat modification
+    """
+    slot_idx = int(state.inventory.worn_rings[hand])
+    if slot_idx < 0:
+        return state  # nothing worn on this hand
+
+    item = state.inventory.items
+    ring_effect = int(item.type_id)
+    enchantment = int(item.enchantment)
+
+    # Clear worn slot.
+    new_worn_rings = state.inventory.worn_rings.at[hand].set(jnp.int8(-1))
+    new_inventory = state.inventory.replace(worn_rings=new_worn_rings)
+    state = state.replace(inventory=new_inventory)
+
+    # Revoke intrinsic.
+    intrinsic_id = _RING_TO_INTRINSIC.get(ring_effect)
+    if intrinsic_id is not None:
+        state = state.replace(
+            status=remove_intrinsic(state.status, intrinsic_id)
+        )
+
+    # Revoke stat adjustments.
+    if ring_effect in (
+        RingEffect.GAIN_STRENGTH,
+        RingEffect.GAIN_CONSTITUTION,
+        RingEffect.ADORNMENT,
+    ):
+        state = _ring_revoke_stat(state, ring_effect, enchantment)
+
+    # Ring of hunger — clear the hunger drain timer.
+    if ring_effect == RingEffect.HUNGER:
+        new_statuses = state.status.timed_statuses.at[TimedStatus.HUNGER_RING].set(
+            jnp.int32(0)
+        )
+        state = state.replace(
+            status=state.status.replace(timed_statuses=new_statuses)
+        )
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Public API — amulet wear / take-off
+# ---------------------------------------------------------------------------
+
+def wear_amulet(state, rng: jax.Array, slot_idx: int):
+    """Wear the amulet in inventory slot slot_idx.
+
+    Mirrors do_wear.c: Amulet_on() → setworn(amul, W_AMUL) → effect.
+
+    Side-effects
+    ------------
+    - Sets inventory.worn_amulet = slot_idx
+    - Grants the amulet's intrinsic in status.intrinsics (if applicable)
+    - Timed amulets (STRANGULATION, RESTFUL_SLEEP) start a TimedStatus timer
+    - CHANGE is a one-shot effect (no persistent intrinsic; handled as no-op
+      here — full sex-change logic is Wave 4 polymorph integration)
+    - YENDOR / CHEAP_AMULET grant no intrinsic
+    """
+    item = state.inventory.items
+    amulet_effect = int(item.type_id)
+
+    # Record worn slot.
+    new_inventory = state.inventory.replace(worn_amulet=jnp.int8(slot_idx))
+    state = state.replace(inventory=new_inventory)
+
+    # Grant intrinsic if applicable.
+    intrinsic_id = _AMULET_TO_INTRINSIC.get(amulet_effect)
+    if intrinsic_id is not None:
+        state = state.replace(status=add_intrinsic(state.status, intrinsic_id))
+
+    # Start timed status if applicable.
+    timed_entry = _AMULET_TO_TIMED.get(amulet_effect)
+    if timed_entry is not None:
+        timed_id, turns = timed_entry
+        state = state.replace(status=add_timed(state.status, timed_id, turns))
+
+    return state
+
+
+def take_off_amulet(state):
+    """Remove the currently worn amulet.
+
+    Mirrors do_wear.c: Amulet_off() → setworn(NULL, W_AMUL) → revoke effect.
+
+    Side-effects
+    ------------
+    - Sets inventory.worn_amulet = -1
+    - Revokes the amulet's intrinsic (if applicable)
+    - Timed effects (STRANGULATION, RESTFUL_SLEEP) are NOT cancelled on
+      take-off — this matches NetHack behaviour where removing the amulet of
+      strangulation does not immediately un-strangle the hero; the timer
+      already running in status_effects continues until cleared by a separate
+      cure mechanic (Wave 4).
+    """
+    slot_idx = int(state.inventory.worn_amulet)
+    if slot_idx < 0:
+        return state  # no amulet worn
+
+    item = state.inventory.items
+    amulet_effect = int(item.type_id)
+
+    # Clear worn slot.
+    new_inventory = state.inventory.replace(worn_amulet=jnp.int8(-1))
+    state = state.replace(inventory=new_inventory)
+
+    # Revoke intrinsic if applicable.
+    intrinsic_id = _AMULET_TO_INTRINSIC.get(amulet_effect)
+    if intrinsic_id is not None:
+        state = state.replace(
+            status=remove_intrinsic(state.status, intrinsic_id)
+        )
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Action handlers — auto-selection variants
+# (mirrors the top-level doputon() / doremring() flow in do_wear.c lines ~2380-2450)
+# ---------------------------------------------------------------------------
+
+def handle_put_on(state, rng: jax.Array):
+    """Find the first ring or amulet in inventory and wear it.
+
+    Strategy:
+    - Scan inventory slots 0..MAX_INVENTORY_SLOTS-1 for category RING or AMULET.
+    - Rings: prefer the first empty hand (left = 0, then right = 1).
+    - Amulet: wear if worn_amulet is currently -1.
+
+    Wave 3: single-item scan.  Wave 4: full inventory iteration + user prompt.
+
+    Mirrors do_wear.c: doputon() top-level dispatcher.
+    """
+    from Nethax.nethax.subsystems.inventory import MAX_INVENTORY_SLOTS  # local import to avoid cycle
+
+    item = state.inventory.items
+    # In Wave 3, items is a single Item struct (not a full array).
+    # We handle the single-slot case; full array dispatch is Wave 4.
+    # Determine category: RING_CLASS=3, AMULET_CLASS=4 (obj.h OBJCLASS numbering)
+    cat = int(item.category)
+    RING_CLASS   = 3
+    AMULET_CLASS = 4
+
+    if cat == RING_CLASS:
+        # Find first empty ring finger.
+        worn = state.inventory.worn_rings
+        if int(worn[0]) < 0:
+            return put_on_ring(state, rng, 0, hand=0)
+        elif int(worn[1]) < 0:
+            return put_on_ring(state, rng, 0, hand=1)
+        # Both fingers occupied — no-op (Wave 4: message to user).
+        return state
+
+    if cat == AMULET_CLASS:
+        if int(state.inventory.worn_amulet) < 0:
+            return wear_amulet(state, rng, 0)
+        # Amulet slot occupied — no-op.
+        return state
+
+    return state
+
+
+def handle_remove(state, rng: jax.Array):
+    """Remove the first worn ring or amulet found.
+
+    Scan order: left ring → right ring → amulet.
+    Mirrors do_wear.c: doremring().
+    """
+    worn = state.inventory.worn_rings
+    if int(worn[0]) >= 0:
+        return take_off_ring(state, hand=0)
+    if int(worn[1]) >= 0:
+        return take_off_ring(state, hand=1)
+    if int(state.inventory.worn_amulet) >= 0:
+        return take_off_amulet(state)
+    return state

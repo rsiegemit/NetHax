@@ -1,0 +1,884 @@
+"""Inventory subsystem — slot management, wear/wield/pickup/drop.
+
+Canonical sources:
+  vendor/nethack/src/invent.c  — inventory display, slot management (a-zA-Z)
+  vendor/nethack/src/pickup.c  — auto-pickup, weight checking
+  vendor/nethack/src/do_wear.c — wear/take-off armor
+  vendor/nethack/src/wield.c   — wield weapon, two-weapon combat
+  vendor/nethack/src/worn.c    — track intrinsics granted by worn gear
+
+Status: Wave 3 — core inventory operations implemented.
+
+TODO (Wave 4 — full equipment):
+  - Cursed item locking (cannot take off unless remove-cursed)
+  - Enchantment effect on AC / to-hit / damage
+  - Erosion penalties on worn armor AC
+
+TODO (Wave 5 — containers):
+  - Bag-of-holding nested inventory
+  - Container open/close/put/take
+"""
+from dataclasses import field
+from enum import IntEnum
+
+import jax
+import jax.numpy as jnp
+import jax.lax as lax
+from flax import struct
+
+
+# ---------------------------------------------------------------------------
+# Item category enum  (vendor/nethack/include/defsym.h OBJCLASS entries)
+# RANDOM_CLASS = 0 → used as "empty slot" sentinel here too.
+# ---------------------------------------------------------------------------
+
+class ItemCategory(IntEnum):
+    NONE    = 0   # empty slot (RANDOM_CLASS in NetHack)
+    ILLOBJ  = 1
+    WEAPON  = 2
+    ARMOR   = 3
+    RING    = 4
+    AMULET  = 5
+    TOOL    = 6
+    FOOD    = 7
+    POTION  = 8
+    SCROLL  = 9
+    SPBOOK  = 10
+    WAND    = 11
+    COIN    = 12
+    GEM     = 13
+    ROCK    = 14
+    BALL    = 15
+    CHAIN   = 16
+    VENOM   = 17
+
+
+# ---------------------------------------------------------------------------
+# Constants (vendor/nethack/src/invent.c, include/hack.h)
+# ---------------------------------------------------------------------------
+
+# NetHack uses letters a-z A-Z — exactly 52 slots.
+MAX_INVENTORY_SLOTS = 52  # a-zA-Z
+
+# User-given name length per slot (Wave 6).  Mirrors NetHack's ONAME_MAX in
+# vendor/nethack/include/obj.h (capped at 16 chars + null for inv display).
+USER_NAME_LEN = 16
+
+# Body armor slots tracked by worn_armor array.
+# vendor/nethack/include/obj.h: ARM_SUIT, ARM_SHIELD, ARM_HELM,
+#   ARM_GLOVES, ARM_BOOTS, ARM_CLOAK, ARM_SHIRT
+N_ARMOR_SLOTS = 7  # body, shield, helm, gloves, boots, cloak, shirt
+
+# Additional worn/wielded slots outside the armor array.
+# weapon (wielded), off-hand (two-weapon), amulet, ring[0], ring[1]
+# quiver is tracked separately; that makes 5 + 1 = 6 non-armor slots.
+# (The spec asked us to verify: invent.c treats rings as two separate slots.)
+N_WORN_NON_ARMOR_SLOTS = 5  # wielded, off_hand, amulet, ring_L, ring_R
+
+# Ground stack depth per tile — max items on one floor tile.
+MAX_GROUND_STACK = 8
+
+# Base AC with no armor worn (NetHack: u.uac starts at 10).
+BASE_AC = 10
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class ArmorSlot(IntEnum):
+    """Indices into InventoryState.worn_armor.
+
+    Matches the ARM_* sub-field ordering in vendor/nethack/include/obj.h.
+    """
+    BODY   = 0  # ARM_SUIT
+    SHIELD = 1  # ARM_SHIELD
+    HELM   = 2  # ARM_HELM
+    GLOVES = 3  # ARM_GLOVES
+    BOOTS  = 4  # ARM_BOOTS
+    CLOAK  = 5  # ARM_CLOAK
+    SHIRT  = 6  # ARM_SHIRT
+
+
+# ---------------------------------------------------------------------------
+# Item struct
+# ---------------------------------------------------------------------------
+
+@struct.dataclass
+class Item:
+    """A single item slot. Empty slots have ``category == 0``.
+
+    Migrated from legacy ``Nethax.nethax.nethax_state.Item`` during Wave 2.
+
+    Field map vs vendor ``include/obj.h::struct obj`` (Wave 6 parity polish):
+      category       <- oclass
+      type_id        <- otyp
+      buc_status     <- cursed/blessed bitfield pair (collapsed)
+      enchantment    <- spe (general slot for enchant/charges)
+      charges        <- spe (split for clarity; vendor reuses spe)
+      identified     <- known
+      quantity       <- quan
+      weight         <- owt
+      ac_bonus       <- derived from objects table (not in vendor struct)
+      is_two_handed  <- derived from objects table (not in vendor struct)
+      greased        <- greased bitfield     (vendor obj.h L#172)
+      oeroded        <- oeroded:2 bitfield   (vendor obj.h L#162-164)
+      oeroded2       <- oeroded2:2 bitfield  (rust/corrode tiers)
+      oerodeproof    <- oerodeproof bitfield (vendor obj.h L#166)
+      bknown         <- bknown bitfield      (BUC-awareness)
+      lamplit        <- lamplit bitfield     (light source state)
+      olocked        <- olocked bitfield     (container lock state)
+    """
+    category: jnp.ndarray       # ItemCategory enum value (0 = empty)
+    type_id: jnp.ndarray        # weapon/armor/potion/scroll/... type id
+    buc_status: jnp.ndarray     # 0=unknown / 1=cursed / 2=uncursed / 3=blessed
+    enchantment: jnp.ndarray    # +/- enchantment level
+    charges: jnp.ndarray        # remaining charges (wands)
+    identified: jnp.ndarray     # bool — known type
+    quantity: jnp.ndarray       # stack count (arrows, gold, etc.)
+    weight: jnp.ndarray         # item weight in aum (avoirdupois units)
+    ac_bonus: jnp.ndarray       # base AC contribution (armor only; 0 for non-armor)
+    is_two_handed: jnp.ndarray  # bool — two-handed weapon flag
+    # Vendor obj.h gameplay bitfields — default False/0 so existing call sites
+    # that pre-date this expansion still work.
+    greased: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
+    oeroded: jnp.ndarray = field(default_factory=lambda: jnp.int8(0))
+    oeroded2: jnp.ndarray = field(default_factory=lambda: jnp.int8(0))
+    oerodeproof: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
+    bknown: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
+    lamplit: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
+    olocked: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
+
+
+def make_empty_item() -> Item:
+    """Return a zeroed Item representing an empty inventory slot."""
+    return Item(
+        category=jnp.int8(0),
+        type_id=jnp.int16(0),
+        buc_status=jnp.int8(0),
+        enchantment=jnp.int8(0),
+        charges=jnp.int8(0),
+        identified=jnp.bool_(False),
+        quantity=jnp.int16(0),
+        weight=jnp.int32(0),
+        ac_bonus=jnp.int8(0),
+        is_two_handed=jnp.bool_(False),
+        greased=jnp.bool_(False),
+        oeroded=jnp.int8(0),
+        oeroded2=jnp.int8(0),
+        oerodeproof=jnp.bool_(False),
+        bknown=jnp.bool_(False),
+        lamplit=jnp.bool_(False),
+        olocked=jnp.bool_(False),
+    )
+
+
+def make_item(
+    category: int,
+    type_id: int,
+    quantity: int = 1,
+    weight: int = 0,
+    ac_bonus: int = 0,
+    enchantment: int = 0,
+    is_two_handed: bool = False,
+    buc_status: int = 0,
+) -> Item:
+    """Construct a concrete Item with given fields (Python-side helper)."""
+    return Item(
+        category=jnp.int8(category),
+        type_id=jnp.int16(type_id),
+        buc_status=jnp.int8(buc_status),
+        enchantment=jnp.int8(enchantment),
+        charges=jnp.int8(0),
+        identified=jnp.bool_(True),
+        quantity=jnp.int16(quantity),
+        weight=jnp.int32(weight),
+        ac_bonus=jnp.int8(ac_bonus),
+        is_two_handed=jnp.bool_(is_two_handed),
+        greased=jnp.bool_(False),
+        oeroded=jnp.int8(0),
+        oeroded2=jnp.int8(0),
+        oerodeproof=jnp.bool_(False),
+        bknown=jnp.bool_(False),
+        lamplit=jnp.bool_(False),
+        olocked=jnp.bool_(False),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers to build batched Item arrays from a list of items
+# ---------------------------------------------------------------------------
+
+def _items_from_list(item_list: list) -> Item:
+    """Stack a Python list of Items into a batched Item of shape [N].
+
+    Pads with empty items to MAX_INVENTORY_SLOTS.
+    """
+    padded = list(item_list) + [make_empty_item()] * (MAX_INVENTORY_SLOTS - len(item_list))
+    return _stack_items(padded)
+
+
+def _stack_items(items: list) -> Item:
+    """Stack a fixed-length list of Items into a single batched Item."""
+    return Item(
+        category=jnp.array([int(it.category) for it in items], dtype=jnp.int8),
+        type_id=jnp.array([int(it.type_id) for it in items], dtype=jnp.int16),
+        buc_status=jnp.array([int(it.buc_status) for it in items], dtype=jnp.int8),
+        enchantment=jnp.array([int(it.enchantment) for it in items], dtype=jnp.int8),
+        charges=jnp.array([int(it.charges) for it in items], dtype=jnp.int8),
+        identified=jnp.array([bool(it.identified) for it in items], dtype=jnp.bool_),
+        quantity=jnp.array([int(it.quantity) for it in items], dtype=jnp.int16),
+        weight=jnp.array([int(it.weight) for it in items], dtype=jnp.int32),
+        ac_bonus=jnp.array([int(it.ac_bonus) for it in items], dtype=jnp.int8),
+        is_two_handed=jnp.array([bool(it.is_two_handed) for it in items], dtype=jnp.bool_),
+        greased=jnp.array([bool(it.greased) for it in items], dtype=jnp.bool_),
+        oeroded=jnp.array([int(it.oeroded) for it in items], dtype=jnp.int8),
+        oeroded2=jnp.array([int(it.oeroded2) for it in items], dtype=jnp.int8),
+        oerodeproof=jnp.array([bool(it.oerodeproof) for it in items], dtype=jnp.bool_),
+        bknown=jnp.array([bool(it.bknown) for it in items], dtype=jnp.bool_),
+        lamplit=jnp.array([bool(it.lamplit) for it in items], dtype=jnp.bool_),
+        olocked=jnp.array([bool(it.olocked) for it in items], dtype=jnp.bool_),
+    )
+
+
+def _empty_items_array() -> Item:
+    """Return a batched Item array of shape [MAX_INVENTORY_SLOTS], all empty."""
+    n = MAX_INVENTORY_SLOTS
+    return Item(
+        category=jnp.zeros((n,), dtype=jnp.int8),
+        type_id=jnp.zeros((n,), dtype=jnp.int16),
+        buc_status=jnp.zeros((n,), dtype=jnp.int8),
+        enchantment=jnp.zeros((n,), dtype=jnp.int8),
+        charges=jnp.zeros((n,), dtype=jnp.int8),
+        identified=jnp.zeros((n,), dtype=jnp.bool_),
+        quantity=jnp.zeros((n,), dtype=jnp.int16),
+        weight=jnp.zeros((n,), dtype=jnp.int32),
+        ac_bonus=jnp.zeros((n,), dtype=jnp.int8),
+        is_two_handed=jnp.zeros((n,), dtype=jnp.bool_),
+        greased=jnp.zeros((n,), dtype=jnp.bool_),
+        oeroded=jnp.zeros((n,), dtype=jnp.int8),
+        oeroded2=jnp.zeros((n,), dtype=jnp.int8),
+        oerodeproof=jnp.zeros((n,), dtype=jnp.bool_),
+        bknown=jnp.zeros((n,), dtype=jnp.bool_),
+        lamplit=jnp.zeros((n,), dtype=jnp.bool_),
+        olocked=jnp.zeros((n,), dtype=jnp.bool_),
+    )
+
+
+def _empty_ground_items_array(n_branches: int, max_levels: int, map_h: int, map_w: int) -> Item:
+    """Return a ground_items array of shape [n_branches, max_levels, map_h, map_w, MAX_GROUND_STACK]."""
+    shape = (n_branches, max_levels, map_h, map_w, MAX_GROUND_STACK)
+    return Item(
+        category=jnp.zeros(shape, dtype=jnp.int8),
+        type_id=jnp.zeros(shape, dtype=jnp.int16),
+        buc_status=jnp.zeros(shape, dtype=jnp.int8),
+        enchantment=jnp.zeros(shape, dtype=jnp.int8),
+        charges=jnp.zeros(shape, dtype=jnp.int8),
+        identified=jnp.zeros(shape, dtype=jnp.bool_),
+        quantity=jnp.zeros(shape, dtype=jnp.int16),
+        weight=jnp.zeros(shape, dtype=jnp.int32),
+        ac_bonus=jnp.zeros(shape, dtype=jnp.int8),
+        is_two_handed=jnp.zeros(shape, dtype=jnp.bool_),
+        greased=jnp.zeros(shape, dtype=jnp.bool_),
+        oeroded=jnp.zeros(shape, dtype=jnp.int8),
+        oeroded2=jnp.zeros(shape, dtype=jnp.int8),
+        oerodeproof=jnp.zeros(shape, dtype=jnp.bool_),
+        bknown=jnp.zeros(shape, dtype=jnp.bool_),
+        lamplit=jnp.zeros(shape, dtype=jnp.bool_),
+        olocked=jnp.zeros(shape, dtype=jnp.bool_),
+    )
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+@struct.dataclass
+class InventoryState:
+    """Persistent inventory state for a single hero.
+
+    All slot-index fields use -1 to mean "empty / bare hands / none".
+
+    Fields
+    ------
+    items        : Item array of length MAX_INVENTORY_SLOTS.
+                   Empty slots have category == 0 (NONE).
+    wielded      : index into items for the wielded weapon (-1 = bare hands).
+    off_hand     : index into items for the off-hand weapon (-1 = none).
+                   Two-weapon combat (wield.c:dotwoweapon).
+    alternate_weapon_slot : Wave 5 — index into items for the two-weapon
+                   alternate weapon (-1 = none).  Distinct from off_hand
+                   so callers can preserve the bookkeeping that 'X' toggle
+                   updates without disturbing off-hand wear semantics.
+    worn_armor   : int8[N_ARMOR_SLOTS] — items index per ArmorSlot (-1 = none).
+    worn_armor_ac_bonus : int8[N_ARMOR_SLOTS] — cached AC bonus contribution
+                   per worn armor slot.  Mirrors vendor/nethack/src/do_wear.c::
+                   find_ac which sums each slot's ARM_BONUS.  Updated by
+                   wear_armor / take_off_armor.  Used by combat.compute_ac.
+    worn_amulet  : items index for worn amulet (-1 = none).
+    worn_rings   : int8[2] — items index for left/right ring finger (-1 = none).
+    quiver       : items index for the auto-quiver slot (-1 = none).
+                   (pickup.c / dothrow.c: auto-select ammunition)
+    total_weight : cached sum of all carried item weights (int32, aum units).
+    user_names   : int8[MAX_INVENTORY_SLOTS, USER_NAME_LEN] — per-slot
+                   user-given names (Wave 6).  Mirrors NetHack's oname /
+                   oextra storage (vendor/nethack/src/objnam.c::doname which
+                   appends " named <name>").  A slot's name is "unset" when
+                   user_names[slot, 0] == 0.
+    """
+
+    items: Item                    # [MAX_INVENTORY_SLOTS]
+    wielded: jnp.ndarray           # scalar int8
+    off_hand: jnp.ndarray          # scalar int8
+    alternate_weapon_slot: jnp.ndarray  # scalar int8 (Wave 5)
+    worn_armor: jnp.ndarray        # [N_ARMOR_SLOTS] int8
+    worn_armor_ac_bonus: jnp.ndarray  # [N_ARMOR_SLOTS] int8 (Wave 5)
+    worn_amulet: jnp.ndarray       # scalar int8
+    worn_rings: jnp.ndarray        # [2] int8
+    quiver: jnp.ndarray            # scalar int8
+    total_weight: jnp.ndarray      # scalar int32
+    user_names: jnp.ndarray        # [MAX_INVENTORY_SLOTS, USER_NAME_LEN] int8
+
+    @classmethod
+    def empty(cls) -> "InventoryState":
+        """Return a fully-empty InventoryState for a freshly created character."""
+        return cls(
+            items=_empty_items_array(),
+            wielded=jnp.int8(-1),
+            off_hand=jnp.int8(-1),
+            alternate_weapon_slot=jnp.int8(-1),
+            worn_armor=jnp.full((N_ARMOR_SLOTS,), -1, dtype=jnp.int8),
+            worn_armor_ac_bonus=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.int8),
+            worn_amulet=jnp.int8(-1),
+            worn_rings=jnp.full((2,), -1, dtype=jnp.int8),
+            quiver=jnp.int8(-1),
+            total_weight=jnp.int32(0),
+            user_names=jnp.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=jnp.int8),
+        )
+
+    @classmethod
+    def from_items(cls, item_list: list) -> "InventoryState":
+        """Build an InventoryState pre-populated with a list of Items.
+
+        Pads with empty items to MAX_INVENTORY_SLOTS.
+        """
+        return cls(
+            items=_items_from_list(item_list),
+            wielded=jnp.int8(-1),
+            off_hand=jnp.int8(-1),
+            alternate_weapon_slot=jnp.int8(-1),
+            worn_armor=jnp.full((N_ARMOR_SLOTS,), -1, dtype=jnp.int8),
+            worn_armor_ac_bonus=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.int8),
+            worn_amulet=jnp.int8(-1),
+            worn_rings=jnp.full((2,), -1, dtype=jnp.int8),
+            quiver=jnp.int8(-1),
+            total_weight=jnp.int32(0),
+            user_names=jnp.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=jnp.int8),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Weight computation
+# ---------------------------------------------------------------------------
+
+def total_weight(items: Item) -> jnp.ndarray:
+    """Sum carried item weights across all MAX_INVENTORY_SLOTS.
+
+    JIT-compatible via lax.scan — no Python control flow over slots.
+
+    Parameters
+    ----------
+    items : batched Item of shape [MAX_INVENTORY_SLOTS]
+
+    Returns
+    -------
+    int32 total weight in aum units.
+    """
+    def _add_weight(acc, idx):
+        occupied = items.category[idx] != 0
+        w = jnp.where(occupied, items.weight[idx].astype(jnp.int32), jnp.int32(0))
+        return acc + w, None
+
+    total, _ = lax.scan(_add_weight, jnp.int32(0), jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32))
+    return total
+
+
+# ---------------------------------------------------------------------------
+# AC computation
+# ---------------------------------------------------------------------------
+
+def compute_ac(items: Item, worn_armor: jnp.ndarray,
+               worn_armor_ac_bonus: jnp.ndarray | None = None) -> jnp.ndarray:
+    """Compute player AC from currently worn armor slots.
+
+    NetHack formula (do_wear.c::find_ac): uac = 10 - sum(ARM_BONUS for each
+    worn piece).  ARM_BONUS = objects[otyp].a_ac + spe (enchantment) -
+    erosion_penalty.  Here we use item.ac_bonus + item.enchantment as the
+    bonus, ignoring erosion (Wave 4).
+
+    Wave 5: an optional ``worn_armor_ac_bonus`` array overrides the per-slot
+    contribution.  When a slot's bonus is non-zero in this array, it is used
+    in place of items[worn_armor[slot]].ac_bonus.  This allows callers to
+    inject AC bonuses directly without populating Item records (used by
+    test_armor_reduces_damage) and is the canonical cache updated by
+    wear_armor / take_off_armor.
+
+    Parameters
+    ----------
+    items      : batched Item of shape [MAX_INVENTORY_SLOTS]
+    worn_armor : int8[N_ARMOR_SLOTS] — slot index per armor slot (-1 = empty)
+    worn_armor_ac_bonus : optional int8[N_ARMOR_SLOTS] — per-slot AC bonus
+                          override (default: derive from items.ac_bonus)
+
+    Returns
+    -------
+    int32 player AC
+    """
+    use_cache = worn_armor_ac_bonus is not None
+
+    def _sum_bonus(acc, slot_idx):
+        item_idx = worn_armor[slot_idx].astype(jnp.int32)
+        equipped = item_idx >= 0
+        safe_idx = jnp.clip(item_idx, 0, MAX_INVENTORY_SLOTS - 1)
+        item_bonus = items.ac_bonus[safe_idx].astype(jnp.int32)
+        enchant = items.enchantment[safe_idx].astype(jnp.int32)
+        # Use cached per-slot bonus when provided AND non-zero; otherwise
+        # derive from the item record.  This lets callers set AC bonuses
+        # directly via worn_armor_ac_bonus.
+        if use_cache:
+            cached = worn_armor_ac_bonus[slot_idx].astype(jnp.int32)
+            chosen = jnp.where(cached != 0, cached, item_bonus)
+            bonus = chosen + jnp.where(equipped, enchant, jnp.int32(0))
+            contribution = jnp.where(
+                equipped | (cached != 0),
+                bonus,
+                jnp.int32(0),
+            )
+        else:
+            bonus = item_bonus + enchant
+            contribution = jnp.where(equipped, bonus, jnp.int32(0))
+        return acc + contribution, None
+
+    total_bonus, _ = lax.scan(_sum_bonus, jnp.int32(0), jnp.arange(N_ARMOR_SLOTS, dtype=jnp.int32))
+    return jnp.int32(BASE_AC) - total_bonus
+
+
+# ---------------------------------------------------------------------------
+# Core inventory operations
+# ---------------------------------------------------------------------------
+
+def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
+    """Pick up the top item from the ground tile at player_pos.
+
+    Reads item at ground_items[branch, level, row, col, 0] (top of stack).
+    Finds the first empty inventory slot (lowest index where category == 0).
+    Copies item into that slot; clears ground tile; updates total_weight.
+
+    Canonical: vendor/nethack/src/pickup.c::pickup,
+               vendor/nethack/src/invent.c::addinv
+
+    Parameters
+    ----------
+    state        : EnvState
+    rng          : JAX PRNG key (unused now; reserved for future weight checks)
+    ground_items : Item of shape [n_branches, max_levels, map_h, map_w, MAX_GROUND_STACK]
+    branch, level: current branch/level (Python ints for indexing)
+
+    Returns
+    -------
+    (new_state, new_ground_items)
+    """
+    row = state.player_pos[0].astype(jnp.int32)
+    col = state.player_pos[1].astype(jnp.int32)
+
+    # Ground item at top of stack (index 0)
+    ground_cat  = ground_items.category[branch, level, row, col, 0]
+    has_item    = ground_cat != 0
+
+    # Find first empty inventory slot via lax.scan
+    def _find_slot(carry, idx):
+        found, slot = carry
+        is_empty = state.inventory.items.category[idx] == 0
+        slot  = jnp.where(~found & is_empty, idx, slot)
+        found = found | is_empty
+        return (found, slot), None
+
+    (found, free_slot), _ = lax.scan(
+        _find_slot,
+        (jnp.bool_(False), jnp.int32(0)),
+        jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32),
+    )
+    can_pickup = has_item & found
+
+    # Helpers to read one scalar field from a ground tile position
+    def _g(field, default):
+        val = field[branch, level, row, col, 0]
+        return jnp.where(can_pickup, val, default)
+
+    # Write ground item into the chosen inventory slot
+    safe_slot = jnp.clip(free_slot, 0, MAX_INVENTORY_SLOTS - 1)
+    new_items = state.inventory.items
+
+    new_items = new_items.replace(
+        category   = new_items.category.at[safe_slot].set(
+            jnp.where(can_pickup, ground_items.category[branch, level, row, col, 0], new_items.category[safe_slot])
+        ),
+        type_id    = new_items.type_id.at[safe_slot].set(
+            jnp.where(can_pickup, ground_items.type_id[branch, level, row, col, 0], new_items.type_id[safe_slot])
+        ),
+        buc_status = new_items.buc_status.at[safe_slot].set(
+            jnp.where(can_pickup, ground_items.buc_status[branch, level, row, col, 0], new_items.buc_status[safe_slot])
+        ),
+        enchantment = new_items.enchantment.at[safe_slot].set(
+            jnp.where(can_pickup, ground_items.enchantment[branch, level, row, col, 0], new_items.enchantment[safe_slot])
+        ),
+        charges    = new_items.charges.at[safe_slot].set(
+            jnp.where(can_pickup, ground_items.charges[branch, level, row, col, 0], new_items.charges[safe_slot])
+        ),
+        identified = new_items.identified.at[safe_slot].set(
+            jnp.where(can_pickup, ground_items.identified[branch, level, row, col, 0], new_items.identified[safe_slot])
+        ),
+        quantity   = new_items.quantity.at[safe_slot].set(
+            jnp.where(can_pickup, ground_items.quantity[branch, level, row, col, 0], new_items.quantity[safe_slot])
+        ),
+        weight     = new_items.weight.at[safe_slot].set(
+            jnp.where(can_pickup, ground_items.weight[branch, level, row, col, 0], new_items.weight[safe_slot])
+        ),
+        ac_bonus   = new_items.ac_bonus.at[safe_slot].set(
+            jnp.where(can_pickup, ground_items.ac_bonus[branch, level, row, col, 0], new_items.ac_bonus[safe_slot])
+        ),
+        is_two_handed = new_items.is_two_handed.at[safe_slot].set(
+            jnp.where(can_pickup, ground_items.is_two_handed[branch, level, row, col, 0], new_items.is_two_handed[safe_slot])
+        ),
+    )
+
+    # Clear ground tile (set category to 0)
+    new_ground_items = ground_items.replace(
+        category=ground_items.category.at[branch, level, row, col, 0].set(
+            jnp.where(can_pickup, jnp.int8(0), ground_items.category[branch, level, row, col, 0])
+        )
+    )
+
+    new_inv = state.inventory.replace(
+        items=new_items,
+        total_weight=total_weight(new_items),
+    )
+    new_state = state.replace(inventory=new_inv)
+    return new_state, new_ground_items
+
+
+def drop(state, rng, ground_items: Item, branch: int, level: int, slot_idx: int) -> tuple:
+    """Drop the item in inventory slot ``slot_idx`` onto the ground at player_pos.
+
+    Finds the first empty position in the ground stack at player_pos,
+    copies item from inventory, zeros inventory slot, updates total_weight.
+
+    Canonical: vendor/nethack/src/invent.c::dotypeobj drop path,
+               vendor/nethack/src/do.c::drop
+
+    Returns
+    -------
+    (new_state, new_ground_items)
+    """
+    row = state.player_pos[0].astype(jnp.int32)
+    col = state.player_pos[1].astype(jnp.int32)
+    slot_idx = jnp.int32(slot_idx)
+
+    has_item = state.inventory.items.category[slot_idx] != 0
+
+    # Find first empty ground stack position
+    def _find_ground_slot(carry, stack_idx):
+        found, gslot = carry
+        is_empty = ground_items.category[branch, level, row, col, stack_idx] == 0
+        gslot = jnp.where(~found & is_empty, stack_idx, gslot)
+        found = found | is_empty
+        return (found, gslot), None
+
+    (ground_found, ground_slot), _ = lax.scan(
+        _find_ground_slot,
+        (jnp.bool_(False), jnp.int32(0)),
+        jnp.arange(MAX_GROUND_STACK, dtype=jnp.int32),
+    )
+    can_drop = has_item & ground_found
+    safe_gs = jnp.clip(ground_slot, 0, MAX_GROUND_STACK - 1)
+
+    # Copy item fields to ground
+    def _set_ground(field_ground, field_inv):
+        return field_ground.at[branch, level, row, col, safe_gs].set(
+            jnp.where(can_drop, field_inv[slot_idx], field_ground[branch, level, row, col, safe_gs])
+        )
+
+    inv = state.inventory.items
+    new_ground = ground_items.replace(
+        category    = _set_ground(ground_items.category,    inv.category),
+        type_id     = _set_ground(ground_items.type_id,     inv.type_id),
+        buc_status  = _set_ground(ground_items.buc_status,  inv.buc_status),
+        enchantment = _set_ground(ground_items.enchantment, inv.enchantment),
+        charges     = _set_ground(ground_items.charges,     inv.charges),
+        identified  = _set_ground(ground_items.identified,  inv.identified),
+        quantity    = _set_ground(ground_items.quantity,    inv.quantity),
+        weight      = _set_ground(ground_items.weight,      inv.weight),
+        ac_bonus    = _set_ground(ground_items.ac_bonus,    inv.ac_bonus),
+        is_two_handed = _set_ground(ground_items.is_two_handed, inv.is_two_handed),
+    )
+
+    # Zero the inventory slot
+    zero = make_empty_item()
+    new_items = inv.replace(
+        category   = inv.category.at[slot_idx].set(jnp.where(can_drop, jnp.int8(0), inv.category[slot_idx])),
+        type_id    = inv.type_id.at[slot_idx].set(jnp.where(can_drop, jnp.int16(0), inv.type_id[slot_idx])),
+        buc_status = inv.buc_status.at[slot_idx].set(jnp.where(can_drop, jnp.int8(0), inv.buc_status[slot_idx])),
+        enchantment= inv.enchantment.at[slot_idx].set(jnp.where(can_drop, jnp.int8(0), inv.enchantment[slot_idx])),
+        charges    = inv.charges.at[slot_idx].set(jnp.where(can_drop, jnp.int8(0), inv.charges[slot_idx])),
+        identified = inv.identified.at[slot_idx].set(jnp.where(can_drop, jnp.bool_(False), inv.identified[slot_idx])),
+        quantity   = inv.quantity.at[slot_idx].set(jnp.where(can_drop, jnp.int16(0), inv.quantity[slot_idx])),
+        weight     = inv.weight.at[slot_idx].set(jnp.where(can_drop, jnp.int32(0), inv.weight[slot_idx])),
+        ac_bonus   = inv.ac_bonus.at[slot_idx].set(jnp.where(can_drop, jnp.int8(0), inv.ac_bonus[slot_idx])),
+        is_two_handed = inv.is_two_handed.at[slot_idx].set(jnp.where(can_drop, jnp.bool_(False), inv.is_two_handed[slot_idx])),
+    )
+
+    new_inv = state.inventory.replace(
+        items=new_items,
+        total_weight=total_weight(new_items),
+    )
+    new_state = state.replace(inventory=new_inv)
+    return new_state, new_ground
+
+
+def wield(state, slot_idx: int):
+    """Wield the item in slot_idx as the primary weapon.
+
+    If the item is two-handed and a shield is equipped (worn_armor[SHIELD]),
+    the shield is unequipped (worn_armor[SHIELD] set to -1).
+
+    Canonical: vendor/nethack/src/wield.c::wieldwep
+
+    Parameters
+    ----------
+    state    : EnvState
+    slot_idx : inventory slot index to wield
+
+    Returns
+    -------
+    new_state
+    """
+    slot_idx = jnp.int8(slot_idx)
+    has_item = state.inventory.items.category[slot_idx.astype(jnp.int32)] != 0
+
+    new_wielded = jnp.where(has_item, slot_idx, state.inventory.wielded)
+
+    # Two-handed: unequip shield if present
+    is_two_handed = state.inventory.items.is_two_handed[slot_idx.astype(jnp.int32)]
+    shield_slot   = jnp.int32(ArmorSlot.SHIELD)
+    new_worn_armor = jnp.where(
+        has_item & is_two_handed,
+        state.inventory.worn_armor.at[shield_slot].set(jnp.int8(-1)),
+        state.inventory.worn_armor,
+    )
+
+    new_inv = state.inventory.replace(
+        wielded=new_wielded,
+        worn_armor=new_worn_armor,
+    )
+    return state.replace(inventory=new_inv)
+
+
+def wear_armor(state, slot_idx: int, armor_slot: ArmorSlot):
+    """Wear the item in slot_idx in the given armor_slot.
+
+    Updates player_ac via AC computation and caches the worn item's
+    ac_bonus into inventory.worn_armor_ac_bonus[armor_slot] (Wave 5).
+
+    Canonical: vendor/nethack/src/do_wear.c::dowearx
+
+    Returns
+    -------
+    new_state with updated inventory.worn_armor, worn_armor_ac_bonus,
+    and player_ac.
+    """
+    slot_idx   = jnp.int8(slot_idx)
+    slot_i32   = slot_idx.astype(jnp.int32)
+    armor_i32  = jnp.int32(int(armor_slot))
+
+    has_item   = state.inventory.items.category[slot_i32] != 0
+    is_armor   = state.inventory.items.category[slot_i32] == jnp.int8(ItemCategory.ARMOR)
+    can_wear   = has_item & is_armor
+
+    new_worn_armor = jnp.where(
+        can_wear,
+        state.inventory.worn_armor.at[armor_i32].set(slot_idx),
+        state.inventory.worn_armor,
+    )
+    # Cache per-slot AC bonus (vendor/nethack/src/do_wear.c::find_ac sums
+    # each ARM_BONUS).  When unequipped (-1), bonus is 0.
+    item_bonus = state.inventory.items.ac_bonus[slot_i32].astype(jnp.int8)
+    new_worn_ac_bonus = jnp.where(
+        can_wear,
+        state.inventory.worn_armor_ac_bonus.at[armor_i32].set(item_bonus),
+        state.inventory.worn_armor_ac_bonus,
+    )
+    new_ac = compute_ac(state.inventory.items, new_worn_armor)
+
+    new_inv = state.inventory.replace(
+        worn_armor=new_worn_armor,
+        worn_armor_ac_bonus=new_worn_ac_bonus,
+    )
+    return state.replace(inventory=new_inv, player_ac=new_ac)
+
+
+def take_off_armor(state, armor_slot: ArmorSlot):
+    """Remove the armor in armor_slot.
+
+    Updates player_ac and zeros the cached AC bonus slot.
+
+    Canonical: vendor/nethack/src/do_wear.c::dotakeoff
+
+    Returns
+    -------
+    new_state with updated inventory.worn_armor, worn_armor_ac_bonus,
+    and player_ac.
+    """
+    armor_i32 = jnp.int32(int(armor_slot))
+    new_worn_armor = state.inventory.worn_armor.at[armor_i32].set(jnp.int8(-1))
+    new_worn_ac_bonus = state.inventory.worn_armor_ac_bonus.at[armor_i32].set(jnp.int8(0))
+    new_ac = compute_ac(state.inventory.items, new_worn_armor)
+
+    new_inv = state.inventory.replace(
+        worn_armor=new_worn_armor,
+        worn_armor_ac_bonus=new_worn_ac_bonus,
+    )
+    return state.replace(inventory=new_inv, player_ac=new_ac)
+
+
+def put_on_ring(state, slot: int, ring_idx: int):
+    """Put on the ring in inventory slot onto finger ring_idx (0=left, 1=right).
+
+    No-op stub (do_wear.c: doputon).
+    Wave 4: grant ring intrinsic via worn.c:setworn logic.
+    """
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Action handlers (top-level dispatch targets)
+# ---------------------------------------------------------------------------
+
+def handle_pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
+    """Pickup action handler — pickup from current tile.
+
+    Returns (new_state, new_ground_items).
+    """
+    return pickup(state, rng, ground_items, branch, level)
+
+
+def handle_drop(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
+    """Drop action handler — drop first occupied inventory slot.
+
+    Wave 4 will add item selection UI.
+
+    Returns (new_state, new_ground_items).
+    """
+    # Find first occupied slot
+    def _find_occupied(carry, idx):
+        found, slot = carry
+        occupied = state.inventory.items.category[idx] != 0
+        slot  = jnp.where(~found & occupied, idx, slot)
+        found = found | occupied
+        return (found, slot), None
+
+    (_, first_slot), _ = lax.scan(
+        _find_occupied, (jnp.bool_(False), jnp.int32(0)), jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32)
+    )
+    return drop(state, rng, ground_items, branch, level, first_slot)
+
+
+def handle_wield(state, rng):
+    """Wield action handler — wield first weapon in inventory."""
+    def _find_weapon(carry, idx):
+        found, slot = carry
+        is_weapon = state.inventory.items.category[idx] == jnp.int8(ItemCategory.WEAPON)
+        slot  = jnp.where(~found & is_weapon, idx, slot)
+        found = found | is_weapon
+        return (found, slot), None
+
+    (found_weapon, first_weapon), _ = lax.scan(
+        _find_weapon, (jnp.bool_(False), jnp.int32(0)), jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32)
+    )
+    new_state = wield(state, first_weapon)
+    # Conduct: vendor/nethack/src/wield.c::wieldwep — WEAPONLESS broken when a
+    # non-bare-hand weapon is wielded (insight.c ~2137, u.uconduct.weaphit).
+    from Nethax.nethax.subsystems.conduct import Conduct, mark_violated_if
+    return mark_violated_if(new_state, int(Conduct.WEAPONLESS), found_weapon)
+
+
+def handle_wear(state, rng):
+    """Wear action handler — wear first armor in inventory (BODY slot)."""
+    def _find_armor(carry, idx):
+        found, slot = carry
+        is_armor = state.inventory.items.category[idx] == jnp.int8(ItemCategory.ARMOR)
+        slot  = jnp.where(~found & is_armor, idx, slot)
+        found = found | is_armor
+        return (found, slot), None
+
+    (_, first_armor), _ = lax.scan(
+        _find_armor, (jnp.bool_(False), jnp.int32(0)), jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32)
+    )
+    return wear_armor(state, first_armor, ArmorSlot.BODY)
+
+
+def step(state, rng):
+    """Per-turn inventory upkeep (ring/amulet tick effects, etc.).
+
+    No-op for Wave 3. Wave 4: tick worn ring/amulet duration effects.
+    """
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Naming (Wave 6) — vendor/nethack/src/do_name.c::do_oname
+# ---------------------------------------------------------------------------
+
+def handle_name(state, rng, slot_idx, name_bytes) -> "object":
+    """Assign a user-given name to the inventory slot ``slot_idx``.
+
+    Mirrors NetHack's ``do_oname`` (do_name.c): writes the chosen name into
+    the slot's onamebuf so subsequent ``doname`` calls emit
+    ``" named <name>"`` after the canonical item name.
+
+    Parameters
+    ----------
+    state      : EnvState (must contain ``inventory`` field).
+    rng        : JAX PRNG key (unused; kept for handler-signature symmetry).
+    slot_idx   : int / jnp.int32 — inventory slot to name.
+    name_bytes : sequence of length USER_NAME_LEN (Python list, bytes, or
+                 ndarray).  Zero-terminated; first 0 byte marks the end.
+
+    Returns
+    -------
+    new_state with ``inventory.user_names[slot_idx]`` updated.
+    """
+    slot_i32 = jnp.int32(slot_idx)
+    safe_slot = jnp.clip(slot_i32, 0, MAX_INVENTORY_SLOTS - 1)
+
+    # Normalize name_bytes to a length-USER_NAME_LEN int8 array.
+    if isinstance(name_bytes, (bytes, bytearray)):
+        padded = bytes(name_bytes)[:USER_NAME_LEN]
+        padded = padded + b"\x00" * (USER_NAME_LEN - len(padded))
+        name_row = jnp.array(list(padded), dtype=jnp.int8)
+    elif isinstance(name_bytes, str):
+        b = name_bytes.encode("ascii")[:USER_NAME_LEN]
+        b = b + b"\x00" * (USER_NAME_LEN - len(b))
+        name_row = jnp.array(list(b), dtype=jnp.int8)
+    else:
+        name_row = jnp.asarray(name_bytes, dtype=jnp.int8)
+        # Ensure exact length
+        cur_len = name_row.shape[0] if hasattr(name_row, "shape") else len(name_row)
+        if cur_len < USER_NAME_LEN:
+            pad = jnp.zeros((USER_NAME_LEN - cur_len,), dtype=jnp.int8)
+            name_row = jnp.concatenate([name_row, pad], axis=0)
+        elif cur_len > USER_NAME_LEN:
+            name_row = name_row[:USER_NAME_LEN]
+
+    new_user_names = state.inventory.user_names.at[safe_slot].set(name_row)
+    new_inv = state.inventory.replace(user_names=new_user_names)
+    return state.replace(inventory=new_inv)
