@@ -1145,11 +1145,108 @@ def _build_status_row1(env_state, blstats) -> jnp.ndarray:
     return _pad_to(row, 80)
 
 
-def _build_status_row2(blstats) -> jnp.ndarray:
+# ---------------------------------------------------------------------------
+# Status-line condition keywords  (vendor botl.c::do_statusline2 ~line 220-249)
+#
+# Vendor appends a space-separated tail of keywords for every active player
+# status: " Conf", " Stun", " Hallu", " Blind", " FoodPois", " Ill", " Slime",
+# " Strngl", " Burdened", " Stressed", " Strained", " Overtaxed", " Overloaded".
+#
+# We pack each keyword as a fixed-width uint8 chunk, then mask each chunk to
+# spaces if the corresponding flag is inactive, then concatenate.  Pad to 80.
+# ---------------------------------------------------------------------------
+
+def _kw_bytes(s: str, width: int) -> jnp.ndarray:
+    arr = list(s.encode("ascii")) + [ord(' ')] * (width - len(s))
+    return jnp.array(arr[:width], dtype=jnp.uint8)
+
+
+# Keywords with leading space; widths chosen to be just long enough.
+_KW_CONF      = _kw_bytes(" Conf",       5)
+_KW_STUN      = _kw_bytes(" Stun",       5)
+_KW_HALLU     = _kw_bytes(" Hallu",      6)
+_KW_BLIND     = _kw_bytes(" Blind",      6)
+_KW_FOODPOIS  = _kw_bytes(" FoodPois",   9)
+_KW_ILL       = _kw_bytes(" Ill",        4)
+_KW_SLIME     = _kw_bytes(" Slime",      6)
+_KW_STRNGL    = _kw_bytes(" Strngl",     7)
+_KW_BURDENED  = _kw_bytes(" Burdened",   9)
+_KW_STRESSED  = _kw_bytes(" Stressed",   9)
+_KW_STRAINED  = _kw_bytes(" Strained",   9)
+_KW_OVERTAX   = _kw_bytes(" Overtaxed", 10)
+_KW_OVERLOAD  = _kw_bytes(" Overloaded",11)
+
+
+def build_status_conditions(env_state) -> jnp.ndarray:
+    """Vendor-format status-condition keyword tail as a 32-byte uint8 vector.
+
+    Reads ``env_state.status.timed_statuses`` (TimedStatus enum indices) and
+    ``env_state.status.encumbrance`` (Encumbrance enum value), masks each
+    keyword's bytes to spaces when inactive, concatenates and pads to 32
+    bytes.  Designed to be appended to the row-23 tail in build_tty.
+
+    Citation: vendor/nethack/src/botl.c::do_statusline2 (lines ~220-249)
+              where each ``Strcpy(nb = eos(nb), " <KW>")`` is gated by the
+              corresponding ``HConfusion``, ``Blind``, ``Stunned`` ... flag.
+    """
+    # TimedStatus indices (must match status_effects.TimedStatus enum order).
+    ts = env_state.status.timed_statuses                         # int32[N]
+    is_stun       = ts[0]  > 0   # STUNNED
+    is_conf       = ts[1]  > 0   # CONFUSION
+    is_blind      = ts[2]  > 0   # BLIND
+    is_sick       = ts[4]  > 0   # SICK
+    is_strngl     = ts[6]  > 0   # STRANGLED
+    is_slime      = ts[9]  > 0   # SLIMED
+    is_hallu      = ts[10] > 0   # HALLUCINATION
+
+    # SICK splits into FoodPois vs Ill based on status.sick_kind.
+    sick_kind = jnp.int32(env_state.status.sick_kind)
+    is_foodpois = is_sick & (sick_kind == 1)
+    is_ill      = is_sick & (sick_kind == 2)
+
+    # Encumbrance (Encumbrance enum: 0=UN, 1=BURDENED, 2=STRESSED, 3=STRAINED,
+    # 4=OVERTAXED, 5=OVERLOADED).  See status_effects.Encumbrance.
+    enc = jnp.int32(env_state.status.encumbrance)
+    is_burdened  = enc == 1
+    is_stressed  = enc == 2
+    is_strained  = enc == 3
+    is_overtaxed = enc == 4
+    is_overload  = enc == 5
+
+    def _mask(kw: jnp.ndarray, active: jnp.ndarray) -> jnp.ndarray:
+        """Return kw bytes if active else all spaces, same length as kw."""
+        spaces = jnp.full(kw.shape, jnp.uint8(ord(' ')), dtype=jnp.uint8)
+        return jnp.where(active, kw, spaces)
+
+    chunks = [
+        _mask(_KW_CONF,     is_conf),
+        _mask(_KW_STUN,     is_stun),
+        _mask(_KW_HALLU,    is_hallu),
+        _mask(_KW_BLIND,    is_blind),
+        _mask(_KW_FOODPOIS, is_foodpois),
+        _mask(_KW_ILL,      is_ill),
+        _mask(_KW_SLIME,    is_slime),
+        _mask(_KW_STRNGL,   is_strngl),
+        _mask(_KW_BURDENED, is_burdened),
+        _mask(_KW_STRESSED, is_stressed),
+        _mask(_KW_STRAINED, is_strained),
+        _mask(_KW_OVERTAX,  is_overtaxed),
+        _mask(_KW_OVERLOAD, is_overload),
+    ]
+    return jnp.concatenate(chunks)
+
+
+def _build_status_row2(env_state, blstats) -> jnp.ndarray:
     """Render row 23 of tty_chars — vendor do_statusline2 format.
 
-    Format: "Dlvl:N $:M HP:H(Hmax) Pw:P(Pmax) AC:A Xp:X T:T"
-    Citation: vendor/nethack/src/botl.c::do_statusline2 (lines 100-249).
+    Format: "Dlvl:N $:M HP:H(Hmax) Pw:P(Pmax) AC:A Xp:X T:T <conditions>"
+
+    The ``<conditions>`` suffix is the keyword tail produced by
+    ``build_status_conditions`` (e.g., " Conf Blind Burdened").
+
+    Citation: vendor/nethack/src/botl.c::do_statusline2 (lines 100-249)
+    where ``Strcpy(nb = eos(nb), " Conf")`` etc. append each active
+    condition keyword to the status line tail.
     """
     ac = blstats[BL_AC]
     neg = ac < 0
@@ -1176,6 +1273,7 @@ def _build_status_row2(blstats) -> jnp.ndarray:
         _uint_to_bytes(blstats[BL_XP], 2),
         _S_SP_T,
         _uint_to_bytes(blstats[BL_TIME], 5),
+        build_status_conditions(env_state),
     ]
     row = jnp.concatenate(parts)
     return _pad_to(row, 80)
@@ -1425,7 +1523,7 @@ def build_tty(env_state) -> dict[str, jnp.ndarray]:
     # _build_status_row1 / _build_status_row2 for vendor citations.
     blstats = build_blstats(env_state)
     row22 = _build_status_row1(env_state, blstats)
-    row23 = _build_status_row2(blstats)
+    row23 = _build_status_row2(env_state, blstats)
     tty = tty.at[22, :].set(row22)
     tty = tty.at[23, :].set(row23)
 
