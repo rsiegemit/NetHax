@@ -15,13 +15,17 @@ Controls:
     r          read
     d          drop
     z          zap
-    i          toggle inventory pane
+    i          toggle grouped inventory pane
+    ;          look here (show what's at feet)
+    +          spell menu
+    \\          discoveries menu
     Q          quit
     ESC        quit
 """
 
 from __future__ import annotations
 
+import random
 import sys
 
 try:
@@ -35,8 +39,164 @@ import jax.numpy as jnp
 
 from Nethax.nethax.env import NethaxEnv
 from Nethax.nethax.constants.actions import ACTIONS, Action
+from Nethax.nethax.constants.roles import Role
+from Nethax.nethax.constants.races import Race
 from Nethax.tiles import render_pixels, GLYPH2TILE, TILE_SIZE
 from Nethax.tiles.renderer import load_tiles
+
+
+# ---------------------------------------------------------------------------
+# Class selection — vendor parity with role.c::role_init and
+# wintty.c::tty_player_selection (sequential prompts).
+# ---------------------------------------------------------------------------
+
+# 13 roles in canonical vendor order (role.c::roles[], lines 27-586).
+_ROLE_NAMES = [
+    "Archeologist", "Barbarian", "Caveman", "Healer", "Knight",
+    "Monk", "Priest", "Ranger", "Rogue", "Samurai", "Tourist",
+    "Valkyrie", "Wizard",
+]
+# Maps display index (1-based) -> Role enum value
+_ROLE_MAP = {i + 1: Role(i) for i in range(len(_ROLE_NAMES))}
+
+# 5 races (role.c::races[], lines 617-726).
+_RACE_NAMES = ["Human", "Elf", "Dwarf", "Gnome", "Orc"]
+_RACE_MAP = {i + 1: Race(i) for i in range(len(_RACE_NAMES))}
+
+# Alignments (role.c::aligns[]).
+_ALIGN_OPTS = ["Lawful", "Neutral", "Chaotic"]
+# env.reset alignment: 0=Lawful, 1=Neutral, 2=Chaotic
+_ALIGN_MAP = {1: 0, 2: 1, 3: 2}
+
+_GENDER_OPTS = ["Male", "Female"]
+
+# Defaults used when bailing (Q/ESC) or --no-select.
+_DEFAULT_ROLE      = Role.VALKYRIE
+_DEFAULT_RACE      = Race.HUMAN
+_DEFAULT_ALIGNMENT = 0   # Lawful
+_DEFAULT_GENDER    = "Female"
+
+
+def _draw_selection_menu(screen, font, font_large, title: str, options: list[str]) -> None:
+    """Render a centered selection menu onto screen.
+
+    Vendor wintty.c::tty_player_selection draws a sequential prompt with
+    numbered choices.  We replicate that as a simple full-screen overlay.
+    """
+    screen.fill((0, 0, 0))
+    title_surf = font_large.render(title, True, (255, 255, 100))
+    tw = title_surf.get_width()
+    screen.blit(title_surf, ((screen.get_width() - tw) // 2, 40))
+
+    start_y = 100
+    for i, opt in enumerate(options, start=1):
+        line = f"{i}) {opt}"
+        surf = font.render(line, True, (200, 200, 230))
+        screen.blit(surf, (80, start_y + (i - 1) * 22))
+
+    hint = font.render("Enter = random    Q/ESC = defaults", True, (120, 120, 120))
+    screen.blit(hint, (80, start_y + len(options) * 22 + 20))
+    pygame.display.flip()
+
+
+def run_selection_screen(screen, font, font_large, *, key_iter=None) -> tuple:
+    """Run the sequential class-selection prompts.
+
+    Vendor reference: wintty.c::tty_player_selection (sequential prompts
+    for role, race, alignment, gender) and role.c::role_init (default
+    assignment).
+
+    Parameters
+    ----------
+    key_iter : optional iterator yielding (key, unicode) tuples.  When
+        provided, the screen reads keys from `key_iter` instead of
+        pygame.event.get().  Used by headless tests to bypass the SDL
+        dummy-driver event queue (which doesn't reliably surface
+        ``event.post`` traffic to ``event.get``).
+
+    Returns (role, race, alignment, gender) where:
+      role      : Role enum
+      race      : Race enum
+      alignment : int  0=Lawful 1=Neutral 2=Chaotic
+      gender    : str  "Male" | "Female"
+    """
+    prompts = [
+        ("Choose your Role", _ROLE_NAMES, _ROLE_MAP),
+        ("Choose your Race", _RACE_NAMES, _RACE_MAP),
+        ("Choose your Alignment", _ALIGN_OPTS, _ALIGN_MAP),
+        ("Choose your Gender", _GENDER_OPTS, {1: "Male", 2: "Female"}),
+    ]
+
+    results = []
+    bail = False
+
+    for title, options, mapping in prompts:
+        if bail:
+            # Fill remaining with None (defaults applied below).
+            results.append(None)
+            continue
+
+        _draw_selection_menu(screen, font, font_large, title, options)
+
+        chosen = None
+        # Test path: read directly from the injected key iterator.
+        if key_iter is not None:
+            try:
+                key, uni = next(key_iter)
+            except StopIteration:
+                key, uni = (pygame.K_RETURN, "\r")
+            if key == pygame.K_ESCAPE or key == pygame.K_q:
+                bail = True
+            elif key == pygame.K_RETURN:
+                chosen = random.choice(list(mapping.values()))
+            elif uni and uni.isdigit():
+                n = int(uni)
+                if n in mapping:
+                    chosen = mapping[n]
+            results.append(chosen)
+            continue
+
+        # Live path: busy-poll pygame's event queue.
+        waiting = True
+        max_idle_iters = 60 * 30   # ~30s safety bound for headless runs
+        idle = 0
+        while waiting and idle < max_idle_iters:
+            pygame.event.pump()
+            had_event = False
+            for event in pygame.event.get():
+                had_event = True
+                if event.type == pygame.QUIT:
+                    bail = True
+                    waiting = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE,) or (
+                        event.key == pygame.K_q
+                    ):
+                        bail = True
+                        waiting = False
+                    elif event.key == pygame.K_RETURN:
+                        chosen = random.choice(list(mapping.values()))
+                        waiting = False
+                    elif event.unicode and event.unicode.isdigit():
+                        n = int(event.unicode)
+                        if n in mapping:
+                            chosen = mapping[n]
+                            waiting = False
+            if not had_event:
+                idle += 1
+                pygame.time.wait(16)
+            else:
+                idle = 0
+
+        results.append(chosen)
+
+    # Apply defaults for any None entries (bail path).
+    role = results[0] if results[0] is not None else _DEFAULT_ROLE
+    race = results[1] if results[1] is not None else _DEFAULT_RACE
+    alignment = results[2] if results[2] is not None else _DEFAULT_ALIGNMENT
+    gender = results[3] if results[3] is not None else _DEFAULT_GENDER
+
+    return role, race, alignment, gender
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +458,15 @@ def _draw_status_panel(screen, font, font_large, obs, last_action_name, y_offset
     screen.blit(surf2, (8, y_offset + 48))
 
 
-def _draw_inventory_pane(screen, font, obs, x_offset):
-    """Draw an inventory overlay panel on the right."""
+def _draw_inventory_pane(screen, font, state, x_offset):
+    """Draw a grouped inventory overlay panel on the right.
+
+    Uses build_grouped_inv_text (vendor invent.c::display_inventory parity)
+    instead of the flat inv_strs approach.
+    Vendor citation: inv_strs.py::build_grouped_inv_text.
+    """
+    from Nethax.nethax.obs.inv_strs import build_grouped_inv_text
+
     pane_rect = pygame.Rect(x_offset, 0, INVENTORY_PANEL_W, TILE_PANE_H)
     overlay = pygame.Surface((INVENTORY_PANEL_W, TILE_PANE_H), pygame.SRCALPHA)
     overlay.fill((10, 10, 40, 210))
@@ -308,30 +475,70 @@ def _draw_inventory_pane(screen, font, obs, x_offset):
     title = font.render("INVENTORY", True, (255, 255, 100))
     screen.blit(title, (x_offset + 8, 6))
 
-    inv_letters = np.asarray(obs["inv_letters"])   # (55,)
-    inv_strs    = np.asarray(obs["inv_strs"])       # (55, 80)
+    lines = build_grouped_inv_text(state)
 
     y = 28
-    shown = 0
-    for i in range(55):
-        letter = int(inv_letters[i])
-        if letter == 0:
-            continue
-        item_bytes = inv_strs[i]
-        item_text = bytes(item_bytes[item_bytes != 0]).decode("ascii", errors="replace")
-        if not item_text:
-            continue
-        line = f"{chr(letter)}) {item_text[:38]}"
-        surf = font.render(line, True, (200, 200, 230))
+    for line in lines:
+        # Class headers rendered in a different colour.
+        is_header = not line.startswith((" ", "\t")) and not (" - " in line)
+        color = (255, 220, 80) if is_header else (200, 200, 230)
+        surf = font.render(line[:46], True, color)
         screen.blit(surf, (x_offset + 8, y))
         y += 18
-        shown += 1
         if y + 18 > TILE_PANE_H:
             break
 
-    if shown == 0:
+    if not lines:
         empty_surf = font.render("(empty)", True, (120, 120, 120))
         screen.blit(empty_surf, (x_offset + 8, 28))
+
+
+def _draw_overlay_text(screen, font, lines: list[str], title: str = "") -> None:
+    """Draw a full-screen text overlay for look/spell/discovery menus."""
+    overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+    overlay.fill((0, 0, 20, 220))
+    screen.blit(overlay, (0, 0))
+
+    y = 20
+    if title:
+        t = font.render(title, True, (255, 255, 100))
+        screen.blit(t, (20, y))
+        y += 24
+
+    for line in lines:
+        surf = font.render(line[:100], True, (200, 200, 230))
+        screen.blit(surf, (20, y))
+        y += 18
+        if y + 18 > WINDOW_H - 30:
+            break
+
+    hint = font.render("[any key to close]", True, (100, 100, 100))
+    screen.blit(hint, (20, WINDOW_H - 24))
+    pygame.display.flip()
+
+
+def _wait_for_keypress() -> None:
+    """Block until any key is pressed (for overlay dismiss)."""
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return
+            if event.type == pygame.KEYDOWN:
+                return
+
+
+def _draw_tombstone_screen(screen, font, font_large, lines: list[str]) -> None:
+    """Render the RIP tombstone as a post-game screen and wait for keypress."""
+    screen.fill((0, 0, 0))
+    y = 40
+    for line in lines:
+        surf = font.render(line, True, (180, 180, 180))
+        screen.blit(surf, (40, y))
+        y += 18
+    hint = font_large.render("Press any key to restart", True, (255, 255, 100))
+    screen.blit(hint, (40, y + 20))
+    pygame.display.flip()
+    _wait_for_keypress()
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +549,9 @@ def main():
     if pygame is None:
         print("pygame is not installed.  Run: pip install pygame", file=sys.stderr)
         sys.exit(1)
+
+    # --no-select flag: skip class-selection prompts and use defaults.
+    no_select = "--no-select" in sys.argv
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
@@ -360,13 +570,26 @@ def main():
     # Build reverse lookup: action value -> name string.
     action_names = {int(a): a.name for a in ACTIONS}
 
+    # Class selection — vendor wintty.c::tty_player_selection.
+    # Vendor role.c::role_init provides defaults when skipped.
+    if no_select:
+        chosen_role      = _DEFAULT_ROLE
+        chosen_race      = _DEFAULT_RACE
+        chosen_alignment = _DEFAULT_ALIGNMENT
+        chosen_gender    = _DEFAULT_GENDER
+    else:
+        chosen_role, chosen_race, chosen_alignment, chosen_gender = (
+            run_selection_screen(screen, font, font_large)
+        )
+
     # Initialise env.
     env = NethaxEnv()
     rng = jax.random.PRNGKey(0)
     rng, init_rng = jax.random.split(rng)
 
     print("Compiling nethax environment (first reset) — may take ~30-60s …")
-    state, obs = env.reset(init_rng)
+    state, obs = env.reset(init_rng, role=chosen_role, race=chosen_race,
+                           alignment=chosen_alignment)
     print("Ready.")
 
     # Seed-derived player name (vendor parity for config.c::askname fallback).
@@ -391,9 +614,38 @@ def main():
                     running = False
                     continue
 
-                # Inventory toggle
+                # Inventory toggle — grouped (vendor invent.c::display_inventory).
                 if event.key == pygame.K_i:
                     show_inventory = not show_inventory
+                    continue
+
+                # ';' — look here (vendor invent.c::look_here).
+                if event.unicode == ";":
+                    from Nethax.nethax.obs.look import build_look_here_text
+                    text = build_look_here_text(state)
+                    _draw_overlay_text(screen, font, text.splitlines(), title=";  Look here")
+                    _wait_for_keypress()
+                    continue
+
+                # '+' — spell menu (vendor spell.c::dospellmenu).
+                if event.unicode == "+":
+                    from Nethax.nethax.obs.spell_menu import build_spell_menu_text
+                    lines = build_spell_menu_text(state)
+                    _draw_overlay_text(screen, font, lines, title="+  Spells")
+                    _wait_for_keypress()
+                    continue
+
+                # '\' — discoveries (vendor o_init.c::dodiscovered).
+                if event.unicode == "\\":
+                    from Nethax.nethax.obs.discovery import build_discovery_text
+                    rows = build_discovery_text(state)
+                    import numpy as _np
+                    disc_lines = [
+                        bytes(_np.asarray(row).tolist()).rstrip(b"\x00").decode("ascii", errors="replace")
+                        for row in rows
+                    ]
+                    _draw_overlay_text(screen, font, disc_lines, title="\\  Discoveries")
+                    _wait_for_keypress()
                     continue
 
                 # Action lookup: unicode map first, then key map.
@@ -411,10 +663,33 @@ def main():
                 state, jnp.int32(action_val), step_rng
             )
             if done:
-                # Auto-reset on death/ascension.
+                # Game over — show tombstone then reset.
+                # Vendor rip.c::genl_outrip.
+                from Nethax.nethax.obs.tombstone import build_tombstone
+                msg_bytes = np.asarray(obs["message"])
+                killer = bytes(msg_bytes[msg_bytes != 0]).decode("ascii", errors="replace") or "unknown cause"
+                tombstone_lines = build_tombstone(
+                    state,
+                    name=player_name,
+                    killer=killer,
+                )
+                _draw_tombstone_screen(screen, font, font_large, tombstone_lines)
+
+                # New game: run selection again (or use no-select defaults).
+                if no_select:
+                    chosen_role      = _DEFAULT_ROLE
+                    chosen_race      = _DEFAULT_RACE
+                    chosen_alignment = _DEFAULT_ALIGNMENT
+                else:
+                    chosen_role, chosen_race, chosen_alignment, _ = (
+                        run_selection_screen(screen, font, font_large)
+                    )
+
                 rng, reset_rng = jax.random.split(rng)
-                state, obs = env.reset(reset_rng)
+                state, obs = env.reset(reset_rng, role=chosen_role,
+                                       race=chosen_race, alignment=chosen_alignment)
                 last_action_name = "---"
+                show_inventory = False
 
         # ---- render ----
         # Tile pane
@@ -432,10 +707,10 @@ def main():
             role_idx=role_idx, player_name=player_name,
         )
 
-        # Inventory overlay (toggled with 'i')
+        # Inventory overlay (toggled with 'i') — grouped by class.
         if show_inventory:
             inv_x = max(0, WINDOW_W - INVENTORY_PANEL_W)
-            _draw_inventory_pane(screen, font, obs, inv_x)
+            _draw_inventory_pane(screen, font, state, inv_x)
 
         pygame.display.flip()
         clock.tick(FPS)

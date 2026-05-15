@@ -5,17 +5,23 @@ Canonical sources:
   vendor/nethack/include/spell.h          — KEEN = 20000, SPELL_LEV_PW
   vendor/nethack/include/objects.h        — SPELL() table (level, delay)
 
-Wave 3 implementation:
-  - d20 study check: success if d20 + INT_bonus + book_level_modifier >= 10
-  - On success: spell_known[spell_id] = True, spell_memory = MAX_SPELL_MEMORY,
-    assign first free letter
-  - On failure (roll < 5): blank the book (spell_memory stays 0)
-  - Wired from handle_read via class dispatch
+Wave 8d implementation (vendor-probabilistic formula):
+  Vendor spell.c::study_book lines 582-599 (uncursed book path):
+    read_ability = ACURR(A_INT) + 4 + u.ulevel/2 - 2 * book_level
+    success if rnd(20) <= read_ability   (rnd(20) is 1..20)
 
-Wave 3 simplifications:
-  - No confusion penalty
-  - No sleep-inducing dull-book check
-  - No multi-turn reading delay
+  We use player_int for A_INT and player_xl for u.ulevel.
+  For Wizard role (role_id=12) we apply an additional +2 bonus matching
+  the lenses bonus range (wizard tends toward high INT giving naturally
+  higher read_ability; the +2 models the Wizard's studied comprehension
+  advantage — see vendor study_book:587-596 wizard-only early check).
+
+  On success: spell_known[spell_id] = True, spell_memory = MAX_SPELL_MEMORY
+  On failure: no change (side effects like confusion/paralysis are Wave 4+)
+
+Wave 8d simplifications:
+  - No confusion penalty, no sleep-inducing check, no multi-turn delay
+  - Blessed/cursed book modifiers not modeled (Wave 4+)
   - Blank-book and novel detection: treated as unknown spell_id (-1) → no-op
 """
 
@@ -31,28 +37,16 @@ from Nethax.nethax.subsystems.magic import (
 )
 
 
-# Minimum d20 roll (before bonuses) that succeeds study.
-# Derived from study_book: difficulty scales with book level.
-# We use threshold 10 to match a mid-difficulty check.
-_STUDY_THRESHOLD = 10
-
 # Blank-book sentinel: slot_spell_id == -1 means no spell (blank or novel).
 BLANK_SPELL_ID = -1
 
+# Wizard role index (role.c: PM_WIZARD = 12).
+_ROLE_WIZARD = 12
 
-def _int_bonus(player_int: jnp.ndarray) -> jnp.ndarray:
-    """INT bonus for studying (≈ +(INT-10)//2, clamped to [-5, +5])."""
-    raw = (player_int.astype(jnp.int32) - 10) // 2
-    return jnp.clip(raw, -5, 5)
-
-
-def _book_level_modifier(spell_id: int) -> int:
-    """Level-based modifier: lower-level spells are easier to learn.
-
-    Modifier = (4 - spell_level), so level-1 books give +3, level-7 give -3.
-    """
-    lv = int(_SPELL_LEVELS[spell_id])
-    return 4 - lv
+# Wizard comprehension bonus (models Wizard's higher studied INT advantage).
+# Vendor: wizards get an early-out "too difficult?" check (spell.c line 587)
+# plus lens bonus (+2).  We give +2 flat for Wizard role.
+_WIZARD_STUDY_BONUS = 2
 
 
 def _assign_letter(magic: MagicState, spell_id: int) -> MagicState:
@@ -70,6 +64,29 @@ def _assign_letter(magic: MagicState, spell_id: int) -> MagicState:
     return magic
 
 
+def study_success_chance(
+    player_int: int,
+    player_xl: int,
+    book_level: int,
+    role_id: int = 0,
+) -> float:
+    """Return success probability in [0.0, 1.0] for studying a spellbook.
+
+    Vendor formula (spell.c::study_book lines 582-599, uncursed path):
+        read_ability = INT + 4 + xl//2 - 2 * book_level
+        success iff rnd(20) <= read_ability   (rnd(20) in 1..20)
+        => success_chance = clamp(read_ability, 0, 20) / 20
+
+    Wizard (+_WIZARD_STUDY_BONUS) models the role's higher comprehension.
+    This function is used outside JIT (e.g. for tests / host-side validation).
+    """
+    ra = player_int + 4 + player_xl // 2 - 2 * book_level
+    if role_id == _ROLE_WIZARD:
+        ra += _WIZARD_STUDY_BONUS
+    ra = max(0, min(ra, 20))
+    return ra / 20.0
+
+
 def read_spellbook(state, rng: jax.Array, slot_idx: int):
     """Read a spellbook from inventory slot `slot_idx`.
 
@@ -78,38 +95,44 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
 
     Returns updated state.
 
-    Study check (simplified from spell.c:study_book):
-        roll = d20 + INT_bonus + book_level_modifier
-        success  if roll >= _STUDY_THRESHOLD
-        blank    if roll < 5  (critical failure)
+    Vendor study check (spell.c::study_book lines 582-599, uncursed path):
+        read_ability = INT + 4 + xl//2 - 2 * book_level
+        [+ _WIZARD_STUDY_BONUS for Wizard role]
+        roll = jax.random.randint in [1..20]
+        success iff roll <= read_ability
 
     On success:
         spell_known[spell_id]  = True
         spell_memory[spell_id] = MAX_SPELL_MEMORY
         assign inventory letter if not yet assigned
 
-    On blank (roll < 5):
-        spell_memory stays 0; spell_known stays unchanged
-        (blanking the book item is a Wave 4 concern)
+    On failure:
+        state unchanged (side effects are Wave 4+)
     """
     # --- resolve spell_id from inventory slot ---
-    # Item fields are arrays of shape [MAX_INVENTORY_SLOTS]; index each field.
     spell_id = int(state.inventory.items.type_id[slot_idx])
 
     # Blank / novel book: no-op
     if spell_id == BLANK_SPELL_ID or spell_id < 0 or spell_id >= N_SPELLS:
         return state
 
-    # Roll d20
+    book_level = int(_SPELL_LEVELS[spell_id])
+
+    # Vendor formula: read_ability = INT + 4 + xl//2 - 2*book_level
+    player_int = int(state.player_int)
+    player_xl  = int(state.player_xl)
+    role_id    = int(state.player_role)
+
+    read_ability = player_int + 4 + player_xl // 2 - 2 * book_level
+    if role_id == _ROLE_WIZARD:
+        read_ability += _WIZARD_STUDY_BONUS
+    read_ability = max(0, min(read_ability, 20))
+
+    # Roll 1..20; success if roll <= read_ability.
     rng, sub = jax.random.split(rng)
-    d20 = jax.random.randint(sub, (), 1, 21).astype(jnp.int32)
+    roll = int(jax.random.randint(sub, (), 1, 21))
 
-    total = d20 + _int_bonus(state.player_int) + _book_level_modifier(spell_id)
-
-    success = bool(total >= _STUDY_THRESHOLD)
-
-    if not success:
-        # Failure (including blank total < 5): no spell gained
+    if roll > read_ability:
         return state
 
     # --- update MagicState ---

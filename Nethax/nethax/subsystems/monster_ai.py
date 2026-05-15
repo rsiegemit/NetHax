@@ -1081,12 +1081,18 @@ def pet_within_leash(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
 def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
     """Run one turn for a pet (tame) monster.
 
-    Wave 6 vendor-parity behaviour (vendor/nethack/src/dogmove.c::dog_move):
-        1. If a hostile alive monster is adjacent (Chebyshev <= 1) AND the
-           pet has not exceeded its leash → attack it (vendor mattackm).
-        2. Else if within leash → step toward player.
-        3. Else (beyond leash) → step toward player just to close the leash.
-        We model leash via ``pet_within_leash`` (apport-scaled radius).
+    Wave 8d vendor-parity behaviour (vendor/nethack/src/dogmove.c::dog_move):
+        1. If a hostile alive monster is adjacent (Chebyshev <= 1) → attack it
+           (vendor mattackm).
+        2. Else if pet is within 6 Chebyshev tiles of player → FOLLOW mode:
+           step toward player (vendor dog_goal: udist < 9 sets appr=0/1; we
+           use Chebyshev 6 per the task spec which matches the vendor leash
+           constant LEASH_LENGTH=6 in dogmove.c).
+        3. Else → EXPLORE mode: random walk (vendor dog_goal sets gx=gg.gy=
+           FARAWAY when player not in sight and no track, dogmove.c line 629).
+
+    Cite: vendor/nethack/src/dogmove.c::dog_move lines 566-644, 1014.
+    JIT-pure: all branches via jax.lax.cond / jnp.where.
 
     Returns updated state.
     """
@@ -1119,6 +1125,7 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
         return s.replace(monster_ai=new_mai)
 
     def _follow_player(s):
+        """FOLLOW mode: greedy step toward player (Chebyshev dist < 6)."""
         _mai = s.monster_ai
         ppos = s.player_pos.astype(jnp.int32)
         cur = _mai.pos[idx]
@@ -1126,8 +1133,37 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
         new_mai = _mai.replace(pos=_mai.pos.at[idx].set(new_pos))
         return s.replace(monster_ai=new_mai)
 
+    def _explore(s):
+        """EXPLORE mode: random 8-dir walk (Chebyshev dist >= 6).
+
+        Vendor dogmove.c line 629: gx=gg.gy=FARAWAY (random wander).
+        We pick a random direction from the 8 cardinal+diagonal dirs.
+        """
+        _mai = s.monster_ai
+        cur = _mai.pos[idx].astype(jnp.int32)
+        # Random direction: sample an integer in [0,8) and map to (dy, dx).
+        rng_dir, _ = jax.random.split(rng)
+        dir_idx = jax.random.randint(rng_dir, (), 0, 8)
+        dy = jnp.array([-1, -1, -1, 0, 0, 1, 1, 1], dtype=jnp.int32)[dir_idx]
+        dx = jnp.array([-1,  0,  1,-1, 1,-1, 0, 1], dtype=jnp.int32)[dir_idx]
+        new_r = jnp.clip(cur[0] + dy, 0, _MAP_H - 1).astype(jnp.int16)
+        new_c = jnp.clip(cur[1] + dx, 0, _MAP_W - 1).astype(jnp.int16)
+        new_pos = jnp.array([new_r, new_c], dtype=jnp.int16)
+        new_mai = _mai.replace(pos=_mai.pos.at[idx].set(new_pos))
+        return s.replace(monster_ai=new_mai)
+
+    # Follow/explore split: Chebyshev distance to player vs threshold 6.
+    # Vendor: LEASH_LENGTH=6, udist<9 (squared) ~ Chebyshev<3 in dogmove.c;
+    # task spec uses Chebyshev 6 matching the leash constant directly.
+    ppos = state.player_pos.astype(jnp.int32)
+    dist_to_player = _chebyshev_dist(mpos, ppos)
+    within_follow_range = dist_to_player < jnp.int32(6)
+
+    def _move_no_target(s):
+        return jax.lax.cond(within_follow_range, _follow_player, _explore, s)
+
     def _pet_act(s):
-        return jax.lax.cond(has_target, _attack_hostile, _follow_player, s)
+        return jax.lax.cond(has_target, _attack_hostile, _move_no_target, s)
 
     return jax.lax.cond(is_pet, _pet_act, lambda s: s, state)
 
