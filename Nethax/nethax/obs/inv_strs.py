@@ -889,3 +889,114 @@ def build_inv_strs(state) -> jnp.ndarray:
 
     result = lax.map(render_one, slot_indices)  # uint8[55, 80]
     return result
+
+
+# ---------------------------------------------------------------------------
+# Wave 8c: Grouped inventory rendering (vendor `i` menu parity)
+# ---------------------------------------------------------------------------
+#
+# Vendor's display_inventory groups inventory by ObjectClass and prints a class
+# header before each group, in the order given by `flags.inv_order`
+# (vendor/nethack/src/options.c::def_inv_order).  Each item line is the
+# 'doname'-formatted string (the same one already produced by
+# ``build_inv_strs``).
+#
+# Header strings come from invent.c::names[] (lines 4789-4793):
+#   {0, "Illegal objects", "Weapons", "Armor", "Rings", "Amulets", "Tools",
+#    "Comestibles", "Potions", "Scrolls", "Spellbooks", "Wands", "Coins",
+#    "Gems/Stones", "Boulders/Statues", "Iron balls", "Chains", "Venoms"}
+#
+# Default packing order (options.c::def_inv_order, line 118):
+#   COIN_CLASS, AMULET_CLASS, WEAPON_CLASS, ARMOR_CLASS, FOOD_CLASS,
+#   SCROLL_CLASS, SPBOOK_CLASS, POTION_CLASS, RING_CLASS, WAND_CLASS,
+#   TOOL_CLASS, GEM_CLASS, ROCK_CLASS, BALL_CLASS, CHAIN_CLASS
+# ---------------------------------------------------------------------------
+
+# Class -> header string  (vendor invent.c::names[])
+_CLASS_HEADERS: dict[int, str] = {
+    int(ObjectClass.ILLOBJ_CLASS):  "Illegal objects",
+    int(ObjectClass.WEAPON_CLASS):  "Weapons",
+    int(ObjectClass.ARMOR_CLASS):   "Armor",
+    int(ObjectClass.RING_CLASS):    "Rings",
+    int(ObjectClass.AMULET_CLASS):  "Amulets",
+    int(ObjectClass.TOOL_CLASS):    "Tools",
+    int(ObjectClass.FOOD_CLASS):    "Comestibles",
+    int(ObjectClass.POTION_CLASS):  "Potions",
+    int(ObjectClass.SCROLL_CLASS):  "Scrolls",
+    int(ObjectClass.SPBOOK_CLASS):  "Spellbooks",
+    int(ObjectClass.WAND_CLASS):    "Wands",
+    int(ObjectClass.COIN_CLASS):    "Coins",
+    int(ObjectClass.GEM_CLASS):     "Gems/Stones",
+    int(ObjectClass.ROCK_CLASS):    "Boulders/Statues",
+    int(ObjectClass.BALL_CLASS):    "Iron balls",
+    int(ObjectClass.CHAIN_CLASS):   "Chains",
+    int(ObjectClass.VENOM_CLASS):   "Venoms",
+}
+
+# Default inv-order from vendor options.c::def_inv_order (line 118).
+_DEFAULT_INV_ORDER: tuple = (
+    int(ObjectClass.COIN_CLASS),
+    int(ObjectClass.AMULET_CLASS),
+    int(ObjectClass.WEAPON_CLASS),
+    int(ObjectClass.ARMOR_CLASS),
+    int(ObjectClass.FOOD_CLASS),
+    int(ObjectClass.SCROLL_CLASS),
+    int(ObjectClass.SPBOOK_CLASS),
+    int(ObjectClass.POTION_CLASS),
+    int(ObjectClass.RING_CLASS),
+    int(ObjectClass.WAND_CLASS),
+    int(ObjectClass.TOOL_CLASS),
+    int(ObjectClass.GEM_CLASS),
+    int(ObjectClass.ROCK_CLASS),
+    int(ObjectClass.BALL_CLASS),
+    int(ObjectClass.CHAIN_CLASS),
+)
+
+
+def _decode_row(row) -> str:
+    """Decode a uint8[80] row (or numpy array) into a Python string, trimming nulls."""
+    import numpy as np
+    arr = np.asarray(row).astype(np.uint8)
+    return bytes(arr.tolist()).rstrip(b"\x00").decode("ascii", errors="replace")
+
+
+def build_grouped_inv_text(state) -> list[str]:
+    """Vendor-parity ``i`` menu output: class-grouped inventory listing.
+
+    Returns a list of text lines: each class with at least one non-empty
+    inventory slot produces a header line (e.g. "Weapons") followed by one
+    item line per slot in that class, in slot-letter order.
+
+    Mirrors vendor/nethack/src/invent.c::display_pickinv (~line 3266+):
+        for each class in flags.inv_order:
+            print class header (let_to_name)
+            for each item whose oclass matches:
+                print doname(item)
+
+    Host-side helper: NOT jitted; intended for human-readable debug dumps
+    and parity tests against the vendor menu.
+    """
+    # Build the flat doname-strings via the existing JITed builder.
+    inv_rows = build_inv_strs(state)  # uint8[55, 80]
+    inv = state.inventory
+    items = inv.items
+
+    # Extract per-slot class id (only first MAX_INVENTORY_SLOTS are real).
+    import numpy as np
+    categories = np.asarray(items.category).astype(np.int32)
+
+    lines: list[str] = []
+    for class_id in _DEFAULT_INV_ORDER:
+        # Collect slots in this class, in invlet (slot index) order.
+        slot_idxs = [
+            i for i in range(MAX_INVENTORY_SLOTS) if int(categories[i]) == class_id
+        ]
+        if not slot_idxs:
+            continue
+        header = _CLASS_HEADERS.get(class_id, "Items")
+        lines.append(header)
+        for i in slot_idxs:
+            row_str = _decode_row(inv_rows[i])
+            if row_str:
+                lines.append(row_str)
+    return lines
