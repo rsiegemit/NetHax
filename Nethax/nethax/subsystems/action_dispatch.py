@@ -73,13 +73,14 @@ from Nethax.nethax.constants.actions import (
 )
 from Nethax.nethax.constants import TileType
 from Nethax.nethax.constants.objects import ObjectClass
-from Nethax.nethax.fov import compute_fov, update_explored
+from Nethax.nethax.fov import compute_fov, update_explored, BLIND_SIGHT_RADIUS, DEFAULT_SIGHT_RADIUS
 from Nethax.nethax.subsystems.features import (
     DoorState,
     open_door,
     handle_open as _features_handle_open,
     handle_close as _features_handle_close,
     handle_kick as _features_handle_kick,
+    handle_search as _features_handle_search,
 )
 from Nethax.nethax.subsystems.traps import trigger_trap, TrapType
 from Nethax.nethax.subsystems.items_potions import handle_quaff as _potions_handle_quaff
@@ -194,16 +195,32 @@ def _current_level_terrain(state):
 
 
 def _apply_fov(state):
-    """Recompute visible + explored for the current level after a move."""
+    """Recompute visible + explored for the current level after a move.
+
+    Vendor: vision.c — blindness forces vision radius=1.
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
     terrain_2d = _current_level_terrain(state)
-    new_visible = compute_fov(terrain_2d, state.player_pos)
+    is_blind = state.status.timed_statuses[int(TimedStatus.BLIND)] > 0
+    sight_radius = jnp.where(is_blind, BLIND_SIGHT_RADIUS, DEFAULT_SIGHT_RADIUS)
+    new_visible = compute_fov(terrain_2d, state.player_pos, sight_radius)
 
     b  = state.dungeon.current_branch
     lv = state.dungeon.current_level - 1
     new_explored = update_explored(state.explored[b, lv], new_visible)
 
     new_explored_full = state.explored.at[b, lv].set(new_explored)
-    return state.replace(visible=new_visible, explored=new_explored_full)
+
+    # Stamp visible tiles into last_seen_terrain (vendor display.c lastseentyp ~line 850).
+    old_lst = state.last_seen_terrain[b, lv]
+    new_lst_slice = jnp.where(new_visible, terrain_2d.astype(jnp.int8), old_lst)
+    new_last_seen = state.last_seen_terrain.at[b, lv].set(new_lst_slice)
+
+    return state.replace(
+        visible=new_visible,
+        explored=new_explored_full,
+        last_seen_terrain=new_last_seen,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -328,10 +345,35 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     open_on_bump = target_is_closed_door & ~door_is_locked
     blocked_by_lock = target_is_closed_door & door_is_locked
 
+    # Pre-roll trap damage outside lax.cond (jax.random.randint is not
+    # concrete-value-safe inside cond branches on some JAX versions).
+    bump_trap_dmg_roll = jax.random.randint(rng, (), minval=1, maxval=11, dtype=jnp.int32)
+
+    def _do_open(f):
+        # open_door with pre-rolled damage avoids randint inside cond.
+        lv_, row_, col_ = door_pos[0], door_pos[1], door_pos[2]
+        current_ = f.door_state[lv_, row_, col_].astype(jnp.int32)
+        is_closed_ = current_ == jnp.int32(DoorState.CLOSED)
+        is_trapped_ = f.door_trapped[lv_, row_, col_]
+        new_val_ = jnp.where(
+            is_closed_ & is_trapped_,
+            jnp.int32(DoorState.BROKEN),
+            jnp.where(is_closed_ & ~is_trapped_, jnp.int32(DoorState.OPEN), current_),
+        ).astype(jnp.int8)
+        damage_ = jnp.where(is_closed_ & is_trapped_, bump_trap_dmg_roll, jnp.int32(0))
+        new_trapped_ = jnp.where(
+            is_closed_ & is_trapped_,
+            f.door_trapped.at[lv_, row_, col_].set(jnp.bool_(False)),
+            f.door_trapped,
+        )
+        new_ds_ = f.door_state.at[lv_, row_, col_].set(new_val_)
+        return f.replace(door_state=new_ds_, door_trapped=new_trapped_), damage_
+
     new_features = jax.lax.cond(
         open_on_bump,
-        lambda f: open_door(f, door_pos),
-        lambda f: f,
+        # vendor lock.c::doopen checks D_TRAPPED; trap springs on bump-open too.
+        _do_open,
+        lambda f: (f, jnp.int32(0)),
         state.features,
     )
 
@@ -362,10 +404,15 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
 
     new_pos = jnp.where(can_move, target, pos).astype(jnp.int16)
 
+    # Apply trapped-door damage from bump-open (vendor lock.c::doopen D_TRAPPED).
+    bump_hp = jnp.maximum(jnp.int32(0), state.player_hp - new_features[1])
+    new_features = new_features[0]
+
     state_mid = state.replace(
         player_pos=new_pos,
         features=new_features,
         terrain=new_terrain,
+        player_hp=bump_hp,
     )
 
     # --- Trap triggering (trap.c dotrap) ---
@@ -424,6 +471,29 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         player_hp=new_hp,
         status=new_status,
         rng=new_rng,
+    )
+
+    # Elbereth dust wipe when player steps over an engraved tile.
+    # Cite: vendor/nethack/src/engrave.c::wipe_engr_at lines 270-290.
+    # Dust Elbereth has a 1/4 chance of erasure per step (vendor rn2(4)).
+    from Nethax.nethax.subsystems.engrave import is_elbereth_at, ENGR_DUST
+    wipe_rng, _ = jax.random.split(state_final.rng)
+    wipe_r = state_final.player_pos[0].astype(jnp.int32)
+    wipe_c = state_final.player_pos[1].astype(jnp.int32)
+    is_elb = is_elbereth_at(state_final.engrave, wipe_r, wipe_c)
+    is_dust = (
+        state_final.engrave.engraving_kind[wipe_r, wipe_c].astype(jnp.int32)
+        == jnp.int32(ENGR_DUST)
+    )
+    wipe_roll = jax.random.uniform(wipe_rng)
+    do_wipe = is_elb & is_dust & actually_moved & (wipe_roll < 0.25)
+    new_has_engraving = jnp.where(
+        do_wipe,
+        state_final.engrave.has_engraving.at[wipe_r, wipe_c].set(jnp.bool_(False)),
+        state_final.engrave.has_engraving,
+    )
+    state_final = state_final.replace(
+        engrave=state_final.engrave.replace(has_engraving=new_has_engraving)
     )
 
     return _apply_fov(state_final)
@@ -920,13 +990,13 @@ def _handle_fight(state, rng):
 
 
 def _handle_search(state, rng):
-    """SEARCH — vendor/nethack/src/detect.c::dosearch.
+    """SEARCH — vendor/nethack/src/detect.c::dosearch0.
 
-    Wave 4 Phase 0: no-op until a search handler is implemented; the action
-    is still routed (rather than dropped through unmapped → noop) so future
-    waves can swap in real reveal logic without touching the table.
+    Delegates to features.handle_search which performs the 3x3 sweep with
+    1/7 roll per tile to reveal secret doors (SECRET → CLOSED).
     """
-    return state
+    rng, sub = jax.random.split(rng)
+    return _features_handle_search(state, sub)
 
 
 def _handle_pray(state, rng):

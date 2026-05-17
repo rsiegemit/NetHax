@@ -30,8 +30,10 @@ from Nethax.nethax.constants.roles import Role
 from Nethax.nethax.rng import dice_roll, rnd, split_n
 from Nethax.nethax.subsystems.inventory import (
     N_ARMOR_SLOTS,
+    ItemCategory,
     compute_ac as _inv_compute_ac,
 )
+from Nethax.nethax.subsystems.items_potions import apply_potion_to_monster
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +59,25 @@ def _build_monster_symbol_table() -> jnp.ndarray:
 
 
 _MONSTER_SYMBOL_TABLE: jnp.ndarray = _build_monster_symbol_table()
+
+# ---------------------------------------------------------------------------
+# Monster primary-attack damage-type table — adtyp of attack[0] per entry.
+# Vendor reference: vendor/nethack/src/uhitm.c::mhitm_ad_were (line 4265);
+# src/were.c::set_ulycn (line 234).  Used to dispatch AD_WERE infection.
+# Built once at module load; never traced inside a jit boundary.
+# ---------------------------------------------------------------------------
+def _build_monster_primary_adtyp_table() -> jnp.ndarray:
+    from Nethax.nethax.constants.monsters import MONSTERS  # noqa: PLC0415
+    return jnp.array(
+        [int(m.attacks[0][1]) if m.attacks else 0 for m in MONSTERS],
+        dtype=jnp.int32,
+    )
+
+
+_MONSTER_PRIMARY_ADTYP_TABLE: jnp.ndarray = _build_monster_primary_adtyp_table()
+
+# AD_WERE = 29  (mirrors DamageType.AD_WERE; plain int for use in lax.cond).
+_AD_WERE: int = 29
 
 # vendor/nethack/include/defsym.h: S_HUMANOID=8, S_HUMAN=53.
 _S_HUMANOID: int = 8
@@ -980,6 +1001,44 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
     new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(0)).astype(jnp.int32)
     new_done = state.done | (new_hp <= 0)
     new_state = state.replace(player_hp=new_hp, done=new_done)
+    # ------------------------------------------------------------------
+    # AD_WERE lycanthropy infection
+    # Vendor: vendor/nethack/src/uhitm.c::mhitm_ad_were (line 4265);
+    # src/were.c::set_ulycn (line 234).
+    # Gates: attack landed, player not already lycanthropic, no
+    # Protection_from_shape_changers intrinsic.
+    # ------------------------------------------------------------------
+    safe_entry = jnp.clip(
+        mai.entry_idx[idx].astype(jnp.int32),
+        0,
+        _MONSTER_PRIMARY_ADTYP_TABLE.shape[0] - 1,
+    )
+    adtyp = _MONSTER_PRIMARY_ADTYP_TABLE[safe_entry]
+
+    poly = new_state.polymorph
+    already_lycan = poly.lycanthropy_form >= jnp.int8(0)
+    from Nethax.nethax.subsystems.status_effects import Intrinsic  # noqa: PLC0415
+    prot_shape = new_state.status.intrinsics[
+        int(Intrinsic.PROT_FROM_SHAPE_CHANGERS)
+    ]
+
+    infect_cond = (
+        hit
+        & (adtyp == jnp.int32(_AD_WERE))
+        & (~already_lycan)
+        & (~prot_shape)
+    )
+
+    from Nethax.nethax.subsystems.polymorph import trigger_lycanthropy as _trigger_lycan  # noqa: PLC0415
+    were_form = mai.entry_idx[idx].astype(jnp.int32)
+
+    new_state = jax.lax.cond(
+        infect_cond,
+        lambda s: _trigger_lycan(s, rng, were_form),
+        lambda s: s,
+        new_state,
+    )
+
     return new_state, dmg
 
 
@@ -1087,6 +1146,29 @@ def thrown_attack(
     new_hp_arr = mai.hp.at[target_idx].set(new_hp)
     new_alive_arr = mai.alive.at[target_idx].set(new_alive)
     new_mai = mai.replace(hp=new_hp_arr, alive=new_alive_arr)
+
+    # --- Potion shatter — vendor/nethack/src/dothrow.c:2262-2400 (potionhit) ---
+    # When a thrown potion reaches its target it shatters and applies its liquid
+    # effect.  JIT-pure: jax.lax.cond gates on is_potion & found_hit; lax.switch
+    # inside apply_potion_to_monster selects the per-effect branch.
+    is_potion = items.category[slot] == jnp.int8(int(ItemCategory.POTION))
+    potion_type_id = items.type_id[slot].astype(jnp.int32)
+    key_pot, _ = split_n(rng, 2)
+
+    def _shatter(s):
+        s2 = s.replace(monster_ai=new_mai)
+        return apply_potion_to_monster(s2, key_pot, potion_type_id, target_idx)
+
+    def _no_shatter(s):
+        return s.replace(monster_ai=new_mai)
+
+    state_after_hit = jax.lax.cond(
+        is_potion & found_hit,
+        _shatter,
+        _no_shatter,
+        state,
+    )
+    new_mai = state_after_hit.monster_ai
 
     # --- Remove projectile from inventory (1 unit) ---
     old_qty = items.quantity[slot].astype(jnp.int16)
@@ -1209,8 +1291,6 @@ def handle_throw(state, rng):
     Direction defaults to east (0, 1) — full directional input requires
     a follow-up direction prompt which Wave 5 does not model.
     """
-    from Nethax.nethax.subsystems.inventory import ItemCategory
-
     items = state.inventory.items
     quiver = state.inventory.quiver.astype(jnp.int32)
     has_quiver = quiver >= jnp.int32(0)

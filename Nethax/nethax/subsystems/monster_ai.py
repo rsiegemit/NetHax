@@ -111,6 +111,36 @@ _MONSTER_SOUND_TABLE: jnp.ndarray = _build_monster_sound_table()
  _MONSTER_LEVEL_TABLE) = _build_monster_flag_tables()
 _MS_SPELL: int = 42   # vendor/nethack/include/monflag.h
 _MS_PRIEST: int = 41  # vendor/nethack/include/monflag.h
+_MS_RIDER: int = 35   # vendor/nethack/include/monflag.h
+
+
+def _build_ignores_elbereth_table() -> jnp.ndarray:
+    """Precompute per-entry Elbereth exemption flags.
+
+    Cite: vendor/nethack/src/monmove.c::onscary lines 241-303.
+    Exempt:
+      - S_HUMAN ('@') — humanoids (vendor onscary: ``ishumanoid`` check)
+      - Wizard of Yendor — vendor line 256 (nemesis)
+      - Archon — vendor line 271
+      - Riders (Death, Famine, Pestilence) — vendor line 259
+        ``if (is_rider(ptr)) return 0;``
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
+    _RIDER_NAMES = frozenset({"Death", "Pestilence", "Famine"})
+    _EXEMPT_NAMES = frozenset({"Wizard of Yendor", "Archon"})
+    result = []
+    for m in MONSTERS:
+        exempt = (
+            m.symbol == MonsterSymbol.S_HUMAN
+            or m.name in _RIDER_NAMES
+            or m.name in _EXEMPT_NAMES
+        )
+        result.append(bool(exempt))
+    return jnp.array(result, dtype=jnp.bool_)
+
+
+# Elbereth exemption table indexed by entry_idx.  Built once at module load.
+_IGNORES_ELBERETH: jnp.ndarray = _build_ignores_elbereth_table()
 
 # ---- Item category / type IDs (mirrors subsystems/inventory.ItemCategory
 # and subsystems/items_{potions,scrolls,wands}.<Effect>) ------------------
@@ -1255,11 +1285,34 @@ def monster_turn(state, rng: jax.Array, monster_idx: jnp.ndarray) -> object:
 
             st = jax.lax.cond(cast_now, _maybe_cast, lambda s2: s2, st)
 
-            # 7: movement decision.
+            # 7a: Elbereth fear check (onscary).
+            # Cite: vendor/nethack/src/monmove.c::onscary lines 241-303.
+            # If Elbereth is engraved on the player's tile and this monster is
+            # not exempt, freeze it in place this turn.  Vendor moves the
+            # monster in a random valid direction away; we use "stay put" as a
+            # simpler JIT-pure equivalent.
+            from Nethax.nethax.subsystems.engrave import is_elbereth_at
+            from Nethax.nethax.dungeon.branches import Branch as _Branch
+            _ppos = st.player_pos.astype(jnp.int32)
+            _scared_raw = is_elbereth_at(st.engrave, _ppos[0], _ppos[1])
+            _eidx = st.monster_ai.entry_idx[idx].astype(jnp.int32)
+            _safe_e = jnp.clip(_eidx, 0, _IGNORES_ELBERETH.shape[0] - 1)
+            _ignores = _IGNORES_ELBERETH[_safe_e]
+            # Gehennom: vendor onscary line 296 "if (In_hell(&u.uz)) return 0"
+            _in_gehennom = (
+                st.dungeon.current_branch.astype(jnp.int32)
+                == jnp.int32(_Branch.GEHENNOM)
+            )
+            scared = _scared_raw & ~_ignores & ~_in_gehennom
+
+            # 7b: movement decision; zero out step when scared.
             retreat_step = maybe_retreat(st, idx)
             wants_retreat = jnp.any(retreat_step != 0)
             path_step = pathfind_step(st, idx)
             step_delta = jnp.where(wants_retreat, retreat_step, path_step)
+            step_delta = jnp.where(
+                scared, jnp.zeros(2, dtype=jnp.int32), step_delta
+            )
 
             cur_pos = st.monster_ai.pos[idx].astype(jnp.int32)
             new_pos_i32 = cur_pos + step_delta

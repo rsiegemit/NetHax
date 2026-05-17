@@ -153,6 +153,7 @@ class FeaturesState:
     sinks_used:      jnp.ndarray   # [num_levels, map_h, map_w]  bool
     altar_alignment: jnp.ndarray   # [num_levels, map_h, map_w]  int8
     door_state:      jnp.ndarray   # [num_levels, map_h, map_w]  int8
+    door_trapped:    jnp.ndarray   # [num_levels, map_h, map_w]  bool
 
     @classmethod
     def default(cls, num_levels: int, map_h: int, map_w: int) -> "FeaturesState":
@@ -164,6 +165,7 @@ class FeaturesState:
             sinks_used=jnp.zeros(shape, dtype=jnp.bool_),
             altar_alignment=jnp.full(shape, -1, dtype=jnp.int8),
             door_state=jnp.zeros(shape, dtype=jnp.int8),
+            door_trapped=jnp.zeros(shape, dtype=jnp.bool_),
         )
 
 
@@ -171,23 +173,34 @@ class FeaturesState:
 # Door operations (Wave 3)
 # ---------------------------------------------------------------------------
 
-def open_door(
-    state: FeaturesState,
-    pos: jnp.ndarray,
-) -> FeaturesState:
+def open_door(state: FeaturesState, pos: jnp.ndarray, rng: jax.Array = None):
     """Open the door at *pos* if it is CLOSED (doopen, lock.c).
 
-    pos : int array [3] = (level, row, col)
+    Vendor: vendor/nethack/src/lock.c::doopen checks d->doormask & D_TRAPPED
+    before opening; if set, springs trap (rnd(10) damage, door becomes BROKEN).
 
-    CLOSED (4) → OPEN (2).
-    All other states (LOCKED, BROKEN, GONE, SECRET) are unchanged.
+    Returns (new_state, damage: int32).
     """
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
     lv, row, col = pos[0], pos[1], pos[2]
     current = state.door_state[lv, row, col].astype(jnp.int32)
     is_closed = current == jnp.int32(DoorState.CLOSED)
-    new_val = jnp.where(is_closed, jnp.int32(DoorState.OPEN), current).astype(jnp.int8)
+    is_trapped = state.door_trapped[lv, row, col]
+    trap_dmg = jax.random.randint(rng, (), minval=1, maxval=11, dtype=jnp.int32)
+    new_val = jnp.where(
+        is_closed & is_trapped,
+        jnp.int32(DoorState.BROKEN),
+        jnp.where(is_closed & ~is_trapped, jnp.int32(DoorState.OPEN), current),
+    ).astype(jnp.int8)
+    damage = jnp.where(is_closed & is_trapped, trap_dmg, jnp.int32(0))
+    new_trapped = jnp.where(
+        is_closed & is_trapped,
+        state.door_trapped.at[lv, row, col].set(jnp.bool_(False)),
+        state.door_trapped,
+    )
     new_door_state = state.door_state.at[lv, row, col].set(new_val)
-    return state.replace(door_state=new_door_state)
+    return state.replace(door_state=new_door_state, door_trapped=new_trapped), damage
 
 
 def close_door(
@@ -486,12 +499,14 @@ def handle_open(state, rng: jax.Array):
     """Open door in the direction the player last moved (Wave 4 adds dir selection).
 
     Wave 3 simplified: opens door at player's current tile if any.
+    Checks D_TRAPPED (vendor/nethack/src/lock.c::doopen) and applies damage.
     Returns new EnvState.
     """
     flat_lv = _flat_lv_from_state(state)
     pos = jnp.array([flat_lv, state.player_pos[0], state.player_pos[1]], dtype=jnp.int32)
-    new_features = open_door(state.features, pos)
-    return state.replace(features=new_features)
+    new_features, trap_dmg = open_door(state.features, pos, rng)
+    new_hp = jnp.maximum(jnp.int32(0), state.player_hp - trap_dmg)
+    return state.replace(features=new_features, player_hp=new_hp)
 
 
 def handle_close(state, rng: jax.Array):

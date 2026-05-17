@@ -78,7 +78,7 @@ class TestOpenDoor:
         state = _make_state()
         state = _set_door_state(state, 3, 3, DoorState.CLOSED)
         pos = _door_pos(state, 3, 3)
-        new_features = open_door(state.features, pos)
+        new_features, _dmg = open_door(state.features, pos)
         flat = _flat_lv(state)
         assert int(new_features.door_state[flat, 3, 3]) == DoorState.OPEN
 
@@ -86,7 +86,7 @@ class TestOpenDoor:
         state = _make_state()
         state = _set_door_state(state, 3, 3, DoorState.LOCKED)
         pos = _door_pos(state, 3, 3)
-        new_features = open_door(state.features, pos)
+        new_features, _dmg = open_door(state.features, pos)
         flat = _flat_lv(state)
         assert int(new_features.door_state[flat, 3, 3]) == DoorState.LOCKED
 
@@ -94,7 +94,7 @@ class TestOpenDoor:
         state = _make_state()
         state = _set_door_state(state, 3, 3, DoorState.OPEN)
         pos = _door_pos(state, 3, 3)
-        new_features = open_door(state.features, pos)
+        new_features, _dmg = open_door(state.features, pos)
         flat = _flat_lv(state)
         assert int(new_features.door_state[flat, 3, 3]) == DoorState.OPEN
 
@@ -102,7 +102,7 @@ class TestOpenDoor:
         state = _make_state()
         state = _set_door_state(state, 3, 3, DoorState.BROKEN)
         pos = _door_pos(state, 3, 3)
-        new_features = open_door(state.features, pos)
+        new_features, _dmg = open_door(state.features, pos)
         flat = _flat_lv(state)
         assert int(new_features.door_state[flat, 3, 3]) == DoorState.BROKEN
 

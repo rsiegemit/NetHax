@@ -29,7 +29,8 @@ from Nethax.nethax.dungeon.branches import generate_main_branch_l1
 from Nethax.nethax.dungeon.spawning import populate_level_with_monsters
 from Nethax.nethax.constants.roles import Role
 from Nethax.nethax.constants.races import Race
-from Nethax.nethax.subsystems.character import create_character
+from Nethax.nethax.constants import TileType
+from Nethax.nethax.subsystems.character import create_character, get_starting_pet
 
 
 class NethaxEnv:
@@ -83,6 +84,9 @@ class NethaxEnv:
         # Populate level 1 with monsters after dungeon gen.
         state = populate_level_with_monsters(state, rng_monsters, n_monsters=5)
 
+        # Spawn starting pet adjacent to player — vendor/nethack/src/u_init.c::makedog.
+        state = _spawn_starting_pet(state, role)
+
         # Seed the explored mask via FOV so the player can see their starting
         # room on the very first frame.  Without this the initial obs is all
         # NO_GLYPH and the UI shows an empty screen.
@@ -114,6 +118,77 @@ class NethaxEnv:
         new_state, obs, reward, done = self._step_jit(state, action, rng)
         info: Dict[str, Any] = {}
         return new_state, obs, reward, done, info
+
+
+def _spawn_starting_pet(state, role: Role):
+    """Spawn the role's starting pet adjacent to the player.
+
+    Vendor: vendor/nethack/src/u_init.c::makedog (called from u_init()).
+    Host-side only — reset() is not jit-compiled.
+    Pet is placed in slot 5 (after the 5 wild monsters in slots 0-4).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS
+    from Nethax.nethax.dungeon.spawning import (
+        _BASE_AC, _ATK_DICE_N, _ATK_DICE_S, _IS_LARGE, _roll_hp,
+    )
+    import numpy as np
+    import jax.random as jr
+
+    # Resolve pet monster name → MONSTERS index (host-side name lookup).
+    pet_name = get_starting_pet(role)
+    pet_pm = next(
+        (i for i, m in enumerate(MONSTERS) if m.name == pet_name),
+        32,  # fallback: kitten (index 32)
+    )
+
+    # Find an adjacent FLOOR or CORRIDOR tile (Chebyshev distance == 1).
+    terrain = np.array(state.terrain[0, 0])   # host numpy copy
+    pr = int(state.player_pos[0])
+    pc = int(state.player_pos[1])
+    H, W = terrain.shape
+    pet_pos = (pr, pc)  # fallback: same tile as player (vendor fallback)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            rr, cc = pr + dr, pc + dc
+            if 0 <= rr < H and 0 <= cc < W:
+                t = int(terrain[rr, cc])
+                if t in (int(TileType.FLOOR), int(TileType.CORRIDOR)):
+                    pet_pos = (rr, cc)
+                    break
+        else:
+            continue
+        break
+
+    # Roll HP using the same formula as wild monsters (makemon.c::newmonhp).
+    dummy_rng = jr.PRNGKey(0)
+    hp_val = int(_roll_hp(dummy_rng, jnp.int32(max(1, int(MONSTERS[pet_pm].level)))))
+
+    # Write pet into slot 5 (first slot after the 5 wild monsters).
+    PET_SLOT = 5
+    pm_i16 = jnp.int16(pet_pm)
+    mai = state.monster_ai.replace(
+        alive=state.monster_ai.alive.at[PET_SLOT].set(True),
+        tame=state.monster_ai.tame.at[PET_SLOT].set(True),
+        peaceful=state.monster_ai.peaceful.at[PET_SLOT].set(True),
+        mtame=state.monster_ai.mtame.at[PET_SLOT].set(jnp.int8(10)),
+        entry_idx=state.monster_ai.entry_idx.at[PET_SLOT].set(pm_i16),
+        pos=state.monster_ai.pos.at[PET_SLOT].set(
+            jnp.array(pet_pos, dtype=jnp.int16)
+        ),
+        hp=state.monster_ai.hp.at[PET_SLOT].set(jnp.int32(hp_val)),
+        hp_max=state.monster_ai.hp_max.at[PET_SLOT].set(jnp.int32(hp_val)),
+        ac=state.monster_ai.ac.at[PET_SLOT].set(_BASE_AC[pet_pm]),
+        is_large=state.monster_ai.is_large.at[PET_SLOT].set(_IS_LARGE[pet_pm]),
+        attack_dice_n=state.monster_ai.attack_dice_n.at[PET_SLOT].set(
+            _ATK_DICE_N[pet_pm]
+        ),
+        attack_dice_sides=state.monster_ai.attack_dice_sides.at[PET_SLOT].set(
+            _ATK_DICE_S[pet_pm]
+        ),
+    )
+    return state.replace(monster_ai=mai)
 
 
 def _step_impl(state, action, rng):

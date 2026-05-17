@@ -10,6 +10,7 @@ from Nethax.nethax.subsystems.status_effects import (
     add_timed_intrinsic,
 )
 from Nethax.nethax.constants.objects import ObjectClass
+from Nethax.nethax.rng import rnd
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +605,157 @@ _SWITCH_BRANCHES = [
     (lambda operand, fn=fn: fn(operand[0], operand[1], operand[2]))
     for fn in _EFFECT_TABLE
 ]
+
+
+# ---------------------------------------------------------------------------
+# Monster-targeted potion effects — vendor/nethack/src/dothrow.c:2262-2400
+# (potionhit).  Applied when a thrown potion shatters on a monster.
+#
+# Signature: (state, m_slot: jnp.int32, rng) -> state
+# Top effects are implemented; the default branch deals rnd(4) damage.
+# ---------------------------------------------------------------------------
+
+def _monster_sleep(state, m_slot, rng):
+    """Sleeping potion shatters on monster — set asleep=True."""
+    mai = state.monster_ai
+    new_asleep = mai.asleep.at[m_slot].set(jnp.bool_(True))
+    return state.replace(monster_ai=mai.replace(asleep=new_asleep))
+
+
+def _monster_heal(state, m_slot, rng):
+    """Healing potion shatters on monster — restore 10 HP (capped at hp_max)."""
+    mai = state.monster_ai
+    cur_hp  = mai.hp[m_slot].astype(jnp.int32)
+    cur_max = mai.hp_max[m_slot].astype(jnp.int32)
+    new_hp  = jnp.minimum(cur_hp + jnp.int32(10), cur_max)
+    return state.replace(monster_ai=mai.replace(hp=mai.hp.at[m_slot].set(new_hp)))
+
+
+def _monster_acid_dmg(state, m_slot, rng):
+    """Acid potion shatters on monster — deal 6 damage."""
+    mai = state.monster_ai
+    cur_hp = mai.hp[m_slot].astype(jnp.int32)
+    new_hp = jnp.maximum(cur_hp - jnp.int32(6), jnp.int32(0))
+    new_alive = (new_hp > jnp.int32(0)) & mai.alive[m_slot]
+    return state.replace(monster_ai=mai.replace(
+        hp=mai.hp.at[m_slot].set(new_hp),
+        alive=mai.alive.at[m_slot].set(new_alive),
+    ))
+
+
+def _monster_paralyze(state, m_slot, rng):
+    """Paralysis potion shatters on monster — freeze (set asleep=True)."""
+    mai = state.monster_ai
+    new_asleep = mai.asleep.at[m_slot].set(jnp.bool_(True))
+    return state.replace(monster_ai=mai.replace(asleep=new_asleep))
+
+
+def _monster_blindness(state, m_slot, rng):
+    """Blindness potion shatters on monster — deal 1 damage (minor nuisance)."""
+    mai = state.monster_ai
+    cur_hp = mai.hp[m_slot].astype(jnp.int32)
+    new_hp = jnp.maximum(cur_hp - jnp.int32(1), jnp.int32(0))
+    new_alive = (new_hp > jnp.int32(0)) & mai.alive[m_slot]
+    return state.replace(monster_ai=mai.replace(
+        hp=mai.hp.at[m_slot].set(new_hp),
+        alive=mai.alive.at[m_slot].set(new_alive),
+    ))
+
+
+def _monster_sickness(state, m_slot, rng):
+    """Sickness potion shatters on monster — deal 8 damage."""
+    mai = state.monster_ai
+    cur_hp = mai.hp[m_slot].astype(jnp.int32)
+    new_hp = jnp.maximum(cur_hp - jnp.int32(8), jnp.int32(0))
+    new_alive = (new_hp > jnp.int32(0)) & mai.alive[m_slot]
+    return state.replace(monster_ai=mai.replace(
+        hp=mai.hp.at[m_slot].set(new_hp),
+        alive=mai.alive.at[m_slot].set(new_alive),
+    ))
+
+
+def _monster_extra_heal(state, m_slot, rng):
+    """Extra-healing potion shatters on monster — restore 25 HP."""
+    mai = state.monster_ai
+    cur_hp  = mai.hp[m_slot].astype(jnp.int32)
+    cur_max = mai.hp_max[m_slot].astype(jnp.int32)
+    new_hp  = jnp.minimum(cur_hp + jnp.int32(25), cur_max)
+    return state.replace(monster_ai=mai.replace(hp=mai.hp.at[m_slot].set(new_hp)))
+
+
+def _monster_default_dmg(state, m_slot, rng):
+    """Unknown potion shatters — rnd(4) splash damage (vendor default)."""
+    dmg = rnd(rng, 4).astype(jnp.int32)
+    mai = state.monster_ai
+    cur_hp = mai.hp[m_slot].astype(jnp.int32)
+    new_hp = jnp.maximum(cur_hp - dmg, jnp.int32(0))
+    new_alive = (new_hp > jnp.int32(0)) & mai.alive[m_slot]
+    return state.replace(monster_ai=mai.replace(
+        hp=mai.hp.at[m_slot].set(new_hp),
+        alive=mai.alive.at[m_slot].set(new_alive),
+    ))
+
+
+# Dispatch table indexed by effect_id = type_id - _POTION_BASE_ID.
+_MONSTER_EFFECT_TABLE = (
+    _monster_default_dmg,    #  0  GAIN_ABILITY
+    _monster_default_dmg,    #  1  RESTORE_ABILITY
+    _monster_default_dmg,    #  2  CONFUSION
+    _monster_blindness,      #  3  BLINDNESS
+    _monster_paralyze,       #  4  PARALYSIS
+    _monster_default_dmg,    #  5  SPEED
+    _monster_default_dmg,    #  6  LEVITATION
+    _monster_default_dmg,    #  7  HALLUCINATION
+    _monster_default_dmg,    #  8  INVISIBILITY
+    _monster_default_dmg,    #  9  SEE_INVISIBLE
+    _monster_heal,           # 10  HEALING
+    _monster_extra_heal,     # 11  EXTRA_HEALING
+    _monster_default_dmg,    # 12  GAIN_LEVEL
+    _monster_default_dmg,    # 13  ENLIGHTENMENT
+    _monster_default_dmg,    # 14  MONSTER_DETECTION
+    _monster_default_dmg,    # 15  OBJECT_DETECTION
+    _monster_default_dmg,    # 16  GAIN_ENERGY
+    _monster_sleep,          # 17  SLEEPING
+    _monster_heal,           # 18  FULL_HEALING
+    _monster_default_dmg,    # 19  POLYMORPH
+    _monster_default_dmg,    # 20  BOOZE
+    _monster_sickness,       # 21  SICKNESS
+    _monster_default_dmg,    # 22  FRUIT_JUICE
+    _monster_acid_dmg,       # 23  ACID
+    _monster_default_dmg,    # 24  OIL
+    _monster_default_dmg,    # 25  WATER
+)
+
+assert len(_MONSTER_EFFECT_TABLE) == N_POTIONS
+
+_MONSTER_SWITCH_BRANCHES = [
+    (lambda operand, fn=fn: fn(operand[0], operand[1], operand[2]))
+    for fn in _MONSTER_EFFECT_TABLE
+]
+
+
+def apply_potion_to_monster(state, rng, type_id, m_slot):
+    """Dispatch a shattered potion effect onto a monster (JIT-pure).
+
+    Vendor reference: dothrow.c::potionhit (lines 2262-2400).
+
+    Parameters
+    ----------
+    state   : EnvState
+    rng     : JAX PRNG key
+    type_id : int32 — raw object type_id from the thrown item
+    m_slot  : int32 — monster slot index in monster_ai arrays
+    """
+    effect_id = jnp.clip(
+        type_id.astype(jnp.int32) - jnp.int32(_POTION_BASE_ID),
+        0,
+        N_POTIONS - 1,
+    )
+    return jax.lax.switch(
+        effect_id,
+        _MONSTER_SWITCH_BRANCHES,
+        (state, m_slot.astype(jnp.int32), rng),
+    )
 
 
 # ---------------------------------------------------------------------------

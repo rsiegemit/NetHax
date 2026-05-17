@@ -166,20 +166,19 @@ def compute_fov(
     visible = visible.at[pr, pc].set(True)
 
     # Enumerate all target offsets on the perimeter of the bounding square.
-    # The side length is (2*R+1); offsets range from -R to R inclusive.
-    R = sight_radius
-    diameter = 2 * R + 1
-    # Walk at most R steps per ray. Starting from one tile away from the
-    # player (handled in _cast_ray), R iterations cover cells at Chebyshev
-    # distance 1..R inclusive. Any extra steps would mark cells beyond
-    # sight_radius — that was the Wave 2 first-pass bug.
-    max_steps = R
+    # We always use DEFAULT_SIGHT_RADIUS for static array sizes (required by
+    # jnp.arange inside JIT), then mask out tiles beyond sight_radius at the
+    # end.  This keeps the function JIT-pure even when sight_radius is a traced
+    # value (e.g. jnp.where for blindness).
+    # Vendor: vision.c — blindness forces radius=1.
+    R_static = DEFAULT_SIGHT_RADIUS  # static: used only for loop bounds
+    sight_radius_i32 = jnp.int32(sight_radius)  # may be traced
+    diameter = 2 * R_static + 1
+    max_steps = R_static  # upper bound; rays beyond actual radius get masked
 
-    # Build (dr, dc) pairs for all cells in [-R, R] x [-R, R] excluding (0,0).
-    # We cast a ray to every such cell so the FOV is "filled in" — rays to
-    # interior cells fill the interior, rays to the border bound the radius.
-    rows = jnp.arange(-R, R + 1, dtype=jnp.int32)  # (diameter,)
-    cols = jnp.arange(-R, R + 1, dtype=jnp.int32)  # (diameter,)
+    # Build (dr, dc) pairs for all cells in [-R_static, R_static]^2.
+    rows = jnp.arange(-R_static, R_static + 1, dtype=jnp.int32)  # (diameter,)
+    cols = jnp.arange(-R_static, R_static + 1, dtype=jnp.int32)  # (diameter,)
     dr_grid, dc_grid = jnp.meshgrid(rows, cols, indexing="ij")  # (D, D)
     dr_flat = dr_grid.reshape(-1)   # (D*D,)
     dc_flat = dc_grid.reshape(-1)   # (D*D,)
@@ -191,10 +190,9 @@ def compute_fov(
         dr = dr_flat[idx]
         dc = dc_flat[idx]
         # Skip the player's own cell (offset 0,0) — already marked.
-        skip = (dr == 0) & (dc == 0)
-        # Also skip if offset is beyond sight radius (L∞ check already
-        # satisfied by construction, but guard against non-perimeter interior
-        # rays that go nowhere useful when dr=dc=0 exactly).
+        # Also skip rays whose L∞ distance exceeds the actual sight_radius.
+        beyond_radius = jnp.maximum(jnp.abs(dr), jnp.abs(dc)) > sight_radius_i32
+        skip = ((dr == 0) & (dc == 0)) | beyond_radius
         new_vis = jax.lax.cond(
             skip,
             lambda v: v,
@@ -204,6 +202,13 @@ def compute_fov(
         return new_vis, None
 
     visible, _ = jax.lax.scan(cast_one, visible, jnp.arange(diameter * diameter))
+    # Additionally mask out any tiles whose Chebyshev distance from player
+    # exceeds sight_radius (guards against diagonal rays slightly overreaching).
+    rows_all = jnp.arange(h, dtype=jnp.int32)
+    cols_all = jnp.arange(w, dtype=jnp.int32)
+    rr, cc = jnp.meshgrid(rows_all, cols_all, indexing="ij")
+    chebyshev = jnp.maximum(jnp.abs(rr - pr), jnp.abs(cc - pc))
+    visible = visible & (chebyshev <= sight_radius_i32)
     return visible
 
 

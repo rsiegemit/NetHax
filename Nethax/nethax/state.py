@@ -140,6 +140,7 @@ class EnvState:
     terrain: jax.Array          # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]  tile type
     explored: jax.Array         # bool[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]
     visible: jax.Array          # bool[MAP_H, MAP_W]  FOV for current level only
+    last_seen_terrain: jax.Array  # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]; -1=never seen (vendor display.c lastseentyp ~line 850)
 
     # ---- Ground items (item stack per tile) ----
     # Item[N_BRANCHES, MAX_LEVELS, MAP_H, MAP_W, MAX_GROUND_STACK]
@@ -215,6 +216,7 @@ class EnvState:
             terrain=jnp.zeros((b, l, h, w), dtype=jnp.int8),
             explored=jnp.zeros((b, l, h, w), dtype=jnp.bool_),
             visible=jnp.zeros((h, w), dtype=jnp.bool_),
+            last_seen_terrain=jnp.full((b, l, h, w), -1, dtype=jnp.int8),
             # ground items
             ground_items=_empty_ground_items_array(b, l, h, w),
             # game loop
