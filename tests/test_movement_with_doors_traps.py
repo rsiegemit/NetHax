@@ -177,9 +177,12 @@ def test_revealed_trap_visible():
 
     flat_level = branch * state.terrain.shape[1] + level_idx
 
-    # Mark tile as explored so it shows up in glyphs
+    # Mark tile as explored+visible so last_seen_terrain layer doesn't shadow it
+    # vendor pager.c::lookat: last_seen_terrain layer added post-parity; tile must be
+    # in current FOV (visible) for glyph to reflect terrain rather than stale memory
     new_explored = state.explored.at[branch, level_idx, p_row, trap_col].set(True)
-    state = state.replace(explored=new_explored)
+    new_visible = state.visible.at[p_row, trap_col].set(True)
+    state = state.replace(explored=new_explored, visible=new_visible)
 
     # Unrevealed: glyph should be floor (S_room + GLYPH_CMAP_OFF)
     from Nethax.nethax.obs.nle_obs import build_glyphs, _S_room

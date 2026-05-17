@@ -53,7 +53,10 @@ def _find_object_type_id_class(obj_class: ObjectClass, name_contains: str) -> in
 
 
 def _make_empty_items() -> Item:
-    """Return a 52-slot Item array, all empty (category=0)."""
+    """Return a 52-slot Item array, all empty (category=0).
+
+    post-erosion-merge: positional → kwarg; new fields greased/oeroded*/bknown/lamplit/olocked/corpse_entry_idx added.
+    """
     return Item(
         category=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8),
         type_id=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int16),
@@ -65,6 +68,14 @@ def _make_empty_items() -> Item:
         weight=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int32),
         ac_bonus=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8),
         is_two_handed=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        greased=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        oeroded=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8),
+        oeroded2=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8),
+        oerodeproof=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        bknown=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        lamplit=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        olocked=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        corpse_entry_idx=jnp.full((MAX_INVENTORY_SLOTS,), -1, dtype=jnp.int16),
     )
 
 

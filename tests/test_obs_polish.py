@@ -215,14 +215,17 @@ def test_screen_descriptions_shape():
 
 def test_screen_descriptions_wall_string():
     """A wall tile's description should start with 'wall'."""
+    # vendor pager.c::lookat: tile must be in visible to avoid last_seen_terrain shadowing
     state = _default_state()
     branch = int(state.dungeon.current_branch)
     level = int(state.dungeon.current_level) - 1
     new_terrain = state.terrain.at[branch, level, 2, 2].set(jnp.int8(TileType.WALL))
     new_explored = state.explored.at[branch, level, 2, 2].set(True)
+    new_visible = state.visible.at[2, 2].set(True)
     state = state.replace(
         terrain=new_terrain,
         explored=new_explored,
+        visible=new_visible,
         player_pos=jnp.array([0, 0], dtype=jnp.int16),
     )
     sd = build_screen_descriptions(state)
@@ -232,14 +235,17 @@ def test_screen_descriptions_wall_string():
 
 def test_screen_descriptions_floor_string():
     """A floor tile's description should be 'floor'."""
+    # vendor pager.c::lookat: tile must be in visible to avoid last_seen_terrain shadowing
     state = _default_state()
     branch = int(state.dungeon.current_branch)
     level = int(state.dungeon.current_level) - 1
     new_terrain = state.terrain.at[branch, level, 7, 9].set(jnp.int8(TileType.FLOOR))
     new_explored = state.explored.at[branch, level, 7, 9].set(True)
+    new_visible = state.visible.at[7, 9].set(True)
     state = state.replace(
         terrain=new_terrain,
         explored=new_explored,
+        visible=new_visible,
         player_pos=jnp.array([0, 0], dtype=jnp.int16),
     )
     sd = build_screen_descriptions(state)
@@ -249,14 +255,17 @@ def test_screen_descriptions_floor_string():
 
 def test_screen_descriptions_lava_string():
     """A lava tile description should mention 'lava'."""
+    # vendor pager.c::lookat: tile must be in visible to avoid last_seen_terrain shadowing
     state = _default_state()
     branch = int(state.dungeon.current_branch)
     level = int(state.dungeon.current_level) - 1
     new_terrain = state.terrain.at[branch, level, 5, 5].set(jnp.int8(TileType.LAVA))
     new_explored = state.explored.at[branch, level, 5, 5].set(True)
+    new_visible = state.visible.at[5, 5].set(True)
     state = state.replace(
         terrain=new_terrain,
         explored=new_explored,
+        visible=new_visible,
         player_pos=jnp.array([0, 0], dtype=jnp.int16),
     )
     sd = build_screen_descriptions(state)

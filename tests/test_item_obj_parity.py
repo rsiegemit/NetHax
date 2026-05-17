@@ -94,6 +94,8 @@ def test_item_field_count_full():
         # Wave 6 vendor obj.h additions
         "greased", "oeroded", "oeroded2", "oerodeproof", "bknown",
         "lamplit", "olocked",
+        # post-erosion-merge: corpse identity tracking field
+        "corpse_entry_idx",
     }
     assert fields == expected, (
         f"Item field-set drift:\n"

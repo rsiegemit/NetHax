@@ -50,6 +50,7 @@ def _find_type_id_by_appearance(appearance: str, obj_class: ObjectClass | None =
 
 
 def _empty_items() -> Item:
+    # post-erosion-merge: added greased/oeroded*/bknown/lamplit/olocked/corpse_entry_idx fields
     return Item(
         category=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8),
         type_id=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int16),
@@ -61,6 +62,14 @@ def _empty_items() -> Item:
         weight=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int32),
         ac_bonus=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8),
         is_two_handed=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        greased=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        oeroded=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8),
+        oeroded2=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8),
+        oerodeproof=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        bknown=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        lamplit=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        olocked=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_),
+        corpse_entry_idx=jnp.full((MAX_INVENTORY_SLOTS,), -1, dtype=jnp.int16),
     )
 
 
@@ -252,6 +261,7 @@ def test_regular_plural_es_for_sh_ending():
 
 def test_two_weapon_alternate_marker_when_toggled():
     """When state.combat.two_weapon=True and alt_slot=X, slot X gets the marker."""
+    # vendor wield.c: marker is now "(alternate weapon; not wielded)" or "(alternate weapon)"
     from Nethax.nethax.obs.inv_strs import build_inv_strs
 
     type_id = _find_type_id_by_name("dagger")
@@ -264,11 +274,12 @@ def test_two_weapon_alternate_marker_when_toggled():
     state = _FakeState(inv, two_weapon=True)
     result = build_inv_strs(state)
     s = _decode(result[2])
-    assert "(alternate weapon)" in s, f"expected '(alternate weapon)' in: {s!r}"
+    assert "(alternate weapon" in s, f"expected '(alternate weapon' in: {s!r}"
 
 
 def test_no_alternate_marker_when_two_weapon_off():
     """With two_weapon=False, the marker is suppressed even if alt_slot is set."""
+    # vendor wield.c: marker prefix is "(alternate weapon" regardless of suffix
     from Nethax.nethax.obs.inv_strs import build_inv_strs
 
     type_id = _find_type_id_by_name("dagger")
@@ -281,8 +292,8 @@ def test_no_alternate_marker_when_two_weapon_off():
     state = _FakeState(inv, two_weapon=False)
     result = build_inv_strs(state)
     s = _decode(result[2])
-    assert "(alternate weapon)" not in s, (
-        f"should not show '(alternate weapon)' when two_weapon=False: {s!r}"
+    assert "(alternate weapon" not in s, (
+        f"should not show '(alternate weapon' when two_weapon=False: {s!r}"
     )
 
 
@@ -301,5 +312,6 @@ def test_alt_marker_only_on_alt_slot():
     result = build_inv_strs(state)
     s0 = _decode(result[0])
     s1 = _decode(result[1])
-    assert "(alternate weapon)" not in s0, f"slot 0 should not be marked: {s0!r}"
-    assert "(alternate weapon)" in s1, f"slot 1 should be marked: {s1!r}"
+    # vendor wield.c: marker prefix is "(alternate weapon" regardless of suffix
+    assert "(alternate weapon" not in s0, f"slot 0 should not be marked: {s0!r}"
+    assert "(alternate weapon" in s1, f"slot 1 should be marked: {s1!r}"
