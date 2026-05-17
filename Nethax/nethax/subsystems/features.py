@@ -146,6 +146,11 @@ class FeaturesState:
                         2 = lawful;   3 = unaligned (Moloch shrines).
     door_state       : int8  [num_levels, map_h, map_w]
                        DoorState value for each tile.
+    door_trapped     : bool  [num_levels, map_h, map_w]
+                       True when the door at this tile is trapped (D_TRAPPED).
+                       Parallel bool grid mirrors vendor/nethack/include/rm.h
+                       D_TRAPPED bit on doormask; stored separately for JAX
+                       int8 array compatibility.
     """
 
     fountains_used:  jnp.ndarray   # [num_levels, map_h, map_w]  bool
@@ -173,32 +178,56 @@ class FeaturesState:
 # Door operations (Wave 3)
 # ---------------------------------------------------------------------------
 
-def open_door(state: FeaturesState, pos: jnp.ndarray, rng: jax.Array = None):
+def open_door(
+    state: FeaturesState,
+    pos: jnp.ndarray,
+    rng: jax.Array = None,
+) -> tuple["FeaturesState", jnp.ndarray]:
     """Open the door at *pos* if it is CLOSED (doopen, lock.c).
 
-    Vendor: vendor/nethack/src/lock.c::doopen checks d->doormask & D_TRAPPED
-    before opening; if set, springs trap (rnd(10) damage, door becomes BROKEN).
+    Vendor reference: vendor/nethack/src/lock.c::doopen — checks
+    ``d->doormask & D_TRAPPED`` before opening; if set, springs trap via
+    ``trapsounding()`` which deals rnd(10) damage and breaks the door.
+
+    pos : int array [3] = (level, row, col)
+    rng : optional PRNGKey for trap-damage roll (unused if door not trapped)
+
+    State transitions:
+      CLOSED + not trapped → OPEN (2), damage = 0
+      CLOSED + trapped     → BROKEN (1), damage = rnd(10), trapped bit cleared
+      All other states     → unchanged, damage = 0
 
     Returns (new_state, damage: int32).
     """
     if rng is None:
         rng = jax.random.PRNGKey(0)
     lv, row, col = pos[0], pos[1], pos[2]
-    current = state.door_state[lv, row, col].astype(jnp.int32)
+    current  = state.door_state[lv, row, col].astype(jnp.int32)
     is_closed = current == jnp.int32(DoorState.CLOSED)
     is_trapped = state.door_trapped[lv, row, col]
+
+    # Trap spring: rnd(10) = 1..10 (vendor lock.c doopen D_TRAPPED branch).
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
     trap_dmg = jax.random.randint(rng, (), minval=1, maxval=11, dtype=jnp.int32)
+
+    # Door state: trapped → BROKEN, else → OPEN (only when was CLOSED)
     new_val = jnp.where(
         is_closed & is_trapped,
         jnp.int32(DoorState.BROKEN),
         jnp.where(is_closed & ~is_trapped, jnp.int32(DoorState.OPEN), current),
     ).astype(jnp.int8)
+
+    # Damage: only when opening a trapped door
     damage = jnp.where(is_closed & is_trapped, trap_dmg, jnp.int32(0))
+
+    # Clear the trapped bit once sprung
     new_trapped = jnp.where(
         is_closed & is_trapped,
         state.door_trapped.at[lv, row, col].set(jnp.bool_(False)),
         state.door_trapped,
     )
+
     new_door_state = state.door_state.at[lv, row, col].set(new_val)
     return state.replace(door_state=new_door_state, door_trapped=new_trapped), damage
 

@@ -85,6 +85,7 @@ class NethaxEnv:
         state = populate_level_with_monsters(state, rng_monsters, n_monsters=5)
 
         # Spawn starting pet adjacent to player — vendor/nethack/src/u_init.c::makedog.
+        # Host-side (reset is not jit-compiled), so Python loops are fine.
         state = _spawn_starting_pet(state, role)
 
         # Seed the explored mask via FOV so the player can see their starting
@@ -267,5 +268,8 @@ def _step_impl(state, action, rng):
 
     new_state = jax.lax.cond(already_done, lambda _: state, _do_step, operand=None)
     obs = build_nle_observation(new_state)
-    reward = jnp.float32(0.0)
+    # Reward = score delta (NLE convention: vendor topten.c::u.urexp running
+    # accumulator, surfaced as bl_score in blstats).  Already-done steps
+    # contribute 0 since new_state == state.
+    reward = jnp.float32(new_state.scoring.score - state.scoring.score)
     return new_state, obs, reward, new_state.done

@@ -197,6 +197,8 @@ class ScoringState:
                        ASCENDED`` flag captured in really_done).
     final_score      : cached final score after compute_final_score() is run on
                        end-of-game; 0 until game-over.
+    death_cause      : DeathCause int8 — reason for game-over (0 = DIED).
+                       Set at the moment the player dies; 0 before death.
     """
     score:             jnp.ndarray  # scalar int32
     monsters_killed:   jnp.ndarray  # scalar int32
@@ -206,6 +208,7 @@ class ScoringState:
     deepest_level:     jnp.ndarray  # scalar int8
     ascended:          jnp.ndarray  # scalar bool
     final_score:       jnp.ndarray  # scalar int32
+    death_cause:       jnp.ndarray  # scalar int8  (DeathCause enum value)
 
     @classmethod
     def default(cls) -> "ScoringState":
@@ -219,6 +222,7 @@ class ScoringState:
             deepest_level=jnp.int8(1),
             ascended=jnp.bool_(False),
             final_score=jnp.int32(0),
+            death_cause=jnp.int8(0),
         )
 
 

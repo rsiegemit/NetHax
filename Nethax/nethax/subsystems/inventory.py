@@ -148,6 +148,10 @@ class Item:
     bknown: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
     lamplit: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
     olocked: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
+    # Corpse tracking: index into MONSTERS table (-1 = not a corpse).
+    # Set when a monster's death produces a corpse item; used by items_corpses.py
+    # to dispatch apply_corpse_postfx.  int16 is sufficient (NUMMONS = 381 < 32767).
+    corpse_entry_idx: jnp.ndarray = field(default_factory=lambda: jnp.int16(-1))
 
 
 def make_empty_item() -> Item:
@@ -170,6 +174,7 @@ def make_empty_item() -> Item:
         bknown=jnp.bool_(False),
         lamplit=jnp.bool_(False),
         olocked=jnp.bool_(False),
+        corpse_entry_idx=jnp.int16(-1),
     )
 
 
@@ -182,8 +187,15 @@ def make_item(
     enchantment: int = 0,
     is_two_handed: bool = False,
     buc_status: int = 0,
+    oeroded: int = 0,
+    oeroded2: int = 0,
+    oerodeproof: bool = False,
 ) -> Item:
-    """Construct a concrete Item with given fields (Python-side helper)."""
+    """Construct a concrete Item with given fields (Python-side helper).
+
+    oeroded / oeroded2 / oerodeproof mirror vendor/nethack/include/obj.h
+    bitfields (obj->oeroded, obj->oeroded2, obj->oerodeproof).
+    """
     return Item(
         category=jnp.int8(category),
         type_id=jnp.int16(type_id),
@@ -196,12 +208,13 @@ def make_item(
         ac_bonus=jnp.int8(ac_bonus),
         is_two_handed=jnp.bool_(is_two_handed),
         greased=jnp.bool_(False),
-        oeroded=jnp.int8(0),
-        oeroded2=jnp.int8(0),
-        oerodeproof=jnp.bool_(False),
+        oeroded=jnp.int8(oeroded),
+        oeroded2=jnp.int8(oeroded2),
+        oerodeproof=jnp.bool_(oerodeproof),
         bknown=jnp.bool_(False),
         lamplit=jnp.bool_(False),
         olocked=jnp.bool_(False),
+        corpse_entry_idx=jnp.int16(-1),
     )
 
 
@@ -238,6 +251,7 @@ def _stack_items(items: list) -> Item:
         bknown=jnp.array([bool(it.bknown) for it in items], dtype=jnp.bool_),
         lamplit=jnp.array([bool(it.lamplit) for it in items], dtype=jnp.bool_),
         olocked=jnp.array([bool(it.olocked) for it in items], dtype=jnp.bool_),
+        corpse_entry_idx=jnp.array([int(it.corpse_entry_idx) for it in items], dtype=jnp.int16),
     )
 
 
@@ -262,6 +276,7 @@ def _empty_items_array() -> Item:
         bknown=jnp.zeros((n,), dtype=jnp.bool_),
         lamplit=jnp.zeros((n,), dtype=jnp.bool_),
         olocked=jnp.zeros((n,), dtype=jnp.bool_),
+        corpse_entry_idx=jnp.full((n,), -1, dtype=jnp.int16),
     )
 
 
@@ -286,6 +301,7 @@ def _empty_ground_items_array(n_branches: int, max_levels: int, map_h: int, map_
         bknown=jnp.zeros(shape, dtype=jnp.bool_),
         lamplit=jnp.zeros(shape, dtype=jnp.bool_),
         olocked=jnp.zeros(shape, dtype=jnp.bool_),
+        corpse_entry_idx=jnp.full(shape, -1, dtype=jnp.int16),
     )
 
 

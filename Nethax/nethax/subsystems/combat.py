@@ -34,6 +34,40 @@ from Nethax.nethax.subsystems.inventory import (
     compute_ac as _inv_compute_ac,
 )
 from Nethax.nethax.subsystems.items_potions import apply_potion_to_monster
+from Nethax.nethax.subsystems.scoring import record_kill as _scoring_record_kill
+
+
+# ---------------------------------------------------------------------------
+# Monster XP lookup table — mirrors MONSTERS[i].level used as the XP award.
+# Vendor reference: vendor/nethack/src/mon.c::experience() — the XP a monster
+# is worth is proportional to its level (monst.c::permonst.mlevel).
+# Built once at module load (same pattern as _MONSTER_SYMBOL_TABLE in this
+# file and _MONSTER_LEVEL_TABLE in monster_ai.py).
+# ---------------------------------------------------------------------------
+def _build_monster_xp_table() -> jnp.ndarray:
+    from Nethax.nethax.constants.monsters import MONSTERS
+    return jnp.array([int(m.level) for m in MONSTERS], dtype=jnp.int32)
+
+_MONSTER_XP_TABLE: jnp.ndarray = _build_monster_xp_table()
+
+
+# ---------------------------------------------------------------------------
+# Monster primary-attack damage-type table — adtyp of attack[0] per entry.
+# Vendor reference: vendor/nethack/src/uhitm.c::mhitm_ad_were (line 4265);
+# src/were.c::set_ulycn (line 234).  Used to dispatch AD_WERE infection.
+# Built once at module load; never traced inside a jit boundary.
+# ---------------------------------------------------------------------------
+def _build_monster_primary_adtyp_table() -> jnp.ndarray:
+    from Nethax.nethax.constants.monsters import MONSTERS
+    return jnp.array(
+        [int(m.attacks[0][1]) if m.attacks else 0 for m in MONSTERS],
+        dtype=jnp.int32,
+    )
+
+_MONSTER_PRIMARY_ADTYP_TABLE: jnp.ndarray = _build_monster_primary_adtyp_table()
+
+# AD_WERE value as a module-level int constant (mirrors DamageType.AD_WERE=29).
+_AD_WERE: int = 29
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +887,24 @@ def _single_melee_strike(
     from Nethax.nethax.subsystems.conduct import Conduct, mark_violated_if
     new_state = mark_violated_if(new_state, int(Conduct.PACIFIST), killed)
 
+    # Award XP/score for kill.
+    # Vendor reference: vendor/nethack/src/mon.c::experience() — XP is based
+    # on monster level (mlevel).  We use MONSTERS[entry_idx].level as the
+    # mon_xp value (same table as monster_ai._MONSTER_LEVEL_TABLE).
+    # JIT-safe: jnp.where gates the update; no Python branch on tracers.
+    entry = jnp.clip(
+        mai.entry_idx[idx].astype(jnp.int32),
+        0, _MONSTER_XP_TABLE.shape[0] - 1,
+    )
+    mon_xp = _MONSTER_XP_TABLE[entry]
+    new_scoring = jax.lax.cond(
+        killed,
+        lambda s: _scoring_record_kill(s, jnp.int32(mon_xp)),
+        lambda s: s,
+        new_state.scoring,
+    )
+    new_state = new_state.replace(scoring=new_scoring)
+
     return new_state, dmg, hit
 
 
@@ -1001,10 +1053,11 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
     new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(0)).astype(jnp.int32)
     new_done = state.done | (new_hp <= 0)
     new_state = state.replace(player_hp=new_hp, done=new_done)
+
     # ------------------------------------------------------------------
-    # AD_WERE lycanthropy infection
-    # Vendor: vendor/nethack/src/uhitm.c::mhitm_ad_were (line 4265);
-    # src/were.c::set_ulycn (line 234).
+    # AD_WERE lycanthropy infection — vendor/nethack/src/uhitm.c:mhitm_ad_were
+    # (line 4265): when a were-creature lands a hit on the player, set
+    # u.ulycn to the were's monster type (src/were.c:set_ulycn, line 234).
     # Gates: attack landed, player not already lycanthropic, no
     # Protection_from_shape_changers intrinsic.
     # ------------------------------------------------------------------
@@ -1017,10 +1070,8 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
 
     poly = new_state.polymorph
     already_lycan = poly.lycanthropy_form >= jnp.int8(0)
-    from Nethax.nethax.subsystems.status_effects import Intrinsic  # noqa: PLC0415
-    prot_shape = new_state.status.intrinsics[
-        int(Intrinsic.PROT_FROM_SHAPE_CHANGERS)
-    ]
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    prot_shape = new_state.status.intrinsics[int(Intrinsic.PROT_FROM_SHAPE_CHANGERS)]
 
     infect_cond = (
         hit
@@ -1029,7 +1080,7 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
         & (~prot_shape)
     )
 
-    from Nethax.nethax.subsystems.polymorph import trigger_lycanthropy as _trigger_lycan  # noqa: PLC0415
+    from Nethax.nethax.subsystems.polymorph import trigger_lycanthropy as _trigger_lycan
     were_form = mai.entry_idx[idx].astype(jnp.int32)
 
     new_state = jax.lax.cond(
@@ -1148,14 +1199,17 @@ def thrown_attack(
     new_mai = mai.replace(hp=new_hp_arr, alive=new_alive_arr)
 
     # --- Potion shatter — vendor/nethack/src/dothrow.c:2262-2400 (potionhit) ---
-    # When a thrown potion reaches its target it shatters and applies its liquid
-    # effect.  JIT-pure: jax.lax.cond gates on is_potion & found_hit; lax.switch
+    # When a thrown potion reaches its target (found_hit), it shatters and
+    # applies its liquid effect instead of the weight-based damage above.
+    # JIT-pure: jax.lax.cond gates on is_potion & found_hit; lax.switch
     # inside apply_potion_to_monster selects the per-effect branch.
     is_potion = items.category[slot] == jnp.int8(int(ItemCategory.POTION))
     potion_type_id = items.type_id[slot].astype(jnp.int32)
     key_pot, _ = split_n(rng, 2)
 
     def _shatter(s):
+        # Commit new_mai (weight-based HP update cleared for potions) then
+        # overlay the potion effect onto the target monster.
         s2 = s.replace(monster_ai=new_mai)
         return apply_potion_to_monster(s2, key_pot, potion_type_id, target_idx)
 

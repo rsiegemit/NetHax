@@ -206,6 +206,9 @@ _SPELL_LEVELS  = jnp.array([lv for _, lv in _SPELL_TABLE], dtype=jnp.int32)
 # We only need spelbase, spelheal, spelstat for percent_success.
 # ---------------------------------------------------------------------------
 
+# Wizard role index (vendor/nethack/src/role.c: PM_WIZARD = 12).
+_ROLE_WIZARD = 12
+
 # Use 0 for INT-based roles, 1 for WIS-based roles
 _ROLE_SPELSTAT_IS_WIS = jnp.array(
     # Arc  Bar  Cav  Hea  Kni  Mon  Pri  Rog  Ran  Sam  Tou  Val  Wiz
@@ -1424,6 +1427,20 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
     adapter["player_pw"] = jnp.maximum(
         adapter["player_pw"] - jnp.int32(pw_cost), jnp.int32(0)
     )
+
+    # Hunger drain on successful cast (vendor spell.c:spelleffects_check lines 1322-1367).
+    # Vendor: morehungry(energy * 2) where energy = spelllev * 5.
+    # Wizard reduction: hunger cost reduced by ACURR(A_INT) for wizards (line ~1340).
+    if not failed:
+        nutrition_cost = jnp.int32(lv * 5 * 2)
+        is_wizard = jnp.int32(state.player_role) == jnp.int32(_ROLE_WIZARD)
+        wiz_reduction = jnp.minimum(
+            nutrition_cost, state.player_int.astype(jnp.int32)
+        )
+        nutrition_cost = jnp.where(is_wizard, nutrition_cost - wiz_reduction, nutrition_cost)
+        old_nutrition = adapter["status"].nutrition
+        new_nutrition = jnp.maximum(old_nutrition - nutrition_cost, jnp.int32(0))
+        adapter["status"] = adapter["status"].replace(nutrition=new_nutrition)
 
     # Decrement spell memory (Wave 3 simplified: -1 per cast, floor 0)
     magic = adapter["magic"]

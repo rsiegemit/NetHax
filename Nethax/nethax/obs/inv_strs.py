@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from Nethax.nethax.constants.objects import OBJECTS, ObjectClass
+from Nethax.nethax.constants.objects import OBJECTS, ObjectClass, Material
 from Nethax.nethax.subsystems.items import BUCStatus
 from Nethax.nethax.subsystems.inventory import (
     MAX_INVENTORY_SLOTS,
@@ -87,6 +87,84 @@ _OBJECT_CLASS: jnp.ndarray = jnp.array(
     [int(obj.class_) for obj in OBJECTS],
     dtype=jnp.uint8,
 )  # uint8[NUM_OBJECTS]
+
+# ---------------------------------------------------------------------------
+# Erosion rendering tables
+# Canonical: vendor/nethack/src/objnam.c::add_erosion_words() lines 1142-1191
+# ---------------------------------------------------------------------------
+
+# Per-object erosion material class:
+#   0 = no erosion applicable
+#   1 = rustprone  (IRON/METAL/MITHRIL/PLATINUM)
+#   2 = flammable  (LEATHER/WOOD/CLOTH/PAPER/WAX/VEGGY/FLESH)
+#   3 = corrodeable-only (COPPER/SILVER/GOLD — oeroded2->corrode, no oeroded word)
+# Mirrors: is_rustprone / is_flammable / is_corrodeable in vendor/nethack/src/obj*.
+_EROSION_RUST_MAT = {int(Material.IRON), int(Material.METAL), int(Material.MITHRIL), int(Material.PLATINUM)}
+_EROSION_CORRODE_MAT = {int(Material.COPPER), int(Material.SILVER), int(Material.GOLD)}
+_EROSION_FLAME_MAT = {
+    int(Material.LEATHER),
+    int(Material.WOOD),
+    int(Material.CLOTH),
+    int(Material.PAPER),
+    int(Material.WAX),
+    int(Material.VEGGY),
+    int(Material.FLESH),
+}
+
+
+def _erosion_mat_class(obj) -> int:
+    m = int(obj.material)
+    if m in _EROSION_RUST_MAT:
+        return 1
+    if m in _EROSION_CORRODE_MAT:
+        return 3
+    if m in _EROSION_FLAME_MAT:
+        return 2
+    return 0
+
+
+_OBJECT_EROSION_CLASS: jnp.ndarray = jnp.array(
+    [_erosion_mat_class(obj) for obj in OBJECTS],
+    dtype=jnp.uint8,
+)  # uint8[NUM_OBJECTS]: 0=none,1=rustprone,2=flammable,3=corrodeable-only
+
+# Erosion word tables indexed [mat_class 0..3][level 0..3].
+# vendor/nethack/src/objnam.c lines 1156-1168 (oeroded), 1169-1178 (oeroded2).
+_MAX_EROSION_WORD_LEN = 22  # "thoroughly corroded \0" = 21 bytes
+
+_EROSION_OERODED_STRS = [
+    ["", "", "", ""],  # mat 0: none
+    ["", "rusty ", "very rusty ", "thoroughly rusty "],  # mat 1: rustprone
+    ["", "burnt ", "very burnt ", "thoroughly burnt "],  # mat 2: flammable
+    ["", "", "", ""],  # mat 3: corrode-only (oeroded unused)
+]
+_EROSION_OERODED2_STRS = [
+    ["", "", "", ""],  # mat 0: none
+    ["", "corroded ", "very corroded ", "thoroughly corroded "],  # mat 1: rustprone->corrode
+    ["", "rotted ", "very rotted ", "thoroughly rotted "],  # mat 2: flammable->rot
+    ["", "corroded ", "very corroded ", "thoroughly corroded "],  # mat 3: corrode-only
+]
+_EROSION_PROOF_STRS = ["", "rustproof ", "fireproof ", "corrodeproof "]
+_ROTPROOF_STR = "rotproof "  # mat_class 2 + oerodeproof + oeroded2 nonzero
+
+_EROSION_OERODED_BYTES: jnp.ndarray = jnp.array(
+    [[_pad_bytes(w, _MAX_EROSION_WORD_LEN) for w in row] for row in _EROSION_OERODED_STRS],
+    dtype=jnp.uint8,
+)  # uint8[4, 4, _MAX_EROSION_WORD_LEN]
+
+_EROSION_OERODED2_BYTES: jnp.ndarray = jnp.array(
+    [[_pad_bytes(w, _MAX_EROSION_WORD_LEN) for w in row] for row in _EROSION_OERODED2_STRS],
+    dtype=jnp.uint8,
+)  # uint8[4, 4, _MAX_EROSION_WORD_LEN]
+
+_EROSION_PROOF_BYTES: jnp.ndarray = jnp.array(
+    [_pad_bytes(w, _MAX_EROSION_WORD_LEN) for w in _EROSION_PROOF_STRS],
+    dtype=jnp.uint8,
+)  # uint8[4, _MAX_EROSION_WORD_LEN]
+
+_ROTPROOF_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes(_ROTPROOF_STR, _MAX_EROSION_WORD_LEN), dtype=jnp.uint8
+)  # uint8[_MAX_EROSION_WORD_LEN]
 
 # BUC words — index 0=empty, 1=cursed, 2=uncursed, 3=blessed
 # Matches BUCStatus enum: UNKNOWN=0, CURSED=1, UNCURSED=2, BLESSED=3
@@ -207,6 +285,68 @@ def _build_vowel_mask() -> jnp.ndarray:
     return jnp.array(mask, dtype=jnp.bool_)
 
 _VOWEL_MASK: jnp.ndarray = _build_vowel_mask()  # bool[256]
+
+
+# Per-object "use 'an'" table — True iff the item's effective display name
+# starts with a vowel-sound that warrants "an" (rather than "a").
+# Implements the same exception logic as vendor/nethack/src/objnam.c::just_an()
+# lines 2108-2142 but evaluated at module load time on the known object names
+# and appearance strings (not inside JIT).
+#
+# Long-u / 'one' exceptions (vendor just_an lines 2129-2135):
+#   starts with "eu", "uke", "ukulele", "unicorn", "uranium", "useful" -> "a"
+# Single-letter rule (vendor just_an line 2117):
+#   only letters in "aefhilmnosx" take "an"
+# 'x' + consonant (vendor just_an line 2136): -> "an"
+_LONG_U_PREFIXES_INV = ("eu", "uke", "ukulele", "unicorn", "uranium", "useful")
+_AN_SINGLE_LETTERS_INV = set("aefhilmnosx")
+_NO_ARTICLE_NAMES_INV = {"molten lava", "iron bars", "ice"}
+
+
+def _compute_use_an(name: str | None) -> bool:
+    """Return True iff just_an() would choose 'an' for this name.
+
+    Port of vendor/nethack/src/objnam.c::just_an() lines 2108-2142.
+    Evaluated at module load time to populate static per-object tables.
+    """
+    if not name:
+        return False
+    lower = name.lower()
+    if lower in _NO_ARTICLE_NAMES_INV:
+        return False
+    if lower.startswith("the "):
+        return False
+    c0 = lower[0]
+    # Single-letter word (just_an line 2115-2117)
+    if len(name) == 1 or name[1] == ' ':
+        return c0 in _AN_SINGLE_LETTERS_INV
+    if c0 in "aeiou":
+        # 'one' + separator -> "a" (just_an line 2130)
+        if lower.startswith("one") and (len(name) == 3 or name[3] in "-_ "):
+            return False
+        # long-u prefixes -> "a" (just_an lines 2132-2135)
+        for pfx in _LONG_U_PREFIXES_INV:
+            if lower.startswith(pfx):
+                return False
+        return True
+    # 'x' + consonant -> "an" (just_an line 2136)
+    if c0 == 'x' and len(name) > 1 and name[1].lower() not in "aeiou":
+        return True
+    return False
+
+
+# shape (NUM_OBJECTS,) — True means write "an ", False means write "a ".
+# Based on canonical name (identified path).
+_OBJECT_USE_AN: jnp.ndarray = jnp.array(
+    [_compute_use_an(obj.name) for obj in OBJECTS],
+    dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS]
+
+# Same for appearance descriptions (unidentified path).
+_APP_USE_AN: jnp.ndarray = jnp.array(
+    [_compute_use_an(obj.description) for obj in OBJECTS],
+    dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS]
 
 
 # Suffix-level irregular plurals (apply to compound words too:
@@ -350,9 +490,10 @@ _APPEARANCE_BYTES_PADDED: jnp.ndarray = jnp.array(
 _NAMED_PREFIX_BYTES: jnp.ndarray = jnp.array(
     _pad_bytes(" named ", 8), dtype=jnp.uint8,
 )  # uint8[8]
+# Vendor objnam.c line 1619 emits " (alternate weapon; not wielded)".
 _ALT_WEAPON_BYTES: jnp.ndarray = jnp.array(
-    _pad_bytes(" (alternate weapon)", 20), dtype=jnp.uint8,
-)  # uint8[20]
+    _pad_bytes(" (alternate weapon; not wielded)", 33), dtype=jnp.uint8,
+)  # uint8[33]
 
 
 # ---------------------------------------------------------------------------
@@ -548,22 +689,24 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     # Slot is empty when category == 0 OR slot_idx >= MAX_INVENTORY_SLOTS
     is_empty = (category == jnp.int32(0)) | (slot_idx >= jnp.int32(MAX_INVENTORY_SLOTS))
 
-    # Precompute the first byte that determines the a/an article.  The
-    # article precedes BUC/enchant/name, so we pick the first byte of
-    # whichever segment will actually be written first:
-    #   - BUC word (if buc known)
+    # Precompute the a/an article choice.  The article precedes BUC/enchant/
+    # name, so we pick whichever segment will actually be written first:
+    #   - BUC word (if buc known): "blessed"/"cursed"/"uncursed" all start
+    #     with a consonant, so always "a ".
     #   - appearance description (if unidentified + has appearance)
     #   - canonical name (otherwise)
+    # We use pre-computed _OBJECT_USE_AN / _APP_USE_AN tables (built at
+    # module load via just_an() logic) to encode all vendor exceptions
+    # (long-u, 'one', single-letter, x-consonant).
+    # Vendor: objnam.c::just_an() lines 2108-2142.
     safe_type = jnp.clip(type_id, 0, _MAX_OBJ - 1).astype(jnp.int32)
     has_app   = _HAS_APPEARANCE[safe_type]
     buc_known = buc_status != jnp.int32(BUCStatus.UNKNOWN)
     buc_row   = jnp.clip(buc_status, 0, 3).astype(jnp.int32)
-    buc_first = _BUC_BYTES[buc_row, 0]
-    app_first = _APPEARANCE_BYTES[safe_type, 0]
-    name_first = _OBJECT_NAMES_BYTES[safe_type, 0]
     show_app  = (~identified) & has_app
-    noun_first = jnp.where(show_app, app_first, name_first)
-    article_first = jnp.where(buc_known, buc_first, noun_first)
+    # BUC words are all consonant-initial -> use_an = False.
+    noun_use_an = jnp.where(show_app, _APP_USE_AN[safe_type], _OBJECT_USE_AN[safe_type])
+    article_use_an = jnp.where(buc_known, jnp.bool_(False), noun_use_an)
 
     def render_nonempty(args):
         b, c = args
@@ -575,13 +718,14 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         b, c = _write_byte(b, c, jnp.uint8(ord('-')))
         b, c = _write_byte(b, c, jnp.uint8(ord(' ')))
 
-        # 2. Quantity word: "<N> " for stacks, "a " or "an " for singletons.
-        # Wave 6: vowel check via _VOWEL_MASK selects between 'a' and 'an'.
+        # 2. Quantity word: "<N> " for stacks, "a "/"an " for singletons.
+        # Full just_an() exceptions via _OBJECT_USE_AN/_APP_USE_AN tables.
+        # Vendor: objnam.c::just_an() lines 2108-2142.
         is_plural = quantity > jnp.int32(1)
         b, c = lax.cond(
             is_plural,
             lambda bc: _write_uint_space(bc[0], bc[1], quantity),
-            lambda bc: _write_article_space(bc[0], bc[1], article_first),
+            lambda bc: _write_article_space(bc[0], bc[1], article_use_an),
             (b, c),
         )
 
@@ -589,6 +733,25 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         b, c = lax.cond(
             buc_known,
             lambda bc: _write_buc(bc[0], bc[1], buc_row),
+            lambda bc: bc,
+            (b, c),
+        )
+
+        # 3b. Erosion prefix (rusty/burnt/corroded/rotted/rustproof/fireproof/…)
+        # Canonical: vendor/nethack/src/objnam.c::add_erosion_words() lines 1142-1191.
+        # Read erosion fields from the item; clamp levels to 0-3.
+        oeroded      = inv_state.items.oeroded[safe_idx].astype(jnp.int32)
+        oeroded2     = inv_state.items.oeroded2[safe_idx].astype(jnp.int32)
+        oerodeproof  = inv_state.items.oerodeproof[safe_idx]
+        erod_lvl1 = jnp.clip(oeroded,  0, 3)
+        erod_lvl2 = jnp.clip(oeroded2, 0, 3)
+        emat_class = _OBJECT_EROSION_CLASS[safe_type].astype(jnp.int32)
+        has_erosion = (emat_class > jnp.int32(0)) & (
+            (erod_lvl1 > jnp.int32(0)) | (erod_lvl2 > jnp.int32(0)) | oerodeproof
+        )
+        b, c = lax.cond(
+            has_erosion,
+            lambda bc: _write_erosion(bc[0], bc[1], emat_class, erod_lvl1, erod_lvl2, oerodeproof),
             lambda bc: bc,
             (b, c),
         )
@@ -689,19 +852,19 @@ def _write_a_space(buf, cursor):
     return buf, cursor
 
 
-def _write_article_space(buf, cursor, first_byte):
-    """Write 'a ' or 'an ' based on whether *first_byte* starts a vowel.
+def _write_article_space(buf, cursor, use_an):
+    """Write 'a ' or 'an ' based on *use_an* boolean.
 
-    Mirrors vendor/nethack/src/objnam.c::an, which picks 'an' when the
-    following word begins with a vowel ('a','e','i','o','u').
+    Full port of vendor/nethack/src/objnam.c::just_an() lines 2108-2142.
+    *use_an* is pre-computed at module load time via _OBJECT_USE_AN /
+    _APP_USE_AN tables (which encode the long-u / 'one' / single-letter /
+    x-consonant exceptions), so this function stays JIT-compatible while
+    applying all vendor exception rules.
     """
-    safe = first_byte.astype(jnp.int32)
-    safe = jnp.clip(safe, 0, 255)
-    is_vowel = _VOWEL_MASK[safe]
     # Write 'a' always, conditionally append 'n', then a space.
     buf, cursor = _write_byte(buf, cursor, jnp.uint8(ord('a')))
     buf, cursor = lax.cond(
-        is_vowel,
+        use_an,
         lambda bc: _write_byte(bc[0], bc[1], jnp.uint8(ord('n'))),
         lambda bc: bc,
         (buf, cursor),
@@ -715,6 +878,44 @@ def _write_buc(buf, cursor, buc_row):
     buc_src = _BUC_BYTES[buc_row]
     buf, cursor = _write_fixed(buf, cursor, buc_src, _MAX_BUC_LEN)
     buf, cursor = _write_space(buf, cursor)
+    return buf, cursor
+
+
+def _write_erosion(buf, cursor, emat_class, erod_lvl1, erod_lvl2, oerodeproof):
+    """Write erosion prefix words for an item.
+
+    Mirrors vendor/nethack/src/objnam.c::add_erosion_words() lines 1142-1191.
+
+    oeroded  (erod_lvl1 1-3) -> rusty/burnt series based on emat_class.
+    oeroded2 (erod_lvl2 1-3) -> corroded/rotted series.
+    oerodeproof (rknown)     -> rustproof/fireproof/corrodeproof/rotproof.
+    All words are table-looked-up (JIT-compatible; no Python branching at trace).
+    """
+    # oeroded word (rust/burn)
+    oeroded_src = _EROSION_OERODED_BYTES[emat_class, erod_lvl1]
+    buf, cursor = _write_fixed(buf, cursor, oeroded_src, _MAX_EROSION_WORD_LEN)
+
+    # oeroded2 word (corrode/rot)
+    oeroded2_src = _EROSION_OERODED2_BYTES[emat_class, erod_lvl2]
+    buf, cursor = _write_fixed(buf, cursor, oeroded2_src, _MAX_EROSION_WORD_LEN)
+
+    # proof prefix: rustproof/fireproof/corrodeproof (indexed by emat_class).
+    # For mat_class 2 (flammable), oeroded2 controls "rotproof" separately.
+    # vendor objnam.c line 1183: rknown && oerodeproof
+    proof_src = _EROSION_PROOF_BYTES[emat_class]
+    is_rotproof = oerodeproof & (emat_class == jnp.int32(2)) & (erod_lvl2 > jnp.int32(0))
+    buf, cursor = lax.cond(
+        oerodeproof & ~is_rotproof,
+        lambda bc: _write_fixed(bc[0], bc[1], proof_src, _MAX_EROSION_WORD_LEN),
+        lambda bc: bc,
+        (buf, cursor),
+    )
+    buf, cursor = lax.cond(
+        is_rotproof,
+        lambda bc: _write_fixed(bc[0], bc[1], _ROTPROOF_BYTES, _MAX_EROSION_WORD_LEN),
+        lambda bc: bc,
+        (buf, cursor),
+    )
     return buf, cursor
 
 
@@ -823,13 +1024,13 @@ def _write_user_name(buf, cursor, name_row):
 
 
 def _write_alt_weapon(buf, cursor):
-    """Append ' (alternate weapon)' to the buffer.
+    """Append ' (alternate weapon; not wielded)' to the buffer.
 
+    Vendor objnam.c line 1619 emits ' (alternate weapon; not wielded)'.
     Emitted when ``state.combat.two_weapon`` is True and the slot matches
-    ``state.inventory.alternate_weapon_slot``.  Mirrors the two-weapon
-    status marker shown by vendor/nethack/src/wield.c.
+    ``state.inventory.alternate_weapon_slot``.
     """
-    buf, cursor = _write_fixed(buf, cursor, _ALT_WEAPON_BYTES, 20)
+    buf, cursor = _write_fixed(buf, cursor, _ALT_WEAPON_BYTES, 33)
     return buf, cursor
 
 

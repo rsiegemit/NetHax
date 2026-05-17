@@ -140,7 +140,11 @@ class EnvState:
     terrain: jax.Array          # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]  tile type
     explored: jax.Array         # bool[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]
     visible: jax.Array          # bool[MAP_H, MAP_W]  FOV for current level only
-    last_seen_terrain: jax.Array  # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]; -1=never seen (vendor display.c lastseentyp ~line 850)
+    # Last-seen terrain: mirrors vendor/nethack/src/display.c::lastseentyp[x][y]
+    # (~line 850). Stores the terrain type last observed at each cell; -1 = never
+    # seen. Off-FOV explored tiles render from this layer so that terrain changes
+    # (monster opens door, digging) are not immediately visible to the player.
+    last_seen_terrain: jax.Array  # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]
 
     # ---- Ground items (item stack per tile) ----
     # Item[N_BRANCHES, MAX_LEVELS, MAP_H, MAP_W, MAX_GROUND_STACK]

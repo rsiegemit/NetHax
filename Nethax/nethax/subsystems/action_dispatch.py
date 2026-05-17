@@ -114,6 +114,7 @@ from Nethax.nethax.subsystems.status_effects import (
     compute_hunger_state,
     MAX_NUTRITION,
 )
+from Nethax.nethax.subsystems.items_corpses import apply_corpse_postfx as _corpse_postfx
 from Nethax.nethax.subsystems.magic import N_SPELLS
 from Nethax.nethax.subsystems.conduct import (
     Conduct as _Conduct,
@@ -732,6 +733,16 @@ def _handle_eat(state, rng):
     new_state = _mark_violated_if(new_state, int(_Conduct.FOODLESS), found)
     new_state = _mark_violated_if(new_state, int(_Conduct.VEGETARIAN), found & _is_meat_material(eaten_material))
     new_state = _mark_violated_if(new_state, int(_Conduct.VEGAN), found & _is_animal_material(eaten_material))
+
+    # Corpse special-effects (eat.c::cpostfx lines 1129-1328).
+    # Gate on corpse_entry_idx >= 0 (sentinel -1 = plain food, not a corpse).
+    # cite: vendor/nethack/src/eat.c::eatcorpse line 1090
+    corpse_idx = items.corpse_entry_idx[safe_slot].astype(jnp.int32)
+    is_corpse_item = found & (corpse_idx >= jnp.int32(0))
+    # Use jnp.where on the idx so the postfx sees -1 when not a corpse → no-op.
+    effective_corpse_idx = jnp.where(is_corpse_item, corpse_idx, jnp.int32(-1))
+    new_state = _corpse_postfx(new_state, rng, effective_corpse_idx)
+
     return new_state
 
 

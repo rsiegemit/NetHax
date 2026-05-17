@@ -1406,7 +1406,11 @@ def build_glyphs(env_state) -> jnp.ndarray:
     1. Slice current level terrain from env_state.terrain[branch, level-1, :21, :79].
     2. Map each tile type through _TILE_TO_CMAP to get a cmap symbol index.
     3. Add GLYPH_CMAP_OFF to get NLE glyph ID.
-    4. Where explored==False, substitute NO_GLYPH (cast to int16).
+    4. Three-way visibility split (mirrors vendor/nethack/src/display.c::lastseentyp
+       ~line 850):
+         - visible tile      → render from terrain (live truth)
+         - explored+not-visible → render from last_seen_terrain (stale memory)
+         - unexplored        → NO_GLYPH
     5. Overlay the player glyph (GLYPH_MON_OFF + 0) at player_pos.
 
     Returns:
@@ -1417,15 +1421,15 @@ def build_glyphs(env_state) -> jnp.ndarray:
 
     # terrain shape: [N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H=21, MAP_W=80]
     # NLE glyphs shape: [21, 79] — trim last column
-    level_terrain = env_state.terrain[branch, level_idx, :21, :79]        # int8[21,79]
-    last_seen = env_state.last_seen_terrain[branch, level_idx, :21, :79]  # int8[21,79]
-    visible = env_state.visible[:21, :79]                                  # bool[21,79]
-    explored = env_state.explored[branch, level_idx, :21, :79]            # bool[21,79]
+    level_terrain = env_state.terrain[branch, level_idx, :21, :79]         # int8[21,79]
+    last_seen = env_state.last_seen_terrain[branch, level_idx, :21, :79]   # int8[21,79]
 
-    # Three-way split (vendor display.c lastseentyp ~line 850):
-    #   visible           -> live terrain
-    #   explored+invisible -> last_seen_terrain (stale; -1 sentinel falls back to 0)
-    #   unexplored        -> NO_GLYPH below
+    # For explored-but-not-visible tiles use last_seen_terrain; sentinel -1
+    # (never seen) falls back to 0 (VOID/stone) which renders as NO_GLYPH anyway.
+    visible = env_state.visible[:21, :79]                                   # bool[21,79]
+    explored = env_state.explored[branch, level_idx, :21, :79]             # bool[21,79]
+
+    # Pick the terrain source per cell.
     display_terrain = jnp.where(
         visible,
         level_terrain,
@@ -1434,13 +1438,13 @@ def build_glyphs(env_state) -> jnp.ndarray:
 
     # Clamp tile index to valid _TILE_TO_CMAP range (in case of corrupt data)
     tile_idx = jnp.clip(display_terrain.astype(jnp.int16), 0, NUM_TILE_TYPES - 1)
-    cmap_idx = _TILE_TO_CMAP[tile_idx]                                    # int16[21,79]
+    cmap_idx = _TILE_TO_CMAP[tile_idx]                                     # int16[21,79]
 
     # Terrain glyph IDs
     terrain_glyphs = (cmap_idx + jnp.int16(GLYPH_CMAP_OFF)).astype(jnp.int16)
 
     # Unexplored tiles -> NO_GLYPH
-    no_glyph_val = jnp.int16(NO_GLYPH & 0xFFFF)                          # NO_GLYPH as int16
+    no_glyph_val = jnp.int16(NO_GLYPH & 0xFFFF)                           # NO_GLYPH as int16
     glyphs = jnp.where(explored, terrain_glyphs, no_glyph_val)
 
     # Overlay player at player_pos (row, col).
