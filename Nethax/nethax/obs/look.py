@@ -250,8 +250,8 @@ def _terrain_noun(state, r: int, c: int) -> str:
 
 # Engraving kind constants (mirrors engrave.py ENGR_* lines 43-47).
 _ENGR_DUST    = 1
-_ENGR_BURN    = 2
-_ENGR_ENGRAVE = 3
+_ENGR_ENGRAVE = 2
+_ENGR_BURN    = 3
 
 
 def _engrave_descriptor(state, r: int, c: int) -> List[str]:

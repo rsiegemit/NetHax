@@ -68,6 +68,10 @@ def _make_empty_items() -> Item:
         bknown=jnp.zeros((n,), dtype=jnp.bool_),
         lamplit=jnp.zeros((n,), dtype=jnp.bool_),
         olocked=jnp.zeros((n,), dtype=jnp.bool_),
+        corpse_entry_idx=jnp.full((n,), -1, dtype=jnp.int16),
+        recharged=jnp.zeros((n,), dtype=jnp.int8),
+        corpse_creation_turn=jnp.full((n,), -1, dtype=jnp.int32),
+        tin_poisoned=jnp.zeros((n,), dtype=jnp.bool_),
     )
 
 
@@ -84,6 +88,7 @@ def _make_inv_state(items: Item) -> InventoryState:
         quiver=jnp.int8(-1),
         total_weight=jnp.int32(0),
         user_names=jnp.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=jnp.int8),
+        wielded_artifact_idx=jnp.int8(-1),
     )
 
 
