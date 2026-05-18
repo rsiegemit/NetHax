@@ -377,3 +377,25 @@ def build_look_here_text(state) -> str:
 
     engrave_lines = _engrave_descriptor(state, pr, pc)
     return "\n".join(lines + engrave_lines)
+
+
+# ---------------------------------------------------------------------------
+# _s_suffix — hacklib.c:345-359
+# ---------------------------------------------------------------------------
+
+def _s_suffix(name: str) -> str:
+    """Return the possessive form of *name*.
+
+    Rules (vendor/nethack/src/hacklib.c::s_suffix lines 345-359):
+      "it"  → "its"
+      "you" → "your"
+      word ending in 's' → word + "'"
+      otherwise          → word + "'s"
+    """
+    if name == "it":
+        return "its"
+    if name == "you":
+        return "your"
+    if name.endswith("s"):
+        return name + "'"
+    return name + "'s"

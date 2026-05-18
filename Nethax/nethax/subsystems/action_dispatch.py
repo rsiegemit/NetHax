@@ -924,10 +924,17 @@ def _handle_zap(state, rng):
         mon_asleep    = state.monster_ai.asleep,
         mon_undead    = jnp.zeros_like(state.monster_ai.alive),
         mon_invisible = jnp.zeros_like(state.monster_ai.alive),
+        # TODO: wire from MonsterAIState when per-monster resist/speed fields exist
+        mon_resists   = jnp.zeros_like(state.monster_ai.hp, dtype=jnp.int32),
+        mon_speed_mod = jnp.zeros(state.monster_ai.hp.shape[0], dtype=jnp.int8),
+        mon_cancelled = jnp.zeros_like(state.monster_ai.alive, dtype=jnp.bool_),
         terrain       = terrain_2d,
         explored      = explored_2d,
         inventory     = state.inventory,
         player_pos    = state.player_pos,
+        dungeon_level = state.dungeon.current_level.astype(jnp.int8),
+        probed_hp     = jnp.int32(0),
+        probed_idx    = jnp.int32(-1),
     )
 
     new_wand = _wands_handle_zap(wand_state, rng)
