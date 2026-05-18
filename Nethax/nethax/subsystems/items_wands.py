@@ -119,6 +119,14 @@ _MONSTER_GEN_LEVEL: jax.Array = jnp.array(
     [m.level for m in MONSTERS], dtype=jnp.int8
 )
 
+# int32[N_MONSTERS] — simplified hp_max for polymorph form rescaling.
+# new_hp_max = max(level + 1, 1) * 8 — mirrors polymorph.py::_form_hp_max
+# deterministic path.  Used by _effect_polymorph on_hit.
+# Cite: vendor/nethack/src/zap.c::newcham HP-scaling, makemon.c::newmonhp.
+_POLY_FORM_HP_MAX: jax.Array = jnp.array(
+    [max(m.level + 1, 1) * 8 for m in MONSTERS], dtype=jnp.int32
+)
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -248,6 +256,7 @@ class WandState:
     """
     mon_pos:       jax.Array   # int16[N, 2]
     mon_hp:        jax.Array   # int32[N]
+    mon_hp_max:    jax.Array   # int32[N]  — used by drain_life HP-max reduction
     mon_type:      jax.Array   # int16[N]
     mon_alive:     jax.Array   # bool[N]
     mon_asleep:    jax.Array   # bool[N]
@@ -268,6 +277,11 @@ class WandState:
     probed_hp:     jax.Array   # int32 scalar
     probed_idx:    jax.Array   # int32 scalar
 
+    # Reflection intrinsic — when True, rays hitting player are bounced back.
+    # Cite: vendor/nethack/src/artifact.c::arti_prop AMULET_OF_REFLECTION +
+    # zap.c::buzz reflection path.
+    player_reflecting: jax.Array  # bool scalar
+
     @classmethod
     def empty(cls, map_h: int = 21, map_w: int = 80) -> "WandState":
         """Return a zero-initialised WandState (no monsters, empty inventory)."""
@@ -275,6 +289,7 @@ class WandState:
         return cls(
             mon_pos=jnp.zeros((n, 2), dtype=jnp.int16),
             mon_hp=jnp.zeros(n, dtype=jnp.int32),
+            mon_hp_max=jnp.zeros(n, dtype=jnp.int32),
             mon_type=jnp.zeros(n, dtype=jnp.int16),
             mon_alive=jnp.zeros(n, dtype=bool),
             mon_asleep=jnp.zeros(n, dtype=bool),
@@ -290,6 +305,7 @@ class WandState:
             dungeon_level=jnp.int8(1),
             probed_hp=jnp.int32(0),
             probed_idx=jnp.int32(0),
+            player_reflecting=jnp.bool_(False),
         )
 
 
@@ -461,40 +477,126 @@ def _effect_nothing(
 def _effect_secret_door_detection(
     state: WandState, rng: jax.Array
 ) -> tuple[WandState, jax.Array]:
-    """WAN_SECRET_DOOR_DETECTION — reveal all tiles (simplified detect_doors).
+    """WAN_SECRET_DOOR_DETECTION — reveals SDOOR/SCORR tiles only.
 
-    NetHack reveals secret doors; we mark the full map as explored.
+    Cite: vendor/nethack/src/detect.c::findone (line ~1093). The wand
+    converts SDOOR→DOOR (closed) and SCORR→CORR on the current level.
+    It does NOT reveal arbitrary terrain, only the hidden ones.
     """
-    new_explored = jnp.ones_like(state.explored)
-    return state.replace(explored=new_explored), rng
+    from Nethax.nethax.constants.tiles import VendorTileType
+    # SDOOR (14) → CLOSED_DOOR; SCORR (15) → CORRIDOR.
+    is_sdoor = state.terrain == jnp.int8(int(VendorTileType.SDOOR))
+    is_scorr = state.terrain == jnp.int8(int(VendorTileType.SCORR))
+    new_terrain = jnp.where(is_sdoor,
+                            jnp.int8(int(TileType.CLOSED_DOOR)),
+                            state.terrain)
+    new_terrain = jnp.where(is_scorr,
+                            jnp.int8(int(TileType.CORRIDOR)),
+                            new_terrain)
+    return state.replace(terrain=new_terrain), rng
 
 
 def _effect_opening(
-    state: WandState, rng: jax.Array
+    state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_OPENING — open closed doors with 50% probability each.
+    """WAN_OPENING — RAY: opens the first closed/locked door along the path.
 
-    Cite: vendor/nethack/src/zap.c wand_unlock — targets a single door,
-    not all doors.  We approximate with per-door 50% coin flip so that
-    on average half of doors open, matching the spirit of the vendor logic.
+    Cite: vendor/nethack/src/zap.c::wand_unlock (line ~4600) — beam stops at
+    the first closed/locked door, opening it.  RAY propagation matches the
+    other directed wands (cite zap.c::buzz line 4823: rn1(7,7) range).
+    Also unlocks containers on the targeted tile (TODO: wire container hits).
     """
-    rng, sub = jax.random.split(rng)
-    map_h, map_w = state.terrain.shape
-    # Coin flip per cell: uniform in {0,1}.
-    coins = jax.random.randint(sub, shape=(map_h, map_w), minval=0, maxval=2)
-    is_closed = state.terrain == int(TileType.CLOSED_DOOR)
-    open_this = is_closed & (coins == 1)
-    new_terrain = jnp.where(open_this, int(TileType.OPEN_DOOR), state.terrain)
-    return state.replace(terrain=new_terrain), rng
+    def on_hit_door(s, r, pos):
+        # Open the door at this tile.
+        tr, tc = pos[0], pos[1]
+        cur = s.terrain[tr, tc]
+        is_closed = cur == jnp.int8(int(TileType.CLOSED_DOOR))
+        new_t = jnp.where(is_closed,
+                          jnp.int8(int(TileType.OPEN_DOOR)),
+                          cur)
+        new_terrain = s.terrain.at[tr, tc].set(new_t)
+        return s.replace(terrain=new_terrain), r
+
+    # cast_ray walks tiles; stop at first door (any closed door).
+    return _cast_ray_terrain_predicate(
+        state, rng, direction,
+        target=int(TileType.CLOSED_DOOR),
+        on_tile_fn=on_hit_door,
+    )
 
 
 def _effect_locking(
-    state: WandState, rng: jax.Array
+    state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_LOCKING — close all open doors on the level."""
-    is_open = state.terrain == int(TileType.OPEN_DOOR)
-    new_terrain = jnp.where(is_open, int(TileType.CLOSED_DOOR), state.terrain)
-    return state.replace(terrain=new_terrain), rng
+    """WAN_LOCKING — RAY: closes the first open door along the path.
+
+    Cite: vendor/nethack/src/zap.c::wand_unlock + locking branch.
+    """
+    def on_hit_door(s, r, pos):
+        tr, tc = pos[0], pos[1]
+        cur = s.terrain[tr, tc]
+        is_open = cur == jnp.int8(int(TileType.OPEN_DOOR))
+        new_t = jnp.where(is_open,
+                          jnp.int8(int(TileType.CLOSED_DOOR)),
+                          cur)
+        new_terrain = s.terrain.at[tr, tc].set(new_t)
+        return s.replace(terrain=new_terrain), r
+
+    return _cast_ray_terrain_predicate(
+        state, rng, direction,
+        target=int(TileType.OPEN_DOOR),
+        on_tile_fn=on_hit_door,
+    )
+
+
+def _cast_ray_terrain_predicate(state, rng, direction, target, on_tile_fn,
+                                max_range: int = 13):
+    """Walk a ray from player_pos in `direction` up to `max_range` tiles,
+    firing `on_tile_fn(state, rng, pos)` on the first tile matching `target`.
+
+    Vendor: zap.c::buzz line 4823 — rn1(7,7) range = 7..13. We use the upper
+    bound here (worst case), gated by tile match.
+
+    JIT-pure via lax.fori_loop with a `done` flag.
+    """
+    dir_table = jnp.array([
+        [-1,  0],  # N
+        [-1,  1],  # NE
+        [ 0,  1],  # E
+        [ 1,  1],  # SE
+        [ 1,  0],  # S
+        [ 1, -1],  # SW
+        [ 0, -1],  # W
+        [-1, -1],  # NW
+    ], dtype=jnp.int32)
+    dir_idx = jnp.clip(jnp.asarray(direction, jnp.int32), 0, 7)
+    dy = dir_table[dir_idx, 0]
+    dx = dir_table[dir_idx, 1]
+    map_h, map_w = state.terrain.shape
+    start_r = state.player_pos[0].astype(jnp.int32)
+    start_c = state.player_pos[1].astype(jnp.int32)
+    target_t = jnp.int8(int(target))
+
+    def body(i, carry):
+        s, r, done = carry
+        step = i + jnp.int32(1)
+        tr = start_r + dy * step
+        tc = start_c + dx * step
+        in_bounds = (tr >= 0) & (tr < map_h) & (tc >= 0) & (tc < map_w)
+        # Safe-clamped read.
+        rr = jnp.clip(tr, 0, map_h - 1)
+        cc = jnp.clip(tc, 0, map_w - 1)
+        cur = s.terrain[rr, cc]
+        matches = in_bounds & (cur == target_t) & ~done
+        def _do_hit(args):
+            ss, rr_ = args
+            return on_tile_fn(ss, rr_, jnp.array([rr, cc], dtype=jnp.int32))
+        s_new, r_new = jax.lax.cond(matches, _do_hit, lambda a: a, (s, r))
+        return s_new, r_new, done | matches
+
+    final_state, final_rng, _ = jax.lax.fori_loop(
+        0, max_range, body, (state, rng, jnp.bool_(False)))
+    return final_state, final_rng
 
 
 def _effect_probing(
@@ -601,19 +703,54 @@ def _effect_cancellation(
 def _effect_polymorph(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_POLYMORPH — BEAM, change monster type to random eligible species.
+    """WAN_POLYMORPH — BEAM, change monster type via newcham().
 
-    vendor/nethack/src/zap.c bhitm() WAN_POLYMORPH: newcham().
-    We randomise mon_type to [1, N_MONSTERS-1].
+    Cite: vendor/nethack/src/zap.c bhitm() WAN_POLYMORPH (~line 263):
+      newcham(mtmp, NULL, ncflags) — picks eligible form via
+      select_newcham_form which filters G_UNIQ and M2_NOPOLY.
 
-    TODO Wave 5: when WandState is folded into EnvState, route through
-    subsystems.polymorph.polymorph_monster so HP-scaling + intrinsic gain
-    behave the same as monster-side newcham.
+    Implementation mirrors polymorph.py::polymorph_monster (zap.c::newcham):
+      1. Rejection-sample a valid form using _POLY_FORM_VALID.
+      2. Roll new_hp_max = (new_form_level + 1) * 8 (simplified newmonhp).
+      3. Scale current HP proportionally: new_hp = cur_hp * new_max / old_max.
+      4. Update entry_idx (mon_type) and hp arrays.
     """
+    from Nethax.nethax.subsystems.polymorph import _POLY_FORM_VALID
+
     def on_hit(s, r, mon_idx):
-        r, new_type = _rng_rnd(r, N_MONSTERS - 1)
-        new_mon_type = s.mon_type.at[mon_idx].set(new_type.astype(jnp.int16))
-        return s.replace(mon_type=new_mon_type), r
+        # Rejection-sample a _POLY_FORM_VALID index in [1, N_MONSTERS-1].
+        def _cond(ws):
+            _, candidate = ws
+            return ~_POLY_FORM_VALID[candidate]
+
+        def _body(ws):
+            r_, _ = ws
+            r_, sub = jax.random.split(r_)
+            c = jax.random.randint(sub, shape=(), minval=1,
+                                   maxval=N_MONSTERS, dtype=jnp.int32)
+            return (r_, c)
+
+        r, sub0 = jax.random.split(r)
+        init_c = jax.random.randint(sub0, shape=(), minval=1,
+                                    maxval=N_MONSTERS, dtype=jnp.int32)
+        r, new_type = lax.while_loop(_cond, _body, (r, init_c))
+        new_type = new_type.astype(jnp.int32)
+
+        # Proportional HP scaling (newcham / polymorph_monster logic).
+        # new_hp_max = (level + 1) * 8 — mirrors _form_hp_max simplified path.
+        new_hp_max = jnp.take(_POLY_FORM_HP_MAX, new_type, axis=0)
+        old_hp_max = jnp.maximum(s.mon_hp_max[mon_idx].astype(jnp.float32),
+                                 jnp.float32(1.0))
+        ratio  = s.mon_hp[mon_idx].astype(jnp.float32) / old_hp_max
+        new_hp = jnp.maximum(jnp.int32(1),
+                             (ratio * new_hp_max.astype(jnp.float32)).astype(jnp.int32))
+
+        s = s.replace(
+            mon_type=s.mon_type.at[mon_idx].set(new_type.astype(jnp.int16)),
+            mon_hp=s.mon_hp.at[mon_idx].set(new_hp),
+            mon_hp_max=s.mon_hp_max.at[mon_idx].set(new_hp_max),
+        )
+        return s, r
 
     return cast_ray(state, rng, state.player_pos, direction,
                     on_hit_fn=on_hit, stop_on_hit=True)
@@ -991,13 +1128,32 @@ def _effect_undead_turning(
 def _effect_draining(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_DRAINING — BEAM, drain experience level (stub: 1d4 damage).
+    """WAN_DRAINING — BEAM, drain one experience level from the target.
 
-    Full XL drain requires a monster XL array (Wave 4).
+    Cite: vendor/nethack/src/zap.c::bhitm SPE_DRAIN_LIFE branch (~line 521):
+      dmg = monhp_per_lvl(mtmp)  [defaults to rnd(8)]
+      mtmp->mhp    -= dmg
+      mtmp->mhpmax -= dmg
+      if mhpmax <= 0: killed
+
+    monhp_per_lvl() default path: rnd(8) — makemon.c:986.
+    resists_drli: undead are immune (mon_undead flag).
+    WandState does not carry a per-monster XL array; we model the HP-max
+    reduction which is the mechanically significant part.
     """
     def on_hit(s, r, mon_idx):
-        r, dmg = _rng_d(r, 1, 4)
-        s = _deal_damage(s, mon_idx, dmg)
+        r, dmg = _rng_rnd(r, 8)            # rnd(8) — makemon.c:989
+        is_immune = s.mon_undead[mon_idx]  # resists_drli proxy
+        actual_dmg = jnp.where(is_immune, jnp.int32(0), dmg)
+        # Reduce both current HP and HP-max (zap.c:533-534).
+        new_hp     = jnp.maximum(s.mon_hp[mon_idx]     - actual_dmg, jnp.int32(0))
+        new_hp_max = jnp.maximum(s.mon_hp_max[mon_idx] - actual_dmg, jnp.int32(0))
+        is_killed  = (new_hp_max <= jnp.int32(0)) | (new_hp <= jnp.int32(0))
+        s = s.replace(
+            mon_hp=s.mon_hp.at[mon_idx].set(new_hp),
+            mon_hp_max=s.mon_hp_max.at[mon_idx].set(new_hp_max),
+            mon_alive=s.mon_alive.at[mon_idx].set(~is_immune & ~is_killed),
+        )
         return s, r
 
     return cast_ray(state, rng, state.player_pos, direction,
@@ -1051,10 +1207,10 @@ def _dispatch_secret_door(state, rng, direction):
     return _effect_secret_door_detection(state, rng)
 
 def _dispatch_opening(state, rng, direction):
-    return _effect_opening(state, rng)
+    return _effect_opening(state, rng, direction)
 
 def _dispatch_locking(state, rng, direction):
-    return _effect_locking(state, rng)
+    return _effect_locking(state, rng, direction)
 
 def _dispatch_probing(state, rng, direction):
     return _effect_probing(state, rng, direction)

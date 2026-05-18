@@ -175,6 +175,63 @@ def _find_first_empty_inventory_slot(items_category: jnp.ndarray) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Container trap  (vendor/nethack/src/pickup.c::container_trap)
+# ---------------------------------------------------------------------------
+
+def fire_container_trap(state, container_idx: int):
+    """Fire the trap on a trapped container when it is opened.
+
+    Canonical: vendor/nethack/src/pickup.c::container_trap (~line 2460).
+    NetHack checks obj->otrapped; on True it applies one of several effects
+    (explosion, alarm, etc.).  Here we model the common case: a trapped
+    container deals 1d10 damage to the player and clears its trapped flag.
+
+    The ``olocked`` field in the Item struct is reused as the otrapped flag
+    for simplicity (both are boolean container-state bits; in the vendor they
+    are separate bitfields in the same obj.  We diverge by using ``olocked``
+    as a "trapped" sentinel on ground items when the category is TOOL/CHEST).
+
+    buc_status == 4 is used as the "trapped" sentinel (distinct from
+    BUCStatus 0-3).
+
+    Parameters
+    ----------
+    state         : EnvState
+    container_idx : int  — index into state.containers (0..N_CONTAINERS-1)
+
+    Returns
+    -------
+    (new_state, is_trapped)  — new_state with trap fired and 1d10 HP damage
+                               applied; is_trapped bool array.
+    """
+    cs = state.containers
+    c_idx = jnp.int32(container_idx)
+
+    has_container = cs.container_type[c_idx] != jnp.int8(ContainerType.NONE)
+    _TRAPPED_SENTINEL = jnp.int8(4)
+    is_trapped = has_container & (cs.container_buc[c_idx] == _TRAPPED_SENTINEL)
+
+    rng_trap, new_rng = jax.random.split(state.rng)
+    dmg = jax.random.randint(rng_trap, (), minval=1, maxval=11, dtype=jnp.int32)
+
+    new_hp = jnp.where(
+        is_trapped,
+        jnp.maximum(jnp.int32(0), state.player_hp.astype(jnp.int32) - dmg),
+        state.player_hp.astype(jnp.int32),
+    ).astype(state.player_hp.dtype)
+
+    new_container_buc = cs.container_buc.at[c_idx].set(
+        jnp.where(
+            is_trapped,
+            jnp.int8(int(BUCStatus.UNCURSED)),
+            cs.container_buc[c_idx],
+        )
+    )
+    new_cs = cs.replace(container_buc=new_container_buc)
+    return state.replace(player_hp=new_hp, containers=new_cs, rng=new_rng), is_trapped
+
+
+# ---------------------------------------------------------------------------
 # Open / Close
 # ---------------------------------------------------------------------------
 
@@ -264,7 +321,13 @@ def open_container(state, slot_idx):
     # If the cursed BoT exploded, it also empties (otyp NONE-like) — vendor
     # behaviour: bag becomes a regular sack of tricks; we keep the type.
     new_cs = cs.replace(is_open=new_is_open)
-    return state.replace(containers=new_cs, monster_ai=new_mai, rng=new_rng)
+    mid_state = state.replace(containers=new_cs, monster_ai=new_mai, rng=new_rng)
+
+    # ---- Container trap (pickup.c::container_trap) ----
+    # fire_container_trap is defined later but referenced here; Python function
+    # calls are resolved at call-time so the forward reference is fine.
+    mid_state, _fired = fire_container_trap(mid_state, slot_idx)
+    return mid_state
 
 
 def close_container(state, slot_idx):
@@ -371,7 +434,25 @@ def put_in_container(state, container_idx, src_slot):
         ),
     )
 
-    new_inv_state = state.inventory.replace(items=new_inv)
+    # Bag-of-holding weight accounting (pickup.c::in_container).
+    # The item was in inventory at full weight; after moving in, effective
+    # weight = raw * numer // denom.  Delta = effective - raw (negative = savings).
+    raw_w = inv.weight[s_idx].astype(jnp.int32)
+    ctype = cs.container_type[c_idx]
+    cbuc  = cs.container_buc[c_idx]
+    is_boh = ctype == jnp.int8(ContainerType.BAG_OF_HOLDING)
+    w_numer = jnp.where(
+        is_boh & (cbuc == jnp.int8(BUCStatus.BLESSED)),  jnp.int32(_BOH_NUMER_BLESSED),
+        jnp.where(
+            is_boh & (cbuc == jnp.int8(BUCStatus.CURSED)), jnp.int32(_BOH_NUMER_CURSED),
+            jnp.where(is_boh, jnp.int32(_BOH_NUMER_UNCURSED), jnp.int32(_BOH_DENOM)),
+        ),
+    )
+    effective_w = (raw_w * w_numer) // jnp.int32(_BOH_DENOM)
+    weight_delta = jnp.where(can_put, effective_w - raw_w, jnp.int32(0))
+    new_total_weight = state.inventory.total_weight + weight_delta
+
+    new_inv_state = state.inventory.replace(items=new_inv, total_weight=new_total_weight)
     return state.replace(inventory=new_inv_state, containers=new_cs)
 
 
@@ -454,7 +535,24 @@ def take_from_container(state, container_idx, item_pos):
         ),
     )
 
-    new_inv_state = state.inventory.replace(items=new_inv)
+    # Bag-of-holding weight accounting on take-out (pickup.c::out_container).
+    # Reverse the put-in savings: add back (raw - effective) to total_weight.
+    raw_w_out  = cs.items_weight[c_idx, p_idx].astype(jnp.int32)
+    ctype_out  = cs.container_type[c_idx]
+    cbuc_out   = cs.container_buc[c_idx]
+    is_boh_out = ctype_out == jnp.int8(ContainerType.BAG_OF_HOLDING)
+    w_numer_out = jnp.where(
+        is_boh_out & (cbuc_out == jnp.int8(BUCStatus.BLESSED)),  jnp.int32(_BOH_NUMER_BLESSED),
+        jnp.where(
+            is_boh_out & (cbuc_out == jnp.int8(BUCStatus.CURSED)), jnp.int32(_BOH_NUMER_CURSED),
+            jnp.where(is_boh_out, jnp.int32(_BOH_NUMER_UNCURSED), jnp.int32(_BOH_DENOM)),
+        ),
+    )
+    effective_w_out   = (raw_w_out * w_numer_out) // jnp.int32(_BOH_DENOM)
+    weight_delta_out  = jnp.where(can_take, raw_w_out - effective_w_out, jnp.int32(0))
+    new_total_weight  = state.inventory.total_weight + weight_delta_out
+
+    new_inv_state = state.inventory.replace(items=new_inv, total_weight=new_total_weight)
     return state.replace(inventory=new_inv_state, containers=new_cs)
 
 
@@ -523,6 +621,115 @@ def install_container(
         is_open        = cs.is_open.at[c].set(jnp.bool_(False)),
     )
     return state.replace(containers=new_cs)
+
+
+# ---------------------------------------------------------------------------
+# Bag of tricks  (vendor/nethack/src/pickup.c::bagotricks)
+# ---------------------------------------------------------------------------
+
+def use_bag_of_tricks(state, rng):
+    """Use a bag of tricks: spawn a hostile monster, decrement charges.
+
+    Canonical: vendor/nethack/src/pickup.c::bagotricks.  The vendor selects a
+    random low-tier monster and calls makemon().  Here we find the first dead
+    monster slot and wake it as hostile (hp=4).  Charges stored in
+    items_charges[bot_idx, 0] decrement by 1 each call.
+    """
+    cs = state.containers
+
+    is_bot  = cs.container_type == jnp.int8(ContainerType.BAG_OF_TRICKS)
+    has_chg = cs.items_charges[:, 0] > jnp.int8(0)
+    usable  = is_bot & has_chg
+    bot_idx = jnp.argmax(usable).astype(jnp.int32)
+    any_bot = jnp.any(usable)
+
+    old_chg = cs.items_charges[bot_idx, 0]
+    new_charges = cs.items_charges.at[bot_idx, 0].set(
+        jnp.where(any_bot, jnp.maximum(jnp.int8(0), old_chg - jnp.int8(1)), old_chg)
+    )
+    new_cs = cs.replace(items_charges=new_charges)
+
+    mai = state.monster_ai
+    dead_mask = ~mai.alive
+    dead_idx  = jnp.argmax(dead_mask).astype(jnp.int32)
+    has_dead  = jnp.any(dead_mask)
+
+    map_h = state.terrain.shape[2]
+    map_w = state.terrain.shape[3]
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    spawn_r   = jnp.clip(pr + jnp.int32(1), jnp.int32(0), jnp.int32(map_h - 1))
+    spawn_c   = jnp.clip(pc,                jnp.int32(0), jnp.int32(map_w - 1))
+    spawn_pos = jnp.stack([spawn_r, spawn_c]).astype(jnp.int16)
+
+    do_spawn = any_bot & has_dead
+
+    new_mai = mai.replace(
+        alive    = mai.alive.at[dead_idx].set(
+            jnp.where(do_spawn, jnp.bool_(True),  mai.alive[dead_idx])),
+        pos      = mai.pos.at[dead_idx].set(
+            jnp.where(do_spawn, spawn_pos,         mai.pos[dead_idx])),
+        hp       = mai.hp.at[dead_idx].set(
+            jnp.where(do_spawn, jnp.int32(4),      mai.hp[dead_idx])),
+        hp_max   = mai.hp_max.at[dead_idx].set(
+            jnp.where(do_spawn, jnp.int32(4),      mai.hp_max[dead_idx])),
+        peaceful = mai.peaceful.at[dead_idx].set(
+            jnp.where(do_spawn, jnp.bool_(False),  mai.peaceful[dead_idx])),
+        asleep   = mai.asleep.at[dead_idx].set(
+            jnp.where(do_spawn, jnp.bool_(False),  mai.asleep[dead_idx])),
+    )
+
+    rng_new, _ = jax.random.split(rng)
+    return state.replace(containers=new_cs, monster_ai=new_mai, rng=rng_new)
+
+
+# ---------------------------------------------------------------------------
+# Cursed bag of holding item consumption  (pickup.c::use_container)
+# ---------------------------------------------------------------------------
+
+def cursed_bag_consume(state, rng, container_idx: int):
+    """1-in-10 chance a cursed bag of holding destroys a random contained item.
+
+    Canonical: vendor/nethack/src/pickup.c::use_container — cursed BoH
+    has a per-operation chance of eating a contained item.
+    """
+    cs    = state.containers
+    c_idx = jnp.int32(container_idx)
+
+    is_cursed_boh = (
+        (cs.container_type[c_idx] == jnp.int8(ContainerType.BAG_OF_HOLDING))
+        & (cs.container_buc[c_idx] == jnp.int8(BUCStatus.CURSED))
+    )
+
+    rng_roll, rng_pick, rng_new = jax.random.split(rng, 3)
+    eat_roll  = jax.random.uniform(rng_roll, shape=())
+    should_eat = is_cursed_boh & (eat_roll < jnp.float32(0.1))
+
+    occupied  = cs.items_category[c_idx] != jnp.int8(0)
+    n_occupied = jnp.sum(occupied.astype(jnp.int32))
+    has_items  = n_occupied > jnp.int32(0)
+
+    rand_pick  = jax.random.randint(
+        rng_pick, shape=(), minval=0,
+        maxval=jnp.maximum(n_occupied, jnp.int32(1)),
+    )
+    cum_occ    = jnp.cumsum(occupied.astype(jnp.int32))
+    victim_pos = jnp.argmax(cum_occ > rand_pick).astype(jnp.int32)
+
+    do_eat = should_eat & has_items
+
+    new_cs = cs.replace(
+        items_category = cs.items_category.at[c_idx, victim_pos].set(
+            jnp.where(do_eat, jnp.int8(0), cs.items_category[c_idx, victim_pos])
+        ),
+        items_quantity = cs.items_quantity.at[c_idx, victim_pos].set(
+            jnp.where(do_eat, jnp.int16(0), cs.items_quantity[c_idx, victim_pos])
+        ),
+        items_weight   = cs.items_weight.at[c_idx, victim_pos].set(
+            jnp.where(do_eat, jnp.int16(0), cs.items_weight[c_idx, victim_pos])
+        ),
+    )
+    return state.replace(containers=new_cs, rng=rng_new)
 
 
 # ---------------------------------------------------------------------------

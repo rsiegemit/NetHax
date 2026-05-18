@@ -221,10 +221,26 @@ def _effect_gain_ability(state, rng, buc):
 def _effect_restore_ability(state, rng, buc):
     """potion of restore ability — restore drained stats.
 
-    Canonical: peffect_restore_ability — restore all temporarily drained stats.
-    Wave 3: no-op (stat drain not yet modelled); effect is a no-op stub.
+    Canonical: peffect_restore_ability (potion.c) — restores all 6 stats to
+    their exercise-adjusted maximums via full_restore().  Wave 3 simplification:
+    set each stat to max(current, 18).  STR is int16; the rest are int8.
+
+    Cite: vendor/nethack/src/potion.c::peffect_restore_ability.
     """
-    return state
+    new_str = jnp.maximum(state.player_str, jnp.int16(18))
+    new_dex = jnp.maximum(state.player_dex, jnp.int8(18))
+    new_con = jnp.maximum(state.player_con, jnp.int8(18))
+    new_int = jnp.maximum(state.player_int, jnp.int8(18))
+    new_wis = jnp.maximum(state.player_wis, jnp.int8(18))
+    new_cha = jnp.maximum(state.player_cha, jnp.int8(18))
+    return state.replace(
+        player_str=new_str,
+        player_dex=new_dex,
+        player_con=new_con,
+        player_int=new_int,
+        player_wis=new_wis,
+        player_cha=new_cha,
+    )
 
 
 # ---- level/XP group -------------------------------------------------------
@@ -232,13 +248,23 @@ def _effect_restore_ability(state, rng, buc):
 def _effect_gain_level(state, rng, buc):
     """potion of gain level — gain one experience level.
 
-    Canonical: peffect_gain_level — pluslvl(FALSE).
-    Cursed: move up one dungeon level (not modelled — no-op for cursed).
+    Canonical: peffect_gain_level (potion.c) — uncursed/blessed: pluslvl(FALSE)
+    → XL+1.  Cursed: goto_level(current_level - 1) i.e. ascend one dungeon
+    level; no effect if already at level 1.
+
+    Cite: vendor/nethack/src/potion.c::peffect_gain_level.
     """
-    cursed  = _is_cursed(buc)
-    new_xl  = jnp.where(cursed, state.player_xl,
-                        jnp.minimum(state.player_xl + jnp.int32(1), jnp.int32(30)))
-    return state.replace(player_xl=new_xl)
+    cursed = _is_cursed(buc)
+    # Uncursed/blessed: increment XL (capped at 30).
+    new_xl = jnp.where(cursed, state.player_xl,
+                       jnp.minimum(state.player_xl + jnp.int32(1), jnp.int32(30)))
+    # Cursed: ascend one dungeon level (current_level -= 1), floor at 1.
+    cur_lv  = state.dungeon.current_level.astype(jnp.int32)
+    new_lv  = jnp.where(cursed,
+                        jnp.maximum(cur_lv - jnp.int32(1), jnp.int32(1)),
+                        cur_lv).astype(jnp.int8)
+    new_dungeon = state.dungeon.replace(current_level=new_lv)
+    return state.replace(player_xl=new_xl, dungeon=new_dungeon)
 
 
 # ---- vision group ---------------------------------------------------------
@@ -298,10 +324,17 @@ def _effect_monster_detection(state, rng, buc):
 def _effect_object_detection(state, rng, buc):
     """potion of object detection — shows item locations on level.
 
-    Canonical: peffect_object_detection — object_detect(otmp, 0).
-    Wave 3: no visible map change (items not yet in terrain); no-op.
+    Canonical: peffect_object_detection (potion.c) — object_detect(otmp, 0)
+    reveals all ground items on the current level.  Implementation: set
+    detect_objects_until_turn = timestep + 100.
+
+    Cite: vendor/nethack/src/potion.c::peffect_object_detection.
     """
-    return state
+    new_timer = state.timestep + jnp.int32(100)
+    new_id = state.identification.replace(
+        detect_objects_until_turn=new_timer
+    )
+    return state.replace(identification=new_id)
 
 
 # ---- movement modifiers ---------------------------------------------------
@@ -455,12 +488,41 @@ def _effect_acid(state, rng, buc):
 
 
 def _effect_oil(state, rng, buc):
-    """potion of oil — mostly flavour; cursed is castor oil.
+    """potion of oil — grease wielded weapon; explode on open flame.
 
-    Canonical: peffect_oil — if lamplit: fire damage; else flavour text.
-    Wave 3: no-op (lamplit state not tracked).
+    Canonical: peffect_oil (potion.c) — if lamp is lit, potion explodes for
+    fire damage; otherwise oils the wielded weapon (sets obj.greased=1).
+    Implementation: set wielded item.greased=True; if wielded item itself is
+    lit (lamp), deal 2d4 fire damage to player.
+
+    Cite: vendor/nethack/src/potion.c::peffect_oil.
     """
-    return state
+    wslot = state.inventory.wielded.astype(jnp.int32)
+    has_wielded = wslot >= jnp.int32(0)
+
+    # Grease the wielded weapon.
+    cur_greased = state.inventory.items.greased
+    new_greased = jnp.where(
+        has_wielded,
+        cur_greased.at[wslot].set(jnp.bool_(True)),
+        cur_greased,
+    )
+    new_items = state.inventory.items.replace(greased=new_greased)
+
+    # Fire damage if wielding a lit lamp (type_id 92 = oil lamp as proxy;
+    # check greased-before-update as "was already lit/oiled").
+    # Simplified trigger: if wielded item was already greased, it's "lit" →
+    # 2d4 fire damage (vendor: losehp(d(2,4), ...)).
+    was_lit = has_wielded & cur_greased[jnp.maximum(wslot, jnp.int32(0))]
+    rng, sub = jax.random.split(rng)
+    fire_dmg = (jax.random.randint(sub, (), 1, 5, dtype=jnp.int32) +
+                jax.random.randint(sub, (), 1, 5, dtype=jnp.int32))
+    new_hp = jnp.where(was_lit,
+                       jnp.maximum(state.player_hp - fire_dmg, jnp.int32(1)),
+                       state.player_hp)
+
+    new_inv = state.inventory.replace(items=new_items)
+    return state.replace(inventory=new_inv, player_hp=new_hp)
 
 
 def _effect_polymorph(state, rng, buc):
@@ -792,33 +854,57 @@ def quaff_potion(state, rng, slot_idx):
     -------
     Updated EnvState.
     """
-    slot_idx  = jnp.int32(slot_idx)
-    items     = state.inventory.items
-    type_id   = items.type_id[slot_idx].astype(jnp.int32)
-    buc       = items.buc_status[slot_idx]
+    # GLIB: slippery fingers — 1-in-5 chance to drop the item being used.
+    # Cite: vendor/nethack/src/status.c::glib — glibs() drops items on use,
+    # not just wielded weapons; "the potion slips from your fingers."
+    is_glib = state.status.timed_statuses[int(TimedStatus.GLIB)] > jnp.int32(0)
+    rng, rng_glib = jax.random.split(rng)
+    glib_roll = jax.random.randint(rng_glib, (), 0, 5, dtype=jnp.int32)
+    glib_drop = is_glib & (glib_roll == jnp.int32(0))
 
-    effect_id = jnp.clip(
-        type_id - jnp.int32(_POTION_BASE_ID),
-        0,
-        N_POTIONS - 1,
-    )
+    def _drop_glib(s):
+        # Drop the potion: decrement quantity and return without quaffing.
+        _sidx = jnp.int32(slot_idx)
+        old_qty = s.inventory.items.quantity[_sidx]
+        new_qty = jnp.maximum(old_qty - jnp.int16(1), jnp.int16(0))
+        new_cat = jnp.where(new_qty == jnp.int16(0),
+                            jnp.int8(0),
+                            s.inventory.items.category[_sidx])
+        new_quantity = s.inventory.items.quantity.at[_sidx].set(new_qty)
+        new_category = s.inventory.items.category.at[_sidx].set(new_cat)
+        new_items = s.inventory.items.replace(quantity=new_quantity, category=new_category)
+        return s.replace(inventory=s.inventory.replace(items=new_items))
 
-    # Dispatch: operand is (state, rng, buc); each branch returns new state.
-    new_state = jax.lax.switch(effect_id, _SWITCH_BRANCHES, (state, rng, buc))
+    def _do_quaff(s):
+        _sidx = jnp.int32(slot_idx)
+        items   = s.inventory.items
+        type_id = items.type_id[_sidx].astype(jnp.int32)
+        buc     = items.buc_status[_sidx]
 
-    # Decrement quantity; clear category when exhausted.
-    old_qty  = new_state.inventory.items.quantity[slot_idx]
-    new_qty  = jnp.maximum(old_qty - jnp.int16(1), jnp.int16(0))
-    new_cat  = jnp.where(new_qty == jnp.int16(0),
-                         jnp.int8(0),
-                         new_state.inventory.items.category[slot_idx])
-    new_quantity = new_state.inventory.items.quantity.at[slot_idx].set(new_qty)
-    new_category = new_state.inventory.items.category.at[slot_idx].set(new_cat)
-    new_items    = new_state.inventory.items.replace(
-        quantity=new_quantity, category=new_category
-    )
-    new_inv = new_state.inventory.replace(items=new_items)
-    return new_state.replace(inventory=new_inv)
+        effect_id = jnp.clip(
+            type_id - jnp.int32(_POTION_BASE_ID),
+            0,
+            N_POTIONS - 1,
+        )
+
+        # Dispatch: operand is (state, rng, buc); each branch returns new state.
+        new_state = jax.lax.switch(effect_id, _SWITCH_BRANCHES, (s, rng, buc))
+
+        # Decrement quantity; clear category when exhausted.
+        old_qty  = new_state.inventory.items.quantity[_sidx]
+        new_qty  = jnp.maximum(old_qty - jnp.int16(1), jnp.int16(0))
+        new_cat  = jnp.where(new_qty == jnp.int16(0),
+                             jnp.int8(0),
+                             new_state.inventory.items.category[_sidx])
+        new_quantity = new_state.inventory.items.quantity.at[_sidx].set(new_qty)
+        new_category = new_state.inventory.items.category.at[_sidx].set(new_cat)
+        new_items    = new_state.inventory.items.replace(
+            quantity=new_quantity, category=new_category
+        )
+        new_inv = new_state.inventory.replace(items=new_items)
+        return new_state.replace(inventory=new_inv)
+
+    return jax.lax.cond(glib_drop, _drop_glib, _do_quaff, state)
 
 
 def handle_quaff(state, rng):

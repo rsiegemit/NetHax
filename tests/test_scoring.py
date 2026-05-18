@@ -20,6 +20,7 @@ from Nethax.nethax.state import EnvState
 from Nethax.nethax.subsystems.scoring import (
     AMULET_BONUS,
     ASCENSION_BONUS,
+    DEEP_LEVEL_BONUS,
     DLEVEL_BONUS,
     ScoringState,
     add_experience,
@@ -104,34 +105,56 @@ def test_score_includes_xp_and_gold():
 
 
 def test_score_adds_dlevel_bonus():
-    """deepest_level=N adds DLEVEL_BONUS * (N-1) to the final score."""
+    """deepest_level>20 adds DEEP_LEVEL_BONUS * (deepest-20) to the final score.
+
+    Updated for vendor formula (end.c:1339-1340): bonus is 0 below level 20,
+    DEEP_LEVEL_BONUS * (deepest - 20) above it.
+    """
     state = _violate_all_conducts(_fresh_state())
     state = state.replace(
-        scoring=record_deepest_level(state.scoring, jnp.int8(5)),
+        scoring=record_deepest_level(state.scoring, jnp.int8(25)),
     )
-    # No xp, no gold, no amulet, no ascend, no kept conducts.
-    expected = DLEVEL_BONUS * (5 - 1)
+    # No xp, no gold, no ascend, no kept conducts.
+    expected = DEEP_LEVEL_BONUS * (25 - 20)
     assert int(compute_final_score(state)) == expected
+
+    # Levels <= 20 yield zero depth bonus.
+    state_shallow = _violate_all_conducts(_fresh_state())
+    state_shallow = state_shallow.replace(
+        scoring=record_deepest_level(state_shallow.scoring, jnp.int8(5)),
+    )
+    assert int(compute_final_score(state_shallow)) == 0
 
 
 def test_score_amulet_bonus_when_holding():
-    """Carrying the real Amulet of Yendor adds AMULET_BONUS."""
+    """Amulet of Yendor no longer adds a flat bonus in vendor formula.
+
+    The vendor formula (end.c:1325-1352) does not include an amulet bonus;
+    carrying the Amulet is a precondition for ascension, not a score addend.
+    Score is 0 with zero XP/gold/depth even while holding it.
+    """
     state = _violate_all_conducts(_fresh_state())
     state = _give_amulet(state)
-    assert int(compute_final_score(state)) == AMULET_BONUS
+    assert int(compute_final_score(state)) == 0
 
 
 def test_score_no_amulet_bonus_without_amulet():
-    """No amulet in inventory => no amulet bonus."""
+    """No amulet in inventory => score is 0 (no change either way)."""
     state = _violate_all_conducts(_fresh_state())
     assert int(compute_final_score(state)) == 0
 
 
-def test_score_ascension_bonus():
-    """ascended=True adds ASCENSION_BONUS."""
+def test_score_ascension_doubles_xp():
+    """ascended=True doubles XP contribution (end.c:1344-1351).
+
+    With xp=500 and ascended, score = 500 + 500 = 1000.
+    Replaces the old flat ASCENSION_BONUS test.
+    """
     state = _violate_all_conducts(_fresh_state())
-    state = state.replace(scoring=mark_ascended(state.scoring))
-    assert int(compute_final_score(state)) == ASCENSION_BONUS
+    state = state.replace(
+        scoring=add_experience(mark_ascended(state.scoring), jnp.int32(500)),
+    )
+    assert int(compute_final_score(state)) == 1000
 
 
 # ---------------------------------------------------------------------------
@@ -179,24 +202,22 @@ def test_score_only_one_conduct_kept():
 # ---------------------------------------------------------------------------
 
 def test_score_combined_terms():
-    """All bonus channels combine additively."""
+    """All bonus channels combine additively per vendor formula (end.c:1325-1352)."""
     state = _violate_all_conducts(_fresh_state())
     state = state.replace(
         scoring=add_experience(state.scoring, jnp.int32(100)),
         player_gold=jnp.int32(40),
     )
     state = state.replace(
-        scoring=record_deepest_level(state.scoring, jnp.int8(10)),
+        scoring=record_deepest_level(state.scoring, jnp.int8(25)),
     )
-    state = _give_amulet(state)
     state = state.replace(scoring=mark_ascended(state.scoring))
 
     expected = (
-        100                          # XP
-        + 40                         # gold
-        + DLEVEL_BONUS * (10 - 1)    # depth
-        + AMULET_BONUS               # amulet
-        + ASCENSION_BONUS            # ascension
+        100                              # XP
+        + 100                            # ascension doubles XP (end.c:1350)
+        + 40                             # gold
+        + DEEP_LEVEL_BONUS * (25 - 20)   # deepest > 20 bonus (end.c:1340)
     )
     assert int(compute_final_score(state)) == expected
 

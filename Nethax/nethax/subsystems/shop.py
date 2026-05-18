@@ -381,33 +381,6 @@ def shop_step(state, rng) -> object:
     return state
 
 
-# ---------------------------------------------------------------------------
-# Legacy stubs preserved for backwards compatibility with Wave 1 callers.
-# ---------------------------------------------------------------------------
-def enter_shop(state: ShopState, level: int) -> ShopState:
-    """No-op enter-shop stub (shk.c: inshop / you_enter_shop).
-
-    Retained from Wave 1 for callers that take only the ShopState slice.
-    Wave 6 uses accrue_bill / pay_at_exit directly on EnvState.
-    """
-    return state
-
-
-def pickup_in_shop(state: ShopState, slot: int, level: int) -> ShopState:
-    """Legacy no-op — Wave 6 callers should use accrue_bill(EnvState, slot)."""
-    return state
-
-
-def pay_bill(state: ShopState, level: int) -> ShopState:
-    """Legacy no-op — Wave 6 callers should use pay_at_exit(EnvState)."""
-    return state
-
-
-def attack_shopkeeper(state: ShopState, level: int) -> ShopState:
-    """Legacy no-op — Wave 6 callers should use kill_shopkeeper(EnvState)."""
-    return state
-
-
 def step(state: ShopState, rng: jax.Array) -> ShopState:
     """Per-turn no-op for the ShopState slice.
 

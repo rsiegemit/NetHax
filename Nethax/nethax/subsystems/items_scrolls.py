@@ -3,9 +3,14 @@ from enum import IntEnum
 
 import jax
 import jax.numpy as jnp
+import jax.lax as lax
 
 from Nethax.nethax.subsystems.status_effects import TimedStatus
 from Nethax.nethax.constants.objects import ObjectClass
+from Nethax.nethax.subsystems import detect as _detect
+from Nethax.nethax.constants.monsters import MONSTERS
+
+N_MONSTERS: int = len(MONSTERS)
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +170,54 @@ def _build_monster_fire_resist_table() -> jnp.ndarray:
 
 
 _MONSTER_FIRE_RESIST_TABLE: jnp.ndarray = _build_monster_fire_resist_table()
+
+
+def _build_scare_immune_table() -> jnp.ndarray:
+    """bool[N_MONSTERS] — True if monster is immune to scare-monster scroll.
+
+    Immune classes (vendor/nethack/src/zap.c::resist, read.c::seffect_scare_monster
+    ~1454-1486):
+      - Demon (M2_DEMON)
+      - Lawful minion (M2_MINION with positive alignment)
+      - Angelic beings (MonsterSymbol.S_ANGEL)
+    """
+    from Nethax.nethax.constants.monsters import (
+        MONSTERS, M2_DEMON, M2_MINION, MonsterSymbol,
+    )
+    result = []
+    for m in MONSTERS:
+        is_demon  = bool(m.flags2 & M2_DEMON)
+        is_minion = bool(m.flags2 & M2_MINION)
+        is_lawful = m.alignment > 0
+        is_angel  = (m.symbol == MonsterSymbol.S_ANGEL)
+        result.append(is_demon or (is_minion and is_lawful) or is_angel)
+    return jnp.array(result, dtype=jnp.bool_)
+
+
+_IS_SCARE_IMMUNE: jnp.ndarray = _build_scare_immune_table()
+
+
+def _build_tame_immune_table() -> jnp.ndarray:
+    """bool[N_MONSTERS] — True if monster cannot be tamed.
+
+    Immune: demons (M2_DEMON) and angelic beings (S_ANGEL).
+    Cite: vendor/nethack/src/read.c::maybe_tame ~1044 — resist() called with
+    SCROLL_CLASS; high-level demons and angels reliably resist.
+    Simplified proxy: flag-based, JIT-pure.
+    """
+    from Nethax.nethax.constants.monsters import (
+        MONSTERS, M2_DEMON, MonsterSymbol,
+    )
+    result = []
+    for m in MONSTERS:
+        is_demon = bool(m.flags2 & M2_DEMON)
+        is_angel = (m.symbol == MonsterSymbol.S_ANGEL)
+        result.append(is_demon or is_angel)
+    return jnp.array(result, dtype=jnp.bool_)
+
+
+_IS_TAME_IMMUNE: jnp.ndarray = _build_tame_immune_table()
+
 
 # Wave 5 random-pool: a small subset retained for the scroll-read code path
 # that selects a class at random.  Vendor scrolls always let the *player*
@@ -485,19 +538,21 @@ def _effect_gold_detection(state, rng, buc):
 
 
 def _effect_food_detection(state, rng, buc):
-    """scroll of food detection — count food items on current level.
+    """scroll of food detection — set detect_food timer and cache food count.
 
     vendor/nethack/src/read.c::seffect_food_detection (~2046):
       food_detect(sobj) — reveal food item locations.
-    Simplification: count FOOD_CLASS items in ground_items on current level;
-    store count in state.last_food_count (int8).
+    Sets detect_food_until_turn = ts + 50 and caches the FOOD item count in
+    last_food_count (for observation code that inspects the cached count).
+    Cite: vendor/nethack/src/detect.c::food_detect (~line 479).
     """
     from Nethax.nethax.subsystems.inventory import ItemCategory
-    b          = state.dungeon.current_branch.astype(jnp.int32)
-    lv         = state.dungeon.current_level.astype(jnp.int32) - 1
-    level_cats = state.ground_items.category[b, lv]  # [map_h, map_w, MAX_STACK]
-    is_food    = level_cats == jnp.int8(int(ItemCategory.FOOD))
-    count      = jnp.sum(is_food).astype(jnp.int8)
+    state = _detect.detect_food(state, rng)
+    b = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - 1
+    level_cats = state.ground_items.category[b, lv]
+    is_food = level_cats == jnp.int8(int(ItemCategory.FOOD))
+    count = jnp.sum(is_food).astype(jnp.int8)
     return state.replace(last_food_count=count)
 
 
@@ -560,39 +615,190 @@ def _effect_light(state, rng, buc):
 # ---- monster effects ------------------------------------------------------
 
 def _effect_scare_monster(state, rng, buc):
-    """scroll of scare monster — scare nearby monsters.
+    """scroll of scare monster — scare or unfreeze nearby monsters.
 
-    Canonical: seffect_scare_monster — set mflee on visible monsters.
-    Wave 3: no-op (monster flee state not yet in MonsterAIState).
+    Cite: vendor/nethack/src/read.c::seffect_scare_monster ~1454-1486.
+
+    Normal branch: for each alive monster, set flee_until_turn =
+    timestep + rnd(80) + 20, unless monster is immune (demon, lawful minion,
+    or angel — _IS_SCARE_IMMUNE).
+
+    Confused/cursed branch: instead un-freeze paralyzed monsters (clear
+    paralyzed_timer, matching vendor mfrozen=mcanmove=1 at line 1468-1469).
     """
-    return state
+    confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
+    cursed   = _is_cursed(buc)
+    alt_branch = confused | cursed
+
+    mai = state.monster_ai
+    n   = mai.alive.shape[0]
+
+    # --- sane branch: set flee_until_turn ---
+    rng1, rng2 = jax.random.split(rng)
+    flee_roll = jax.random.randint(rng1, (n,), 1, 81, dtype=jnp.int32) + jnp.int32(20)
+    new_flee  = state.timestep + flee_roll
+
+    safe_entry   = jnp.clip(mai.entry_idx.astype(jnp.int32), 0, _IS_SCARE_IMMUNE.shape[0] - 1)
+    is_immune    = _IS_SCARE_IMMUNE[safe_entry]
+    can_scare    = mai.alive & ~is_immune
+    sane_flee    = jnp.where(can_scare, new_flee, mai.flee_until_turn)
+
+    # --- confused/cursed branch: clear paralyzed_timer ---
+    conf_para = jnp.where(mai.alive,
+                          jnp.zeros(n, dtype=jnp.int16),
+                          mai.paralyzed_timer)
+
+    new_flee_arr  = jnp.where(alt_branch, mai.flee_until_turn, sane_flee)
+    new_para_arr  = jnp.where(alt_branch, conf_para, mai.paralyzed_timer)
+
+    new_mai   = mai.replace(flee_until_turn=new_flee_arr, paralyzed_timer=new_para_arr)
+    return state.replace(monster_ai=new_mai)
 
 
 def _effect_confuse_monster(state, rng, buc):
-    """scroll of confuse monster — confuse nearby monsters.
+    """scroll of confuse monster — arm confuse-on-hit or confuse the player.
 
-    Canonical: seffect_confuse_monster — set mconf on nearby monsters.
-    Wave 3: no-op (monster confusion state stub).
+    Cite: vendor/nethack/src/read.c::seffect_confuse_monster ~1399-1451.
+
+    Normal branch: set confuse_attack_pending = True (next melee hit confuses
+    the target, matching vendor u.umconf += incr at line 1449).
+
+    Confused branch: confuse the player (CONFUSION timer += rnd(20)),
+    matching vendor make_confused(HConfusion + rnd(100)) at lines 1411/1417.
+    We scale to rnd(20) for the sim.
     """
-    return state
+    confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
+
+    # Confused branch: add rnd(20) to player confusion timer.
+    rng1, _ = jax.random.split(rng)
+    conf_roll = jax.random.randint(rng1, (), 1, 21, dtype=jnp.int32)
+    cur_conf  = state.status.timed_statuses[int(TimedStatus.CONFUSION)]
+    new_conf  = cur_conf + conf_roll
+    new_ts    = state.status.timed_statuses.at[int(TimedStatus.CONFUSION)].set(new_conf)
+    conf_status = state.status.replace(timed_statuses=new_ts)
+
+    # Sane branch: arm confuse-attack flag.
+    sane_status = state.status.replace(confuse_attack_pending=jnp.bool_(True))
+
+    new_status = jax.lax.cond(confused,
+                              lambda: conf_status,
+                              lambda: sane_status)
+    return state.replace(status=new_status)
 
 
 def _effect_create_monster(state, rng, buc):
-    """scroll of create monster — create a monster near the player.
+    """scroll of create monster — spawn monsters adjacent to player.
 
-    Canonical: seffect_create_monster — makemon(NULL, ux, uy, ...).
-    Wave 3: no-op (monster creation deferred to monster subsystem Wave 3+).
+    Cite: vendor/nethack/src/read.c::seffect_create_monster ~1608-1624.
+
+    Spawns 1 monster normally; 13 if confused or cursed (1 + 12 from vendor
+    ``1 + ((confused || scursed) ? 12 : 0)`` at line 1615).
+
+    Monster type selected level-appropriately using _MONSTER_GEN_LEVEL
+    (same table as items_wands._effect_create_monster).  Each monster is
+    placed in the first dead MonsterAIState slot, at a position adjacent to
+    the player (clipped to map bounds).  hp = hp_max = level * 8 proxy.
+
+    JIT-pure via lax.fori_loop.
     """
-    return state
+    from Nethax.nethax.subsystems.items_wands import _MONSTER_GEN_LEVEL
+
+    confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
+    cursed   = _is_cursed(buc)
+    n_spawn  = jnp.where(confused | cursed, jnp.int32(13), jnp.int32(1))
+
+    mai     = state.monster_ai
+    n_slots = mai.alive.shape[0]
+    map_h, map_w = state.terrain.shape[2], state.terrain.shape[3]
+    b   = state.dungeon.current_branch.astype(jnp.int32)
+    lv  = state.dungeon.current_level.astype(jnp.int32) - 1
+    pr  = state.player_pos[0].astype(jnp.int32)
+    pc  = state.player_pos[1].astype(jnp.int32)
+    max_gen = state.dungeon.current_level.astype(jnp.int32) + jnp.int32(3)
+
+    def _spawn_one(i, carry):
+        mai_c, rng_c = carry
+
+        # Sample a level-appropriate monster type (rejection via lax.while_loop).
+        def _bad_type(ws):
+            _, _, t = ws
+            return _MONSTER_GEN_LEVEL[t].astype(jnp.int32) > max_gen
+
+        def _resample(ws):
+            r_, _, _ = ws
+            r_, sub = jax.random.split(r_)
+            t = jax.random.randint(sub, (), 1, N_MONSTERS, dtype=jnp.int32)
+            return (r_, jnp.int32(0), t)
+
+        rng_c, sub0 = jax.random.split(rng_c)
+        init_t = jax.random.randint(sub0, (), 1, N_MONSTERS, dtype=jnp.int32)
+        rng_c, _, mtype = lax.while_loop(_bad_type, _resample,
+                                          (rng_c, jnp.int32(0), init_t))
+
+        # Find first dead slot (skip slot 0 sentinel).
+        dead_mask = (~mai_c.alive).at[0].set(False)
+        slot = jnp.argmax(dead_mask).astype(jnp.int32)
+
+        # Random adjacent position.
+        rng_c, sr, sc = jax.random.split(rng_c, 3)
+        new_r = jnp.clip(pr + jax.random.randint(sr, (), -1, 2, dtype=jnp.int32),
+                         0, map_h - 1).astype(jnp.int16)
+        new_c = jnp.clip(pc + jax.random.randint(sc, (), -1, 2, dtype=jnp.int32),
+                         0, map_w - 1).astype(jnp.int16)
+        new_pos = jnp.array([new_r, new_c], dtype=jnp.int16)
+
+        # hp proxy: level * 8.
+        mon_level = _MONSTER_GEN_LEVEL[mtype].astype(jnp.int32)
+        hp_val    = jnp.maximum(mon_level * jnp.int32(8), jnp.int32(1))
+
+        new_mai = mai_c.replace(
+            alive=mai_c.alive.at[slot].set(jnp.bool_(True)),
+            pos=mai_c.pos.at[slot].set(new_pos),
+            entry_idx=mai_c.entry_idx.at[slot].set(mtype.astype(jnp.int16)),
+            hp=mai_c.hp.at[slot].set(hp_val.astype(jnp.int32)),
+            hp_max=mai_c.hp_max.at[slot].set(hp_val.astype(jnp.int32)),
+        )
+        return (new_mai, rng_c)
+
+    new_mai, _ = lax.fori_loop(0, n_spawn, _spawn_one, (mai, rng))
+    return state.replace(monster_ai=new_mai)
 
 
 def _effect_taming(state, rng, buc):
-    """scroll of taming — tame nearby monsters.
+    """scroll of taming — tame monsters within Chebyshev radius of player.
 
-    Canonical: seffect_taming — tamedog / tamemonst on nearby monsters.
-    Wave 3: no-op (taming state stub).
+    Cite: vendor/nethack/src/read.c::seffect_taming ~1679-1719,
+    maybe_tame ~1044-1063.
+
+    Radius bd: uncursed=1, confused=5, blessed=full level (maps to 127).
+    For each alive monster within Chebyshev distance bd of player that is
+    not tame-immune (_IS_TAME_IMMUNE), set tame=True, peaceful=True,
+    mtame=10.  JIT-pure via jnp.where masks.
     """
-    return state
+    confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
+    cursed   = _is_cursed(buc)
+    blessed  = _is_blessed(buc)
+
+    bd = jnp.where(blessed, jnp.int32(127),
+         jnp.where(confused | cursed, jnp.int32(5), jnp.int32(1)))
+
+    mai = state.monster_ai
+    pr  = state.player_pos[0].astype(jnp.int32)
+    pc  = state.player_pos[1].astype(jnp.int32)
+    mr  = mai.pos[:, 0].astype(jnp.int32)
+    mc  = mai.pos[:, 1].astype(jnp.int32)
+    cheby = jnp.maximum(jnp.abs(mr - pr), jnp.abs(mc - pc))
+
+    safe_entry = jnp.clip(mai.entry_idx.astype(jnp.int32), 0, _IS_TAME_IMMUNE.shape[0] - 1)
+    is_immune  = _IS_TAME_IMMUNE[safe_entry]
+    in_range   = mai.alive & (cheby <= bd) & ~is_immune
+
+    new_tame    = jnp.where(in_range, jnp.bool_(True),  mai.tame)
+    new_peace   = jnp.where(in_range, jnp.bool_(True),  mai.peaceful)
+    new_mtame   = jnp.where(in_range, jnp.int8(10),     mai.mtame)
+
+    new_mai = mai.replace(tame=new_tame, peaceful=new_peace, mtame=new_mtame)
+    return state.replace(monster_ai=new_mai)
 
 
 def _effect_genocide(state, rng, buc):
@@ -765,12 +971,38 @@ def _effect_stinking_cloud(state, rng, buc):
 # ---- misc -----------------------------------------------------------------
 
 def _effect_mail(state, rng, buc):
-    """scroll of mail — deliver a mail message.
+    """scroll of mail — deliver a letter to inventory.
 
-    Canonical: seffect_mail — deliver a mail message from a mail daemon.
-    Wave 3: no-op (mail system not applicable to headless JAX sim).
+    Cite: vendor/nethack/src/read.c::seffect_mail ~2157-2188,
+    vendor/nethack/src/mail.c::ckmailstatus.
+
+    In the headless sim there is no mail daemon; we deliver the "letter"
+    directly by placing a SCR_MAIL item in the first empty inventory slot.
+    SCR_MAIL type_id = _SCROLL_BASE_ID + ScrollEffect.MAIL (= 21).
     """
-    return state
+    from Nethax.nethax.subsystems.inventory import ItemCategory, MAX_INVENTORY_SLOTS
+
+    mail_cat = jnp.int8(int(ItemCategory.SCROLL))
+    mail_tid = jnp.int16(_SCROLL_BASE_ID + int(ScrollEffect.MAIL))
+
+    inv   = state.inventory
+    items = inv.items
+    empty = items.category == jnp.int8(0)
+    slot  = jnp.argmax(empty).astype(jnp.int32)
+    has_empty = jnp.any(empty)
+
+    new_cat = jnp.where(has_empty,
+                        items.category.at[slot].set(mail_cat),
+                        items.category)
+    new_tid = jnp.where(has_empty,
+                        items.type_id.at[slot].set(mail_tid),
+                        items.type_id)
+    new_qty = jnp.where(has_empty,
+                        items.quantity.at[slot].set(jnp.int16(1)),
+                        items.quantity)
+
+    new_items = items.replace(category=new_cat, type_id=new_tid, quantity=new_qty)
+    return state.replace(inventory=inv.replace(items=new_items))
 
 
 def _effect_blank_paper(state, rng, buc):
@@ -911,6 +1143,11 @@ _CONFUSED_BRANCHES = [
 def read_scroll(state, rng, slot_idx):
     """Apply the scroll in inventory slot `slot_idx`.
 
+    Early-exit conditions (vendor/nethack/src/read.c::doread early checks):
+      BLIND   — "You can't see to read."  No effect.
+      STUNNED — "You are too disoriented to read."  No effect.
+    Cite: vendor/nethack/src/read.c::doread — HBlinded / HStun early returns.
+
     If the player is confused (CONFUSION > 0) and this effect has a
     confused-branch handler, the confused branch runs instead of the sane one.
     Quantity is decremented after dispatch.
@@ -925,46 +1162,54 @@ def read_scroll(state, rng, slot_idx):
     -------
     Updated EnvState.
     """
-    slot_idx  = jnp.int32(slot_idx)
-    items     = state.inventory.items
-    type_id   = items.type_id[slot_idx].astype(jnp.int32)
-    buc       = items.buc_status[slot_idx]
+    # Blind / stunned: cannot read (vendor read.c::doread early checks).
+    is_blind   = state.status.timed_statuses[int(TimedStatus.BLIND)]   > jnp.int32(0)
+    is_stunned = state.status.timed_statuses[int(TimedStatus.STUNNED)] > jnp.int32(0)
+    can_read   = ~(is_blind | is_stunned)
 
-    effect_id = jnp.clip(
-        type_id - jnp.int32(_SCROLL_BASE_ID),
-        0,
-        N_SCROLLS - 1,
-    )
+    def _do_read(s):
+        _slot_idx = jnp.int32(slot_idx)
+        items     = s.inventory.items
+        type_id   = items.type_id[_slot_idx].astype(jnp.int32)
+        buc       = items.buc_status[_slot_idx]
 
-    confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
-    has_confused = _HAS_CONFUSED[effect_id]
-    use_confused = confused & has_confused
+        effect_id = jnp.clip(
+            type_id - jnp.int32(_SCROLL_BASE_ID),
+            0,
+            N_SCROLLS - 1,
+        )
 
-    # Run both branches (JIT requires static structure); select result.
-    confused_state = jax.lax.switch(
-        effect_id, _CONFUSED_BRANCHES, (state, rng, slot_idx)
-    )
-    sane_state = jax.lax.switch(effect_id, _SWITCH_BRANCHES, (state, rng, buc))
+        confused = s.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
+        has_confused = _HAS_CONFUSED[effect_id]
+        use_confused = confused & has_confused
 
-    new_state = jax.tree.map(
-        lambda c, s: jnp.where(use_confused, c, s),
-        confused_state,
-        sane_state,
-    )
+        # Run both branches (JIT requires static structure); select result.
+        confused_state = jax.lax.switch(
+            effect_id, _CONFUSED_BRANCHES, (s, rng, _slot_idx)
+        )
+        sane_state = jax.lax.switch(effect_id, _SWITCH_BRANCHES, (s, rng, buc))
 
-    # Decrement quantity; clear category when exhausted.
-    old_qty  = new_state.inventory.items.quantity[slot_idx]
-    new_qty  = jnp.maximum(old_qty - jnp.int16(1), jnp.int16(0))
-    new_cat  = jnp.where(new_qty == jnp.int16(0),
-                         jnp.int8(0),
-                         new_state.inventory.items.category[slot_idx])
-    new_quantity = new_state.inventory.items.quantity.at[slot_idx].set(new_qty)
-    new_category = new_state.inventory.items.category.at[slot_idx].set(new_cat)
-    new_items    = new_state.inventory.items.replace(
-        quantity=new_quantity, category=new_category
-    )
-    new_inv = new_state.inventory.replace(items=new_items)
-    return new_state.replace(inventory=new_inv)
+        new_state = jax.tree.map(
+            lambda c, ns: jnp.where(use_confused, c, ns),
+            confused_state,
+            sane_state,
+        )
+
+        # Decrement quantity; clear category when exhausted.
+        old_qty  = new_state.inventory.items.quantity[_slot_idx]
+        new_qty  = jnp.maximum(old_qty - jnp.int16(1), jnp.int16(0))
+        new_cat  = jnp.where(new_qty == jnp.int16(0),
+                             jnp.int8(0),
+                             new_state.inventory.items.category[_slot_idx])
+        new_quantity = new_state.inventory.items.quantity.at[_slot_idx].set(new_qty)
+        new_category = new_state.inventory.items.category.at[_slot_idx].set(new_cat)
+        new_items    = new_state.inventory.items.replace(
+            quantity=new_quantity, category=new_category
+        )
+        new_inv = new_state.inventory.replace(items=new_items)
+        return new_state.replace(inventory=new_inv)
+
+    return jax.lax.cond(can_read, _do_read, lambda s: s, state)
 
 
 def handle_read(state, rng):

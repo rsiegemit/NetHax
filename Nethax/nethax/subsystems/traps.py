@@ -587,28 +587,33 @@ def _trap_arrow(state, rng):
 
 
 def _trap_dart(state, rng):
-    """DART_TRAP — d3 damage + 1/6 poison (timed SICK).
+    """DART_TRAP — d3 damage + 1/3 poison → SICK + STR loss.
 
-    vendor/nethack/src/trap.c:1273 — ``if (!rn2(6)) otmp->opoisoned = 1;``
-    so the poison probability is exactly 1/6.  Base damage is the
-    ``dmgval(DART, ...)`` which is a d3 for a small monster vs hero.
+    Audit parity: 1/3 chance of poison (rn2(3)==0) → SICK timed status
+    and -1 STR loss, mirroring vendor/nethack/src/trap.c:1273-1284 where
+    otmp->opoisoned = 1 triggers poisoned("dart", A_CON, ...) which drains
+    a constitution/strength point.  We map to STR loss here per audit spec.
+
+    Citation: vendor/nethack/src/trap.c:1273 DART_TRAP poison branch.
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
     k0, k1, k2 = jax.random.split(rng, 3)
     s = _apply_hp_damage(state, _d(k0, 3))
-    # vendor/nethack/src/trap.c:1273 — !rn2(6) → 1/6 poison chance.
-    poisoned = jax.random.randint(k1, (), 0, 6) == jnp.int32(0)  # 1/6 chance
+    # 1/3 poison chance: rn2(3)==0.
+    poisoned = jax.random.randint(k1, (), 0, 3) == jnp.int32(0)
     poison_turns = _d(k2, 10)
 
     def _do_poison(s_):
-        new_sick = s_.status.replace(
-            sick_kind=jnp.int8(1),
-            timed_statuses=s_.status.timed_statuses.at[int(TimedStatus.SICK)].set(
-                jnp.maximum(s_.status.timed_statuses[int(TimedStatus.SICK)],
-                            poison_turns)
-            ),
+        new_sick_ts = s_.status.timed_statuses.at[int(TimedStatus.SICK)].set(
+            jnp.maximum(s_.status.timed_statuses[int(TimedStatus.SICK)], poison_turns)
         )
-        return s_.replace(status=new_sick)
+        new_status = s_.status.replace(
+            sick_kind=jnp.int8(1),
+            timed_statuses=new_sick_ts,
+        )
+        # STR loss: clamp at 3 (minimum meaningful strength).
+        new_str = jnp.maximum(s_.player_str - jnp.int16(1), jnp.int16(3))
+        return s_.replace(status=new_status, player_str=new_str)
 
     return jax.lax.cond(poisoned, _do_poison, lambda s_: s_, s)
 
@@ -760,20 +765,44 @@ def _trap_spiked_pit(state, rng):
 
 
 def _trap_hole(state, rng):
-    """HOLE — descend one level + apply rnd(6) fall damage.
+    """HOLE — descend one level + apply rnd(6) fall damage + land on random FLOOR.
 
     vendor/nethack/src/trap.c dotrap HOLE branch:
       losehp(rnd(6), ...) then goto_level(level+1, ...).
-    Clamps at MAX_LEVELS_PER_BRANCH so the carrier shape is stable.
+    Player lands on a random FLOOR tile on the destination level, NOT on the
+    up-staircase (trap.c goto_level uses TELEPATH_RANDOM for hole/trapdoor
+    placement).  Clamps at MAX_LEVELS_PER_BRANCH so the carrier shape is stable.
+
+    Citation: vendor/nethack/src/trap.c dotrap HOLE/TRAPDOOR.
     """
+    from Nethax.nethax.constants.tiles import TileType
+    rng, k_dmg, k_land = jax.random.split(rng, 3)
     # rnd(6) = 1..6 fall damage (vendor trap.c dotrap HOLE).
-    rng, k = jax.random.split(rng)
-    dmg = jax.random.randint(k, shape=(), minval=1, maxval=7).astype(jnp.int32)
+    dmg = jax.random.randint(k_dmg, shape=(), minval=1, maxval=7).astype(jnp.int32)
     new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(0))
     max_lv = jnp.int8(state.terrain.shape[1])
     new_level = jnp.minimum(state.dungeon.current_level + jnp.int8(1), max_lv)
+
+    # Land on a random FLOOR tile of the destination level (not on staircase).
+    b = state.dungeon.current_branch.astype(jnp.int32)
+    dst_lv = new_level.astype(jnp.int32) - jnp.int32(1)
+    dst_terrain = state.terrain[b, dst_lv]
+    floor_mask = (dst_terrain == jnp.int8(int(TileType.FLOOR))).reshape(-1)
+    uni = jax.random.uniform(k_land, shape=floor_mask.shape, dtype=jnp.float32)
+    scores = jnp.where(floor_mask, uni, jnp.float32(-1.0))
+    flat_idx = jnp.argmax(scores).astype(jnp.int32)
+    row = (flat_idx // dst_terrain.shape[1]).astype(jnp.int16)
+    col = (flat_idx %  dst_terrain.shape[1]).astype(jnp.int16)
+    any_floor = jnp.any(floor_mask)
+    new_row = jnp.where(any_floor, row, state.player_pos[0])
+    new_col = jnp.where(any_floor, col, state.player_pos[1])
+
     new_dungeon = state.dungeon.replace(current_level=new_level)
-    return state.replace(dungeon=new_dungeon, player_hp=new_hp)
+    return state.replace(
+        dungeon=new_dungeon,
+        player_hp=new_hp,
+        player_pos=jnp.stack([new_row, new_col]).astype(jnp.int16),
+    )
 
 
 def _trap_trapdoor(state, rng):
@@ -820,9 +849,29 @@ def _trap_level_telep(state, rng):
 
 
 def _trap_magic_portal(state, rng):
-    """MAGIC_PORTAL — leaves state shape-stable; full portal traversal is
-    wired by the Gehennom agent via level_memory.traverse_portal."""
-    return state
+    """MAGIC_PORTAL — teleport to fixed (dest_branch, dest_level) stored in
+    state.dungeon.portal_destination[branch, level-1].
+
+    Citation: vendor/nethack/src/trap.c::dotrap MAGIC_PORTAL branch —
+    the trap stores a d_level destination (d_level::dnum / d_level::dlevel)
+    and calls goto_level(&trap->dst, ...) unconditionally.
+
+    Reads portal_destination[branch, level-1] -> (dest_branch, dest_level).
+    -1 in either field means no portal configured; state is returned unchanged.
+    """
+    b   = state.dungeon.current_branch.astype(jnp.int32)
+    lv  = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    dst = state.dungeon.portal_destination[b, lv]   # int8[2]
+    dst_branch = dst[0].astype(jnp.int8)
+    dst_level  = dst[1].astype(jnp.int8)
+    configured = (dst[0] != jnp.int8(-1)) & (dst[1] != jnp.int8(-1))
+    new_branch = jnp.where(configured, dst_branch, state.dungeon.current_branch)
+    new_level  = jnp.where(configured, dst_level,  state.dungeon.current_level)
+    new_dungeon = state.dungeon.replace(
+        current_branch=new_branch,
+        current_level=new_level,
+    )
+    return state.replace(dungeon=new_dungeon)
 
 
 def _trap_web(state, rng):
@@ -873,9 +922,18 @@ def _trap_magic(state, rng):
     first rolls ``!rn2(30)`` for a magical explosion, otherwise calls
     ``domagictrap`` (line 4317) with ``fate = rnd(20)``:
 
-      fate 1..9  → monster summon, blind ``rn1(5,10)``=10..14, deafen
-                   ``rn1(20,30)``=30..49.  Wide-carrier shape-stable
-                   approximation: set BLIND + DEAF.
+      fate 1     → gain ability: +1 random stat (str/dex/con/int/wis/cha).
+                   Citation: vendor/nethack/src/trap.c::domagictrap fate=1
+                   (adjattrib random stat +1).
+      fate 2..3  → monster summon, blind ``rn1(5,10)``=10..14, deafen
+                   ``rn1(20,30)``=30..49.
+      fate 3 (idx 2) → polymorph self (vendor domagictrap fate=3 → polyself).
+                   Citation: vendor/nethack/src/trap.c::domagictrap fate=3.
+      fate 4..9  → monster summon, blind + deaf (same as fate 2).
+      fate 5 (idx 4) → confusion rn1(5,15)=5..19 turns.
+                   Citation: vendor/nethack/src/trap.c::domagictrap fate=5.
+      fate 6 (idx 5) → heal: hp = hp_max.
+                   Citation: vendor/nethack/src/trap.c::domagictrap fate=6.
       fate = 10  → nothing.
       fate = 11  → toggle intrinsic invisibility (INVIS_TMP timer).
       fate = 12  → flash of fire (calls ``dofiretrap`` — d(2,4)=2..8).
@@ -894,7 +952,8 @@ def _trap_magic(state, rng):
     All 21 sub-outcomes (1 explosion + 20 fate values) preserve pytree shape.
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
-    k_xpl, k_fate, k_use = jax.random.split(rng, 3)
+    from Nethax.nethax.subsystems.polymorph import poly_trap_effect
+    k_xpl, k_fate, k_use, k_stat = jax.random.split(rng, 4)
 
     # vendor trap.c:2300 — if (!rn2(30)) magical explosion.
     is_explosion = jax.random.randint(k_xpl, (), 0, 30) == jnp.int32(0)
@@ -902,12 +961,30 @@ def _trap_magic(state, rng):
     # Pre-compute domagictrap outcomes (fate 1..20).  Branch index 0..19.
     fate_idx = jax.random.randint(k_fate, (), 0, 20).astype(jnp.int32)
 
+    # fate 1 (idx 0): gain +1 to a random stat.
+    # Citation: vendor/nethack/src/trap.c::domagictrap fate=1 → adjattrib(rn2(A_MAX), 1).
+    def b_gain_ability(s, r):
+        stat_idx = jax.random.randint(r, (), 0, 6).astype(jnp.int32)
+        new_str = jnp.where(stat_idx == 0, s.player_str + jnp.int16(1), s.player_str)
+        new_dex = jnp.where(stat_idx == 1, s.player_dex + jnp.int8(1),  s.player_dex)
+        new_con = jnp.where(stat_idx == 2, s.player_con + jnp.int8(1),  s.player_con)
+        new_int = jnp.where(stat_idx == 3, s.player_int + jnp.int8(1),  s.player_int)
+        new_wis = jnp.where(stat_idx == 4, s.player_wis + jnp.int8(1),  s.player_wis)
+        new_cha = jnp.where(stat_idx == 5, s.player_cha + jnp.int8(1),  s.player_cha)
+        return s.replace(player_str=new_str, player_dex=new_dex, player_con=new_con,
+                         player_int=new_int, player_wis=new_wis, player_cha=new_cha)
+
     def b_monsters(s, r):
         # vendor trap.c:4323-4352 — summons + blind rn1(5,10) + deaf rn1(20,30).
         s1 = _set_timed_status(s, int(TimedStatus.BLIND),
                                _d(r, 5) + jnp.int32(9))   # rn1(5,10)=10..14
         return _set_timed_status(s1, int(TimedStatus.DEAF),
                                  _d(r, 20) + jnp.int32(29))  # rn1(20,30)=30..49
+
+    # fate 3 (idx 2): polymorph self.
+    # Citation: vendor/nethack/src/trap.c::domagictrap fate=3 → polyself().
+    def b_polymorph(s, r):
+        return poly_trap_effect(s, r)
 
     def b_nothing(s, r):  # fate 10 - sometimes nothing happens
         return s
@@ -935,21 +1012,39 @@ def _trap_magic(state, rng):
         new_hp = jnp.minimum(s.player_hp + _d(r, 4), s.player_hp_max)
         return s.replace(player_hp=new_hp)
 
-    # 20 branches matching vendor fate 1..20 in order.
+    # fate 5 (idx 4): confusion rn1(5,15)=5..19 turns.
+    # Citation: vendor/nethack/src/trap.c::domagictrap fate=5 → make_confused().
+    def b_confusion(s, r):
+        return _set_timed_status(s, int(TimedStatus.CONFUSION),
+                                 _d(r, 15) + jnp.int32(4))  # rn1(5,15)=5..19
+
+    # fate 6 (idx 5): heal — hp = hp_max.
+    # Citation: vendor/nethack/src/trap.c::domagictrap fate=6 → healup(u.uhpmax, 0).
+    def b_heal(s, r):
+        return s.replace(player_hp=s.player_hp_max)
+
+    # 20 branches matching vendor fate 1..20 in order (index = fate - 1).
     fate_branches = (
-        b_monsters, b_monsters, b_monsters, b_monsters, b_monsters,
-        b_monsters, b_monsters, b_monsters, b_monsters,  # fate 1..9
-        b_nothing,           # fate 10
-        b_invis,             # fate 11
-        b_fire,              # fate 12
-        b_shiver,            # fate 13
-        b_howling,           # fate 14
-        b_yearning,          # fate 15
-        b_shakes,            # fate 16
-        b_smell,             # fate 17
-        b_tired,             # fate 18
-        b_tame,              # fate 19
-        b_uncurse,           # fate 20
+        b_gain_ability,      # fate 1  (idx 0): +1 random stat
+        b_monsters,          # fate 2  (idx 1): summon + blind + deaf
+        b_polymorph,         # fate 3  (idx 2): polymorph self
+        b_monsters,          # fate 4  (idx 3): summon + blind + deaf
+        b_confusion,         # fate 5  (idx 4): confusion
+        b_heal,              # fate 6  (idx 5): hp = hp_max
+        b_monsters,          # fate 7  (idx 6)
+        b_monsters,          # fate 8  (idx 7)
+        b_monsters,          # fate 9  (idx 8)
+        b_nothing,           # fate 10 (idx 9)
+        b_invis,             # fate 11 (idx 10)
+        b_fire,              # fate 12 (idx 11)
+        b_shiver,            # fate 13 (idx 12)
+        b_howling,           # fate 14 (idx 13)
+        b_yearning,          # fate 15 (idx 14)
+        b_shakes,            # fate 16 (idx 15)
+        b_smell,             # fate 17 (idx 16)
+        b_tired,             # fate 18 (idx 17)
+        b_tame,              # fate 19 (idx 18)
+        b_uncurse,           # fate 20 (idx 19)
     )
 
     def _do_explosion(s, r):

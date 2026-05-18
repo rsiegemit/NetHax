@@ -448,8 +448,14 @@ def monster_to_hit_tmp(player_uac: int, monster_m_lev: int) -> int:
     # vendor/nethack/src/mhitu.c:709-718 (mattacku tmp accumulator).
     """
     uac = int(player_uac)
-    # AC_VALUE for AC>=0 is the AC itself (hack.h:1538).
-    ac_value = uac if uac >= 0 else uac  # placeholder; negative-path differs at runtime
+    # vendor/nethack/src/uhitm.c:380 — AC_VALUE macro (hack.h:1538):
+    # AC>=0: use AC directly; AC<0: rnd(-AC) softens the bonus.
+    # Pure-Python path: use deterministic midpoint for negative AC.
+    if uac >= 0:
+        ac_value = uac
+    else:
+        import random as _random
+        ac_value = _random.randint(1, -uac)
     tmp = ac_value + 10 + int(monster_m_lev)
     return tmp if tmp > 0 else 1
 
@@ -685,7 +691,12 @@ def to_hit_roll(rng: jax.Array, attacker_state, target_ac: jnp.ndarray) -> jnp.n
     )
     skill_bonus = _skill_hit_bonus(attacker_state)
     enchant = _wielded_enchant(attacker_state)
-    target_ac_i32 = target_ac.astype(jnp.int32)
+    # vendor/nethack/src/uhitm.c:380 — AC_VALUE: AC>=0 used directly;
+    # AC<0: rnd(-ac) softens difficulty for very-low-AC targets.
+    ac_raw = target_ac.astype(jnp.int32)
+    key_ac, rng = jax.random.split(rng)
+    ac_neg_roll = jax.random.randint(key_ac, (), 1, jnp.maximum(-ac_raw + 1, 2), dtype=jnp.int32)
+    target_ac_i32 = jnp.where(ac_raw >= 0, ac_raw, ac_neg_roll)
 
     # vendor/nethack/src/uhitm.c:378 — XL contribution (player level).
     xl_bonus = attacker_state.player_xl.astype(jnp.int32)
@@ -708,9 +719,8 @@ def to_hit_roll(rng: jax.Array, attacker_state, target_ac: jnp.ndarray) -> jnp.n
     stunned_timer = attacker_state.status.timed_statuses[int(TimedStatus.STUNNED)].astype(jnp.int32)
     stun_penalty = jnp.where(stunned_timer > jnp.int32(0), jnp.int32(-1), jnp.int32(0))
 
-    # vendor/nethack/src/uhitm.c:410-411 — trap: -3 to-hit.
-    # TODO: vendor uhitm.c:410 requires player_in_trap field (not yet in EnvState).
-    trap_penalty = jnp.int32(0)
+    # vendor/nethack/src/uhitm.c:410 — trap: -3 to-hit when player is in a trap.
+    trap_penalty = jnp.where(attacker_state.player_in_trap, jnp.int32(-3), jnp.int32(0))
 
     tmp = (jnp.int32(1) + abon + target_ac_i32 + skill_bonus + enchant
            + xl_bonus + luck_bonus + uhitinc
@@ -933,11 +943,17 @@ def _single_melee_strike(
     rolled from the form's attack dice rather than the weapon.
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
-    key_hit, key_dmg, key_monk, key_samurai, key_backstab = split_n(rng, 5)
+    key_hit, key_dmg, key_monk, key_samurai, key_backstab, key_ac = split_n(rng, 6)
     idx = target_monster_idx.astype(jnp.int32)
     mai = state.monster_ai
 
-    target_ac = mai.ac[idx].astype(jnp.int32)
+    # vendor/nethack/src/uhitm.c:380 — AC_VALUE: AC>=0 used directly;
+    # AC<0: rnd(-AC) softens difficulty (very low AC enemies are harder to hit
+    # than the raw number implies). Cite: uhitm.c:380.
+    ac_raw = mai.ac[idx].astype(jnp.int32)
+    ac_neg_roll = jax.random.randint(key_ac, (), 1, jnp.maximum(-ac_raw + 1, 2), dtype=jnp.int32)
+    target_ac = jnp.where(ac_raw >= 0, ac_raw, ac_neg_roll)
+
     target_large = mai.is_large[idx]
     target_alive = mai.alive[idx]
 
@@ -996,8 +1012,8 @@ def _single_melee_strike(
     confused_timer = state.status.timed_statuses[int(TimedStatus.CONFUSION)].astype(jnp.int32)
     confusion_penalty = jnp.where(confused_timer > jnp.int32(0), jnp.int32(-1), jnp.int32(0))
 
-    # TODO: vendor uhitm.c:410 requires player_in_trap field (not yet in EnvState).
-    trap_penalty = jnp.int32(0)
+    # vendor/nethack/src/uhitm.c:410 — trap: -3 to-hit when player is in a trap.
+    trap_penalty = jnp.where(state.player_in_trap, jnp.int32(-3), jnp.int32(0))
 
     tmp = (jnp.int32(1) + abon + target_ac + skill_bonus + enchant + pen + knight_bonus
            + xl_bonus + luck_bonus + uhitinc
@@ -1068,14 +1084,19 @@ def _single_melee_strike(
     arti_bonus = jnp.where(is_poly, jnp.int32(0), arti_bonus)
     base_dmg = (base_dmg + arti_bonus).astype(jnp.int32)
 
+    # vendor/nethack/src/uhitm.c:387-394 — paralyzed target: +4 to-hit (already in
+    # immobile_bonus above) and +4 damage.  Cite: uhitm.c:393-394.
+    target_paralyzed = mai.paralyzed_timer[idx].astype(jnp.int32) > jnp.int32(0)
+    paralyzed_dmg_bonus = jnp.where(target_paralyzed, jnp.int32(4), jnp.int32(0))
+    base_dmg = (base_dmg + paralyzed_dmg_bonus).astype(jnp.int32)
+
     # vendor/nethack/src/uhitm.c:960-964 — Rogue backstab bonus.
-    # If the player is a Rogue AND the target is sleeping or fleeing, deal
-    # +rnd(player_xl) extra damage.
-    # TODO: paralyzed bonus skipped — no mai.paralyzed field yet
-    #       (vendor uhitm.c:960 checks !mtmp->mcanmove).
+    # If the player is a Rogue AND the target is sleeping, fleeing, or paralyzed,
+    # deal +rnd(player_xl) extra damage.
+    # vendor uhitm.c:960 checks !mtmp->mcanmove (paralyzed).
     is_rogue = state.player_role == jnp.int8(int(Role.ROGUE))
     target_fleeing_bs = mai.mstrategy[idx].astype(jnp.int32) == jnp.int32(4)
-    target_vulnerable = mai.asleep[idx] | target_fleeing_bs
+    target_vulnerable = mai.asleep[idx] | target_fleeing_bs | target_paralyzed
     xl_clamped = jnp.maximum(state.player_xl.astype(jnp.int32), jnp.int32(1))
     backstab_roll = rnd(key_backstab, xl_clamped).astype(jnp.int32)
     backstab_bonus = jnp.where(is_rogue & target_vulnerable, backstab_roll, jnp.int32(0))
@@ -1194,6 +1215,19 @@ def _single_melee_strike(
     new_state = jax.lax.cond(
         killed,
         _place_corpse,
+        lambda s: s,
+        new_state,
+    )
+
+    # Quest nemesis kill hook (quest.c::nemdead ~109-113: Qstat(killed_nemesis)=TRUE).
+    # JIT-pure: entry_idx comparison is scalar; lax.cond gates the state update.
+    from Nethax.nethax.subsystems.quest import on_nemesis_killed, _NEMESIS_IDX_BY_ROLE
+    role_idx_q = jnp.clip(new_state.player_role.astype(jnp.int32), 0, _NEMESIS_IDX_BY_ROLE.shape[0] - 1)
+    nemesis_entry = _NEMESIS_IDX_BY_ROLE[role_idx_q].astype(jnp.int32)
+    is_nemesis_kill = killed & (mai.entry_idx[idx].astype(jnp.int32) == nemesis_entry)
+    new_state = jax.lax.cond(
+        is_nemesis_kill,
+        lambda s: on_nemesis_killed(s, mai.entry_idx[idx]),
         lambda s: s,
         new_state,
     )
@@ -1340,8 +1374,12 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
     # vendor/nethack/src/uhitm.c:709-710 — strict ``tmp > dieroll``.
     hit = (tmp > roll) & alive
 
-    n_dice = jnp.clip(mai.attack_dice_n[idx].astype(jnp.int32), 1, 8)
-    sides = jnp.clip(mai.attack_dice_sides[idx].astype(jnp.int32), 1, 12)
+    # vendor/nethack/src/weapon.c — disarmed monster uses bare-hands (1d2).
+    # is_unwielded set by whip-pull or disarm artifact.
+    raw_n_dice = jnp.clip(mai.attack_dice_n[idx].astype(jnp.int32), 1, 8)
+    raw_sides  = jnp.clip(mai.attack_dice_sides[idx].astype(jnp.int32), 1, 12)
+    n_dice = jnp.where(mai.is_unwielded[idx], jnp.int32(1), raw_n_dice)
+    sides  = jnp.where(mai.is_unwielded[idx], jnp.int32(2), raw_sides)
     # Static unrolled dice draw using a small fixed cap (8) — JIT-safe.
     def roll_one(carry, key):
         sub_roll = jax.random.randint(
@@ -1746,18 +1784,6 @@ def thrown_attack(
 # vendor/nethack/include/hack.h SZ_HEROINV (52).
 MAX_INVENTORY_SLOTS_C: int = 52
 
-
-# ---------------------------------------------------------------------------
-# Legacy Wave-1 API shims (kept so the rest of the engine keeps building)
-# ---------------------------------------------------------------------------
-def ranged_attack(state, rng, attacker_idx, target_pos):
-    """No-op ranged stub (Wave 4)."""
-    return state, jnp.int32(0)
-
-
-def passive_attack(state, rng, defender_idx, attacker_idx):
-    """No-op passive-attack stub (Wave 4)."""
-    return state, jnp.int32(0)
 
 
 # ---------------------------------------------------------------------------

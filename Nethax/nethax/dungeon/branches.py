@@ -187,10 +187,18 @@ class DungeonState:
     stair_links:      jnp.ndarray  # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, 2, 2]
     level_rng_seeds:  jnp.ndarray  # uint32[N_BRANCHES, MAX_LEVELS_PER_BRANCH]
     vibrating_square_revealed: jnp.ndarray  # bool scalar
+    # (row, col) of the vibrating-square tile once revealed; (-1,-1) = unset.
+    # Citation: vendor/nethack/src/mklev.c magic_portal placement.
+    vibrating_square_pos: jnp.ndarray  # int16[2]
     # Wave 6 #79: SPELL_LIGHT timer.  Holds the turn at which the lit-radius
     # effect expires (-1 = never active).
     # Cite: vendor/nethack/src/light.c::do_light_sources / read.c SCR_LIGHT.
     lit_radius_until_turn: jnp.ndarray  # scalar int32
+    # Fixed portal destinations: int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, 2]
+    # [branch, level-1] -> (dest_branch, dest_level); -1 = no portal / same level.
+    # Citation: vendor/nethack/src/trap.c::dotrap MAGIC_PORTAL branch — each portal
+    # links to a fixed (d_level) destination stored in trap.dst.
+    portal_destination: jnp.ndarray  # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +263,9 @@ def traverse_stair(
         stair_links=state.stair_links,
         level_rng_seeds=state.level_rng_seeds,
         vibrating_square_revealed=state.vibrating_square_revealed,
+        vibrating_square_pos=state.vibrating_square_pos,
         lit_radius_until_turn=state.lit_radius_until_turn,
+        portal_destination=state.portal_destination,
     )
 
 
@@ -286,7 +296,9 @@ def enter_branch(state: DungeonState, branch_id: int) -> DungeonState:
         stair_links=state.stair_links,
         level_rng_seeds=state.level_rng_seeds,
         vibrating_square_revealed=state.vibrating_square_revealed,
+        vibrating_square_pos=state.vibrating_square_pos,
         lit_radius_until_turn=state.lit_radius_until_turn,
+        portal_destination=state.portal_destination,
     )
 
 
@@ -579,6 +591,36 @@ def init_branch_graph(rng, static_params=None) -> BranchGraphState:
 
 
 # ---------------------------------------------------------------------------
+# Mine Town level detection
+# ---------------------------------------------------------------------------
+
+# Mine Town sits at Mines branch depth 4 per vendor/nethack/dat/dungeon.lua:
+#   name="minetn", base=3, range=2  →  depths 1..5; canonical mid = 4.
+# Citation: vendor/nethack/dat/dungeon.lua lines ~179-185.
+_MINES_MINETOWN_DEPTH: int = 4
+
+
+def _is_minetown_level(branch_idx: int, level_num: int) -> bool:
+    """Return True if (branch_idx, level_num) is the Mine Town level.
+
+    Mine Town occupies Gnomish Mines depth 4 (1-based).  The vendor dungeon.lua
+    places it at base=3, range=2 within the Mines branch; we use the canonical
+    mid-point (depth 4) matching the task spec "level 4-5".
+
+    Citation: vendor/nethack/dat/dungeon.lua name="minetn" block,
+              vendor/nethack/src/mklev.c::mineend_level (Mine Town dispatch).
+
+    Args:
+        branch_idx: Branch enum value (int).
+        level_num:  1-based level index within the branch.
+
+    Returns:
+        True iff this is the Mine Town level.
+    """
+    return branch_idx == int(Branch.GNOMISH_MINES) and level_num == _MINES_MINETOWN_DEPTH
+
+
+# ---------------------------------------------------------------------------
 # generate_mines_level — cellular-automata caves + small rooms
 # ---------------------------------------------------------------------------
 
@@ -604,6 +646,21 @@ def generate_mines_level(rng, depth: int):
         monster_type_ids : list[int]  — recommended monster spawn types
         item_type_ids    : list[int]  — recommended item drops (deferred)
     """
+    # Mine Town dispatch — depth 4 is the Mine Town level.
+    # Citation: vendor/nethack/src/mklev.c::mineend_level (special level
+    #           dispatch), vendor/nethack/dat/dungeon.lua name="minetn" block.
+    if _is_minetown_level(int(Branch.GNOMISH_MINES), depth):
+        from Nethax.nethax.dungeon.special_levels import generate_mine_town
+        terrain, monsters_arr, _items_arr = generate_mine_town(rng)
+        # Extract monster type ids from the placement array (col 2).
+        import numpy as np
+        monster_type_ids = [
+            int(monsters_arr[i, 2])
+            for i in range(int(monsters_arr.shape[0]))
+            if int(monsters_arr[i, 0]) >= 0
+        ]
+        return terrain, monster_type_ids, []
+
     import numpy as np
     from Nethax.nethax.constants.tiles import TileType
     from Nethax.nethax.constants.monsters import MONSTERS

@@ -135,6 +135,12 @@ _RING_TO_INTRINSIC: dict[int, int] = {
     RingEffect.PROTECTION_FROM_SHAPE_CHANGERS: Intrinsic.PROT_FROM_SHAPE_CHANGERS,
 }
 
+# Public table: RingEffect index → Intrinsic index, or -1 for stat/tick rings.
+# Length == 28 (one entry per RingEffect value, indexed by RingEffect int).
+RING_INTRINSIC_TABLE: list = [
+    _RING_TO_INTRINSIC.get(e, -1) for e in sorted(RingEffect, key=lambda x: int(x))
+]
+
 # Amulet effects that grant a single Intrinsic on wear.
 _AMULET_TO_INTRINSIC: dict[int, int] = {
     AmuletEffect.ESP:               Intrinsic.TELEPATHY,
@@ -211,12 +217,27 @@ def put_on_ring(state, rng: jax.Array, slot_idx: int, hand: int):
     - Ring of hunger sets TimedStatus.HUNGER_RING to a large sentinel (999)
     """
     item = state.inventory.items
-    ring_effect = int(item.type_id)
-    enchantment = int(item.enchantment)
+    # Support both scalar (broadcast-replace) and [52]-array item layouts.
+    type_raw = item.type_id
+    enc_raw  = item.enchantment
+    buc_raw  = item.buc_status
+    ring_effect = int(type_raw[slot_idx]) if type_raw.ndim > 0 else int(type_raw)
+    enchantment = int(enc_raw[slot_idx])  if enc_raw.ndim  > 0 else int(enc_raw)
+    buc_val     = int(buc_raw[slot_idx])  if buc_raw.ndim  > 0 else int(buc_raw)
 
     # Record the worn slot.
     new_worn_rings = state.inventory.worn_rings.at[hand].set(jnp.int8(slot_idx))
-    new_inventory = state.inventory.replace(worn_rings=new_worn_rings)
+    # Cursed ring becomes stuck on the finger.
+    # Cite: vendor/nethack/src/do_wear.c Ring_off_or_gone cursed check.
+    CURSED = 1
+    is_cursed = buc_val == CURSED
+    new_worn_rings_welded = state.inventory.worn_rings_welded.at[hand].set(
+        jnp.bool_(is_cursed)
+    )
+    new_inventory = state.inventory.replace(
+        worn_rings=new_worn_rings,
+        worn_rings_welded=new_worn_rings_welded,
+    )
     state = state.replace(inventory=new_inventory)
 
     # Grant intrinsic if this ring type has a direct mapping.
@@ -256,14 +277,24 @@ def take_off_ring(state, hand: int):
     slot_idx = int(state.inventory.worn_rings[hand])
     if slot_idx < 0:
         return state  # nothing worn on this hand
+    # Cursed-stuck ring cannot be removed.
+    # Cite: vendor/nethack/src/do_wear.c Ring_off_or_gone — cursed ring blocked.
+    if bool(state.inventory.worn_rings_welded[hand]):
+        return state
 
     item = state.inventory.items
-    ring_effect = int(item.type_id)
-    enchantment = int(item.enchantment)
+    type_raw = item.type_id
+    enc_raw  = item.enchantment
+    ring_effect = int(type_raw[slot_idx]) if type_raw.ndim > 0 else int(type_raw)
+    enchantment = int(enc_raw[slot_idx])  if enc_raw.ndim  > 0 else int(enc_raw)
 
-    # Clear worn slot.
+    # Clear worn slot and weld flag.
     new_worn_rings = state.inventory.worn_rings.at[hand].set(jnp.int8(-1))
-    new_inventory = state.inventory.replace(worn_rings=new_worn_rings)
+    new_worn_rings_welded = state.inventory.worn_rings_welded.at[hand].set(jnp.bool_(False))
+    new_inventory = state.inventory.replace(
+        worn_rings=new_worn_rings,
+        worn_rings_welded=new_worn_rings_welded,
+    )
     state = state.replace(inventory=new_inventory)
 
     # Revoke intrinsic.
@@ -293,6 +324,50 @@ def take_off_ring(state, hand: int):
     return state
 
 
+def ring_tick(state, rng: jax.Array):
+    """Apply per-turn effects of worn rings.
+
+    Called once per game turn after action dispatch.
+    - HUNGER ring: drain 1 nutrition per turn when worn.
+    - TELEPORTATION ring: 1/85 chance to set a timed teleport (vendor timeout.c).
+
+    Cite: vendor/nethack/src/timeout.c — ring_effects() called from do_regain_pw.
+    JIT-safe.
+    """
+    inv = state.inventory
+    worn0 = inv.worn_rings[0].astype(jnp.int32)
+    worn1 = inv.worn_rings[1].astype(jnp.int32)
+
+    def _type_at(slot):
+        safe = jnp.clip(slot, 0, inv.items.type_id.shape[0] - 1)
+        return inv.items.type_id[safe].astype(jnp.int32)
+
+    ring0_type = jnp.where(worn0 >= jnp.int32(0), _type_at(worn0), jnp.int32(-1))
+    ring1_type = jnp.where(worn1 >= jnp.int32(0), _type_at(worn1), jnp.int32(-1))
+
+    hunger_worn = (ring0_type == jnp.int32(RingEffect.HUNGER)) | \
+                  (ring1_type == jnp.int32(RingEffect.HUNGER))
+    tele_worn   = (ring0_type == jnp.int32(RingEffect.TELEPORTATION)) | \
+                  (ring1_type == jnp.int32(RingEffect.TELEPORTATION))
+
+    # HUNGER: drain 1 nutrition per turn.
+    old_nut = state.status.nutrition
+    new_nut = jnp.where(hunger_worn, jnp.maximum(old_nut - jnp.int32(1), jnp.int32(0)), old_nut)
+    new_status = state.status.replace(nutrition=new_nut)
+
+    # TELEPORTATION: 1/85 chance to set timed_intrinsics[TELEPORT] += 1.
+    rng_tele = jax.random.fold_in(rng, jnp.int32(0x7E1E))
+    tele_roll = jax.random.randint(rng_tele, (), 0, 85, dtype=jnp.int32)
+    tele_fires = tele_worn & (tele_roll == jnp.int32(0))
+    tele_idx = jnp.int32(int(Intrinsic.TELEPORT))
+    old_tele = new_status.timed_intrinsics[tele_idx]
+    new_tele_val = jnp.where(tele_fires, old_tele + jnp.int32(1), old_tele)
+    new_timed_intr = new_status.timed_intrinsics.at[tele_idx].set(new_tele_val)
+    new_status = new_status.replace(timed_intrinsics=new_timed_intr)
+
+    return state.replace(status=new_status)
+
+
 # ---------------------------------------------------------------------------
 # Public API — amulet wear / take-off
 # ---------------------------------------------------------------------------
@@ -312,10 +387,20 @@ def wear_amulet(state, rng: jax.Array, slot_idx: int):
     - YENDOR / CHEAP_AMULET grant no intrinsic
     """
     item = state.inventory.items
-    amulet_effect = int(item.type_id)
+    # Support both scalar (broadcast-replace) and [52]-array item layouts.
+    type_raw = item.type_id
+    buc_raw = item.buc_status
+    amulet_effect = int(type_raw[slot_idx]) if type_raw.ndim > 0 else int(type_raw)
+    buc_val = int(buc_raw[slot_idx]) if buc_raw.ndim > 0 else int(buc_raw)
 
-    # Record worn slot.
-    new_inventory = state.inventory.replace(worn_amulet=jnp.int8(slot_idx))
+    # Cursed amulet becomes stuck.
+    # Cite: vendor/nethack/src/do_wear.c Amulet_off cursed check.
+    CURSED = 1
+    is_cursed = buc_val == CURSED
+    new_inventory = state.inventory.replace(
+        worn_amulet=jnp.int8(slot_idx),
+        worn_amulet_welded=jnp.bool_(is_cursed),
+    )
     state = state.replace(inventory=new_inventory)
 
     # Grant intrinsic if applicable.
@@ -350,12 +435,20 @@ def take_off_amulet(state):
     slot_idx = int(state.inventory.worn_amulet)
     if slot_idx < 0:
         return state  # no amulet worn
+    # Cursed-stuck amulet cannot be removed.
+    # Cite: vendor/nethack/src/do_wear.c Amulet_off — cursed amulet blocked.
+    if bool(state.inventory.worn_amulet_welded):
+        return state
 
     item = state.inventory.items
-    amulet_effect = int(item.type_id)
+    type_raw = item.type_id
+    amulet_effect = int(type_raw[slot_idx]) if type_raw.ndim > 0 else int(type_raw)
 
-    # Clear worn slot.
-    new_inventory = state.inventory.replace(worn_amulet=jnp.int8(-1))
+    # Clear worn slot and weld flag.
+    new_inventory = state.inventory.replace(
+        worn_amulet=jnp.int8(-1),
+        worn_amulet_welded=jnp.bool_(False),
+    )
     state = state.replace(inventory=new_inventory)
 
     # Revoke intrinsic if applicable.
@@ -428,3 +521,54 @@ def handle_remove(state, rng: jax.Array):
     if int(state.inventory.worn_amulet) >= 0:
         return take_off_amulet(state)
     return state
+
+
+# ---------------------------------------------------------------------------
+# Life-saving amulet
+# ---------------------------------------------------------------------------
+
+def check_life_saving(state):
+    """If player would die (done=True) and LIFESAVED intrinsic is set, save them.
+
+    The amulet of life saving is consumed regardless of curse status —
+    it is destroyed, so the welded flag is cleared.
+    Cite: vendor/nethack/src/end.c::done lines 1084-1105.
+
+    Returns (new_state, saved) where saved is a JAX bool.
+    """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic, remove_intrinsic
+
+    intrinsic_idx = int(Intrinsic.LIFESAVED)
+    has_lifesaving = state.status.intrinsics[intrinsic_idx]
+    should_save = state.done & has_lifesaving
+
+    def _save(s):
+        # Consume the amulet: zero its quantity by masking with amulet_slot.
+        # Use jnp.where to avoid scalar/array shape mismatch across test setups.
+        amulet_slot = s.inventory.worn_amulet.astype(jnp.int32)
+        qty = s.inventory.items.quantity
+        if qty.ndim > 0:
+            # Normal [52]-shaped array: zero out the worn slot.
+            slot_mask = jnp.arange(qty.shape[0], dtype=jnp.int32) == amulet_slot
+            new_quantity = jnp.where(slot_mask, jnp.int16(0), qty)
+        else:
+            # Scalar (broadcast test setup): just zero it.
+            new_quantity = jnp.int16(0)
+        new_items = s.inventory.items.replace(quantity=new_quantity)
+        new_inv = s.inventory.replace(
+            items=new_items,
+            worn_amulet=jnp.int8(-1),
+            worn_amulet_welded=jnp.bool_(False),
+        )
+        new_intrinsics = s.status.intrinsics.at[intrinsic_idx].set(False)
+        new_status = s.status.replace(intrinsics=new_intrinsics)
+        return s.replace(
+            done=jnp.bool_(False),
+            player_hp=s.player_hp_max,
+            status=new_status,
+            inventory=new_inv,
+        )
+
+    import jax
+    new_state = jax.lax.cond(should_save, _save, lambda s: s, state)
+    return new_state, should_save

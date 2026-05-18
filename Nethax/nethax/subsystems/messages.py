@@ -111,28 +111,37 @@ class MessageState:
 # Functions
 # ---------------------------------------------------------------------------
 
-def emit(state: MessageState, message: str) -> MessageState:
-    """Queue a message for display (Wave 1 no-op).
+def emit(state: MessageState, msg_id: int) -> MessageState:
+    """Append msg_id to the message_history ring buffer.
 
-    Parameters
-    ----------
-    message : Human-readable string — accepted for API compatibility but
-              ignored in Wave 1 because string encoding inside a jit trace
-              requires static shapes.
+    Cite: vendor/nethack/src/winrl.cc::write_to_message — pushes the current
+    message into the saved_plines ring buffer before overwriting.
 
-    Returns
-    -------
-    state unchanged.
+    Algorithm (mirrors pline.c / winrl.cc ring-buffer logic):
+      1. Rotate the current message_buffer row into message_history at
+         history_index (modulo HISTORY_LEN).
+      2. Advance history_index by 1 (wrapping).
+      3. Write msg_id as the first byte of the new message_buffer (the
+         renderer reads this integer ID outside jit to format the string).
 
-    Wave 4 plan
-    -----------
-    Replace signature with emit(state, msg_id: MessageId, *args) and:
-      1. Rotate current message_buffer into message_history at history_index.
-      2. Increment history_index % HISTORY_LEN.
-      3. Encode msg_id + args into message_buffer (fixed-width int layout).
-    The renderer decodes msg_id + args back to a human string outside jit.
+    JIT-safe; all shapes are static.
     """
-    return state
+    # Step 1: save current buffer into history at history_index.
+    safe_idx = jnp.mod(state.history_index, jnp.int32(HISTORY_LEN))
+    new_history = state.message_history.at[safe_idx].set(state.message_buffer)
+
+    # Step 2: advance the ring pointer.
+    new_index = jnp.mod(state.history_index + jnp.int32(1), jnp.int32(HISTORY_LEN))
+
+    # Step 3: encode msg_id as first byte of fresh buffer; rest zeroed.
+    new_buffer = jnp.zeros((MSG_BUF_LEN,), dtype=jnp.uint8)
+    new_buffer = new_buffer.at[0].set(jnp.uint8(msg_id))
+
+    return state.replace(
+        message_buffer=new_buffer,
+        message_history=new_history,
+        history_index=new_index,
+    )
 
 
 def clear_message(state: MessageState) -> MessageState:

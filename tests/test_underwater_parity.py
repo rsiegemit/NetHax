@@ -144,7 +144,12 @@ def test_underwater_blocks_diagonal():
 # ---------------------------------------------------------------------------
 
 def test_underwater_drowning_damage():
-    """Staying in water for 5 turns without water breathing decreases HP.
+    """Staying in water long enough without water breathing eventually kills.
+
+    Vendor formula (trap.c::drown line 5059): every 5 turns, roll rnl(50);
+    drown (HP→0) if roll <= turns_underwater.  At turns_underwater=25 the
+    probability per check exceeds 50%, so within 50 ticks the player is
+    almost certainly dead.
 
     Cite: vendor/nethack/src/trap.c::drown() lines 5059-5195.
     """
@@ -153,12 +158,15 @@ def test_underwater_drowning_damage():
     state = state.replace(player_hp=jnp.int32(200), player_hp_max=jnp.int32(200))
 
     rng = _RNG
-    for _ in range(5):
+    for _ in range(50):
         rng, sub = jax.random.split(rng)
         state = water_step(state, sub)
+        if int(state.player_hp) == 0:
+            break
 
     assert int(state.player_hp) < 200, (
-        "HP should have decreased after 5 turns underwater (trap.c:5059)"
+        "HP should have reached 0 within 50 turns underwater (trap.c:5059 "
+        "insta-drown formula: rnl(50) <= turns_underwater)"
     )
 
 

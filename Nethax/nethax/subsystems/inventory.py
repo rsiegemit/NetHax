@@ -369,6 +369,14 @@ class InventoryState:
     total_weight: jnp.ndarray      # scalar int32
     user_names: jnp.ndarray        # [MAX_INVENTORY_SLOTS, USER_NAME_LEN] int8
     wielded_artifact_idx: jnp.ndarray  # scalar int8 — wish._ARTIFACTS index (-1=none)
+    # Cursed-stuck (welded) flags.
+    # Cite: vendor/nethack/src/wield.c::welded() lines 1051-1058 —
+    # a cursed wielded weapon is welded to the hand; do_wear.c line 1900
+    # applies the same logic to armor/amulet/rings.
+    welded: jnp.ndarray             # scalar bool — wielded weapon stuck
+    worn_armor_welded: jnp.ndarray  # [N_ARMOR_SLOTS] bool
+    worn_amulet_welded: jnp.ndarray  # scalar bool
+    worn_rings_welded: jnp.ndarray   # [2] bool
 
     @classmethod
     def empty(cls) -> "InventoryState":
@@ -386,6 +394,10 @@ class InventoryState:
             total_weight=jnp.int32(0),
             user_names=jnp.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=jnp.int8),
             wielded_artifact_idx=jnp.int8(-1),
+            welded=jnp.bool_(False),
+            worn_armor_welded=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.bool_),
+            worn_amulet_welded=jnp.bool_(False),
+            worn_rings_welded=jnp.zeros((2,), dtype=jnp.bool_),
         )
 
     @classmethod
@@ -407,6 +419,10 @@ class InventoryState:
             total_weight=jnp.int32(0),
             user_names=jnp.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=jnp.int8),
             wielded_artifact_idx=jnp.int8(-1),
+            welded=jnp.bool_(False),
+            worn_armor_welded=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.bool_),
+            worn_amulet_welded=jnp.bool_(False),
+            worn_rings_welded=jnp.zeros((2,), dtype=jnp.bool_),
         )
 
 
@@ -619,6 +635,18 @@ def drop(state, rng, ground_items: Item, branch: int, level: int, slot_idx: int)
 
     has_item = state.inventory.items.category[slot_idx] != 0
 
+    # Cursed loadstone cannot be dropped.
+    # Cite: vendor/nethack/src/pickup.c (items.c::doloadstone) — a cursed
+    # loadstone weighs too much to lift; drop is silently blocked.
+    # type_id 443 = loadstone (constants/objects.py line 9045).
+    LOADSTONE_TYPE_ID = jnp.int16(443)
+    CURSED = jnp.int8(1)
+    is_cursed_loadstone = (
+        (state.inventory.items.type_id[slot_idx] == LOADSTONE_TYPE_ID)
+        & (state.inventory.items.buc_status[slot_idx] == CURSED)
+    )
+    has_item = has_item & ~is_cursed_loadstone
+
     # Find first empty ground stack position
     def _find_ground_slot(carry, stack_idx):
         found, gslot = carry
@@ -684,6 +712,10 @@ def wield(state, slot_idx: int):
     If the item is two-handed and a shield is equipped (worn_armor[SHIELD]),
     the shield is unequipped (worn_armor[SHIELD] set to -1).
 
+    If the item is cursed (buc_status == 1), sets inventory.welded = True —
+    the weapon is stuck until uncursed.
+    Cite: vendor/nethack/src/wield.c::welded() lines 1051-1058.
+
     Canonical: vendor/nethack/src/wield.c::wieldwep
 
     Parameters
@@ -696,12 +728,13 @@ def wield(state, slot_idx: int):
     new_state
     """
     slot_idx = jnp.int8(slot_idx)
-    has_item = state.inventory.items.category[slot_idx.astype(jnp.int32)] != 0
+    slot_i32 = slot_idx.astype(jnp.int32)
+    has_item = state.inventory.items.category[slot_i32] != 0
 
     new_wielded = jnp.where(has_item, slot_idx, state.inventory.wielded)
 
     # Two-handed: unequip shield if present
-    is_two_handed = state.inventory.items.is_two_handed[slot_idx.astype(jnp.int32)]
+    is_two_handed = state.inventory.items.is_two_handed[slot_i32]
     shield_slot   = jnp.int32(ArmorSlot.SHIELD)
     new_worn_armor = jnp.where(
         has_item & is_two_handed,
@@ -709,10 +742,32 @@ def wield(state, slot_idx: int):
         state.inventory.worn_armor,
     )
 
+    # Cursed weapon welds to hand.
+    CURSED = jnp.int8(1)
+    is_cursed = state.inventory.items.buc_status[slot_i32] == CURSED
+    new_welded = jnp.where(has_item & is_cursed, jnp.bool_(True), state.inventory.welded)
+
     new_inv = state.inventory.replace(
         wielded=new_wielded,
         worn_armor=new_worn_armor,
+        welded=new_welded,
     )
+    return state.replace(inventory=new_inv)
+
+
+def unwield(state):
+    """Lay down the wielded weapon (return to bare hands).
+
+    No-op if inventory.welded == True (cursed weapon stuck to hand).
+    Cite: vendor/nethack/src/wield.c::welded() — cannot unwield while welded.
+
+    Returns
+    -------
+    new_state
+    """
+    can_unwield = ~state.inventory.welded
+    new_wielded = jnp.where(can_unwield, jnp.int8(-1), state.inventory.wielded)
+    new_inv = state.inventory.replace(wielded=new_wielded)
     return state.replace(inventory=new_inv)
 
 
@@ -722,12 +777,15 @@ def wear_armor(state, slot_idx: int, armor_slot: ArmorSlot):
     Updates player_ac via AC computation and caches the worn item's
     ac_bonus into inventory.worn_armor_ac_bonus[armor_slot] (Wave 5).
 
+    If the item is cursed, sets worn_armor_welded[armor_slot] = True.
+    Cite: vendor/nethack/src/do_wear.c line 1900 cursed check.
+
     Canonical: vendor/nethack/src/do_wear.c::dowearx
 
     Returns
     -------
     new_state with updated inventory.worn_armor, worn_armor_ac_bonus,
-    and player_ac.
+    worn_armor_welded, and player_ac.
     """
     slot_idx   = jnp.int8(slot_idx)
     slot_i32   = slot_idx.astype(jnp.int32)
@@ -750,17 +808,29 @@ def wear_armor(state, slot_idx: int, armor_slot: ArmorSlot):
         state.inventory.worn_armor_ac_bonus.at[armor_i32].set(item_bonus),
         state.inventory.worn_armor_ac_bonus,
     )
+    # Cursed armor becomes stuck.
+    CURSED = jnp.int8(1)
+    is_cursed = state.inventory.items.buc_status[slot_i32] == CURSED
+    new_worn_armor_welded = jnp.where(
+        can_wear & is_cursed,
+        state.inventory.worn_armor_welded.at[armor_i32].set(jnp.bool_(True)),
+        state.inventory.worn_armor_welded,
+    )
     new_ac = compute_ac(state.inventory.items, new_worn_armor)
 
     new_inv = state.inventory.replace(
         worn_armor=new_worn_armor,
         worn_armor_ac_bonus=new_worn_ac_bonus,
+        worn_armor_welded=new_worn_armor_welded,
     )
     return state.replace(inventory=new_inv, player_ac=new_ac)
 
 
 def take_off_armor(state, armor_slot: ArmorSlot):
     """Remove the armor in armor_slot.
+
+    No-op if worn_armor_welded[armor_slot] is True (cursed armor stuck).
+    Cite: vendor/nethack/src/do_wear.c line 1900 — cursed armor blocked.
 
     Updates player_ac and zeros the cached AC bonus slot.
 
@@ -772,8 +842,19 @@ def take_off_armor(state, armor_slot: ArmorSlot):
     and player_ac.
     """
     armor_i32 = jnp.int32(int(armor_slot))
-    new_worn_armor = state.inventory.worn_armor.at[armor_i32].set(jnp.int8(-1))
-    new_worn_ac_bonus = state.inventory.worn_armor_ac_bonus.at[armor_i32].set(jnp.int8(0))
+    is_welded = state.inventory.worn_armor_welded[armor_i32]
+    can_remove = ~is_welded
+
+    new_worn_armor = jnp.where(
+        can_remove,
+        state.inventory.worn_armor.at[armor_i32].set(jnp.int8(-1)),
+        state.inventory.worn_armor,
+    )
+    new_worn_ac_bonus = jnp.where(
+        can_remove,
+        state.inventory.worn_armor_ac_bonus.at[armor_i32].set(jnp.int8(0)),
+        state.inventory.worn_armor_ac_bonus,
+    )
     new_ac = compute_ac(state.inventory.items, new_worn_armor)
 
     new_inv = state.inventory.replace(
@@ -783,15 +864,6 @@ def take_off_armor(state, armor_slot: ArmorSlot):
     return state.replace(inventory=new_inv, player_ac=new_ac)
 
 
-def put_on_ring(state, slot: int, ring_idx: int):
-    """Put on the ring in inventory slot onto finger ring_idx (0=left, 1=right).
-
-    No-op stub (do_wear.c: doputon).
-    Wave 4: grant ring intrinsic via worn.c:setworn logic.
-    """
-    return state
-
-
 # ---------------------------------------------------------------------------
 # Action handlers (top-level dispatch targets)
 # ---------------------------------------------------------------------------
@@ -799,9 +871,29 @@ def put_on_ring(state, slot: int, ring_idx: int):
 def handle_pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
     """Pickup action handler — pickup from current tile.
 
+    Calls quest.on_artifact_picked_up when the picked-up item is the role's
+    quest artifact (quest.c::artitouch ~127-134; Qstat(touched_artifact)=TRUE).
+
     Returns (new_state, new_ground_items).
     """
-    return pickup(state, rng, ground_items, branch, level)
+    new_state, new_gi = pickup(state, rng, ground_items, branch, level)
+
+    # Quest artifact check: compare the ground item's type_id to the role's
+    # artifact index before pickup.  JIT-pure: jax.lax.cond gates the update.
+    from Nethax.nethax.subsystems.quest import on_artifact_picked_up, _ARTIFACT_IDX_BY_ROLE
+    row = state.player_pos[0].astype(jnp.int32)
+    col = state.player_pos[1].astype(jnp.int32)
+    picked_type_id = ground_items.type_id[branch, level, row, col, 0].astype(jnp.int16)
+    role_idx = jnp.clip(state.player_role.astype(jnp.int32), 0, _ARTIFACT_IDX_BY_ROLE.shape[0] - 1)
+    quest_art_id = _ARTIFACT_IDX_BY_ROLE[role_idx].astype(jnp.int16)
+    is_quest_artifact = (picked_type_id == quest_art_id) & (picked_type_id > jnp.int16(0))
+    new_state = jax.lax.cond(
+        is_quest_artifact,
+        on_artifact_picked_up,
+        lambda s: s,
+        new_state,
+    )
+    return new_state, new_gi
 
 
 def handle_drop(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
@@ -851,6 +943,15 @@ def handle_wield(state, rng):
     # non-bare-hand weapon is wielded (insight.c ~2137, u.uconduct.weaphit).
     from Nethax.nethax.subsystems.conduct import Conduct, mark_violated_if
     return mark_violated_if(new_state, int(Conduct.WEAPONLESS), found_weapon)
+
+
+def handle_unwield(state, rng):
+    """Unwield action handler — lay down wielded weapon (bare hands).
+
+    No-op if the weapon is cursed-welded.
+    Cite: vendor/nethack/src/wield.c::welded() — blocked while welded.
+    """
+    return unwield(state)
 
 
 def handle_wear(state, rng):

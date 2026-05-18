@@ -92,12 +92,15 @@ def water_step(state, rng):
     """Apply one-turn drowning tick if player is underwater.
 
     Each turn in water:
-      - Deal rnd(6) HP damage (vendor trap.c:5059 drown()).
-        Skipped when player has MAGIC_BREATHING intrinsic (vendor you.h
-        MAGICAL_BREATHING = 52; amulet of magical breathing, air elemental form).
+      - Increment turns_underwater.  Reset to 0 on leaving water (handled by
+        action_dispatch / _try_step when player_in_water transitions to False).
+      - Every 5 turns, check insta-drown: roll rnl(50); drown if roll <=
+        turns_underwater.  Vendor formula: trap.c::drown line 5059.
+        "rnl(50)" = randint [0, 50) biased by luck; we approximate as
+        randint [0, 50) (luck bias is small and requires StatusState).
+        Cite: vendor/nethack/src/trap.c::drown() line 5059.
+      - Skipped entirely when player has MAGIC_BREATHING intrinsic.
         Cite: vendor/nethack/include/you.h MAGIC_BREATHING; vendor prop.h:52.
-        TODO: vendor drown() has a 1-in-N per-turn insta-drown check where N
-        decreases with turns underwater (trap.c:5059); for now rnd(6) per turn.
       - Call water_damage_chain to rust iron inventory items (trap.c:5086).
 
     Cite: vendor/nethack/src/trap.c::drown() lines 5059-5195.
@@ -108,7 +111,7 @@ def water_step(state, rng):
 
     in_water = state.player_in_water
 
-    rng_dmg, rng_rust = jax.random.split(rng)
+    rng_drown, rng_rust = jax.random.split(rng)
 
     # MAGIC_BREATHING (MAGICAL_BREATHING = 52, vendor prop.h) suppresses
     # drowning damage — amulet of magical breathing, air elemental polyform.
@@ -118,20 +121,36 @@ def water_step(state, rng):
         | (state.status.timed_intrinsics[int(Intrinsic.MAGIC_BREATHING)] > jnp.int32(0))
     )
 
-    # rnd(6) = uniform [1, 6] — vendor trap.c:5059 uses rnd(6).
-    dmg = jax.random.randint(rng_dmg, (), minval=1, maxval=7, dtype=jnp.int32)
-
     def _apply_drown(s):
+        # Increment turns_underwater each tick in water.
+        new_turns = (s.turns_underwater.astype(jnp.int32) + jnp.int32(1)).astype(
+            jnp.int16
+        )
+        s = s.replace(turns_underwater=new_turns)
+
+        # Every 5 turns: insta-drown check.
+        # Vendor trap.c::drown line 5059: if (rnl(50) <= turns_underwater) → drown.
+        # We approximate rnl(50) as uniform [0, 50).
+        on_check_turn = (new_turns % jnp.int16(5)) == jnp.int16(0)
+        roll = jax.random.randint(rng_drown, (), minval=0, maxval=50, dtype=jnp.int32)
+        insta_drown = on_check_turn & (roll <= new_turns.astype(jnp.int32))
+
+        # Apply: insta-drown sets HP to 0; MAGIC_BREATHING suppresses both paths.
         new_hp = jnp.where(
             has_magic_breath,
             s.player_hp,
-            jnp.maximum(
+            jnp.where(
+                insta_drown,
                 jnp.int32(0),
-                s.player_hp.astype(jnp.int32) - dmg,
+                s.player_hp.astype(jnp.int32),
             ).astype(s.player_hp.dtype),
         )
         s = s.replace(player_hp=new_hp)
         s = water_damage_chain(s, rng_rust)
         return s
 
-    return jax.lax.cond(in_water, _apply_drown, lambda s: s, state)
+    def _leave_water(s):
+        # Reset counter when not in water this tick.
+        return s.replace(turns_underwater=jnp.int16(0))
+
+    return jax.lax.cond(in_water, _apply_drown, _leave_water, state)

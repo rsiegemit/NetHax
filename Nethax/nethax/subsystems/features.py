@@ -643,60 +643,6 @@ def quaff_fountain(
     return state, jnp.int32(FountainEffect.REFRESH)
 
 
-def dip_fountain(
-    state: FeaturesState,
-    rng: jax.Array,
-    pos: jnp.ndarray,
-    slot: jnp.ndarray,
-) -> tuple[FeaturesState, jnp.ndarray]:
-    """No-op stub — dip inventory slot *slot* into fountain at *pos* (dipfountain).
-
-    Wave 4 will implement BUC detection, uncurse, enchant, and water damage.
-    Returns (new_state, item_changed: bool).
-    """
-    return state, jnp.bool_(False)
-
-
-def sit_throne(
-    state: FeaturesState,
-    rng: jax.Array,
-    pos: jnp.ndarray,
-) -> tuple[FeaturesState, jnp.ndarray, jnp.ndarray]:
-    """No-op stub — sit on the throne at *pos* (throne_sit_effect, sit.c).
-
-    Wave 4 will implement the rnd(13) effect table and throne destruction.
-    Returns (new_state, effect_id: int32, damage: int32).
-    """
-    return state, jnp.int32(ThroneEffect.FULL_HEAL), jnp.int32(0)
-
-
-def kick_sink(
-    state: FeaturesState,
-    rng: jax.Array,
-    pos: jnp.ndarray,
-) -> tuple[FeaturesState, jnp.ndarray]:
-    """No-op stub — kick the sink at *pos* (kick_nondoor/drinksink, fountain.c).
-
-    Wave 4 will implement the rn2(20) sink-drink effect table.
-    Returns (new_state, effect_id: int32).
-    """
-    return state, jnp.int32(SinkEffect.TEPID_WATER)
-
-
-def sacrifice_on_altar(
-    state: FeaturesState,
-    rng: jax.Array,
-    pos: jnp.ndarray,
-    corpse: jnp.ndarray,
-) -> tuple[FeaturesState, jnp.ndarray]:
-    """No-op stub — sacrifice *corpse* (inventory slot) on the altar at *pos*.
-
-    Wave 4 will implement BUC check, alignment conversion, and sacrifice gifts.
-    Returns (new_state, piety_gained: int32).
-    """
-    return state, jnp.int32(0)
-
-
 def step(state: FeaturesState, rng: jax.Array) -> FeaturesState:
     """No-op per-turn tick for the features subsystem.
 

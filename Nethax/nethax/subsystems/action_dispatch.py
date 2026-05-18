@@ -89,6 +89,11 @@ from Nethax.nethax.subsystems.items_scrolls import handle_read as _scrolls_handl
 from Nethax.nethax.subsystems.items_wands import (
     handle_zap as _wands_handle_zap,
     WandState,
+    WandEffect,
+    ITEM_CATEGORY_WAND,
+)
+from Nethax.nethax.subsystems.wish import (
+    handle_wand_of_wishing as _wish_handle_wand,
 )
 from Nethax.nethax.subsystems.inventory import (
     handle_wield as _inv_handle_wield,
@@ -98,6 +103,7 @@ from Nethax.nethax.subsystems.inventory import (
     drop as _inv_drop,
     ItemCategory,
     MAX_INVENTORY_SLOTS,
+    USER_NAME_LEN,
 )
 from Nethax.nethax.subsystems.combat import (
     handle_fight as _combat_handle_fight,
@@ -116,7 +122,7 @@ from Nethax.nethax.subsystems.status_effects import (
     MAX_NUTRITION,
 )
 from Nethax.nethax.subsystems.items_corpses import apply_corpse_postfx as _corpse_postfx
-from Nethax.nethax.subsystems.magic import N_SPELLS
+from Nethax.nethax.subsystems.magic import N_SPELLS, _EFFECT_DISPATCH_LIST as _MAGIC_EFFECT_DISPATCH_LIST
 from Nethax.nethax.subsystems.conduct import (
     Conduct as _Conduct,
     mark_violated_if as _mark_violated_if,
@@ -128,6 +134,40 @@ from Nethax.nethax.subsystems.riding import (
     try_mount as _riding_try_mount,
     try_dismount as _riding_try_dismount,
 )
+
+
+# ---------------------------------------------------------------------------
+# Nutrition lookup tables built from vendor constants at import time.
+#
+# _FOOD_NUTRITION[type_id] — oc_nutrition per food object type.
+#   Cite: vendor/nethack/include/objects.h FOOD() macros (lines 1048-1117).
+#   Values read from Nethax/nethax/constants/objects.py OBJECTS[i].nutrition.
+#   Non-food entries (and corpse type_id=240) carry nutrition=0 here; corpse
+#   nutrition is looked up via _CORPSE_NUTRITION instead.
+#
+# _CORPSE_NUTRITION[monster_idx] — cnutrit per monster species.
+#   Cite: vendor/nethack/include/permonst.h line 68 (cnutrit field);
+#         vendor/nethack/include/monsters.h per-MON() nutrition column.
+#   Values read from Nethax/nethax/constants/monsters.py MONSTERS[i].nutrition.
+# ---------------------------------------------------------------------------
+
+def _build_food_nutrition_table() -> jnp.ndarray:
+    """Return int32[NUM_OBJECTS] of oc_nutrition per OBJECTS entry."""
+    from Nethax.nethax.constants.objects import OBJECTS, NUM_OBJECTS
+    vals = [0] * NUM_OBJECTS
+    for i, obj in enumerate(OBJECTS):
+        vals[i] = int(obj.nutrition)
+    return jnp.array(vals, dtype=jnp.int32)
+
+
+def _build_corpse_nutrition_table() -> jnp.ndarray:
+    """Return int32[N_MONSTERS] of cnutrit per MONSTERS entry."""
+    from Nethax.nethax.constants.monsters import MONSTERS
+    return jnp.array([int(m.nutrition) for m in MONSTERS], dtype=jnp.int32)
+
+
+_FOOD_NUTRITION: jnp.ndarray = _build_food_nutrition_table()
+_CORPSE_NUTRITION: jnp.ndarray = _build_corpse_nutrition_table()
 
 
 # ---------------------------------------------------------------------------
@@ -766,13 +806,27 @@ def _run_shared(state, rng, dir_idx):
 # Stair handlers (hack.c doup / dodown)
 # ---------------------------------------------------------------------------
 
+def _on_quest_leader_level(state) -> object:
+    """Fire quest.on_enter_quest_level if player arrived on Quest branch level 1.
+
+    Called after stair traversal resolves.  Mirrors quest.c::chat_with_leader
+    (~321-324) and qstplay.c on_leader_level / expulsion logic: the first time
+    the hero sets foot on the Quest start level the leader is met and stage
+    advances to BEGUN_QUEST (1).
+    """
+    from Nethax.nethax.subsystems.quest import on_enter_quest_level
+    from Nethax.nethax.dungeon.branches import Branch
+    on_quest_branch = state.dungeon.current_branch == jnp.int8(int(Branch.QUEST))
+    on_level_1      = state.dungeon.current_level  == jnp.int8(1)
+    should_enter    = on_quest_branch & on_level_1 & ~state.quest.met_leader
+    return jax.lax.cond(should_enter, on_enter_quest_level, lambda s: s, state)
+
+
 def _stair_up(state, rng):
     """Traverse up-stair if standing on STAIRCASE_UP tile.
 
-    Wave 2: within-branch traversal only (bumps current_level by -1).
-    Cross-branch traversal deferred to Wave 4.
-    Arriving level: player repositioned to STAIRCASE_DOWN of the new level.
-    For Wave 2 (single level), current_level clamps at 1.
+    Within-branch traversal: bumps current_level by -1 (clamped to 1).
+    Citation: vendor/nethack/src/do.c::dohol() (go up stairs).
     """
     terrain_2d = _current_level_terrain(state)
     row, col    = state.player_pos[0], state.player_pos[1]
@@ -786,36 +840,34 @@ def _stair_up(state, rng):
     )
     new_dungeon = state.dungeon.replace(current_level=new_level)
     new_state   = state.replace(dungeon=new_dungeon)
-    return _apply_fov(new_state)
+    return _on_quest_leader_level(_apply_fov(new_state))
 
 
 def _stair_down(state, rng):
     """Traverse down-stair if standing on STAIRCASE_DOWN tile.
 
-    Wave 2: within-branch traversal only (bumps current_level by +1).
-    Cross-branch traversal deferred to Wave 4.
+    Within-branch traversal: bumps current_level by +1.
+    Tracks deepest_lev_reached for scoring (vendor dungeon.c deepest_lev_reached).
+    Citation: vendor/nethack/src/do.c::dolook() / dodown() (go down stairs).
     """
     terrain_2d = _current_level_terrain(state)
     row, col    = state.player_pos[0], state.player_pos[1]
     tile        = terrain_2d[row, col].astype(jnp.int32)
     on_stair    = tile == jnp.int32(TileType.STAIRCASE_DOWN)
 
-    max_level   = jnp.int8(state.terrain.shape[1])  # MAX_LEVELS_PER_BRANCH
+    max_level   = jnp.int8(state.terrain.shape[1])
     new_level   = jnp.where(
         on_stair,
         jnp.minimum(max_level, state.dungeon.current_level + jnp.int8(1)),
         state.dungeon.current_level,
     )
-    new_dungeon = state.dungeon.replace(current_level=new_level)
-    # Wave 8 vendor parity: track deepest_lev_reached as the max level ever
-    # visited (dungeon.c:deepest_lev_reached).  This drives internal[0] and
-    # the end-of-game scoring bonus.
     new_deepest = jnp.maximum(
         state.scoring.deepest_level, new_level.astype(jnp.int8)
     )
+    new_dungeon = state.dungeon.replace(current_level=new_level)
     new_scoring = state.scoring.replace(deepest_level=new_deepest)
     new_state   = state.replace(dungeon=new_dungeon, scoring=new_scoring)
-    return _apply_fov(new_state)
+    return _on_quest_leader_level(_apply_fov(new_state))
 
 
 def _wait(state, rng):
@@ -841,7 +893,6 @@ def _handle_eat(state, rng):
     """
     categories = state.inventory.items.category   # [MAX_INVENTORY_SLOTS]
     quantities = state.inventory.items.quantity   # [MAX_INVENTORY_SLOTS]
-    nutritions = state.inventory.items.weight      # nutrition stored in weight (Wave 3 placeholder)
 
     is_food   = categories == jnp.int8(ItemCategory.FOOD)
     has_stock = quantities > jnp.int16(0)
@@ -850,14 +901,27 @@ def _handle_eat(state, rng):
     slot_idx  = jnp.argmax(valid).astype(jnp.int32)
     found     = jnp.any(valid)
 
-    # Nutrition value: use a fixed 800 (food-ration default per eat.c) when item
-    # weight is zero, else use the item weight as the nutrition proxy.  Wave 5
-    # will plumb full per-type nutrition from objects.c.
-    slot_nutrition = nutritions[slot_idx].astype(jnp.int32)
-    food_nutrition = jnp.where(slot_nutrition > 0, slot_nutrition, jnp.int32(800))
+    # Nutrition lookup via per-type table (vendor/nethack/include/objects.h FOOD()
+    # macros, nutrition column; cite objects.py OBJECTS[type_id].nutrition).
+    # For corpses (type_id==240, nutrition=0 in OBJECTS), use _CORPSE_NUTRITION
+    # indexed by corpse_entry_idx instead.
+    items = state.inventory.items
+    safe_slot = jnp.clip(slot_idx, 0, MAX_INVENTORY_SLOTS - 1)
+    raw_type_id = items.type_id[safe_slot].astype(jnp.int32)
+    clipped_tid = jnp.clip(raw_type_id, 0, _FOOD_NUTRITION.shape[0] - 1)
+    obj_nutrition = _FOOD_NUTRITION[clipped_tid]
+
+    corpse_idx = items.corpse_entry_idx[safe_slot].astype(jnp.int32)
+    is_corpse_item_pre = found & (corpse_idx >= jnp.int32(0))
+    clipped_cidx = jnp.clip(corpse_idx, 0, _CORPSE_NUTRITION.shape[0] - 1)
+    corp_nutrition = _CORPSE_NUTRITION[clipped_cidx]
+
+    # Use corpse nutrition when item is a corpse, else object table nutrition.
+    # Fall back to 800 (food ration default, eat.c) if both are zero.
+    base_nutrition = jnp.where(is_corpse_item_pre, corp_nutrition, obj_nutrition)
+    food_nutrition = jnp.where(base_nutrition > 0, base_nutrition, jnp.int32(800))
 
     # Apply nutrition via handle_eat on the status slice.
-    safe_slot = jnp.clip(slot_idx, 0, MAX_INVENTORY_SLOTS - 1)
     new_status = _status_handle_eat(
         state.status,
         item_nutrition=food_nutrition,
@@ -866,7 +930,6 @@ def _handle_eat(state, rng):
     )
 
     # Decrement the consumed item's quantity by 1 (clear category if exhausted).
-    items = state.inventory.items
     old_qty = items.quantity[safe_slot]
     new_qty = jnp.where(found, jnp.maximum(old_qty - jnp.int16(1), jnp.int16(0)), old_qty)
     new_cat = jnp.where(
@@ -889,7 +952,6 @@ def _handle_eat(state, rng):
     # Corpse special-effects (eat.c::cpostfx lines 1129-1328).
     # Gate on corpse_entry_idx >= 0 (sentinel -1 = plain food, not a corpse).
     # cite: vendor/nethack/src/eat.c::eatcorpse line 1090
-    corpse_idx = items.corpse_entry_idx[safe_slot].astype(jnp.int32)
     is_corpse_item = found & (corpse_idx >= jnp.int32(0))
     # Use jnp.where on the idx so the postfx sees -1 when not a corpse → no-op.
     effective_corpse_idx = jnp.where(is_corpse_item, corpse_idx, jnp.int32(-1))
@@ -914,25 +976,31 @@ def _handle_zap(state, rng):
     The native handle_zap in items_wands operates on a self-contained
     WandState slice.  This wrapper projects the relevant EnvState fields
     into a WandState, invokes the wand handler, then writes results back.
+
+    Pre-detection: WAN_WISHING is routed directly to wish.handle_wand_of_wishing
+    before the WandState projection so that the full EnvState (conduct, quest,
+    etc.) is available.  Cite: zap.c::zapyourself WAN_WISHING branch.
     """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _ZapIntrinsic
     # Project EnvState → WandState (single current level slice).
     b  = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - 1
     terrain_2d  = state.terrain[b, lv]
     explored_2d = state.explored[b, lv]
 
+    mai = state.monster_ai
     wand_state = WandState(
-        mon_pos       = state.monster_ai.pos,
-        mon_hp        = state.monster_ai.hp,
-        mon_type      = jnp.zeros_like(state.monster_ai.hp).astype(jnp.int16),
-        mon_alive     = state.monster_ai.alive,
-        mon_asleep    = state.monster_ai.asleep,
-        mon_undead    = jnp.zeros_like(state.monster_ai.alive),
-        mon_invisible = jnp.zeros_like(state.monster_ai.alive),
-        # TODO: wire from MonsterAIState when per-monster resist/speed fields exist
-        mon_resists   = jnp.zeros_like(state.monster_ai.hp, dtype=jnp.int32),
-        mon_speed_mod = jnp.zeros(state.monster_ai.hp.shape[0], dtype=jnp.int8),
-        mon_cancelled = jnp.zeros_like(state.monster_ai.alive, dtype=jnp.bool_),
+        mon_pos       = mai.pos,
+        mon_hp        = mai.hp,
+        mon_hp_max    = mai.hp_max,
+        mon_type      = mai.entry_idx,
+        mon_alive     = mai.alive,
+        mon_asleep    = mai.asleep,
+        mon_undead    = mai.undead,
+        mon_invisible = mai.invisible,
+        mon_resists   = mai.resists,
+        mon_speed_mod = mai.speed_mod,
+        mon_cancelled = mai.cancelled,
         terrain       = terrain_2d,
         explored      = explored_2d,
         inventory     = state.inventory,
@@ -940,16 +1008,20 @@ def _handle_zap(state, rng):
         dungeon_level = state.dungeon.current_level.astype(jnp.int8),
         probed_hp     = jnp.int32(0),
         probed_idx    = jnp.int32(-1),
+        player_reflecting = state.status.intrinsics[int(_ZapIntrinsic.REFLECTING)],
     )
 
     new_wand = _wands_handle_zap(wand_state, rng)
 
     # Write back the mutated slices into EnvState.
-    new_monster_ai = state.monster_ai.replace(
+    new_monster_ai = mai.replace(
         pos       = new_wand.mon_pos,
         hp        = new_wand.mon_hp,
         alive     = new_wand.mon_alive,
         asleep    = new_wand.mon_asleep,
+        invisible = new_wand.mon_invisible,
+        speed_mod = new_wand.mon_speed_mod,
+        cancelled = new_wand.mon_cancelled,
     )
     new_terrain  = state.terrain.at[b, lv].set(new_wand.terrain)
     new_explored = state.explored.at[b, lv].set(new_wand.explored)
@@ -963,16 +1035,18 @@ def _handle_zap(state, rng):
 
 
 def _handle_cast(state, rng):
-    """CAST — vendor/nethack/src/spell.c::docast.
+    """CAST — vendor/nethack/src/spell.c::docast / spelleffects.
 
-    JIT-safe wrapper: find the first known+memorized spell, deduct Pw cost
-    (spell.h:SPELL_LEV_PW = spell_level * 5), and decrement that spell's
-    memory by 1.  This is a minimal stand-in for the full spelleffects()
-    pipeline; the native ``magic.handle_cast`` / ``magic.cast_spell``
-    functions use Python control flow (``int(traced)``, ``bool(traced)``)
-    and cannot be invoked from inside ``lax.switch``.  Wave 5 will JIT-port
-    cast_spell (effect dispatch + percent_success rolls) and replace this
-    wrapper; the behavioral surface (Pw drain, memory tick) is preserved.
+    JIT-pure pipeline:
+      1. Find first known+memorized spell via jnp.argmax.
+      2. Check Pw >= spell_level * 5  (spell.h:SPELL_LEV_PW).
+      3. Deduct Pw and decrement spell memory (spell.c::decrnknow).
+      4. Dispatch effect via jax.lax.switch(spell_idx, _EFFECT_DISPATCH_LIST).
+         Each entry wraps the corresponding magic._EFFECT_DISPATCH handler as
+         a JIT-pure (state, rng) -> state function.
+         Cite: vendor/nethack/src/spell.c::spelleffects.
+
+    When no valid spell exists, returns state unchanged (noop).
     """
     from Nethax.nethax.subsystems.magic import _SPELL_LEVELS
 
@@ -998,7 +1072,15 @@ def _handle_cast(state, rng):
         )
     )
     new_magic = magic.replace(spell_memory=new_mem)
-    return state.replace(player_pw=new_pw, magic=new_magic)
+    base_state = state.replace(player_pw=new_pw, magic=new_magic)
+
+    # Effect dispatch: lax.switch traces all N_SPELLS branches at compile time
+    # but only executes the selected branch at runtime.  The noop entry fires
+    # for unknown spells.  Cite: vendor/nethack/src/spell.c::spelleffects.
+    rng, sub = jax.random.split(rng)
+    effect_state = jax.lax.switch(safe_slot, _MAGIC_EFFECT_DISPATCH_LIST, base_state, sub)
+
+    return jax.lax.cond(will_cast, lambda _: effect_state, lambda _: base_state, None)
 
 
 def _handle_pickup(state, rng):
@@ -1232,37 +1314,58 @@ def _handle_engrave(state, rng):
 
 
 def _handle_name(state, rng):
-    """CALL — vendor/nethack/src/do_name.c::do_oname (Wave 6).
+    """CALL — vendor/nethack/src/do_name.c::do_oname.
 
-    The interactive ``C`` command prompts the user for a slot + name; with
-    no UI available in the headless harness this dispatch slot is a no-op.
-    Tests / agents that want to set a name call
-    ``inventory.handle_name(state, rng, slot_idx, name_bytes)`` directly.
+    In the headless harness there is no UI to prompt for a specific slot or
+    name string, so pressing ``C`` applies a generic label to every
+    unidentified inventory slot: slot i receives b"Item <i>\\0..." written into
+    user_names[i].  Identified items are left untouched.
+
+    JIT-pure: lax.fori_loop over MAX_INVENTORY_SLOTS; no Python control flow
+    on traced values.
+    Cite: vendor/nethack/src/do_name.c::do_oname.
     """
-    return state
+    # Pre-build name rows for each slot index as a [MAX_INVENTORY_SLOTS,
+    # USER_NAME_LEN] int8 constant array (static at trace time).
+    import numpy as _np
+    name_table = _np.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=_np.int8)
+    for _i in range(MAX_INVENTORY_SLOTS):
+        label = f"Item {_i}".encode("ascii")[:USER_NAME_LEN]
+        label = label + b"\x00" * (USER_NAME_LEN - len(label))
+        name_table[_i] = list(label)
+    name_table_jnp = jnp.array(name_table, dtype=jnp.int8)
+
+    inv = state.inventory
+    identified = inv.items.identified  # [MAX_INVENTORY_SLOTS] bool
+
+    def _body(i, user_names):
+        occupied = inv.items.category[i] != jnp.int8(0)
+        unidentified = ~identified[i]
+        should_name = occupied & unidentified
+        new_row = jnp.where(should_name, name_table_jnp[i], user_names[i])
+        return user_names.at[i].set(new_row)
+
+    new_user_names = jax.lax.fori_loop(
+        0, MAX_INVENTORY_SLOTS, _body, inv.user_names
+    )
+    new_inv = inv.replace(user_names=new_user_names)
+    return state.replace(inventory=new_inv)
 
 
 def _handle_invoke(state, rng):
-    """#invoke — vendor/nethack/src/artifact.c::arti_invoke.
+    """#invoke — vendor/nethack/src/artifact.c::arti_invoke lines 2131-2232.
 
     Dispatch based on the currently wielded artifact.  Each invoke has a
     cooldown of 100 turns tracked in state.invoke_cooldown[artifact_idx].
 
-    Wired artifacts (cite: artifact.c::arti_invoke ~line 1480+):
-      - Eye of the Aethiopica (idx 21) → +1 player_pw (energy regen).
-        Cite: artifact.c line ~1480.
-      - Mitre of Holiness (idx 16) → grant RESIST_COLD timer (60 turns via
-        intrinsic set; no timer field yet, intrinsic toggled permanently).
-        Cite: artifact.c Mitre of Holiness invoke path.
-      - Tsurugi of Muramasa (idx 10) → +1 player_str.
-        Cite: artifact.c Tsurugi invoke path.
-      - Magicbane (idx 29) → apply CONFUSED (asleep) to all monsters in
-        5×5 area around player. Cite: artifact.c Magicbane invoke path.
-      - Other artifacts → no-op (TODO: add remaining artifacts).
+    All ~30 artifact invoke effects are implemented via
+    artifact_powers.artifact_invoke_dispatch which uses lax.switch.
 
     Cooldown: 100 turns per invoke slot.
     Cite: vendor/nethack/src/artifact.c::arti_invoke artiintrinsics_taught[].
     """
+    from Nethax.nethax.subsystems.artifact_powers import artifact_invoke_dispatch
+
     art = state.inventory.wielded_artifact_idx.astype(jnp.int32)
 
     # Cooldown check: if invoke_cooldown[art] > 0, do nothing.
@@ -1271,54 +1374,10 @@ def _handle_invoke(state, rng):
     ready = (art >= jnp.int32(0)) & (cooldown <= jnp.int32(0))
 
     def _do_invoke(s):
-        # Decrement not needed yet — set cooldown to 100 after use.
+        # Set cooldown to 100 turns.
         new_cd = s.invoke_cooldown.at[safe_art].set(jnp.int16(100))
         s = s.replace(invoke_cooldown=new_cd)
-
-        # Eye of the Aethiopica (idx 21): +1 Pw.
-        # Cite: artifact.c line ~1480.
-        is_eye = art == jnp.int32(21)
-        new_pw = jnp.where(is_eye, s.player_pw + jnp.int32(1), s.player_pw)
-        s = s.replace(player_pw=new_pw)
-
-        # Mitre of Holiness (idx 16): grant RESIST_COLD (intrinsic[2] = True).
-        # No timer field yet; set permanently until next invoke.
-        # Cite: artifact.c Mitre of Holiness invoke path.
-        is_mitre = art == jnp.int32(16)
-        new_intrinsics = s.status.intrinsics.at[2].set(
-            s.status.intrinsics[2] | is_mitre
-        )
-        s = s.replace(status=s.status.replace(intrinsics=new_intrinsics))
-
-        # Tsurugi of Muramasa (idx 10): +1 player_str.
-        # Cite: artifact.c Tsurugi invoke path.
-        is_tsurugi = art == jnp.int32(10)
-        new_str = jnp.where(
-            is_tsurugi,
-            (s.player_str + jnp.int16(1)).astype(jnp.int16),
-            s.player_str,
-        )
-        s = s.replace(player_str=new_str)
-
-        # Magicbane (idx 29): confusion ray — set asleep on monsters in 5×5.
-        # Cite: artifact.c Magicbane invoke path.
-        is_mb = art == jnp.int32(29)
-        pr = s.player_pos[0].astype(jnp.int32)
-        pc = s.player_pos[1].astype(jnp.int32)
-        mai = s.monster_ai
-        # Vectorised 5×5 area check: |row - pr| <= 2 and |col - pc| <= 2.
-        mpos = mai.pos.astype(jnp.int32)
-        in_area = (
-            (jnp.abs(mpos[:, 0] - pr) <= jnp.int32(2))
-            & (jnp.abs(mpos[:, 1] - pc) <= jnp.int32(2))
-            & mai.alive
-        )
-        confused_mask = in_area & is_mb  # only if Magicbane is wielded
-        new_asleep = mai.asleep | confused_mask
-        s = s.replace(monster_ai=mai.replace(asleep=new_asleep))
-
-        # TODO: add remaining artifact invoke effects as subsystems come online.
-        return s
+        return artifact_invoke_dispatch(s, art, rng)
 
     return jax.lax.cond(ready, _do_invoke, lambda s: s, state)
 
@@ -1349,9 +1408,16 @@ def _handle_enhance(state, rng):
 
     JIT-pure: iterates skills via lax.fori_loop, stops at first eligible.
 
+    Thresholds (vendor/nethack/include/skills.h:106 — level*level*20, 0-based):
+      UNSKILLED(0)→BASIC(1):      0
+      BASIC(1)→SKILLED(2):       20
+      SKILLED(2)→EXPERT(3):      80
+      EXPERT(3)→MASTER(4):      180
+      MASTER(4)→GRAND_MASTER(5): 320
+    The uniform formula is byte-equal to vendor for all non-martial-arts skills.
+    TODO: martial arts uses a separate vendor table (weapon.c::Skill_M); skip for now.
+
     Note: vendor gates enhancement on weapon_slots; that is not yet modelled.
-    Note: per-skill practice threshold variation (e.g. martial arts) is TODO;
-          vendor uses uniform level*level*20 for all skills.
     """
     from Nethax.nethax.subsystems.skills import (
         N_SKILLS as _N_SKILLS,

@@ -132,9 +132,11 @@ class EnvState:
 
     # ---- Player core (Wave 6 closing-audit additions; vendor u.* parity) ----
     # Citations refer to vendor/nethack/include/you.h::struct you (lines 360-510).
+    player_in_trap:   jax.Array  # bool   u.utrap (vendor/nethack/src/uhitm.c:410); True while standing on a trap tile
     player_luck:      jax.Array  # int8   u.uluck   (you.h line 460); range [-10,10]
     player_moreluck:  jax.Array  # int8   u.moreluck (you.h line 460); luckstone bonus
     player_in_water:  jax.Array  # bool   u.uinwater (you.h line 431)
+    turns_underwater: jax.Array  # int16  consecutive turns in water; reset on leaving (trap.c::drown line 5059)
     player_buried:    jax.Array  # bool   u.uburied  (you.h line 436)
     player_steed_mid: jax.Array    # uint32 u.usteed_mid (you.h line 494); 0 = not riding
     player_extra_speed: jax.Array  # int8  extra move speed while riding steed (steed.c:447 ugallop)
@@ -175,6 +177,19 @@ class EnvState:
     # ---- Food detection cache (read.c::seffect_food_detection) ----
     # Count of FOOD_CLASS ground items on current level at time of detection.
     last_food_count: jax.Array    # int8
+
+    # ---- Sokoban pit counter (sokoban.c::sokoban_prize) ----
+    # Number of boulders pushed into pits while in the Sokoban branch.
+    # When this reaches SOKOBAN_PITS_TO_FILL (4) the prize spawns.
+    # Citation: vendor/nethack/src/sokoban.c::sokoban_in_play / sokoban_prize.
+    sokoban_boulders_pitted: jax.Array  # int8
+
+    # ---- Probe result cache (apply.c::use_stethoscope / zap.c::probe_monster) ----
+    # Last monster probed by stethoscope or wand of probing.
+    # Cite: vendor/nethack/src/apply.c::use_stethoscope (line 318);
+    #       vendor/nethack/src/zap.c::probe_monster (~line 4700).
+    probed_hp:  jax.Array  # int32  HP of the last probed monster; 0 = no probe
+    probed_idx: jax.Array  # int32  MonsterAIState slot index; -1 = no probe
 
     # ---- Terrain layers (kept at top level; subsystems read but rarely write) ----
     terrain: jax.Array          # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]  tile type
@@ -253,11 +268,13 @@ class EnvState:
             player_gold=jnp.int32(0),
             player_ac=jnp.int32(BASE_AC),
             # Wave 6 closing-audit additions (vendor u.* parity).
+            player_in_trap=jnp.bool_(False),
             player_luck=jnp.int8(0),
             player_moreluck=jnp.int8(0),
             player_uhitinc=jnp.int8(0),
             player_udaminc=jnp.int8(0),
             player_in_water=jnp.bool_(False),
+            turns_underwater=jnp.int16(0),
             player_buried=jnp.bool_(False),
             player_steed_mid=jnp.uint32(0),
             player_extra_speed=jnp.int8(0),
@@ -279,6 +296,11 @@ class EnvState:
             cloud_turns=jnp.int8(0),
             # food detection cache (read.c::seffect_food_detection)
             last_food_count=jnp.int8(0),
+            # sokoban pit counter (sokoban.c::sokoban_prize)
+            sokoban_boulders_pitted=jnp.int8(0),
+            # probe result cache (apply.c::use_stethoscope / zap.c::probe_monster)
+            probed_hp=jnp.int32(0),
+            probed_idx=jnp.int32(-1),
             # terrain layers
             terrain=jnp.zeros((b, l, h, w), dtype=jnp.int8),
             explored=jnp.zeros((b, l, h, w), dtype=jnp.bool_),
@@ -302,5 +324,7 @@ def _default_dungeon_state(n_branches: int, max_levels: int) -> DungeonState:
         stair_links=jnp.full((n_branches, max_levels, 2, 2), -1, dtype=jnp.int8),
         level_rng_seeds=jnp.zeros((n_branches, max_levels), dtype=jnp.uint32),
         vibrating_square_revealed=jnp.bool_(False),
+        vibrating_square_pos=jnp.full((2,), -1, dtype=jnp.int16),
         lit_radius_until_turn=jnp.int32(-1),
+        portal_destination=jnp.full((n_branches, max_levels, 2), -1, dtype=jnp.int8),
     )

@@ -35,21 +35,21 @@ from flax import struct
 # Map dimensions (must match dungeon.branches.MAP_H/MAP_W).  Imported lazily
 # inside default() so this module can be imported before the dungeon package.
 
-# Max characters of inscription text stored per tile.  vendor stores
-# variable-length strings; for JIT-friendly shape we cap at 8 bytes which
-# fits 'Elbereth' exactly.
-ENGRAVE_TEXT_LEN: int = 8
+# Max characters of inscription text stored per tile.
+# Vendor: BUFSZ-1 = 255 in engrave.h; we use 80 to match the screen width
+# bound used in obs/look.py::_engrave_descriptor for "You read: '<text>'".
+# This is wide enough for any realistic engraving while keeping the per-level
+# state under 1.3 MB (21*80*80 bytes).
+# Cite: vendor/nethack/include/engrave.h struct engr.engr_txt.
+ENGRAVE_TEXT_LEN: int = 80
 
-# Engraving kinds (mirrors engrave.h ENGR_DUST / ENGR_BURN / ENGR_ENGRAVE).
+# Engraving kinds (mirrors engrave.h ENGR_DUST / ENGR_BURN / ENGR_ENGRAVE / ENGR_MARK / ENGR_BLOOD).
 ENGR_NONE: int    = 0
 ENGR_DUST: int    = 1
 ENGR_ENGRAVE: int = 2
 ENGR_BURN: int    = 3
 ENGR_MARK: int    = 4  # magic marker (engrave.h:MARK=4); semi-permanent, not eroded by wipe_engr_on_step
 ENGR_BLOOD: int   = 5  # blood writing (engrave.h:ENGR_BLOOD=5); vampire/demon finger (engrave.c:doengrave line 573)
-
-# TODO: Expand ENGRAVE_TEXT_LEN from 8 to 80 to match vendor engrave buffer.
-# This touches state shape (EngraveState.text) and all callers; deferred.
 
 # ASCII byte sequence for "Elbereth" — padded with zeros to ENGRAVE_TEXT_LEN.
 _ELBERETH_BYTES = tuple(b"Elbereth") + (0,) * (ENGRAVE_TEXT_LEN - 8)

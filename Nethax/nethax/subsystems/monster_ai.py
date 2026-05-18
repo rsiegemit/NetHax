@@ -114,6 +114,51 @@ _MS_PRIEST: int = 41  # vendor/nethack/include/monflag.h
 _MS_RIDER: int = 35   # vendor/nethack/include/monflag.h
 
 
+def _build_monster_resists_table() -> jnp.ndarray:
+    """Precompute MONSTERS[i].resists_mask as int32[NUMMONS].
+
+    Cite: vendor/nethack/src/monst.c — each MON() entry has an mr1 field
+    (resistance bitmask: MR_FIRE=0x01, MR_COLD=0x02, MR_SLEEP=0x04,
+    MR_DISINT=0x08, MR_ELEC=0x10, MR_POISON=0x20, MR_ACID=0x40, MR_STONE=0x80).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS
+    return jnp.array([int(m.resists_mask) for m in MONSTERS], dtype=jnp.int32)
+
+
+def _build_monster_undead_table() -> jnp.ndarray:
+    """Precompute bool[NUMMONS]: True iff MONSTERS[i].flags2 & M2_UNDEAD.
+
+    Cite: vendor/nethack/include/monflag.h M2_UNDEAD = 0x00000002.
+    vendor/nethack/include/mondata.h: #define is_undead(ptr) ((ptr)->mflags2 & M2_UNDEAD)
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, M2_UNDEAD
+    return jnp.array([bool(m.flags2 & M2_UNDEAD) for m in MONSTERS], dtype=jnp.bool_)
+
+
+def _build_monster_nonliving_table() -> jnp.ndarray:
+    """Precompute bool[NUMMONS]: True iff monster is nonliving.
+
+    Cite: vendor/nethack/include/mondata.h:
+      #define weirdnonliving(ptr) (is_golem(ptr) || (ptr)->mlet == S_VORTEX)
+      #define nonliving(ptr) (is_undead(ptr) || (ptr)==&mons[PM_MANES] || weirdnonliving(ptr))
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, M2_UNDEAD, MonsterSymbol
+    result = []
+    for m in MONSTERS:
+        is_undead  = bool(m.flags2 & M2_UNDEAD)
+        is_golem   = (m.symbol == MonsterSymbol.S_GOLEM)
+        is_vortex  = (m.symbol == MonsterSymbol.S_VORTEX)
+        is_manes   = (m.name == "manes")
+        result.append(is_undead or is_golem or is_vortex or is_manes)
+    return jnp.array(result, dtype=jnp.bool_)
+
+
+# Eager-built tables indexed by entry_idx (size = NUMMONS = 381).
+_MONSTER_MRESISTS:  jnp.ndarray = _build_monster_resists_table()
+_MONSTER_UNDEAD:    jnp.ndarray = _build_monster_undead_table()
+_MONSTER_NONLIVING: jnp.ndarray = _build_monster_nonliving_table()
+
+
 def _build_ignores_elbereth_table() -> jnp.ndarray:
     """Precompute per-entry Elbereth exemption flags.
 
@@ -304,6 +349,37 @@ class MonsterAIState:
     # Mirrors vendor which_armor(mtmp, W_SADDLE) check in steed.c:281.
     saddled: jnp.ndarray           # [MAX_MONSTERS_PER_LEVEL]  int8
 
+    # ---- Disarmed / unwielded flag ----
+    # True when the monster has been disarmed (whip-pull or disarm artifact).
+    # When set, monster_attack_player uses bare-hands dice instead of weapon
+    # dice.  Cite: vendor/nethack/src/weapon.c (disarm logic).
+    is_unwielded: jnp.ndarray      # [MAX_MONSTERS_PER_LEVEL]  bool
+
+    # ---- Per-monster resist / status fields (wand parity) ----
+    # Populated at spawn from MONSTERS[entry_idx].resists_mask.
+    # Cite: vendor/nethack/src/monst.c MON() mr1 field.
+    resists: jnp.ndarray           # [MAX_MONSTERS_PER_LEVEL]  int32
+
+    # Undead flag — from MONSTERS[entry_idx].flags2 & M2_UNDEAD at spawn.
+    # Cite: vendor/nethack/include/monflag.h M2_UNDEAD = 0x00000002.
+    undead: jnp.ndarray            # [MAX_MONSTERS_PER_LEVEL]  bool
+
+    # Invisible flag — True if naturally invisible or zapped by WAN_MAKE_INVISIBLE.
+    # Cite: vendor/nethack/src/zap.c::zhitm make_invisible handling.
+    invisible: jnp.ndarray         # [MAX_MONSTERS_PER_LEVEL]  bool
+
+    # Nonliving flag — golems, vortices, undead; immune to WAN_DEATH.
+    # Cite: vendor/nethack/include/mondata.h::nonliving().
+    nonliving: jnp.ndarray         # [MAX_MONSTERS_PER_LEVEL]  bool
+
+    # Speed modifier: -1 = slowed, 0 = normal, +1 = hasted.
+    # Cite: vendor/nethack/src/zap.c WAN_SLOW/SPEED_MONSTER.
+    speed_mod: jnp.ndarray         # [MAX_MONSTERS_PER_LEVEL]  int8
+
+    # Cancellation flag — monster has been cancelled (drains powers).
+    # Cite: vendor/nethack/src/zap.c WAN_CANCELLATION.
+    cancelled: jnp.ndarray         # [MAX_MONSTERS_PER_LEVEL]  bool
+
 
 def make_monster_ai_state() -> MonsterAIState:
     """Return a zero-initialized MonsterAIState for one level."""
@@ -343,6 +419,13 @@ def make_monster_ai_state() -> MonsterAIState:
         inv_identified=jnp.zeros(inv_shape, dtype=bool),
         pet_hunger=jnp.full(n, 1000, dtype=jnp.int16),
         saddled=jnp.zeros(n, dtype=jnp.int8),
+        is_unwielded=jnp.zeros(n, dtype=jnp.bool_),
+        resists=jnp.zeros(n, dtype=jnp.int32),
+        undead=jnp.zeros(n, dtype=jnp.bool_),
+        invisible=jnp.zeros(n, dtype=jnp.bool_),
+        nonliving=jnp.zeros(n, dtype=jnp.bool_),
+        speed_mod=jnp.zeros(n, dtype=jnp.int8),
+        cancelled=jnp.zeros(n, dtype=jnp.bool_),
     )
 
 
@@ -1583,6 +1666,73 @@ def wake_monsters_near(state, pos: jnp.ndarray, radius: int = 3) -> object:
     in_radius = (dist <= radius) & mai.alive                # [N] bool
     new_asleep = mai.asleep & ~in_radius                    # flip only those in radius
     new_mai = mai.replace(asleep=new_asleep)
+    return state.replace(monster_ai=new_mai)
+
+
+# ---------------------------------------------------------------------------
+# Shrieker alarm  (vendor/nethack/src/mon.c::shrieker)
+# Cite: vendor/nethack/src/mon.c — adjacent shrieker wails and summons when
+# the player can hear it; deafness suppresses the alarm.
+# Cite (deaf gate): vendor/nethack/src/sounds.c — sound-based effects are
+# skipped entirely when the player is deaf (HDeaf > 0).
+# ---------------------------------------------------------------------------
+
+_MS_SHRIEK_AI: int = 18   # MS_SHRIEK from monsters.py
+_SHRIEK_PROB: float = 0.25  # ~25% chance per turn per adjacent shrieker
+
+
+def shrieker_summon(state, rng: jax.Array) -> object:
+    """Adjacent shriekers trigger a monster summon with prob _SHRIEK_PROB.
+
+    When DEAF, the player cannot hear the wail so no summon occurs.
+    Cite: vendor/nethack/src/mon.c::shrieker — MS_SHRIEK adjacent wail.
+    Cite: vendor/nethack/src/sounds.c — deaf gate suppresses sound events.
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS_SE
+
+    mai = state.monster_ai
+    pr  = state.player_pos[0].astype(jnp.int32)
+    pc  = state.player_pos[1].astype(jnp.int32)
+
+    mon_r = mai.pos[:, 0].astype(jnp.int32)
+    mon_c = mai.pos[:, 1].astype(jnp.int32)
+    adjacent = (jnp.maximum(jnp.abs(mon_r - pr), jnp.abs(mon_c - pc)) == 1) & mai.alive
+
+    entry_safe  = jnp.clip(mai.entry_idx.astype(jnp.int32), 0, _MONSTER_SOUND_TABLE.shape[0] - 1)
+    is_shrieker = _MONSTER_SOUND_TABLE[entry_safe] == jnp.int8(_MS_SHRIEK_AI)
+    any_shrieker = jnp.any(adjacent & is_shrieker)
+
+    # DEAF: player cannot hear the shrieker wail — summon suppressed.
+    is_deaf = state.status.timed_statuses[int(_TS_SE.DEAF)] > jnp.int32(0)
+    any_shrieker = any_shrieker & ~is_deaf
+
+    rng_roll, _ = jax.random.split(rng)
+    do_summon = any_shrieker & (jax.random.uniform(rng_roll) < jnp.float32(_SHRIEK_PROB))
+
+    dead_mask = ~mai.alive
+    dead_idx  = jnp.argmax(dead_mask).astype(jnp.int32)
+    has_dead  = jnp.any(dead_mask)
+
+    map_h = state.terrain.shape[2]
+    map_w = state.terrain.shape[3]
+    spawn_r   = jnp.clip(pr + 1, 0, map_h - 1)
+    spawn_c   = jnp.clip(pc,     0, map_w - 1)
+    spawn_pos = jnp.stack([spawn_r, spawn_c]).astype(jnp.int16)
+
+    should = do_summon & has_dead
+
+    new_alive    = mai.alive.at[dead_idx].set(jnp.where(should, jnp.bool_(True),  mai.alive[dead_idx]))
+    new_pos      = mai.pos.at[dead_idx].set(jnp.where(should, spawn_pos,           mai.pos[dead_idx]))
+    new_hp       = mai.hp.at[dead_idx].set(jnp.where(should, jnp.int32(4),         mai.hp[dead_idx]))
+    new_hp_max   = mai.hp_max.at[dead_idx].set(jnp.where(should, jnp.int32(4),     mai.hp_max[dead_idx]))
+    new_peaceful = mai.peaceful.at[dead_idx].set(jnp.where(should, jnp.bool_(False), mai.peaceful[dead_idx]))
+    new_asleep   = mai.asleep.at[dead_idx].set(jnp.where(should, jnp.bool_(False),  mai.asleep[dead_idx]))
+    new_entry    = mai.entry_idx.at[dead_idx].set(jnp.where(should, jnp.int16(1),   mai.entry_idx[dead_idx]))
+
+    new_mai = mai.replace(
+        alive=new_alive, pos=new_pos, hp=new_hp, hp_max=new_hp_max,
+        peaceful=new_peaceful, asleep=new_asleep, entry_idx=new_entry,
+    )
     return state.replace(monster_ai=new_mai)
 
 

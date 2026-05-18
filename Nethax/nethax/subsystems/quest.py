@@ -372,3 +372,82 @@ def check_quest_complete(
 def step(state: QuestState, rng: jax.Array) -> QuestState:
     """Per-turn no-op — quest state only changes on explicit event calls."""
     return state
+
+
+# ---------------------------------------------------------------------------
+# Spec-aligned progression hooks (quest.c / qstplay.c parity)
+#
+# Stage constants used below match qstplay.c QSTAGE_* values:
+#   _QSTAGE_BEGUN    = 1  — after meeting Quest Leader (quest.c chat_with_leader ~321-324)
+#   _QSTAGE_GOT_OBJ  = 2  — after picking up quest artifact (quest.c artitouch ~127-134)
+#   _QSTAGE_COMPLETE = 4  — returned to Leader with artifact (quest.c finish_quest ~263-279)
+# ---------------------------------------------------------------------------
+_QSTAGE_BEGUN    = jnp.int8(1)
+_QSTAGE_GOT_OBJ  = jnp.int8(2)
+_QSTAGE_COMPLETE = jnp.int8(4)
+
+
+def on_enter_quest_level(state) -> object:
+    """Set met_leader=True and advance stage to BEGUN_QUEST (1).
+
+    Called when the player enters the Quest branch leader level and has not
+    yet met the leader.  Mirrors quest.c::chat_with_leader lines ~321-324
+    (Qstat(met_leader) = TRUE) and qstplay.c expulsion / on_leader_level
+    logic that gates further progress on the entry level.
+
+    JIT-pure: all ops are jnp.where / jnp.maximum on scalars.
+    """
+    new_stage = jnp.maximum(state.quest.stage, _QSTAGE_BEGUN)
+    new_quest = state.quest.replace(
+        met_leader=jnp.bool_(True),
+        stage=new_stage,
+    )
+    return state.replace(quest=new_quest)
+
+
+def on_nemesis_killed(state, monster_entry_idx: jnp.ndarray) -> object:
+    """Set nemesis_killed=True when the role's nemesis is slain.
+
+    Mirrors quest.c::nemdead (~109-113): Qstat(killed_nemesis) = TRUE.
+    The caller confirms monster_entry_idx matches the role's nemesis before
+    calling (combat.py gates on entry_idx == nemesis_entry).
+
+    JIT-pure: delegates to slay_nemesis.
+    """
+    new_quest = slay_nemesis(state.quest, monster_entry_idx)
+    return state.replace(quest=new_quest)
+
+
+def on_artifact_picked_up(state) -> object:
+    """Set touched_artifact=True and advance stage to GOT_QUEST_OBJECT (2).
+
+    Mirrors quest.c::artitouch (~127-134): Qstat(touched_artifact) = TRUE.
+    Called from inventory pickup when the picked-up item's type_id matches
+    the role's quest artifact index (_ARTIFACT_IDX_BY_ROLE[player_role]).
+
+    JIT-pure.
+    """
+    new_stage = jnp.maximum(state.quest.stage, _QSTAGE_GOT_OBJ)
+    new_quest = state.quest.replace(
+        touched_artifact=jnp.bool_(True),
+        artifact_carried=jnp.bool_(True),
+        stage=new_stage,
+    )
+    return state.replace(quest=new_quest)
+
+
+def on_return_to_leader(state) -> object:
+    """Set completed=True and advance stage to COMPLETED (4).
+
+    Mirrors quest.c::finish_quest (~263-279): u.uevent.qcompleted = 1.
+    Called when the player carries the quest artifact back to the leader
+    level and is adjacent to the leader (quest.c leaderchat / finish_quest).
+
+    JIT-pure.
+    """
+    new_stage = jnp.maximum(state.quest.stage, _QSTAGE_COMPLETE)
+    new_quest = state.quest.replace(
+        completed=jnp.bool_(True),
+        stage=new_stage,
+    )
+    return state.replace(quest=new_quest)

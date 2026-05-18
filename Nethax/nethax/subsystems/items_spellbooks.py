@@ -145,6 +145,12 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
 
+    # Blind / stunned: cannot read (vendor/nethack/src/read.c::doread early checks).
+    is_blind   = state.status.timed_statuses[int(TimedStatus.BLIND)]   > jnp.int32(0)
+    is_stunned = state.status.timed_statuses[int(TimedStatus.STUNNED)] > jnp.int32(0)
+    if bool(is_blind) or bool(is_stunned):
+        return state
+
     # --- resolve spell_id and buc_status from inventory slot ---
     spell_id   = int(state.inventory.items.type_id[slot_idx])
     buc_status = int(state.inventory.items.buc_status[slot_idx])

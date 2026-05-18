@@ -49,6 +49,9 @@ from Nethax.nethax.constants.tiles import TileType
 from Nethax.nethax.subsystems.monster_ai import (
     MAX_MONSTERS_PER_LEVEL,
     MAX_MONSTER_INV,
+    _MONSTER_MRESISTS,
+    _MONSTER_UNDEAD,
+    _MONSTER_NONLIVING,
 )
 
 
@@ -563,6 +566,15 @@ def populate_level_with_monsters(
         new_atk_s     = mai_carry.attack_dice_sides.at[i].set(_ATK_DICE_S[type_id])
         new_strategy  = mai_carry.mstrategy.at[i].set(jnp.int8(0))  # NONE until awakened
         new_entry     = mai_carry.entry_idx.at[i].set(type_id.astype(jnp.int16))
+        # Per-monster resist/undead/nonliving from MONSTERS table.
+        # Cite: vendor/nethack/src/monst.c MON() mr1 field.
+        tid           = type_id.astype(jnp.int32)
+        new_resists   = mai_carry.resists.at[i].set(
+            jnp.take(_MONSTER_MRESISTS, tid, axis=0).astype(jnp.int32))
+        new_undead    = mai_carry.undead.at[i].set(
+            jnp.take(_MONSTER_UNDEAD, tid, axis=0).astype(jnp.bool_))
+        new_nonliving = mai_carry.nonliving.at[i].set(
+            jnp.take(_MONSTER_NONLIVING, tid, axis=0).astype(jnp.bool_))
 
         # Vendor makemon.c::mongets: assign per-class inventory kit.
         kit_id = _MONSTER_KIT_BY_ENTRY[type_id.astype(jnp.int32)].astype(jnp.int32)
@@ -591,6 +603,9 @@ def populate_level_with_monsters(
             inv_type_id=new_invt,
             inv_quantity=new_invq,
             inv_charges=new_invch,
+            resists=new_resists,
+            undead=new_undead,
+            nonliving=new_nonliving,
         )
 
     new_mai = jax.lax.fori_loop(0, n_monsters, _write_slot, mai)

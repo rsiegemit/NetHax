@@ -206,12 +206,59 @@ def try_mount(state, rng: jax.Array):
     skill_lv = _riding_skill_level(state)
     skill_ok = skill_lv >= jnp.int32(_RIDING_SKILL_MIN)
 
+    # Byte-equal port of vendor steed.c::can_saddle / mount chance, lines 93-128:
+    #   chance = ACURR(A_DEX) + ACURR(A_CHA)/2 + 2 * mtmp->mtame;
+    #   chance += u.ulevel * (mtmp->mtame ? 20 : 5);
+    #   if (!mtmp->mtame) chance -= 10 * mtmp->m_lev;
+    #   if (Role_if(PM_KNIGHT)) chance += 20;
+    #   skill: ISRESTRICTED/UNSKILLED → -20; BASIC → 0; SKILLED → +15; EXPERT → +30
+    #   if (Confusion || Fumbling || Glib) chance -= 20
+    #   if cursed saddle: chance -= 50  (we already gate via is_cursed → fail)
     dex = state.player_dex.astype(jnp.int32)
-    threshold = jnp.int32(5) + jnp.int32(5) * skill_lv + dex
+    cha = state.player_cha.astype(jnp.int32)
+    xl  = state.player_xl.astype(jnp.int32)
+    mtame = state.monster_ai.mtame[safe_slot].astype(jnp.int32)
+    # Use entry_idx → MONSTERS.level via lookup table built at runtime.
+    from Nethax.nethax.constants.monsters import MONSTERS as _MONS_TABLE
+    _LVL_TABLE = jnp.array([int(m.level) for m in _MONS_TABLE], dtype=jnp.int32)
+    steed_lvl = _LVL_TABLE[jnp.clip(
+        state.monster_ai.entry_idx[safe_slot].astype(jnp.int32),
+        0, _LVL_TABLE.shape[0] - 1)]
+
+    is_tame = mtame > jnp.int32(0)
+    tame_bonus  = jnp.where(is_tame, jnp.int32(20), jnp.int32(5))
+    wild_penalty = jnp.where(is_tame, jnp.int32(0), jnp.int32(10) * steed_lvl)
+    base = dex + cha // jnp.int32(2) + jnp.int32(2) * mtame
+    chance = base + xl * tame_bonus - wild_penalty
+
+    # Knight role bonus.  Role.KNIGHT == 4 (cite roles.py).
+    from Nethax.nethax.constants.roles import Role
+    is_knight = state.player_role == jnp.int8(int(Role.KNIGHT))
+    chance = chance + jnp.where(is_knight, jnp.int32(20), jnp.int32(0))
+
+    # Skill modifier: UNSKILLED -20, BASIC 0, SKILLED +15, EXPERT +30.
+    skill_mod = jnp.where(
+        skill_lv >= jnp.int32(3), jnp.int32(30),  # EXPERT
+        jnp.where(skill_lv >= jnp.int32(2), jnp.int32(15),  # SKILLED
+        jnp.where(skill_lv >= jnp.int32(1), jnp.int32(0),   # BASIC
+        jnp.int32(-20))))                                     # UNSKILLED/RESTRICTED
+    chance = chance + skill_mod
+
+    # Confused / Fumbling / Glib penalty.
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+    ts = state.status.timed_statuses
+    confused  = ts[int(TimedStatus.CONFUSION)] > 0
+    fumbling  = ts[int(TimedStatus.FUMBLING)] > 0
+    glib      = ts[int(TimedStatus.GLIB)] > 0
+    impaired  = confused | fumbling | glib
+    chance = chance + jnp.where(impaired, jnp.int32(-20), jnp.int32(0))
+
+    # Clamp chance to [1, 100] for the roll.
+    chance = jnp.clip(chance, jnp.int32(1), jnp.int32(100))
 
     k_roll, k_fall = jax.random.split(rng)
     roll = jax.random.randint(k_roll, (), minval=0, maxval=100, dtype=jnp.int32)
-    success_roll = roll < threshold
+    success_roll = roll < chance
 
     # Overall success: not riding, found mount, not cursed, skill ok, roll passes.
     success = (~already_riding) & found & (~is_cursed) & skill_ok & success_roll

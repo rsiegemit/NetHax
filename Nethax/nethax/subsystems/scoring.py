@@ -164,12 +164,25 @@ def _conduct_bonus_array() -> jnp.ndarray:
 # Special bonuses (vendor: end.c::really_done lines 1325-1352).
 # ---------------------------------------------------------------------------
 
-AMULET_BONUS:    int = 10000   # carrying the real Amulet of Yendor at endgame
-ASCENSION_BONUS: int = 50000   # baseline ascension bonus (vendor doubles
-                                # u.urexp; we use a flat bonus per Wave 5
-                                # placeholder which the test suite already
-                                # asserts against in test_endgame.py).
-DLEVEL_BONUS:    int = 50      # vendor: tmp += 50 * (deepest - 1)
+# Vendor formula (end.c lines 1325-1352 / 1344-1351):
+#   total = u.urexp                              # XP
+#         + (u.urexp if ASCENDED else 0)         # ascension doubles XP
+#         + gold_carried                          # net gold
+#         + 50 * artifact_score                   # artifacts
+#         + 100 * max(0, deepest - 20)            # deep-level bonus
+#         + alignment_bonus                        # if original alignment kept
+#
+# Nethax Wave 6 simplification: artifacts and alignment_bonus are tracked as
+# 0 (not yet implemented).  The deep-level threshold is 20 per end.c:1339.
+
+ARTIFACT_BONUS:  int = 50    # vendor: 50 * artifact_score  (end.c:1452)
+DEEP_LEVEL_BONUS: int = 100  # vendor: 100 * max(0, deepest - 20)  (end.c:1340)
+
+# Legacy constants kept for backward-compat imports; no longer used by
+# compute_final_score (replaced by vendor formula above).
+AMULET_BONUS:    int = 10000
+ASCENSION_BONUS: int = 50000
+DLEVEL_BONUS:    int = 50
 
 
 # ---------------------------------------------------------------------------
@@ -324,41 +337,40 @@ def compute_conduct_bonus(state) -> jnp.ndarray:
 def compute_final_score(state) -> jnp.ndarray:
     """Compute the end-of-game score.
 
-    Returns an int32 scalar — the sum of:
-        experience_points              (state.scoring.experience_points)
-      + gold_carried                   (state.player_gold)
-      + DLEVEL_BONUS * (deepest - 1)   (vendor end.c line 1338)
-      + AMULET_BONUS  iff carrying the real Amulet of Yendor
-      + ASCENSION_BONUS  iff state.scoring.ascended
-      + conduct_bonus  (sum over kept conducts of _CONDUCT_BONUS[c])
+    Implements vendor/nethack/src/end.c::really_done lines 1325-1352:
 
-    Mirrors vendor/nethack/src/end.c::really_done lines 1325-1352 — with
-    the documented Wave 6 simplifications:
-        * gold is taken as-is (no ``- tmp/10`` post-death deduction).
-        * deepest>20 bonus folded into a single DLEVEL_BONUS coefficient.
-        * ascension awards a flat ASCENSION_BONUS rather than doubling
-          u.urexp (matches the Wave 5 placeholder already in
-          subsystems/ascension.py::ascend).
+        total = u.urexp                              # XP earned
+              + (u.urexp if ASCENDED else 0)         # ascension doubles XP
+              + gold_carried                          # net gold (end.c:1329)
+              + ARTIFACT_BONUS * n_artifacts          # end.c:1452 (0 if none)
+              + DEEP_LEVEL_BONUS * max(0, deepest-20) # end.c:1340
+              + conduct_bonus                         # insight.c simplification
+
+    Nethax Wave 6 simplifications (documented divergences):
+        * n_artifacts=0 (artifact tracking not yet implemented).
+        * alignment_bonus=0 (alignment-record bonus not yet implemented).
+        * gold taken as-is (no ``tmp/10`` post-death deduction, end.c:1337).
 
     JIT-safe — every term is a jnp scalar.
     """
     scoring = state.scoring
 
-    xp_pts   = jnp.int32(scoring.experience_points)
-    gold     = jnp.int32(state.player_gold)
-    deepest  = jnp.int32(scoring.deepest_level)
-    dlevel   = jnp.int32(DLEVEL_BONUS) * jnp.maximum(deepest - 1, jnp.int32(0))
+    xp_pts    = jnp.int32(scoring.experience_points)
+    gold      = jnp.int32(state.player_gold)
+    deepest   = jnp.int32(scoring.deepest_level)
 
-    has_amulet = _player_holds_amulet(state)
-    amulet_b   = jnp.where(has_amulet, jnp.int32(AMULET_BONUS), jnp.int32(0))
+    # Ascension doubles XP (end.c:1344-1351 — full-alignment keeps x2).
+    ascend_xp = jnp.where(scoring.ascended, xp_pts, jnp.int32(0))
 
-    ascended_b = jnp.where(
-        scoring.ascended, jnp.int32(ASCENSION_BONUS), jnp.int32(0)
-    )
+    # Deep-level bonus: 100 * max(0, deepest - 20)  (end.c:1339-1340).
+    deep_b    = jnp.int32(DEEP_LEVEL_BONUS) * jnp.maximum(deepest - 20, jnp.int32(0))
+
+    # Artifact bonus: 50 * n_artifacts (end.c:1452); 0 until tracking added.
+    artifact_b = jnp.int32(0)
 
     conduct_b = compute_conduct_bonus(state)
 
-    total = xp_pts + gold + dlevel + amulet_b + ascended_b + conduct_b
+    total = xp_pts + ascend_xp + gold + deep_b + artifact_b + conduct_b
     return jnp.int32(total)
 
 

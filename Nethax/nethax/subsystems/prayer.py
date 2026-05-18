@@ -709,13 +709,23 @@ def _apply_remove_curse(state):
     """REMOVE_CURSE: bless all cursed items (pray.c pleased case 4).
 
     A cursed item has buc_status == 1; mass-uncurse them to 2 (uncursed).
+    Also clears all cursed-stuck (welded) flags so equipment can be removed.
+    Cite: vendor/nethack/src/wield.c::welded() — once obj->cursed is false
+    the weapon is no longer welded.
     Only acts on the player's inventory slice (52 slots).
     """
+    from Nethax.nethax.subsystems.inventory import N_ARMOR_SLOTS
     items = state.inventory.items
     is_cursed = items.buc_status == jnp.int8(1)
     new_buc = jnp.where(is_cursed, jnp.int8(2), items.buc_status)
     new_items = items.replace(buc_status=new_buc)
-    new_inv = state.inventory.replace(items=new_items)
+    new_inv = state.inventory.replace(
+        items=new_items,
+        welded=jnp.bool_(False),
+        worn_armor_welded=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.bool_),
+        worn_amulet_welded=jnp.bool_(False),
+        worn_rings_welded=jnp.zeros((2,), dtype=jnp.bool_),
+    )
     return state.replace(inventory=new_inv)
 
 
@@ -1330,13 +1340,15 @@ def sacrifice_on_altar(state, rng: jax.Array, slot_idx: jnp.ndarray):
         return (jnp.int32(base) * level_scale_num // jnp.int32(10)).astype(jnp.int16)
 
     # --- Apply state changes ------------------------------------------------
-    # Mighty monster → wish: bump god_anger negatively as "wishes_granted"
-    # counter (Wave 6 placeholder; real wish requires wish.py integration).
-    new_anger = jnp.where(
-        is_mighty,
-        state.prayer.god_anger - jnp.int32(1),   # -1 = "wish credit"
-        state.prayer.god_anger,
-    )
+    # Mighty monster → grant wish via wish.grant_wish (pray.c::pleased mighty
+    # branch calls makewish()).
+    # Cite: vendor/nethack/src/pray.c::pleased mighty branch (makewish call).
+    # grant_wish is Python-side (not JAX-traced); gate on bool(is_mighty).
+    _MIGHTY_WISH = b"blessed greased fixed +3 gray dragon scale mail"
+    if bool(is_mighty):
+        from Nethax.nethax.subsystems import wish as _wish
+        state = _wish.grant_wish(state, rng, _MIGHTY_WISH)
+    new_anger = state.prayer.god_anger  # no god_anger change; wish was granted
 
     # Artifact gift: bump WIS (consistent with _apply_gift_artifact).
     new_wis = jnp.where(

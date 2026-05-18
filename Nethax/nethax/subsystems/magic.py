@@ -14,10 +14,36 @@ import enum
 
 import jax
 import jax.numpy as jnp
+import jax.lax as lax
 from flax import struct
 from Nethax.nethax.subsystems.skills import (
     use_skill as _skills_use_skill,
     _SPELL_SCHOOL_TO_SKILL_ID as _MAGIC_SCHOOL_TO_SKILL,
+)
+from Nethax.nethax.subsystems import detect as _detect
+from Nethax.nethax.constants.monsters import MONSTERS, M2_HOSTILE, M2_NASTY
+
+
+# ---------------------------------------------------------------------------
+# Precomputed per-monster tables (module-level, JIT-safe)
+# ---------------------------------------------------------------------------
+
+_N_MONSTERS: int = len(MONSTERS)
+
+# bool[N_MONSTERS] — True when the monster is "nasty":
+#   level >= 7 AND has M2_HOSTILE flag (i.e. normally aggressive, not a pet).
+# Cite: vendor/nethack/src/wizard.c::nasties[] — these are the high-level
+#   aggressive monsters selected by pick_nasty() / nasty().
+_IS_NASTY: jax.Array = jnp.array(
+    [m.level >= 7 and bool(m.flags2 & M2_HOSTILE) for m in MONSTERS],
+    dtype=jnp.bool_,
+)
+
+# int8[N_MONSTERS] — generation level proxy for level-appropriate sampling.
+# Mirrors items_wands._MONSTER_GEN_LEVEL but defined here so magic.py is
+# self-contained.  Cite: vendor/nethack/src/zap.c wand_create_monster logic.
+_MONSTER_GEN_LEVEL: jax.Array = jnp.array(
+    [m.level for m in MONSTERS], dtype=jnp.int8
 )
 
 
@@ -359,7 +385,7 @@ def spell_success_chance(
     Source: vendor/nethack/src/spell.c::percent_success() lines 2173-2292.
     """
     return jnp.int32(100) - spell_fail_chance(
-        role, spell_id, xl, stat_int, stat_wis, wielded_type_id=wielded_type_id
+        role, spell_id, xl, stat_int, stat_wis
     )
 
 
@@ -538,54 +564,54 @@ def _effect_chain_lightning(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_detect_monsters(state: dict, rng: jax.Array) -> dict:
-    """DETECT_MONSTERS: set identification.detect_monsters_until_turn.
+    """DETECT_MONSTERS: delegate to detect.detect_monsters.
 
-    Vendor: vendor/nethack/src/detect.c::monster_detect — reveals every
-    monster on the current level for a number of turns equal to the spell's
-    base duration (typically 100 turns).  We track that window via a
-    timer on IdentificationState; observation code may consult it later.
     Cite: vendor/nethack/src/detect.c::monster_detect.
     """
-    ts = state["timestep"].astype(jnp.int32)
-    ident = state["identification"]
-    new_ident = ident.replace(
-        detect_monsters_until_turn=ts + jnp.int32(100),
-    )
-    return {**state, "identification": new_ident}
+    built = state.build() if hasattr(state, "build") else state
+    result = _detect.detect_monsters(built, rng)
+    return {**state, "identification": result.identification}
 
 
 def _effect_detect_food(state: dict, rng: jax.Array) -> dict:
-    """DETECT_FOOD: set identification.detect_food_until_turn.
+    """DETECT_FOOD: delegate to detect.detect_food.
 
-    Vendor: vendor/nethack/src/detect.c::food_detect — reveals every food
-    item on the current level until the timer expires.
     Cite: vendor/nethack/src/detect.c::food_detect.
     """
-    ts = state["timestep"].astype(jnp.int32)
-    ident = state["identification"]
-    new_ident = ident.replace(
-        detect_food_until_turn=ts + jnp.int32(100),
-    )
-    return {**state, "identification": new_ident}
+    built = state.build() if hasattr(state, "build") else state
+    result = _detect.detect_food(built, rng)
+    return {**state, "identification": result.identification}
 
 
 def _effect_detect_treasure(state: dict, rng: jax.Array) -> dict:
-    """DETECT_TREASURE: set identification.detect_treasure_until_turn.
+    """DETECT_TREASURE: delegate to detect.detect_treasure.
 
-    Vendor: vendor/nethack/src/detect.c::trap_detect routes the treasure
-    detection branch — we record an expiry timestep on IdentificationState.
-    Cite: vendor/nethack/src/detect.c::trap_detect (treasure-detect branch).
+    Cite: vendor/nethack/src/detect.c::object_detect (COIN_CLASS branch).
     """
-    ts = state["timestep"].astype(jnp.int32)
-    ident = state["identification"]
-    new_ident = ident.replace(
-        detect_treasure_until_turn=ts + jnp.int32(100),
-    )
-    return {**state, "identification": new_ident}
+    built = state.build() if hasattr(state, "build") else state
+    result = _detect.detect_treasure(built, rng)
+    return {**state, "identification": result.identification, "explored": result.explored}
 
 
 def _effect_detect_unseen(state: dict, rng: jax.Array) -> dict:
-    return state
+    """DETECT_UNSEEN: reveal SDOOR→CLOSED_DOOR and SCORR→CORRIDOR on terrain.
+
+    Cite: vendor/nethack/src/detect.c (SPE_DETECT_UNSEEN branch, ~line 1340).
+    """
+    from Nethax.nethax.constants.tiles import VendorTileType, TileType
+    dungeon = state["dungeon"]
+    b  = dungeon.current_branch.astype(jnp.int32)
+    lv = dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    terrain = state["terrain"]
+    level_terrain = terrain[b, lv]
+    _SDOOR      = jnp.int8(int(VendorTileType.SDOOR))
+    _SCORR      = jnp.int8(int(VendorTileType.SCORR))
+    _CLOSED_DOOR = jnp.int8(int(TileType.CLOSED_DOOR))
+    _CORRIDOR   = jnp.int8(int(TileType.CORRIDOR))
+    level_terrain = jnp.where(level_terrain == _SDOOR, _CLOSED_DOOR, level_terrain)
+    level_terrain = jnp.where(level_terrain == _SCORR, _CORRIDOR, level_terrain)
+    new_terrain = terrain.at[b, lv].set(level_terrain)
+    return {**state, "terrain": new_terrain}
 
 
 def _effect_identify(state: dict, rng: jax.Array) -> dict:
@@ -663,13 +689,21 @@ def _effect_confuse_monster(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_cause_fear(state: dict, rng: jax.Array) -> dict:
-    """CAUSE_FEAR: set all monsters to FLEE."""
+    """CAUSE_FEAR: set all alive monsters to FLEE for 10 turns.
+
+    Vendor: spell.c::spelleffects CAUSE_FEAR → monflee() sets flee flag and
+    flee_until_turn.  We set mstrategy=FLEE and flee_until_turn = timestep+10.
+    Cite: vendor/nethack/src/spell.c::spelleffects (CAUSE_FEAR branch).
+    """
     from Nethax.nethax.subsystems.monster_ai import MoveStrategy
     mai = state["monster_ai"]
     if hasattr(mai, "mstrategy"):
+        ts = state["timestep"].astype(jnp.int32)
         alive_mask = mai.hp > 0 if hasattr(mai, "hp") else jnp.zeros(mai.mstrategy.shape, jnp.bool_)
         new_mstrategy = jnp.where(alive_mask, jnp.int32(MoveStrategy.FLEE), mai.mstrategy)
-        return {**state, "monster_ai": mai.replace(mstrategy=new_mstrategy)}
+        flee_val = ts + jnp.int32(10)
+        new_flee = jnp.where(alive_mask, flee_val, mai.flee_until_turn)
+        return {**state, "monster_ai": mai.replace(mstrategy=new_mstrategy, flee_until_turn=new_flee)}
     return state
 
 
@@ -726,25 +760,47 @@ def _effect_remove_curse(state: dict, rng: jax.Array) -> dict:
         buc = _uncurse_slot(buc, inv.worn_rings[ring_slot])
 
     new_items = inv.items.replace(buc_status=buc)
-    new_inv = inv.replace(items=new_items)
+    # Clear all cursed-stuck (welded) flags.
+    # Cite: vendor/nethack/src/wield.c::welded() — once obj->cursed is false
+    # the weapon is no longer welded; same applies to armor/amulet/rings.
+    from Nethax.nethax.subsystems.inventory import N_ARMOR_SLOTS
+    new_inv = inv.replace(
+        items=new_items,
+        welded=jnp.bool_(False),
+        worn_armor_welded=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.bool_),
+        worn_amulet_welded=jnp.bool_(False),
+        worn_rings_welded=jnp.zeros((2,), dtype=jnp.bool_),
+    )
     return {**state, "inventory": new_inv}
 
 
 def _effect_turn_undead(state: dict, rng: jax.Array) -> dict:
-    """TURN_UNDEAD: monsters flee; deal 1d8 vs undead.
+    """TURN_UNDEAD: undead take rnd(8) damage; all flee.
 
     Vendor: zap.c::bhitm line 243 (case SPE_TURN_UNDEAD) — undead/vampires
     take ``rnd(8)`` damage (with spell_damage_bonus) and ``monflee()``.
-    Wave 6 simplification: set monster slot 0 to FLEE strategy.
+    Non-undead are only feared (monflee), not damaged.
+    Cite: vendor/nethack/src/zap.c::bhitm SPE_TURN_UNDEAD branch.
     """
-    from Nethax.nethax.subsystems.monster_ai import MoveStrategy
+    from Nethax.nethax.subsystems.monster_ai import MoveStrategy, _has_flag2, _M2_UNDEAD
     mai = state["monster_ai"]
-    if hasattr(mai, "mstrategy") and mai.mstrategy.shape[0] > 0:
-        alive = mai.hp[0] > 0 if hasattr(mai, "hp") else jnp.bool_(True)
-        new_strat = jnp.where(alive, jnp.int32(MoveStrategy.FLEE), mai.mstrategy[0])
-        new_mstrategy = mai.mstrategy.at[0].set(new_strat)
-        return {**state, "monster_ai": mai.replace(mstrategy=new_mstrategy)}
-    return state
+    if not (hasattr(mai, "mstrategy") and mai.mstrategy.shape[0] > 0):
+        return state
+    alive = mai.hp[0] > 0 if hasattr(mai, "hp") else jnp.bool_(True)
+    # Flee for all alive monsters at slot 0
+    new_strat = jnp.where(alive, jnp.int8(MoveStrategy.FLEE), mai.mstrategy[0])
+    new_mstrategy = mai.mstrategy.at[0].set(new_strat)
+    # rnd(8) damage only to undead (M2_UNDEAD flag)
+    rng, sub = jax.random.split(rng)
+    dmg = jax.random.randint(sub, (), 1, 9).astype(jnp.int32)  # 1..8
+    is_undead = _has_flag2(mai.entry_idx[0], _M2_UNDEAD)
+    new_hp = jnp.where(
+        alive & is_undead,
+        jnp.maximum(mai.hp[0] - dmg, jnp.int32(0)),
+        mai.hp[0],
+    )
+    new_mhp = mai.hp.at[0].set(new_hp)
+    return {**state, "monster_ai": mai.replace(mstrategy=new_mstrategy, hp=new_mhp)}
 
 
 def _effect_restore_ability(state: dict, rng: jax.Array) -> dict:
@@ -1053,35 +1109,48 @@ def _effect_create_familiar(state: dict, rng: jax.Array) -> dict:
     return {**state, "monster_ai": new_mai}
 
 
-def _effect_create_monster(state: dict, rng: jax.Array) -> dict:
-    """CREATE_MONSTER: spawn a hostile monster in the first empty slot.
+def _spawn_level_appropriate_monster(
+    state: dict, rng: jax.Array, spawn_pos, tame: bool = False
+) -> dict:
+    """Helper: rejection-sample a level-appropriate monster and place it.
 
-    Vendor: vendor/nethack/src/makemon.c::makemon — generic hostile monster
-    summon used by SPELL_CREATE_MONSTER and SCR_CREATE_MONSTER.
-    Wave 6 minimum: pick a free slot, set alive=True, tame=False,
-    peaceful=False, hp=hp_max=8, entry_idx=2 (placeholder hostile species),
-    place adjacent (west) of the player.
-    Cite: vendor/nethack/src/makemon.c::makemon, vendor/nethack/src/read.c SCR_CREATE_MONSTER.
+    Mirrors items_wands._effect_create_monster logic.
+    Cite: vendor/nethack/src/zap.c wand_create_monster level-appropriate logic.
     """
     mai = state["monster_ai"]
     free_mask = ~mai.alive
     any_free = jnp.any(free_mask)
     slot = jnp.argmax(free_mask.astype(jnp.int32)).astype(jnp.int32)
 
-    pos = state["player_pos"]
-    spawn_pos = jnp.stack(
-        [pos[0].astype(jnp.int16),
-         (pos[1].astype(jnp.int32) - jnp.int32(1)).astype(jnp.int16)]
+    dungeon_level = state["dungeon"].current_level.astype(jnp.int32)
+    max_level = dungeon_level + jnp.int32(3)
+
+    def _type_cond(wstate):
+        r_, candidate = wstate
+        return _MONSTER_GEN_LEVEL[candidate].astype(jnp.int32) > max_level
+
+    def _type_body(wstate):
+        r_, _ = wstate
+        r_, sub = jax.random.split(r_)
+        c = jax.random.randint(sub, shape=(), minval=1, maxval=_N_MONSTERS,
+                               dtype=jnp.int32)
+        return (r_, c)
+
+    rng, sub_init = jax.random.split(rng)
+    init_candidate = jax.random.randint(
+        sub_init, shape=(), minval=1, maxval=_N_MONSTERS, dtype=jnp.int32
     )
+    rng, new_type = lax.while_loop(_type_cond, _type_body, (rng, init_candidate))
 
-    new_alive    = mai.alive.at[slot].set(jnp.where(any_free, jnp.bool_(True),   mai.alive[slot]))
-    new_tame     = mai.tame.at[slot].set(jnp.where(any_free, jnp.bool_(False),   mai.tame[slot]))
-    new_peaceful = mai.peaceful.at[slot].set(jnp.where(any_free, jnp.bool_(False), mai.peaceful[slot]))
-    new_hp_max   = mai.hp_max.at[slot].set(jnp.where(any_free, jnp.int32(8),     mai.hp_max[slot]))
-    new_hp       = mai.hp.at[slot].set(jnp.where(any_free, jnp.int32(8),         mai.hp[slot]))
-    new_pos      = mai.pos.at[slot].set(jnp.where(any_free, spawn_pos,           mai.pos[slot]))
-    new_entry    = mai.entry_idx.at[slot].set(jnp.where(any_free, jnp.int16(2),  mai.entry_idx[slot]))
-
+    new_alive    = mai.alive.at[slot].set(jnp.where(any_free, jnp.bool_(True),         mai.alive[slot]))
+    new_tame     = mai.tame.at[slot].set(jnp.where(any_free, jnp.bool_(tame),          mai.tame[slot]))
+    new_peaceful = mai.peaceful.at[slot].set(jnp.where(any_free, jnp.bool_(tame),      mai.peaceful[slot]))
+    new_hp_max   = mai.hp_max.at[slot].set(jnp.where(any_free, jnp.int32(8),           mai.hp_max[slot]))
+    new_hp       = mai.hp.at[slot].set(jnp.where(any_free, jnp.int32(8),               mai.hp[slot]))
+    new_pos      = mai.pos.at[slot].set(jnp.where(any_free, spawn_pos,                 mai.pos[slot]))
+    new_entry    = mai.entry_idx.at[slot].set(
+        jnp.where(any_free, new_type.astype(jnp.int16), mai.entry_idx[slot])
+    )
     new_mai = mai.replace(
         alive=new_alive, tame=new_tame, peaceful=new_peaceful,
         hp=new_hp, hp_max=new_hp_max, pos=new_pos, entry_idx=new_entry,
@@ -1089,9 +1158,97 @@ def _effect_create_monster(state: dict, rng: jax.Array) -> dict:
     return {**state, "monster_ai": new_mai}
 
 
+def _effect_create_monster(state: dict, rng: jax.Array) -> dict:
+    """CREATE_MONSTER: spawn a level-appropriate hostile monster.
+
+    Vendor: vendor/nethack/src/makemon.c::makemon — generic hostile monster
+    summon used by SPELL_CREATE_MONSTER and SCR_CREATE_MONSTER.  Uses
+    rejection sampling with _MONSTER_GEN_LEVEL to pick level <= dungeon+3.
+    Cite: vendor/nethack/src/spell.c::cast_summon_monster,
+          vendor/nethack/src/read.c SCR_CREATE_MONSTER.
+    """
+    pos = state["player_pos"]
+    spawn_pos = jnp.stack(
+        [pos[0].astype(jnp.int16),
+         (pos[1].astype(jnp.int32) - jnp.int32(1)).astype(jnp.int16)]
+    )
+    return _spawn_level_appropriate_monster(state, rng, spawn_pos, tame=False)
+
+
 def _effect_summon_nasties(state: dict, rng: jax.Array) -> dict:
-    """SUMMON_NASTIES: hostile monster spawn (Wave 3: no-op)."""
-    return state
+    """SUMMON_NASTIES: spawn 2-7 hostile high-level monsters near player.
+
+    Vendor: vendor/nethack/src/wizard.c::nasty() — spawns rnd(tmp) monsters
+    from the nasties[] table (level >= 7, M2_HOSTILE).
+    sounds.c::summon_nasties line 870 delegates here.
+    Precomputed _IS_NASTY[N_MONSTERS] = (level >= 7 AND M2_HOSTILE).
+    For each of N=2..7 spawns: find first dead slot, set alive/hostile.
+    JIT-pure via lax.fori_loop.
+    Cite: vendor/nethack/src/wizard.c::nasty() line 590.
+    """
+    rng, sub_n = jax.random.split(rng)
+    # rnd(6) + 1 gives 2..7 (matching the spec: 2-7 spawns)
+    n_spawn = jax.random.randint(sub_n, shape=(), minval=2, maxval=8, dtype=jnp.int32)
+
+    # Precompute a pool of candidate nasty indices via rejection sampling.
+    # We sample up to 7 slots; lax.fori_loop fills them sequentially.
+    nasty_candidates = jnp.zeros((7,), dtype=jnp.int32)
+    nasty_rngs = jax.random.split(rng, 8)
+    rng = nasty_rngs[0]
+
+    # Build 7 nasty type indices by rejection-sampling _IS_NASTY.
+    def _sample_nasty(rng_key):
+        def _cond(ws):
+            r_, c = ws
+            return ~_IS_NASTY[c]
+        def _body(ws):
+            r_, _ = ws
+            r_, sub = jax.random.split(r_)
+            c = jax.random.randint(sub, shape=(), minval=1, maxval=_N_MONSTERS, dtype=jnp.int32)
+            return (r_, c)
+        r_, sub0 = jax.random.split(rng_key)
+        init_c = jax.random.randint(sub0, shape=(), minval=1, maxval=_N_MONSTERS, dtype=jnp.int32)
+        _, c = lax.while_loop(_cond, _body, (r_, init_c))
+        return c
+
+    candidates = jnp.stack([_sample_nasty(nasty_rngs[i + 1]) for i in range(7)])
+
+    pos = state["player_pos"]
+
+    def _spawn_one(i, carry):
+        mai, rng_c = carry
+        # Only spawn if i < n_spawn.
+        do_spawn = i < n_spawn
+        free_mask = ~mai.alive
+        slot = jnp.argmax(free_mask.astype(jnp.int32)).astype(jnp.int32)
+        any_free = jnp.any(free_mask)
+
+        rng_c, sub_r, sub_c = jax.random.split(rng_c, 3)
+        dr = jax.random.randint(sub_r, shape=(), minval=-1, maxval=2, dtype=jnp.int16)
+        dc = jax.random.randint(sub_c, shape=(), minval=-1, maxval=2, dtype=jnp.int16)
+        spawn_pos = jnp.stack([
+            (pos[0].astype(jnp.int32) + dr.astype(jnp.int32)).astype(jnp.int16),
+            (pos[1].astype(jnp.int32) + dc.astype(jnp.int32)).astype(jnp.int16),
+        ])
+
+        act = do_spawn & any_free
+        entry = candidates[i].astype(jnp.int16)
+
+        new_alive    = mai.alive.at[slot].set(jnp.where(act, jnp.bool_(True),  mai.alive[slot]))
+        new_tame     = mai.tame.at[slot].set(jnp.where(act, jnp.bool_(False), mai.tame[slot]))
+        new_peaceful = mai.peaceful.at[slot].set(jnp.where(act, jnp.bool_(False), mai.peaceful[slot]))
+        new_hp_max   = mai.hp_max.at[slot].set(jnp.where(act, jnp.int32(20),  mai.hp_max[slot]))
+        new_hp       = mai.hp.at[slot].set(jnp.where(act, jnp.int32(20),      mai.hp[slot]))
+        new_pos      = mai.pos.at[slot].set(jnp.where(act, spawn_pos,          mai.pos[slot]))
+        new_entry    = mai.entry_idx.at[slot].set(jnp.where(act, entry,        mai.entry_idx[slot]))
+        new_mai = mai.replace(
+            alive=new_alive, tame=new_tame, peaceful=new_peaceful,
+            hp=new_hp, hp_max=new_hp_max, pos=new_pos, entry_idx=new_entry,
+        )
+        return new_mai, rng_c
+
+    new_mai, _ = lax.fori_loop(0, 7, _spawn_one, (state["monster_ai"], rng))
+    return {**state, "monster_ai": new_mai}
 
 
 def _effect_stone_to_flesh(state: dict, rng: jax.Array) -> dict:
@@ -1151,21 +1308,15 @@ def _effect_light(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_clairvoyance(state: dict, rng: jax.Array) -> dict:
-    """CLAIRVOYANCE: mark the entire current level as explored.
+    """CLAIRVOYANCE: reveal 5x5 around player via detect.clairvoyance.
 
-    Vendor: vendor/nethack/src/detect.c::do_vicinity_map — reveals tiles
-    around the caster (extended through the spell).  Wave 6 minimum:
-    set explored[branch, level, :, :] = True for the entire level.
-    Cite: vendor/nethack/src/detect.c::do_vicinity_map (extended scope).
+    Cite: vendor/nethack/src/detect.c::do_clairvoyance (~line 1446).
+    do_clairvoyance() calls do_vicinity_map() with Chebyshev radius 2,
+    revealing the 5x5 area around the caster.
     """
-    br = state["dungeon"].current_branch.astype(jnp.int32)
-    lv = state["dungeon"].current_level.astype(jnp.int32) - jnp.int32(1)
-    explored = state["explored"]
-    H = explored.shape[2]
-    W = explored.shape[3]
-    true_layer = jnp.ones((H, W), dtype=jnp.bool_)
-    new_explored = explored.at[br, lv].set(true_layer)
-    return {**state, "explored": new_explored}
+    built = state.build() if hasattr(state, "build") else state
+    result = _detect.clairvoyance(built, rng)
+    return {**state, "explored": result.explored}
 
 
 def _effect_cancellation(state: dict, rng: jax.Array) -> dict:
@@ -1315,6 +1466,42 @@ _EFFECT_DISPATCH = {
     SpellId.FLAME_SPHERE:     _effect_flame_sphere,
     SpellId.FREEZE_SPHERE:    _effect_freeze_sphere,
 }
+
+
+def _make_effect_fn(fn):
+    """Wrap an effect handler (dict, rng) -> dict into (EnvState, rng) -> EnvState.
+
+    The wrapper is JIT-pure: all Python operations on _StateAdapter happen at
+    trace time; only JAX array ops are recorded into the jaxpr.
+
+    After building the result we re-cast every leaf back to the dtype of the
+    original state so that all branches of jax.lax.switch share an identical
+    output pytree (required by XLA).
+    Cite: vendor/nethack/src/spell.c::spelleffects dispatch table.
+    """
+    def _wrapped(state, rng):
+        adapter = _StateAdapter(state)
+        result = fn(adapter, rng)
+        if isinstance(result, dict):
+            for k, v in result.items():
+                adapter[k] = v
+        built = adapter.build()
+        # Re-cast leaves to original dtypes so all lax.switch branches match.
+        return jax.tree_util.tree_map(
+            lambda orig, new: new.astype(orig.dtype) if hasattr(orig, "dtype") and hasattr(new, "dtype") else new,
+            state,
+            built,
+        )
+    return _wrapped
+
+
+# Ordered list indexed by SpellId int value; used by _handle_cast for
+# jax.lax.switch dispatch.  All entries are JIT-pure (state, rng) -> state.
+# Cite: vendor/nethack/src/spell.c::spelleffects.
+_EFFECT_DISPATCH_LIST: tuple = tuple(
+    _make_effect_fn(_EFFECT_DISPATCH.get(SpellId(i), _effect_noop))
+    for i in range(N_SPELLS)
+)
 
 
 # ---------------------------------------------------------------------------

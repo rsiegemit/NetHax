@@ -155,7 +155,34 @@ def generate_special_level(
         terrain.  Variant selection (e.g. minetn-1 vs minetn-7) uses
         jax.random.randint on the rng key.
     """
-    # TODO Wave 5: dispatch to per-level factory functions
+    # Dispatch to per-level factory; return terrain grid only.
+    _FACTORIES = {
+        SpecialLevel.ORACLE:        lambda r: generate_oracle_level(r)[0],
+        SpecialLevel.MINETOWN:      lambda r: generate_mine_town(r)[0],
+        SpecialLevel.MINES_END:     lambda r: generate_mines_end(r)[0],
+        SpecialLevel.BIG_ROOM:      lambda r: generate_big_room(r)[0],
+        SpecialLevel.SOKO_FLOOR_1:  lambda r: generate_sokoban_floor_1(r)[0],
+        SpecialLevel.SOKO_FLOOR_2:  lambda r: generate_sokoban_floor_2(r)[0],
+        SpecialLevel.SOKO_FLOOR_3:  lambda r: generate_sokoban_floor_3(r)[0],
+        SpecialLevel.SOKO_FLOOR_4:  lambda r: generate_sokoban_floor_4(r)[0],
+        SpecialLevel.CASTLE:        lambda r: generate_castle_level(r)[0],
+        SpecialLevel.VALLEY:        lambda r: generate_valley_level(r)[0],
+        SpecialLevel.SANCTUM:       lambda r: generate_sanctum_level(r)[0],
+        SpecialLevel.ASMODEUS:      lambda r: generate_asmodeus_lair(r)[0],
+        SpecialLevel.BAALZEBUB:     lambda r: generate_baalzebub_lair(r)[0],
+        SpecialLevel.JUIBLEX:       lambda r: generate_juiblex_lair(r)[0],
+        SpecialLevel.ORCUS:         lambda r: generate_orcus_town(r)[0],
+        SpecialLevel.VLAD_TOWER_TOP: lambda r: generate_vlads_tower(r, floor=3)[0],
+        SpecialLevel.FAKE_WIZARD_1: lambda r: generate_wizards_tower(r, fake_idx=1)[0],
+        SpecialLevel.FAKE_WIZARD_2: lambda r: generate_wizards_tower(r, fake_idx=2)[0],
+        SpecialLevel.FAKE_WIZARD_3: lambda r: generate_wizards_tower(r, fake_idx=3)[0],
+        SpecialLevel.WIZARD_TOWER:  lambda r: generate_wizards_tower(r, fake_idx=0)[0],
+        SpecialLevel.ASTRAL_PLANE:  lambda r: generate_astral_plane(r)[0],
+    }
+    factory = _FACTORIES.get(level_id)
+    if factory is not None:
+        return factory(rng)
+    # Remaining levels (elemental planes, quest levels) — all-wall stub.
     return jnp.zeros((MAP_H, MAP_W), dtype=jnp.int8)
 
 
@@ -769,6 +796,10 @@ def generate_mine_town(rng):
     terrain = terrain.at[9, 25].set(jnp.int8(_T_FOUNTAIN))
     # Defiled altar at (20,13) per minetn-1.lua
     terrain = terrain.at[13, 20].set(jnp.int8(_T_ALTAR))
+    # Throne room: throne tile near the bottom-right of the town square.
+    # Citation: vendor/nethack/src/mklev.c::mineend_level — Mine Town contains
+    # a throne room (THRONE tile) with peaceful watchmen guards.
+    terrain = terrain.at[14, 34].set(jnp.int8(_T_THRONE))
 
     # Hand-pick monster placements: 6 shopkeepers (one per shop), 3
     # watchmen, 1 priest.  Coords land on SHOP_FLOOR / FLOOR tiles.
@@ -1755,4 +1786,380 @@ def generate_valley_level(rng):
         (15, 60, _ITEM_GOLD),
     ])
 
+    return terrain, monsters, items
+
+
+# ===========================================================================
+# Sokoban floors, Astral Plane, demon lord rooms
+# ===========================================================================
+
+_ITEM_BOULDER = 20  # boulder object sentinel
+
+_MON_ANGEL              = 60
+_MON_HIGH_PRIEST_ASTRAL = 61  # "aligned cleric" on Astral Plane
+_MON_DEATH              = 62  # Rider: Death
+_MON_FAMINE             = 63  # Rider: Famine
+_MON_PESTILENCE         = 64  # Rider: Pestilence
+_MON_BAALZEBUB          = 70  # demon lord: Baalzebub (baalz.lua)
+_MON_ASMODEUS           = 71  # demon lord: Asmodeus
+_MON_JUIBLEX            = 72  # demon lord: Juiblex
+_MON_ORCUS              = 73  # demon lord: Orcus
+
+
+# ---------------------------------------------------------------------------
+# Sokoban floor 4 (vendor soko4-1.lua — shallowest / entry floor)
+# ---------------------------------------------------------------------------
+
+_SOKO4_MAP = """\
+------  -----
+|....|  |...|
+|....----...|
+|...........|
+|..|-|.|-|..|
+---------|.---
+|......|.....|
+|..----|.....|
+--.|   |.....|
+ |.|---|.....|
+ |...........|
+ |..|---------
+ ----
+"""
+
+
+def generate_sokoban_floor_4(rng):
+    """Sokoban floor 4 — entry level (vendor soko4-1.lua).
+
+    Citation: vendor/nethack/dat/soko4-1.lua lines 40-104.
+    Returns (terrain, monsters, items).
+    """
+    terrain = _parse_map_string(_SOKO4_MAP)
+
+    # Pit traps — soko4-1.lua lines 79-91: vendor (x,y) → (col,row).
+    pit_coords = [
+        (4, 6), (6, 2), (7, 2), (8, 2), (9, 2),
+        (10, 2), (10, 3), (10, 4), (10, 5), (10, 6),
+    ]
+    for (col, row) in pit_coords:
+        if 0 <= row < MAP_H and 0 <= col < MAP_W:
+            terrain = terrain.at[row, col].set(jnp.int8(_T_TRAP))
+
+    # Stair up — soko4-1.lua line 56: des.stair("up", 06,06) → row=6, col=6.
+    terrain = terrain.at[6, 6].set(jnp.int8(_T_STAIR_UP))
+
+    # Boulders — soko4-1.lua lines 62-73: vendor (x,y) → (col,row).
+    boulder_coords = [
+        (2, 2), (3, 2),
+        (10, 2), (9, 3), (10, 4),
+        (8, 7), (9, 8), (9, 9), (8, 10), (10, 10),
+    ]
+    items = _pack_placements([(row, col, _ITEM_BOULDER) for (col, row) in boulder_coords])
+    monsters = _pack_placements([])
+    return terrain, monsters, items
+
+
+# ---------------------------------------------------------------------------
+# Sokoban floor 3 (vendor soko3-1.lua)
+# ---------------------------------------------------------------------------
+
+_SOKO3_MAP = """\
+-----------       -----------
+|....|....|--     |.........|
+|....|......|     |.........|
+|.........|--     |.........|
+|....|....|       |.........|
+|-.---------      |.........|
+|....|.....|      |.........|
+|....|.....|      |.........|
+|..........|      |.........|
+|....|.....|---------------+|
+|....|......................|
+-----------------------------
+"""
+
+
+def generate_sokoban_floor_3(rng):
+    """Sokoban floor 3 (vendor soko3-1.lua).
+
+    Citation: vendor/nethack/dat/soko3-1.lua lines 9-82.
+    Returns (terrain, monsters, items).
+    """
+    terrain = _parse_map_string(_SOKO3_MAP)
+
+    # Hole traps along row 10 — soko3-1.lua lines 58-74.
+    for col in range(12, 27):
+        if 0 <= col < MAP_W:
+            terrain = terrain.at[10, col].set(jnp.int8(_T_TRAP))
+
+    terrain = terrain.at[2, 11].set(jnp.int8(_T_STAIR_DOWN))
+    terrain = terrain.at[4, 23].set(jnp.int8(_T_STAIR_UP))
+
+    boulder_coords = [
+        (3, 2), (4, 2),
+        (6, 2), (6, 3), (7, 2),
+        (3, 6), (2, 7), (3, 7), (3, 8), (2, 9), (3, 9), (4, 9),
+        (6, 7), (6, 9), (8, 7), (8, 10), (9, 8), (9, 9), (10, 7), (10, 10),
+    ]
+    items = _pack_placements([(row, col, _ITEM_BOULDER) for (col, row) in boulder_coords])
+    monsters = _pack_placements([])
+    return terrain, monsters, items
+
+
+# ---------------------------------------------------------------------------
+# Sokoban floor 2 (vendor soko2-1.lua)
+# ---------------------------------------------------------------------------
+
+_SOKO2_MAP = """\
+--------------------
+|........|...|.....|
+|.....-..|.-.|.....|
+|..|.....|...|.....|
+|-.|..-..|.-.|.....|
+|...--.......|.....|
+|...|...-...-|.....|
+|...|..|...--|.....|
+|-..|..|----------+|
+|..................|
+|...|..|------------
+--------
+"""
+
+
+def generate_sokoban_floor_2(rng):
+    """Sokoban floor 2 (vendor soko2-1.lua).
+
+    Citation: vendor/nethack/dat/soko2-1.lua lines 9-70.
+    Returns (terrain, monsters, items).
+    """
+    terrain = _parse_map_string(_SOKO2_MAP)
+
+    for col in range(8, 18):
+        if 0 <= col < MAP_W:
+            terrain = terrain.at[9, col].set(jnp.int8(_T_TRAP))
+
+    terrain = terrain.at[10, 6].set(jnp.int8(_T_STAIR_DOWN))
+    terrain = terrain.at[4, 16].set(jnp.int8(_T_STAIR_UP))
+
+    boulder_coords = [
+        (2, 2), (3, 2),
+        (5, 3), (7, 3), (7, 2), (8, 2),
+        (10, 3), (11, 3),
+        (2, 7), (2, 8), (3, 9),
+        (5, 7), (6, 6),
+    ]
+    items = _pack_placements([(row, col, _ITEM_BOULDER) for (col, row) in boulder_coords])
+    monsters = _pack_placements([])
+    return terrain, monsters, items
+
+
+# ---------------------------------------------------------------------------
+# Sokoban floor 1 (vendor soko1-1.lua — deepest / hardest floor)
+# ---------------------------------------------------------------------------
+
+_SOKO1_MAP = """\
+--------------------------
+|........................|
+|.......|---------------.|
+-------.------         |.|
+ |...........|         |.|
+ |...........|         |.|
+--------.-----         |.|
+|............|         |.|
+|............|         |.|
+-----.--------   ------|.|
+ |..........|  --|.....|.|
+ |..........|  |.+.....|.|
+ |.........|-  |-|.....|.|
+-------.----   |.+.....+.|
+|........|     |-|.....|--
+|........|     |.+.....|
+|...|-----     --|.....|
+-----            -------
+"""
+
+
+def generate_sokoban_floor_1(rng):
+    """Sokoban floor 1 — deepest floor with prize room (vendor soko1-1.lua).
+
+    Citation: vendor/nethack/dat/soko1-1.lua lines 8-112.
+    Returns (terrain, monsters, items).
+    """
+    terrain = _parse_map_string(_SOKO1_MAP)
+
+    # Hole traps along col 1, rows 7-17 — soko1-1.lua lines 65-82.
+    for row in range(7, 18):
+        if 0 <= row < MAP_H:
+            terrain = terrain.at[row, 1].set(jnp.int8(_T_TRAP))
+
+    # Stair down — soko1-1.lua line 34: des.stair("down", 01,01).
+    terrain = terrain.at[1, 1].set(jnp.int8(_T_STAIR_DOWN))
+
+    boulder_coords = [
+        (3, 5), (5, 5), (7, 5), (9, 5), (11, 5),
+        (4, 7), (4, 8), (6, 7), (9, 7), (11, 7),
+        (3, 12), (4, 10), (5, 12), (6, 10), (7, 11),
+        (8, 10), (9, 12),
+        (3, 14),
+    ]
+    items = _pack_placements([(row, col, _ITEM_BOULDER) for (col, row) in boulder_coords])
+    monsters = _pack_placements([])
+    return terrain, monsters, items
+
+
+# ---------------------------------------------------------------------------
+# Astral Plane — vendor/nethack/dat/astral.lua
+# ---------------------------------------------------------------------------
+
+_ASTRAL_MAP = """\
+                              ---------------
+                              |.............|
+                              |..---------..|
+                              |..|.......|..|
+---------------               |..|.......|..|               ---------------
+|.............|               |..|.......|..|               |.............|
+|..---------..-|   |-------|  |..|.......|..|  |-------|   |-..---------..|
+|..|.......|...-| |-.......-| |..|.......|..| |-.......-| |-...|.......|..|
+|..|.......|....-|-.........-||..----+----..||-.........-|-....|.......|..|
+|..|.......+.....+...........||.............||...........+.....+.......|..|
+|..|.......|....-|-.........-|--|.........|--|-.........-|-....|.......|..|
+|..|.......|...-| |-.......-|   -|---+---|-   |-.......-| |-...|.......|..|
+|..---------..-|   |---+---|    |-.......-|    |---+---|   |-..---------..|
+|.............|      |...|-----|-.........-|-----|...|      |.............|
+---------------      |.........|...........|.........|      ---------------
+                     -------...|-.........-|...-------
+                           |....|-.......-|....|
+                           ---...|---+---|...---
+                             |...............|
+                             -----------------
+"""
+
+
+def generate_astral_plane(rng):
+    """Generate the Astral Plane.
+
+    Three altars (one per alignment: Law, Neutral, Chaos) are the
+    primary structural landmarks for tests.  Riders + aligned clerics +
+    Angels placed per vendor astral.lua.
+
+    Citation: vendor/nethack/dat/astral.lua
+        lines 89-91 — 3 altars at vendor (07,09), (37,05), (67,09).
+        lines 107-129 — Riders and Moloch's horde.
+    Returns (terrain, monsters, items).
+    """
+    terrain = _parse_map_string(_ASTRAL_MAP)
+
+    # Three altars — astral.lua lines 89-91.
+    # vendor (x,y) → (col,row) → our (row,col).
+    for (row, col) in [(9, 7), (5, 37), (9, 67)]:
+        if 0 <= row < MAP_H and 0 <= col < MAP_W:
+            terrain = terrain.at[row, col].set(jnp.int8(_T_ALTAR))
+
+    monsters = _pack_placements([
+        # Three Riders — lines 113, 121, 129.
+        (9,  23, _MON_PESTILENCE),
+        (14, 37, _MON_DEATH),
+        (9,  51, _MON_FAMINE),
+        # West round room clerics — lines 107-110.
+        (9,  18, _MON_HIGH_PRIEST_ASTRAL),
+        (8,  19, _MON_HIGH_PRIEST_ASTRAL),
+        (9,  19, _MON_HIGH_PRIEST_ASTRAL),
+        (10, 19, _MON_HIGH_PRIEST_ASTRAL),
+        # South-central clerics — lines 115-118.
+        (12, 36, _MON_HIGH_PRIEST_ASTRAL),
+        (12, 37, _MON_HIGH_PRIEST_ASTRAL),
+        (12, 38, _MON_HIGH_PRIEST_ASTRAL),
+        (13, 36, _MON_HIGH_PRIEST_ASTRAL),
+        # East round room clerics — lines 123-126.
+        (9,  56, _MON_HIGH_PRIEST_ASTRAL),
+        (8,  55, _MON_HIGH_PRIEST_ASTRAL),
+        (9,  55, _MON_HIGH_PRIEST_ASTRAL),
+        (10, 55, _MON_HIGH_PRIEST_ASTRAL),
+        # Angels — lines 111-112, 119-120, 127-128.
+        (9,  20, _MON_ANGEL),
+        (10, 20, _MON_ANGEL),
+        (13, 38, _MON_ANGEL),
+        (13, 37, _MON_ANGEL),
+        (9,  54, _MON_ANGEL),
+        (10, 54, _MON_ANGEL),
+    ])
+
+    items = _pack_placements([])
+    return terrain, monsters, items
+
+
+# ---------------------------------------------------------------------------
+# Demon lord rooms — Baalzebub, Asmodeus, Juiblex, Orcus
+# ---------------------------------------------------------------------------
+
+_BAALZ_MAP = """\
+-------------------------------------------------
+|                   ----               ----
+|          ----     |     -----------  |
+| ------      |  ---------|.........|--
+| |....|  -------|...........----
+---|....|--|..................|............|----
++...--.....|..----------------|............|...
+---|....|--|..................|............|----
+| |....|  -------|...........-----
+| ------      |  ---------|.........|--
+|          ----     |     -----------  |
+|                   ----               ----
+-------------------------------------------------
+"""
+
+
+def generate_baalzebub_lair(rng):
+    """Baalzebub's Lair — vendor/nethack/dat/baalz.lua.
+
+    Citation: baalz.lua line 37: des.monster("Baalzebub",35,06).
+    Returns (terrain, monsters, items).
+    """
+    terrain = _parse_map_string(_BAALZ_MAP)
+    terrain = terrain.at[6, 0].set(jnp.int8(_T_OPEN_DOOR))
+    terrain = terrain.at[6, 44].set(jnp.int8(_T_STAIR_DOWN))
+    monsters = _pack_placements([
+        (6, 35, _MON_BAALZEBUB),
+        (7, 37, _MON_GHOUL),
+        (5, 32, _MON_GHOUL),
+        (7, 38, _MON_GHOUL),
+    ])
+    items = _pack_placements([
+        (6, 36, _ITEM_GEM),
+        (6, 37, _ITEM_GOLD),
+    ])
+    return terrain, monsters, items
+
+
+def _make_simple_demon_room(demon_type_id):
+    """Minimal carved room for a demon lord without a full MAP string."""
+    terrain = jnp.zeros((MAP_H, MAP_W), dtype=jnp.int8)
+    terrain = _carve_room(terrain, top=6, left=20, h=9, w=20)
+    terrain = terrain.at[10, 20].set(jnp.int8(_T_OPEN_DOOR))
+    terrain = terrain.at[7, 39].set(jnp.int8(_T_STAIR_DOWN))
+    monsters = _pack_placements([
+        (10, 30, demon_type_id),
+        (8,  25, _MON_GHOUL),
+        (12, 35, _MON_GHOUL),
+    ])
+    items = _pack_placements([(10, 29, _ITEM_GOLD)])
+    return terrain, monsters, items
+
+
+def generate_asmodeus_lair(rng):
+    """Asmodeus' Lair — compact single-room demon lord lair."""
+    return _make_simple_demon_room(_MON_ASMODEUS)
+
+
+def generate_juiblex_lair(rng):
+    """Juiblex's Swamp — compact demon lord lair with water tiles."""
+    terrain, monsters, items = _make_simple_demon_room(_MON_JUIBLEX)
+    for (r, c) in [(9, 28), (9, 29), (11, 28)]:
+        terrain = terrain.at[r, c].set(jnp.int8(_T_WATER))
+    return terrain, monsters, items
+
+
+def generate_orcus_town(rng):
+    """Orcus Town — compact demon lord lair with altar."""
+    terrain, monsters, items = _make_simple_demon_room(_MON_ORCUS)
+    terrain = terrain.at[10, 31].set(jnp.int8(_T_ALTAR))
     return terrain, monsters, items

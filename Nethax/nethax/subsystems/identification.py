@@ -110,9 +110,11 @@ class IdentificationState:
     # corresponding detection effect expires (-1 = never active).
     # Cite: vendor/nethack/src/detect.c::monster_detect / food_detect /
     #       trap_detect (used here for "detect treasure").
-    detect_monsters_until_turn: jnp.ndarray  # scalar int32
-    detect_food_until_turn:     jnp.ndarray  # scalar int32
-    detect_treasure_until_turn: jnp.ndarray  # scalar int32
+    detect_monsters_until_turn:  jnp.ndarray  # scalar int32
+    detect_food_until_turn:      jnp.ndarray  # scalar int32
+    detect_treasure_until_turn:  jnp.ndarray  # scalar int32
+    detect_objects_until_turn:   jnp.ndarray  # scalar int32
+    detect_magic_until_turn:     jnp.ndarray  # scalar int32
 
     @classmethod
     def unshuffled(cls) -> "IdentificationState":
@@ -132,6 +134,8 @@ class IdentificationState:
             detect_monsters_until_turn=jnp.int32(-1),
             detect_food_until_turn=jnp.int32(-1),
             detect_treasure_until_turn=jnp.int32(-1),
+            detect_objects_until_turn=jnp.int32(-1),
+            detect_magic_until_turn=jnp.int32(-1),
         )
 
 
@@ -237,6 +241,8 @@ def init_shuffled_appearances(rng: jax.Array) -> IdentificationState:
         detect_monsters_until_turn=jnp.int32(-1),
         detect_food_until_turn=jnp.int32(-1),
         detect_treasure_until_turn=jnp.int32(-1),
+        detect_objects_until_turn=jnp.int32(-1),
+        detect_magic_until_turn=jnp.int32(-1),
     )
 
 
@@ -391,16 +397,36 @@ def type_for_appearance(
 
 def partial_identify(
     state: IdentificationState,
-    obj_type: int,
+    rng: jax.Array,
+    cnt: int,
 ) -> IdentificationState:
-    """Reveal one property of obj_type without full identification.
+    """Identify *cnt* randomly-chosen currently-unidentified object types.
 
-    No-op stub (insight.c: partial_id).
-    Future: mark a sub-flag (buc_known, enchant_known, charges_known) rather
-    than the full identified bit.  Requires extending IdentificationState
-    with per-type partial-knowledge arrays.
+    Cite: vendor/nethack/src/o_init.c::peffect_object_detection — the
+    scroll/potion of object-detection path that identifies a random subset
+    of unknown item types rather than the full inventory.
+
+    Algorithm:
+      1. Build a priority vector: uniform random noise for unidentified slots,
+         -inf for already-identified slots (so they are never chosen).
+      2. Take the top-cnt indices via jnp.argsort (descending priority).
+      3. Set those slots to True in state.identified.
+
+    JIT-safe; no Python branching on traced values.
     """
-    return state
+    n = state.identified.shape[0]
+    noise = jax.random.uniform(rng, shape=(n,))
+    # Mask out already-identified slots so they are never picked.
+    priority = jnp.where(state.identified, jnp.float32(-1.0), noise)
+    # argsort ascending; we want the highest-priority (largest noise) indices.
+    order = jnp.argsort(-priority)          # descending
+    cnt_clipped = jnp.minimum(jnp.int32(cnt), n)
+    # Build a mask: True for the first cnt_clipped positions in the sorted order.
+    rank = jnp.arange(n, dtype=jnp.int32)
+    chosen_mask = jnp.zeros((n,), dtype=jnp.bool_)
+    chosen_mask = chosen_mask.at[order].set(rank < cnt_clipped)
+    new_identified = state.identified | chosen_mask
+    return state.replace(identified=new_identified)
 
 
 def full_identify(
