@@ -1565,20 +1565,20 @@ def build_glyphs(env_state) -> jnp.ndarray:
     # across frames.  Terrain glyphs (GLYPH_CMAP_OFF+) are left untouched.
     # TODO: status message scramble (status surface not yet in obs).
     # TODO: "Everything looks boring now" message on HALLUCINATION→0 transition.
-    if is_hallu:
-        rows_all = jnp.arange(21, dtype=jnp.uint32)
-        cols_all = jnp.arange(79, dtype=jnp.uint32)
-        rc_rows, rc_cols = jnp.meshgrid(rows_all, cols_all, indexing='ij')  # [21,79]
-        ts_grid = env_state.timestep.astype(jnp.uint32)
-        hash_grid = (ts_grid * jnp.uint32(2654435761)
-                     + rc_rows * jnp.uint32(1597334677)
-                     + rc_cols * jnp.uint32(1431655781))
-        pool_idx = jnp.mod(hash_grid, jnp.uint32(_HCOLOR_POOL_SIZE)).astype(jnp.int32)
-        scrambled_obj_idx = _HCOLOR_POOL[pool_idx]                      # int32[21,79]
-        scrambled_obj_glyphs = (jnp.int32(GLYPH_OBJ_OFF) + scrambled_obj_idx).astype(jnp.int16)
-        is_obj_glyph = (glyphs.astype(jnp.int32) >= jnp.int32(GLYPH_OBJ_OFF)) & \
-                       (glyphs.astype(jnp.int32) < jnp.int32(GLYPH_CMAP_OFF))
-        glyphs = jnp.where(is_obj_glyph, scrambled_obj_glyphs, glyphs)
+    rows_all = jnp.arange(21, dtype=jnp.uint32)
+    cols_all = jnp.arange(79, dtype=jnp.uint32)
+    rc_rows, rc_cols = jnp.meshgrid(rows_all, cols_all, indexing='ij')  # [21,79]
+    ts_grid = env_state.timestep.astype(jnp.uint32)
+    hash_grid = (ts_grid * jnp.uint32(2654435761)
+                 + rc_rows * jnp.uint32(1597334677)
+                 + rc_cols * jnp.uint32(1431655781))
+    pool_idx = jnp.mod(hash_grid, jnp.uint32(_HCOLOR_POOL_SIZE)).astype(jnp.int32)
+    scrambled_obj_idx = _HCOLOR_POOL[pool_idx]                      # int32[21,79]
+    scrambled_obj_glyphs = (jnp.int32(GLYPH_OBJ_OFF) + scrambled_obj_idx).astype(jnp.int16)
+    is_obj_glyph = (glyphs.astype(jnp.int32) >= jnp.int32(GLYPH_OBJ_OFF)) & \
+                   (glyphs.astype(jnp.int32) < jnp.int32(GLYPH_CMAP_OFF))
+    scramble_mask = is_obj_glyph & is_hallu
+    glyphs = jnp.where(scramble_mask, scrambled_obj_glyphs, glyphs)
 
     return glyphs
 
