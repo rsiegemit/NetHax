@@ -157,6 +157,18 @@ class ObjType:
     ORCISH_CLOAK      = 102
     HAWAIIAN_SHIRT    = 103
     T_SHIRT           = 104
+    HELM_OF_BRILLIANCE        = 105
+    HELM_OF_OPPOSITE_ALIGNMENT = 106
+    HELM_OF_TELEPATHY         = 107
+    DUNCE_CAP                 = 108
+    CORNUTHAUM                = 109
+    TINFOIL_HAT               = 110
+    MUMMY_WRAPPING            = 111
+    GAUNTLETS_OF_FUMBLING     = 112
+    GAUNTLETS_OF_POWER        = 113
+    GAUNTLETS_OF_DEXTERITY    = 114
+    LOW_BOOTS                 = 115
+    WATER_WALKING_BOOTS       = 116
 
     # Potions (POTION_CLASS = 8)
     POT_WATER         = 200

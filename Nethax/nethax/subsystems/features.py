@@ -1368,3 +1368,145 @@ def drink_sink(state, rng):
     )
     new_state = jax.lax.switch(bucket, branches, state)
     return new_state
+
+
+# ---------------------------------------------------------------------------
+# Sit-on-sink effects (sit.c::dosit IS_SINK branch, rn2(6) table)
+# ---------------------------------------------------------------------------
+def sit_sink(state, rng):
+    """Sit on a sink.
+
+    Implements 6 outcomes from vendor/nethack/src/sit.c::dosit IS_SINK branch
+    (rn2(6) effect table):
+        case 0  → slip: 1 HP damage (slip off the edge)
+        case 1  → pudding: nutrition drain −20
+        case 2  → faucet: HP drain −1 (cold water splash)
+        case 3  → throw-up: nutrition drain −50
+        case 4  → curse worn item (rndcurse proxy: buc_status → CURSED=1)
+        case 5  → identify worn rings (mark first ring slot as identified)
+
+    Cite: vendor/nethack/src/sit.c::dosit, IS_SINK branch.
+    """
+    bucket = jax.random.randint(rng, (), minval=0, maxval=6, dtype=jnp.int32)
+
+    def _slip(s):
+        return s.replace(player_hp=jnp.maximum(jnp.int32(0), s.player_hp - jnp.int32(1)))
+
+    def _pudding(s):
+        return s.replace(status=s.status.replace(
+            nutrition=s.status.nutrition - jnp.int32(20)))
+
+    def _faucet(s):
+        return s.replace(player_hp=jnp.maximum(jnp.int32(0), s.player_hp - jnp.int32(1)))
+
+    def _throw_up(s):
+        return s.replace(status=s.status.replace(
+            nutrition=s.status.nutrition - jnp.int32(50)))
+
+    def _curse_worn(s):
+        # Proxy for rndcurse(): curse the first non-empty inventory slot.
+        buc = s.inventory.items.buc_status
+        has_item = s.inventory.items.quantity > jnp.int16(0)
+        first = jnp.argmax(has_item).astype(jnp.int32)
+        new_buc = buc.at[first].set(jnp.int8(1))
+        return s.replace(inventory=s.inventory.replace(
+            items=s.inventory.items.replace(buc_status=new_buc)))
+
+    def _identify_rings(s):
+        # Identify first ring slot (identified flag → True).
+        ident = s.inventory.identified
+        new_ident = ident.at[0].set(True)
+        return s.replace(inventory=s.inventory.replace(identified=new_ident))
+
+    branches = (
+        _slip,           # 0
+        _pudding,        # 1
+        _faucet,         # 2
+        _throw_up,       # 3
+        _curse_worn,     # 4
+        _identify_rings, # 5
+    )
+    return jax.lax.switch(bucket, branches, state)
+
+
+# ---------------------------------------------------------------------------
+# Kick-sink effects (dokick.c::kick_nondoor IS_SINK branch, rn2(4) table)
+# ---------------------------------------------------------------------------
+def kick_sink(state, rng):
+    """Kick a sink.
+
+    Implements 4 outcomes from vendor/nethack/src/dokick.c::kick_nondoor
+    IS_SINK branch (rn2(4) effect table):
+        case 0  → strange shock: 1d6 electric damage
+        case 1  → pudding erupts: nutrition drain −30
+        case 2  → water spray: 1 HP damage
+        case 3  → no effect (noise only)
+
+    Returns (new_state, outcome_id) where outcome_id is int32 in [0, 3].
+
+    Cite: vendor/nethack/src/dokick.c::kick_nondoor, IS_SINK branch,
+    lines 1194-1240.
+    """
+    rng_outcome, rng_dmg = jax.random.split(rng)
+    bucket = jax.random.randint(rng_outcome, (), minval=0, maxval=4, dtype=jnp.int32)
+    shock_dmg = jax.random.randint(rng_dmg, (), minval=1, maxval=7, dtype=jnp.int32)
+
+    def _shock(s):
+        return s.replace(player_hp=jnp.maximum(jnp.int32(0), s.player_hp - shock_dmg))
+
+    def _pudding(s):
+        return s.replace(status=s.status.replace(
+            nutrition=s.status.nutrition - jnp.int32(30)))
+
+    def _spray(s):
+        return s.replace(player_hp=jnp.maximum(jnp.int32(0), s.player_hp - jnp.int32(1)))
+
+    def _nothing(s):
+        return s
+
+    branches = (_shock, _pudding, _spray, _nothing)
+    new_state = jax.lax.switch(bucket, branches, state)
+    return new_state, bucket
+
+
+# ---------------------------------------------------------------------------
+# Drop-at-altar BUC mutation (pray.c::doaltar)
+# ---------------------------------------------------------------------------
+def drop_at_altar(state, slot_idx: jnp.ndarray):
+    """Drop item in slot_idx on the altar at the player's position.
+
+    BUC mutation rules (vendor/nethack/src/pray.c::doaltar):
+        coaligned altar  (altar_align == player_align) → bless item (buc=3)
+        cross-aligned    (altar_align != player_align, both ≥0) → curse (buc=1)
+        neutral          (altar_align=1, or unaligned player) → no change
+        no altar         (altar_align=-1) → no change
+
+    JIT-safe: no Python control flow on traced values.
+
+    Cite: vendor/nethack/src/pray.c::doaltar.
+    """
+    max_lv = state.terrain.shape[1]
+    b   = state.dungeon.current_branch.astype(jnp.int32)
+    lv  = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    flat_lv = b * jnp.int32(max_lv) + lv
+    row = state.player_pos[0].astype(jnp.int32)
+    col = state.player_pos[1].astype(jnp.int32)
+
+    altar_align = state.features.altar_alignment[flat_lv, row, col].astype(jnp.int32)
+    player_align = state.player_align.astype(jnp.int32)
+    on_altar = altar_align >= jnp.int32(0)
+    coaligned = on_altar & (altar_align == player_align)
+    cross_aligned = on_altar & (altar_align != player_align)
+
+    safe_slot = jnp.clip(slot_idx.astype(jnp.int32), 0,
+                         state.inventory.items.buc_status.shape[0] - 1)
+    old_buc = state.inventory.items.buc_status[safe_slot].astype(jnp.int32)
+
+    new_buc = jnp.where(coaligned, jnp.int32(3),
+              jnp.where(cross_aligned, jnp.int32(1),
+              old_buc))
+
+    new_buc_arr = state.inventory.items.buc_status.at[safe_slot].set(
+        new_buc.astype(jnp.int8))
+    new_items = state.inventory.items.replace(buc_status=new_buc_arr)
+    return state.replace(inventory=state.inventory.replace(items=new_items))

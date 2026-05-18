@@ -688,6 +688,37 @@ def parse_wish_string(wish_bytes) -> tuple[int, int, int, int, int]:
     )
 
 
+def grant_wish_from_string(state, wish_input, rng=None):
+    """Grant a wish from a plain string (no rng required for parse path).
+
+    Thin wrapper over ``grant_wish`` that accepts str or bytes and uses a
+    deterministic RNG when none is provided.  Added as a public alias for the
+    wave-13 wish-parser agent.
+
+    Cite: vendor/nethack/src/wizard.c::makewish.
+    """
+    import jax
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
+    if isinstance(wish_input, str):
+        wish_input = wish_input.encode()
+    return grant_wish(state, rng, wish_input)
+
+
+def parse_wish_string_dict(wish_input) -> dict:
+    """Parse a wish string and return the full vendor wishymatch dict.
+
+    Thin wrapper over ``wishymatch`` that accepts either str or bytes and
+    always returns the raw parsed dict (same shape as wishymatch's return
+    value).  Introduced as a public alias for the wave-13 wish-parser agent.
+
+    Cite: vendor/nethack/src/objnam.c::wishymatch.
+    """
+    if isinstance(wish_input, str):
+        wish_input = wish_input.encode()
+    return wishymatch(wish_input)
+
+
 # ---------------------------------------------------------------------------
 # Grant
 # ---------------------------------------------------------------------------

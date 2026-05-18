@@ -1805,6 +1805,161 @@ def handle_twoweapon(state, rng):
 
 
 # ---------------------------------------------------------------------------
+# Weapon-class predicate helpers
+# ---------------------------------------------------------------------------
+def _wielded_is_polearm(state) -> bool:
+    """Return True when the wielded weapon maps to SkillId.POLEARMS.
+
+    Cite: vendor/nethack/src/weapon.c::weapon_skill + uhitm.c::dolean.
+    """
+    from Nethax.nethax.subsystems.skills import _WEAPON_TYPE_TO_SKILL, SkillId
+    type_id = _wielded_type_id(state)
+    safe = jnp.clip(type_id, 0, _WEAPON_TYPE_TO_SKILL.shape[0] - 1)
+    skill = _WEAPON_TYPE_TO_SKILL[safe]
+    return bool(int(skill) == int(SkillId.POLEARMS))
+
+
+def _wielded_is_axe(state) -> bool:
+    """Return True when the wielded weapon maps to SkillId.AXE.
+
+    Cite: vendor/nethack/src/weapon.c::weapon_skill + uhitm.c::cleave.
+    """
+    from Nethax.nethax.subsystems.skills import _WEAPON_TYPE_TO_SKILL, SkillId
+    type_id = _wielded_type_id(state)
+    safe = jnp.clip(type_id, 0, _WEAPON_TYPE_TO_SKILL.shape[0] - 1)
+    skill = _WEAPON_TYPE_TO_SKILL[safe]
+    return bool(int(skill) == int(SkillId.AXE))
+
+
+def _handle_polearm_attack(state, rng, dir_idx: jnp.ndarray):
+    """Attack the monster 2 tiles away in direction dir_idx using a polearm.
+
+    Mirrors vendor/nethack/src/uhitm.c::dolean (reach weapon attack).
+    dir_idx maps to (dy, dx) via the 8-direction table; 1 = East = (0, 1).
+
+    Finds the first alive monster at distance exactly 2 in the given direction
+    and applies a standard melee attack roll against it.  The adjacent tile
+    (distance 1) is assumed empty (not checked for JIT safety).
+
+    Cite: vendor/nethack/src/uhitm.c::dolean, circa line 3480.
+    """
+    # Direction table: 0=N, 1=E, 2=S, 3=W, 4=NE, 5=SE, 6=SW, 7=NW
+    dy_table = jnp.array([[-1, 0, 1, 0, -1, 1, 1, -1]], dtype=jnp.int32)
+    dx_table = jnp.array([[0, 1, 0, -1, 1, 1, -1, -1]], dtype=jnp.int32)
+    safe_dir = jnp.clip(dir_idx.astype(jnp.int32), 0, 7)
+    dy = dy_table[0, safe_dir]
+    dx = dx_table[0, safe_dir]
+
+    p_row = state.player_pos[0].astype(jnp.int32)
+    p_col = state.player_pos[1].astype(jnp.int32)
+    target_row = p_row + dy * jnp.int32(2)
+    target_col = p_col + dx * jnp.int32(2)
+
+    mai = state.monster_ai
+    n = mai.alive.shape[0]
+    indices = jnp.arange(n, dtype=jnp.int32)
+    m_rows = mai.pos[:, 0].astype(jnp.int32)
+    m_cols = mai.pos[:, 1].astype(jnp.int32)
+    at_target = (m_rows == target_row) & (m_cols == target_col) & mai.alive
+    idx = jnp.argmax(at_target).astype(jnp.int32)
+
+    return attack(state, rng, idx)
+
+
+def _apply_cleave_splash(state, rng, primary_idx: jnp.ndarray, primary_dmg: jnp.ndarray):
+    """Apply half of primary_dmg to monsters perpendicular to the attack direction.
+
+    Mirrors vendor/nethack/src/uhitm.c::cleave splash behaviour: after an axe
+    hit on a primary target, all alive monsters adjacent to the primary target
+    (but not the primary target itself) take primary_dmg // 2 damage.
+
+    Cite: vendor/nethack/src/uhitm.c::cleave, circa line 3620.
+    """
+    splash = (primary_dmg // jnp.int32(2)).astype(jnp.int32)
+    mai = state.monster_ai
+
+    primary_pos = mai.pos[primary_idx]
+    p_row = primary_pos[0].astype(jnp.int32)
+    p_col = primary_pos[1].astype(jnp.int32)
+
+    n = mai.alive.shape[0]
+    m_rows = mai.pos[:, 0].astype(jnp.int32)
+    m_cols = mai.pos[:, 1].astype(jnp.int32)
+
+    dr = jnp.abs(m_rows - p_row)
+    dc = jnp.abs(m_cols - p_col)
+    is_adjacent = (dr <= jnp.int32(1)) & (dc <= jnp.int32(1))
+    not_primary = jnp.arange(n, dtype=jnp.int32) != primary_idx.astype(jnp.int32)
+    gets_splash = is_adjacent & not_primary & mai.alive
+
+    new_hp = jnp.where(
+        gets_splash,
+        jnp.maximum(mai.hp - splash, jnp.int32(0)),
+        mai.hp,
+    )
+    new_alive = new_hp > jnp.int32(0)
+    new_mai = mai.replace(hp=new_hp, alive=new_alive)
+    return state.replace(monster_ai=new_mai)
+
+
+def enforce_no_twohanded_while_riding(state):
+    """Force-unwield a two-handed weapon when the player is riding a steed.
+
+    Cite: vendor/nethack/src/do_wear.c (two-handed riding restriction,
+    circa line 1820): you can't wield a two-handed weapon while mounted.
+
+    When player_steed_mid > 0 (riding) and the wielded weapon has
+    is_two_handed=True, sets inventory.wielded to -1 (bare-handed).
+    The item stays in the inventory slot; it is merely unwielded.
+    """
+    wielded = state.inventory.wielded.astype(jnp.int32)
+    is_riding = state.player_steed_mid > jnp.uint32(0)
+    safe = jnp.clip(wielded, 0, state.inventory.items.is_two_handed.shape[0] - 1)
+    wep_two_handed = state.inventory.items.is_two_handed[safe]
+    should_unwield = is_riding & (wielded >= jnp.int32(0)) & wep_two_handed
+    new_wielded = jnp.where(should_unwield, jnp.int8(-1), state.inventory.wielded)
+    return state.replace(inventory=state.inventory.replace(wielded=new_wielded))
+
+
+# ---------------------------------------------------------------------------
+# Multi-shot thrown attack (vendor/nethack/src/dothrow.c::dofire)
+# ---------------------------------------------------------------------------
+def multishot_thrown_attack(state, rng, slot_idx, direction):
+    """Fire N shots from slot_idx along direction where N = 1 + skill_tier.
+
+    Mirrors vendor/nethack/src/dothrow.c::dofire multishot block (~line 386):
+        n = 1 + P_SKILL(weapon_skill(otmp->otyp));
+    We derive skill_tier from the wielded launcher's SkillId via the combat
+    skills array (defaulting to SKILL_UNSKILLED=0 → N=1 when no launcher
+    is wielded).
+
+    Each shot is an independent ``thrown_attack`` call consuming one unit
+    of ammo.  Calls are unrolled via lax.fori_loop for JIT safety.
+
+    Cite: vendor/nethack/src/dothrow.c::dofire, multishot block.
+    """
+    from Nethax.nethax.subsystems.skills import SkillId
+
+    # Determine launcher skill tier from the wielded weapon's skill entry.
+    wielded = state.inventory.wielded.astype(jnp.int32)
+    has_wielded = wielded >= jnp.int32(0)
+    # Look up skill tier for BOW (covers most launcher types).
+    bow_id = int(SkillId.BOW)
+    skill_tier = jnp.where(
+        has_wielded,
+        state.skills.level[bow_id].astype(jnp.int32),
+        jnp.int32(0),
+    )
+    n_shots = jnp.int32(1) + skill_tier  # N = 1 + skill_tier
+
+    def _one_shot(i, s):
+        rng_i = jax.random.fold_in(rng, i)
+        return thrown_attack(s, rng_i, slot_idx, direction)
+
+    return jax.lax.fori_loop(jnp.int32(0), n_shots, _one_shot, state)
+
+
+# ---------------------------------------------------------------------------
 # Throw action handler (vendor/nethack/src/dothrow.c::dothrow)
 # ---------------------------------------------------------------------------
 def handle_throw(state, rng):

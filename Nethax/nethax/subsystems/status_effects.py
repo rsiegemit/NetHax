@@ -480,15 +480,25 @@ def apply_paralyze(state: StatusState, rng: jax.Array) -> StatusState:
     return _extend_timer(state, TimedStatus.FROZEN, _roll_rn1(rng, 6, 5))
 
 
-def apply_stoned(state: StatusState) -> StatusState:
-    """Begin petrification: STONED timer = 5 (deterministic).
+def apply_stoned(state: StatusState, turns: int = 5) -> StatusState:
+    """Begin petrification: STONED timer = turns (default 5, deterministic).
 
     Cite: vendor/nethack/src/timeout.c::nh_timeout STONED case — the
     cockatrice / chickatrice touch initialises the stoning countdown to a
     fixed 5 turns (see ``Stoned`` macro / ``Popeye(STONED)`` use at line
     158).  Death fires on expiry.
     """
-    return _extend_timer(state, TimedStatus.STONED, jnp.int32(5))
+    return _extend_timer(state, TimedStatus.STONED, jnp.int32(turns))
+
+
+def cure_stoned(state: StatusState) -> StatusState:
+    """Clear the STONED timer (stoning cured, e.g. by lizard corpse).
+
+    Cite: vendor/nethack/src/eat.c::eatcorpse — eating a lizard corpse
+    calls ``make_stoned(0, ...)`` which sets the STONED timer to 0.
+    """
+    new_statuses = state.timed_statuses.at[TimedStatus.STONED].set(jnp.int32(0))
+    return state.replace(timed_statuses=new_statuses)
 
 
 def apply_slimed(state: StatusState) -> StatusState:
@@ -1084,3 +1094,82 @@ def step(
     state, player_hp, done = apply_starvation(state, player_hp, done, rng)
 
     return state, player_hp, player_pw, done
+
+
+# ---------------------------------------------------------------------------
+# EnvState-level lethal-status tick helpers (wave-13 lethal-statuses agent)
+# ---------------------------------------------------------------------------
+
+def tick_stoned_lethal(env_state):
+    """Fire STONED death when timer == 1 on the given EnvState.
+
+    Checks state.status.timed_statuses[STONED] == 1 (pre-decrement convention).
+    Sets player_hp=0, done=True, scoring.death_cause=DeathCause.STONING.
+
+    Cite: vendor/nethack/src/timeout.c::stoned_dialogue line 200.
+    """
+    from Nethax.nethax.subsystems.scoring import DeathCause
+    timer = env_state.status.timed_statuses[TimedStatus.STONED]
+    expiring = timer == jnp.int32(1)
+    new_hp = jnp.where(expiring, jnp.int32(0), env_state.player_hp)
+    new_done = env_state.done | expiring
+    new_cause = jnp.where(
+        expiring,
+        jnp.int8(int(DeathCause.STONING)),
+        env_state.scoring.death_cause,
+    )
+    new_scoring = env_state.scoring.replace(death_cause=new_cause)
+    return env_state.replace(player_hp=new_hp, done=new_done, scoring=new_scoring)
+
+
+def tick_slimed_lethal(env_state):
+    """Fire SLIMED death when timer == 1 on the given EnvState.
+
+    Cite: vendor/nethack/src/timeout.c::slime_dialogue — done_timeout(TURNED_SLIME, SLIMED).
+    """
+    from Nethax.nethax.subsystems.scoring import DeathCause
+    timer = env_state.status.timed_statuses[TimedStatus.SLIMED]
+    expiring = timer == jnp.int32(1)
+    new_hp = jnp.where(expiring, jnp.int32(0), env_state.player_hp)
+    new_done = env_state.done | expiring
+    new_cause = jnp.where(
+        expiring,
+        jnp.int8(int(DeathCause.TURNED_SLIME)),
+        env_state.scoring.death_cause,
+    )
+    new_scoring = env_state.scoring.replace(death_cause=new_cause)
+    return env_state.replace(player_hp=new_hp, done=new_done, scoring=new_scoring)
+
+
+def tick_strangled_lethal(env_state):
+    """Fire STRANGLED death when timer == 1 on the given EnvState.
+
+    Cite: vendor/nethack/src/timeout.c lines 890-894 — done_timeout(DIED, STRANGLED).
+    """
+    from Nethax.nethax.subsystems.scoring import DeathCause
+    timer = env_state.status.timed_statuses[TimedStatus.STRANGLED]
+    expiring = timer == jnp.int32(1)
+    new_hp = jnp.where(expiring, jnp.int32(0), env_state.player_hp)
+    new_done = env_state.done | expiring
+    new_cause = jnp.where(
+        expiring,
+        jnp.int8(int(DeathCause.CHOKING)),
+        env_state.scoring.death_cause,
+    )
+    new_scoring = env_state.scoring.replace(death_cause=new_cause)
+    return env_state.replace(player_hp=new_hp, done=new_done, scoring=new_scoring)
+
+
+def tick_glib(env_state, rng):
+    """GLIB: 1-in-20 chance per turn to drop wielded weapon.
+
+    Cite: vendor/nethack/src/status.c::glibs — each turn rn2(20)==0 drops
+    the wielded weapon (slippery fingers).  Only fires when GLIB timer > 0.
+    """
+    timer = env_state.status.timed_statuses[TimedStatus.GLIB]
+    glib_active = timer > jnp.int32(0)
+    roll = jax.random.randint(rng, (), minval=0, maxval=20, dtype=jnp.int32)
+    drops = glib_active & (roll == jnp.int32(0))
+    new_wielded = jnp.where(drops, jnp.int8(-1), env_state.inventory.wielded)
+    new_inv = env_state.inventory.replace(wielded=new_wielded)
+    return env_state.replace(inventory=new_inv)
