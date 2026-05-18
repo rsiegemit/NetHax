@@ -1,7 +1,7 @@
 """Vendor-parity tests: cursed/blessed spellbook backfire.
 
-Cite: vendor/nethack/src/spell.c::study_book / cursed_book lines 590-650.
-Cursed: skip success roll, confusion timer set, hp decreases, spell NOT learned.
+Cite: vendor/nethack/src/spell.c::study_book / cursed_book lines 130-185.
+Cursed: skip success roll, five-branch backfire, spell NOT learned.
 Blessed: +2 read_ability bonus over uncursed.
 """
 import os
@@ -61,7 +61,7 @@ def _state_with_spellbook(
 def test_cursed_book_no_learn():
     """Cursed spellbook: spell is never learned regardless of INT/xl.
 
-    Cite: vendor/nethack/src/spell.c::cursed_book lines 590-650 —
+    Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185 —
     cursed path skips the success roll entirely; spell_known stays False.
     """
     spell_id = int(SpellId.HEALING)
@@ -83,44 +83,65 @@ def test_cursed_book_no_learn():
         )
 
 
-def test_cursed_book_confuses():
-    """Cursed spellbook sets CONFUSION timer to 4..11 turns.
+def test_cursed_book_some_branch_triggers():
+    """Cursed spellbook triggers one of the five backfire branches across seeds.
 
-    Cite: vendor/nethack/src/spell.c::cursed_book ~line 610 —
-    makeknown + confusion timer rn1(8,4).
+    Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185 —
+    five-branch backfire: explode / paralyze / poison / amnesia / blank.
+    At least one non-blank branch should fire in 20 seeds.
     """
     spell_id = int(SpellId.HEALING)
-    state, slot = _state_with_spellbook(spell_id, buc_status=_BUC_CURSED)
-
-    for seed in range(20):
-        rng = jax.random.PRNGKey(seed)
-        new_state = read_spellbook(state, rng, slot)
-        conf_timer = int(new_state.status.timed_statuses[int(TimedStatus.CONFUSION)])
-        assert 4 <= conf_timer <= 11, (
-            f"Confusion timer {conf_timer} not in [4,11] (seed={seed})"
-        )
-
-
-def test_cursed_book_damages():
-    """Cursed spellbook deals 1..10 hp damage.
-
-    Cite: vendor/nethack/src/spell.c::cursed_book ~line 620 —
-    losehp(rnd(10), ...).
-    """
-    spell_id = int(SpellId.HEALING)
-    initial_hp = 30
+    initial_hp = 50
     state, slot = _state_with_spellbook(
         spell_id, buc_status=_BUC_CURSED, player_hp=initial_hp
     )
 
+    any_effect = False
     for seed in range(20):
         rng = jax.random.PRNGKey(seed)
         new_state = read_spellbook(state, rng, slot)
-        hp_after = int(new_state.player_hp)
-        damage = initial_hp - hp_after
-        assert 1 <= damage <= 10, (
-            f"Cursed book damage {damage} not in [1,10] (seed={seed})"
-        )
+        hp_changed = int(new_state.player_hp) != initial_hp
+        paralyzed = int(new_state.status.timed_statuses[int(TimedStatus.FROZEN)]) > 0
+        poisoned = int(new_state.status.timed_statuses[int(TimedStatus.ATTRIBUTE_AWAY)]) > 0
+        destroyed = int(new_state.inventory.items.quantity[slot]) == 0
+        if hp_changed or paralyzed or poisoned or destroyed:
+            any_effect = True
+    assert any_effect, "No cursed-book branch had any observable effect across 20 seeds"
+
+
+def test_cursed_book_damages():
+    """Cursed explode branch (rnd20 in 1-4) deals hp damage and destroys book.
+
+    Cite: vendor/nethack/src/spell.c::cursed_book line 176 —
+    book explodes in face; dmg = 2*rnd(10)+5; we model as rnd(20).
+    """
+    spell_id = int(SpellId.HEALING)
+    initial_hp = 60
+    state, slot = _state_with_spellbook(
+        spell_id, buc_status=_BUC_CURSED, player_hp=initial_hp
+    )
+
+    # Find a seed that hits the explode branch (b in 1-4 → branch index 0)
+    from Nethax.nethax.rng import rnd as nethax_rnd
+    explode_seed = None
+    for seed in range(200):
+        rng = jax.random.PRNGKey(seed)
+        rng, sub_b, *_ = jax.random.split(rng, 5)
+        b = int(nethax_rnd(sub_b, 20))
+        if (b - 1) // 4 == 0:
+            explode_seed = seed
+            break
+
+    assert explode_seed is not None, "No explode seed found in 200 tries"
+    rng = jax.random.PRNGKey(explode_seed)
+    new_state = read_spellbook(state, rng, slot)
+    hp_after = int(new_state.player_hp)
+    assert hp_after < initial_hp, (
+        f"Explode branch: hp {hp_after} should be < {initial_hp}"
+    )
+    assert int(new_state.inventory.items.quantity[slot]) == 0, (
+        "Explode branch: book should be destroyed"
+    )
 
 
 def test_blessed_book_higher_success():

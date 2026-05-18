@@ -93,24 +93,43 @@ def water_step(state, rng):
 
     Each turn in water:
       - Deal rnd(6) HP damage (vendor trap.c:5059 drown()).
+        Skipped when player has MAGIC_BREATHING intrinsic (vendor you.h
+        MAGICAL_BREATHING = 52; amulet of magical breathing, air elemental form).
+        Cite: vendor/nethack/include/you.h MAGIC_BREATHING; vendor prop.h:52.
+        TODO: vendor drown() has a 1-in-N per-turn insta-drown check where N
+        decreases with turns underwater (trap.c:5059); for now rnd(6) per turn.
       - Call water_damage_chain to rust iron inventory items (trap.c:5086).
 
     Cite: vendor/nethack/src/trap.c::drown() lines 5059-5195.
 
     JIT-pure: all branching via jnp.where / jax.lax.cond.
     """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+
     in_water = state.player_in_water
 
     rng_dmg, rng_rust = jax.random.split(rng)
+
+    # MAGIC_BREATHING (MAGICAL_BREATHING = 52, vendor prop.h) suppresses
+    # drowning damage — amulet of magical breathing, air elemental polyform.
+    # Cite: vendor/nethack/include/you.h MAGIC_BREATHING.
+    has_magic_breath = (
+        state.status.intrinsics[int(Intrinsic.MAGIC_BREATHING)]
+        | (state.status.timed_intrinsics[int(Intrinsic.MAGIC_BREATHING)] > jnp.int32(0))
+    )
 
     # rnd(6) = uniform [1, 6] — vendor trap.c:5059 uses rnd(6).
     dmg = jax.random.randint(rng_dmg, (), minval=1, maxval=7, dtype=jnp.int32)
 
     def _apply_drown(s):
-        new_hp = jnp.maximum(
-            jnp.int32(0),
-            s.player_hp.astype(jnp.int32) - dmg,
-        ).astype(s.player_hp.dtype)
+        new_hp = jnp.where(
+            has_magic_breath,
+            s.player_hp,
+            jnp.maximum(
+                jnp.int32(0),
+                s.player_hp.astype(jnp.int32) - dmg,
+            ).astype(s.player_hp.dtype),
+        )
         s = s.replace(player_hp=new_hp)
         s = water_damage_chain(s, rng_rust)
         return s

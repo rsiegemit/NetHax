@@ -959,17 +959,30 @@ def _single_melee_strike(
     # vendor/nethack/src/uhitm.c:376 — u.uhitinc (ring of increase accuracy).
     uhitinc = state.player_uhitinc.astype(jnp.int32)
     # vendor/nethack/src/uhitm.c:387-394 — target-state bonuses.
-    # +2 sleeping (asleep field; no sleep_timer yet).
-    sleeping_bonus = jnp.where(mai.asleep[idx], jnp.int32(2), jnp.int32(0))
-    # +2 fleeing (mstrategy == MoveStrategy.FLEE == 4).
-    fleeing_bonus = jnp.where(
+    # +2 sleeping (sleep_timer > 0; asleep kept in sync for backward-compat).
+    sleeping_bonus = jnp.where(mai.sleep_timer[idx].astype(jnp.int32) > jnp.int32(0), jnp.int32(2), jnp.int32(0))
+    # +2 stunned target (stun_timer > 0).  vendor/nethack/src/uhitm.c:388.
+    target_stun_bonus = jnp.where(mai.stun_timer[idx].astype(jnp.int32) > jnp.int32(0), jnp.int32(2), jnp.int32(0))
+    # +2 fleeing (flee_until_turn > timestep OR mstrategy == FLEE).
+    # vendor/nethack/src/uhitm.c:389.
+    timestep = getattr(state, "timestep", jnp.int32(0))
+    fleeing_timer_bonus = jnp.where(
+        mai.flee_until_turn[idx].astype(jnp.int32) > timestep.astype(jnp.int32),
+        jnp.int32(2), jnp.int32(0),
+    )
+    fleeing_strat_bonus = jnp.where(
         mai.mstrategy[idx].astype(jnp.int32) == jnp.int32(4),
         jnp.int32(2), jnp.int32(0),
     )
-    # +4 structurally immobile (move_speed == 0).
-    # TODO: runtime paralysis (!mcanmove) not modelled — no mcanmove field yet.
+    fleeing_bonus = jnp.maximum(fleeing_timer_bonus, fleeing_strat_bonus)
+    # +4 paralyzed (paralyzed_timer > 0) or structurally immobile.
+    # vendor/nethack/src/uhitm.c:393-394.
+    paralyzed_bonus = jnp.where(mai.paralyzed_timer[idx].astype(jnp.int32) > jnp.int32(0), jnp.int32(4), jnp.int32(0))
     entry_i = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, _IS_IMMOBILE.shape[0] - 1)
-    immobile_bonus = jnp.where(_IS_IMMOBILE[entry_i], jnp.int32(4), jnp.int32(0))
+    immobile_bonus = jnp.maximum(
+        jnp.where(_IS_IMMOBILE[entry_i], jnp.int32(4), jnp.int32(0)),
+        paralyzed_bonus,
+    )
 
     # vendor/nethack/src/uhitm.c:455 — stun: -1 to-hit.
     stunned_timer = state.status.timed_statuses[int(TimedStatus.STUNNED)].astype(jnp.int32)
@@ -988,7 +1001,7 @@ def _single_melee_strike(
 
     tmp = (jnp.int32(1) + abon + target_ac + skill_bonus + enchant + pen + knight_bonus
            + xl_bonus + luck_bonus + uhitinc
-           + sleeping_bonus + fleeing_bonus + immobile_bonus
+           + sleeping_bonus + target_stun_bonus + fleeing_bonus + immobile_bonus
            + stun_hit_penalty + enc_penalty + confusion_penalty + trap_penalty)
     # vendor/nethack/src/uhitm.c:709-710 — strict ``tmp > dieroll``.
     hit = (tmp > roll) & target_alive

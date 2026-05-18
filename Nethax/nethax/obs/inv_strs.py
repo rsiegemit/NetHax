@@ -804,7 +804,10 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     # Vendor: objnam.c::just_an() lines 2108-2142.
     safe_type = jnp.clip(type_id, 0, _MAX_OBJ - 1).astype(jnp.int32)
     has_app   = _HAS_APPEARANCE[safe_type]
-    buc_known = buc_status != jnp.int32(BUCStatus.UNKNOWN)
+    # bknown: player knows the BUC status of this item (vendor objnam.c:1318).
+    # When False, suppress the "blessed"/"cursed"/"uncursed" prefix.
+    bknown    = inv_state.items.bknown[safe_idx]
+    buc_known = (buc_status != jnp.int32(BUCStatus.UNKNOWN)) & bknown
     buc_row   = jnp.clip(buc_status, 0, 3).astype(jnp.int32)
     show_app  = (~identified) & has_app
     # BUC words are all consonant-initial -> use_an = False.
@@ -864,7 +867,7 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         )
         b, c = lax.cond(
             has_erosion,
-            lambda bc: _write_erosion(bc[0], bc[1], emat_class, erod_lvl1, erod_lvl2, oerodeproof),
+            lambda bc: _write_erosion(bc[0], bc[1], emat_class, erod_lvl1, erod_lvl2, oerodeproof, identified),
             lambda bc: bc,
             (b, c),
         )
@@ -1005,14 +1008,16 @@ def _write_buc(buf, cursor, buc_row):
     return buf, cursor
 
 
-def _write_erosion(buf, cursor, emat_class, erod_lvl1, erod_lvl2, oerodeproof):
+def _write_erosion(buf, cursor, emat_class, erod_lvl1, erod_lvl2, oerodeproof, identified):
     """Write erosion prefix words for an item.
 
     Mirrors vendor/nethack/src/objnam.c::add_erosion_words() lines 1142-1191.
 
     oeroded  (erod_lvl1 1-3) -> rusty/burnt series based on emat_class.
     oeroded2 (erod_lvl2 1-3) -> corroded/rotted series.
-    oerodeproof (rknown)     -> rustproof/fireproof/corrodeproof/rotproof.
+    oerodeproof (rknown)     -> rustproof/fireproof/corrodeproof/rotproof, only
+                                 when identified (vendor objnam.c:1183: rknown &&
+                                 oerodeproof; rknown mirrors identified here).
     All words are table-looked-up (JIT-compatible; no Python branching at trace).
     """
     # oeroded word (rust/burn)
@@ -1025,11 +1030,12 @@ def _write_erosion(buf, cursor, emat_class, erod_lvl1, erod_lvl2, oerodeproof):
 
     # proof prefix: rustproof/fireproof/corrodeproof (indexed by emat_class).
     # For mat_class 2 (flammable), oeroded2 controls "rotproof" separately.
-    # vendor objnam.c line 1183: rknown && oerodeproof
+    # vendor objnam.c:1183: rknown && oerodeproof — only show when identified.
+    show_proof = oerodeproof & identified
     proof_src = _EROSION_PROOF_BYTES[emat_class]
-    is_rotproof = oerodeproof & (emat_class == jnp.int32(2)) & (erod_lvl2 > jnp.int32(0))
+    is_rotproof = show_proof & (emat_class == jnp.int32(2)) & (erod_lvl2 > jnp.int32(0))
     buf, cursor = lax.cond(
-        oerodeproof & ~is_rotproof,
+        show_proof & ~is_rotproof,
         lambda bc: _write_fixed(bc[0], bc[1], proof_src, _MAX_EROSION_WORD_LEN),
         lambda bc: bc,
         (buf, cursor),

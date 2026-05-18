@@ -251,7 +251,17 @@ class MonsterAIState:
     attack_dice_sides: jnp.ndarray # [MAX_MONSTERS_PER_LEVEL]  int8  natural-attack die sides
 
     # ---- Wave 3 sleep flag ----
+    # Kept as a computed convenience: True iff sleep_timer > 0.
     asleep: jnp.ndarray            # [MAX_MONSTERS_PER_LEVEL]  bool
+
+    # ---- Status timers (vendor/nethack/src/uhitm.c:387-394) ----
+    # Supersede the boolean asleep/stunned flags; booleans remain for
+    # backward-compat and are kept equal to (timer > 0).
+    sleep_timer:     jnp.ndarray   # [MAX_MONSTERS_PER_LEVEL]  int16
+    stun_timer:      jnp.ndarray   # [MAX_MONSTERS_PER_LEVEL]  int16
+    confuse_timer:   jnp.ndarray   # [MAX_MONSTERS_PER_LEVEL]  int16
+    flee_until_turn: jnp.ndarray   # [MAX_MONSTERS_PER_LEVEL]  int32
+    paralyzed_timer: jnp.ndarray   # [MAX_MONSTERS_PER_LEVEL]  int16
 
     # ---- Wave 4 monster polymorph (vendor/nethack/src/mon.c::newcham) ----
     # MONSTERS table index for each slot.  Defaults to 0; only meaningful
@@ -315,6 +325,11 @@ def make_monster_ai_state() -> MonsterAIState:
         attack_dice_n=jnp.ones(n, dtype=jnp.int8),
         attack_dice_sides=jnp.full((n,), 4, dtype=jnp.int8),
         asleep=jnp.zeros(n, dtype=bool),
+        sleep_timer=jnp.zeros(n, dtype=jnp.int16),
+        stun_timer=jnp.zeros(n, dtype=jnp.int16),
+        confuse_timer=jnp.zeros(n, dtype=jnp.int16),
+        flee_until_turn=jnp.zeros(n, dtype=jnp.int32),
+        paralyzed_timer=jnp.zeros(n, dtype=jnp.int16),
         entry_idx=jnp.zeros(n, dtype=jnp.int16),
         orig_entry_idx=jnp.full((n,), -1, dtype=jnp.int16),
         mtame=jnp.zeros(n, dtype=jnp.int8),
@@ -1512,6 +1527,10 @@ def monsters_step_all(state, rng: jax.Array) -> object:
 
     Uses jax.lax.scan over MAX_MONSTERS_PER_LEVEL slots.  Each slot gets
     an independent RNG subkey via sequential splitting.
+
+    After all turns, decrement status timers by 1 (clamped at 0) and sync
+    the boolean asleep flag from sleep_timer > 0.
+    JIT-pure: jnp.maximum(timer - 1, 0) for each int16/int32 array.
     """
     keys = jax.random.split(rng, MAX_MONSTERS_PER_LEVEL)
     indices = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
@@ -1522,7 +1541,23 @@ def monsters_step_all(state, rng: jax.Array) -> object:
         return new_carry, None
 
     final_state, _ = jax.lax.scan(_body, state, (indices, keys))
-    return final_state
+
+    # Tick status timers (vendor src/timeout.c::run_timers pattern).
+    mai = final_state.monster_ai
+    new_sleep     = jnp.maximum(mai.sleep_timer.astype(jnp.int32)     - 1, 0).astype(jnp.int16)
+    new_stun      = jnp.maximum(mai.stun_timer.astype(jnp.int32)      - 1, 0).astype(jnp.int16)
+    new_confuse   = jnp.maximum(mai.confuse_timer.astype(jnp.int32)   - 1, 0).astype(jnp.int16)
+    new_paralyzed = jnp.maximum(mai.paralyzed_timer.astype(jnp.int32) - 1, 0).astype(jnp.int16)
+    # flee_until_turn is an absolute turn counter; do not decrement.
+    new_asleep    = new_sleep > jnp.int16(0)
+    mai = mai.replace(
+        sleep_timer=new_sleep,
+        stun_timer=new_stun,
+        confuse_timer=new_confuse,
+        paralyzed_timer=new_paralyzed,
+        asleep=new_asleep,
+    )
+    return final_state.replace(monster_ai=mai)
 
 
 # ---------------------------------------------------------------------------

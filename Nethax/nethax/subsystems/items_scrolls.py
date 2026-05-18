@@ -145,6 +145,27 @@ def _build_monster_symbol_table() -> jnp.ndarray:
 # Eager build (mirrors polymorph._build_monster_lookup_tables pattern).
 _MONSTER_SYMBOL_TABLE: jnp.ndarray = _build_monster_symbol_table()
 
+
+# Boulder type_id in the compiled object table (objects.py entry #447).
+# vendor/nethack/include/objects.h — boulder is the first ROCK_CLASS entry.
+BOULDER_TYPE_ID: int = 447
+
+
+def _build_monster_fire_resist_table() -> jnp.ndarray:
+    """Build MONSTERS[i].resists_mask & MR_FIRE lookup eagerly at module load.
+
+    Returns bool[n_monsters] — True where the monster is fire-resistant.
+    vendor/nethack/include/monflag.h MR_FIRE = 0x01.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, MR_FIRE
+    return jnp.array(
+        [(int(m.resists_mask) & MR_FIRE) != 0 for m in MONSTERS],
+        dtype=jnp.bool_,
+    )
+
+
+_MONSTER_FIRE_RESIST_TABLE: jnp.ndarray = _build_monster_fire_resist_table()
+
 # Wave 5 random-pool: a small subset retained for the scroll-read code path
 # that selects a class at random.  Vendor scrolls always let the *player*
 # pick; we keep a uniform pick for the scroll-read flow until a UI layer
@@ -436,21 +457,48 @@ def _effect_remove_curse(state, rng, buc):
 # ---- detection -----------------------------------------------------------
 
 def _effect_gold_detection(state, rng, buc):
-    """scroll of gold detection — sense nearby gold.
+    """scroll of gold detection — sense gold; confused/cursed reveals traps.
 
-    Canonical: seffect_gold_detection — sense_gold / show gold locations.
-    Wave 3: no-op (gold-on-map not yet modelled).
+    vendor/nethack/src/read.c::seffect_gold_detection (~2035):
+      if (confused || scursed): trap_detect(sobj) — reveal all traps on level.
+    On confused or cursed: set traps.revealed[flat_lv, :, :] = True.
+    TrapState uses flat level index branch*max_levels + (level-1).
     """
-    return state
+    cursed   = _is_cursed(buc)
+    confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
+    reveal   = confused | cursed
+
+    b       = state.dungeon.current_branch.astype(jnp.int32)
+    lv      = state.dungeon.current_level.astype(jnp.int32) - 1
+    max_lv  = jnp.int32(state.terrain.shape[1])
+    flat_lv = b * max_lv + lv
+
+    old_revealed = state.traps.revealed  # [num_levels, map_h, map_w]
+    new_row      = jnp.ones_like(old_revealed[flat_lv])
+    new_revealed = jnp.where(
+        reveal,
+        old_revealed.at[flat_lv].set(new_row),
+        old_revealed,
+    )
+    new_traps = state.traps.replace(revealed=new_revealed)
+    return state.replace(traps=new_traps)
 
 
 def _effect_food_detection(state, rng, buc):
-    """scroll of food detection — sense food items.
+    """scroll of food detection — count food items on current level.
 
-    Canonical: seffect_food_detection — sense_food / show food locations.
-    Wave 3: no-op (food-on-map not yet modelled).
+    vendor/nethack/src/read.c::seffect_food_detection (~2046):
+      food_detect(sobj) — reveal food item locations.
+    Simplification: count FOOD_CLASS items in ground_items on current level;
+    store count in state.last_food_count (int8).
     """
-    return state
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+    b          = state.dungeon.current_branch.astype(jnp.int32)
+    lv         = state.dungeon.current_level.astype(jnp.int32) - 1
+    level_cats = state.ground_items.category[b, lv]  # [map_h, map_w, MAX_STACK]
+    is_food    = level_cats == jnp.int8(int(ItemCategory.FOOD))
+    count      = jnp.sum(is_food).astype(jnp.int8)
+    return state.replace(last_food_count=count)
 
 
 # ---- mapping / teleport ---------------------------------------------------
@@ -584,29 +632,90 @@ def _effect_amnesia(state, rng, buc):
 def _effect_fire(state, rng, buc):
     """scroll of fire — fire explosion centered on player.
 
-    Canonical: seffect_fire — explode(hero, EXPL_FIERY, ...).
-    Wave 3: deal 10 HP fire damage to the player (blessed: 5 HP, cursed: 20 HP).
+    vendor/nethack/src/read.c::seffect_fire (~1850):
+      blessed: dam = (2*(rn1(3,3) + 2*1) + 1)/3, AoE to monsters in
+               Chebyshev-1 neighbourhood; fire-resistant monsters take 0.
+      uncursed/cursed: same formula with bcsign 0/-1, only player hurt.
     """
+    rng1, _ = jax.random.split(rng)
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
-    dmg     = jnp.where(blessed, jnp.int32(5),
-              jnp.where(cursed,  jnp.int32(20), jnp.int32(10)))
-    new_hp  = jnp.maximum(state.player_hp - dmg, jnp.int32(1))
-    return state.replace(player_hp=new_hp)
+
+    bcsign  = jnp.where(blessed, jnp.int32(1),
+              jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+    # rn1(3,3) = random in [3,5]; dam = (2*(roll + 2*bcsign) + 1) / 3
+    roll    = jax.random.randint(rng1, (), 3, 6).astype(jnp.int32)
+    dam     = jnp.maximum((2 * (roll + 2 * bcsign) + 1) // 3, jnp.int32(1))
+
+    # Non-blessed: hurt player only
+    new_player_hp     = jnp.maximum(state.player_hp - dam, jnp.int32(1))
+    state_hurt_player = state.replace(player_hp=new_player_hp)
+
+    # Blessed: AoE — damage all alive monsters within Chebyshev 1 of player
+    fire_resist_table = _MONSTER_FIRE_RESIST_TABLE
+    mai       = state.monster_ai
+    pr        = state.player_pos[0].astype(jnp.int32)
+    pc        = state.player_pos[1].astype(jnp.int32)
+    safe_entry = jnp.clip(mai.entry_idx.astype(jnp.int32), 0, fire_resist_table.shape[0] - 1)
+    is_fire_res = fire_resist_table[safe_entry]
+    mon_row   = mai.pos[:, 0].astype(jnp.int32)
+    mon_col   = mai.pos[:, 1].astype(jnp.int32)
+    cheby     = jnp.maximum(jnp.abs(mon_row - pr), jnp.abs(mon_col - pc))
+    in_aoe    = mai.alive & (cheby <= jnp.int32(1)) & ~is_fire_res
+    new_hp    = jnp.where(in_aoe, jnp.maximum(mai.hp - dam, jnp.int32(0)), mai.hp)
+    new_alive = jnp.where(in_aoe & (new_hp <= jnp.int32(0)), jnp.bool_(False), mai.alive)
+    state_aoe = state.replace(monster_ai=mai.replace(hp=new_hp, alive=new_alive))
+
+    return jax.tree.map(
+        lambda a, b: jnp.where(blessed, a, b),
+        state_aoe,
+        state_hurt_player,
+    )
 
 
 def _effect_earth(state, rng, buc):
-    """scroll of earth — summon rocks / boulders from ceiling.
+    """scroll of earth — drop boulders at 4 cardinal tiles around player.
 
-    Canonical: seffect_earth — drop rocks on monsters/player.
-    Wave 3: deal 5 HP blunt damage (blessed: 0, cursed: 15).
+    vendor/nethack/src/read.c::seffect_earth (~1919):
+      Drops boulders on surrounding squares; monster on tile takes rnd(20).
+      Simplification: 4 cardinal directions only (N/E/S/W).
+      Boulders placed as ground_items (ROCK_CLASS, type_id=BOULDER_TYPE_ID).
     """
-    blessed = _is_blessed(buc)
-    cursed  = _is_cursed(buc)
-    dmg     = jnp.where(blessed, jnp.int32(0),
-              jnp.where(cursed,  jnp.int32(15), jnp.int32(5)))
-    new_hp  = jnp.maximum(state.player_hp - dmg, jnp.int32(1))
-    return state.replace(player_hp=new_hp)
+    rng1, rng2, rng3, rng4 = jax.random.split(rng, 4)
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    h  = state.terrain.shape[2]
+    w  = state.terrain.shape[3]
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - 1
+
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+    boulder_cat = jnp.int8(int(ItemCategory.ROCK))
+    boulder_tid = jnp.int16(BOULDER_TYPE_ID)
+
+    mai        = state.monster_ai
+    new_mai    = mai
+    new_ground = state.ground_items
+
+    for dr, dc, rng_i in [(-1, 0, rng1), (0, 1, rng2), (1, 0, rng3), (0, -1, rng4)]:
+        tr = jnp.clip(pr + dr, 0, h - 1).astype(jnp.int32)
+        tc = jnp.clip(pc + dc, 0, w - 1).astype(jnp.int32)
+
+        roll      = jax.random.randint(rng_i, (), 1, 21).astype(jnp.int32)
+        mon_row   = new_mai.pos[:, 0].astype(jnp.int32)
+        mon_col   = new_mai.pos[:, 1].astype(jnp.int32)
+        on_tile   = new_mai.alive & (mon_row == tr) & (mon_col == tc)
+        new_hp    = jnp.where(on_tile, jnp.maximum(new_mai.hp - roll, jnp.int32(0)), new_mai.hp)
+        new_alive = jnp.where(on_tile & (new_hp <= jnp.int32(0)), jnp.bool_(False), new_mai.alive)
+        new_mai   = new_mai.replace(hp=new_hp, alive=new_alive)
+
+        new_ground = new_ground.replace(
+            category=new_ground.category.at[b, lv, tr, tc, 0].set(boulder_cat),
+            type_id=new_ground.type_id.at[b, lv, tr, tc, 0].set(boulder_tid),
+            quantity=new_ground.quantity.at[b, lv, tr, tc, 0].set(jnp.int16(1)),
+        )
+
+    return state.replace(monster_ai=new_mai, ground_items=new_ground)
 
 
 def _effect_punishment(state, rng, buc):
@@ -624,20 +733,33 @@ def _effect_punishment(state, rng, buc):
 
 
 def _effect_stinking_cloud(state, rng, buc):
-    """scroll of stinking cloud — create nausea cloud at player position.
+    """scroll of stinking cloud — create positional gas cloud at player pos.
 
-    Canonical: seffect_stinking_cloud — do_stinking_cloud(); create cloud object.
-    Wave 3: add 15-turn VOMITING status (blessed 0, cursed 30).
+    vendor/nethack/src/read.c::do_stinking_cloud (~3082):
+      create_gas_cloud(cc.x, cc.y, 15+10*bcsign, 8+4*bcsign)
+      turns = 8+4*bcsign: uncursed=8, blessed=12, cursed=4.
+    Sets cloud_pos = player_pos, cloud_radius = 3, cloud_turns per BUC.
+    Also sets VOMITING status for the player.
+    TODO: wire per-turn tick in env.py step.
     """
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
+
+    cloud_turns = jnp.where(blessed, jnp.int8(12),
+                  jnp.where(cursed,  jnp.int8(4), jnp.int8(8)))
+
+    st1 = state.replace(
+        cloud_pos=state.player_pos,
+        cloud_radius=jnp.int8(3),
+        cloud_turns=cloud_turns,
+    )
+
     turns   = jnp.where(blessed, jnp.int32(0),
               jnp.where(cursed,  jnp.int32(30), jnp.int32(15)))
-    cur_vom = state.status.timed_statuses[int(TimedStatus.VOMITING)]
+    cur_vom = st1.status.timed_statuses[int(TimedStatus.VOMITING)]
     new_vom = jnp.maximum(cur_vom, turns)
-    new_ts  = state.status.timed_statuses.at[int(TimedStatus.VOMITING)].set(new_vom)
-    new_status = state.status.replace(timed_statuses=new_ts)
-    return state.replace(status=new_status)
+    new_ts  = st1.status.timed_statuses.at[int(TimedStatus.VOMITING)].set(new_vom)
+    return st1.replace(status=st1.status.replace(timed_statuses=new_ts))
 
 
 # ---- misc -----------------------------------------------------------------

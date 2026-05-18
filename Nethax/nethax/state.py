@@ -43,6 +43,7 @@ from Nethax.nethax.subsystems.engrave import EngraveState
 from Nethax.nethax.subsystems.skills import SkillState
 from Nethax.nethax.subsystems.digging import DigState
 from Nethax.nethax.subsystems.swallow import SwallowState
+from Nethax.nethax.subsystems.lighting import LightingState
 
 from Nethax.nethax.dungeon.branches import (
     DungeonState,
@@ -107,6 +108,7 @@ class EnvState:
     skills: SkillState
     dig: DigState
     swallow: SwallowState
+    lighting: LightingState
 
     # ---- Player core (kept here for fast access; not part of any subsystem) ----
     player_pos: jax.Array       # int16[2]  (row, col)
@@ -134,8 +136,10 @@ class EnvState:
     player_moreluck:  jax.Array  # int8   u.moreluck (you.h line 460); luckstone bonus
     player_in_water:  jax.Array  # bool   u.uinwater (you.h line 431)
     player_buried:    jax.Array  # bool   u.uburied  (you.h line 436)
-    player_steed_mid: jax.Array  # uint32 u.usteed_mid (you.h line 494); 0 = not riding
-    player_killer_mid: jax.Array # uint32 last-attacker monster id (you.h: svk.killer)
+    player_steed_mid: jax.Array    # uint32 u.usteed_mid (you.h line 494); 0 = not riding
+    player_extra_speed: jax.Array  # int8  extra move speed while riding steed (steed.c:447 ugallop)
+    saddle_condition: jax.Array    # int8  0=broken, 100=new; degrades 1/100 turns riding (steed.c)
+    player_killer_mid: jax.Array   # uint32 last-attacker monster id (you.h: svk.killer)
     player_mortality: jax.Array  # int32  u.umortality (you.h line 497); deaths so far
     player_uhitinc:   jax.Array  # int8   u.uhitinc (you.h); ring of increase accuracy
     player_udaminc:   jax.Array  # int8   u.udaminc (you.h); ring of increase damage
@@ -158,6 +162,19 @@ class EnvState:
     is_punished: jax.Array        # bool  — iron ball attached
     ball_pos:    jax.Array        # int16[2]  (row, col) of iron ball
     genocided_species: jax.Array  # bool[381] — True = genocided
+
+    # ---- Stinking cloud state (read.c::do_stinking_cloud) ----
+    # vendor/nethack/src/read.c::do_stinking_cloud (~3082):
+    #   create_gas_cloud(cc.x, cc.y, radius, turns)
+    # TODO: wire per-turn tick in env.py step (decrement cloud_turns, 1HP+VOMITING
+    #       to anything within cloud_radius of cloud_pos while cloud_turns > 0).
+    cloud_pos:    jax.Array       # int16[2]  tile cloud is centered on
+    cloud_radius: jax.Array       # int8      Chebyshev radius (vendor: 15+10*bcsign)
+    cloud_turns:  jax.Array       # int8      turns remaining; 0 = inactive
+
+    # ---- Food detection cache (read.c::seffect_food_detection) ----
+    # Count of FOOD_CLASS ground items on current level at time of detection.
+    last_food_count: jax.Array    # int8
 
     # ---- Terrain layers (kept at top level; subsystems read but rarely write) ----
     terrain: jax.Array          # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]  tile type
@@ -215,6 +232,7 @@ class EnvState:
             skills=SkillState.default(),
             dig=DigState.default(),
             swallow=SwallowState.default(),
+            lighting=LightingState.default(),
             # player core
             player_pos=jnp.zeros((2,), dtype=jnp.int16),
             player_hp=jnp.int32(10),
@@ -242,6 +260,8 @@ class EnvState:
             player_in_water=jnp.bool_(False),
             player_buried=jnp.bool_(False),
             player_steed_mid=jnp.uint32(0),
+            player_extra_speed=jnp.int8(0),
+            saddle_condition=jnp.int8(100),
             player_killer_mid=jnp.uint32(0),
             player_mortality=jnp.int32(0),
             # artifact invoke cooldown
@@ -253,6 +273,12 @@ class EnvState:
             is_punished=jnp.bool_(False),
             ball_pos=jnp.zeros((2,), dtype=jnp.int16),
             genocided_species=jnp.zeros((381,), dtype=jnp.bool_),
+            # stinking cloud (read.c::do_stinking_cloud)
+            cloud_pos=jnp.zeros((2,), dtype=jnp.int16),
+            cloud_radius=jnp.int8(0),
+            cloud_turns=jnp.int8(0),
+            # food detection cache (read.c::seffect_food_detection)
+            last_food_count=jnp.int8(0),
             # terrain layers
             terrain=jnp.zeros((b, l, h, w), dtype=jnp.int8),
             explored=jnp.zeros((b, l, h, w), dtype=jnp.bool_),

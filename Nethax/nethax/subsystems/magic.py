@@ -347,6 +347,7 @@ def spell_success_chance(
     xl: jnp.ndarray,
     stat_int: jnp.ndarray,
     stat_wis: jnp.ndarray,
+    wielded_type_id: jnp.ndarray = None,
 ) -> jnp.ndarray:
     """Return SUCCESS percentage (0–100) for casting spell_id.
 
@@ -358,7 +359,7 @@ def spell_success_chance(
     Source: vendor/nethack/src/spell.c::percent_success() lines 2173-2292.
     """
     return jnp.int32(100) - spell_fail_chance(
-        role, spell_id, xl, stat_int, stat_wis
+        role, spell_id, xl, stat_int, stat_wis, wielded_type_id=wielded_type_id
     )
 
 

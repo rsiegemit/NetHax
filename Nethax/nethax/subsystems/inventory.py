@@ -152,6 +152,14 @@ class Item:
     corpse_entry_idx: jnp.ndarray = field(default_factory=lambda: jnp.int16(-1))
     # Recharge counter — vendor read.c::seffect_charging: wand explodes at 7.
     recharged: jnp.ndarray = field(default_factory=lambda: jnp.int8(0))
+    # Corpse age: game turn when corpse was created (-1 = not a corpse/unknown).
+    # cite: vendor/nethack/src/eat.c::eatcorpse line 1885 peek_at_iced_corpse_age
+    corpse_creation_turn: jnp.ndarray = field(
+        default_factory=lambda: jnp.int32(-1)
+    )
+    # Poisoned-tin flag: tin is poisoned even when sealed.
+    # cite: vendor/nethack/src/eat.c::consume_tin line 1537 tin->otrapped check
+    tin_poisoned: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
 
 
 def make_empty_item() -> Item:
@@ -163,7 +171,10 @@ def make_empty_item() -> Item:
         is_two_handed=jnp.bool_(False), greased=jnp.bool_(False),
         oeroded=jnp.int8(0), oeroded2=jnp.int8(0), oerodeproof=jnp.bool_(False),
         bknown=jnp.bool_(False), lamplit=jnp.bool_(False), olocked=jnp.bool_(False),
-        corpse_entry_idx=jnp.int16(-1), recharged=jnp.int8(0),
+        corpse_entry_idx=jnp.int16(-1),
+        recharged=jnp.int8(0),
+        corpse_creation_turn=jnp.int32(-1),
+        tin_poisoned=jnp.bool_(False),
     )
 
 
@@ -179,18 +190,33 @@ def make_item(
     oeroded: int = 0,
     oeroded2: int = 0,
     oerodeproof: bool = False,
+    corpse_entry_idx: int = -1,
+    corpse_creation_turn: int = -1,
+    tin_poisoned: bool = False,
 ) -> Item:
     """Construct a concrete Item with given fields (Python-side helper)."""
     return Item(
-        category=jnp.int8(category), type_id=jnp.int16(type_id),
-        buc_status=jnp.int8(buc_status), enchantment=jnp.int8(enchantment),
-        charges=jnp.int8(0), identified=jnp.bool_(True),
-        quantity=jnp.int16(quantity), weight=jnp.int32(weight),
-        ac_bonus=jnp.int8(ac_bonus), is_two_handed=jnp.bool_(is_two_handed),
-        greased=jnp.bool_(False), oeroded=jnp.int8(oeroded),
-        oeroded2=jnp.int8(oeroded2), oerodeproof=jnp.bool_(oerodeproof),
-        bknown=jnp.bool_(False), lamplit=jnp.bool_(False), olocked=jnp.bool_(False),
-        corpse_entry_idx=jnp.int16(-1), recharged=jnp.int8(0),
+        category=jnp.int8(category),
+        type_id=jnp.int16(type_id),
+        buc_status=jnp.int8(buc_status),
+        enchantment=jnp.int8(enchantment),
+        charges=jnp.int8(0),
+        identified=jnp.bool_(True),
+        quantity=jnp.int16(quantity),
+        weight=jnp.int32(weight),
+        ac_bonus=jnp.int8(ac_bonus),
+        is_two_handed=jnp.bool_(is_two_handed),
+        greased=jnp.bool_(False),
+        oeroded=jnp.int8(oeroded),
+        oeroded2=jnp.int8(oeroded2),
+        oerodeproof=jnp.bool_(oerodeproof),
+        bknown=jnp.bool_(False),
+        lamplit=jnp.bool_(False),
+        olocked=jnp.bool_(False),
+        corpse_entry_idx=jnp.int16(corpse_entry_idx),
+        recharged=jnp.int8(0),
+        corpse_creation_turn=jnp.int32(corpse_creation_turn),
+        tin_poisoned=jnp.bool_(tin_poisoned),
     )
 
 
@@ -224,8 +250,16 @@ def _stack_items(items: list) -> Item:
         bknown=jnp.array([bool(it.bknown) for it in items], dtype=jnp.bool_),
         lamplit=jnp.array([bool(it.lamplit) for it in items], dtype=jnp.bool_),
         olocked=jnp.array([bool(it.olocked) for it in items], dtype=jnp.bool_),
-        corpse_entry_idx=jnp.array([int(it.corpse_entry_idx) for it in items], dtype=jnp.int16),
+        corpse_entry_idx=jnp.array(
+            [int(it.corpse_entry_idx) for it in items], dtype=jnp.int16
+        ),
         recharged=jnp.array([int(it.recharged) for it in items], dtype=jnp.int8),
+        corpse_creation_turn=jnp.array(
+            [int(it.corpse_creation_turn) for it in items], dtype=jnp.int32
+        ),
+        tin_poisoned=jnp.array(
+            [bool(it.tin_poisoned) for it in items], dtype=jnp.bool_
+        ),
     )
 
 
@@ -252,6 +286,8 @@ def _empty_items_array() -> Item:
         olocked=jnp.zeros((n,), dtype=jnp.bool_),
         corpse_entry_idx=jnp.full((n,), -1, dtype=jnp.int16),
         recharged=jnp.zeros((n,), dtype=jnp.int8),
+        corpse_creation_turn=jnp.full((n,), -1, dtype=jnp.int32),
+        tin_poisoned=jnp.zeros((n,), dtype=jnp.bool_),
     )
 
 
@@ -278,6 +314,8 @@ def _empty_ground_items_array(n_branches: int, max_levels: int, map_h: int, map_
         olocked=jnp.zeros(shape, dtype=jnp.bool_),
         corpse_entry_idx=jnp.full(shape, -1, dtype=jnp.int16),
         recharged=jnp.zeros(shape, dtype=jnp.int8),
+        corpse_creation_turn=jnp.full(shape, -1, dtype=jnp.int32),
+        tin_poisoned=jnp.zeros(shape, dtype=jnp.bool_),
     )
 
 

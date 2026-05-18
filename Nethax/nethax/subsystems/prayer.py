@@ -46,6 +46,7 @@ Each branch is decided via jnp.where on the d100 roll so the function
 remains lax-traceable.
 """
 from enum import IntEnum
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -86,6 +87,86 @@ class Alignment(IntEnum):
     NEUTRAL = 1
     LAWFUL = 2
     UNALIGNED = 3
+
+
+# ---------------------------------------------------------------------------
+# Race enum — mirrors vendor/nethack/src/role.c races[] order
+# ---------------------------------------------------------------------------
+class Race(IntEnum):
+    HUMAN  = 0
+    ELF    = 1
+    DWARF  = 2
+    GNOME  = 3
+    ORC    = 4
+
+
+# ---------------------------------------------------------------------------
+# God-name table — role.c::races[] god triples (lawful, neutral, chaotic)
+# per race.  pray.c:50 note: "prayers are made to your god".
+# Cited: pray.c:50, role.c races[].
+# ---------------------------------------------------------------------------
+GOD_OWN      = 0   # own alignment slot
+GOD_NEUTRAL  = 1   # neutral slot (middle)
+GOD_OPPOSITE = 2   # opposite alignment slot
+
+# (lawful_god, neutral_god, chaotic_god) per Race.
+# Source: vendor/nethack/src/role.c (race-level god assignments).
+# Human uses Babylonian pantheon (role.c:123), Elf uses Elven pantheon
+# (role.c:371), Dwarf uses Dwarvish, Gnome uses Gnomish, Orc uses Orcish.
+_GODS: dict = {
+    Race.HUMAN: ("Anu",                   "Ishtar",   "Anshar"),
+    Race.ELF:   ("Solonor Thelandira",    "Aerdrie Faenya", "Lolth"),
+    Race.DWARF: ("Moradin",               "Dumathoin", "Abbathor"),
+    Race.GNOME: ("Garl Glittergold",      "Baervan Wildwanderer", "Urdlen"),
+    Race.ORC:   ("Gruumsh",               "Ilneval",   "Shargaas"),
+}
+
+# Alignment → index into the god triple.
+_ALIGN_TO_GOD_IDX: dict = {
+    Alignment.LAWFUL:   0,
+    Alignment.NEUTRAL:  1,
+    Alignment.CHAOTIC:  2,
+}
+
+
+def god_name(race: "Race", align: "Alignment", kind: int) -> str:
+    """Return the god name for *race*/*align* at position *kind*.
+
+    *kind* is GOD_OWN (own-alignment slot), GOD_NEUTRAL, or GOD_OPPOSITE.
+    For GOD_OWN the returned name is the deity matching *align*.
+    For GOD_NEUTRAL always the neutral (middle) entry.
+    For GOD_OPPOSITE the entry opposite to *align*.
+
+    Cited: pray.c:50.
+    """
+    triple = _GODS[Race(race)]
+    if kind == GOD_OWN:
+        idx = _ALIGN_TO_GOD_IDX[Alignment(align)]
+    elif kind == GOD_NEUTRAL:
+        idx = 1
+    else:  # GOD_OPPOSITE
+        own_idx = _ALIGN_TO_GOD_IDX[Alignment(align)]
+        idx = 2 - own_idx
+    name = triple[idx]
+    # Strip leading "_" prefix used in role.c for female variants.
+    return name.lstrip("_")
+
+
+def god_speaks_message(race: int, align: int, message_kind: str) -> str:
+    """Return a flavour string for a divine message.
+
+    *message_kind*: "pleased" / "angry" / "unaware" / "ascension".
+    Host-side only (returns a Python str, not a JAX array).
+    Cited: pray.c:50.
+    """
+    god = god_name(Race(race), Alignment(align), GOD_OWN)
+    templates = {
+        "pleased":    f"{god} is well-pleased.",
+        "angry":      f"{god} is displeased!",
+        "unaware":    f"{god} is unaware of your deeds.",
+        "ascension":  f"{god} raises you to demigod-hood!",
+    }
+    return templates.get(message_kind, f"{god} speaks.")
 
 
 class PrayerOutcome(IntEnum):
@@ -902,6 +983,27 @@ def pray(state, rng: jax.Array):
     """
     trouble = in_trouble(state)
 
+    # --- Cross-aligned altar check (pray.c can_pray / god_zaps_you branch) --
+    # pray.c: if on a cross-aligned altar the deity zaps you immediately.
+    # We detect altar alignment via features.altar_alignment at player pos.
+    max_levels = state.terrain.shape[1]
+    _b  = state.dungeon.current_branch.astype(jnp.int32)
+    _lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    _flat_lv = _b * jnp.int32(max_levels) + _lv
+    _row = state.player_pos[0].astype(jnp.int32)
+    _col = state.player_pos[1].astype(jnp.int32)
+    altar_align = state.features.altar_alignment[_flat_lv, _row, _col].astype(jnp.int32)
+    player_align_i = state.player_align.astype(jnp.int32)
+    # altar_align == -1 means no altar; >= 0 means an altar is present.
+    on_cross_altar = (altar_align >= jnp.int32(0)) & (altar_align != player_align_i)
+    rng, rng_cross_zap = jax.random.split(rng)
+    state = jax.lax.cond(
+        on_cross_altar,
+        lambda s: god_zaps_you(s, rng_cross_zap),
+        lambda s: s,
+        state,
+    )
+
     # --- Anger gates (pray.c::can_pray) -------------------------------------
     pray_timeout = state.prayer.pray_timeout
     record = state.prayer.alignment_record.astype(jnp.int32)
@@ -927,17 +1029,10 @@ def pray(state, rng: jax.Array):
     )
 
     # --- Pleased path (pray.c::pleased pat_on_head 0..8) --------------------
-    # Bucket mapping (covers all 8 vendor "pat-on-head" cases plus the
-    # alignment-bump short-circuit at line 1089):
-    #   0..14   ALIGNMENT_BUMP    (pray.c:1088-1089, record<2 trouble<=0)
-    #   15..29  HEAL_CURE         (case 2, lines 1246-1282)
-    #   30..44  PROTECTION_+1     (case 5, lines 1310-1338)
-    #   45..59  REMOVE_CURSE      (case 4, lines 1283-1309)
-    #   60..69  LUCK_GIVING       (case 2 luck-floor, line 1275-1276)
-    #   70..79  INTRINSIC_GIFT    (case 5 telepathy/speed branch)
-    #   80..89  ABILITY_INCREASE  (case 2 STR/WIS restore, lines 1264-1268)
-    #   90..99  GIFT_ARTIFACT     (case 7-8 gcrownu, lines 1340-1350,
-    #                              gated by alignment_record >= PIOUS)
+    # Bucket thresholds are biased by piety = alignment_record + luck/2.
+    # pray.c::pleased: higher piety → gcrownu / intrinsic gifts more likely;
+    # lower piety → alignment bump / heal more likely.
+    # Cited: pray.c::pleased (lines 1070-1390).
     is_pleased = (~angry) & (trouble == jnp.int32(TROUBLE_NONE))
 
     def _pleased_branch(s):
@@ -952,27 +1047,55 @@ def pray(state, rng: jax.Array):
 
         can_gift = s.prayer.alignment_record.astype(jnp.int32) >= jnp.int32(PIOUS)
 
-        # Nested lax.cond chain — full 8-bucket switch (vendor parity).
+        # Piety score (pray.c::pleased rnl() / alignment_record gates).
+        piety = (
+            s.prayer.alignment_record.astype(jnp.int32)
+            + s.player_luck.astype(jnp.int32) // jnp.int32(2)
+        )
+
+        # Bucket cutoffs shift with piety so that:
+        #   piety >= 14 → 50 % chance of GIFT_ARTIFACT (roll < 50 → gift)
+        #   piety <  5  → 80 % chance of ALIGNMENT_BUMP (roll < 80 → bump)
+        # Implementation: compress/expand the gift window by clamping a
+        # piety-derived offset in [-40, +40] and applying it to the
+        # artifact threshold (default 90).
+        piety_offset = jnp.clip(piety * jnp.int32(3), jnp.int32(-40), jnp.int32(40))
+        # artifact threshold: 90 - offset  (high piety lowers threshold → more gifts)
+        t_gift = jnp.int32(90) - piety_offset   # [50, 130] clipped to [50, 99]
+        t_gift = jnp.clip(t_gift, jnp.int32(50), jnp.int32(99))
+        # Low-piety bump threshold: default 15, expands to 80 when piety < 5.
+        low_piety = piety < jnp.int32(5)
+        t_bump = jnp.where(low_piety, jnp.int32(80), jnp.int32(15))
+        # Remaining fixed thresholds are scaled between t_bump and t_gift.
+        span = jnp.maximum(t_gift - t_bump, jnp.int32(1))
+        t_heal = t_bump + span * jnp.int32(20) // jnp.int32(85)
+        t_prot = t_bump + span * jnp.int32(35) // jnp.int32(85)
+        t_rmc  = t_bump + span * jnp.int32(50) // jnp.int32(85)
+        t_luck = t_bump + span * jnp.int32(62) // jnp.int32(85)
+        t_intr = t_bump + span * jnp.int32(72) // jnp.int32(85)
+        t_abil = t_bump + span * jnp.int32(82) // jnp.int32(85)
+
+        # Nested lax.cond cascade — piety-biased 8-bucket switch.
         return jax.lax.cond(
-            roll < jnp.int32(15),
+            roll < t_bump,
             lambda _: s_align,
             lambda _: jax.lax.cond(
-                roll < jnp.int32(30),
+                roll < t_heal,
                 lambda _: s_heal,
                 lambda _: jax.lax.cond(
-                    roll < jnp.int32(45),
+                    roll < t_prot,
                     lambda _: s_prot,
                     lambda _: jax.lax.cond(
-                        roll < jnp.int32(60),
+                        roll < t_rmc,
                         lambda _: s_rmc,
                         lambda _: jax.lax.cond(
-                            roll < jnp.int32(70),
+                            roll < t_luck,
                             lambda _: s_luck,
                             lambda _: jax.lax.cond(
-                                roll < jnp.int32(80),
+                                roll < t_intr,
                                 lambda _: s_intr,
                                 lambda _: jax.lax.cond(
-                                    roll < jnp.int32(90),
+                                    roll < t_abil,
                                     lambda _: s_abil,
                                     lambda _: jax.lax.cond(
                                         can_gift,
@@ -1081,13 +1204,21 @@ def pray(state, rng: jax.Array):
     )
     new_record = state_final.prayer.alignment_record + delta
 
+    # --- Luck cap at +13 (pray.c LUCKMAX=13 prayer path) --------------------
+    # On pleased path bump player_luck by 1, capped at 13.  Cited: pray.c.
+    new_player_luck = jnp.where(
+        is_pleased,
+        jnp.minimum(state_final.player_luck.astype(jnp.int32) + jnp.int32(1), jnp.int32(13)),
+        state_final.player_luck.astype(jnp.int32),
+    ).astype(jnp.int8)
+
     new_prayer = state_final.prayer.replace(
         pray_timeout=new_pray_timeout,
         prayer_timeout=new_pray_timeout,   # keep aliases in sync
         alignment_record=new_record,
         last_pray_turn=state_final.timestep,
     )
-    return state_final.replace(prayer=new_prayer)
+    return state_final.replace(prayer=new_prayer, player_luck=new_player_luck)
 
 
 # ---------------------------------------------------------------------------
@@ -1183,6 +1314,21 @@ def sacrifice_on_altar(state, rng: jax.Array, slot_idx: jnp.ndarray):
     # 5. Plain opposite-aligned non-human.
     is_wrong = opposite & (~is_cross_human) & (~is_mighty)
 
+    # Monster level encoded in the corpse's enchantment field (int8).
+    # pray.c:2030-2065: alignment delta scales with sacrifice value which is
+    # proportional to monster level.  Formula: delta = base * (1 + level/10).
+    # Cited: pray.c:2030-2065.
+    monster_level = items.enchantment[safe_slot].astype(jnp.int32)
+    # Scale factor: (10 + level) / 10, applied to base deltas.
+    level_scale_num = jnp.int32(10) + jnp.maximum(monster_level, jnp.int32(0))
+
+    def _scale(base: int) -> jnp.ndarray:
+        """Return base * (1 + level/10), as int16."""
+        return (jnp.int32(base) * level_scale_num // jnp.int32(10)).astype(jnp.int16)
+
+    def _scale_neg(base: int) -> jnp.ndarray:
+        return (jnp.int32(base) * level_scale_num // jnp.int32(10)).astype(jnp.int16)
+
     # --- Apply state changes ------------------------------------------------
     # Mighty monster → wish: bump god_anger negatively as "wishes_granted"
     # counter (Wave 6 placeholder; real wish requires wish.py integration).
@@ -1199,27 +1345,27 @@ def sacrifice_on_altar(state, rng: jax.Array, slot_idx: jnp.ndarray):
         state.player_wis,
     )
 
-    # Record delta — vendor table:
-    #   mighty           → +10 (also wish granted via god_anger field)
-    #   artifact gift    → +5  (pray.c bestow_artifact still ups standing)
-    #   normal blessing  → +5  (pray.c:2030-2065 brownie points)
-    #   cross-human (chaotic player) → +5  (pray.c:1773 adjalign(5))
-    #   cross-human (lawful/neutral) → -5  (pray.c:1766 adjalign(-5))
-    #   wrong-aligned    → -5  (pray.c:2015-2017 offer_negative_valued)
+    # Record delta — vendor table with level scaling (pray.c:2030-2065):
+    #   mighty           → +10 scaled by level
+    #   artifact gift    → +5  scaled
+    #   normal blessing  → +5  scaled (same/cross-aligned coaligned sacrifice)
+    #   cross-human (chaotic player) → +5 scaled
+    #   cross-human (lawful/neutral) → -5 scaled
+    #   wrong-aligned    → -5 scaled  (pray.c:2015-2017 offer_negative_valued)
     is_chaotic_player = player_align == jnp.int32(0)  # Alignment.CHAOTIC
     cross_human_delta = jnp.where(
-        is_chaotic_player, jnp.int16(5), jnp.int16(-5)
+        is_chaotic_player, _scale(5), -_scale_neg(5)
     )
     delta = jnp.where(
-        is_mighty,           jnp.int16(10),
+        is_mighty,          _scale(10),
         jnp.where(
-            is_artifact_gift,    jnp.int16(5),
+            is_artifact_gift,   _scale(5),
             jnp.where(
-                is_normal_blessing, jnp.int16(5),
+                is_normal_blessing, _scale(5),
                 jnp.where(
                     is_cross_human, cross_human_delta,
                     jnp.where(
-                        is_wrong, jnp.int16(-5),
+                        is_wrong, -_scale_neg(5),
                         jnp.int16(0),
                     ),
                 ),

@@ -107,6 +107,7 @@ class Intrinsic(IntEnum):
     WWALKING             = 50   # water-walking
     SWIMMING             = 51
     BREATHLESS           = 52   # MAGICAL_BREATHING / amphibious
+    MAGIC_BREATHING      = 52   # alias — vendor prop.h MAGICAL_BREATHING = 52
     PASSES_WALLS         = 53
     # Physical attributes (prop.h 54-68)
     SLOW_DIGESTION       = 54
@@ -163,9 +164,10 @@ class TimedStatus(IntEnum):
     FROZEN           = 21   # paralyzed / frozen solid
     NUMBED           = 22   # cold-numbed (reduced dex)
     FAINTING_TURNS   = 23   # fainted from hunger — multi-turn incapacitation
+    POISONED         = 24   # poison status — ticks 1 HP/turn (vendor/nethack/src/status.c)
 
 
-N_TIMED_STATUSES = 24
+N_TIMED_STATUSES = 25
 
 
 # ---------------------------------------------------------------------------
@@ -266,26 +268,29 @@ class StatusState:
 
     Fields
     ------
-    intrinsics          : permanent intrinsic flags gained (bool per property)
-    timed_intrinsics    : turns remaining for timed versions of intrinsics (int32)
-    timed_statuses      : turns remaining for each TimedStatus (int32)
-    hunger_state        : current HungerState (int8)
-    nutrition           : raw nutrition counter; canonical max ~2000 (int32)
-    encumbrance         : current Encumbrance level (int8)
-    sick_kind           : 0=none, 1=food-poisoning (kills fast), 2=illness (chronic)
-    hp_regen_counter    : turns since last HP regen tick (int32)
-    pw_regen_counter    : turns since last Pw regen tick (int32)
+    intrinsics              : permanent intrinsic flags gained (bool per property)
+    timed_intrinsics        : turns remaining for timed versions of intrinsics (int32)
+    timed_statuses          : turns remaining for each TimedStatus (int32)
+    hunger_state            : current HungerState (int8)
+    nutrition               : raw nutrition counter; canonical max ~2000 (int32)
+    encumbrance             : current Encumbrance level (int8)
+    sick_kind               : 0=none, 1=food-poisoning (kills fast), 2=illness (chronic)
+    hp_regen_counter        : turns since last HP regen tick (int32)
+    pw_regen_counter        : turns since last Pw regen tick (int32)
+    confuse_attack_pending  : player's next melee hit will confuse the target
+                              (vendor/nethack/src/spell.c SPE_CONFUSE_MONSTER)
     """
 
-    intrinsics:       jnp.ndarray  # [N_INTRINSICS]       bool
-    timed_intrinsics: jnp.ndarray  # [N_INTRINSICS]       int32
-    timed_statuses:   jnp.ndarray  # [N_TIMED_STATUSES]   int32
-    hunger_state:     jnp.ndarray  # scalar               int8
-    nutrition:        jnp.ndarray  # scalar               int32
-    encumbrance:      jnp.ndarray  # scalar               int8
-    sick_kind:        jnp.ndarray  # scalar               int8
-    hp_regen_counter: jnp.ndarray  # scalar               int32
-    pw_regen_counter: jnp.ndarray  # scalar               int32
+    intrinsics:              jnp.ndarray  # [N_INTRINSICS]       bool
+    timed_intrinsics:        jnp.ndarray  # [N_INTRINSICS]       int32
+    timed_statuses:          jnp.ndarray  # [N_TIMED_STATUSES]   int32
+    hunger_state:            jnp.ndarray  # scalar               int8
+    nutrition:               jnp.ndarray  # scalar               int32
+    encumbrance:             jnp.ndarray  # scalar               int8
+    sick_kind:               jnp.ndarray  # scalar               int8
+    hp_regen_counter:        jnp.ndarray  # scalar               int32
+    pw_regen_counter:        jnp.ndarray  # scalar               int32
+    confuse_attack_pending:  jnp.ndarray  # scalar               bool
 
     @classmethod
     def default(cls) -> "StatusState":
@@ -303,6 +308,7 @@ class StatusState:
             sick_kind=jnp.int8(0),
             hp_regen_counter=jnp.int32(0),
             pw_regen_counter=jnp.int32(0),
+            confuse_attack_pending=jnp.bool_(False),
         )
 
 
@@ -915,6 +921,41 @@ def apply_food_poisoning(
     return state, new_hp, new_done
 
 
+def apply_sick_lethal(
+    state: StatusState,
+    player_hp: jnp.ndarray,
+    done: jnp.ndarray,
+) -> tuple:
+    """SICK (illness) lethal expiry: sick_kind == 2 and timer at 1 → death.
+
+    Vendor: vendor/nethack/src/status.c::sick — illness (non-food-poison)
+    also kills when the timer reaches zero.  Called before tick_timers so
+    timer == 1 fires on this turn.
+    Cite: vendor/nethack/src/status.c::sick lethal-on-zero path.
+    """
+    is_illness = state.sick_kind == jnp.int8(2)
+    sick_expiring = (state.timed_statuses[TimedStatus.SICK] == jnp.int32(1)) & is_illness
+    new_hp = jnp.where(sick_expiring, jnp.int32(0), player_hp)
+    new_done = done | sick_expiring
+    return state, new_hp, new_done
+
+
+def apply_poisoned_tick(
+    state: StatusState,
+    player_hp: jnp.ndarray,
+) -> tuple:
+    """Drain 1 HP per turn while POISONED.
+
+    Vendor: vendor/nethack/src/status.c — poison drains HP each turn until
+    the timer expires.  Called after tick_timers so the timer has already
+    been decremented; we drain HP whenever the (post-decrement) timer > 0.
+    Cite: vendor/nethack/src/status.c POISONED tick.
+    """
+    is_poisoned = state.timed_statuses[TimedStatus.POISONED] > jnp.int32(0)
+    new_hp = jnp.where(is_poisoned, jnp.maximum(player_hp - jnp.int32(1), jnp.int32(0)), player_hp)
+    return state, new_hp
+
+
 # ---------------------------------------------------------------------------
 # Eat action handler
 # ---------------------------------------------------------------------------
@@ -994,12 +1035,18 @@ def step(
     state, player_hp, done = apply_stoning(state, player_hp, done)
     state, player_hp, done = apply_sliming(state, player_hp, done)
     state, player_hp, done = apply_food_poisoning(state, player_hp, done)
+    # SICK (illness, sick_kind==2) lethal expiry — vendor status.c::sick.
+    state, player_hp, done = apply_sick_lethal(state, player_hp, done)
 
     # --- 2. Decrement all timers ---
     state = tick_timers(state)
 
     # --- 3. Hunger drain ---
     state = hunger_tick(state)
+
+    # --- 3b. POISONED damage tick — vendor/nethack/src/status.c.
+    # Applied after tick_timers so the post-decrement timer drives the check.
+    state, player_hp = apply_poisoned_tick(state, player_hp)
 
     # --- 4. HP regen (vendor-parity only path) ---
     # Defaults are supplied here for legacy step() callers that omit

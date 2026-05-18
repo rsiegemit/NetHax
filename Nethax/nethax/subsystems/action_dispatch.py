@@ -74,6 +74,7 @@ from Nethax.nethax.constants.actions import (
 from Nethax.nethax.constants import TileType
 from Nethax.nethax.constants.objects import ObjectClass
 from Nethax.nethax.fov import compute_fov, update_explored, BLIND_SIGHT_RADIUS, DEFAULT_SIGHT_RADIUS, DARK_ROOM_SIGHT_RADIUS
+from Nethax.nethax.subsystems.lighting import _player_in_lit_area
 from Nethax.nethax.subsystems.features import (
     DoorState,
     open_door,
@@ -231,16 +232,21 @@ def _apply_fov(state):
     player_tile = terrain_2d[pr, pc]
     in_dark_room = player_tile == jnp.int8(int(TileType.CORRIDOR))
 
-    # condition 3: carried light source active (wand / spell of light)
+    # condition 3: player covered by any active light source.
     # Vendor light.c::do_light_sources line 169.
-    spell_lit = state.dungeon.lit_radius_until_turn > state.timestep.astype(jnp.int32)
+    # Legacy scalar still honoured for wand/spell handlers not yet migrated.
+    # TODO: items_wands.py / magic.py should call add_light_source() instead of
+    #       setting dungeon.lit_radius_until_turn directly; remove legacy check
+    #       once that migration is complete.
+    legacy_lit = state.dungeon.lit_radius_until_turn > state.timestep.astype(jnp.int32)
+    has_light = legacy_lit | _player_in_lit_area(state)
 
     sight_radius = jnp.where(
         is_blind | in_water,
         BLIND_SIGHT_RADIUS,
         jnp.where(
             in_dark_room,
-            jnp.where(spell_lit, DEFAULT_SIGHT_RADIUS, DARK_ROOM_SIGHT_RADIUS),
+            jnp.where(has_light, DEFAULT_SIGHT_RADIUS, DARK_ROOM_SIGHT_RADIUS),
             DEFAULT_SIGHT_RADIUS,
         ),
     )
@@ -302,11 +308,29 @@ def _try_step(state, dy: int, dx: int, rng: jax.Array):
     Swallow gate: if the player is currently swallowed, movement is a no-op.
     The vendor requires attacking the engulfer to escape (mhitu.c::gulpmu).
     Cite: vendor/nethack/src/mhitu.c::swallowed movement block.
+
+    VOMITING gate: while VOMITING, movement becomes a no-op (incapacitated).
+    Cite: vendor/nethack/src/hack.c — VOMITING causes brief incapacitation.
+
+    WOUNDED_LEGS limp: while WOUNDED_LEGS, with prob 0.3 skip the move.
+    Cite: vendor/nethack/src/hack.c WOUNDED_LEGS movement penalty.
     """
-    # Swallow no-op gate — vendor/nethack/src/mhitu.c (swallowed player cannot
-    # move; must attack engulfer instead).
+    from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS
+
+    # VOMITING no-op gate.
+    is_vomiting = state.status.timed_statuses[int(_TS.VOMITING)] > jnp.int32(0)
+
+    # WOUNDED_LEGS limp: 30% chance to NOOP the move.
+    rng, rng_wl = jax.random.split(rng)
+    wl_roll = jax.random.uniform(rng_wl)
+    is_wounded = state.status.timed_statuses[int(_TS.WOUNDED_LEGS)] > jnp.int32(0)
+    do_limp = is_wounded & (wl_roll < jnp.float32(0.3))
+
+    # Any no-op gate → skip movement entirely.
+    noop_gate = state.swallow.swallowed | is_vomiting | do_limp
+
     return jax.lax.cond(
-        state.swallow.swallowed,
+        noop_gate,
         lambda s: s,
         lambda s: _try_step_inner(s, dy, dx, rng),
         state,
@@ -314,12 +338,31 @@ def _try_step(state, dy: int, dx: int, rng: jax.Array):
 
 
 def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
-    """Inner body of _try_step — runs only when player is not swallowed."""
+    """Inner body of _try_step — runs only when no no-op gate applies."""
+    from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS
+
+    # -------------------------------------------------------------------
+    # Confused / stunned direction randomization.
+    # Cite: vendor/nethack/src/hack.c:2424 — when CONFUSED or STUNNED,
+    # movement direction is randomized with probability 0.5.
+    # JIT-pure: use jnp.where to swap computed dy/dx with random direction.
+    # -------------------------------------------------------------------
+    confused = state.status.timed_statuses[int(_TS.CONFUSION)] > jnp.int32(0)
+    stunned  = state.status.timed_statuses[int(_TS.STUNNED)]   > jnp.int32(0)
+    impaired = confused | stunned
+
+    rng, rng_imp, rng_dy, rng_dx = jax.random.split(rng, 4)
+    do_randomize = impaired & (jax.random.uniform(rng_imp) < jnp.float32(0.5))
+    rand_dy = jax.random.randint(rng_dy, (), -1, 2).astype(jnp.int32)
+    rand_dx = jax.random.randint(rng_dx, (), -1, 2).astype(jnp.int32)
+    eff_dy = jnp.where(do_randomize, rand_dy, jnp.int32(dy))
+    eff_dx = jnp.where(do_randomize, rand_dx, jnp.int32(dx))
+
     terrain_2d = _current_level_terrain(state)
     map_h, map_w = terrain_2d.shape
 
     pos    = state.player_pos.astype(jnp.int32)
-    target = pos + jnp.array([dy, dx], dtype=jnp.int32)
+    target = pos + jnp.stack([eff_dy, eff_dx])
 
     # Bounds check
     in_bounds = (
@@ -363,7 +406,25 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
         new_xp = (attacked.player_xp.astype(jnp.int32) + xp_gain).astype(
             attacked.player_xp.dtype
         )
-        return attacked.replace(player_xp=new_xp)
+        attacked = attacked.replace(player_xp=new_xp)
+
+        # Confuse-attack-on-hit: if confuse_attack_pending is set and the
+        # strike landed (target still alive indicates a hit occurred even if
+        # not killed; use _hit flag from _combat_melee_attack).
+        # Cite: vendor/nethack/src/spell.c SPE_CONFUSE_MONSTER — player's
+        # next melee hit confuses the target.
+        pending = attacked.status.confuse_attack_pending
+        apply_confuse_hit = pending & _hit & ~killed
+        old_ct = attacked.monster_ai.confuse_timer[monster_idx].astype(jnp.int32)
+        new_ct = jnp.where(apply_confuse_hit, jnp.maximum(old_ct, jnp.int32(15)), old_ct)
+        new_ct_arr = attacked.monster_ai.confuse_timer.at[monster_idx].set(
+            new_ct.astype(attacked.monster_ai.confuse_timer.dtype)
+        )
+        new_mai = attacked.monster_ai.replace(confuse_timer=new_ct_arr)
+        # Clear the pending flag after any hit (hit or kill).
+        new_pending = jnp.where(pending & _hit, jnp.bool_(False), pending)
+        new_status = attacked.status.replace(confuse_attack_pending=new_pending)
+        return attacked.replace(monster_ai=new_mai, status=new_status)
 
     # _attack_branch must return the same pytree shape as _move_branch
     # (below).  We construct that by computing the full movement state and
@@ -371,7 +432,7 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
     return jax.lax.cond(
         monster_present,
         _attack_branch,
-        lambda s: _move_branch(s, dy, dx, rng, target, in_bounds, terrain_2d, map_h, map_w),
+        lambda s: _move_branch(s, eff_dy, eff_dx, rng, target, in_bounds, terrain_2d, map_h, map_w),
         state,
     )
 
@@ -552,6 +613,36 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     state_final = state_final.replace(
         engrave=state_final.engrave.replace(has_engraving=new_has_engraving)
     )
+
+    # --- Water entry/exit (hack.c::pooleffects line 3304 / swimeffect line 3237) ---
+    # After moving, update player_in_water based on the new tile.
+    # SWIMMING intrinsic (prop.h:51, hack.c) keeps player on surface — no submersion.
+    # Cite: vendor/nethack/src/hack.c::pooleffects line 3304 (enter),
+    #        vendor/nethack/src/hack.c lines 3237-3268 (exit / swimeffect).
+    # TODO (Wave 5): Plane of Water surface levels — player on water but not underwater.
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intrinsic
+    _new_r = state_final.player_pos[0].astype(jnp.int32)
+    _new_c = state_final.player_pos[1].astype(jnp.int32)
+    _new_tile = _current_level_terrain(state_final)[
+        jnp.clip(_new_r, 0, map_h - 1),
+        jnp.clip(_new_c, 0, map_w - 1),
+    ].astype(jnp.int32)
+    _is_water_tile = (
+        (_new_tile == jnp.int32(TileType.WATER))
+        | (_new_tile == jnp.int32(TileType.POOL))
+    )
+    _has_swimming = (
+        state_final.status.intrinsics[int(_Intrinsic.SWIMMING)]
+        | (state_final.status.timed_intrinsics[int(_Intrinsic.SWIMMING)] > jnp.int32(0))
+    )
+    # On a water tile: submerge only if NOT swimming.
+    # On a non-water tile or no actual move: preserve or clear flag.
+    _new_in_water = jnp.where(
+        actually_moved,
+        _is_water_tile & ~_has_swimming,
+        state_final.player_in_water,
+    )
+    state_final = state_final.replace(player_in_water=_new_in_water)
 
     return _apply_fov(state_final)
 
@@ -1235,6 +1326,50 @@ def _handle_ride(state, rng):
     )
 
 
+def _handle_enhance(state, rng):
+    """#enhance — advance an eligible skill tier.
+
+    Cite: vendor/nethack/src/weapon.c::enhance_weapon_skill line 1329.
+
+    Auto-picks the first eligible skill (vendor shows a menu; we cannot in
+    headless JAX).  A skill is eligible when:
+      advance[i] >= practice_needed_to_advance(level[i])  AND  level[i] < max_level[i]
+
+    JIT-pure: iterates skills via lax.fori_loop, stops at first eligible.
+
+    Note: vendor gates enhancement on weapon_slots; that is not yet modelled.
+    Note: per-skill practice threshold variation (e.g. martial arts) is TODO;
+          vendor uses uniform level*level*20 for all skills.
+    """
+    from Nethax.nethax.subsystems.skills import (
+        N_SKILLS as _N_SKILLS,
+        practice_needed_to_advance as _pnta,
+        try_advance_skill as _try_adv,
+    )
+
+    def _body(i, carry):
+        s, done = carry
+        sk = s.skills
+        cur_lv  = sk.level[i].astype(jnp.int32)
+        cur_adv = sk.advance[i].astype(jnp.int32)
+        cap     = sk.max_level[i].astype(jnp.int32)
+        threshold = _pnta(cur_lv)
+        eligible = (cur_adv >= threshold) & (cur_lv < cap) & ~done
+        new_s = jax.lax.cond(
+            eligible,
+            lambda st: _try_adv(st, jnp.int32(i)),
+            lambda st: st,
+            s,
+        )
+        new_done = done | eligible
+        return new_s, new_done
+
+    final_state, _found = jax.lax.fori_loop(
+        0, _N_SKILLS, _body, (state, jnp.bool_(False))
+    )
+    return final_state
+
+
 # ---------------------------------------------------------------------------
 # Handler tuple — indexed by handler slot (0 = noop, 1-8 = move, 9-16 = run,
 #                                          17 = stair_up, 18 = stair_down,
@@ -1287,6 +1422,7 @@ _HANDLERS = (
     _handle_name,       # 42  vendor/nethack/src/do_name.c::do_oname (Wave 6)
     _handle_ride,       # 43  vendor/nethack/src/steed.c::doride
     _handle_invoke,     # 44  vendor/nethack/src/artifact.c::arti_invoke
+    _handle_enhance,    # 45  vendor/nethack/src/weapon.c::enhance_weapon_skill line 1329
 )
 
 # Slot indices for each named handler.
@@ -1341,6 +1477,8 @@ _SLOT_NAME       = 42
 _SLOT_RIDE       = 43
 # Artifact invoke (#invoke / M-i).
 _SLOT_INVOKE     = 44
+# #enhance — advance weapon/spell skill (M-e per vendor cmd.c:1716).
+_SLOT_ENHANCE    = 45
 
 # ---------------------------------------------------------------------------
 # 256-entry lookup table: action ASCII value → handler slot index
@@ -1517,11 +1655,7 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     table[_M_byte("c")] = _SLOT_NOOP   # cmd.c::dotalk (chat)
     table[_M_byte("C")] = _SLOT_NOOP   # cmd.c::doconduct
     table[_M_byte("d")] = _SLOT_NOOP   # cmd.c::dodip
-    table[_M_byte("e")] = _SLOT_EAT    # cmd.c::doeat is 'e'; M-e (enhance)
-                                       # is the actual extcmdlist entry — we
-                                       # alias to EAT here so any agent that
-                                       # sends Meta-e for "eat via #" still
-                                       # routes correctly.
+    table[_M_byte("e")] = _SLOT_ENHANCE  # cmd.c:1716 — M('e') → enhance_weapon_skill
     table[_M_byte("f")] = _SLOT_NOOP   # cmd.c::doforce
     table[_M_byte("g")] = _SLOT_NOOP   # cmd.c::dogenocided
     table[_M_byte("i")] = _SLOT_INVOKE  # cmd.c::doinvoke → artifact.c::arti_invoke
@@ -1638,10 +1772,11 @@ _COMPACT_ENGRAVE    = 27
 _COMPACT_NAME       = 28
 _COMPACT_INVOKE     = 29
 _COMPACT_RIDE       = 30
+_COMPACT_ENHANCE    = 31
 
 
 def _build_compact_handlers():
-    """Return the 31-entry tuple of ``(state, rng, dir_idx) -> state`` handlers."""
+    """Return the 32-entry tuple of ``(state, rng, dir_idx) -> state`` handlers."""
     return (
         _wrap_no_dir(_noop),          # 0  COMPACT_NOOP
         _move_shared,                 # 1  COMPACT_MOVE  (dir_idx ∈ [0,7])
@@ -1674,6 +1809,7 @@ def _build_compact_handlers():
         _wrap_no_dir(_handle_name),   # 28
         _wrap_no_dir(_handle_invoke), # 29  COMPACT_INVOKE
         _wrap_no_dir(_handle_ride),   # 30  COMPACT_RIDE  — steed.c:178
+        _wrap_no_dir(_handle_enhance),# 31  COMPACT_ENHANCE — weapon.c:1329
     )
 
 
@@ -1681,8 +1817,8 @@ _COMPACT_HANDLERS: tuple = _build_compact_handlers()
 
 
 def _build_slot_to_compact() -> jnp.ndarray:
-    """Map legacy handler slot (0..44) → compact slot (0..29)."""
-    table = [0] * 45
+    """Map legacy handler slot (0..45) → compact slot (0..31)."""
+    table = [0] * 46
     # Movement slots 1..8 → COMPACT_MOVE.
     for s in (_SLOT_MOVE_N, _SLOT_MOVE_E, _SLOT_MOVE_S, _SLOT_MOVE_W,
               _SLOT_MOVE_NE, _SLOT_MOVE_SE, _SLOT_MOVE_SW, _SLOT_MOVE_NW):
@@ -1720,6 +1856,7 @@ def _build_slot_to_compact() -> jnp.ndarray:
     table[_SLOT_NAME]       = _COMPACT_NAME
     table[_SLOT_RIDE]       = _COMPACT_RIDE   # steed.c:178 doride
     table[_SLOT_INVOKE]     = _COMPACT_INVOKE
+    table[_SLOT_ENHANCE]    = _COMPACT_ENHANCE  # weapon.c:1329 enhance_weapon_skill
     return jnp.array(table, dtype=jnp.int32)
 
 
@@ -1729,7 +1866,7 @@ def _build_slot_to_dir_idx() -> jnp.ndarray:
     Non-movement slots map to 0 (the direction is unused for those branches).
     The order matches ``_DIR_TABLE``: N=0, E=1, S=2, W=3, NE=4, SE=5, SW=6, NW=7.
     """
-    table = [0] * 45
+    table = [0] * 46
     # Move slots.
     table[_SLOT_MOVE_N]  = 0
     table[_SLOT_MOVE_E]  = 1

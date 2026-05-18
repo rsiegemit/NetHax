@@ -51,10 +51,16 @@ from Nethax.nethax.constants.monsters import (
     M1_POIS,
     M1_ACID,
     M2_GIANT,
+    M2_HUMAN,
+    M2_ELF,
+    M2_DWARF,
+    M2_GNOME,
+    M2_ORC,
 )
 from Nethax.nethax.subsystems.status_effects import (
     StatusState,
     Intrinsic,
+    TimedStatus,
     N_INTRINSICS,
 )
 
@@ -300,3 +306,180 @@ def apply_corpse_postfx(
     state = state.replace(player_str=new_str)
 
     return state
+
+
+# ---------------------------------------------------------------------------
+# Corpse age / rotten effects
+# cite: vendor/nethack/src/eat.c::eatcorpse lines 1884-1916
+# ---------------------------------------------------------------------------
+
+# Age threshold (turns) beyond which a corpse is tainted.
+# eat.c:1887 rotted=(moves-age)/(10+rn2(20)); tainted if rotted>5.
+# Conservative worst-case: age>50 turns (50/10=5 exactly at minimum divisor).
+_CORPSE_AGE_THRESHOLD: int = 50
+
+
+def apply_old_corpse_effects(state, rng: jax.Array, is_old: jnp.ndarray):
+    """Apply VOMITING + SICK when eating a tainted/old corpse.
+
+    cite: vendor/nethack/src/eat.c::eatcorpse lines 1895-1916
+      rotted > 5L -> make_sick(rn1(10,10), ..., SICK_VOMITABLE)
+    When corpse_creation_turn is tracked: is_old = (timestep - creation) > 50.
+    JIT-pure.
+    """
+    rng, rng_sick = jax.random.split(rng)
+    sick_time = jax.random.randint(rng_sick, (), 11, 21).astype(jnp.int32)
+
+    cur_sick = state.status.timed_statuses[int(TimedStatus.SICK)]
+    new_sick = jnp.where(is_old, jnp.maximum(cur_sick, sick_time), cur_sick)
+    new_ts = state.status.timed_statuses.at[int(TimedStatus.SICK)].set(new_sick)
+
+    rng, rng_vom = jax.random.split(rng)
+    vom_time = jax.random.randint(rng_vom, (), 11, 26).astype(jnp.int32)
+    cur_vom = new_ts[int(TimedStatus.VOMITING)]
+    new_vom = jnp.where(is_old, jnp.maximum(cur_vom, vom_time), cur_vom)
+    new_ts = new_ts.at[int(TimedStatus.VOMITING)].set(new_vom)
+
+    new_sick_kind = jnp.where(is_old, jnp.int8(1), state.status.sick_kind)
+    new_status = state.status.replace(timed_statuses=new_ts, sick_kind=new_sick_kind)
+    return state.replace(status=new_status)
+
+
+# ---------------------------------------------------------------------------
+# Cannibalism penalty
+# cite: vendor/nethack/src/eat.c::maybe_cannibal lines 757-788
+#       eat.c:775 your_race(fptr) checks mflags2 race bits vs player race
+# ---------------------------------------------------------------------------
+
+# Map Race enum index -> M2_* race bit.
+# Verified: all 5 races (HUMAN/ELF/DWARF/GNOME/ORC) present in monsters.py.
+# cite: eat.c:775 your_race(fptr) -- compares permonst.mflags2 race bit.
+_RACE_M2_TABLE: np.ndarray = np.array(
+    [M2_HUMAN, M2_ELF, M2_DWARF, M2_GNOME, M2_ORC], dtype=np.int32
+)
+_MONSTER_RACE_BITS_NP: np.ndarray = np.array(
+    [
+        int(m.flags2) & (M2_HUMAN | M2_ELF | M2_DWARF | M2_GNOME | M2_ORC)
+        for m in MONSTERS
+    ],
+    dtype=np.int32,
+)
+_MONSTER_RACE_BITS: jnp.ndarray = jnp.array(_MONSTER_RACE_BITS_NP, dtype=jnp.int32)
+_RACE_M2_JAX: jnp.ndarray = jnp.array(_RACE_M2_TABLE, dtype=jnp.int32)
+
+
+def apply_cannibalism_penalty(state, monster_entry_idx: jnp.ndarray):
+    """Apply alignment hit + CONFUSION for same-race cannibalism.
+
+    cite: vendor/nethack/src/eat.c::maybe_cannibal lines 770-786
+      your_race check -> HAggravate_monster + change_luck(-rn1(4,2))
+      -> alignment_record -= 2; CONFUSION set ~20 turns.
+    All 5 races covered by _RACE_M2_TABLE (HUMAN/ELF/DWARF/GNOME/ORC).
+    """
+    safe_idx = jnp.clip(monster_entry_idx, 0, NUMMONS - 1)
+    corpse_race_bits = _MONSTER_RACE_BITS[safe_idx]
+    safe_race = jnp.clip(state.player_race.astype(jnp.int32), 0, 4)
+    player_m2 = _RACE_M2_JAX[safe_race]
+    is_cannibal = (monster_entry_idx >= jnp.int32(0)) & (
+        (corpse_race_bits & player_m2) != jnp.int32(0)
+    )
+
+    new_record = jnp.where(
+        is_cannibal,
+        (state.prayer.alignment_record - jnp.int16(2)).astype(jnp.int16),
+        state.prayer.alignment_record,
+    )
+    new_prayer = state.prayer.replace(alignment_record=new_record)
+
+    cur_conf = state.status.timed_statuses[int(TimedStatus.CONFUSION)]
+    new_conf = jnp.where(is_cannibal, jnp.maximum(cur_conf, jnp.int32(20)), cur_conf)
+    new_ts = state.status.timed_statuses.at[int(TimedStatus.CONFUSION)].set(new_conf)
+    new_status = state.status.replace(timed_statuses=new_ts)
+    return state.replace(prayer=new_prayer, status=new_status)
+
+
+# ---------------------------------------------------------------------------
+# Tin opening counter
+# cite: vendor/nethack/src/eat.c::opentin / consume_tin
+#       blessed->30 turns, uncursed->50 turns to open
+# ---------------------------------------------------------------------------
+
+
+def apply_tin_open_start(
+    state, is_tin: jnp.ndarray, type_id: jnp.ndarray, is_blessed: jnp.ndarray
+):
+    """Begin opening a tin: set tin_opening_turns_left and type_id.
+
+    cite: vendor/nethack/src/eat.c consume_tin area, line 1370 area.
+    """
+    turns = jnp.where(is_blessed, jnp.int8(30), jnp.int8(50))
+    new_turns = jnp.where(is_tin, turns, state.tin_opening_turns_left)
+    new_type = jnp.where(
+        is_tin, type_id.astype(jnp.int16), state.tin_opening_type_id
+    )
+    return state.replace(tin_opening_turns_left=new_turns, tin_opening_type_id=new_type)
+
+
+def tick_tin_opening(state):
+    """Decrement tin-opening counter by 1 (floor 0).
+
+    cite: vendor/nethack/src/eat.c::opentin -- called each turn while opening.
+    """
+    cur = state.tin_opening_turns_left.astype(jnp.int32)
+    new_val = jnp.maximum(cur - jnp.int32(1), jnp.int32(0)).astype(jnp.int8)
+    return state.replace(tin_opening_turns_left=new_val)
+
+
+# ---------------------------------------------------------------------------
+# Eattin -- consume opened tin
+# cite: vendor/nethack/src/eat.c::consume_tin lines 1527-1698
+# ---------------------------------------------------------------------------
+
+
+def apply_eattin(state, rng: jax.Array, item):
+    """Apply effects of eating an opened tin.
+
+    1. Spinach (enchantment==1 -> vendor spe==1): +1 STR clamped at 18.
+       cite: eat.c:1684 gainstr(tin, 0, FALSE); eat.c:1470 obj->spe=1 spinach.
+    2. Monster-meat (corpse_entry_idx>=0, not spinach): delegate to
+       apply_corpse_postfx for same intrinsics as eating the corpse.
+       cite: eat.c:1611-1613 cprefx(mnum)/cpostfx(mnum).
+    3. Poisoned tin (tin_poisoned==True): rnd(15) HP damage + SICK timer.
+       cite: eat.c:1537 if (tin->otrapped || (tin->cursed && !rn2(8))).
+    JIT-pure.
+    """
+    is_spinach = item.enchantment == jnp.int8(1)
+    corpse_idx = item.corpse_entry_idx.astype(jnp.int32)
+    is_monster_tin = (~is_spinach) & (corpse_idx >= jnp.int32(0))
+    is_poisoned_tin = item.tin_poisoned
+
+    # 1. Spinach: +1 STR clamped at 18
+    new_str = jnp.where(
+        is_spinach,
+        jnp.minimum(state.player_str + jnp.int16(1), jnp.int16(18)),
+        state.player_str,
+    )
+    state = state.replace(player_str=new_str)
+
+    # 2. Monster-meat intrinsics via apply_corpse_postfx
+    effective_idx = jnp.where(is_monster_tin, corpse_idx, jnp.int32(-1))
+    state = apply_corpse_postfx(state, rng, effective_idx)
+
+    # 3. Poisoned tin: rnd(15) HP damage + SICK
+    rng, rng_dmg = jax.random.split(rng)
+    poison_dmg = jax.random.randint(rng_dmg, (), 1, 16).astype(jnp.int32)
+    new_hp = jnp.where(
+        is_poisoned_tin,
+        jnp.maximum(state.player_hp - poison_dmg, jnp.int32(0)),
+        state.player_hp,
+    )
+    state = state.replace(player_hp=new_hp)
+
+    cur_sick = state.status.timed_statuses[int(TimedStatus.SICK)]
+    new_sick = jnp.where(
+        is_poisoned_tin, jnp.maximum(cur_sick, jnp.int32(10)), cur_sick
+    )
+    new_ts = state.status.timed_statuses.at[int(TimedStatus.SICK)].set(new_sick)
+    new_sick_kind = jnp.where(is_poisoned_tin, jnp.int8(1), state.status.sick_kind)
+    new_status = state.status.replace(timed_statuses=new_ts, sick_kind=new_sick_kind)
+    return state.replace(status=new_status)

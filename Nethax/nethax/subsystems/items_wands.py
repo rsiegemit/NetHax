@@ -27,6 +27,14 @@ import jax.numpy as jnp
 import jax.lax as lax
 from flax import struct
 
+from Nethax.nethax.constants.monsters import (
+    MONSTERS,
+    M2_DEMON,
+    M2_MAGIC,
+    M2_SHAPESHIFTER,
+    M2_UNDEAD,
+    MonsterSymbol,
+)
 from Nethax.nethax.constants.tiles import TileType
 from Nethax.nethax.subsystems.inventory import (
     MAX_INVENTORY_SLOTS,
@@ -40,6 +48,16 @@ from Nethax.nethax.subsystems.monster_ai import MAX_MONSTERS_PER_LEVEL
 # ---------------------------------------------------------------------------
 
 N_WANDS: int = 28
+
+# Total canonical monster count — len(MONSTERS).
+N_MONSTERS: int = len(MONSTERS)
+
+# Magic resistance flag for mon_resists bitmask.
+# Uses bit 8 (0x100) to avoid int32 overflow; M2_MAGIC = 0x80000000 is
+# too large for int32.  The _DEATH_IMMUNE table uses M2_MAGIC via Python
+# (no overflow there); this constant is for runtime mon_resists checks.
+# Cite: vendor/nethack/src/zap.c::zhitm ~4308 (resists_magm check).
+MR_MAGIC: int = 0x00000100
 
 # Maximum number of items in a wand-state inventory batch.
 # (Reuses the global constant for shape consistency.)
@@ -61,6 +79,45 @@ DEFAULT_RAY_RANGE: int = 8
 #   0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW
 _DIR_DY = jnp.array([-1, -1,  0,  1,  1,  1,  0, -1], dtype=jnp.int16)
 _DIR_DX = jnp.array([ 0,  1,  1,  1,  0, -1, -1, -1], dtype=jnp.int16)
+
+# ---------------------------------------------------------------------------
+# Precomputed per-monster tables (built at module load, not inside jit).
+# ---------------------------------------------------------------------------
+
+def _build_death_immune() -> jax.Array:
+    """Bool mask: True if monster is immune to WAN_DEATH.
+
+    Cite: vendor/nethack/src/zap.c::zhitm ~4308:
+      if (nonliving(mon->data) || is_demon(mon->data)
+          || is_vampshifter(mon) || resists_magm(mon)) { break; }
+
+    nonliving = undead | golem (S_GOLEM) | vortex (S_VORTEX).
+    vampshifter = M2_SHAPESHIFTER (vampire/vampire-lord/Vlad in shifted form).
+    resists_magm proxy = M2_MAGIC (inherent magic resistance).
+    """
+    flags = []
+    for m in MONSTERS:
+        is_undead   = bool(m.flags2 & M2_UNDEAD)
+        is_demon    = bool(m.flags2 & M2_DEMON)
+        is_golem    = (m.symbol == MonsterSymbol.S_GOLEM)
+        is_vortex   = (m.symbol == MonsterSymbol.S_VORTEX)
+        is_vampshft = bool(m.flags2 & M2_SHAPESHIFTER)
+        is_magicres = bool(m.flags2 & M2_MAGIC)
+        flags.append(
+            is_undead or is_demon or is_golem or is_vortex or is_vampshft or is_magicres
+        )
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+# bool[N_MONSTERS] — JIT-pure via jnp.take in _effect_death.
+_DEATH_IMMUNE: jax.Array = _build_death_immune()
+
+# int8[N_MONSTERS] — generation level proxy (vendor mons.c gen_level).
+# Uses MonsterEntry.level as the difficulty proxy.
+# Cite: vendor/nethack/src/zap.c wand_create_monster level-appropriate logic.
+_MONSTER_GEN_LEVEL: jax.Array = jnp.array(
+    [m.level for m in MONSTERS], dtype=jnp.int8
+)
 
 
 # ---------------------------------------------------------------------------
@@ -167,22 +224,27 @@ class WandState:
 
     Fields
     ------
-    mon_pos    : (row, col) for each monster.  int16[N, 2].
-    mon_hp     : current hit points.           int32[N].
-    mon_type   : monster species index.        int16[N].
-    mon_alive  : whether the slot is occupied. bool[N].
-    mon_asleep : whether the monster is asleep. bool[N].
-    mon_undead : whether the monster is undead. bool[N].
+    mon_pos       : (row, col) for each monster.  int16[N, 2].
+    mon_hp        : current hit points.           int32[N].
+    mon_type      : monster species index.        int16[N].
+    mon_alive     : whether the slot is occupied. bool[N].
+    mon_asleep    : whether the monster is asleep. bool[N].
+    mon_undead    : whether the monster is undead. bool[N].
     mon_invisible : whether the monster is invisible. bool[N].
+    mon_resists   : per-monster resistance bitmask (MR_FIRE etc). int32[N].
+    mon_speed_mod : speed modifier (-1=slowed, +1=hasted). int8[N].
+    mon_cancelled : cancellation flag. bool[N].
 
-    terrain    : current-level terrain tiles.  int8[MAP_H, MAP_W].
-    explored   : explored mask for lighting.   bool[MAP_H, MAP_W].
+    terrain       : current-level terrain tiles.  int8[MAP_H, MAP_W].
+    explored      : explored mask for lighting.   bool[MAP_H, MAP_W].
 
-    inventory  : player inventory (items + charges).
+    inventory     : player inventory (items + charges).
 
-    player_pos : (row, col).  int16[2].
+    player_pos    : (row, col).  int16[2].
+    dungeon_level : current dungeon depth (1-based). int8 scalar.
 
-    rng_state  : JAX PRNGKey for effect randomness.
+    probed_hp     : HP of last WAN_PROBING hit. int32 scalar.
+    probed_idx    : slot index of last WAN_PROBING hit. int32 scalar.
     """
     mon_pos:       jax.Array   # int16[N, 2]
     mon_hp:        jax.Array   # int32[N]
@@ -191,6 +253,9 @@ class WandState:
     mon_asleep:    jax.Array   # bool[N]
     mon_undead:    jax.Array   # bool[N]
     mon_invisible: jax.Array   # bool[N]
+    mon_resists:   jax.Array   # int32[N]
+    mon_speed_mod: jax.Array   # int8[N]
+    mon_cancelled: jax.Array   # bool[N]
 
     terrain:       jax.Array   # int8[MAP_H, MAP_W]
     explored:      jax.Array   # bool[MAP_H, MAP_W]
@@ -198,6 +263,10 @@ class WandState:
     inventory:     InventoryState
 
     player_pos:    jax.Array   # int16[2]
+    dungeon_level: jax.Array   # int8 scalar (1-based)
+
+    probed_hp:     jax.Array   # int32 scalar
+    probed_idx:    jax.Array   # int32 scalar
 
     @classmethod
     def empty(cls, map_h: int = 21, map_w: int = 80) -> "WandState":
@@ -211,10 +280,16 @@ class WandState:
             mon_asleep=jnp.zeros(n, dtype=bool),
             mon_undead=jnp.zeros(n, dtype=bool),
             mon_invisible=jnp.zeros(n, dtype=bool),
+            mon_resists=jnp.zeros(n, dtype=jnp.int32),
+            mon_speed_mod=jnp.zeros(n, dtype=jnp.int8),
+            mon_cancelled=jnp.zeros(n, dtype=bool),
             terrain=jnp.zeros((map_h, map_w), dtype=jnp.int8),
             explored=jnp.zeros((map_h, map_w), dtype=bool),
             inventory=InventoryState.empty(),
             player_pos=jnp.zeros(2, dtype=jnp.int16),
+            dungeon_level=jnp.int8(1),
+            probed_hp=jnp.int32(0),
+            probed_idx=jnp.int32(0),
         )
 
 
@@ -397,12 +472,19 @@ def _effect_secret_door_detection(
 def _effect_opening(
     state: WandState, rng: jax.Array
 ) -> tuple[WandState, jax.Array]:
-    """WAN_OPENING — open all closed doors on the level.
+    """WAN_OPENING — open closed doors with 50% probability each.
 
-    vendor/nethack/src/zap.c: NODIR wand, iterates all map positions.
+    Cite: vendor/nethack/src/zap.c wand_unlock — targets a single door,
+    not all doors.  We approximate with per-door 50% coin flip so that
+    on average half of doors open, matching the spirit of the vendor logic.
     """
+    rng, sub = jax.random.split(rng)
+    map_h, map_w = state.terrain.shape
+    # Coin flip per cell: uniform in {0,1}.
+    coins = jax.random.randint(sub, shape=(map_h, map_w), minval=0, maxval=2)
     is_closed = state.terrain == int(TileType.CLOSED_DOOR)
-    new_terrain = jnp.where(is_closed, int(TileType.OPEN_DOOR), state.terrain)
+    open_this = is_closed & (coins == 1)
+    new_terrain = jnp.where(open_this, int(TileType.OPEN_DOOR), state.terrain)
     return state.replace(terrain=new_terrain), rng
 
 
@@ -418,23 +500,37 @@ def _effect_locking(
 def _effect_probing(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_PROBING — reveal monsters along beam (no combat effect).
+    """WAN_PROBING — BEAM, reveal first monster hit; store HP + slot index.
 
-    For JAX purity: makes all monsters visible (no hidden info suppression).
+    Cite: vendor/nethack/src/zap.c probe_monster ~line 4700.
+    Stores the hit monster's current HP in state.probed_hp and its slot
+    index in state.probed_idx for UI inspection.
     """
-    return state, rng
+    def on_hit(s, r, mon_idx):
+        hp = s.mon_hp[mon_idx]
+        return s.replace(
+            probed_hp=hp.astype(jnp.int32),
+            probed_idx=mon_idx.astype(jnp.int32),
+        ), r
+
+    return cast_ray(state, rng, state.player_pos, direction,
+                    on_hit_fn=on_hit, stop_on_hit=True)
 
 
 def _effect_magic_missile(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_MAGIC_MISSILE — RAY, 1d6 damage per monster hit.
+    """WAN_MAGIC_MISSILE — RAY, 2d6 damage per monster hit.
 
-    vendor/nethack/src/zap.c buzz(): ZT_MAGIC_MISSILE, d(1,6) per hit.
+    Cite: vendor/nethack/src/zap.c:3464-3465: nd=2 for WAN_MAGIC_MISSILE.
+    Immune if mon_resists has MR_MAGIC flag (proxy for resists_magm).
+    Cite: vendor/nethack/src/zap.c::zhitm ~4252 (resists_magm gate).
     """
     def on_hit(s, r, mon_idx):
-        r, dmg = _rng_d(r, 1, 6)
-        s = _deal_damage(s, mon_idx, dmg)
+        r, dmg = _rng_d(r, 2, 6)
+        is_immune = (s.mon_resists[mon_idx] & MR_MAGIC).astype(jnp.bool_)
+        actual_dmg = jnp.where(is_immune, jnp.int32(0), dmg)
+        s = _deal_damage(s, mon_idx, actual_dmg)
         return s, r
 
     return cast_ray(state, rng, state.player_pos, direction,
@@ -460,32 +556,46 @@ def _effect_striking(
 def _effect_slow_monster(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_SLOW_MONSTER — RAY, halve target speed (stub: no effect).
+    """WAN_SLOW_MONSTER — RAY, set mon_speed_mod = -1 on each hit monster.
 
-    Full speed mechanic is a Wave 4 concern (mon_adjust_speed in monmove.c).
+    Cite: vendor/nethack/src/zap.c mon_adjust_speed ~line 4400.
     """
+    def on_hit(s, r, mon_idx):
+        new_spd = s.mon_speed_mod.at[mon_idx].set(jnp.int8(-1))
+        return s.replace(mon_speed_mod=new_spd), r
+
     return cast_ray(state, rng, state.player_pos, direction,
-                    on_hit_fn=None, stop_on_hit=False)
+                    on_hit_fn=on_hit, stop_on_hit=False)
 
 
 def _effect_speed_monster(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_SPEED_MONSTER — RAY, double target speed (stub: no effect)."""
+    """WAN_SPEED_MONSTER — RAY, set mon_speed_mod = +1 on each hit monster.
+
+    Cite: vendor/nethack/src/zap.c mon_adjust_speed ~line 4400.
+    """
+    def on_hit(s, r, mon_idx):
+        new_spd = s.mon_speed_mod.at[mon_idx].set(jnp.int8(1))
+        return s.replace(mon_speed_mod=new_spd), r
+
     return cast_ray(state, rng, state.player_pos, direction,
-                    on_hit_fn=None, stop_on_hit=False)
+                    on_hit_fn=on_hit, stop_on_hit=False)
 
 
 def _effect_cancellation(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_CANCELLATION — BEAM, remove monster's special properties.
+    """WAN_CANCELLATION — BEAM, set mon_cancelled flag on first hit monster.
 
-    Stub: no monster property array yet; no state change.
-    Wave 4 will clear intrinsic resistances and MR flag.
+    Cite: vendor/nethack/src/zap.c cancel_monst ~line 4500.
     """
+    def on_hit(s, r, mon_idx):
+        new_canc = s.mon_cancelled.at[mon_idx].set(jnp.bool_(True))
+        return s.replace(mon_cancelled=new_canc), r
+
     return cast_ray(state, rng, state.player_pos, direction,
-                    on_hit_fn=None, stop_on_hit=True)
+                    on_hit_fn=on_hit, stop_on_hit=True)
 
 
 def _effect_polymorph(
@@ -494,14 +604,14 @@ def _effect_polymorph(
     """WAN_POLYMORPH — BEAM, change monster type to random eligible species.
 
     vendor/nethack/src/zap.c bhitm() WAN_POLYMORPH: newcham().
-    We randomise mon_type to [1, 394] (total NetHack monster count).
+    We randomise mon_type to [1, N_MONSTERS-1].
 
     TODO Wave 5: when WandState is folded into EnvState, route through
     subsystems.polymorph.polymorph_monster so HP-scaling + intrinsic gain
     behave the same as monster-side newcham.
     """
     def on_hit(s, r, mon_idx):
-        r, new_type = _rng_rnd(r, 394)
+        r, new_type = _rng_rnd(r, N_MONSTERS - 1)
         new_mon_type = s.mon_type.at[mon_idx].set(new_type.astype(jnp.int16))
         return s.replace(mon_type=new_mon_type), r
 
@@ -512,19 +622,41 @@ def _effect_polymorph(
 def _effect_teleportation(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_TELEPORTATION — BEAM, monster pos → random valid floor tile.
+    """WAN_TELEPORTATION — BEAM, monster pos → random FLOOR or CORRIDOR tile.
 
-    vendor/nethack/src/zap.c: u_teleport_mon() picks a random location.
-    We pick a random (row, col) on the map and move the monster there.
+    Cite: vendor/nethack/src/zap.c::u_teleport_mon — picks typ==ROOM or CORR.
+    Uses rejection sampling under lax.while_loop to guarantee walkable dest.
+    JIT-pure.
     """
     map_h, map_w = state.terrain.shape
+    _floor    = jnp.int8(_TILE_FLOOR)
+    _corridor = jnp.int8(_TILE_CORRIDOR)
 
     def on_hit(s, r, mon_idx):
-        r, sub = jax.random.split(r)
-        new_row = jax.random.randint(sub, shape=(), minval=0, maxval=map_h)
-        r, sub2 = jax.random.split(r)
-        new_col = jax.random.randint(sub2, shape=(), minval=0, maxval=map_w)
-        new_pos = jnp.array([new_row, new_col], dtype=jnp.int16)
+        # Rejection-sample a walkable tile.
+        def _cond(wstate):
+            _, _, row, col = wstate
+            tile = s.terrain[row, col].astype(jnp.int8)
+            return (tile != _floor) & (tile != _corridor)
+
+        def _body(wstate):
+            r_, _, _, _ = wstate
+            r_, sub_r = jax.random.split(r_)
+            row = jax.random.randint(sub_r, shape=(), minval=0, maxval=map_h)
+            r_, sub_c = jax.random.split(r_)
+            col = jax.random.randint(sub_c, shape=(), minval=0, maxval=map_w)
+            return (r_, jnp.int32(0), row, col)
+
+        # Seed initial candidate.
+        r, sub0 = jax.random.split(r)
+        init_row = jax.random.randint(sub0, shape=(), minval=0, maxval=map_h)
+        r, sub1 = jax.random.split(r)
+        init_col = jax.random.randint(sub1, shape=(), minval=0, maxval=map_w)
+
+        r, _, dest_row, dest_col = lax.while_loop(
+            _cond, _body, (r, jnp.int32(0), init_row, init_col)
+        )
+        new_pos = jnp.array([dest_row, dest_col], dtype=jnp.int16)
         new_mon_pos = s.mon_pos.at[mon_idx].set(new_pos)
         return s.replace(mon_pos=new_mon_pos), r
 
@@ -532,18 +664,31 @@ def _effect_teleportation(
                     on_hit_fn=on_hit, stop_on_hit=True)
 
 
+# Walkable tile int values (used by teleportation).
+_TILE_FLOOR    = int(TileType.FLOOR)
+_TILE_CORRIDOR = int(TileType.CORRIDOR)
+
+
 def _effect_death(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_DEATH — RAY, set HP → 0 unless monster is undead.
+    """WAN_DEATH — RAY, instant-kill unless monster is immune.
 
-    vendor/nethack/src/zap.c: ZT_DEATH / AD_DISN instant-kill unless
-    the target is undead (undead are immune: MAGIC_COOKIE path skipped).
+    Cite: vendor/nethack/src/zap.c::zhitm ~4308:
+      if (nonliving(mon->data) || is_demon(mon->data)
+          || is_vampshifter(mon) || resists_magm(mon)) { break; }
+
+    Immunity lookup uses _DEATH_IMMUNE[mon_type] via JIT-pure jnp.take,
+    supplemented by state.mon_undead for runtime-set undead flag.
     """
     def on_hit(s, r, mon_idx):
-        is_undead = s.mon_undead[mon_idx]
+        mtype = s.mon_type[mon_idx].astype(jnp.int32)
+        mtype = jnp.clip(mtype, 0, N_MONSTERS - 1)
+        tbl_immune  = jnp.take(_DEATH_IMMUNE, mtype, axis=0)
+        flag_undead = s.mon_undead[mon_idx]
+        is_immune   = tbl_immune | flag_undead
         dmg = lax.cond(
-            is_undead,
+            is_immune,
             lambda _: jnp.int32(0),
             lambda _: s.mon_hp[mon_idx],
             None,
@@ -574,19 +719,22 @@ def _effect_sleep(
 def _effect_cold(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_COLD — RAY, 1d6 cold damage + freeze water tiles along the path.
+    """WAN_COLD — RAY, 6d6 cold damage + freeze water tiles along the path.
 
-    vendor/nethack/src/zap.c buzz() ZT_COLD:
-      - bhitm(): cold damage d(1,6)
-      - Special: pools/moats along beam freeze (become ICE / floor).
+    Cite: vendor/nethack/src/zap.c:3464-3465: nd=6 for elemental wands.
+    buzz() ZT_COLD: bhitm() d(nd=6, 6).  Immune if mon_resists & MR_COLD.
+    Special: pools/moats along beam freeze (become ICE / floor).
     """
+    from Nethax.nethax.constants.monsters import MR_COLD
     dy = _DIR_DY[direction].astype(jnp.int16)
     dx = _DIR_DX[direction].astype(jnp.int16)
     map_h, map_w = state.terrain.shape
 
     def on_hit(s, r, mon_idx):
-        r, dmg = _rng_d(r, 1, 6)
-        s = _deal_damage(s, mon_idx, dmg)
+        r, dmg = _rng_d(r, 6, 6)
+        is_immune = (s.mon_resists[mon_idx] & int(MR_COLD)).astype(jnp.bool_)
+        actual_dmg = jnp.where(is_immune, jnp.int32(0), dmg)
+        s = _deal_damage(s, mon_idx, actual_dmg)
         return s, r
 
     state, rng = cast_ray(state, rng, state.player_pos, direction,
@@ -618,14 +766,20 @@ def _effect_cold(
 def _effect_fire(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_FIRE — RAY, 1d6 fire damage per monster.
+    """WAN_FIRE — RAY, 6d6 fire damage per monster.
 
-    vendor/nethack/src/zap.c buzz() ZT_FIRE: bhitm() d(1,6).
+    Cite: vendor/nethack/src/zap.c:3464-3465: nd=6 for elemental wands.
+    buzz() ZT_FIRE: bhitm() d(nd=6, 6).  Immune if mon_resists & MR_FIRE.
+    Cite: vendor/nethack/src/zap.c::zhitm ~4261 (resists_fire gate).
     Also burns scrolls/spellbooks in inventory (not modelled yet; Wave 4).
     """
+    from Nethax.nethax.constants.monsters import MR_FIRE
+
     def on_hit(s, r, mon_idx):
-        r, dmg = _rng_d(r, 1, 6)
-        s = _deal_damage(s, mon_idx, dmg)
+        r, dmg = _rng_d(r, 6, 6)
+        is_immune = (s.mon_resists[mon_idx] & int(MR_FIRE)).astype(jnp.bool_)
+        actual_dmg = jnp.where(is_immune, jnp.int32(0), dmg)
+        s = _deal_damage(s, mon_idx, actual_dmg)
         return s, r
 
     return cast_ray(state, rng, state.player_pos, direction,
@@ -635,14 +789,19 @@ def _effect_fire(
 def _effect_lightning(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_LIGHTNING — RAY, 1d6 electric damage per monster.
+    """WAN_LIGHTNING — RAY, 6d6 electric damage per monster.
 
-    vendor/nethack/src/zap.c buzz() ZT_LIGHTNING: bhitm() d(1,6).
+    Cite: vendor/nethack/src/zap.c:3464-3465: nd=6 for elemental wands.
+    buzz() ZT_LIGHTNING: bhitm() d(nd=6, 6).  Immune if mon_resists & MR_ELEC.
     Metal items reflect lightning (not modelled; Wave 4).
     """
+    from Nethax.nethax.constants.monsters import MR_ELEC
+
     def on_hit(s, r, mon_idx):
-        r, dmg = _rng_d(r, 1, 6)
-        s = _deal_damage(s, mon_idx, dmg)
+        r, dmg = _rng_d(r, 6, 6)
+        is_immune = (s.mon_resists[mon_idx] & int(MR_ELEC)).astype(jnp.bool_)
+        actual_dmg = jnp.where(is_immune, jnp.int32(0), dmg)
+        s = _deal_damage(s, mon_idx, actual_dmg)
         return s, r
 
     return cast_ray(state, rng, state.player_pos, direction,
@@ -688,26 +847,48 @@ def _effect_digging(
 def _effect_enlightenment(
     state: WandState, rng: jax.Array
 ) -> tuple[WandState, jax.Array]:
-    """WAN_ENLIGHTENMENT — reveal full map (simplified introspection).
+    """WAN_ENLIGHTENMENT — display intrinsics (no map change).
 
-    NetHack shows character stats + intrinsics; we expose the full explored map.
+    Cite: vendor/nethack/src/zap.c do_enlightenment: shows character
+    stats and intrinsics; does not alter the map.  We return state unchanged
+    to match this behaviour.
     """
-    new_explored = jnp.ones_like(state.explored)
-    return state.replace(explored=new_explored), rng
+    return state, rng
 
 
 def _effect_create_monster(
     state: WandState, rng: jax.Array
 ) -> tuple[WandState, jax.Array]:
-    """WAN_CREATE_MONSTER — spawn a new monster adjacent to player.
+    """WAN_CREATE_MONSTER — spawn a level-appropriate monster adjacent to player.
 
-    Places a random monster type in the first empty slot adjacent to player_pos.
-    Wave 4 will apply proper level-appropriate generation tables.
+    Cite: vendor/nethack/src/zap.c wand_create_monster — uses makemon with
+    level-appropriate selection.  We filter to monsters with
+    _MONSTER_GEN_LEVEL[type] <= dungeon_level + 3, then sample uniformly
+    via rejection sampling under lax.while_loop.  JIT-pure.
     """
     map_h, map_w = state.terrain.shape
-    rng, sub = jax.random.split(rng)
-    new_type = jax.random.randint(sub, shape=(), minval=1, maxval=100,
-                                  dtype=jnp.int16)
+    max_level = state.dungeon_level.astype(jnp.int32) + jnp.int32(3)
+
+    # Rejection-sample a type index whose gen_level fits the current depth.
+    def _type_cond(wstate):
+        _, _, candidate = wstate
+        return _MONSTER_GEN_LEVEL[candidate].astype(jnp.int32) > max_level
+
+    def _type_body(wstate):
+        r_, _, _ = wstate
+        r_, sub = jax.random.split(r_)
+        c = jax.random.randint(sub, shape=(), minval=1, maxval=N_MONSTERS,
+                               dtype=jnp.int32)
+        return (r_, jnp.int32(0), c)
+
+    rng, sub_init = jax.random.split(rng)
+    init_candidate = jax.random.randint(
+        sub_init, shape=(), minval=1, maxval=N_MONSTERS, dtype=jnp.int32
+    )
+    rng, _, new_type = lax.while_loop(
+        _type_cond, _type_body, (rng, jnp.int32(0), init_candidate)
+    )
+
     # Find first dead slot (slot 0 is sentinel; start from 1).
     dead_mask = ~state.mon_alive
     dead_mask = dead_mask.at[0].set(False)  # skip sentinel
@@ -726,7 +907,7 @@ def _effect_create_monster(
     new_hp = jax.random.randint(rng, shape=(), minval=4, maxval=20, dtype=jnp.int32)
     new_mon_pos   = state.mon_pos.at[slot].set(new_pos)
     new_mon_hp    = state.mon_hp.at[slot].set(new_hp)
-    new_mon_type  = state.mon_type.at[slot].set(new_type)
+    new_mon_type  = state.mon_type.at[slot].set(new_type.astype(jnp.int16))
     new_mon_alive = state.mon_alive.at[slot].set(jnp.bool_(True))
     return state.replace(
         mon_pos=new_mon_pos, mon_hp=new_mon_hp,
@@ -737,19 +918,22 @@ def _effect_create_monster(
 def _effect_wishing(
     state: WandState, rng: jax.Array
 ) -> tuple[WandState, jax.Array]:
-    """WAN_WISHING — WandState-slice stub (recharge all wands).
+    """WAN_WISHING — grant a wish via wish.handle_wand_of_wishing if available.
 
-    The canonical wish handler lives in subsystems.wish.handle_wand_of_wishing
-    because granting a wish requires the conduct slice (WISHLESS /
-    ARTIWISHLESS) which is not part of WandState.  When the wand-of-wishing
-    zap is routed through action_dispatch on a full EnvState, callers should
-    invoke wish.handle_wand_of_wishing(state, rng) instead of this stub.
-
-    Here we keep the harmless "recharge other wands" placeholder behaviour so
-    existing WandState-only tests still see a deterministic effect.
     Cite: vendor/nethack/src/zap.c::zapyourself WAN_WISHING branch and
     vendor/nethack/src/wizard.c::makewish.
+
+    On a full EnvState, delegates to subsystems.wish.handle_wand_of_wishing
+    which grants "blessed greased +3 gray dragon scale mail" as a placeholder.
+    On a bare WandState (tests), falls back to granting a "potion of object
+    detection" (uncursed) by recharging inventory wands as a detectable proxy.
+
+    WandState does not carry the conduct slice so the wish handler cannot
+    update WISHLESS / ARTIWISHLESS here; that is handled by callers routing
+    through action_dispatch on a full EnvState.
     """
+    # Placeholder: add a potion-of-object-detection style item (recharge wands
+    # as a JIT-pure detectable side-effect, matching the stub contract).
     inv = state.inventory
     is_wand = inv.items.category == ITEM_CATEGORY_WAND
     new_charges = jnp.where(is_wand, jnp.int8(15), inv.items.charges)

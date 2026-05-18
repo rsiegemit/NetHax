@@ -542,6 +542,43 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
 
 _GLYPH_TO_COLOR, _GLYPH_TO_DESCRIPTION_BYTES = _build_glyph_lookups()
 
+
+# ---------------------------------------------------------------------------
+# Hallucination hcolor pool — vendor/nethack/src/do_name.c:1461
+#
+# When hallucinating, object glyphs are replaced with random "junk" objects
+# that differ in color from the true object.  We build a static pool of
+# NUM_OBJECTS object indices (one canonical representative per CLR_* value,
+# plus enough filler to reach 32 entries) so the per-tile hash can pick a
+# replacement index without requiring a dynamic table at JIT trace time.
+#
+# The pool only needs to be large enough that modular selection produces a
+# visually varied result.  We pick the first object index for each distinct
+# color (up to 16 colors), then repeat the full sweep to pad to 32 entries.
+# ---------------------------------------------------------------------------
+
+def _build_hcolor_pool() -> jnp.ndarray:
+    """Build a uint16 array of object indices for hallucination color scramble."""
+    import numpy as _np
+    from Nethax.nethax.constants.objects import OBJECTS
+    seen: dict[int, int] = {}
+    for i, o in enumerate(OBJECTS):
+        if o is None:
+            continue
+        c = int(o.color) & 0xFF
+        if c not in seen:
+            seen[c] = i
+    # Collect in color order, then pad to 32 by cycling.
+    pool = list(seen.values())
+    while len(pool) < 32:
+        pool.extend(pool)
+    pool = pool[:32]
+    return jnp.array(pool, dtype=jnp.int32)
+
+
+_HCOLOR_POOL: jnp.ndarray = _build_hcolor_pool()   # int32[32]
+_HCOLOR_POOL_SIZE: int = 32
+
 # ---------------------------------------------------------------------------
 # Public factories
 # ---------------------------------------------------------------------------
@@ -1411,7 +1448,12 @@ def build_glyphs(env_state) -> jnp.ndarray:
          - visible tile      → render from terrain (live truth)
          - explored+not-visible → render from last_seen_terrain (stale memory)
          - unexplored        → NO_GLYPH
-    5. Overlay the player glyph (GLYPH_MON_OFF + 0) at player_pos.
+    5. Overlay live monster glyphs; scramble via per-(timestep,tile) hash when
+       hallucinating (vendor/nethack/src/display.c::display_monster ~line 599).
+    6. Overlay the player glyph at player_pos.
+    7. Scramble object glyphs (GLYPH_OBJ_OFF range) when hallucinating via the
+       _HCOLOR_POOL table (vendor/nethack/src/do_name.c:1461 hcolor scramble).
+       Terrain glyphs (GLYPH_CMAP_OFF range) are never scrambled.
 
     Returns:
         int16[21, 79]
@@ -1514,6 +1556,29 @@ def build_glyphs(env_state) -> jnp.ndarray:
 
     player_glyph = (jnp.int32(GLYPH_MON_OFF) + mon_idx).astype(jnp.int16)
     glyphs = glyphs.at[player_row, player_col_clamped].set(player_glyph)
+
+    # Hallucination hcolor scramble for object glyphs — vendor do_name.c:1461.
+    # Any tile whose glyph is in [GLYPH_OBJ_OFF, GLYPH_CMAP_OFF) gets replaced
+    # with a random entry from _HCOLOR_POOL when hallucinating.
+    # The per-tile seed uses the same (timestep, row, col) hash as the monster
+    # scramble above so the result is deterministic within a frame and changes
+    # across frames.  Terrain glyphs (GLYPH_CMAP_OFF+) are left untouched.
+    # TODO: status message scramble (status surface not yet in obs).
+    # TODO: "Everything looks boring now" message on HALLUCINATION→0 transition.
+    if is_hallu:
+        rows_all = jnp.arange(21, dtype=jnp.uint32)
+        cols_all = jnp.arange(79, dtype=jnp.uint32)
+        rc_rows, rc_cols = jnp.meshgrid(rows_all, cols_all, indexing='ij')  # [21,79]
+        ts_grid = env_state.timestep.astype(jnp.uint32)
+        hash_grid = (ts_grid * jnp.uint32(2654435761)
+                     + rc_rows * jnp.uint32(1597334677)
+                     + rc_cols * jnp.uint32(1431655781))
+        pool_idx = jnp.mod(hash_grid, jnp.uint32(_HCOLOR_POOL_SIZE)).astype(jnp.int32)
+        scrambled_obj_idx = _HCOLOR_POOL[pool_idx]                      # int32[21,79]
+        scrambled_obj_glyphs = (jnp.int32(GLYPH_OBJ_OFF) + scrambled_obj_idx).astype(jnp.int16)
+        is_obj_glyph = (glyphs.astype(jnp.int32) >= jnp.int32(GLYPH_OBJ_OFF)) & \
+                       (glyphs.astype(jnp.int32) < jnp.int32(GLYPH_CMAP_OFF))
+        glyphs = jnp.where(is_obj_glyph, scrambled_obj_glyphs, glyphs)
 
     return glyphs
 

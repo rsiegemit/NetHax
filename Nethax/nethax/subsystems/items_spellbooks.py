@@ -20,19 +20,21 @@ Wave 8d implementation (vendor-probabilistic formula):
   On failure: no change (side effects like confusion/paralysis are Wave 4+)
 
 BUC handling (vendor spell.c::study_book / cursed_book lines 590-650):
-  CURSED  (buc_status == 1): skips success roll; applies confusion timer
-    (rn1(8,4) = 4..11 turns), deals rnd(10) damage, spell never learned.
+  CURSED  (buc_status == 1): skips success roll; five-branch backfire via
+    rnd(20) (1-4 explode, 5-8 paralyze, 9-12 poison, 13-16 amnesia,
+    17-20 blank), spell never learned.
+    Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
   UNCURSED (buc_status == 2): standard formula (see above).
   BLESSED  (buc_status == 3): +2 bonus to read_ability (vendor line ~555-560).
 
 Wave 8d simplifications:
-  - Cursed: no poison / book-explosion path (Wave 4+)
   - Blank-book and novel detection: treated as unknown spell_id (-1) → no-op
 """
 
 import jax
 import jax.numpy as jnp
 
+from Nethax.nethax.rng import rnd, rn1
 from Nethax.nethax.subsystems.magic import (
     MagicState,
     MAX_SPELL_MEMORY,
@@ -119,8 +121,10 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
     Returns updated state.
 
     BUC handling (vendor spell.c::study_book / cursed_book lines 590-650):
-      CURSED  (buc_status == 1): skips success roll; applies confusion timer
-        (rn1(8,4) = 4..11 turns), deals rnd(10) hp damage, spell NOT learned.
+      CURSED  (buc_status == 1): skips success roll; five-branch backfire
+        selected by rnd(20): 1-4 explode (damage+destroy), 5-8 paralyze,
+        9-12 poison (str-1), 13-16 amnesia (clear all spells), 17-20 blank.
+        Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
       UNCURSED (buc_status == 2): standard formula (see below).
       BLESSED  (buc_status == 3): +_BLESSED_STUDY_BONUS to read_ability.
 
@@ -151,24 +155,84 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
 
     book_level = int(_SPELL_LEVELS[spell_id])
 
-    # --- CURSED path (vendor spell.c::cursed_book lines 590-650) ---
-    # Cursed book: skip success roll, apply confusion + damage, never learn.
+    # --- CURSED path (vendor spell.c::cursed_book lines 130-185) ---
+    # Five branches selected by rnd(20), grouped in blocks of 4:
+    #   1-4  explode: rnd(20) hp damage, book destroyed (quantity=0)
+    #   5-8  paralyze: FROZEN timer rn1(5,10) = 10..14 turns
+    #   9-12 poison: ATTRIBUTE_AWAY timer set, player_str decremented (min 3)
+    #   13-16 amnesia: all spell_known cleared
+    #   17-20 blank: no effect (turn wasted)
+    # Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
     if buc_status == _BUC_CURSED:
-        rng, sub_conf, sub_dmg = jax.random.split(rng, 3)
-        # rn1(8, 4) = randint(0,8) + 4 → 4..11 turns of confusion
-        conf_turns = int(jax.random.randint(sub_conf, (), 0, 8)) + 4
-        # rnd(10) = randint(1,11) hp damage
-        damage = int(jax.random.randint(sub_dmg, (), 1, 11))
+        rng, sub_b, sub_dmg, sub_par, _sub_pois = jax.random.split(rng, 5)
 
-        new_hp = max(int(state.player_hp) - damage, 1)
+        # rnd(20) in [1,20]; branch index = (b-1)//4 in [0,4]:
+        #   0=explode, 1=paralyze, 2=poison, 3=amnesia, 4=blank
+        # Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
+        b = rnd(sub_b, 20)
+        branch = (b - jnp.int32(1)) // jnp.int32(4)  # [0,4]
+
+        is_explode  = branch == jnp.int32(0)
+        is_paralyze = branch == jnp.int32(1)
+        is_poison   = branch == jnp.int32(2)
+        is_amnesia  = branch == jnp.int32(3)
+
+        # --- Branch 0: explode — rnd(20) hp damage, destroy book ---
+        # Vendor spell.c::cursed_book line 176: book explodes in face.
+        explode_dmg = rnd(sub_dmg, 20)
+        new_hp = jnp.where(
+            is_explode,
+            jnp.maximum(state.player_hp - explode_dmg, jnp.int32(1)),
+            state.player_hp,
+        )
+        new_qty = jnp.where(
+            is_explode,
+            jnp.int16(0),
+            state.inventory.items.quantity[slot_idx],
+        ).astype(jnp.int16)
+        new_inventory_qty = state.inventory.items.quantity.at[slot_idx].set(new_qty)
+        new_items = state.inventory.items.replace(quantity=new_inventory_qty)
+        new_inventory = state.inventory.replace(items=new_items)
+
+        # --- Branch 1: paralyze — FROZEN timer rn1(5,10) = 10..14 turns ---
+        # Vendor spell.c::cursed_book (paralysis path).
+        par_turns = rn1(sub_par, 5, 10)
         ts = state.status.timed_statuses
-        cur_conf = int(ts[int(TimedStatus.CONFUSION)])
-        new_conf = max(cur_conf, conf_turns)
-        new_ts = ts.at[int(TimedStatus.CONFUSION)].set(jnp.int32(new_conf))
+        cur_frozen = ts[int(TimedStatus.FROZEN)]
+        new_frozen = jnp.where(is_paralyze, jnp.maximum(cur_frozen, par_turns), cur_frozen)
+
+        # --- Branch 2: poison — ATTRIBUTE_AWAY set, str -1 (min 3) ---
+        # Vendor spell.c::cursed_book line 164: poison_strdmg.
+        cur_attr = ts[int(TimedStatus.ATTRIBUTE_AWAY)]
+        new_attr = jnp.where(is_poison, jnp.int32(10), cur_attr)
+        new_str = jnp.where(
+            is_poison,
+            jnp.maximum(state.player_str - jnp.int16(1), jnp.int16(3)),
+            state.player_str,
+        ).astype(jnp.int16)
+
+        # --- Branch 3: amnesia — all spell_known cleared ---
+        new_known = jnp.where(
+            is_amnesia,
+            jnp.zeros_like(state.magic.spell_known),
+            state.magic.spell_known,
+        )
+
+        # Commit timed_statuses with all branch updates applied selectively.
+        new_ts = (
+            ts
+            .at[int(TimedStatus.FROZEN)].set(new_frozen)
+            .at[int(TimedStatus.ATTRIBUTE_AWAY)].set(new_attr)
+        )
         new_status = state.status.replace(timed_statuses=new_ts)
+        new_magic  = state.magic.replace(spell_known=new_known)
+
         return state.replace(
-            player_hp=jnp.int32(new_hp),
+            player_hp=new_hp,
+            player_str=new_str,
+            inventory=new_inventory,
             status=new_status,
+            magic=new_magic,
         )
 
     # --- UNCURSED / BLESSED path ---

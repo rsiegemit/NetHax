@@ -256,6 +256,40 @@ def _build_poly_form_valid() -> jnp.ndarray:
 _POLY_FORM_VALID: jnp.ndarray = _build_poly_form_valid()
 
 
+def _build_form_hates_silver() -> jnp.ndarray:
+    """Pre-compute bool[N_MONSTERS]: True iff form is harmed by silver.
+
+    polyself.c::retouch_equipment — vampires (M2_UNDEAD+S_VAMPIRE),
+    were-creatures (M2_WERE), and major demons (M2_DEMON) take burn damage
+    from silver items.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, M2_UNDEAD, M2_WERE, M2_DEMON, MonsterSymbol
+    result = []
+    for m in MONSTERS:
+        hates = (
+            bool(m.flags2 & M2_WERE)
+            or bool(m.flags2 & M2_DEMON)
+            or (bool(m.flags2 & M2_UNDEAD) and m.symbol == MonsterSymbol.S_VAMPIRE)
+        )
+        result.append(hates)
+    return jnp.array(result, dtype=jnp.bool_)
+
+
+_FORM_HATES_SILVER: jnp.ndarray = _build_form_hates_silver()
+
+
+def _build_item_is_silver() -> jnp.ndarray:
+    """Pre-compute bool[N_OBJECTS]: True iff the object is made of silver.
+
+    polyself.c::retouch_equipment uses objects.c material checks.
+    """
+    from Nethax.nethax.constants.objects import OBJECTS, Material
+    return jnp.array([o.material == Material.SILVER for o in OBJECTS], dtype=jnp.bool_)
+
+
+_ITEM_IS_SILVER: jnp.ndarray = _build_item_is_silver()
+
+
 def _build_form_flags2() -> jnp.ndarray:
     """Pre-compute int32[N_MONSTERS] of flags2 for JIT-safe gather."""
     from Nethax.nethax.constants.monsters import MONSTERS
@@ -493,6 +527,85 @@ def _drop_worn_armor_per_slot(state, form_idx: jnp.ndarray):
 
 
 # ---------------------------------------------------------------------------
+# retouch_equipment()  (vendor/nethack/src/polyself.c::retouch_equipment)
+# ---------------------------------------------------------------------------
+
+def _retouch_equipment_silver(state, form_idx: jnp.ndarray, rng: jax.Array):
+    """Drop silver worn items and apply burn damage for silver-allergic forms.
+
+    polyself.c::retouch_equipment — when polymorphing into a form that hates
+    silver (vampires, were-creatures, demons), each worn item made of silver
+    is dropped to ground_items and deals 1d6 burn damage per item.
+
+    JIT-pure: fori_loop over armor slots.
+    """
+    from Nethax.nethax.subsystems.inventory import N_ARMOR_SLOTS
+
+    idx = form_idx.astype(jnp.int32)
+    form_hates = _FORM_HATES_SILVER[idx]
+
+    worn = state.inventory.worn_armor
+    ground = state.ground_items
+    p_row = state.player_pos[0].astype(jnp.int32)
+    p_col = state.player_pos[1].astype(jnp.int32)
+    n_objects = _ITEM_IS_SILVER.shape[0]
+
+    def _check_slot(slot_i, carry):
+        new_worn, g, dmg_acc, rng_c = carry
+
+        inv_idx = worn[slot_i].astype(jnp.int32)
+        occupied = inv_idx >= jnp.int32(0)
+
+        type_id = state.inventory.items.type_id[inv_idx].astype(jnp.int32)
+        safe_tid = jnp.where(occupied, jnp.clip(type_id, 0, n_objects - 1), jnp.int32(0))
+        is_silver = _ITEM_IS_SILVER[safe_tid] & occupied
+
+        should_drop = form_hates & is_silver
+
+        ground_stack_cat = g.category[0, 0, p_row, p_col]
+        free_idx = jnp.argmax(ground_stack_cat == jnp.int8(0)).astype(jnp.int32)
+
+        item_cat = state.inventory.items.category[inv_idx]
+        item_tid = state.inventory.items.type_id[inv_idx]
+
+        new_g_cat = jnp.where(
+            should_drop,
+            g.category[0, 0, p_row, p_col].at[free_idx].set(item_cat),
+            g.category[0, 0, p_row, p_col],
+        )
+        new_g_tid = jnp.where(
+            should_drop,
+            g.type_id[0, 0, p_row, p_col].at[free_idx].set(item_tid),
+            g.type_id[0, 0, p_row, p_col],
+        )
+        g = g.replace(
+            category=g.category.at[0, 0, p_row, p_col].set(new_g_cat),
+            type_id=g.type_id.at[0, 0, p_row, p_col].set(new_g_tid),
+        )
+
+        cleared = jnp.where(should_drop, jnp.int8(-1), new_worn[slot_i])
+        new_worn = new_worn.at[slot_i].set(cleared)
+
+        rng_c, sub = jax.random.split(rng_c)
+        roll = jax.random.randint(sub, (), 1, 7).astype(jnp.int32)
+        dmg_acc = dmg_acc + jnp.where(should_drop, roll, jnp.int32(0))
+
+        return new_worn, g, dmg_acc, rng_c
+
+    init_carry = (worn, ground, jnp.int32(0), rng)
+    new_worn, new_ground, total_dmg, _ = jax.lax.fori_loop(
+        0, N_ARMOR_SLOTS, _check_slot, init_carry
+    )
+
+    new_inv = state.inventory.replace(worn_armor=new_worn)
+    state = state.replace(inventory=new_inv, ground_items=new_ground)
+
+    new_hp = jnp.maximum(state.player_hp - total_dmg, jnp.int32(0))
+    done = new_hp <= jnp.int32(0)
+    return state.replace(player_hp=new_hp, done=state.done | done)
+
+
+# ---------------------------------------------------------------------------
 # newman()  (vendor/nethack/src/polyself.c:336)
 # ---------------------------------------------------------------------------
 
@@ -524,6 +637,9 @@ def newman(state, rng: jax.Array):
     ts = ts.at[int(TimedStatus.SICK)].set(jnp.int32(0))
     ts = ts.at[int(TimedStatus.STONED)].set(jnp.int32(0))
     new_status = state.status.replace(timed_statuses=ts)
+
+    # polyself.c:336 — newman also restores nutrition to NORMAL (1000).
+    new_status = new_status.replace(nutrition=jnp.int32(1000))
 
     return state.replace(
         player_xl=new_xl,
@@ -633,18 +749,46 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool):
         poly_controlled_legacy=controlled_b,
     )
 
-    # --- 4. Recompute AC.  Apply HP_max swap.
+    # --- 4. Recompute AC.  Apply HP_max swap.  Clamp Pw to current pw_max.
+    # polyself.c — HP and Pw are both clamped on poly.
     state = state.replace(
         polymorph=poly,
         player_hp_max=new_hp_max,
         player_hp=jnp.minimum(state.player_hp, new_hp_max),
+        player_pw=jnp.minimum(state.player_pw, state.player_pw_max),
     )
     state = _recompute_ac(state, form_i16)
+
+    # --- 4b. Mount-on-poly: if riding and form cannot ride, force dismount.
+    # polyself.c:1412 — when can_ride() fails after poly, dismount_steed().
+    # We always dismount on poly for safety.  Apply 1d6 fall damage.
+    rng, sub_fall = jax.random.split(rng)
+    fall_roll = jax.random.randint(sub_fall, (), 1, 7).astype(jnp.int32)
+    was_riding = state.player_steed_mid != jnp.uint32(0)
+
+    def _dismount(s):
+        new_hp = jnp.maximum(s.player_hp - fall_roll, jnp.int32(0))
+        return s.replace(
+            player_steed_mid=jnp.uint32(0),
+            player_hp=new_hp,
+            done=s.done | (new_hp <= jnp.int32(0)),
+        )
+
+    state = jax.lax.cond(was_riding, _dismount, lambda s: s, state)
 
     # --- 5. Drop incompatible armor per-slot (polyself.c:1156 break_armor).
     state = _drop_worn_armor_per_slot(state, form_i16)
 
-    # --- 5b. newman(): if target form matches player's own race, re-roll XL/HP/PW
+    # --- 5b. retouch_equipment: silver items burn silver-allergic forms.
+    # polyself.c::retouch_equipment — vampires/weres/demons drop silver gear
+    # and take 1d6 burn damage per item.
+    rng, sub_rt = jax.random.split(rng)
+    state = _retouch_equipment_silver(state, form_i16, sub_rt)
+
+    # TODO: polyself.c — if player has cursed-item-touch-while-polymorphed
+    # conflict during prayer, alignment_record -= 2.  Not yet wired.
+
+    # --- 5c. newman(): if target form matches player's own race, re-roll XL/HP/PW
     # and cure sick/stoned.  (polyself.c:336)
     # We approximate "same race" as M2_HUMAN flag in the form matching the
     # player_race == human (race=0).  For simplicity: if flags2 & M2_HUMAN and
@@ -724,6 +868,19 @@ def revert_polymorph(state, rng: jax.Array | None = None):
                 player_ac=p.orig_ac,
                 player_role=p.orig_role_idx,
             )
+            # Genocide-self check: polyself.c::rehumanize — if the player's own
+            # race/species has been genocided, reverting to that form kills them.
+            # polyself.c:233 ugenocided() check inside rehumanize.
+            race_idx = reverted.player_race.astype(jnp.int32)
+            n_genocided = reverted.genocided_species.shape[0]
+            safe_race = jnp.clip(race_idx, 0, n_genocided - 1)
+            self_genocided = reverted.genocided_species[safe_race]
+
+            def _genocide_death(st2):
+                return st2.replace(player_hp=jnp.int32(0), done=jnp.bool_(True))
+
+            reverted = jax.lax.cond(self_genocided, _genocide_death, lambda st2: st2, reverted)
+
             # Post-revert: if HP < 1, player dies.  polyself.c rehumanize.
             hp_fatal = reverted.player_hp < jnp.int32(1)
             return jax.lax.cond(
