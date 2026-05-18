@@ -93,6 +93,10 @@ def _make_inv_state(items: Item) -> InventoryState:
         worn_armor_ac_bonus=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.int8),
         user_names=jnp.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=jnp.int8),
         wielded_artifact_idx=jnp.int8(-1),
+        welded=jnp.bool_(False),
+        worn_armor_welded=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.bool_),
+        worn_amulet_welded=jnp.bool_(False),
+        worn_rings_welded=jnp.zeros((2,), dtype=jnp.bool_),
     )
 
 

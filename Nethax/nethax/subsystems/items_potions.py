@@ -219,27 +219,34 @@ def _effect_gain_ability(state, rng, buc):
 
 
 def _effect_restore_ability(state, rng, buc):
-    """potion of restore ability — restore drained stats.
+    """potion of restore ability — restore drained stats to race/role maxima.
 
-    Canonical: peffect_restore_ability (potion.c) — restores all 6 stats to
-    their exercise-adjusted maximums via full_restore().  Wave 3 simplification:
-    set each stat to max(current, 18).  STR is int16; the rest are int8.
+    Canonical: peffect_restore_ability (potion.c) — calls full_restore() which
+    sets each stat to its undrained maximum (u.urace.attrmax).  We use
+    state.player_amax[i] as the per-stat ceiling, matching vendor u.urace.attrmax[].
+    Only raises stats below amax; never lowers a stat already above amax.
 
-    Cite: vendor/nethack/src/potion.c::peffect_restore_ability.
+    Stat order in player_amax: str(0) int(1) wis(2) dex(3) con(4) cha(5).
+    STR is int16; the rest are int8.
+
+    Cite: vendor/nethack/src/potion.c::peffect_restore_ability;
+          vendor/nethack/src/u_init.c lines 250-580 (init_attr race cap).
     """
-    new_str = jnp.maximum(state.player_str, jnp.int16(18))
-    new_dex = jnp.maximum(state.player_dex, jnp.int8(18))
-    new_con = jnp.maximum(state.player_con, jnp.int8(18))
-    new_int = jnp.maximum(state.player_int, jnp.int8(18))
-    new_wis = jnp.maximum(state.player_wis, jnp.int8(18))
-    new_cha = jnp.maximum(state.player_cha, jnp.int8(18))
+    amax = state.player_amax  # int8[6]: str,int,wis,dex,con,cha
+    new_str = jnp.where(state.player_str < amax[0].astype(jnp.int16),
+                        amax[0].astype(jnp.int16), state.player_str)
+    new_dex = jnp.where(state.player_dex < amax[3], amax[3], state.player_dex)
+    new_con = jnp.where(state.player_con < amax[4], amax[4], state.player_con)
+    new_int = jnp.where(state.player_int < amax[1], amax[1], state.player_int)
+    new_wis = jnp.where(state.player_wis < amax[2], amax[2], state.player_wis)
+    new_cha = jnp.where(state.player_cha < amax[5], amax[5], state.player_cha)
     return state.replace(
-        player_str=new_str,
-        player_dex=new_dex,
-        player_con=new_con,
-        player_int=new_int,
-        player_wis=new_wis,
-        player_cha=new_cha,
+        player_str=new_str.astype(jnp.int16),
+        player_dex=new_dex.astype(jnp.int8),
+        player_con=new_con.astype(jnp.int8),
+        player_int=new_int.astype(jnp.int8),
+        player_wis=new_wis.astype(jnp.int8),
+        player_cha=new_cha.astype(jnp.int8),
     )
 
 

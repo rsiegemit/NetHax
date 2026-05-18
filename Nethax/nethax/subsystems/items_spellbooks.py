@@ -170,7 +170,7 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
     #   17-20 blank: no effect (turn wasted)
     # Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
     if buc_status == _BUC_CURSED:
-        rng, sub_b, sub_dmg, sub_par, _sub_pois = jax.random.split(rng, 5)
+        rng, sub_b, sub_dmg, sub_par, _sub_pois, sub_burn = jax.random.split(rng, 6)
 
         # rnd(20) in [1,20]; branch index = (b-1)//4 in [0,4]:
         #   0=explode, 1=paralyze, 2=poison, 3=amnesia, 4=blank
@@ -183,12 +183,16 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
         is_poison   = branch == jnp.int32(2)
         is_amnesia  = branch == jnp.int32(3)
 
-        # --- Branch 0: explode — rnd(20) hp damage, destroy book ---
+        # --- Branch 0: explode — rnd(20) hp damage + 1d4 hand burn, destroy book ---
         # Vendor spell.c::cursed_book line 176: book explodes in face.
+        # Additional 1d4 burn damage to hands.
+        # Cite: vendor/nethack/src/spell.c::cursed_book lines 590-650 full table.
         explode_dmg = rnd(sub_dmg, 20)
+        burn_dmg    = rnd(sub_burn, 4)   # 1d4 additional hand burn
+        total_explode_dmg = explode_dmg + burn_dmg
         new_hp = jnp.where(
             is_explode,
-            jnp.maximum(state.player_hp - explode_dmg, jnp.int32(1)),
+            jnp.maximum(state.player_hp - total_explode_dmg, jnp.int32(1)),
             state.player_hp,
         )
         new_qty = jnp.where(
@@ -197,8 +201,12 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
             state.inventory.items.quantity[slot_idx],
         ).astype(jnp.int16)
         new_inventory_qty = state.inventory.items.quantity.at[slot_idx].set(new_qty)
-        new_items = state.inventory.items.replace(quantity=new_inventory_qty)
-        new_inventory = state.inventory.replace(items=new_items)
+        new_items_stage = state.inventory.items.replace(quantity=new_inventory_qty)
+
+        # Explode also force-drops wielded item (burned hands can't hold weapon).
+        # Cite: vendor/nethack/src/spell.c::cursed_book — item drop on explode branch.
+        new_wielded = jnp.where(is_explode, jnp.int8(-1), state.inventory.wielded)
+        new_inventory = state.inventory.replace(items=new_items_stage, wielded=new_wielded)
 
         # --- Branch 1: paralyze — FROZEN timer rn1(5,10) = 10..14 turns ---
         # Vendor spell.c::cursed_book (paralysis path).

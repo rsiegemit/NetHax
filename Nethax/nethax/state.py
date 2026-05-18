@@ -145,6 +145,14 @@ class EnvState:
     player_mortality: jax.Array  # int32  u.umortality (you.h line 497); deaths so far
     player_uhitinc:   jax.Array  # int8   u.uhitinc (you.h); ring of increase accuracy
     player_udaminc:   jax.Array  # int8   u.udaminc (you.h); ring of increase damage
+
+    # ---- Per-stat race+role attribute maxima (vendor u.urace.attrmax[]) ----
+    # int8[6]: per-stat racial/role max for STR/INT/WIS/DEX/CON/CHA (attrib.h order).
+    # STR is capped at 18 in this field (18/** percentile range NOT encoded here).
+    # Cite: vendor/nethack/src/u_init.c lines 250-580 (init_attr race cap loop);
+    #       vendor/nethack/src/potion.c::peffect_restore_ability (full_restore).
+    player_amax:      jax.Array  # int8[6]
+
     # TODO (post-Wave-6): mirror u.uintrinsic[] timed-intrinsic array and
     # u.uprops[LAST_PROP+1] property timers — currently fielded indirectly
     # through StatusState (status_effects.py); revisit when an end-to-end
@@ -281,6 +289,10 @@ class EnvState:
             saddle_condition=jnp.int8(100),
             player_killer_mid=jnp.uint32(0),
             player_mortality=jnp.int32(0),
+            # per-stat attribute maxima (vendor u.urace.attrmax[]; init_attr race cap)
+            # Default: 18 for all stats (human unconstrained cap, capped at int8 max).
+            # Cite: vendor/nethack/src/u_init.c init_attr; potion.c peffect_restore_ability.
+            player_amax=jnp.full((6,), 18, dtype=jnp.int8),
             # artifact invoke cooldown
             invoke_cooldown=jnp.zeros((30,), dtype=jnp.int16),
             # tin-opening mechanic

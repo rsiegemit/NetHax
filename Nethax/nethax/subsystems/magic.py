@@ -804,21 +804,39 @@ def _effect_turn_undead(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_restore_ability(state: dict, rng: jax.Array) -> dict:
-    """RESTORE_ABILITY: reset all six player abilities to 18.
+    """RESTORE_ABILITY: restore drained stats to race/role maxima.
 
-    Vendor: vendor/nethack/src/potion.c::peffect_restore_ability — restores
-    every drained ability score to its undrained value.  Wave 6 simplification
-    sets STR/DEX/CON/INT/WIS/CHA = 18 (the standard cap for a fresh roll).
-    Cite: vendor/nethack/src/potion.c::peffect_restore_ability.
+    Vendor: vendor/nethack/src/potion.c::peffect_restore_ability — calls
+    full_restore() which sets each stat to its undrained maximum (u.urace.attrmax).
+    We use state["player_amax"][i] as the per-stat ceiling. Only raises stats
+    below amax; never lowers a stat already above amax.
+
+    Stat order in player_amax: str(0) int(1) wis(2) dex(3) con(4) cha(5).
+    Cite: vendor/nethack/src/potion.c::peffect_restore_ability;
+          vendor/nethack/src/u_init.c lines 250-580 (init_attr race cap).
     """
+    amax = state["player_amax"]  # int8[6]: str,int,wis,dex,con,cha
+    cur_str = state["player_str"]
+    cur_dex = state["player_dex"]
+    cur_con = state["player_con"]
+    cur_int = state["player_int"]
+    cur_wis = state["player_wis"]
+    cur_cha = state["player_cha"]
+    new_str = jnp.where(cur_str < amax[0].astype(jnp.int16),
+                        amax[0].astype(jnp.int16), cur_str)
+    new_dex = jnp.where(cur_dex < amax[3], amax[3], cur_dex)
+    new_con = jnp.where(cur_con < amax[4], amax[4], cur_con)
+    new_int = jnp.where(cur_int < amax[1], amax[1], cur_int)
+    new_wis = jnp.where(cur_wis < amax[2], amax[2], cur_wis)
+    new_cha = jnp.where(cur_cha < amax[5], amax[5], cur_cha)
     return {
         **state,
-        "player_str": jnp.int16(18),
-        "player_dex": jnp.int8(18),
-        "player_con": jnp.int8(18),
-        "player_int": jnp.int8(18),
-        "player_wis": jnp.int8(18),
-        "player_cha": jnp.int8(18),
+        "player_str": new_str.astype(jnp.int16),
+        "player_dex": new_dex.astype(jnp.int8),
+        "player_con": new_con.astype(jnp.int8),
+        "player_int": new_int.astype(jnp.int8),
+        "player_wis": new_wis.astype(jnp.int8),
+        "player_cha": new_cha.astype(jnp.int8),
     }
 
 

@@ -134,6 +134,9 @@ from Nethax.nethax.subsystems.riding import (
     try_mount as _riding_try_mount,
     try_dismount as _riding_try_dismount,
 )
+from Nethax.nethax.subsystems.monster_ai import (
+    pet_follow_on_stair as _pet_follow_on_stair,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -867,6 +870,9 @@ def _stair_down(state, rng):
     new_dungeon = state.dungeon.replace(current_level=new_level)
     new_scoring = state.scoring.replace(deepest_level=new_deepest)
     new_state   = state.replace(dungeon=new_dungeon, scoring=new_scoring)
+    # Move adjacent tame pets to follow the player down the stair.
+    # Citation: vendor/nethack/src/dog.c::stair_pet.
+    new_state   = _pet_follow_on_stair(new_state)
     return _on_quest_leader_level(_apply_fov(new_state))
 
 

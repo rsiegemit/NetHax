@@ -441,13 +441,13 @@ def test_wand_opening_unlocks_doors():
 
 
 def test_wand_magic_missile_deals_d6_damage():
-    """WAN_MAGIC_MISSILE — vendor buzz() d(1,6)."""
+    """WAN_MAGIC_MISSILE — vendor zap.c:3464 sets nd=2, so damage is 2d6 (2..12)."""
     state = _wand_state_with_wand(WandEffect.MAGIC_MISSILE)
     state = _place_monster(state, slot=1, row=10, col=11, hp=20)
     result = zap_wand(state, _RNG, slot_idx=jnp.int32(0), direction=jnp.int32(2))
     final_hp = int(result.mon_hp[1])
-    assert final_hp < 20 and final_hp >= 14, (
-        f"Magic missile d6 damage should be 1..6; HP went 20→{final_hp}"
+    assert final_hp < 20 and final_hp >= 8, (
+        f"Magic missile 2d6 damage should be 2..12; HP went 20→{final_hp}"
     )
 
 

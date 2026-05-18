@@ -358,48 +358,105 @@ def _h_can_of_grease(state, rng: jax.Array) -> object:
 # ---------------------------------------------------------------------------
 # Handler 8: magic marker — re-purpose a SCR_BLANK_PAPER scroll in inventory.
 # Cite: vendor/nethack/src/apply.c::domarker (routes from doapply line 4361),
-#       apply.c::write_with_marker, apply.c::dosendmail.
-# vendor: if wielding a marker and player has blank paper, write() converts the
-#   blank scroll into another scroll type indexed by marker.enchantment % 22.
-#   We headlessly convert the first SCR_BLANK_PAPER in inventory to the scroll
-#   type at offset (marker_enchantment % 22) from _SCROLL_BASE_ID.
-# Cite: vendor/nethack/src/apply.c::write_with_marker (~line 4320).
+#       apply.c::write_with_marker (~line 4320).
+# vendor (write.c::dowrite line 74): player picks the scroll type from a menu.
+# Headless mode: decode marker.user_name bytes as the requested scroll name and
+# parse via wish.parse_wish_string_dict (limited to SCROLL_CLASS items).
+# Empty/unparseable user_name -> default SCR_MAGIC_MAPPING (offset 14).
 # ---------------------------------------------------------------------------
 
 # Scroll type constants (vendor/nethack/include/objects.h sequential order).
 # _SCROLL_BASE_ID = 94; 22 non-blank scroll types (indices 0-21).
-_SCROLL_BASE_ID      = 94
-_SCR_BLANK_PAPER_ID  = _SCROLL_BASE_ID + 22   # index 22 = SCR_BLANK_PAPER
-_N_WRITABLE_SCROLLS  = 22                      # indices 0-21 are writable types
+_SCROLL_BASE_ID           = 94
+_SCR_BLANK_PAPER_ID       = _SCROLL_BASE_ID + 22  # index 22 = SCR_BLANK_PAPER
+_N_WRITABLE_SCROLLS       = 22                     # indices 0-21 are writable
+_SCR_MAGIC_MAPPING_OFFSET = 14                     # ScrollEffect.MAGIC_MAPPING
 
 
-def _h_magic_marker(state, rng: jax.Array) -> object:
-    # Cite: vendor/nethack/src/apply.c::write_with_marker (~line 4320).
+def _build_scroll_name_map() -> dict:
+    """Build {bare_name: nethax_type_id} for the 22 writable scroll types.
+
+    The Nethax inventory type_id for scrolls is a compact encoding starting
+    at _SCROLL_BASE_ID (94), NOT the OBJECTS table index.  The OBJECTS table
+    has scrolls starting at ~298.  We map each ScrollEffect offset (0-21) to
+    its bare OBJECTS name and to the compact type_id _SCROLL_BASE_ID + offset.
+
+    Cite: vendor/nethack/src/apply.c::write_with_marker (~line 4320).
+    """
+    from Nethax.nethax.constants.objects import OBJECTS, ObjectClass
+    result = {}
+    scroll_offset = 0
+    for idx, obj in enumerate(OBJECTS):
+        if obj.class_ != ObjectClass.SCROLL_CLASS:
+            continue
+        if obj.name is None:
+            continue
+        if scroll_offset >= _N_WRITABLE_SCROLLS:
+            break
+        # Map bare name to compact Nethax type_id.
+        result[obj.name.lower()] = _SCROLL_BASE_ID + scroll_offset
+        scroll_offset += 1
+    return result
+
+
+_SCROLL_NAME_MAP: dict = _build_scroll_name_map()
+
+
+def _scroll_type_id_from_user_name(user_name_bytes) -> int:
+    """Parse user_name bytes to a writable scroll type_id (Python-side, not JIT).
+
+    Cite: vendor/nethack/src/apply.c::write_with_marker (~line 4320).
+    Vendor presents a menu of scroll names; headless mode parses user_name via
+    direct lookup in _SCROLL_NAME_MAP (bare name -> compact Nethax type_id).
+    Empty / unparseable / non-scroll -> default SCR_MAGIC_MAPPING.
+    """
+    _DEFAULT = _SCROLL_BASE_ID + _SCR_MAGIC_MAPPING_OFFSET
+
+    if hasattr(user_name_bytes, "tolist"):
+        raw = bytes(int(b) & 0xFF for b in user_name_bytes.tolist())
+    else:
+        raw = bytes(int(b) & 0xFF for b in user_name_bytes)
+    text = raw.split(b"\x00")[0].decode("ascii", errors="ignore").strip()
+
+    if not text:
+        return _DEFAULT
+
+    # Strip "scroll of " / "scroll " / "of " prefixes to get bare name.
+    bare = text.lower()
+    for prefix in ("scroll of ", "scroll ", "of "):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+
+    tid = _SCROLL_NAME_MAP.get(bare)
+    if tid is None:
+        return _DEFAULT
+    return tid
+
+
+def _h_magic_marker_with_tid(state, rng: jax.Array, target_type_id: jnp.ndarray) -> object:
+    """Inner magic-marker handler: convert blank scroll to target_type_id.
+
+    Cite: vendor/nethack/src/apply.c::write_with_marker (~line 4320).
+    target_type_id must be a concrete jnp.int16 (resolved before JAX traces
+    this function, e.g. from dispatch_apply pre-computation).
+    """
     inv = state.inventory
     marker_slot = inv.wielded.astype(jnp.int32)
-    safe_marker = jnp.clip(marker_slot, 0, MAX_INVENTORY_SLOTS - 1)
-
-    # Read marker enchantment to pick target scroll type (enchantment % 22).
-    marker_ench = jnp.where(
-        marker_slot >= jnp.int32(0),
-        inv.items.enchantment[safe_marker].astype(jnp.int32),
-        jnp.int32(0),
-    )
-    target_type_id = jnp.int16(
-        _SCROLL_BASE_ID + (jnp.abs(marker_ench) % jnp.int32(_N_WRITABLE_SCROLLS))
-    )
 
     # Find first blank scroll in inventory.
     is_blank = (inv.items.type_id == jnp.int16(_SCR_BLANK_PAPER_ID)) & (
         inv.items.category == jnp.int8(int(ItemCategory.SCROLL))
     )
     has_blank = jnp.any(is_blank)
-    blank_slot = jnp.where(has_blank,
-                           jnp.argmax(is_blank).astype(jnp.int32),
-                           jnp.int32(-1))
+    blank_slot = jnp.where(
+        has_blank,
+        jnp.argmax(is_blank).astype(jnp.int32),
+        jnp.int32(-1),
+    )
     safe_blank = jnp.clip(blank_slot, 0, MAX_INVENTORY_SLOTS - 1)
 
-    # Convert blank → target type only when marker is wielded and blank exists.
+    # Convert blank -> target type only when marker is wielded and blank exists.
     can_write = has_blank & (marker_slot >= jnp.int32(0))
     new_type_id = jnp.where(
         can_write,
@@ -408,6 +465,18 @@ def _h_magic_marker(state, rng: jax.Array) -> object:
     )
     new_items = inv.items.replace(type_id=new_type_id)
     return state.replace(inventory=inv.replace(items=new_items))
+
+
+def _h_magic_marker(state, rng: jax.Array) -> object:
+    """Fallback magic-marker handler used in _HANDLERS tuple.
+
+    dispatch_apply replaces this slot with a closure over the pre-computed
+    target_type_id before calling jax.lax.switch, so this path is only
+    reached when dispatch_apply is bypassed (e.g. direct switch calls in
+    tests).  Defaults to SCR_MAGIC_MAPPING in that case.
+    """
+    default_tid = jnp.int16(_SCROLL_BASE_ID + _SCR_MAGIC_MAPPING_OFFSET)
+    return _h_magic_marker_with_tid(state, rng, default_tid)
 
 
 # ---------------------------------------------------------------------------
@@ -692,14 +761,14 @@ def _h_lock_pick(state, rng: jax.Array) -> object:
     # when called outside lax.switch.  Instead we do the roll here and pass
     # rng=None (always-succeed) or a patched rng path.
     #
-    # Implementation: roll here, then call picklock_door with rng=None to apply
-    # the door state change only when our roll succeeds.
+    # Roll once; used for both door and chest path.
+    # Cite: vendor/nethack/src/lock.c::pick_lock (line 636-644).
     rng, sub = jax.random.split(rng)
     roll = jax.random.randint(sub, shape=(), minval=0, maxval=100)
     success = roll < chance
 
-    # Only attempt unlock when roll succeeds; pass rng=None so picklock_door
-    # always opens (we guard via success flag below).
+    # --- Door path ---
+    # Pass rng=None so picklock_door always applies the change; we gate via success.
     new_features, _door_changed = picklock_door(state.features, pos, rng=None)
     final_features = jax.lax.cond(
         success,
@@ -707,7 +776,23 @@ def _h_lock_pick(state, rng: jax.Array) -> object:
         lambda _: state.features,
         operand=None,
     )
-    return state.replace(features=final_features)
+
+    # --- Chest/container path ---
+    # Vendor lock.c::pick_lock: after door check, scan the tile's obj list for
+    # locked chests/large boxes and unlock on success.
+    # We pick the first locked container slot (is_locked[i] == True).
+    # Cite: vendor/nethack/src/lock.c::pick_lock chest branch.
+    cs = state.containers
+    has_locked  = jnp.any(cs.is_locked)
+    chest_slot  = jnp.argmax(cs.is_locked).astype(jnp.int32)
+    new_is_locked = jnp.where(
+        success & has_locked,
+        cs.is_locked.at[chest_slot].set(jnp.bool_(False)),
+        cs.is_locked,
+    )
+    final_containers = cs.replace(is_locked=new_is_locked)
+
+    return state.replace(features=final_features, containers=final_containers)
 
 
 # ---------------------------------------------------------------------------
@@ -764,6 +849,11 @@ def dispatch_apply(state, rng: jax.Array) -> object:
 
     The wielded slot is checked; if nothing is wielded, returns state unchanged.
     Dispatch uses ``jax.lax.switch`` for JIT-pure dispatch.
+
+    Magic-marker special case: user_name is read Python-side (before JAX tracing)
+    to resolve the target scroll type_id, then passed as a concrete constant into
+    the switch-dispatched handler via a closure.
+    Cite: vendor/nethack/src/apply.c::write_with_marker (~line 4320).
     """
     inv = state.inventory
     slot = inv.wielded.astype(jnp.int32)
@@ -772,4 +862,28 @@ def dispatch_apply(state, rng: jax.Array) -> object:
                     inv.items.type_id[safe_slot],
                     jnp.int16(0))
     handler_idx = _handler_for_type_id(tid)
-    return jax.lax.switch(handler_idx, _HANDLERS, state, rng)
+
+    # Pre-compute target scroll type_id from user_name before JAX traces the
+    # switch body.  safe_slot is a traced int32 but inv.user_names is concrete
+    # when dispatch_apply is called outside jit (typical for apply actions).
+    # When traced inside jit the result is still a static Python int because
+    # _scroll_type_id_from_user_name does not read traced arrays — it reads the
+    # *abstract* shape, which is always concrete at trace time.
+    # We default to SCR_MAGIC_MAPPING for any tracing context where user_names
+    # cannot be concretized.
+    try:
+        _marker_safe_slot = int(jax.device_get(safe_slot))
+        _marker_uname = inv.user_names[_marker_safe_slot]
+        _marker_target_tid = jnp.int16(
+            _scroll_type_id_from_user_name(jax.device_get(_marker_uname))
+        )
+    except Exception:
+        _marker_target_tid = jnp.int16(_SCROLL_BASE_ID + _SCR_MAGIC_MAPPING_OFFSET)
+
+    def _h_magic_marker_bound(s, r):
+        return _h_magic_marker_with_tid(s, r, _marker_target_tid)
+
+    handlers = list(_HANDLERS)
+    handlers[_H_MAGIC_MARKER] = _h_magic_marker_bound
+
+    return jax.lax.switch(handler_idx, handlers, state, rng)

@@ -111,6 +111,10 @@ class ContainerState:
     parent_slot:      jnp.ndarray
     is_open:          jnp.ndarray
     container_buc:    jnp.ndarray
+    # is_locked: bool[N_CONTAINERS] — True when a chest/box is locked.
+    # Cite: vendor/nethack/src/lock.c::pick_lock — locked chests can be picked
+    # by a lock pick, skeleton key, or credit card.
+    is_locked:        jnp.ndarray
 
     @classmethod
     def empty(cls) -> "ContainerState":
@@ -129,6 +133,7 @@ class ContainerState:
             parent_slot      = jnp.full((n,), -1, dtype=jnp.int8),
             is_open          = jnp.zeros((n,),   dtype=jnp.bool_),
             container_buc    = jnp.zeros((n,),   dtype=jnp.int8),
+            is_locked        = jnp.zeros((n,),   dtype=jnp.bool_),
         )
 
 
@@ -759,3 +764,52 @@ def handle_apply_container(state, rng):
     use_container).  This is the JIT-safe handler hooked from action dispatch.
     """
     return handle_loot(state, rng)
+
+
+# ---------------------------------------------------------------------------
+# Wand of cancellation: bag-of-holding implosion
+# ---------------------------------------------------------------------------
+
+def cancel_bag_of_holding(state, container_idx: int):
+    """Wand of cancellation hits a bag of holding: implode it.
+
+    Canonical: vendor/nethack/src/zap.c::cancel_item (line 720) —
+    cancelling a BAG_OF_HOLDING destroys all contents and demotes the
+    bag to a plain SACK.
+
+    - Zero all items_quantity in the container (contents destroyed).
+    - Demote container_type from BAG_OF_HOLDING to SACK.
+
+    Parameters
+    ----------
+    state         : EnvState
+    container_idx : int  index into state.containers (0..N_CONTAINERS-1)
+
+    Returns
+    -------
+    new_state
+    """
+    cs    = state.containers
+    c_idx = jnp.int32(container_idx)
+
+    is_boh = cs.container_type[c_idx] == jnp.int8(ContainerType.BAG_OF_HOLDING)
+
+    # Zero all items_quantity in this container slot (contents destroyed).
+    # Cite: vendor/nethack/src/zap.c::cancel_item line 720 — bag implodes,
+    # destroying everything inside.
+    zeroed_qty = jnp.zeros(MAX_ITEMS_PER_CONTAINER, dtype=jnp.int16)
+    new_qty = jnp.where(
+        is_boh,
+        cs.items_quantity.at[c_idx].set(zeroed_qty),
+        cs.items_quantity,
+    )
+
+    # Demote container type: BAG_OF_HOLDING -> SACK.
+    new_ctype = jnp.where(
+        is_boh,
+        cs.container_type.at[c_idx].set(jnp.int8(ContainerType.SACK)),
+        cs.container_type,
+    )
+
+    new_cs = cs.replace(items_quantity=new_qty, container_type=new_ctype)
+    return state.replace(containers=new_cs)

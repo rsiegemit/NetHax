@@ -66,6 +66,7 @@ from Nethax.nethax.subsystems.action_dispatch import (
     _SLOT_APPLY,
     _SLOT_ENGRAVE,
     _SLOT_NAME,
+    _SLOT_ENHANCE,
 )
 
 
@@ -273,9 +274,13 @@ def test_meta_l_maps_to_loot_handler():
 
 
 def test_meta_e_aliases_to_eat_handler():
-    """Meta-e (0xE5) — vendor binds to enhance; our env aliases to eat
-    so any "eat via extcmd" path through M-e still works."""
-    assert _slot(0xE5) == _SLOT_EAT
+    """Meta-e (0xE5) → _SLOT_ENHANCE per vendor cmd.c:1716.
+
+    Wave-14 remap: _SLOT_ENHANCE is vendor-correct; plain 'e' (0x65) still
+    routes to _SLOT_EAT.  Citation: cmd.c:1716.
+    """
+    assert _slot(0xE5) == _SLOT_ENHANCE
+    assert _slot(ord("e")) == _SLOT_EAT
 
 
 # ---------------------------------------------------------------------------

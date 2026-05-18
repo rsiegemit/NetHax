@@ -376,8 +376,8 @@ def cast_ray(
     -------
     (new_state, rng)
     """
-    dy = _DIR_DY[direction].astype(jnp.int16)
-    dx = _DIR_DX[direction].astype(jnp.int16)
+    dy0 = _DIR_DY[direction].astype(jnp.int16)
+    dx0 = _DIR_DX[direction].astype(jnp.int16)
 
     map_h, map_w = state.terrain.shape
 
@@ -386,7 +386,7 @@ def cast_ray(
             return s, r
 
     def _step(carry, _step_i):
-        s, r, pos, stopped = carry
+        s, r, pos, dy, dx, stopped, reflected = carry
 
         next_pos = pos + jnp.array([dy, dx], dtype=jnp.int16)
 
@@ -403,6 +403,17 @@ def cast_ray(
 
         mon_idx = _find_monster_at(s, next_pos)
         has_monster = (mon_idx > 0) & s.mon_alive[mon_idx]
+
+        # Reflection: when the beam reaches a reflecting player, reverse the
+        # travel direction once. vendor/nethack/src/zap.c::buzz reflection.
+        hits_player = (
+            (next_pos[0] == s.player_pos[0])
+            & (next_pos[1] == s.player_pos[1])
+        )
+        do_reflect = (~stopped) & (~reflected) & hits_player & s.player_reflecting
+        new_dy = jnp.where(do_reflect, -dy, dy)
+        new_dx = jnp.where(do_reflect, -dx, dx)
+        new_reflected = reflected | do_reflect
 
         # Apply effect when there is a live monster and we are not stopped.
         def _apply(args):
@@ -428,10 +439,18 @@ def cast_ray(
             None,
         )
 
-        return (s, r, next_pos, beam_stopped), None
+        return (s, r, next_pos, new_dy, new_dx, beam_stopped, new_reflected), None
 
-    init_carry = (state, rng, start_pos.astype(jnp.int16), jnp.bool_(False))
-    (final_state, final_rng, _, _), _ = lax.scan(
+    init_carry = (
+        state,
+        rng,
+        start_pos.astype(jnp.int16),
+        dy0,
+        dx0,
+        jnp.bool_(False),
+        jnp.bool_(False),
+    )
+    (final_state, final_rng, _, _, _, _, _), _ = lax.scan(
         _step, init_carry, jnp.arange(ray_range)
     )
     return final_state, final_rng

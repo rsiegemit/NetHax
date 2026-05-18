@@ -1365,10 +1365,16 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
     # vendor ordering relative to monster strength.
     # vendor/nethack/src/mhitu.c:709-710 (tmp = AC_VALUE(u.uac) + 10 + m_lev)
     # vendor/nethack/src/mhitu.c:717-718 (clamp tmp >= 1)
+    key_hit, key_ac = jax.random.split(key_hit)
     roll = rnd(key_hit, 20).astype(jnp.int32)
     mlev = jnp.clip((mai.hp_max[idx] // 4).astype(jnp.int32), 1, 30)
-    # AC_VALUE is the identity for AC>=0 (the deterministic Nethax case).
-    ac_value = player_ac.astype(jnp.int32)
+    # AC_VALUE: identity when AC>=0; rnd(-AC) softening when AC<0
+    # vendor/nethack/src/hack.h:1538 (AC_VALUE macro); uhitm.c:380.
+    ac_raw = player_ac.astype(jnp.int32)
+    ac_neg_roll = jax.random.randint(
+        key_ac, (), 1, jnp.maximum(-ac_raw + 1, 2), dtype=jnp.int32
+    )
+    ac_value = jnp.where(ac_raw >= 0, ac_raw, -ac_neg_roll)
     raw_tmp = ac_value + jnp.int32(10) + mlev
     tmp = jnp.maximum(raw_tmp, jnp.int32(1))
     # vendor/nethack/src/uhitm.c:709-710 — strict ``tmp > dieroll``.

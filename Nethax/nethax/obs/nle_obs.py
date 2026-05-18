@@ -873,9 +873,14 @@ def build_program_state(env_state) -> jnp.ndarray:
     Returns:
         int32[6]
     """
+    done = env_state.done.astype(jnp.int32)
     out = jnp.zeros((6,), dtype=jnp.int32)
-    out = out.at[3].set(jnp.int32(1))   # in_moveloop
-    out = out.at[5].set(jnp.int32(1))   # something_worth_saving
+    # vendor/nle/win/rl/winrl.cc:263,265 — both gameover and exiting flip on
+    # terminal frame; in_moveloop drops to 0.
+    out = out.at[0].set(done)                          # gameover
+    out = out.at[2].set(done)                          # exiting
+    out = out.at[3].set(jnp.int32(1) - done)           # in_moveloop
+    out = out.at[5].set(jnp.int32(1))                  # something_worth_saving
     return out
 
 

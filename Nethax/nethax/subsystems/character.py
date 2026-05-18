@@ -871,6 +871,17 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int):
         alignment_record=jnp.int16(init_record),
     )
 
+    # --- player_amax: race attrmax capped at 18 for int8 storage ---
+    # Vendor: u.urace.attrmax[] set during init_attr from race.attrmax[].
+    # STR cap > 18 (18/** range) is clamped to 18 here since int8 can't
+    # hold values > 127; restore_ability uses this as the per-stat ceiling.
+    # Stat order matches _STAT_NAMES: str(0), int(1), wis(2), dex(3), con(4), cha(5).
+    # Cite: vendor/nethack/src/u_init.c lines 250-580;
+    #       vendor/nethack/src/potion.c::peffect_restore_ability (full_restore).
+    race_entry = get_race(race)
+    amax_vals = [min(int(race_entry.attrmax[i]), 18) for i in range(6)]
+    player_amax = jnp.array(amax_vals, dtype=jnp.int8)
+
     return dict(
         player_role=jnp.int8(int(role)),
         player_race=jnp.int8(int(race)),
@@ -881,6 +892,7 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int):
         player_int=jnp.int8(stats["int"]),
         player_wis=jnp.int8(stats["wis"]),
         player_cha=jnp.int8(stats["cha"]),
+        player_amax=player_amax,
         player_hp=hp,
         player_hp_max=hp,
         player_pw=pw,
