@@ -116,15 +116,16 @@ def _melee_hit_rate(state, monster_idx: int = 0, n: int = _N_TRIALS, seed: int =
     Uses a fresh RNG split for each trial; returns fraction of trials where
     the returned hit flag is True.
     """
+    # JIT once so compilation happens before the loop, not on every call.
+    _attack_jit = jax.jit(
+        lambda rng: melee_attack(state, rng, jnp.int32(monster_idx))
+    )
     rng = jax.random.PRNGKey(seed)
     hits = 0
-    cur = state
     for _ in range(n):
         rng, sub = jax.random.split(rng)
-        _new_state, _dmg, hit = melee_attack(cur, sub, jnp.int32(monster_idx))
+        _new_state, _dmg, hit = _attack_jit(sub)
         hits += int(hit)
-        # Reset hp so the monster stays alive throughout.
-        cur = cur  # keep original state (don't accumulate damage)
     return hits / n
 
 

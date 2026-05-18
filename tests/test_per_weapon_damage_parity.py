@@ -90,11 +90,13 @@ def _state_bare_handed(is_large_target: bool = False):
 
 def _hit_damages(state, n: int = 200) -> list:
     """Collect damage values for hits over n trials."""
+    # JIT once so compilation happens before the loop, not on every call.
+    _strike_jit = jax.jit(lambda rng: _single_melee_strike(state, rng, jnp.int32(0)))
     rng = jax.random.PRNGKey(7)
     dmgs = []
     for _ in range(n):
         rng, sub = jax.random.split(rng)
-        _, dmg, hit = _single_melee_strike(state, sub, jnp.int32(0))
+        _, dmg, hit = _strike_jit(sub)
         if bool(hit):
             dmgs.append(int(dmg))
     return dmgs
@@ -118,10 +120,13 @@ def test_dagger_does_1d4_vs_small():
     assert 2.0 <= avg <= 3.2, f"dagger 1d4 mean expected ~2.5, got {avg:.3f}"
 
 
+@pytest.mark.timeout(600)
 def test_long_sword_does_1d8_vs_small():
     """Long sword (type_id=37) vs small target: sdam=(1,8) → mean ~4.5.
 
     Vendor: objects.c entry 37 oc_wsdam=8. weapon.c:264-265 rnd(8).
+    Extended timeout: JAX re-traces on first call per weapon type_id, adding
+    JIT compilation overhead (same pattern as test_two_handed_sword_does_3d6_vs_large).
     """
     state = _state_with_weapon(type_id=37, is_large_target=False)
     dmgs = _hit_damages(state)
@@ -131,10 +136,13 @@ def test_long_sword_does_1d8_vs_small():
     assert 3.5 <= avg <= 5.8, f"long sword 1d8 mean expected ~4.5, got {avg:.3f}"
 
 
+@pytest.mark.timeout(600)
 def test_long_sword_does_1d12_vs_large():
     """Long sword (type_id=37) vs large target: ldam=(1,12) → mean ~6.5.
 
     Vendor: objects.c entry 37 oc_wldam=12. weapon.c:226-227 rnd(12).
+    Extended timeout: JAX re-traces on first call per weapon type_id, adding
+    JIT compilation overhead.
     """
     state = _state_with_weapon(type_id=37, is_large_target=True)
     dmgs = _hit_damages(state)
