@@ -359,24 +359,37 @@ def door_blocks_movement(
 def picklock_door(
     state: FeaturesState,
     pos: jnp.ndarray,
+    rng: jax.Array | None = None,
+    player_dex: int = 10,
 ) -> tuple[FeaturesState, jnp.ndarray]:
     """Pick the lock on a LOCKED door (vendor/nethack/src/lock.c::picklock,
-    lines 138-150).
+    lines 636-644).
 
-    pos : int array [3] = (level, row, col)
+    pos        : int array [3] = (level, row, col)
+    rng        : JAX PRNGKey; if None, always succeeds (legacy behaviour).
+    player_dex : player Dexterity score.
 
-    LOCKED → CLOSED on success (we always succeed here; the rn2(100) busy
-    loop in vendor models multi-turn occupation, not gate parity).
+    Success formula (LOCK_PICK): ch = 3 * DEX; succeed if rn2(100) < ch.
+    Cite: vendor/nethack/src/lock.c:636-637 — ``ch = 3 * ACURR(A_DEX)``.
 
-    Returns (new_state, success: bool) — success is True iff the door was
-    LOCKED before the call.
+    LOCKED → CLOSED on success.
+    Returns (new_state, success: bool).
     """
     lv, row, col = pos[0], pos[1], pos[2]
     current = state.door_state[lv, row, col].astype(jnp.int32)
     is_locked = current == jnp.int32(DoorState.LOCKED)
-    new_val = jnp.where(is_locked, jnp.int32(DoorState.CLOSED), current).astype(jnp.int8)
+
+    if rng is None:
+        # Legacy: always succeed when no rng supplied.
+        did_unlock = is_locked
+    else:
+        ch = jnp.int32(3 * int(player_dex))
+        roll = jax.random.randint(rng, shape=(), minval=0, maxval=100)
+        did_unlock = is_locked & (roll < ch)
+
+    new_val = jnp.where(did_unlock, jnp.int32(DoorState.CLOSED), current).astype(jnp.int8)
     new_door_state = state.door_state.at[lv, row, col].set(new_val)
-    return state.replace(door_state=new_door_state), is_locked
+    return state.replace(door_state=new_door_state), did_unlock
 
 
 def forcelock_door(
@@ -550,14 +563,65 @@ def handle_close(state, rng: jax.Array):
 
 
 def handle_kick(state, rng: jax.Array):
-    """Kick the door adjacent to the player (Wave 3: kicks tile at player pos).
+    """Kick the door or monster at the player's tile.
+
+    WOUNDED_LEGS blocks the kick entirely.
+    Cite: vendor/nethack/src/dokick.c:1265-1310 — wounded legs prevent kicking.
+
+    If a live monster occupies the player's tile, damages it:
+      damage = max(1, (Str + Dex + Con) // 15)
+    and marks it hostile.
+    Cite: vendor/nethack/src/dokick.c:146-291.
+
+    Otherwise kicks the door at the player's tile (existing Wave-3 logic).
 
     Returns new EnvState.
     """
-    flat_lv = _flat_lv_from_state(state)
-    pos = jnp.array([flat_lv, state.player_pos[0], state.player_pos[1]], dtype=jnp.int32)
-    new_features, _ = kick_door(state.features, rng, pos)
-    return state.replace(features=new_features)
+    from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS
+
+    is_wounded = state.status.timed_statuses[int(_TS.WOUNDED_LEGS)] > jnp.int32(0)
+
+    def _do_kick(s):
+        flat_lv = _flat_lv_from_state(s)
+        prow = s.player_pos[0].astype(jnp.int32)
+        pcol = s.player_pos[1].astype(jnp.int32)
+
+        # Check for a live monster at the player's tile.
+        mai = s.monster_ai
+        at_tile = (
+            mai.alive
+            & (mai.pos[:, 0].astype(jnp.int32) == prow)
+            & (mai.pos[:, 1].astype(jnp.int32) == pcol)
+        )
+        any_monster = jnp.any(at_tile)
+        target_slot = jnp.argmax(at_tile).astype(jnp.int32)
+
+        # Kick damage: max(1, (Str + Dex + Con) // 15)
+        # Cite: vendor/nethack/src/dokick.c:146-291.
+        kick_dmg = jnp.maximum(
+            jnp.int32(1),
+            (s.player_str.astype(jnp.int32)
+             + s.player_dex.astype(jnp.int32)
+             + s.player_con.astype(jnp.int32)) // jnp.int32(15),
+        )
+
+        def _kick_monster(s_):
+            old_hp = mai.hp[target_slot]
+            new_hp = jnp.maximum(old_hp - kick_dmg, jnp.int32(0))
+            new_mai = mai.replace(
+                hp=mai.hp.at[target_slot].set(new_hp),
+                peaceful=mai.peaceful.at[target_slot].set(jnp.bool_(False)),
+            )
+            return s_.replace(monster_ai=new_mai)
+
+        def _kick_door(s_):
+            pos = jnp.array([flat_lv, prow, pcol], dtype=jnp.int32)
+            new_features, _ = kick_door(s_.features, rng, pos)
+            return s_.replace(features=new_features)
+
+        return jax.lax.cond(any_monster, _kick_monster, _kick_door, s)
+
+    return jax.lax.cond(is_wounded, lambda s: s, _do_kick, state)
 
 
 # ---------------------------------------------------------------------------

@@ -760,19 +760,27 @@ def _trap_spiked_pit(state, rng):
 
 
 def _trap_hole(state, rng):
-    """HOLE — descend one level in the current branch.
+    """HOLE — descend one level + apply rnd(6) fall damage.
 
-    vendor/nethack/src/trap.c::HOLE — goto_level(level+1, ...).
+    vendor/nethack/src/trap.c dotrap HOLE branch:
+      losehp(rnd(6), ...) then goto_level(level+1, ...).
     Clamps at MAX_LEVELS_PER_BRANCH so the carrier shape is stable.
     """
+    # rnd(6) = 1..6 fall damage (vendor trap.c dotrap HOLE).
+    rng, k = jax.random.split(rng)
+    dmg = jax.random.randint(k, shape=(), minval=1, maxval=7).astype(jnp.int32)
+    new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(0))
     max_lv = jnp.int8(state.terrain.shape[1])
     new_level = jnp.minimum(state.dungeon.current_level + jnp.int8(1), max_lv)
     new_dungeon = state.dungeon.replace(current_level=new_level)
-    return state.replace(dungeon=new_dungeon)
+    return state.replace(dungeon=new_dungeon, player_hp=new_hp)
 
 
 def _trap_trapdoor(state, rng):
-    """TRAPDOOR — same effect as HOLE."""
+    """TRAPDOOR — same effect as HOLE (rnd(6) fall damage + descend level).
+
+    vendor/nethack/src/trap.c dotrap TRAPDOOR — identical to HOLE branch.
+    """
     return _trap_hole(state, rng)
 
 
@@ -1003,8 +1011,29 @@ def _trap_trapped_door(state, rng):
 
 
 def _trap_trapped_chest(state, rng):
-    """TRAPPED_CHEST — handled by chest-open logic, not movement here."""
-    return state
+    """TRAPPED_CHEST — 1d10 HP damage + 25% poison chance.
+
+    vendor/nethack/src/lock.c lines 104-114:
+      losehp(rnd(10), ...) and if (!rn2(4)) poisoned("needle", ...).
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+    k0, k1, k2, k3 = jax.random.split(rng, 4)
+    s = _apply_hp_damage(state, _d(k0, 10))
+    # 25% poison: vendor uses !rn2(4).
+    poisoned = jax.random.randint(k1, (), 0, 4) == jnp.int32(0)
+    poison_turns = _d(k2, 10)
+
+    def _do_poison(s_):
+        new_sick = s_.status.replace(
+            sick_kind=jnp.int8(1),
+            timed_statuses=s_.status.timed_statuses.at[int(TimedStatus.SICK)].set(
+                jnp.maximum(s_.status.timed_statuses[int(TimedStatus.SICK)],
+                            poison_turns)
+            ),
+        )
+        return s_.replace(status=new_sick)
+
+    return jax.lax.cond(poisoned, _do_poison, lambda s_: s_, s)
 
 
 # Tuple of branches indexed by TrapType value.  Order MUST match enum.

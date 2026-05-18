@@ -326,8 +326,13 @@ def _try_step(state, dy: int, dx: int, rng: jax.Array):
     is_wounded = state.status.timed_statuses[int(_TS.WOUNDED_LEGS)] > jnp.int32(0)
     do_limp = is_wounded & (wl_roll < jnp.float32(0.3))
 
+    # UNDERWATER diagonal block: diagonal moves are forbidden while in water.
+    # Cite: vendor/nethack/src/hack.c lines 1016-1023.
+    is_diagonal = jnp.bool_((dy != 0) & (dx != 0))
+    blocked_underwater = state.player_in_water & is_diagonal
+
     # Any no-op gate → skip movement entirely.
-    noop_gate = state.swallow.swallowed | is_vomiting | do_limp
+    noop_gate = state.swallow.swallowed | is_vomiting | do_limp | blocked_underwater
 
     return jax.lax.cond(
         noop_gate,

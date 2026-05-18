@@ -259,7 +259,13 @@ def test_polymorph_via_poly_trap_through_env_step():
 # ---------------------------------------------------------------------------
 
 def test_polymorph_reverts_after_timer_via_env_step():
-    """Polymorph the player, then run polymorph.step many times → reverts."""
+    """Polymorph the player, then run polymorph.step many times → reverts.
+
+    NOTE: jit_disabled because poly_step loops up to ~700 iterations; JIT
+    compilation of the full EnvState transition graph hits XLA timeouts on CI.
+    The logic is correct (verified with jax_disable_jit=True); compilation
+    time is a toolchain issue, not a correctness issue.
+    """
     import jax
     import jax.numpy as jnp
     from Nethax.nethax.state import EnvState
@@ -270,25 +276,30 @@ def test_polymorph_reverts_after_timer_via_env_step():
     from Nethax.nethax.constants.monsters import MONSTERS
 
     rng = jax.random.PRNGKey(12)
-    state = EnvState.default(rng)
 
-    # Pick a form that has at least one attack (so polymorph proceeds normally).
-    target_idx = 0
-    for i, m in enumerate(MONSTERS):
-        if m.attacks and m.attacks[0][0] != 0:
-            target_idx = i
-            break
+    # Disable JIT: this test iterates ~700 times; the XLA compilation of the
+    # full EnvState graph on first call exceeds the 300s pytest timeout on CPU.
+    # Cite: poly_timer ∈ [500, 1000) — polyself.c, 500 + rn2(500).
+    with jax.disable_jit():
+        state = EnvState.default(rng)
 
-    state = polymorph_player(state, rng, target_idx, controlled=False)
-    assert bool(state.polymorph.is_polymorphed)
-    initial_timer = int(state.polymorph.poly_timer)
-    assert initial_timer > 0
+        # Pick a form that has at least one attack (so polymorph proceeds normally).
+        target_idx = 0
+        for i, m in enumerate(MONSTERS):
+            if m.attacks and m.attacks[0][0] != 0:
+                target_idx = i
+                break
 
-    # Run more steps than the maximum possible timer (≤ 1000 by construction).
-    for i in range(initial_timer + 5):
-        state = poly_step(state, jax.random.PRNGKey(1000 + i))
-        if not bool(state.polymorph.is_polymorphed):
-            break
+        state = polymorph_player(state, rng, target_idx, controlled=False)
+        assert bool(state.polymorph.is_polymorphed)
+        initial_timer = int(state.polymorph.poly_timer)
+        assert initial_timer > 0
+
+        # Run more steps than the maximum possible timer (≤ 1000 by construction).
+        for i in range(initial_timer + 5):
+            state = poly_step(state, jax.random.PRNGKey(1000 + i))
+            if not bool(state.polymorph.is_polymorphed):
+                break
 
     assert not bool(state.polymorph.is_polymorphed), (
         f"Expected polymorph to revert by now; "
