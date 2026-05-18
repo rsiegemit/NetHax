@@ -35,6 +35,27 @@ from Nethax.nethax.subsystems.inventory import (
 )
 from Nethax.nethax.subsystems.items_potions import apply_potion_to_monster
 from Nethax.nethax.subsystems.scoring import record_kill as _scoring_record_kill
+# Module-level imports to avoid lazy-import tracer leaks (module-level jnp.array
+# builds must happen outside any JIT trace).  Cite: tests show wave9 inline
+# imports inside _single_melee_strike trigger jax.errors.UnexpectedTracerError.
+from Nethax.nethax.subsystems.weapon_dice import weapon_damage_dice as _wdd
+from Nethax.nethax.subsystems.artifact_powers import (
+    artifact_bonus_damage as _arti_bonus,
+    wielded_artifact_idx_from_state as _arti_idx,
+    apply_artifact_hit_effects as _arti_hit_effects,
+)
+from Nethax.nethax.subsystems.throwing import (
+    _HATES_SILVER,
+    _OBJECT_MATERIAL,
+    _IS_RETURNING_WEAPON,
+    compute_throw_range,
+)
+from Nethax.nethax.constants.objects import Material
+from Nethax.nethax.rng import rn2 as _rn2
+from Nethax.nethax.subsystems.skills import (
+    use_skill as _skills_use_skill,
+    _WEAPON_TYPE_TO_SKILL as _SKILL_WEAPON_TYPE_TO_SKILL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +70,38 @@ def _build_monster_xp_table() -> jnp.ndarray:
     return jnp.array([int(m.level) for m in MONSTERS], dtype=jnp.int32)
 
 _MONSTER_XP_TABLE: jnp.ndarray = _build_monster_xp_table()
+
+
+# ---------------------------------------------------------------------------
+# Corpse-drops table — vendor/nethack/src/mondead.c::xkilled.
+# Most monsters leave a corpse; exceptions: elementals (S_ELEMENTAL=31),
+# ghosts (S_GHOST=54), vortices (S_VORTEX=22), and shades (S_SHADE=55).
+# vendor/nethack/src/mondead.c (xkilled, corpse-generation block).
+# ---------------------------------------------------------------------------
+def _build_killed_drops_corpse_table() -> jnp.ndarray:
+    from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
+    _NO_CORPSE_SYMS = {
+        int(MonsterSymbol.S_ELEMENTAL),
+        int(MonsterSymbol.S_GHOST),
+        int(MonsterSymbol.S_VORTEX),
+    }
+    # S_SHADE may not exist in all builds; guard with getattr.
+    shade_val = getattr(MonsterSymbol, "S_SHADE", None)
+    if shade_val is not None:
+        _NO_CORPSE_SYMS.add(int(shade_val))
+    return jnp.array(
+        [int(m.symbol) not in _NO_CORPSE_SYMS for m in MONSTERS],
+        dtype=jnp.bool_,
+    )
+
+_KILLED_DROPS_CORPSE: jnp.ndarray = _build_killed_drops_corpse_table()
+
+# Sentinel type_id for a corpse item (FOOD class, vendor objects.h index 240).
+# Mirrors nle_obs.py::CORPSE_TYPE_ID = 260.
+_CORPSE_TYPE_ID: int = 260
+
+# ItemCategory.FOOD value = 7 (inventory.py ItemCategory enum).
+_FOOD_CATEGORY: int = 7
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +121,27 @@ _MONSTER_PRIMARY_ADTYP_TABLE: jnp.ndarray = _build_monster_primary_adtyp_table()
 
 # AD_WERE value as a module-level int constant (mirrors DamageType.AD_WERE=29).
 _AD_WERE: int = 29
+
+# ---------------------------------------------------------------------------
+# Engulfer table — True for monsters whose attack list includes AT_ENGL.
+# Vendor: vendor/nethack/src/mhitu.c::gulpmu (line 1287).
+# Imported from swallow.py; referenced here for the monster_attack_player hook.
+# ---------------------------------------------------------------------------
+from Nethax.nethax.subsystems.swallow import _IS_ENGULFER as _ENGULFER_TABLE, try_engulf as _try_engulf  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Immobile-monster mask — vendor/nethack/src/uhitm.c:393-394:
+#   if (!mtmp->mcanmove) tmp += 4;
+# Structural immobility: move_speed == 0 (e.g. brown mold, blue jelly).
+# TODO: runtime paralysis (!mcanmove) not modelled — no mcanmove field yet.
+# Built once at module load; never traced inside JIT.
+# ---------------------------------------------------------------------------
+def _build_is_immobile_table() -> jnp.ndarray:
+    from Nethax.nethax.constants.monsters import MONSTERS
+    return jnp.array([int(m.move_speed) == 0 for m in MONSTERS], dtype=jnp.bool_)
+
+_IS_IMMOBILE: jnp.ndarray = _build_is_immobile_table()
 
 
 # ---------------------------------------------------------------------------
@@ -546,9 +620,22 @@ def _wielded_skill_id(state) -> jnp.ndarray:
 
 
 def _skill_hit_bonus(state) -> jnp.ndarray:
-    """Return the current to-hit bonus from the wielded weapon's skill tier."""
-    skill_id = _wielded_skill_id(state)
-    tier = state.combat.weapon_skill[skill_id].astype(jnp.int32)
+    """Return the current to-hit bonus from the wielded weapon's skill tier.
+
+    Reads from state.skills.level[skill_id] (SkillState) using the canonical
+    weapon type_id → SkillId mapping (_SKILL_WEAPON_TYPE_TO_SKILL).
+    Falls back to CombatState.weapon_skill when SkillState is absent.
+    Cite: vendor/nethack/src/weapon.c:1566-1577 (weapon_hit_bonus table).
+    """
+    skills = getattr(state, "skills", None)
+    if skills is not None:
+        wep_type = _wielded_type_id(state)
+        safe_type = jnp.clip(wep_type.astype(jnp.int32), 0, _SKILL_WEAPON_TYPE_TO_SKILL.shape[0] - 1)
+        skill_id = _SKILL_WEAPON_TYPE_TO_SKILL[safe_type]
+        tier = skills.level[skill_id].astype(jnp.int32)
+    else:
+        skill_id = _wielded_skill_id(state)
+        tier = state.combat.weapon_skill[skill_id].astype(jnp.int32)
     safe_tier = jnp.clip(tier, 0, N_SKILL_TIERS - 1)
     return _SKILL_HIT_BONUS[safe_tier].astype(jnp.int32)
 
@@ -556,6 +643,28 @@ def _skill_hit_bonus(state) -> jnp.ndarray:
 # ---------------------------------------------------------------------------
 # To-hit roll (vendor/nethack/src/uhitm.c::find_roll_to_hit, lines 365-427)
 # ---------------------------------------------------------------------------
+def _compute_encumbrance(state) -> jnp.ndarray:
+    """Compute encumbrance level (0=normal .. 5=overloaded) from inventory weight.
+
+    Vendor reference: vendor/nethack/src/uhitm.c:407-409 — near_capacity().
+    Capacity approximation: cap = 25 * Str + 50 (vendor weight.c heuristic).
+    enc_level = floor(total_weight / (cap / 2.5)) clamped to [0, 5].
+
+    # vendor/nethack/src/uhitm.c:407 (near_capacity() != 0 → subtract penalty)
+    """
+    items = state.inventory.items
+    weight_total = jnp.sum(
+        items.weight.astype(jnp.int32) * items.quantity.astype(jnp.int32)
+    ).astype(jnp.int32)
+    str_val = state.player_str.astype(jnp.int32)
+    cap = jnp.int32(25) * str_val + jnp.int32(50)
+    # cap/2.5 = cap*2//5
+    half_cap = cap * jnp.int32(2) // jnp.int32(5)
+    safe_half_cap = jnp.maximum(half_cap, jnp.int32(1))
+    enc = weight_total // safe_half_cap
+    return jnp.clip(enc, jnp.int32(0), jnp.int32(5)).astype(jnp.int32)
+
+
 def to_hit_roll(rng: jax.Array, attacker_state, target_ac: jnp.ndarray) -> jnp.ndarray:
     """d20 hit check.
 
@@ -578,7 +687,34 @@ def to_hit_roll(rng: jax.Array, attacker_state, target_ac: jnp.ndarray) -> jnp.n
     enchant = _wielded_enchant(attacker_state)
     target_ac_i32 = target_ac.astype(jnp.int32)
 
-    tmp = jnp.int32(1) + abon + target_ac_i32 + skill_bonus + enchant
+    # vendor/nethack/src/uhitm.c:378 — XL contribution (player level).
+    xl_bonus = attacker_state.player_xl.astype(jnp.int32)
+    # vendor/nethack/src/uhitm.c:377 — Luck bonus: sgn(Luck)*((|Luck|+2)/3).
+    luck = attacker_state.player_luck.astype(jnp.int32)
+    luck_bonus = jnp.sign(luck) * ((jnp.abs(luck) + 2) // 3)
+    # vendor/nethack/src/uhitm.c:376 — u.uhitinc (ring of increase accuracy).
+    uhitinc = attacker_state.player_uhitinc.astype(jnp.int32)
+
+    # vendor/nethack/src/uhitm.c:407-409 — encumbrance penalty: (2*enc)-1.
+    enc = _compute_encumbrance(attacker_state)
+    enc_penalty = jnp.where(enc > jnp.int32(0), -(jnp.int32(2) * enc - jnp.int32(1)), jnp.int32(0))
+
+    # vendor/nethack/src/weapon.c:961 (abon) — confusion: -1 to-hit.
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+    confused_timer = attacker_state.status.timed_statuses[int(TimedStatus.CONFUSION)].astype(jnp.int32)
+    confusion_penalty = jnp.where(confused_timer > jnp.int32(0), jnp.int32(-1), jnp.int32(0))
+
+    # vendor/nethack/src/uhitm.c:455 — stun: -1 to-hit.
+    stunned_timer = attacker_state.status.timed_statuses[int(TimedStatus.STUNNED)].astype(jnp.int32)
+    stun_penalty = jnp.where(stunned_timer > jnp.int32(0), jnp.int32(-1), jnp.int32(0))
+
+    # vendor/nethack/src/uhitm.c:410-411 — trap: -3 to-hit.
+    # TODO: vendor uhitm.c:410 requires player_in_trap field (not yet in EnvState).
+    trap_penalty = jnp.int32(0)
+
+    tmp = (jnp.int32(1) + abon + target_ac_i32 + skill_bonus + enchant
+           + xl_bonus + luck_bonus + uhitinc
+           + enc_penalty + confusion_penalty + stun_penalty + trap_penalty)
     # vendor/nethack/src/uhitm.c:709-710: mhit = (tmp > dieroll)
     return tmp > roll
 
@@ -796,7 +932,8 @@ def _single_melee_strike(
     two-weapon melee paths.  When the player is polymorphed, damage is
     rolled from the form's attack dice rather than the weapon.
     """
-    key_hit, key_dmg, key_monk, key_samurai = split_n(rng, 4)
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+    key_hit, key_dmg, key_monk, key_samurai, key_backstab = split_n(rng, 5)
     idx = target_monster_idx.astype(jnp.int32)
     mai = state.monster_ai
 
@@ -814,7 +951,45 @@ def _single_melee_strike(
     enchant = _wielded_enchant(state)
     pen = jnp.int32(0) if hit_penalty is None else hit_penalty.astype(jnp.int32)
     knight_bonus = _knight_chivalric_bonus(state, idx)
-    tmp = jnp.int32(1) + abon + target_ac + skill_bonus + enchant + pen + knight_bonus
+    # vendor/nethack/src/uhitm.c:378 — XL contribution.
+    xl_bonus = state.player_xl.astype(jnp.int32)
+    # vendor/nethack/src/uhitm.c:377 — Luck bonus: sgn(Luck)*((|Luck|+2)/3).
+    luck = state.player_luck.astype(jnp.int32)
+    luck_bonus = jnp.sign(luck) * ((jnp.abs(luck) + 2) // 3)
+    # vendor/nethack/src/uhitm.c:376 — u.uhitinc (ring of increase accuracy).
+    uhitinc = state.player_uhitinc.astype(jnp.int32)
+    # vendor/nethack/src/uhitm.c:387-394 — target-state bonuses.
+    # +2 sleeping (asleep field; no sleep_timer yet).
+    sleeping_bonus = jnp.where(mai.asleep[idx], jnp.int32(2), jnp.int32(0))
+    # +2 fleeing (mstrategy == MoveStrategy.FLEE == 4).
+    fleeing_bonus = jnp.where(
+        mai.mstrategy[idx].astype(jnp.int32) == jnp.int32(4),
+        jnp.int32(2), jnp.int32(0),
+    )
+    # +4 structurally immobile (move_speed == 0).
+    # TODO: runtime paralysis (!mcanmove) not modelled — no mcanmove field yet.
+    entry_i = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, _IS_IMMOBILE.shape[0] - 1)
+    immobile_bonus = jnp.where(_IS_IMMOBILE[entry_i], jnp.int32(4), jnp.int32(0))
+
+    # vendor/nethack/src/uhitm.c:455 — stun: -1 to-hit.
+    stunned_timer = state.status.timed_statuses[int(TimedStatus.STUNNED)].astype(jnp.int32)
+    stun_hit_penalty = jnp.where(stunned_timer > jnp.int32(0), jnp.int32(-1), jnp.int32(0))
+
+    # vendor/nethack/src/uhitm.c:407-409 — encumbrance: -(2*enc-1) to-hit.
+    enc = _compute_encumbrance(state)
+    enc_penalty = jnp.where(enc > jnp.int32(0), -(jnp.int32(2) * enc - jnp.int32(1)), jnp.int32(0))
+
+    # vendor/nethack/src/weapon.c:961 (abon) — confusion: -1 to-hit.
+    confused_timer = state.status.timed_statuses[int(TimedStatus.CONFUSION)].astype(jnp.int32)
+    confusion_penalty = jnp.where(confused_timer > jnp.int32(0), jnp.int32(-1), jnp.int32(0))
+
+    # TODO: vendor uhitm.c:410 requires player_in_trap field (not yet in EnvState).
+    trap_penalty = jnp.int32(0)
+
+    tmp = (jnp.int32(1) + abon + target_ac + skill_bonus + enchant + pen + knight_bonus
+           + xl_bonus + luck_bonus + uhitinc
+           + sleeping_bonus + fleeing_bonus + immobile_bonus
+           + stun_hit_penalty + enc_penalty + confusion_penalty + trap_penalty)
     # vendor/nethack/src/uhitm.c:709-710 — strict ``tmp > dieroll``.
     hit = (tmp > roll) & target_alive
 
@@ -839,16 +1014,18 @@ def _single_melee_strike(
     )
     skill_dmg_bonus = _SKILL_DAM_BONUS[skill_dmg_tier].astype(jnp.int32)
 
-    # Weapon-path damage (1d4 fallback + STR + enchant + skill).
-    key_dmg_w, key_dmg_p = split_n(key_dmg, 2)
-    weapon_dmg = damage_roll(
-        key_dmg_w,
-        None,
-        target_large,
-        sdam_n=1, sdam_sides=4,
-        ldam_n=1, ldam_sides=4,
-        str_bonus=str_dmg + weapon_enchant + skill_dmg_bonus,
-    )
+    # Per-weapon damage dice: objects[].oc_wsdam/oc_wldam + vendor switch
+    # bonuses (weapon.c::dmgval lines 225-295). type_id==-1 (bare-hands)
+    # clamps to index 0 (fists sentinel: 1d2 small / 1d1 large).
+    wep_type = _wielded_type_id(state)
+    dn1, ds1, dn2, ds2 = _wdd(wep_type, target_large)
+
+    # Weapon-path damage (per-weapon dice + STR + enchant + skill).
+    key_dmg_w, key_dmg_p, key_dmg_w2 = split_n(key_dmg, 3)
+    raw1 = _roll_dice_sum(key_dmg_w, dn1, ds1)
+    raw2 = jnp.where(ds2 > 0, _roll_dice_sum(key_dmg_w2, dn2, ds2), jnp.int32(0))
+    str_bonus_total = (str_dmg + weapon_enchant + skill_dmg_bonus).astype(jnp.int32)
+    weapon_dmg = jnp.maximum(raw1 + raw2 + str_bonus_total, jnp.int32(0)).astype(jnp.int32)
 
     # Polymorph-path damage (form attack dice; no weapon enchant).
     poly_raw = _roll_dice_sum(key_dmg_p, poly_dice, poly_sides)
@@ -861,7 +1038,40 @@ def _single_melee_strike(
     samurai_bonus = _samurai_bushido_bonus(state, key_samurai)
     role_bonus = (monk_bonus + samurai_bonus).astype(jnp.int32)
 
+    # vendor/nethack/src/uhitm.c:1450 — u.udaminc (ring of increase damage).
+    udaminc = state.player_udaminc.astype(jnp.int32)
     base_dmg = jnp.where(is_poly, poly_dmg, weapon_dmg + role_bonus).astype(jnp.int32)
+    base_dmg = jnp.maximum(base_dmg + udaminc, jnp.int32(0)).astype(jnp.int32)
+
+    # vendor/nethack/src/artifact.c::spec_dbon (lines 1091-1109) — artifact
+    # bonus damage applied to weapon strikes against eligible targets.  Not
+    # applied while polymorphed (no weapon strike).  JIT-pure: bonus is 0
+    # when no artifact is wielded (artifact_bonus_damage handles arti==-1).
+    arti_idx = _arti_idx(state)
+    target_entry = mai.entry_idx[idx].astype(jnp.int32)
+    key_dmg_arti = jax.random.fold_in(key_dmg, jnp.uint32(0xA47F))
+    arti_bonus = _arti_bonus(arti_idx, target_entry, key_dmg_arti).astype(jnp.int32)
+    # Skip artifact bonus while polymorphed (no weapon strike).
+    arti_bonus = jnp.where(is_poly, jnp.int32(0), arti_bonus)
+    base_dmg = (base_dmg + arti_bonus).astype(jnp.int32)
+
+    # vendor/nethack/src/uhitm.c:960-964 — Rogue backstab bonus.
+    # If the player is a Rogue AND the target is sleeping or fleeing, deal
+    # +rnd(player_xl) extra damage.
+    # TODO: paralyzed bonus skipped — no mai.paralyzed field yet
+    #       (vendor uhitm.c:960 checks !mtmp->mcanmove).
+    is_rogue = state.player_role == jnp.int8(int(Role.ROGUE))
+    target_fleeing_bs = mai.mstrategy[idx].astype(jnp.int32) == jnp.int32(4)
+    target_vulnerable = mai.asleep[idx] | target_fleeing_bs
+    xl_clamped = jnp.maximum(state.player_xl.astype(jnp.int32), jnp.int32(1))
+    backstab_roll = rnd(key_backstab, xl_clamped).astype(jnp.int32)
+    backstab_bonus = jnp.where(is_rogue & target_vulnerable, backstab_roll, jnp.int32(0))
+    base_dmg = (base_dmg + backstab_bonus).astype(jnp.int32)
+
+    # vendor/nethack/src/uhitm.c:455 — stun: -1 damage (in addition to to-hit penalty).
+    stun_dmg_penalty = jnp.where(stunned_timer > jnp.int32(0), jnp.int32(-1), jnp.int32(0))
+    base_dmg = jnp.maximum(base_dmg + stun_dmg_penalty, jnp.int32(0)).astype(jnp.int32)
+
     dmg = jnp.where(hit, base_dmg, jnp.int32(0)).astype(jnp.int32)
 
     new_hp = jnp.maximum(mai.hp[idx] - dmg, jnp.int32(0)).astype(jnp.int32)
@@ -875,11 +1085,24 @@ def _single_melee_strike(
     new_combat = state.combat.replace(last_hit_landed=hit)
     new_state = state.replace(monster_ai=new_mai, combat=new_combat)
 
-    # Skill practice on hit.
+    # Skill practice on hit (legacy CombatState path).
     skill_id = _wielded_skill_id(new_state)
     new_state = jax.lax.cond(
         hit,
         lambda s: practice_skill(s, skill_id),
+        lambda s: s,
+        new_state,
+    )
+
+    # SkillState advancement — use_skill increments state.skills.advance.
+    # Cite: vendor/nethack/src/weapon.c:1424 (use_skill).
+    # Called on every hit regardless of success to mirror vendor behavior.
+    wep_type_id = _wielded_type_id(new_state)
+    safe_type_id = jnp.clip(wep_type_id.astype(jnp.int32), 0, _SKILL_WEAPON_TYPE_TO_SKILL.shape[0] - 1)
+    wep_skill_id = _SKILL_WEAPON_TYPE_TO_SKILL[safe_type_id]
+    new_state = jax.lax.cond(
+        hit,
+        lambda s: _skills_use_skill(s, wep_skill_id, 1),
         lambda s: s,
         new_state,
     )
@@ -904,6 +1127,75 @@ def _single_melee_strike(
         new_state.scoring,
     )
     new_state = new_state.replace(scoring=new_scoring)
+
+    # vendor/nethack/src/mondead.c::xkilled — death drops a corpse on the floor.
+    # Most monsters leave a corpse; elementals, ghosts, vortices do not.
+    # JIT-pure: lax.cond gates on killed; all writes are indexed array updates.
+    safe_entry_corpse = jnp.clip(entry, 0, _KILLED_DROPS_CORPSE.shape[0] - 1)
+    drops_corpse = _KILLED_DROPS_CORPSE[safe_entry_corpse]
+
+    def _place_corpse(s):
+        gi = s.ground_items
+        death_pos = s.monster_ai.pos[idx].astype(jnp.int32)
+        d_row = jnp.clip(death_pos[0], 0, s.terrain.shape[2] - 1)
+        d_col = jnp.clip(death_pos[1], 0, s.terrain.shape[3] - 1)
+        branch = s.dungeon.current_branch.astype(jnp.int32)
+        level = s.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+        n_stack = gi.category.shape[-1]
+
+        def _find_slot(carry, sidx):
+            found, gs = carry
+            is_empty = gi.category[branch, level, d_row, d_col, sidx] == jnp.int8(0)
+            gs = jnp.where(~found & is_empty, sidx, gs)
+            found = found | is_empty
+            return (found, gs), None
+
+        (gfound, gslot), _ = jax.lax.scan(
+            _find_slot,
+            (jnp.bool_(False), jnp.int32(0)),
+            jnp.arange(n_stack, dtype=jnp.int32),
+        )
+        can_place = gfound & drops_corpse
+        safe_gs = jnp.clip(gslot, 0, n_stack - 1)
+        corpse_entry = s.monster_ai.entry_idx[idx].astype(jnp.int16)
+        new_gi = gi.replace(
+            category=gi.category.at[branch, level, d_row, d_col, safe_gs].set(
+                jnp.where(can_place, jnp.int8(_FOOD_CATEGORY),
+                          gi.category[branch, level, d_row, d_col, safe_gs])
+            ),
+            type_id=gi.type_id.at[branch, level, d_row, d_col, safe_gs].set(
+                jnp.where(can_place, jnp.int16(_CORPSE_TYPE_ID),
+                          gi.type_id[branch, level, d_row, d_col, safe_gs])
+            ),
+            quantity=gi.quantity.at[branch, level, d_row, d_col, safe_gs].set(
+                jnp.where(can_place, jnp.int16(1),
+                          gi.quantity[branch, level, d_row, d_col, safe_gs])
+            ),
+            corpse_entry_idx=gi.corpse_entry_idx.at[branch, level, d_row, d_col, safe_gs].set(
+                jnp.where(can_place, corpse_entry,
+                          gi.corpse_entry_idx[branch, level, d_row, d_col, safe_gs])
+            ),
+        )
+        return s.replace(ground_items=new_gi)
+
+    new_state = jax.lax.cond(
+        killed,
+        _place_corpse,
+        lambda s: s,
+        new_state,
+    )
+
+    # vendor/nethack/src/artifact.c::artifact_hit lines 1220-1255 (Vorpal Blade)
+    # vendor/nethack/src/artifact.c::magicbane_hit lines 1090-1170 (Magicbane)
+    # Apply special on-hit artifact effects only when a hit landed and not poly.
+    key_arti_hit = jax.random.fold_in(rng, jnp.uint32(0xB33F))
+    new_state, arti_killed = jax.lax.cond(
+        hit & ~is_poly,
+        lambda s: _arti_hit_effects(s, idx, key_arti_hit),
+        lambda s: (s, jnp.bool_(False)),
+        new_state,
+    )
+    killed = killed | arti_killed
 
     return new_state, dmg, hit
 
@@ -1090,6 +1382,21 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
         new_state,
     )
 
+    # ------------------------------------------------------------------
+    # AT_ENGL engulf hook — vendor/nethack/src/mhitu.c::gulpmu line 1287.
+    # When the attacker is an engulfer and the hit landed, call try_engulf.
+    # ------------------------------------------------------------------
+    rng_engulf, _ = jax.random.split(rng)
+    is_engulfer = _ENGULFER_TABLE[safe_entry]
+    engulf_cond = hit & is_engulfer
+
+    new_state = jax.lax.cond(
+        engulf_cond,
+        lambda s: _try_engulf(s, idx, rng_engulf),
+        lambda s: s,
+        new_state,
+    )
+
     return new_state, dmg
 
 
@@ -1097,6 +1404,18 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
 # Thrown / ranged attack (vendor/nethack/src/dothrow.c::throwit)
 # ---------------------------------------------------------------------------
 THROW_MAX_RANGE: int = 8
+
+# Impassable terrain values for obstacle check during flight.
+# vendor/nethack/src/dothrow.c:1510-1580 — projectile stops at walls.
+from Nethax.nethax.constants.tiles import TileType as _TileType
+_IMPASSABLE_VOID: int = int(_TileType.VOID)
+_IMPASSABLE_WALL: int = int(_TileType.WALL)
+
+# Material ints referenced in throw logic.
+_MATERIAL_SILVER: int = int(Material.SILVER)
+_MATERIAL_GLASS: int  = int(Material.GLASS)
+# POTTERY maps to MINERAL in our Material enum (closest analogue).
+_MATERIAL_POTTERY: int = int(Material.MINERAL)
 
 
 def thrown_attack(
@@ -1107,21 +1426,32 @@ def thrown_attack(
 ):
     """Throw the item in ``slot_idx`` along ``direction``.
 
-    Mirrors vendor/nethack/src/dothrow.c::throwit:
-      * Walk up to THROW_MAX_RANGE tiles along (dy, dx).
-      * On each tile, check for a live monster; on first match, roll
-        to-hit; on hit, deal damage based on item weight (heuristic:
-        max(1, weight // 30)) plus the item's enchantment.
-      * If no monster is hit, drop the projectile on the floor at the
-        terminal tile (top of the ground stack at the player's current
-        branch/level).
+    Mirrors vendor/nethack/src/dothrow.c::throwit with these additions:
+
+      Gap 1 — Obstacle check during flight (dothrow.c:1510-1580):
+        lax.scan accumulates `still_flying`; stops at VOID or WALL.
+
+      Gap 2 — Knockback on hit (dothrow.c:1130 mhurtle):
+        weight > 100 knocks monster back 1 tile in throw direction.
+
+      Gap 3 — Glass/POTTERY shatter on landing (dothrow.c:1825 + 2262):
+        GLASS or MINERAL items have 50% chance to break; sets quantity=0.
+
+      Gap 4 — Boomerang return (dothrow.c:1601-1611):
+        BOOMERANG / AKLYS return to thrower on miss (Dex-based catch check).
+
+      Gap 5 — Silver damage vs hates_silver (dothrow.c:1343):
+        SILVER material weapon vs M2_UNDEAD|M2_WERE|M2_DEMON: +d20 damage.
+
+      Gap 6 — Range formula (dothrow.c:1616-1625):
+        range = max(1, str//2) - weight//40, clamped [1, 8].
 
     Parameters
     ----------
     state      : EnvState
     rng        : JAX PRNG key.
-    slot_idx   : int32 — inventory slot holding the projectile.
-    direction  : int32[2] — (dy, dx) step vector.
+    slot_idx   : int32 -- inventory slot holding the projectile.
+    direction  : int32[2] -- (dy, dx) step vector.
 
     Returns
     -------
@@ -1135,62 +1465,110 @@ def thrown_attack(
     has_item = items.category[slot] != jnp.int8(0)
     weight = items.weight[slot].astype(jnp.int32)
     enchant = items.enchantment[slot].astype(jnp.int32)
+    type_id = items.type_id[slot].astype(jnp.int32)
 
     mai = state.monster_ai
     start_row = state.player_pos[0].astype(jnp.int32)
     start_col = state.player_pos[1].astype(jnp.int32)
 
-    # ---- Carry state for the trajectory loop ----
-    # (hit, target_idx, last_row, last_col, key)
-    init_carry = (
-        jnp.bool_(False),
-        jnp.int32(0),
-        start_row,
-        start_col,
-        rng,
-    )
+    map_h = state.terrain.shape[2]
+    map_w = state.terrain.shape[3]
+    branch = state.dungeon.current_branch.astype(jnp.int32)
+    level = (state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1))
 
+    # --- Gap 6: dynamic range (dothrow.c:1616-1625) ---
+    dyn_range = compute_throw_range(state.player_str, weight)
+
+    # --- Gap 1 + monster scan: lax.scan over THROW_MAX_RANGE steps ---
+    # Carry: (still_flying, hit, target_idx, last_r, last_c)
+    # vendor/nethack/src/dothrow.c:1510-1580
     monster_pos = mai.pos.astype(jnp.int32)
     monster_alive = mai.alive
 
-    def _body(i, carry):
-        hit, tgt_idx, _last_r, _last_c, k = carry
-        step = i + jnp.int32(1)
+    init_scan = (
+        jnp.bool_(True),   # still_flying
+        jnp.bool_(False),  # hit
+        jnp.int32(0),      # target_idx
+        start_row,
+        start_col,
+    )
+
+    def _flight_step(carry, step):
+        flying, hit, tgt_idx, last_r, last_c = carry
+        # Kill flying once step exceeds dynamic range (Gap 6).
+        flying = flying & (step <= dyn_range)
+
         r = start_row + dy * step
         c = start_col + dx * step
+        r_safe = jnp.clip(r, 0, map_h - 1)
+        c_safe = jnp.clip(c, 0, map_w - 1)
 
-        # Find monster at (r, c)
+        # Gap 1 -- stop at explicit WALL tiles (dothrow.c:1510-1580 IS_OBSTRUCTED).
+        # VOID (0) = unexplored/unset terrain: treated as passable so that
+        # states without full terrain maps (tests, default state) still work.
+        tile = state.terrain[branch, level, r_safe, c_safe].astype(jnp.int32)
+        is_blocked = (tile == jnp.int32(_IMPASSABLE_WALL))
+        still_flying = flying & ~is_blocked
+
+        # Monster detection: only while still flying and no hit yet.
         match = (monster_pos[:, 0] == r) & (monster_pos[:, 1] == c) & monster_alive
         any_match = jnp.any(match)
         m_idx = jnp.argmax(match).astype(jnp.int32)
-
-        # First contact only.
-        first_contact = any_match & ~hit
+        first_contact = any_match & ~hit & still_flying
         new_hit = hit | first_contact
         new_tgt = jnp.where(first_contact, m_idx, tgt_idx)
-        return (new_hit, new_tgt, r, c, k)
 
-    (found_hit, target_idx, end_row, end_col, _k) = jax.lax.fori_loop(
-        0, THROW_MAX_RANGE, _body, init_carry
+        # Advance position only while still flying.
+        new_r = jnp.where(still_flying, r, last_r)
+        new_c = jnp.where(still_flying, c, last_c)
+
+        return (still_flying, new_hit, new_tgt, new_r, new_c), None
+
+    steps = jnp.arange(1, THROW_MAX_RANGE + 1, dtype=jnp.int32)
+    (_, found_hit, target_idx, end_row, end_col), _ = jax.lax.scan(
+        _flight_step,
+        init_scan,
+        steps,
     )
 
     valid_throw = has_item & found_hit
 
     # --- To-hit roll ---
-    key_hit, key_dmg = split_n(rng, 2)
+    key_hit, key_dmg, key_silver, key_boom, key_break = split_n(rng, 5)
     target_ac = mai.ac[target_idx].astype(jnp.int32)
     target_alive = mai.alive[target_idx]
     roll = rnd(key_hit, 20).astype(jnp.int32)
     abon = _abon(state.player_str, state.player_dex, state.player_xl)
     tmp = jnp.int32(1) + abon + target_ac + enchant
-    # vendor/nethack/src/uhitm.c:709-710 — strict ``tmp > dieroll``.
+    # vendor/nethack/src/uhitm.c:709-710 -- strict ``tmp > dieroll``.
     hit_landed = (tmp > roll) & valid_throw & target_alive
 
-    # --- Damage: weight-based heuristic + enchant + dex bonus ---
+    # --- Damage: weight-based heuristic + enchant ---
     base = jnp.maximum(weight // jnp.int32(30), jnp.int32(1))
     spread = rnd(key_dmg, 4).astype(jnp.int32)  # +1..4 variability
     raw_dmg = base + spread + enchant
-    dmg = jnp.where(hit_landed, jnp.maximum(raw_dmg, jnp.int32(1)), jnp.int32(0))
+
+    # --- Gap 5: silver damage vs hates_silver (dothrow.c:1343) ---
+    # if (obj->material == SILVER && hates_silver(mtmp->data)) dmg += d(20)
+    # entry_idx maps monster slot → MONSTERS table index (species row).
+    n_monsters = _HATES_SILVER.shape[0]
+    safe_tgt_slot = jnp.clip(target_idx, 0, mai.entry_idx.shape[0] - 1)
+    monster_entry = jnp.clip(
+        mai.entry_idx[safe_tgt_slot].astype(jnp.int32), 0, n_monsters - 1
+    )
+    item_material = _OBJECT_MATERIAL[
+        jnp.clip(type_id, 0, _OBJECT_MATERIAL.shape[0] - 1)
+    ].astype(jnp.int32)
+    is_silver = item_material == jnp.int32(_MATERIAL_SILVER)
+    target_hates_silver = _HATES_SILVER[monster_entry]
+    silver_bonus = rnd(key_silver, 20).astype(jnp.int32)
+    silver_extra = jnp.where(
+        is_silver & target_hates_silver & hit_landed,
+        silver_bonus,
+        jnp.int32(0),
+    )
+
+    dmg = jnp.where(hit_landed, jnp.maximum(raw_dmg + silver_extra, jnp.int32(1)), jnp.int32(0))
 
     new_hp = jnp.maximum(mai.hp[target_idx] - dmg, jnp.int32(0)).astype(jnp.int32)
     new_alive = (new_hp > 0) & target_alive
@@ -1198,7 +1576,27 @@ def thrown_attack(
     new_alive_arr = mai.alive.at[target_idx].set(new_alive)
     new_mai = mai.replace(hp=new_hp_arr, alive=new_alive_arr)
 
-    # --- Potion shatter — vendor/nethack/src/dothrow.c:2262-2400 (potionhit) ---
+    # --- Gap 2: knockback on hit (dothrow.c:1130 mhurtle) ---
+    # Heavy weapon (weight > 100) knocks monster back 1 tile in throw direction.
+    is_heavy = weight > jnp.int32(100)
+    kb_r = mai.pos[target_idx, 0].astype(jnp.int32) + dy
+    kb_c = mai.pos[target_idx, 1].astype(jnp.int32) + dx
+    kb_r_safe = jnp.clip(kb_r, 0, map_h - 1)
+    kb_c_safe = jnp.clip(kb_c, 0, map_w - 1)
+    kb_tile = state.terrain[branch, level, kb_r_safe, kb_c_safe].astype(jnp.int32)
+    kb_passable = (
+        (kb_tile != jnp.int32(_IMPASSABLE_VOID)) &
+        (kb_tile != jnp.int32(_IMPASSABLE_WALL))
+    )
+    do_knockback = hit_landed & is_heavy & kb_passable
+    new_pos_r = jnp.where(do_knockback, kb_r.astype(jnp.int16), new_mai.pos[target_idx, 0])
+    new_pos_c = jnp.where(do_knockback, kb_c.astype(jnp.int16), new_mai.pos[target_idx, 1])
+    new_pos_arr = new_mai.pos.at[target_idx].set(
+        jnp.stack([new_pos_r, new_pos_c]).astype(jnp.int16)
+    )
+    new_mai = new_mai.replace(pos=new_pos_arr)
+
+    # --- Potion shatter -- vendor/nethack/src/dothrow.c:2262-2400 (potionhit) ---
     # When a thrown potion reaches its target (found_hit), it shatters and
     # applies its liquid effect instead of the weight-based damage above.
     # JIT-pure: jax.lax.cond gates on is_potion & found_hit; lax.switch
@@ -1243,14 +1641,29 @@ def thrown_attack(
     )
 
     # --- Drop on ground at terminal tile if no hit landed (projectile missed) ---
-    map_h = state.terrain.shape[2]
-    map_w = state.terrain.shape[3]
     drop_row = jnp.clip(end_row, 0, map_h - 1)
     drop_col = jnp.clip(end_col, 0, map_w - 1)
-    branch = state.dungeon.current_branch.astype(jnp.int32)
-    level = (state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1))
 
     should_drop = consume & ~hit_landed  # missed: projectile lands on floor
+
+    # --- Gap 4: boomerang return (dothrow.c:1601-1611) ---
+    # BOOMERANG / AKLYS return to thrower; rn2(100) > 2*Dex+50 => fumble => drop.
+    n_objs = _IS_RETURNING_WEAPON.shape[0]
+    is_returning = _IS_RETURNING_WEAPON[jnp.clip(type_id, 0, n_objs - 1)]
+    dex_i = state.player_dex.astype(jnp.int32)
+    catch_threshold = jnp.int32(2) * dex_i + jnp.int32(50)
+    boom_roll = _rn2(key_boom, 100)
+    catches = boom_roll <= catch_threshold
+    # Returning and caught: undo the inventory decrement.
+    boomerang_return = is_returning & catches & ~hit_landed & has_item
+    return_qty = jnp.where(boomerang_return, old_qty, new_items.quantity[slot])
+    return_cat = jnp.where(boomerang_return, items.category[slot], new_items.category[slot])
+    new_items = new_items.replace(
+        quantity=new_items.quantity.at[slot].set(return_qty),
+        category=new_items.category.at[slot].set(return_cat),
+    )
+    # A caught boomerang must not also land on the floor.
+    should_drop = should_drop & ~boomerang_return
 
     gi = state.ground_items
     # Find first empty slot in the ground stack at the terminal tile.
@@ -1271,14 +1684,32 @@ def thrown_attack(
     can_drop = should_drop & gfound
     safe_gs = jnp.clip(gslot, 0, n_stack - 1)
 
+    # --- Gap 3: glass/pottery shatter on landing (dothrow.c:1825 + 2262) ---
+    # GLASS or MINERAL (pottery) items: 50% chance to break on floor landing.
+    is_glass_or_pottery = (
+        (item_material == jnp.int32(_MATERIAL_GLASS)) |
+        (item_material == jnp.int32(_MATERIAL_POTTERY))
+    )
+    break_roll = _rn2(key_break, 2)  # 0 or 1 => 50% chance
+    does_break = is_glass_or_pottery & (break_roll == jnp.int32(0)) & can_drop
+    drop_qty_base = jnp.where(
+        can_drop,
+        jnp.int16(1),
+        gi.quantity[branch, level, drop_row, drop_col, safe_gs],
+    )
+    drop_qty = jnp.where(does_break, jnp.int16(0), drop_qty_base)
+    # Also zero out inventory slot when item shatters.
+    break_inv_qty = jnp.where(does_break, jnp.int16(0), new_items.quantity[slot])
+    break_inv_cat = jnp.where(does_break, jnp.int8(0), new_items.category[slot])
+    new_items = new_items.replace(
+        quantity=new_items.quantity.at[slot].set(break_inv_qty),
+        category=new_items.category.at[slot].set(break_inv_cat),
+    )
+
     def _set_field_ground(field_g, field_inv):
         return field_g.at[branch, level, drop_row, drop_col, safe_gs].set(
             jnp.where(can_drop, field_inv[slot], field_g[branch, level, drop_row, drop_col, safe_gs])
         )
-
-    # Use a quantity of 1 for the dropped projectile (the rest stays in inv).
-    drop_qty = jnp.where(can_drop, jnp.int16(1),
-                         gi.quantity[branch, level, drop_row, drop_col, safe_gs])
 
     new_ground = gi.replace(
         category=_set_field_ground(gi.category, items.category),
@@ -1295,6 +1726,7 @@ def thrown_attack(
 
     new_inv = state.inventory.replace(items=new_items)
     return state.replace(monster_ai=new_mai, inventory=new_inv, ground_items=new_ground)
+
 
 
 # Constant alias to avoid an extra import inside thrown_attack.  Matches

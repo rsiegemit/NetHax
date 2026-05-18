@@ -283,6 +283,17 @@ class MonsterAIState:
     inv_charges:    jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] int8
     inv_identified: jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] bool
 
+    # ---- Pet hunger counter (vendor dog.c:380 edog.hungrytime) ----
+    # Per-slot hunger counter.  Starts at 1000; decrements 1 per turn for
+    # tame slots.  At 0, pet enters "hungry" state (lower aggression).
+    # At -50, pet dies / transitions away.
+    pet_hunger: jnp.ndarray        # [MAX_MONSTERS_PER_LEVEL]  int16
+
+    # ---- Saddle flag (vendor steed.c:put_saddle_on_mon / W_SADDLE) ----
+    # 0 = no saddle, 1 = saddled.  Required before player can mount.
+    # Mirrors vendor which_armor(mtmp, W_SADDLE) check in steed.c:281.
+    saddled: jnp.ndarray           # [MAX_MONSTERS_PER_LEVEL]  int8
+
 
 def make_monster_ai_state() -> MonsterAIState:
     """Return a zero-initialized MonsterAIState for one level."""
@@ -315,6 +326,8 @@ def make_monster_ai_state() -> MonsterAIState:
         inv_quantity=jnp.zeros(inv_shape, dtype=jnp.int16),
         inv_charges=jnp.zeros(inv_shape, dtype=jnp.int8),
         inv_identified=jnp.zeros(inv_shape, dtype=bool),
+        pet_hunger=jnp.full(n, 1000, dtype=jnp.int16),
+        saddled=jnp.zeros(n, dtype=jnp.int8),
     )
 
 
@@ -1111,28 +1124,131 @@ def pet_within_leash(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
 def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
     """Run one turn for a pet (tame) monster.
 
-    Wave 8d vendor-parity behaviour (vendor/nethack/src/dogmove.c::dog_move):
-        1. If a hostile alive monster is adjacent (Chebyshev <= 1) → attack it
-           (vendor mattackm).
-        2. Else if pet is within 6 Chebyshev tiles of player → FOLLOW mode:
-           step toward player (vendor dog_goal: udist < 9 sets appr=0/1; we
-           use Chebyshev 6 per the task spec which matches the vendor leash
-           constant LEASH_LENGTH=6 in dogmove.c).
-        3. Else → EXPLORE mode: random walk (vendor dog_goal sets gx=gg.gy=
-           FARAWAY when player not in sight and no track, dogmove.c line 629).
+    Vendor-parity behaviour (vendor/nethack/src/dogmove.c::dog_move):
 
-    Cite: vendor/nethack/src/dogmove.c::dog_move lines 566-644, 1014.
+    Per-turn bookkeeping:
+        0a. Hunger tick: decrement pet_hunger by 1 (dog.c:380 edog.hungrytime).
+            At <= -50, pet dies.
+        0b. Eat floor food: if hungry (pet_hunger <= 0) and a FOOD item is on
+            the pet's tile, eat it — restore HP by food_value/4, remove the
+            food, reset hunger to 1000. (dogmove.c:520 dog_eat)
+        0c. Flee on low HP: if hp < hp_max/4 and not fearless (not undead /
+            demon), move AWAY from player. (dogmove.c:1100)
+
+    Movement:
+        1. If a hostile alive monster is adjacent (Chebyshev <= 1) → attack it
+           (dogmove.c:1150 mattackm).
+        2. Else if pet is within 6 Chebyshev tiles of player → FOLLOW mode:
+           step toward player using BFS pathfind (mfndpos).
+        3. Else → EXPLORE mode: random walk (dogmove.c:629 gx=FARAWAY).
+
+    Cite: vendor/nethack/src/dogmove.c::dog_move lines 520, 566-644, 1014,
+          1100, 1150; vendor/nethack/src/dog.c:380.
     JIT-pure: all branches via jax.lax.cond / jnp.where.
 
     Returns updated state.
     """
+    # Item category constant for food (mirrors ItemCategory.FOOD = 7).
+    _CAT_FOOD_LOCAL: int = 7
+
     idx = monster_idx.astype(jnp.int32)
     mai = state.monster_ai
 
     is_pet = mai.tame[idx] & mai.alive[idx]
+
+    # -----------------------------------------------------------------------
+    # 0a. Hunger tick — dog.c:380 edog.hungrytime
+    # Decrement pet_hunger by 1 each turn (tame slots only).
+    # At <= -50, pet dies.
+    # -----------------------------------------------------------------------
+    cur_hunger = mai.pet_hunger[idx].astype(jnp.int32)
+    new_hunger_val = cur_hunger - jnp.int32(1)
+    new_hunger = jnp.where(is_pet, new_hunger_val, cur_hunger).astype(jnp.int16)
+    starved = is_pet & (new_hunger_val <= jnp.int32(-50))
+    new_alive_after_hunger = mai.alive.at[idx].set(
+        jnp.where(starved, jnp.bool_(False), mai.alive[idx])
+    )
+    mai_h = mai.replace(
+        pet_hunger=mai.pet_hunger.at[idx].set(new_hunger),
+        alive=new_alive_after_hunger,
+    )
+    state = state.replace(monster_ai=mai_h)
+
+    # Re-read is_pet after possible starvation death.
+    mai = state.monster_ai
+    is_pet = mai.tame[idx] & mai.alive[idx]
     mpos = mai.pos[idx].astype(jnp.int32)
 
-    # Find a hostile alive monster adjacent to this pet.
+    # -----------------------------------------------------------------------
+    # 0b. Eat floor food — dogmove.c:520 dog_eat
+    # If hungry (pet_hunger <= 0) and FOOD item at pet's tile, eat it.
+    # -----------------------------------------------------------------------
+    is_hungry = mai.pet_hunger[idx].astype(jnp.int32) <= jnp.int32(0)
+    b = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    pr = jnp.clip(mpos[0], 0, _MAP_H - 1)
+    pc = jnp.clip(mpos[1], 0, _MAP_W - 1)
+    food_cat = state.ground_items.category[b, lv, pr, pc, 0].astype(jnp.int32)
+    has_food = food_cat == jnp.int32(_CAT_FOOD_LOCAL)
+    can_eat = is_pet & is_hungry & has_food
+    food_weight = state.ground_items.weight[b, lv, pr, pc, 0].astype(jnp.int32)
+    heal_amount = jnp.maximum(food_weight // jnp.int32(4), jnp.int32(1))
+    new_pet_hp = jnp.minimum(
+        mai.hp[idx].astype(jnp.int32) + heal_amount,
+        mai.hp_max[idx].astype(jnp.int32),
+    )
+    new_ground_cat = state.ground_items.category.at[b, lv, pr, pc, 0].set(
+        jnp.where(can_eat, jnp.int8(0), state.ground_items.category[b, lv, pr, pc, 0])
+    )
+    new_hunger_after_eat = jnp.where(can_eat, jnp.int16(1000), mai.pet_hunger[idx])
+    mai_e = mai.replace(
+        hp=mai.hp.at[idx].set(jnp.where(can_eat, new_pet_hp.astype(jnp.int32), mai.hp[idx])),
+        pet_hunger=mai.pet_hunger.at[idx].set(new_hunger_after_eat),
+    )
+    new_ground = state.ground_items.replace(category=new_ground_cat)
+    state = state.replace(monster_ai=mai_e, ground_items=new_ground)
+    mai = state.monster_ai
+
+    # -----------------------------------------------------------------------
+    # 0c. Flee on low HP — dogmove.c:1100
+    # If pet hp < hp_max/4 and not fearless, move away from player.
+    # Fearless = undead (M2_UNDEAD) or demon (M2_DEMON).
+    # -----------------------------------------------------------------------
+    pet_hp = mai.hp[idx].astype(jnp.int32)
+    pet_hp_max = jnp.maximum(mai.hp_max[idx].astype(jnp.int32), jnp.int32(1))
+    low_hp = pet_hp * jnp.int32(4) < pet_hp_max
+    entry = mai.entry_idx[idx]
+    fearless = _has_flag2(entry, _M2_UNDEAD) | _has_flag2(entry, _M2_DEMON)
+    should_flee_low_hp = is_pet & low_hp & ~fearless
+
+    ppos = state.player_pos.astype(jnp.int32)
+    flee_delta = jnp.clip(mpos - ppos, -1, 1).astype(jnp.int32)
+    # Ensure non-zero delta when on same tile.
+    flee_delta = jnp.where(
+        jnp.all(flee_delta == 0),
+        jnp.array([1, 0], dtype=jnp.int32),
+        flee_delta,
+    )
+    flee_r = jnp.clip(mpos[0] + flee_delta[0], 0, _MAP_H - 1).astype(jnp.int16)
+    flee_c = jnp.clip(mpos[1] + flee_delta[1], 0, _MAP_W - 1).astype(jnp.int16)
+    flee_pos = jnp.stack([flee_r, flee_c])
+
+    def _flee_move(s):
+        _mai = s.monster_ai
+        new_mai = _mai.replace(pos=_mai.pos.at[idx].set(flee_pos))
+        return s.replace(monster_ai=new_mai)
+
+    state = jax.lax.cond(should_flee_low_hp, _flee_move, lambda s: s, state)
+    mai = state.monster_ai
+    # Re-derive is_pet, mpos after potential flee.
+    is_pet = mai.tame[idx] & mai.alive[idx]
+    mpos = mai.pos[idx].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+
+    # -----------------------------------------------------------------------
+    # Find adjacent hostile monster.
+    # Cite: dogmove.c:1150 (mattackm — pet attacks adjacent hostile).
+    # -----------------------------------------------------------------------
     other_pos = mai.pos.astype(jnp.int32)  # [N, 2]
     dr = jnp.abs(other_pos[:, 0] - mpos[0])
     dc = jnp.abs(other_pos[:, 1] - mpos[1])
@@ -1143,8 +1259,8 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
     target_idx = jnp.argmax(hostile.astype(jnp.int32)).astype(jnp.int32)
 
     def _attack_hostile(s):
+        # Cite: dogmove.c:1150 mattackm — pet attacks adjacent hostile.
         _mai = s.monster_ai
-        # Deal 2 damage to target_idx (Wave 5 simplification).
         cur_hp = _mai.hp[target_idx].astype(jnp.int32)
         new_hp = jnp.maximum(cur_hp - jnp.int32(2), jnp.int32(0))
         new_alive = (new_hp > 0) & _mai.alive[target_idx]
@@ -1155,11 +1271,17 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
         return s.replace(monster_ai=new_mai)
 
     def _follow_player(s):
-        """FOLLOW mode: greedy step toward player (Chebyshev dist < 6)."""
+        """FOLLOW mode: BFS pathfind toward player (mfndpos).
+
+        Vendor: dogmove.c::dog_move uses mfndpos for path-finding.
+        Cite: vendor/nethack/src/monmove.c::mfndpos.
+        """
         _mai = s.monster_ai
-        ppos = s.player_pos.astype(jnp.int32)
-        cur = _mai.pos[idx]
-        new_pos = _greedy_step(cur, ppos.astype(jnp.int16))
+        step_delta = pathfind_step(s, idx)
+        cur = _mai.pos[idx].astype(jnp.int32)
+        new_r = jnp.clip(cur[0] + step_delta[0], 0, _MAP_H - 1).astype(jnp.int16)
+        new_c = jnp.clip(cur[1] + step_delta[1], 0, _MAP_W - 1).astype(jnp.int16)
+        new_pos = jnp.stack([new_r, new_c])
         new_mai = _mai.replace(pos=_mai.pos.at[idx].set(new_pos))
         return s.replace(monster_ai=new_mai)
 
@@ -1167,11 +1289,9 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
         """EXPLORE mode: random 8-dir walk (Chebyshev dist >= 6).
 
         Vendor dogmove.c line 629: gx=gg.gy=FARAWAY (random wander).
-        We pick a random direction from the 8 cardinal+diagonal dirs.
         """
         _mai = s.monster_ai
         cur = _mai.pos[idx].astype(jnp.int32)
-        # Random direction: sample an integer in [0,8) and map to (dy, dx).
         rng_dir, _ = jax.random.split(rng)
         dir_idx = jax.random.randint(rng_dir, (), 0, 8)
         dy = jnp.array([-1, -1, -1, 0, 0, 1, 1, 1], dtype=jnp.int32)[dir_idx]
@@ -1182,10 +1302,6 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
         new_mai = _mai.replace(pos=_mai.pos.at[idx].set(new_pos))
         return s.replace(monster_ai=new_mai)
 
-    # Follow/explore split: Chebyshev distance to player vs threshold 6.
-    # Vendor: LEASH_LENGTH=6, udist<9 (squared) ~ Chebyshev<3 in dogmove.c;
-    # task spec uses Chebyshev 6 matching the leash constant directly.
-    ppos = state.player_pos.astype(jnp.int32)
     dist_to_player = _chebyshev_dist(mpos, ppos)
     within_follow_range = dist_to_player < jnp.int32(6)
 
@@ -1196,6 +1312,33 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
         return jax.lax.cond(has_target, _attack_hostile, _move_no_target, s)
 
     return jax.lax.cond(is_pet, _pet_act, lambda s: s, state)
+
+
+def pet_follow_on_stair(state):
+    """Teleport any tame pets within Chebyshev 1 of player to follow on stair.
+
+    When the player descends (or ascends) stairs, pets adjacent to the player
+    at the moment of transition should follow.  This function handles the
+    bookkeeping for those pets on the *current* level: it marks them as
+    no-longer-alive on this level (they will be re-spawned on the destination
+    level by the stair handler).
+
+    Vendor reference: dog.c (tamedog follow-on-stair logic).
+    TODO: wire from action_dispatch._stair_down
+    """
+    mai = state.monster_ai
+    ppos = state.player_pos.astype(jnp.int32)
+    mpos = mai.pos.astype(jnp.int32)
+    dr = jnp.abs(mpos[:, 0] - ppos[0])
+    dc = jnp.abs(mpos[:, 1] - ppos[1])
+    cheb = jnp.maximum(dr, dc)
+    # Pets within Chebyshev 1 of player that are alive and tame.
+    follows = mai.tame & mai.alive & (cheb <= jnp.int32(1))
+    # Mark them as no-longer-alive on this level so the stair handler can
+    # re-place them on the destination level.
+    new_alive = mai.alive & ~follows
+    new_mai = mai.replace(alive=new_alive)
+    return state.replace(monster_ai=new_mai)
 
 
 # ---------------------------------------------------------------------------

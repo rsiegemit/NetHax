@@ -1447,6 +1447,48 @@ def build_glyphs(env_state) -> jnp.ndarray:
     no_glyph_val = jnp.int16(NO_GLYPH & 0xFFFF)                           # NO_GLYPH as int16
     glyphs = jnp.where(explored, terrain_glyphs, no_glyph_val)
 
+    # Overlay live monsters at their tile positions.  Each visible, alive
+    # monster slot writes GLYPH_MON_OFF + entry_idx at its (row, col).
+    # Vendor reference: display.c::show_glyph; mhitu.c writes monster glyph
+    # via map_location each turn.
+    mai = env_state.monster_ai
+    mon_pos = mai.pos                          # int16[N, 2]
+    mon_alive = mai.alive                      # bool[N]
+    mon_entry = mai.entry_idx.astype(jnp.int32)  # int32[N]
+
+    rows = jnp.clip(mon_pos[:, 0].astype(jnp.int32), 0, 20)
+    cols = jnp.clip(mon_pos[:, 1].astype(jnp.int32), 0, 78)
+    # Only overlay monsters that are alive AND on visible tiles.
+    tile_visible = visible[rows, cols]
+    write_mask = mon_alive & tile_visible & (mon_entry >= jnp.int32(0))
+    mon_glyphs = (jnp.int32(GLYPH_MON_OFF) + mon_entry).astype(jnp.int16)
+
+    # Hallucination scramble — vendor/nethack/src/display.c:599 randomizes
+    # the monster glyph each render when Hallu.  We use a per-(timestep,row,col)
+    # deterministic scramble so the same frame is consistent.
+    # Cite: vendor/nethack/src/display.c::display_monster (line ~599).
+    is_hallu = env_state.status.timed_statuses[10] > 0  # TimedStatus.HALLUCINATION
+    NUMMONS = 381
+    ts_u = env_state.timestep.astype(jnp.uint32)
+    rows_u = rows.astype(jnp.uint32)
+    cols_u = cols.astype(jnp.uint32)
+    # Stable hash over (timestep, row, col) → int in [0, NUMMONS).  uint32 so
+    # the Knuth/multiplier constants don't overflow int32.
+    hash_seed = (ts_u * jnp.uint32(2654435761)
+                 + rows_u * jnp.uint32(1597334677)
+                 + cols_u * jnp.uint32(1431655781))
+    hallu_entry = jnp.mod(hash_seed, jnp.uint32(NUMMONS)).astype(jnp.int32)
+    hallu_glyphs = (jnp.int32(GLYPH_MON_OFF) + hallu_entry).astype(jnp.int16)
+    final_mon_glyphs = jnp.where(is_hallu, hallu_glyphs, mon_glyphs)
+
+    # JIT-safe scatter: for each slot, replace glyph at (row, col) only when
+    # write_mask is True.  Using a vectorised .at[...] update is safe since
+    # later writes naturally overwrite earlier ones for duplicate positions
+    # (rare for live monsters).
+    glyphs = glyphs.at[rows, cols].set(
+        jnp.where(write_mask, final_mon_glyphs, glyphs[rows, cols])
+    )
+
     # Overlay player at player_pos (row, col).
     # The player's display glyph is their race's monster type (human=256,
     # elf=260, dwarf=43, gnome=162, orc=71 in our MONSTERS table), unless

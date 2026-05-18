@@ -73,7 +73,7 @@ from Nethax.nethax.constants.actions import (
 )
 from Nethax.nethax.constants import TileType
 from Nethax.nethax.constants.objects import ObjectClass
-from Nethax.nethax.fov import compute_fov, update_explored, BLIND_SIGHT_RADIUS, DEFAULT_SIGHT_RADIUS
+from Nethax.nethax.fov import compute_fov, update_explored, BLIND_SIGHT_RADIUS, DEFAULT_SIGHT_RADIUS, DARK_ROOM_SIGHT_RADIUS
 from Nethax.nethax.subsystems.features import (
     DoorState,
     open_door,
@@ -122,6 +122,10 @@ from Nethax.nethax.subsystems.conduct import (
     food_material_for_type_id as _food_material_for_type_id,
     is_meat_material as _is_meat_material,
     is_animal_material as _is_animal_material,
+)
+from Nethax.nethax.subsystems.riding import (
+    try_mount as _riding_try_mount,
+    try_dismount as _riding_try_dismount,
 )
 
 
@@ -198,12 +202,48 @@ def _current_level_terrain(state):
 def _apply_fov(state):
     """Recompute visible + explored for the current level after a move.
 
-    Vendor: vision.c — blindness forces vision radius=1.
+    Radius formula (JIT-pure via jnp.where):
+
+      1. Blind or underwater -> BLIND_SIGHT_RADIUS (1).
+         Vendor: vision.c (blindness forces radius=1);
+                 hack.c:1016 (Underwater restricts perception).
+
+      2. Player on CORRIDOR tile without carried light -> DARK_ROOM_SIGHT_RADIUS (2).
+         Vendor: vision.c:328 -- rooms[rnum].rlit gates IN_SIGHT vs COULD_SEE.
+         Proxy: CORRIDOR tile = always dark; non-CORRIDOR = in lit room.
+
+      3. Carried light (wand/spell: lit_radius_until_turn > timestep) restores
+         DEFAULT_SIGHT_RADIUS even in a dark corridor.
+         Vendor: light.c::do_light_sources line 169.
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
     terrain_2d = _current_level_terrain(state)
+
+    # condition 1: blind (vendor vision.c) or underwater (vendor hack.c:1016)
     is_blind = state.status.timed_statuses[int(TimedStatus.BLIND)] > 0
-    sight_radius = jnp.where(is_blind, BLIND_SIGHT_RADIUS, DEFAULT_SIGHT_RADIUS)
+    in_water = state.player_in_water
+
+    # condition 2: dark room -- player on CORRIDOR tile
+    # Vendor vision.c:328: rlit gates full sight vs COULD_SEE-only.
+    # Room lit state not persisted in EnvState; CORRIDOR tiles are always dark.
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    player_tile = terrain_2d[pr, pc]
+    in_dark_room = player_tile == jnp.int8(int(TileType.CORRIDOR))
+
+    # condition 3: carried light source active (wand / spell of light)
+    # Vendor light.c::do_light_sources line 169.
+    spell_lit = state.dungeon.lit_radius_until_turn > state.timestep.astype(jnp.int32)
+
+    sight_radius = jnp.where(
+        is_blind | in_water,
+        BLIND_SIGHT_RADIUS,
+        jnp.where(
+            in_dark_room,
+            jnp.where(spell_lit, DEFAULT_SIGHT_RADIUS, DARK_ROOM_SIGHT_RADIUS),
+            DEFAULT_SIGHT_RADIUS,
+        ),
+    )
     new_visible = compute_fov(terrain_2d, state.player_pos, sight_radius)
 
     b  = state.dungeon.current_branch
@@ -258,7 +298,23 @@ def _try_step(state, dy: int, dx: int, rng: jax.Array):
       7. TRAP / HIDDEN_TRAP: move, then trigger trap and apply effects.
       8. Otherwise: update player_pos.
     All branching via jnp.where / jax.lax.cond — no Python control flow.
+
+    Swallow gate: if the player is currently swallowed, movement is a no-op.
+    The vendor requires attacking the engulfer to escape (mhitu.c::gulpmu).
+    Cite: vendor/nethack/src/mhitu.c::swallowed movement block.
     """
+    # Swallow no-op gate — vendor/nethack/src/mhitu.c (swallowed player cannot
+    # move; must attack engulfer instead).
+    return jax.lax.cond(
+        state.swallow.swallowed,
+        lambda s: s,
+        lambda s: _try_step_inner(s, dy, dx, rng),
+        state,
+    )
+
+
+def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
+    """Inner body of _try_step — runs only when player is not swallowed."""
     terrain_2d = _current_level_terrain(state)
     map_h, map_w = terrain_2d.shape
 
@@ -1043,11 +1099,23 @@ def _handle_loot(state, rng):
 def _handle_apply(state, rng):
     """APPLY — vendor/nethack/src/apply.c::doapply.
 
-    Wave 5 Phase 3: if the player has any held container, route to the
-    container open path.  Non-container APPLY (lamps, pick-axes, etc.) will
-    be wired in a later wave.
+    Wave 5 Phase 3: container open path.
+    Digging wave: if wielded item is a pickaxe/mattock, start a horizontal
+    dig northward (direction=0).  The direction default matches dodig's
+    prompt-north fallback when no direction is given.
+    Cite: vendor/nethack/src/dig.c::dodig (line 445).
     """
-    return _containers_handle_apply(state, rng)
+    from Nethax.nethax.subsystems.digging import start_dig, _has_digging_tool
+    # Route pickaxe apply → start dig (north by default).
+    # jax.lax.cond requires both branches to be traced; _containers_handle_apply
+    # is the non-dig path.
+    has_tool = _has_digging_tool(state)
+    return jax.lax.cond(
+        has_tool,
+        lambda s: start_dig(s, direction=0),  # direction 0 = NORTH
+        lambda s: _containers_handle_apply(s, rng),
+        operand=state,
+    )
 
 
 def _handle_engrave(state, rng):
@@ -1069,6 +1137,102 @@ def _handle_name(state, rng):
     ``inventory.handle_name(state, rng, slot_idx, name_bytes)`` directly.
     """
     return state
+
+
+def _handle_invoke(state, rng):
+    """#invoke — vendor/nethack/src/artifact.c::arti_invoke.
+
+    Dispatch based on the currently wielded artifact.  Each invoke has a
+    cooldown of 100 turns tracked in state.invoke_cooldown[artifact_idx].
+
+    Wired artifacts (cite: artifact.c::arti_invoke ~line 1480+):
+      - Eye of the Aethiopica (idx 21) → +1 player_pw (energy regen).
+        Cite: artifact.c line ~1480.
+      - Mitre of Holiness (idx 16) → grant RESIST_COLD timer (60 turns via
+        intrinsic set; no timer field yet, intrinsic toggled permanently).
+        Cite: artifact.c Mitre of Holiness invoke path.
+      - Tsurugi of Muramasa (idx 10) → +1 player_str.
+        Cite: artifact.c Tsurugi invoke path.
+      - Magicbane (idx 29) → apply CONFUSED (asleep) to all monsters in
+        5×5 area around player. Cite: artifact.c Magicbane invoke path.
+      - Other artifacts → no-op (TODO: add remaining artifacts).
+
+    Cooldown: 100 turns per invoke slot.
+    Cite: vendor/nethack/src/artifact.c::arti_invoke artiintrinsics_taught[].
+    """
+    art = state.inventory.wielded_artifact_idx.astype(jnp.int32)
+
+    # Cooldown check: if invoke_cooldown[art] > 0, do nothing.
+    safe_art = jnp.clip(art, 0, 29)
+    cooldown = state.invoke_cooldown[safe_art].astype(jnp.int32)
+    ready = (art >= jnp.int32(0)) & (cooldown <= jnp.int32(0))
+
+    def _do_invoke(s):
+        # Decrement not needed yet — set cooldown to 100 after use.
+        new_cd = s.invoke_cooldown.at[safe_art].set(jnp.int16(100))
+        s = s.replace(invoke_cooldown=new_cd)
+
+        # Eye of the Aethiopica (idx 21): +1 Pw.
+        # Cite: artifact.c line ~1480.
+        is_eye = art == jnp.int32(21)
+        new_pw = jnp.where(is_eye, s.player_pw + jnp.int32(1), s.player_pw)
+        s = s.replace(player_pw=new_pw)
+
+        # Mitre of Holiness (idx 16): grant RESIST_COLD (intrinsic[2] = True).
+        # No timer field yet; set permanently until next invoke.
+        # Cite: artifact.c Mitre of Holiness invoke path.
+        is_mitre = art == jnp.int32(16)
+        new_intrinsics = s.status.intrinsics.at[2].set(
+            s.status.intrinsics[2] | is_mitre
+        )
+        s = s.replace(status=s.status.replace(intrinsics=new_intrinsics))
+
+        # Tsurugi of Muramasa (idx 10): +1 player_str.
+        # Cite: artifact.c Tsurugi invoke path.
+        is_tsurugi = art == jnp.int32(10)
+        new_str = jnp.where(
+            is_tsurugi,
+            (s.player_str + jnp.int16(1)).astype(jnp.int16),
+            s.player_str,
+        )
+        s = s.replace(player_str=new_str)
+
+        # Magicbane (idx 29): confusion ray — set asleep on monsters in 5×5.
+        # Cite: artifact.c Magicbane invoke path.
+        is_mb = art == jnp.int32(29)
+        pr = s.player_pos[0].astype(jnp.int32)
+        pc = s.player_pos[1].astype(jnp.int32)
+        mai = s.monster_ai
+        # Vectorised 5×5 area check: |row - pr| <= 2 and |col - pc| <= 2.
+        mpos = mai.pos.astype(jnp.int32)
+        in_area = (
+            (jnp.abs(mpos[:, 0] - pr) <= jnp.int32(2))
+            & (jnp.abs(mpos[:, 1] - pc) <= jnp.int32(2))
+            & mai.alive
+        )
+        confused_mask = in_area & is_mb  # only if Magicbane is wielded
+        new_asleep = mai.asleep | confused_mask
+        s = s.replace(monster_ai=mai.replace(asleep=new_asleep))
+
+        # TODO: add remaining artifact invoke effects as subsystems come online.
+        return s
+
+    return jax.lax.cond(ready, _do_invoke, lambda s: s, state)
+
+
+def _handle_ride(state, rng):
+    """RIDE — vendor/nethack/src/steed.c::doride (steed.c:178).
+
+    If currently riding → try_dismount (steed.c:183).
+    Otherwise → try_mount (steed.c:187).
+    """
+    riding = state.player_steed_mid != jnp.uint32(0)
+    return jax.lax.cond(
+        riding,
+        lambda s: _riding_try_dismount(s, rng),
+        lambda s: _riding_try_mount(s, rng),
+        operand=state,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1285,8 @@ _HANDLERS = (
     _handle_apply,      # 40  vendor/nethack/src/apply.c::doapply
     _handle_engrave,    # 41  vendor/nethack/src/engrave.c::doengrave
     _handle_name,       # 42  vendor/nethack/src/do_name.c::do_oname (Wave 6)
+    _handle_ride,       # 43  vendor/nethack/src/steed.c::doride
+    _handle_invoke,     # 44  vendor/nethack/src/artifact.c::arti_invoke
 )
 
 # Slot indices for each named handler.
@@ -1171,6 +1337,10 @@ _SLOT_APPLY      = 40
 _SLOT_ENGRAVE    = 41
 # Wave 6 Phase A — name (call) action.
 _SLOT_NAME       = 42
+# Riding action.
+_SLOT_RIDE       = 43
+# Artifact invoke (#invoke / M-i).
+_SLOT_INVOKE     = 44
 
 # ---------------------------------------------------------------------------
 # 256-entry lookup table: action ASCII value → handler slot index
@@ -1354,7 +1524,7 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
                                        # routes correctly.
     table[_M_byte("f")] = _SLOT_NOOP   # cmd.c::doforce
     table[_M_byte("g")] = _SLOT_NOOP   # cmd.c::dogenocided
-    table[_M_byte("i")] = _SLOT_NOOP   # cmd.c::doinvoke
+    table[_M_byte("i")] = _SLOT_INVOKE  # cmd.c::doinvoke → artifact.c::arti_invoke
     table[_M_byte("j")] = _SLOT_NOOP   # cmd.c::dojump
     table[_M_byte("l")] = _SLOT_LOOT   # cmd.c::doloot (already set via Command.LOOT)
     table[_M_byte("m")] = _SLOT_NOOP   # cmd.c::domonability
@@ -1363,7 +1533,7 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     table[_M_byte("p")] = _SLOT_PRAY   # cmd.c::dopray (already set)
     table[_M_byte("q")] = _SLOT_NOOP   # cmd.c::done2 (quit)
     table[_M_byte("r")] = _SLOT_NOOP   # cmd.c::dorub
-    table[_M_byte("R")] = _SLOT_NOOP   # cmd.c::doride
+    table[_M_byte("R")] = _SLOT_RIDE   # cmd.c::doride — steed.c:178
     table[_M_byte("s")] = _SLOT_NOOP   # cmd.c::dosit
     table[_M_byte("t")] = _SLOT_NOOP   # cmd.c::doturn
     table[_M_byte("T")] = _SLOT_NOOP   # cmd.c::dotip
@@ -1466,10 +1636,12 @@ _COMPACT_LOOT       = 25
 _COMPACT_APPLY      = 26
 _COMPACT_ENGRAVE    = 27
 _COMPACT_NAME       = 28
+_COMPACT_INVOKE     = 29
+_COMPACT_RIDE       = 30
 
 
 def _build_compact_handlers():
-    """Return the 29-entry tuple of ``(state, rng, dir_idx) -> state`` handlers."""
+    """Return the 31-entry tuple of ``(state, rng, dir_idx) -> state`` handlers."""
     return (
         _wrap_no_dir(_noop),          # 0  COMPACT_NOOP
         _move_shared,                 # 1  COMPACT_MOVE  (dir_idx ∈ [0,7])
@@ -1500,6 +1672,8 @@ def _build_compact_handlers():
         _wrap_no_dir(_handle_apply),  # 26
         _wrap_no_dir(_handle_engrave),# 27
         _wrap_no_dir(_handle_name),   # 28
+        _wrap_no_dir(_handle_invoke), # 29  COMPACT_INVOKE
+        _wrap_no_dir(_handle_ride),   # 30  COMPACT_RIDE  — steed.c:178
     )
 
 
@@ -1507,8 +1681,8 @@ _COMPACT_HANDLERS: tuple = _build_compact_handlers()
 
 
 def _build_slot_to_compact() -> jnp.ndarray:
-    """Map legacy handler slot (0..42) → compact slot (0..28)."""
-    table = [0] * 43
+    """Map legacy handler slot (0..44) → compact slot (0..29)."""
+    table = [0] * 45
     # Movement slots 1..8 → COMPACT_MOVE.
     for s in (_SLOT_MOVE_N, _SLOT_MOVE_E, _SLOT_MOVE_S, _SLOT_MOVE_W,
               _SLOT_MOVE_NE, _SLOT_MOVE_SE, _SLOT_MOVE_SW, _SLOT_MOVE_NW):
@@ -1544,6 +1718,8 @@ def _build_slot_to_compact() -> jnp.ndarray:
     table[_SLOT_APPLY]      = _COMPACT_APPLY
     table[_SLOT_ENGRAVE]    = _COMPACT_ENGRAVE
     table[_SLOT_NAME]       = _COMPACT_NAME
+    table[_SLOT_RIDE]       = _COMPACT_RIDE   # steed.c:178 doride
+    table[_SLOT_INVOKE]     = _COMPACT_INVOKE
     return jnp.array(table, dtype=jnp.int32)
 
 
@@ -1553,7 +1729,7 @@ def _build_slot_to_dir_idx() -> jnp.ndarray:
     Non-movement slots map to 0 (the direction is unused for those branches).
     The order matches ``_DIR_TABLE``: N=0, E=1, S=2, W=3, NE=4, SE=5, SW=6, NW=7.
     """
-    table = [0] * 43
+    table = [0] * 45
     # Move slots.
     table[_SLOT_MOVE_N]  = 0
     table[_SLOT_MOVE_E]  = 1

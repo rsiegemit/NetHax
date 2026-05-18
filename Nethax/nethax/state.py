@@ -40,6 +40,9 @@ from Nethax.nethax.subsystems.scoring import ScoringState
 from Nethax.nethax.subsystems.messages import MessageState
 from Nethax.nethax.subsystems.containers import ContainerState
 from Nethax.nethax.subsystems.engrave import EngraveState
+from Nethax.nethax.subsystems.skills import SkillState
+from Nethax.nethax.subsystems.digging import DigState
+from Nethax.nethax.subsystems.swallow import SwallowState
 
 from Nethax.nethax.dungeon.branches import (
     DungeonState,
@@ -101,6 +104,9 @@ class EnvState:
     level_memory: LevelMemoryState
     containers: ContainerState
     engrave: EngraveState
+    skills: SkillState
+    dig: DigState
+    swallow: SwallowState
 
     # ---- Player core (kept here for fast access; not part of any subsystem) ----
     player_pos: jax.Array       # int16[2]  (row, col)
@@ -131,10 +137,27 @@ class EnvState:
     player_steed_mid: jax.Array  # uint32 u.usteed_mid (you.h line 494); 0 = not riding
     player_killer_mid: jax.Array # uint32 last-attacker monster id (you.h: svk.killer)
     player_mortality: jax.Array  # int32  u.umortality (you.h line 497); deaths so far
+    player_uhitinc:   jax.Array  # int8   u.uhitinc (you.h); ring of increase accuracy
+    player_udaminc:   jax.Array  # int8   u.udaminc (you.h); ring of increase damage
     # TODO (post-Wave-6): mirror u.uintrinsic[] timed-intrinsic array and
     # u.uprops[LAST_PROP+1] property timers — currently fielded indirectly
     # through StatusState (status_effects.py); revisit when an end-to-end
     # property-timer simulation is needed.
+
+    # ---- Artifact invoke cooldown (artifact.c::arti_invoke) ----
+    # int16[30]: cooldown turns remaining per artifact slot; 0 = ready.
+    # 30 slots = 22 wish-table entries + 8 headroom (synthetic idx like Magicbane=29).
+    # Cite: vendor/nethack/src/artifact.c::arti_invoke artiintrinsics_taught[].
+    invoke_cooldown: jax.Array  # int16[30]
+
+    # ---- Tin-opening mechanic (eat.c:1370) ----
+    tin_opening_turns_left: jax.Array  # int8  turns remaining; 0 = no tin
+    tin_opening_type_id: jax.Array     # int16 type_id of the tin being opened
+
+    # ---- Punishment / genocide state (read.c) ----
+    is_punished: jax.Array        # bool  — iron ball attached
+    ball_pos:    jax.Array        # int16[2]  (row, col) of iron ball
+    genocided_species: jax.Array  # bool[381] — True = genocided
 
     # ---- Terrain layers (kept at top level; subsystems read but rarely write) ----
     terrain: jax.Array          # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]  tile type
@@ -189,6 +212,9 @@ class EnvState:
             level_memory=make_empty_level_memory(),
             containers=ContainerState.empty(),
             engrave=EngraveState.default(map_h=h, map_w=w),
+            skills=SkillState.default(),
+            dig=DigState.default(),
+            swallow=SwallowState.default(),
             # player core
             player_pos=jnp.zeros((2,), dtype=jnp.int16),
             player_hp=jnp.int32(10),
@@ -211,11 +237,22 @@ class EnvState:
             # Wave 6 closing-audit additions (vendor u.* parity).
             player_luck=jnp.int8(0),
             player_moreluck=jnp.int8(0),
+            player_uhitinc=jnp.int8(0),
+            player_udaminc=jnp.int8(0),
             player_in_water=jnp.bool_(False),
             player_buried=jnp.bool_(False),
             player_steed_mid=jnp.uint32(0),
             player_killer_mid=jnp.uint32(0),
             player_mortality=jnp.int32(0),
+            # artifact invoke cooldown
+            invoke_cooldown=jnp.zeros((30,), dtype=jnp.int16),
+            # tin-opening mechanic
+            tin_opening_turns_left=jnp.int8(0),
+            tin_opening_type_id=jnp.int16(0),
+            # punishment / genocide
+            is_punished=jnp.bool_(False),
+            ball_pos=jnp.zeros((2,), dtype=jnp.int16),
+            genocided_species=jnp.zeros((381,), dtype=jnp.bool_),
             # terrain layers
             terrain=jnp.zeros((b, l, h, w), dtype=jnp.int8),
             explored=jnp.zeros((b, l, h, w), dtype=jnp.bool_),

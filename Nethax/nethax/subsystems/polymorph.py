@@ -52,6 +52,9 @@ _LYCANTHROPY_FORM_DURATION: int = 20
 # Sentinel meaning "not polymorphed / no were-form active".
 _NONE_FORM: int = -1
 
+# vendor/nethack/src/polyself.c:280 — Unchanging intrinsic bit (prop.h UNCHANGING=63)
+UNCHANGING_MASK: int = 63  # index in status.intrinsics array
+
 
 # ---------------------------------------------------------------------------
 # State struct
@@ -223,6 +226,104 @@ def _monster_tables() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Valid-form mask  (polyself.c:280 — choose_race / polyself filter logic)
+# ---------------------------------------------------------------------------
+
+def _build_poly_form_valid() -> jnp.ndarray:
+    """Pre-compute bool[N_MONSTERS]: True iff a form is eligible for random poly.
+
+    Filters out (polyself.c:280):
+      - G_UNIQ monsters (Wizard of Yendor, Medusa, Riders, quest leaders, etc.)
+      - M2_NOPOLY flagged monsters (werecreatures, some humanoids, shopkeepers)
+      - Explicit Rider indices (Death, Pestilence, Famine) — also caught by G_UNIQ
+        but named here for clarity, mirroring polyself.c's explicit rider check.
+
+    Role-specific bans (Monk: no carnivore; Healer: no demon) are applied
+    dynamically in choose_random_polymorph_form() using the state's role.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, G_UNIQ, M2_NOPOLY
+
+    n = len(MONSTERS)
+    valid = []
+    for i, m in enumerate(MONSTERS):
+        is_uniq   = bool(m.generation_mask & G_UNIQ)
+        is_nopoly = bool(m.flags2 & M2_NOPOLY)
+        valid.append(not is_uniq and not is_nopoly)
+
+    return jnp.array(valid, dtype=jnp.bool_)
+
+
+_POLY_FORM_VALID: jnp.ndarray = _build_poly_form_valid()
+
+
+def _build_form_flags2() -> jnp.ndarray:
+    """Pre-compute int32[N_MONSTERS] of flags2 for JIT-safe gather."""
+    from Nethax.nethax.constants.monsters import MONSTERS
+    return jnp.array([m.flags2 & 0xFFFFFFFF for m in MONSTERS], dtype=jnp.uint32)
+
+
+_FORM_FLAGS2: jnp.ndarray = _build_form_flags2()
+
+
+def choose_random_polymorph_form(state, rng: jax.Array) -> jnp.ndarray:
+    """Pick a random valid polymorph target form index.  JIT-pure.
+
+    Vendor polyself.c:280 — rndmonst() filtered through poly_newcham() checks:
+      - Skip G_UNIQ forms.
+      - Skip M2_NOPOLY forms.
+      - Role-specific bans:
+          Monk  (role 9): M1_CARNIVORE forms banned.
+          Healer (role 2): M2_DEMON forms banned.
+
+    Uses lax.while_loop rejection sampling — statistically O(1) iterations
+    since ~75% of forms are valid.
+
+    Returns
+    -------
+    jnp.int32 scalar — MONSTERS table index of the chosen form.
+    """
+    from Nethax.nethax.constants.monsters import M1_CARNIVORE, M2_DEMON
+
+    n = _MONSTER_TABLES["n"]
+    flags1_arr = _MONSTER_TABLES["flags1"]   # uint32[N]
+    flags2_arr = _FORM_FLAGS2                # uint32[N]
+
+    # Role constants (Role enum indices matching vendor roles.h order)
+    _ROLE_MONK   = jnp.int8(9)
+    _ROLE_HEALER = jnp.int8(2)
+
+    is_monk   = state.player_role.astype(jnp.int8) == _ROLE_MONK
+    is_healer = state.player_role.astype(jnp.int8) == _ROLE_HEALER
+
+    def _body(args):
+        rng_inner, _form = args
+        rng_inner, sub = jax.random.split(rng_inner)
+        candidate = jax.random.randint(sub, (), 0, n).astype(jnp.int32)
+
+        base_valid = _POLY_FORM_VALID[candidate]
+
+        f1 = flags1_arr[candidate]
+        f2 = flags2_arr[candidate]
+        carnivore = (f1 & jnp.uint32(M1_CARNIVORE)) != jnp.uint32(0)
+        is_demon  = (f2 & jnp.uint32(M2_DEMON))     != jnp.uint32(0)
+
+        monk_ban   = is_monk   & carnivore
+        healer_ban = is_healer & is_demon
+
+        valid = base_valid & (~monk_ban) & (~healer_ban)
+        # Keep candidate if valid, else keep -1 sentinel to loop again.
+        chosen = jnp.where(valid, candidate, jnp.int32(-1))
+        return rng_inner, chosen
+
+    def _cond(args):
+        _rng, form = args
+        return form < jnp.int32(0)
+
+    _, form = jax.lax.while_loop(_cond, _body, (rng, jnp.int32(-1)))
+    return form.astype(jnp.int32)
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -286,14 +387,151 @@ def _drop_worn_armor(state):
 
     polyself.c::drop_inv_loss drops the *items* on the floor; in our
     simplified model we set worn_armor[i] = -1 (slot empty) and leave the
-    inventory entry itself alone (it would need to be moved to ground
-    items, which we defer to Wave 5).  AC penalty is captured via
+    inventory entry itself alone.  AC penalty is captured via
     ``_recompute_ac``.
+
+    Deprecated in favour of _drop_worn_armor_per_slot; retained as a
+    fallback for non-per-slot callers.
     """
     from Nethax.nethax.subsystems.inventory import N_ARMOR_SLOTS
     new_worn = jnp.full((N_ARMOR_SLOTS,), -1, dtype=jnp.int8)
     new_inv = state.inventory.replace(worn_armor=new_worn)
     return state.replace(inventory=new_inv)
+
+
+def _drop_worn_armor_per_slot(state, form_idx: jnp.ndarray):
+    """Drop worn armor per-slot based on the new form's flags.
+
+    vendor/nethack/src/polyself.c:1156 — break_armor() checks each worn
+    slot against the new form's M1_NOHANDS / M1_NOHEAD / M1_SLITHY flags:
+
+      M1_NOHANDS  → can't wear body/shield/gloves (all hand-dependent slots)
+      M1_NOHEAD   → can't wear helm
+      M1_SLITHY   → can't wear boots (no legs)
+      M1_NOHANDS also covers helm/boots for fully limbless forms.
+
+    For each incompatible slot:
+      - Set worn_armor[slot] = -1.
+      - Place the displaced item into ground_items at player_pos (first free
+        stack slot, branch=0/level=0 for current level — Wave 6 simplification;
+        full dungeon-level routing deferred to Wave 7).
+
+    JIT-pure: uses jnp.where masks per slot.
+    """
+    from Nethax.nethax.subsystems.inventory import N_ARMOR_SLOTS, ArmorSlot
+
+    tables   = _monster_tables()
+    idx      = form_idx.astype(jnp.int32)
+    f1       = tables["flags1"][idx]   # uint32
+
+    M1_NOHANDS_U = jnp.uint32(0x00002000)
+    M1_NOHEAD_U  = jnp.uint32(0x00008000)
+    M1_SLITHY_U  = jnp.uint32(0x00080000)
+
+    nohands = (f1 & M1_NOHANDS_U) != jnp.uint32(0)
+    nohead  = (f1 & M1_NOHEAD_U)  != jnp.uint32(0)
+    slithy  = (f1 & M1_SLITHY_U)  != jnp.uint32(0)
+
+    # Per-slot incompatibility mask: True → must drop.
+    # Slot order: BODY=0, SHIELD=1, HELM=2, GLOVES=3, BOOTS=4, CLOAK=5, SHIRT=6
+    # nohands blocks body(0), shield(1), gloves(3); nohead blocks helm(2);
+    # slithy blocks boots(4); nohands also blocks helm/boots for fully limbless.
+    drop_mask = jnp.array([
+        nohands,        # BODY
+        nohands,        # SHIELD
+        nohands | nohead,  # HELM
+        nohands,        # GLOVES
+        nohands | slithy,  # BOOTS
+        jnp.bool_(False),  # CLOAK — no vendor restriction
+        jnp.bool_(False),  # SHIRT — no vendor restriction
+    ], dtype=jnp.bool_)
+
+    worn      = state.inventory.worn_armor   # int8[N_ARMOR_SLOTS]
+    new_worn  = jnp.where(drop_mask, jnp.int8(-1), worn)
+    new_inv   = state.inventory.replace(worn_armor=new_worn)
+    state     = state.replace(inventory=new_inv)
+
+    # Move displaced items to ground at player_pos (branch 0, level 0).
+    # We iterate over slots using lax.fori_loop to stay JIT-pure.
+    ground = state.ground_items
+    p_row  = state.player_pos[0].astype(jnp.int32)
+    p_col  = state.player_pos[1].astype(jnp.int32)
+
+    def _drop_slot(slot_i, carry):
+        g, inv_items = carry
+        was_worn = worn[slot_i].astype(jnp.int32)  # inv slot idx, or -1
+        should_drop = drop_mask[slot_i] & (was_worn >= jnp.int32(0))
+
+        # Find first free ground stack position (category == 0).
+        ground_stack = g.category[0, 0, p_row, p_col]  # [MAX_GROUND_STACK]
+        free_idx = jnp.argmax(ground_stack == jnp.int8(0)).astype(jnp.int32)
+
+        # Copy item from inventory to ground stack.
+        item_cat = inv_items.category[was_worn]
+        item_tid = inv_items.type_id[was_worn]
+
+        new_g_cat = jnp.where(
+            should_drop,
+            g.category[0, 0, p_row, p_col].at[free_idx].set(item_cat),
+            g.category[0, 0, p_row, p_col],
+        )
+        new_g_tid = jnp.where(
+            should_drop,
+            g.type_id[0, 0, p_row, p_col].at[free_idx].set(item_tid),
+            g.type_id[0, 0, p_row, p_col],
+        )
+        g = g.replace(
+            category=g.category.at[0, 0, p_row, p_col].set(new_g_cat),
+            type_id=g.type_id.at[0, 0, p_row, p_col].set(new_g_tid),
+        )
+        return g, inv_items
+
+    new_ground, _ = jax.lax.fori_loop(
+        0, N_ARMOR_SLOTS, _drop_slot, (ground, state.inventory.items)
+    )
+    return state.replace(ground_items=new_ground)
+
+
+# ---------------------------------------------------------------------------
+# newman()  (vendor/nethack/src/polyself.c:336)
+# ---------------------------------------------------------------------------
+
+def newman(state, rng: jax.Array):
+    """Re-roll player stats when they polymorph into their own race form.
+
+    vendor/nethack/src/polyself.c:336 — newman():
+      - Re-roll player XL ± 2 (clamped 1..30).
+      - Recompute HP_max from new XL  (8 * XL simplified).
+      - Recompute PW_max from new XL  (4 * XL simplified).
+      - Cure SICK and STONED status effects.
+
+    Returns
+    -------
+    EnvState — updated state (does NOT set is_polymorphed; caller handles that).
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+
+    rng, sub = jax.random.split(rng)
+    xl_delta  = jax.random.randint(sub, (), -2, 3).astype(jnp.int32)  # [-2,+2]
+    new_xl    = jnp.clip(state.player_xl.astype(jnp.int32) + xl_delta,
+                         jnp.int32(1), jnp.int32(30))
+    new_hp_max = jnp.maximum(new_xl * jnp.int32(8), jnp.int32(1))
+    new_pw_max = jnp.maximum(new_xl * jnp.int32(4), jnp.int32(0))
+    new_hp     = jnp.minimum(state.player_hp.astype(jnp.int32), new_hp_max)
+
+    # Cure SICK and STONED.
+    ts = state.status.timed_statuses
+    ts = ts.at[int(TimedStatus.SICK)].set(jnp.int32(0))
+    ts = ts.at[int(TimedStatus.STONED)].set(jnp.int32(0))
+    new_status = state.status.replace(timed_statuses=ts)
+
+    return state.replace(
+        player_xl=new_xl,
+        player_hp_max=new_hp_max,
+        player_pw_max=new_pw_max,
+        player_hp=new_hp,
+        status=new_status,
+    )
 
 
 def _recompute_ac(state, form_idx: jnp.ndarray):
@@ -403,9 +641,24 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool):
     )
     state = _recompute_ac(state, form_i16)
 
-    # --- 5. Drop incompatible armor.
-    can_wear = _can_wear_armor(form_i16)
-    state = jax.lax.cond(can_wear, lambda s: s, _drop_worn_armor, state)
+    # --- 5. Drop incompatible armor per-slot (polyself.c:1156 break_armor).
+    state = _drop_worn_armor_per_slot(state, form_i16)
+
+    # --- 5b. newman(): if target form matches player's own race, re-roll XL/HP/PW
+    # and cure sick/stoned.  (polyself.c:336)
+    # We approximate "same race" as M2_HUMAN flag in the form matching the
+    # player_race == human (race=0).  For simplicity: if flags2 & M2_HUMAN and
+    # player_race == 0 (Human), call newman.
+    form_flags2 = _FORM_FLAGS2[form_i16.astype(jnp.int32)]
+    form_is_human_race = (form_flags2 & jnp.uint32(0x00000008)) != jnp.uint32(0)  # M2_HUMAN=0x8
+    player_is_human    = state.player_race.astype(jnp.int32) == jnp.int32(0)
+    same_race          = form_is_human_race & player_is_human
+
+    rng, sub_nm = jax.random.split(rng)
+    state = jax.lax.cond(same_race,
+                         lambda s: newman(s, sub_nm),
+                         lambda s: s,
+                         state)
 
     # --- 7. Conduct: POLYSELFLESS violated.
     from Nethax.nethax.subsystems.conduct import Conduct
@@ -422,41 +675,65 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool):
 def revert_polymorph(state, rng: jax.Array | None = None):
     """Restore original stats and clear polymorph flags.
 
-    Mirrors polyself.c::rehumanize:
+    Mirrors polyself.c::rehumanize (polyself.c:1367):
+      - Unchanging check: if UNCHANGING intrinsic is set, player dies (done=True,
+        hp=0).  Cite: polyself.c:1367.
       - Restore STR/DEX/CON/HP_max/AC.
       - Restore the original attack set.
       - Clear is_polymorphed, poly_timer, current_form_idx.
+      - If post-revert HP < 1, player dies.  Cite: polyself.c.
     """
     poly = state.polymorph
 
     def _do_revert(s):
         p = s.polymorph
-        # Restore attack set
-        p2 = p.replace(
-            is_polymorphed=jnp.bool_(False),
-            current_form_idx=jnp.int16(_NONE_FORM),
-            poly_timer=jnp.int16(0),
-            poly_controlled=jnp.bool_(False),
-            attack_types=p.orig_attack_types,
-            attack_damage_types=p.orig_attack_damage_types,
-            attack_n_dice=p.orig_attack_n_dice,
-            attack_n_sides=p.orig_attack_n_sides,
-            intrinsics_mask=jnp.int32(0),
-            # legacy aliases
-            poly_form_id=jnp.int32(-1),
-            poly_turns=jnp.int32(0),
-            poly_controlled_legacy=jnp.bool_(False),
-        )
-        return s.replace(
-            polymorph=p2,
-            player_str=p.orig_str,
-            player_dex=p.orig_dex,
-            player_con=p.orig_con,
-            player_hp_max=p.orig_hp_max,
-            player_hp=jnp.minimum(s.player_hp, p.orig_hp_max),
-            player_ac=p.orig_ac,
-            player_role=p.orig_role_idx,
-        )
+
+        # Unchanging: rehumanizing while Unchanging kills the player.
+        # polyself.c:1367 — "rehumanize: Unchanging → You die."
+        has_unchanging = s.status.intrinsics[UNCHANGING_MASK].astype(jnp.bool_)
+
+        def _unchanging_death(st):
+            return st.replace(
+                player_hp=jnp.int32(0),
+                done=jnp.bool_(True),
+            )
+
+        def _normal_revert(st):
+            p2 = p.replace(
+                is_polymorphed=jnp.bool_(False),
+                current_form_idx=jnp.int16(_NONE_FORM),
+                poly_timer=jnp.int16(0),
+                poly_controlled=jnp.bool_(False),
+                attack_types=p.orig_attack_types,
+                attack_damage_types=p.orig_attack_damage_types,
+                attack_n_dice=p.orig_attack_n_dice,
+                attack_n_sides=p.orig_attack_n_sides,
+                intrinsics_mask=jnp.int32(0),
+                # legacy aliases
+                poly_form_id=jnp.int32(-1),
+                poly_turns=jnp.int32(0),
+                poly_controlled_legacy=jnp.bool_(False),
+            )
+            reverted = st.replace(
+                polymorph=p2,
+                player_str=p.orig_str,
+                player_dex=p.orig_dex,
+                player_con=p.orig_con,
+                player_hp_max=p.orig_hp_max,
+                player_hp=jnp.minimum(st.player_hp, p.orig_hp_max),
+                player_ac=p.orig_ac,
+                player_role=p.orig_role_idx,
+            )
+            # Post-revert: if HP < 1, player dies.  polyself.c rehumanize.
+            hp_fatal = reverted.player_hp < jnp.int32(1)
+            return jax.lax.cond(
+                hp_fatal,
+                lambda st2: st2.replace(player_hp=jnp.int32(0), done=jnp.bool_(True)),
+                lambda st2: st2,
+                reverted,
+            )
+
+        return jax.lax.cond(has_unchanging, _unchanging_death, _normal_revert, s)
 
     return jax.lax.cond(poly.is_polymorphed, _do_revert, lambda s: s, state)
 

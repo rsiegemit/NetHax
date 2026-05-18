@@ -395,12 +395,16 @@ def test_teleportation_moves_player():
     assert moved, "Teleportation should change player_pos"
 
 
-def test_punishment_adds_wounded_legs_timer():
-    """scroll of punishment → WOUNDED_LEGS timer > 0."""
+def test_punishment_sets_is_punished():
+    """scroll of punishment (uncursed) → is_punished=True.
+
+    Updated from Wave-3 WOUNDED_LEGS stub to parity-correct ball+chain per
+    vendor/nethack/src/read.c::seffect_punishment (~1976).
+    """
     state  = _state_with_scroll(ScrollEffect.PUNISHMENT)
     result = read_scroll(state, _RNG, 0)
-    assert int(result.status.timed_statuses[int(TimedStatus.WOUNDED_LEGS)]) > 0, (
-        "Punishment should set WOUNDED_LEGS timer"
+    assert bool(result.is_punished), (
+        "Uncursed punishment must set is_punished=True"
     )
 
 

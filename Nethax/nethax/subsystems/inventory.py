@@ -149,32 +149,21 @@ class Item:
     lamplit: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
     olocked: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
     # Corpse tracking: index into MONSTERS table (-1 = not a corpse).
-    # Set when a monster's death produces a corpse item; used by items_corpses.py
-    # to dispatch apply_corpse_postfx.  int16 is sufficient (NUMMONS = 381 < 32767).
     corpse_entry_idx: jnp.ndarray = field(default_factory=lambda: jnp.int16(-1))
+    # Recharge counter — vendor read.c::seffect_charging: wand explodes at 7.
+    recharged: jnp.ndarray = field(default_factory=lambda: jnp.int8(0))
 
 
 def make_empty_item() -> Item:
     """Return a zeroed Item representing an empty inventory slot."""
     return Item(
-        category=jnp.int8(0),
-        type_id=jnp.int16(0),
-        buc_status=jnp.int8(0),
-        enchantment=jnp.int8(0),
-        charges=jnp.int8(0),
-        identified=jnp.bool_(False),
-        quantity=jnp.int16(0),
-        weight=jnp.int32(0),
-        ac_bonus=jnp.int8(0),
-        is_two_handed=jnp.bool_(False),
-        greased=jnp.bool_(False),
-        oeroded=jnp.int8(0),
-        oeroded2=jnp.int8(0),
-        oerodeproof=jnp.bool_(False),
-        bknown=jnp.bool_(False),
-        lamplit=jnp.bool_(False),
-        olocked=jnp.bool_(False),
-        corpse_entry_idx=jnp.int16(-1),
+        category=jnp.int8(0), type_id=jnp.int16(0), buc_status=jnp.int8(0),
+        enchantment=jnp.int8(0), charges=jnp.int8(0), identified=jnp.bool_(False),
+        quantity=jnp.int16(0), weight=jnp.int32(0), ac_bonus=jnp.int8(0),
+        is_two_handed=jnp.bool_(False), greased=jnp.bool_(False),
+        oeroded=jnp.int8(0), oeroded2=jnp.int8(0), oerodeproof=jnp.bool_(False),
+        bknown=jnp.bool_(False), lamplit=jnp.bool_(False), olocked=jnp.bool_(False),
+        corpse_entry_idx=jnp.int16(-1), recharged=jnp.int8(0),
     )
 
 
@@ -191,30 +180,17 @@ def make_item(
     oeroded2: int = 0,
     oerodeproof: bool = False,
 ) -> Item:
-    """Construct a concrete Item with given fields (Python-side helper).
-
-    oeroded / oeroded2 / oerodeproof mirror vendor/nethack/include/obj.h
-    bitfields (obj->oeroded, obj->oeroded2, obj->oerodeproof).
-    """
+    """Construct a concrete Item with given fields (Python-side helper)."""
     return Item(
-        category=jnp.int8(category),
-        type_id=jnp.int16(type_id),
-        buc_status=jnp.int8(buc_status),
-        enchantment=jnp.int8(enchantment),
-        charges=jnp.int8(0),
-        identified=jnp.bool_(True),
-        quantity=jnp.int16(quantity),
-        weight=jnp.int32(weight),
-        ac_bonus=jnp.int8(ac_bonus),
-        is_two_handed=jnp.bool_(is_two_handed),
-        greased=jnp.bool_(False),
-        oeroded=jnp.int8(oeroded),
-        oeroded2=jnp.int8(oeroded2),
-        oerodeproof=jnp.bool_(oerodeproof),
-        bknown=jnp.bool_(False),
-        lamplit=jnp.bool_(False),
-        olocked=jnp.bool_(False),
-        corpse_entry_idx=jnp.int16(-1),
+        category=jnp.int8(category), type_id=jnp.int16(type_id),
+        buc_status=jnp.int8(buc_status), enchantment=jnp.int8(enchantment),
+        charges=jnp.int8(0), identified=jnp.bool_(True),
+        quantity=jnp.int16(quantity), weight=jnp.int32(weight),
+        ac_bonus=jnp.int8(ac_bonus), is_two_handed=jnp.bool_(is_two_handed),
+        greased=jnp.bool_(False), oeroded=jnp.int8(oeroded),
+        oeroded2=jnp.int8(oeroded2), oerodeproof=jnp.bool_(oerodeproof),
+        bknown=jnp.bool_(False), lamplit=jnp.bool_(False), olocked=jnp.bool_(False),
+        corpse_entry_idx=jnp.int16(-1), recharged=jnp.int8(0),
     )
 
 
@@ -223,10 +199,7 @@ def make_item(
 # ---------------------------------------------------------------------------
 
 def _items_from_list(item_list: list) -> Item:
-    """Stack a Python list of Items into a batched Item of shape [N].
-
-    Pads with empty items to MAX_INVENTORY_SLOTS.
-    """
+    """Stack a Python list of Items into a batched Item of shape [N]."""
     padded = list(item_list) + [make_empty_item()] * (MAX_INVENTORY_SLOTS - len(item_list))
     return _stack_items(padded)
 
@@ -252,6 +225,7 @@ def _stack_items(items: list) -> Item:
         lamplit=jnp.array([bool(it.lamplit) for it in items], dtype=jnp.bool_),
         olocked=jnp.array([bool(it.olocked) for it in items], dtype=jnp.bool_),
         corpse_entry_idx=jnp.array([int(it.corpse_entry_idx) for it in items], dtype=jnp.int16),
+        recharged=jnp.array([int(it.recharged) for it in items], dtype=jnp.int8),
     )
 
 
@@ -277,6 +251,7 @@ def _empty_items_array() -> Item:
         lamplit=jnp.zeros((n,), dtype=jnp.bool_),
         olocked=jnp.zeros((n,), dtype=jnp.bool_),
         corpse_entry_idx=jnp.full((n,), -1, dtype=jnp.int16),
+        recharged=jnp.zeros((n,), dtype=jnp.int8),
     )
 
 
@@ -302,6 +277,7 @@ def _empty_ground_items_array(n_branches: int, max_levels: int, map_h: int, map_
         lamplit=jnp.zeros(shape, dtype=jnp.bool_),
         olocked=jnp.zeros(shape, dtype=jnp.bool_),
         corpse_entry_idx=jnp.full(shape, -1, dtype=jnp.int16),
+        recharged=jnp.zeros(shape, dtype=jnp.int8),
     )
 
 
@@ -354,6 +330,7 @@ class InventoryState:
     quiver: jnp.ndarray            # scalar int8
     total_weight: jnp.ndarray      # scalar int32
     user_names: jnp.ndarray        # [MAX_INVENTORY_SLOTS, USER_NAME_LEN] int8
+    wielded_artifact_idx: jnp.ndarray  # scalar int8 — wish._ARTIFACTS index (-1=none)
 
     @classmethod
     def empty(cls) -> "InventoryState":
@@ -370,6 +347,7 @@ class InventoryState:
             quiver=jnp.int8(-1),
             total_weight=jnp.int32(0),
             user_names=jnp.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=jnp.int8),
+            wielded_artifact_idx=jnp.int8(-1),
         )
 
     @classmethod
@@ -390,6 +368,7 @@ class InventoryState:
             quiver=jnp.int8(-1),
             total_weight=jnp.int32(0),
             user_names=jnp.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=jnp.int8),
+            wielded_artifact_idx=jnp.int8(-1),
         )
 
 
@@ -821,6 +800,15 @@ def handle_wield(state, rng):
         _find_weapon, (jnp.bool_(False), jnp.int32(0)), jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32)
     )
     new_state = wield(state, first_weapon)
+    # Clear wielded_artifact_idx when wielding via the action handler (no
+    # artifact context available here; callers that grant artifacts set it
+    # directly via state.inventory.replace(wielded_artifact_idx=...)).
+    # Cite: vendor/nethack/src/artifact.c lines 880-885 (setworn clears
+    # the W_WEP extrinsic for inv_prop when a new weapon is wielded).
+    new_inv = new_state.inventory.replace(wielded_artifact_idx=jnp.int8(-1))
+    new_state = new_state.replace(inventory=new_inv)
+    from Nethax.nethax.subsystems.artifact_powers import apply_artifact_intrinsics
+    new_state = apply_artifact_intrinsics(new_state)
     # Conduct: vendor/nethack/src/wield.c::wieldwep — WEAPONLESS broken when a
     # non-bare-hand weapon is wielded (insight.c ~2137, u.uconduct.weaphit).
     from Nethax.nethax.subsystems.conduct import Conduct, mark_violated_if

@@ -180,7 +180,9 @@ def _kill_all_of_symbol(state, chosen_class):
     new_hp    = jnp.where(is_match, jnp.int32(0), mai.hp)
 
     new_mai = mai.replace(alive=new_alive, hp=new_hp)
-    new_state = state.replace(monster_ai=new_mai)
+    symbol_match_table = symbol_table.astype(jnp.int32) == jnp.int32(chosen_class)
+    new_genocided = jnp.where(symbol_match_table, jnp.bool_(True), state.genocided_species)
+    new_state = state.replace(monster_ai=new_mai, genocided_species=new_genocided)
     return mark_violated(new_state, int(Conduct.GENOCIDELESS))
 
 
@@ -278,28 +280,28 @@ def _effect_identify(state, rng, buc):
 # ---- enchantment ----------------------------------------------------------
 
 def _effect_enchant_weapon(state, rng, buc):
-    """scroll of enchant weapon — +1 enchant on wielded weapon.
+    """scroll of enchant weapon — enchant wielded weapon.
 
-    Canonical: seffect_enchant_weapon — enchant wielded weapon +1 (blessed +2,
-    cursed chance of destroy at high enchant).
-    Wave 3: +1 enchantment on wielded slot item; blessed +2; cursed -1.
+    vendor/nethack/src/read.c::seffect_enchant_weapon (~1627).
+      cursed : -1
+      uncursed: +1
+      blessed : rnd(max(3 - spe//3, 1))  diminishing formula (~1638)
     """
+    rng1, _ = jax.random.split(rng)
     cursed  = _is_cursed(buc)
     blessed = _is_blessed(buc)
-    delta   = jnp.where(blessed, jnp.int8(2),
-              jnp.where(cursed,  jnp.int8(-1), jnp.int8(1)))
-
     wielded = state.inventory.wielded.astype(jnp.int32)
     valid   = wielded >= jnp.int32(0)
-
-    old_enc  = state.inventory.items.enchantment
-    new_enc_val = jnp.clip(old_enc[wielded] + delta, jnp.int8(-7), jnp.int8(7))
-    new_enc  = jnp.where(valid,
-                         old_enc.at[wielded].set(new_enc_val),
-                         old_enc)
+    old_enc = state.inventory.items.enchantment
+    spe = old_enc[wielded].astype(jnp.int32)
+    blessed_range = jnp.maximum(jnp.int32(3) - spe // jnp.int32(3), jnp.int32(1))
+    blessed_delta = jax.random.randint(rng1, (), 1, blessed_range + 1).astype(jnp.int32)
+    delta = jnp.where(blessed, blessed_delta,
+            jnp.where(cursed, jnp.int32(-1), jnp.int32(1)))
+    new_enc_val = jnp.clip(spe + delta, -7, 7).astype(jnp.int8)
+    new_enc = jnp.where(valid, old_enc.at[wielded].set(new_enc_val), old_enc)
     new_items = state.inventory.items.replace(enchantment=new_enc)
-    new_inv   = state.inventory.replace(items=new_items)
-    return state.replace(inventory=new_inv)
+    return state.replace(inventory=state.inventory.replace(items=new_items))
 
 
 def _effect_enchant_armor(state, rng, buc):
@@ -327,58 +329,81 @@ def _effect_enchant_armor(state, rng, buc):
 
 
 def _effect_destroy_armor(state, rng, buc):
-    """scroll of destroy armor — destroy a piece of worn armor.
+    """scroll of destroy armor — damage worn body armor.
 
-    Canonical: seffect_destroy_armor — set enchant to -6 or destroy.
-    Wave 3: cursed or uncursed: set worn body armor enchantment to -6;
-    blessed: no-op (Canonically the scroll has no blessed effect distinct
-    from uncursed when read normally).
+    vendor/nethack/src/read.c::seffect_destroy_armor (~1324).
+      cursed/uncursed: set enchantment to -6.
+      blessed: subtract rnd(3) from enchantment (~1361).
     """
-    cursed   = _is_cursed(buc)
+    rng1, _ = jax.random.split(rng)
     blessed  = _is_blessed(buc)
-
     armor_slot = state.inventory.worn_armor[0].astype(jnp.int32)
     valid      = armor_slot >= jnp.int32(0)
-    do_damage  = valid & ~blessed
-
     old_enc = state.inventory.items.enchantment
-    new_enc = jnp.where(do_damage,
-                        old_enc.at[armor_slot].set(jnp.int8(-6)),
-                        old_enc)
+    blessed_delta = jax.random.randint(rng1, (), 1, 4).astype(jnp.int32)
+    blessed_enc_val = jnp.clip(
+        old_enc[armor_slot].astype(jnp.int32) - blessed_delta, -7, 7
+    ).astype(jnp.int8)
+    new_enc_val = jnp.where(blessed, blessed_enc_val, jnp.int8(-6))
+    new_enc = jnp.where(valid, old_enc.at[armor_slot].set(new_enc_val), old_enc)
     new_items = state.inventory.items.replace(enchantment=new_enc)
     new_inv   = state.inventory.replace(items=new_items)
     return state.replace(inventory=new_inv)
 
 
 def _effect_charging(state, rng, buc):
-    """scroll of charging — recharge a wand/tool.
+    """scroll of charging — recharge a wand with BUC-dependent formula.
 
-    Canonical: seffect_charging — restore charges on a wand.
-    Wave 3: +5 charges on the first wand found (WAND_CLASS) in inventory;
-    blessed: all wands get +5.
+    vendor/nethack/src/read.c::seffect_charging (~1788) + recharge (~726).
+      blessed : rnd(2*nchg); uncursed: rnd(nchg); cursed: -rnd(2).
+    Increments recharged counter; wand explodes (destroyed) when recharged>=7.
     """
-    blessed    = _is_blessed(buc)
-    categories = state.inventory.items.category  # [52]
-    charges    = state.inventory.items.charges   # [52]
-
-    is_wand    = categories == jnp.int8(ObjectClass.WAND_CLASS)
-
-    # Blessed: charge all wands; else charge first found wand only.
+    rng1, rng2, rng3 = jax.random.split(rng, 3)
+    blessed  = _is_blessed(buc)
+    cursed   = _is_cursed(buc)
+    categories = state.inventory.items.category
+    charges    = state.inventory.items.charges
+    recharged  = state.inventory.items.recharged
+    is_wand   = categories == jnp.int8(ObjectClass.WAND_CLASS)
+    found_any = jnp.any(is_wand)
     first_wand = jnp.argmax(is_wand).astype(jnp.int32)
-    slot_mask  = jnp.where(blessed,
-                           is_wand,
-                           jnp.arange(52, dtype=jnp.int32) == first_wand)
-    found_any  = jnp.any(is_wand)
+    nchg = jnp.maximum(charges[first_wand].astype(jnp.int32), jnp.int32(1))
+    roll_b = jax.random.randint(rng1, (), 1, 2 * nchg + 1).astype(jnp.int32)
+    roll_u = jax.random.randint(rng2, (), 1, nchg + 1).astype(jnp.int32)
+    roll_c = -jax.random.randint(rng3, (), 1, 3).astype(jnp.int32)
+    delta = jnp.where(blessed, roll_b, jnp.where(cursed, roll_c, roll_u))
+    new_ch_val = jnp.clip(
+        charges[first_wand].astype(jnp.int32) + delta, 0, 40
+    ).astype(jnp.int8)
+    old_rchrg = recharged[first_wand].astype(jnp.int32)
+    explodes  = found_any & (old_rchrg >= jnp.int32(7))
     new_charges = jnp.where(
-        found_any,
-        jnp.where(slot_mask,
-                  jnp.clip(charges.astype(jnp.int32) + 5, 0, 40).astype(jnp.int8),
-                  charges),
+        found_any & ~explodes,
+        charges.at[first_wand].set(new_ch_val),
         charges,
     )
-    new_items = state.inventory.items.replace(charges=new_charges)
-    new_inv   = state.inventory.replace(items=new_items)
-    return state.replace(inventory=new_inv)
+    new_recharged = jnp.where(
+        found_any & ~explodes,
+        recharged.at[first_wand].set(
+            jnp.clip(old_rchrg + 1, 0, 127).astype(jnp.int8)
+        ),
+        recharged,
+    )
+    new_qty = jnp.where(
+        explodes,
+        state.inventory.items.quantity.at[first_wand].set(jnp.int16(0)),
+        state.inventory.items.quantity,
+    )
+    new_cat = jnp.where(
+        explodes,
+        categories.at[first_wand].set(jnp.int8(0)),
+        categories,
+    )
+    new_items = state.inventory.items.replace(
+        charges=new_charges, recharged=new_recharged,
+        quantity=new_qty, category=new_cat,
+    )
+    return state.replace(inventory=state.inventory.replace(items=new_items))
 
 
 # ---- curse/bless ----------------------------------------------------------
@@ -585,22 +610,17 @@ def _effect_earth(state, rng, buc):
 
 
 def _effect_punishment(state, rng, buc):
-    """scroll of punishment — ball and chain appear on player.
+    """scroll of punishment — attach iron ball and chain.
 
-    Canonical: seffect_punishment — attach iron ball and chain.
-    Wave 3: deal 5 HP damage and add 30-turn STUMBLING-equivalent (WOUNDED_LEGS).
-    Blessed: no-op.
+    vendor/nethack/src/read.c::seffect_punishment (~1976).
+      uncursed/cursed: set is_punished=True, ball_pos=player_pos.
+      blessed: "you feel guilty" — no ball attached.
     """
     blessed = _is_blessed(buc)
-    cursed  = _is_cursed(buc)
-    dmg     = jnp.where(blessed, jnp.int32(0), jnp.int32(5))
-    new_hp  = jnp.maximum(state.player_hp - dmg, jnp.int32(1))
-    turns   = jnp.where(blessed, jnp.int32(0), jnp.int32(30))
-    cur_wl  = state.status.timed_statuses[int(TimedStatus.WOUNDED_LEGS)]
-    new_wl  = jnp.maximum(cur_wl, turns)
-    new_ts  = state.status.timed_statuses.at[int(TimedStatus.WOUNDED_LEGS)].set(new_wl)
-    new_status = state.status.replace(timed_statuses=new_ts)
-    return state.replace(player_hp=new_hp, status=new_status)
+    guilty  = blessed
+    new_is_punished = jnp.where(guilty, state.is_punished, jnp.bool_(True))
+    new_ball_pos    = jnp.where(guilty, state.ball_pos,    state.player_pos)
+    return state.replace(is_punished=new_is_punished, ball_pos=new_ball_pos)
 
 
 def _effect_stinking_cloud(state, rng, buc):
@@ -683,14 +703,95 @@ _SWITCH_BRANCHES = [
 
 
 # ---------------------------------------------------------------------------
+# Confused-branch handlers
+# vendor/nethack/src/read.c — each seffect_* has a "if(Confused)" early path.
+# ---------------------------------------------------------------------------
+
+def _confused_teleport(state, rng, slot_idx):
+    """Confused teleport: level teleport — change current_level randomly."""
+    max_levels = state.terrain.shape[1]
+    rng1, _ = jax.random.split(rng)
+    new_level = jax.random.randint(rng1, (), 1, max_levels + 1).astype(jnp.int8)
+    return state.replace(dungeon=state.dungeon.replace(current_level=new_level))
+
+
+def _confused_identify(state, rng, slot_idx):
+    """Confused identify: identify only the scroll itself (slot_idx)."""
+    slot_idx = jnp.int32(slot_idx)
+    new_id = state.inventory.items.identified.at[slot_idx].set(jnp.bool_(True))
+    new_items = state.inventory.items.replace(identified=new_id)
+    return state.replace(inventory=state.inventory.replace(items=new_items))
+
+
+def _confused_magic_mapping(state, rng, slot_idx):
+    """Confused magic mapping: reveal level AND add 30 confusion turns."""
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - 1
+    new_explored = state.explored.at[b, lv].set(jnp.ones_like(state.explored[b, lv]))
+    st2 = state.replace(explored=new_explored)
+    cur_conf = st2.status.timed_statuses[int(TimedStatus.CONFUSION)]
+    new_conf = cur_conf + jnp.int32(30)
+    new_ts = st2.status.timed_statuses.at[int(TimedStatus.CONFUSION)].set(new_conf)
+    return st2.replace(status=st2.status.replace(timed_statuses=new_ts))
+
+
+def _confused_charging(state, rng, slot_idx):
+    """Confused charging: restore player_pw instead of wand charges."""
+    rng1, _ = jax.random.split(rng)
+    pw_max = state.player_pw_max
+    gain_max = jnp.maximum(pw_max // jnp.int32(4) + jnp.int32(1), jnp.int32(2))
+    gain = jax.random.randint(rng1, (), 1, gain_max + 1).astype(jnp.int32)
+    return state.replace(player_pw=jnp.minimum(state.player_pw + gain, pw_max))
+
+
+def _confused_remove_curse(state, rng, slot_idx):
+    """Confused remove curse: randomise BUC of all non-empty items (50/50)."""
+    from Nethax.nethax.subsystems.inventory import MAX_INVENTORY_SLOTS
+    rng1, _ = jax.random.split(rng)
+    n = MAX_INVENTORY_SLOTS
+    old_buc = state.inventory.items.buc_status
+    non_empty = state.inventory.items.category != jnp.int8(0)
+    rand_buc = jax.random.randint(rng1, (n,), 0, 2)
+    random_buc_val = jnp.where(rand_buc == 0, jnp.int8(_BUC_BLESSED), jnp.int8(_BUC_CURSED))
+    new_buc = jnp.where(non_empty, random_buc_val, old_buc)
+    new_items = state.inventory.items.replace(buc_status=new_buc)
+    return state.replace(inventory=state.inventory.replace(items=new_items))
+
+
+# Map ScrollEffect int value → confused handler (None = fall through to sane).
+_CONFUSED_HANDLER_MAP = {
+    int(ScrollEffect.TELEPORTATION): _confused_teleport,
+    int(ScrollEffect.IDENTIFY):      _confused_identify,
+    int(ScrollEffect.MAGIC_MAPPING): _confused_magic_mapping,
+    int(ScrollEffect.CHARGING):      _confused_charging,
+    int(ScrollEffect.REMOVE_CURSE):  _confused_remove_curse,
+}
+
+# Static bool array: True for effects that have a confused handler.
+_HAS_CONFUSED = jnp.array(
+    [i in _CONFUSED_HANDLER_MAP for i in range(N_SCROLLS)],
+    dtype=jnp.bool_,
+)
+
+# lax.switch branches for confused path: operand is (state, rng, slot_idx).
+_CONFUSED_BRANCHES = [
+    (lambda operand, h=_CONFUSED_HANDLER_MAP.get(i): (
+        h(operand[0], operand[1], operand[2]) if h is not None else operand[0]
+    ))
+    for i in range(N_SCROLLS)
+]
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def read_scroll(state, rng, slot_idx):
     """Apply the scroll in inventory slot `slot_idx`.
 
-    Looks up type_id → ScrollEffect, dispatches via jax.lax.switch, then
-    decrements quantity (marks slot empty when exhausted).
+    If the player is confused (CONFUSION > 0) and this effect has a
+    confused-branch handler, the confused branch runs instead of the sane one.
+    Quantity is decremented after dispatch.
 
     Parameters
     ----------
@@ -713,8 +814,21 @@ def read_scroll(state, rng, slot_idx):
         N_SCROLLS - 1,
     )
 
-    # Dispatch: operand is (state, rng, buc); each branch returns new state.
-    new_state = jax.lax.switch(effect_id, _SWITCH_BRANCHES, (state, rng, buc))
+    confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
+    has_confused = _HAS_CONFUSED[effect_id]
+    use_confused = confused & has_confused
+
+    # Run both branches (JIT requires static structure); select result.
+    confused_state = jax.lax.switch(
+        effect_id, _CONFUSED_BRANCHES, (state, rng, slot_idx)
+    )
+    sane_state = jax.lax.switch(effect_id, _SWITCH_BRANCHES, (state, rng, buc))
+
+    new_state = jax.tree.map(
+        lambda c, s: jnp.where(use_confused, c, s),
+        confused_state,
+        sane_state,
+    )
 
     # Decrement quantity; clear category when exhausted.
     old_qty  = new_state.inventory.items.quantity[slot_idx]

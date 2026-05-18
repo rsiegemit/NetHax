@@ -177,6 +177,28 @@ def _player_at(state, r: int, c: int) -> bool:
     return int(state.player_pos[0]) == r and int(state.player_pos[1]) == c
 
 
+def _is_hallucinating(state) -> bool:
+    """Return True when the HALLUCINATION timed status is active.
+
+    Cite: vendor/nethack/src/do_name.c::rndmonnam line 1199 — replaces the
+    canonical monster name with a random one when Hallu.
+    """
+    try:
+        return int(state.status.timed_statuses[10]) > 0
+    except (AttributeError, IndexError):
+        return False
+
+
+def _random_monster_name() -> str:
+    """Return a random monster name (vendor do_name.c::rndmonnam line 1199)."""
+    import random
+    # Pick a random named monster from MONSTERS.
+    named = [m.name for m in MONSTERS if m is not None and m.name]
+    if not named:
+        return "creature"
+    return random.choice(named)
+
+
 def _monster_at(state, r: int, c: int) -> Optional[str]:
     mons = state.monster_ai
     pos = np.asarray(mons.pos)
@@ -184,6 +206,9 @@ def _monster_at(state, r: int, c: int) -> Optional[str]:
     entry = np.asarray(mons.entry_idx).astype(np.int32)
     for i in range(pos.shape[0]):
         if alive[i] and int(pos[i, 0]) == r and int(pos[i, 1]) == c:
+            # Vendor do_name.c:1199 — hallucinating: random monster name.
+            if _is_hallucinating(state):
+                return _random_monster_name()
             idx = int(entry[i])
             if 0 <= idx < len(MONSTERS) and MONSTERS[idx] is not None:
                 return MONSTERS[idx].name or "creature"

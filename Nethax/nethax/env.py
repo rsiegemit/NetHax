@@ -31,6 +31,9 @@ from Nethax.nethax.constants.roles import Role
 from Nethax.nethax.constants.races import Race
 from Nethax.nethax.constants import TileType
 from Nethax.nethax.subsystems.character import create_character, get_starting_pet
+from Nethax.nethax.subsystems.skills import init_skills
+from Nethax.nethax.subsystems.digging import dig_tick as _dig_tick
+from Nethax.nethax.subsystems.swallow import digest_tick as _digest_tick
 
 
 class NethaxEnv:
@@ -71,6 +74,9 @@ class NethaxEnv:
         # Apply character creation (stats, inventory, AC)
         char_fields = create_character(rng_char, role, race, alignment)
         state = state.replace(**char_fields)
+
+        # Initialise role-specific skill caps (vendor/nethack/src/u_init.c Skill_X tables).
+        state = state.replace(skills=init_skills(role))
 
         # Generate Main branch level 1 and write into the [branch=0, level=0] slot.
         terrain, _rooms, _active, up_pos, down_pos = generate_main_branch_l1(
@@ -213,12 +219,15 @@ def _step_impl(state, action, rng):
         timestep increases; no separate decrement call is needed here.
         Cite: vendor/nethack/src/light.c::do_light_sources.
     """
-    rng_act, rng_monsters, rng_status, rng_poly, rng_shop = jax.random.split(rng, 5)
+    rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow = jax.random.split(rng, 6)
     already_done = state.done
 
     def _do_step(_):
         # 1. Player action — allmain.c line 203 (svc.context.move).
         ns = dispatch_action(state, action, rng_act)
+
+        # 1b. Digging tick — advance multi-turn pickaxe dig (dig.c::dodig).
+        ns = _dig_tick(ns, rng_act)
 
         # 2. Monster turn — allmain.c line 212 (movemon).
         ns = _monster_ai_step(ns, rng_monsters)
@@ -245,6 +254,9 @@ def _step_impl(state, action, rng):
             player_pw=new_pw,
             done=new_done,
         )
+
+        # 4b. Swallow/engulf digestion tick — vendor/nethack/src/mhitu.c:1418.
+        ns = _digest_tick(ns, rng_swallow)
 
         # 5. Were-creature / polymorph timer tick — allmain.c lines 322-339
         #    (mvl_change handling).  polymorph.step decrements both

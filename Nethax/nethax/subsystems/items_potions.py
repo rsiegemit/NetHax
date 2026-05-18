@@ -464,12 +464,22 @@ def _effect_oil(state, rng, buc):
 
 
 def _effect_polymorph(state, rng, buc):
-    """potion of polymorph — polymorph the player.
+    """potion of polymorph — polymorph the player into a random valid form.
 
-    Canonical: peffect_polymorph — polyself(POLY_NOFLAGS).
-    Wave 3: no-op (polymorph subsystem stub; PolymorphState not modified yet).
+    Canonical: peffect_polymorph → polyself(POLY_NOFLAGS).
+    Vendor reference: vendor/nethack/src/potion.c::peffect_polymorph, which
+    calls polyself.c::polyself() with POLY_NOFLAGS (uncontrolled random form).
+
+    Cite: polyself.c:280 for valid-form selection.
     """
-    return state
+    from Nethax.nethax.subsystems.polymorph import (
+        polymorph_player,
+        choose_random_polymorph_form,
+    )
+    rng, sub = jax.random.split(rng)
+    form = choose_random_polymorph_form(state, sub)
+    rng, sub2 = jax.random.split(rng)
+    return polymorph_player(state, sub2, form, controlled=False)
 
 
 # ---- water group ----------------------------------------------------------

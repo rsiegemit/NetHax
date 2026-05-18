@@ -392,9 +392,11 @@ def test_to_hit_roll_uses_strict_greater_than():
     from Nethax.nethax.state import EnvState
 
     state = EnvState.default(jax.random.PRNGKey(0)).replace(
-        player_str=jnp.int16(8),    # strhitbon = 0
-        player_dex=jnp.int8(10),    # dexbon = 0
-        player_xl=jnp.int32(5),     # no XL kludge
+        player_str=jnp.int16(8),       # strhitbon = 0
+        player_dex=jnp.int8(10),       # dexbon = 0
+        player_xl=jnp.int32(5),        # xl>=3: no kludge; xl_bonus=+5 (uhitm.c:378)
+        player_luck=jnp.int8(0),       # luck_bonus = 0 (uhitm.c:377)
+        player_uhitinc=jnp.int8(0),    # uhitinc = 0 (uhitm.c:376)
     )
     # Bare-handed (skill tier 0 / UNSKILLED → -4 hit bonus, but martial-arts
     # path isn't invoked here because the weapon_skill table is zeroed).
@@ -405,9 +407,10 @@ def test_to_hit_roll_uses_strict_greater_than():
         )
     )
 
-    # With target_ac = 9, the formula yields tmp = 1 + 0 + 9 + 0 + 0 = 10.
+    # With XL=5, STR=8 (abon=0), target_ac=4, BASIC(0), enchant=0, luck=0:
+    # tmp = 1 + 0 + 4 + 0 + 0 + 5(xl) + 0 + 0 = 10.
     # vendor: hit iff rnd(20) < 10 → 9 winning faces (1..9) out of 20.
-    target_ac = jnp.int32(9)
+    target_ac = jnp.int32(4)
     n = 5_000
     keys = jax.random.split(jax.random.PRNGKey(2024), n)
     # Vectorise to avoid per-call retracing overhead.

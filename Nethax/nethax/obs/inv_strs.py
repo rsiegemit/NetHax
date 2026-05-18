@@ -12,7 +12,7 @@ Wave 3 simplifications (documented per feature):
 - article "a" always used for singular items (no a/an vowel check — simplified)
 - User-given names (oname/oextra) skipped entirely
 - Two-weapon "alternate weapon" status skipped
-- Charges shown as "(N:M)" where N=charges, M=max_charges (max pinned at 8)
+- Charges shown as "(recharged:charges)" matching vendor objnam.c:1486
 - Slots 52-54 (NLE extras beyond a-zA-Z) always rendered empty
 
 Canonical sources:
@@ -27,6 +27,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from Nethax.nethax.constants.objects import OBJECTS, ObjectClass, Material
+from Nethax.nethax.constants.monsters import MONSTERS
 from Nethax.nethax.subsystems.items import BUCStatus
 from Nethax.nethax.subsystems.inventory import (
     MAX_INVENTORY_SLOTS,
@@ -46,7 +47,7 @@ _MAX_OBJ        = len(OBJECTS)
 _MAX_NAME_LEN       = 40   # longest canonical object name
 _MAX_APP_LEN        = 30   # longest appearance description
 _MAX_BUC_LEN        = 10   # "uncursed\0" = 9 bytes
-_MAX_EQUIP_LEN      = 24   # "(weapon in hand)\0" = 17 bytes
+_MAX_EQUIP_LEN      = 24   # "(in quiver pouch)\0" = 18 bytes
 _MAX_ENCHANT_LEN    =  5   # "+127\0"
 _MAX_QTY_LEN        =  8   # "999999\0"
 
@@ -193,9 +194,13 @@ _LETTERS: jnp.ndarray = _make_letters()  # uint8[55]
 # 2: (being worn)
 # 3: (on left hand)
 # 4: (on right hand)
-# 5: (in quiver)
-# 6: (on left hand) — same as 3, used for worn amulet display
-# 7: (being worn)   — alias for body armor
+# 5: (in quiver)           — ammo for a bow  (vendor objnam.c:1629 Qtyp==1)
+# 6: (being worn)          — amulet
+# 7: (being worn)          — shirt / cloak (all non-ring/non-weapon armor)
+# 8: (in quiver pouch)     — small non-ammo: ring/amulet/wand/gem/coin
+#                            vendor objnam.c:1636 Qtyp==2
+# 9: (at the ready)        — non-ammo weapon-class or other odd items in quiver
+#                            vendor objnam.c:1639 Qtyp==3
 _EQUIP_STRS = [
     "",
     "(weapon in hand)",
@@ -203,13 +208,15 @@ _EQUIP_STRS = [
     "(on left hand)",
     "(on right hand)",
     "(in quiver)",
-    "(being worn)",   # amulet
-    "(being worn)",   # shirt / cloak (all non-ring/non-weapon armor)
+    "(being worn)",        # amulet
+    "(being worn)",        # shirt / cloak (all non-ring/non-weapon armor)
+    "(in quiver pouch)",   # vendor objnam.c:1644 Qtyp==2
+    "(at the ready)",      # vendor objnam.c:1645 Qtyp==3
 ]
 _EQUIP_BYTES: jnp.ndarray = jnp.array(
     [_pad_bytes(s, _MAX_EQUIP_LEN) for s in _EQUIP_STRS],
     dtype=jnp.uint8,
-)  # uint8[8, _MAX_EQUIP_LEN]
+)  # uint8[10, _MAX_EQUIP_LEN]
 
 # ObjectClass values for classes that get enchantment shown
 _WEAPON_CLASS_VAL = int(ObjectClass.WEAPON_CLASS)
@@ -223,6 +230,71 @@ _SCROLL_CLASS_VAL  = int(ObjectClass.SCROLL_CLASS)
 _SPBOOK_CLASS_VAL  = int(ObjectClass.SPBOOK_CLASS)
 _RING_CLASS_VAL    = int(ObjectClass.RING_CLASS)
 _AMULET_CLASS_VAL  = int(ObjectClass.AMULET_CLASS)
+_FOOD_CLASS_VAL    = int(ObjectClass.FOOD_CLASS)
+
+# Special type-ID sentinels — looked up once at module load.
+# vendor/nethack/src/objnam.c:841 (holy/unholy water),
+# vendor/nethack/src/eat.c:tin_details (tin contents),
+# vendor/nethack/src/objnam.c:1507 (corpse naming).
+def _find_type_id(name: str, cls: ObjectClass) -> int:
+    for i, obj in enumerate(OBJECTS):
+        if obj.name == name and obj.class_ == cls:
+            return i
+    return -1
+
+_POT_WATER_TYPE_ID: int = _find_type_id("water", ObjectClass.POTION_CLASS)   # 297
+_TIN_TYPE_ID:       int = _find_type_id("tin",   ObjectClass.FOOD_CLASS)      # 271
+_CORPSE_TYPE_ID:    int = _find_type_id("corpse", ObjectClass.FOOD_CLASS)     # 240
+
+# Rings with oc_charged==1 (vendor/nle/src/objects.c RING macro, spec arg):
+# adornment, gain strength, gain constitution, increase accuracy,
+# increase damage, protection all have spec=1.
+# vendor/nethack/src/objnam.c:1500: if (known && objects[obj->otyp].oc_charged)
+_CHARGED_RING_NAMES = frozenset({
+    "adornment", "gain strength", "gain constitution",
+    "increase accuracy", "increase damage", "protection",
+})
+_OBJECT_IS_CHARGED: jnp.ndarray = jnp.array(
+    [
+        obj.class_ == ObjectClass.RING_CLASS and obj.name in _CHARGED_RING_NAMES
+        for obj in OBJECTS
+    ],
+    dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS] — True iff ring has oc_charged (vendor objnam.c:1500)
+
+# Monster name byte table — for corpse/tin rendering.
+# vendor/nethack/src/objnam.c:1824 (corpse_xname), eat.c:1456 (tin monster meat).
+_MAX_MONSTER_NAME_LEN = 32
+_NUM_MONSTERS = len(MONSTERS)
+_MONSTER_NAME_BYTES: jnp.ndarray = jnp.array(
+    [
+        _pad_bytes(m.name if m is not None else "", _MAX_MONSTER_NAME_LEN)
+        for m in MONSTERS
+    ],
+    dtype=jnp.uint8,
+)  # uint8[NUM_MONSTERS, _MAX_MONSTER_NAME_LEN]
+
+# Suffix/prefix byte constants for corpse and tin name rendering.
+_CORPSE_SUFFIX_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes(" corpse", 8), dtype=jnp.uint8,
+)  # uint8[8]
+_TIN_OF_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("tin of ", 8), dtype=jnp.uint8,
+)  # uint8[8]
+_SPINACH_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("spinach", 8), dtype=jnp.uint8,
+)  # uint8[8]
+_MEAT_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes(" meat", 6), dtype=jnp.uint8,
+)  # uint8[6]
+
+# Holy / unholy water name bytes (vendor objnam.c:841-843).
+_HOLY_WATER_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("holy water", 11), dtype=jnp.uint8,
+)  # uint8[11]
+_UNHOLY_WATER_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("unholy water", 13), dtype=jnp.uint8,
+)  # uint8[13]
 
 # Class prefix strings — prepended before the name or appearance for certain classes
 # Index matches ObjectClass integer values (0-17)
@@ -350,7 +422,7 @@ _APP_USE_AN: jnp.ndarray = jnp.array(
 
 
 # Suffix-level irregular plurals (apply to compound words too:
-# crysknife → crysknives, midwife → midwives).
+# crysknife -> crysknives, midwife -> midwives).
 # Source: vendor/nethack/src/objnam.c::makeplural ~lines 340-460.
 _SUFFIX_IRREGULARS: tuple = (
     ("knife", "knives"),
@@ -393,7 +465,7 @@ def pluralize(word: str) -> str:
         a separator, so "fox" pluralizes to "foxes" (not "foxen").
 
     Falls back to "es" for sibilant endings ('s','x','z','sh','ch') and "s"
-    otherwise.  Pure Python — invoked only at module import time to populate
+    otherwise.  Pure Python -- invoked only at module import time to populate
     static byte tables.
     """
     if not word:
@@ -421,10 +493,10 @@ def _pluralize_phrase(name) -> str:
     """Pluralize the head noun of a NetHack object phrase.
 
     Wave 6 parity-fix: accepts None for shuffled-appearance OBJECTS slots
-    (vendor/nle/src/objects.c lines 855-875 and 1044-1046 — 23 None-named
+    (vendor/nle/src/objects.c lines 855-875 and 1044-1046 -- 23 None-named
     entries with only a description).
 
-    Handles the "X of Y" pattern (e.g. "ring of protection" → "rings of
+    Handles the "X of Y" pattern (e.g. "ring of protection" -> "rings of
     protection") by pluralizing the word before ' of '.  Otherwise pluralizes
     the last word.
     """
@@ -439,14 +511,14 @@ def _pluralize_phrase(name) -> str:
         if sp >= 0:
             return head[: sp + 1] + pluralize(head[sp + 1 :]) + tail
         return pluralize(head) + tail
-    # No " of " — pluralize the trailing word.
+    # No " of " -- pluralize the trailing word.
     sp = name.rfind(" ")
     if sp >= 0:
         return name[: sp + 1] + pluralize(name[sp + 1 :])
     return pluralize(name)
 
 
-# Plural-name table — one row per object, padded to a width wide enough to
+# Plural-name table -- one row per object, padded to a width wide enough to
 # hold the longest plural form.
 _MAX_PLURAL_NAME_LEN = max(_MAX_NAME_LEN, max(len(_pluralize_phrase(obj.name)) for obj in OBJECTS) + 1)
 _NAME_PLURAL_BYTES: jnp.ndarray = jnp.array(
@@ -461,10 +533,10 @@ _OBJECT_NAMES_BYTES_PADDED: jnp.ndarray = jnp.array(
     dtype=jnp.uint8,
 )  # uint8[NUM_OBJECTS, _MAX_PLURAL_NAME_LEN]
 
-# Plural-appearance table — pluralize the last word of the description so
-# "wooden" → "wooden" (no last word change needed; an "s" comes via the class
-# noun route) but "elven dagger" → "elven daggers".  When the description is
-# None/empty the row is all zeros (and is unused — has_appearance handles
+# Plural-appearance table -- pluralize the last word of the description so
+# "wooden" -> "wooden" (no last word change needed; an "s" comes via the class
+# noun route) but "elven dagger" -> "elven daggers".  When the description is
+# None/empty the row is all zeros (and is unused -- has_appearance handles
 # fallback to the canonical-name path).
 def _safe_pluralize_app(desc: str | None) -> str:
     if not desc:
@@ -613,13 +685,17 @@ def _write_uint(buf: jax.Array, cursor: jax.Array,
 # Equip-status resolver
 # ---------------------------------------------------------------------------
 
-def _equip_status_idx(inv_state, slot_idx: jax.Array) -> jax.Array:
+def _equip_status_idx(inv_state, slot_idx: jax.Array,
+                      item_class: jax.Array) -> jax.Array:
     """Return the equip-status table index (int32) for the given inventory slot.
 
     0 = no status, 1 = weapon in hand, 2 = being worn (body/helm/gloves/boots/
     cloak/shirt), 3 = on left hand (ring), 4 = on right hand (ring),
-    5 = in quiver, 6 = being worn (amulet).
+    5 = in quiver (bow ammo), 6 = being worn (amulet),
+    8 = in quiver pouch (small non-ammo: ring/amulet/wand/gem/coin),
+    9 = at the ready (non-ammo weapon-class or odd quivered items).
 
+    Vendor: objnam.c:1622-1646 -- quiver Qtyp switch.
     JIT-compatible: only jnp.where / == comparisons.
     """
     i8 = slot_idx.astype(jnp.int8)
@@ -627,27 +703,41 @@ def _equip_status_idx(inv_state, slot_idx: jax.Array) -> jax.Array:
     # Wielded weapon
     is_wielded = inv_state.wielded == i8
 
-    # Worn armor — any of the 7 slots
+    # Worn armor -- any of the 7 slots
     # worn_armor[j] == slot_idx  means slot is worn in armor position j
     is_armor_worn = jnp.any(inv_state.worn_armor == i8)
 
-    # Rings — left = worn_rings[0], right = worn_rings[1]
+    # Rings -- left = worn_rings[0], right = worn_rings[1]
     is_ring_l = inv_state.worn_rings[0] == i8
     is_ring_r = inv_state.worn_rings[1] == i8
 
     # Amulet
     is_amulet = inv_state.worn_amulet == i8
 
-    # Quiver
+    # Quiver -- differentiate by item class per vendor objnam.c:1622-1646.
+    # RING/AMULET/WAND/COIN/GEM class -> Qtyp 2 "in quiver pouch" (idx 8).
+    # WEAPON class -> idx 5 "(in quiver)" (approximation: all weapon-class).
+    # Other classes -> idx 9 "at the ready".
     is_quiver = inv_state.quiver == i8
+    cls = item_class.astype(jnp.int32)
+    is_pouch_class = (
+        (cls == jnp.int32(_RING_CLASS_VAL))   |
+        (cls == jnp.int32(_AMULET_CLASS_VAL)) |
+        (cls == jnp.int32(_WAND_CLASS_VAL))   |
+        (cls == jnp.int32(int(ObjectClass.COIN_CLASS))) |
+        (cls == jnp.int32(int(ObjectClass.GEM_CLASS)))
+    )
+    is_weapon_class = cls == jnp.int32(_WEAPON_CLASS_VAL)
+    quiver_idx = jnp.where(is_pouch_class, jnp.int32(8),
+                           jnp.where(is_weapon_class, jnp.int32(5), jnp.int32(9)))
 
     result = jnp.int32(0)
-    result = jnp.where(is_quiver,    jnp.int32(5), result)
-    result = jnp.where(is_amulet,    jnp.int32(6), result)
-    result = jnp.where(is_ring_r,    jnp.int32(4), result)
-    result = jnp.where(is_ring_l,    jnp.int32(3), result)
+    result = jnp.where(is_quiver,     quiver_idx, result)
+    result = jnp.where(is_amulet,     jnp.int32(6), result)
+    result = jnp.where(is_ring_r,     jnp.int32(4), result)
+    result = jnp.where(is_ring_l,     jnp.int32(3), result)
     result = jnp.where(is_armor_worn, jnp.int32(2), result)
-    result = jnp.where(is_wielded,   jnp.int32(1), result)
+    result = jnp.where(is_wielded,    jnp.int32(1), result)
     return result
 
 
@@ -665,8 +755,8 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         inv_state:  InventoryState pytree (items fields are [52]-arrays)
         id_state:   IdentificationState pytree
         slot_idx:   int32 scalar, 0..54
-        two_weapon: bool scalar — state.combat.two_weapon flag (Wave 6).
-        alt_slot:   int32 scalar — state.inventory.alternate_weapon_slot.
+        two_weapon: bool scalar -- state.combat.two_weapon flag (Wave 6).
+        alt_slot:   int32 scalar -- state.inventory.alternate_weapon_slot.
 
     Returns:
         uint8[80]
@@ -685,6 +775,19 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     charges     = inv_state.items.charges[safe_idx].astype(jnp.int32)
     identified  = inv_state.items.identified[safe_idx]
     quantity    = inv_state.items.quantity[safe_idx].astype(jnp.int32)
+    # recharged: vendor obj.h recharged field -- recharge counter for wands.
+    # vendor/nethack/src/objnam.c:1486: ConcatF2(bp,0," (%d:%d)",(int)obj->recharged,obj->spe)
+    # Guard: legacy Item constructions may have recharged as a scalar default;
+    # broadcast to a length-52 array so safe_idx indexing always works.
+    _recharged_raw = getattr(inv_state.items, "recharged",
+                             jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8))
+    _recharged_arr = jnp.broadcast_to(
+        jnp.asarray(_recharged_raw, dtype=jnp.int8),
+        (MAX_INVENTORY_SLOTS,),
+    )
+    recharged   = _recharged_arr[safe_idx].astype(jnp.int32)
+    # corpse_entry_idx: index into MONSTERS (-1 = not a corpse/tin-with-monster).
+    corpse_idx  = inv_state.items.corpse_entry_idx[safe_idx].astype(jnp.int32)
 
     # Slot is empty when category == 0 OR slot_idx >= MAX_INVENTORY_SLOTS
     is_empty = (category == jnp.int32(0)) | (slot_idx >= jnp.int32(MAX_INVENTORY_SLOTS))
@@ -729,15 +832,25 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             (b, c),
         )
 
-        # 3. BUC word (only if buc_status != UNKNOWN == 0)
+        # 3. BUC word (only if buc_status != UNKNOWN == 0).
+        # Exception: holy/unholy water -- BUC is encoded in the name itself
+        # (vendor objnam.c:841-843), so suppress the BUC prefix for that case.
+        is_water_special = (
+            (category == jnp.int32(_POTION_CLASS_VAL)) &
+            (type_id  == jnp.int32(_POT_WATER_TYPE_ID)) &
+            identified &
+            ((buc_status == jnp.int32(BUCStatus.BLESSED)) |
+             (buc_status == jnp.int32(BUCStatus.CURSED)))
+        )
+        show_buc = buc_known & ~is_water_special
         b, c = lax.cond(
-            buc_known,
+            show_buc,
             lambda bc: _write_buc(bc[0], bc[1], buc_row),
             lambda bc: bc,
             (b, c),
         )
 
-        # 3b. Erosion prefix (rusty/burnt/corroded/rotted/rustproof/fireproof/…)
+        # 3b. Erosion prefix (rusty/burnt/corroded/rotted/rustproof/fireproof/...)
         # Canonical: vendor/nethack/src/objnam.c::add_erosion_words() lines 1142-1191.
         # Read erosion fields from the item; clamp levels to 0-3.
         oeroded      = inv_state.items.oeroded[safe_idx].astype(jnp.int32)
@@ -756,11 +869,14 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             (b, c),
         )
 
-        # 4. Enchantment (only for weapon/armor, only if identified)
+        # 4. Enchantment -- weapons, armor, and oc_charged rings, only if identified.
+        # vendor/nethack/src/objnam.c:1500: rings with oc_charged show +N prefix.
         obj_class   = _OBJECT_CLASS[jnp.clip(type_id, 0, _MAX_OBJ - 1)]
+        is_charged_ring = _OBJECT_IS_CHARGED[safe_type]
         show_enchant = identified & (
             (obj_class == jnp.uint8(_WEAPON_CLASS_VAL)) |
-            (obj_class == jnp.uint8(_ARMOR_CLASS_VAL))
+            (obj_class == jnp.uint8(_ARMOR_CLASS_VAL))  |
+            ((obj_class == jnp.uint8(_RING_CLASS_VAL)) & is_charged_ring)
         )
         b, c = lax.cond(
             show_enchant,
@@ -769,17 +885,24 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             (b, c),
         )
 
-        # 5. Class prefix (e.g. "potion of ") + name or appearance
+        # 5. Class prefix (e.g. "potion of ") + name or appearance.
+        # Special cases handled inside _write_true_name:
+        #   - holy/unholy water (vendor objnam.c:841-843)
+        #   - corpse name (vendor objnam.c:1824)
+        #   - tin contents (vendor eat.c:tin_details)
         # Unidentified + has appearance  -> appearance description (no prefix)
         # Identified OR no appearance    -> class prefix (if any) + canonical name
         b, c = lax.cond(
             show_app,
             lambda bc: _write_appearance(bc[0], bc[1], safe_type, quantity),
-            lambda bc: _write_true_name(bc[0], bc[1], safe_type, obj_class, quantity),
+            lambda bc: _write_true_name(bc[0], bc[1], safe_type, obj_class,
+                                        quantity, category, type_id,
+                                        buc_status, identified, enchantment,
+                                        corpse_idx),
             (b, c),
         )
 
-        # 5b. User-given name suffix " named <name>" (Wave 6) — emitted
+        # 5b. User-given name suffix " named <name>" (Wave 6) -- emitted
         #     when inventory.user_names[slot, 0] != 0.
         name_row = inv_state.user_names[safe_idx]
         has_user_name = name_row[0] != jnp.int8(0)
@@ -790,8 +913,8 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             (b, c),
         )
 
-        # 6. Equip status
-        eq_idx = _equip_status_idx(inv_state, slot_idx)
+        # 6. Equip status -- pass item_class so quiver can pick pouch vs bow-ammo.
+        eq_idx = _equip_status_idx(inv_state, slot_idx, obj_class)
         b, c = lax.cond(
             eq_idx > jnp.int32(0),
             lambda bc: _write_equip(bc[0], bc[1], eq_idx),
@@ -799,14 +922,15 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             (b, c),
         )
 
-        # 7. Charges "(N:M)" for wands/tools, only if identified
+        # 7. Charges "(recharged:charges)" for wands/tools, only if identified.
+        # vendor/nethack/src/objnam.c:1486
         show_charges = identified & (
             (obj_class == jnp.uint8(_WAND_CLASS_VAL)) |
             (obj_class == jnp.uint8(_TOOL_CLASS_VAL))
         )
         b, c = lax.cond(
             show_charges,
-            lambda bc: _write_charges(bc[0], bc[1], charges),
+            lambda bc: _write_charges(bc[0], bc[1], recharged, charges),
             lambda bc: bc,
             (b, c),
         )
@@ -846,7 +970,7 @@ def _write_uint_space(buf, cursor, qty):
 
 
 def _write_a_space(buf, cursor):
-    """Write 'a ' (singular article, simplified — no vowel check)."""
+    """Write 'a ' (singular article, simplified -- no vowel check)."""
     buf, cursor = _write_byte(buf, cursor, jnp.uint8(ord('a')))
     buf, cursor = _write_space(buf, cursor)
     return buf, cursor
@@ -936,7 +1060,7 @@ def _write_appearance(buf, cursor, safe_type, quantity):
     Uses the object's ``description`` field, e.g. "orange" for an unidentified
     potion.  The appearance is augmented with the class noun ("potion",
     "scroll", etc.) from the name.  When ``quantity > 1`` the appearance
-    table is sourced from the pluralized form (e.g. "elven dagger" →
+    table is sourced from the pluralized form (e.g. "elven dagger" ->
     "elven daggers") and the class noun gets an "s" appended for regular-
     plural class nouns.
     """
@@ -971,34 +1095,130 @@ def _write_appearance(buf, cursor, safe_type, quantity):
     return buf, cursor
 
 
-def _write_true_name(buf, cursor, safe_type, obj_class, quantity):
+def _write_true_name(buf, cursor, safe_type, obj_class, quantity,
+                     category, type_id, buc_status, identified,
+                     enchantment, corpse_idx):
     """Write class prefix (if any) + canonical object name.
+
+    Handles special cases (host-side Python control flow OK per spec):
+    - Holy/unholy water: vendor objnam.c:841-843 -- blessed POT_WATER -> "holy water",
+      cursed -> "unholy water".  No BUC prefix (suppressed in _render_slot step 3).
+    - Corpse name: vendor objnam.c:1824 -- "<monster> corpse".
+    - Tin contents: vendor eat.c:tin_details -- "tin of spinach" / "tin of X meat".
 
     Wave 6: when ``quantity > 1`` the precomputed pluralized form is written
     instead of the singular + 's' fallback.  Handles irregular plurals like
-    knife→knives, staff→staves, man→men.  See ``pluralize`` for the rules.
+    knife->knives, staff->staves, man->men.  See ``pluralize`` for the rules.
     """
     cls_int = obj_class.astype(jnp.int32)
     cls_safe = jnp.clip(cls_int, 0, 17).astype(jnp.int32)
-
-    # Class prefix ("potion of ", "ring of ", ...).  Class prefix is only
-    # emitted for the singular form; pluralized names already include the
-    # head noun (e.g. "rings of protection"), so we suppress the prefix
-    # in the plural branch.
     is_plural = quantity > jnp.int32(1)
-    pfx_src = _CLASS_PREFIX_BYTES[cls_safe]
+
+    # --- Special case: holy / unholy water (vendor objnam.c:841-843) ---
+    # Identified blessed POT_WATER -> "holy water" (no "blessed " prefix).
+    # Identified cursed  POT_WATER -> "unholy water" (no "cursed " prefix).
+    is_water_special = (
+        (category == jnp.int32(_POTION_CLASS_VAL)) &
+        (type_id  == jnp.int32(_POT_WATER_TYPE_ID)) &
+        identified &
+        ((buc_status == jnp.int32(BUCStatus.BLESSED)) |
+         (buc_status == jnp.int32(BUCStatus.CURSED)))
+    )
+    is_holy   = is_water_special & (buc_status == jnp.int32(BUCStatus.BLESSED))
+    is_unholy = is_water_special & (buc_status == jnp.int32(BUCStatus.CURSED))
+
+    def write_holy(bc):
+        return _write_fixed(bc[0], bc[1], _HOLY_WATER_BYTES, 11)
+
+    def write_unholy(bc):
+        return _write_fixed(bc[0], bc[1], _UNHOLY_WATER_BYTES, 13)
+
+    # --- Special case: corpse name (vendor objnam.c:1824) ---
+    # FOOD_CLASS + type_id==CORPSE + corpse_entry_idx >= 0 -> "<monster> corpse".
+    is_corpse = (
+        (category == jnp.int32(_FOOD_CLASS_VAL)) &
+        (type_id  == jnp.int32(_CORPSE_TYPE_ID)) &
+        (corpse_idx >= jnp.int32(0))
+    )
+    safe_monster_idx = jnp.clip(corpse_idx, 0, _NUM_MONSTERS - 1).astype(jnp.int32)
+
+    def write_corpse(bc):
+        b, c = bc
+        mon_src = _MONSTER_NAME_BYTES[safe_monster_idx]
+        b, c = _write_fixed(b, c, mon_src, _MAX_MONSTER_NAME_LEN)
+        b, c = _write_fixed(b, c, _CORPSE_SUFFIX_BYTES, 8)
+        return b, c
+
+    # --- Special case: tin contents (vendor eat.c:tin_details) ---
+    # FOOD_CLASS + type_id==TIN + identified:
+    #   enchantment==1 (spe==1 in vendor) -> "tin of spinach"
+    #   corpse_idx >= 0                   -> "tin of <monster> meat"
+    #   otherwise                         -> "tin" (empty / unknown)
+    is_tin = (
+        (category == jnp.int32(_FOOD_CLASS_VAL)) &
+        (type_id  == jnp.int32(_TIN_TYPE_ID)) &
+        identified
+    )
+    is_spinach_tin = is_tin & (enchantment == jnp.int32(1))
+    is_monster_tin = is_tin & (corpse_idx >= jnp.int32(0)) & ~is_spinach_tin
+
+    def write_spinach_tin(bc):
+        b, c = bc
+        b, c = _write_fixed(b, c, _TIN_OF_BYTES, 8)
+        b, c = _write_fixed(b, c, _SPINACH_BYTES, 8)
+        return b, c
+
+    def write_monster_tin(bc):
+        b, c = bc
+        b, c = _write_fixed(b, c, _TIN_OF_BYTES, 8)
+        mon_src = _MONSTER_NAME_BYTES[safe_monster_idx]
+        b, c = _write_fixed(b, c, mon_src, _MAX_MONSTER_NAME_LEN)
+        b, c = _write_fixed(b, c, _MEAT_BYTES, 6)
+        return b, c
+
+    # --- Normal path: class prefix + canonical name ---
+    def write_normal(bc):
+        b, c = bc
+        pfx_src = _CLASS_PREFIX_BYTES[cls_safe]
+        b, c = lax.cond(
+            is_plural,
+            lambda _bc: _bc,
+            lambda _bc: _write_fixed(_bc[0], _bc[1], pfx_src, _MAX_PREFIX_LEN),
+            (b, c),
+        )
+        sing_row = _OBJECT_NAMES_BYTES_PADDED[safe_type]
+        plur_row = _NAME_PLURAL_BYTES[safe_type]
+        name_src = jnp.where(is_plural, plur_row, sing_row)
+        b, c = _write_fixed(b, c, name_src, _MAX_PLURAL_NAME_LEN)
+        return b, c
+
+    # Dispatch: water_special > corpse > spinach_tin > monster_tin > normal.
     buf, cursor = lax.cond(
-        is_plural,
-        lambda bc: bc,
-        lambda bc: _write_fixed(bc[0], bc[1], pfx_src, _MAX_PREFIX_LEN),
+        is_holy,
+        write_holy,
+        lambda bc: lax.cond(
+            is_unholy,
+            write_unholy,
+            lambda bc2: lax.cond(
+                is_corpse,
+                write_corpse,
+                lambda bc3: lax.cond(
+                    is_spinach_tin,
+                    write_spinach_tin,
+                    lambda bc4: lax.cond(
+                        is_monster_tin,
+                        write_monster_tin,
+                        write_normal,
+                        bc4,
+                    ),
+                    bc3,
+                ),
+                bc2,
+            ),
+            bc,
+        ),
         (buf, cursor),
     )
-
-    # Canonical name — choose between singular and pluralized rows.
-    sing_row = _OBJECT_NAMES_BYTES_PADDED[safe_type]
-    plur_row = _NAME_PLURAL_BYTES[safe_type]
-    name_src = jnp.where(is_plural, plur_row, sing_row)
-    buf, cursor = _write_fixed(buf, cursor, name_src, _MAX_PLURAL_NAME_LEN)
 
     return buf, cursor
 
@@ -1034,14 +1254,18 @@ def _write_alt_weapon(buf, cursor):
     return buf, cursor
 
 
-def _write_charges(buf, cursor, charges):
-    """Write charge count as ' (N:8)' — max_charges pinned to 8 (simplified)."""
-    # Simplified: max charges shown as 8 always; Wave 4 can track max_charges.
+def _write_charges(buf, cursor, recharged, charges):
+    """Write charge counter as ' (recharged:charges)'.
+
+    vendor/nethack/src/objnam.c:1486:
+        ConcatF2(bp, 0, " (%d:%d)", (int) obj->recharged, obj->spe)
+    where obj->recharged is the recharge count and obj->spe is remaining charges.
+    """
     buf, cursor = _write_space(buf, cursor)
     buf, cursor = _write_byte(buf, cursor, jnp.uint8(ord('(')))
-    buf, cursor = _write_uint(buf, cursor, jnp.clip(charges, 0, 99).astype(jnp.int32))
+    buf, cursor = _write_uint(buf, cursor, jnp.clip(recharged, 0, 99).astype(jnp.int32))
     buf, cursor = _write_byte(buf, cursor, jnp.uint8(ord(':')))
-    buf, cursor = _write_uint(buf, cursor, jnp.int32(8))
+    buf, cursor = _write_uint(buf, cursor, jnp.clip(charges, 0, 99).astype(jnp.int32))
     buf, cursor = _write_byte(buf, cursor, jnp.uint8(ord(')')))
     return buf, cursor
 

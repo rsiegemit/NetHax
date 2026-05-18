@@ -15,6 +15,10 @@ import enum
 import jax
 import jax.numpy as jnp
 from flax import struct
+from Nethax.nethax.subsystems.skills import (
+    use_skill as _skills_use_skill,
+    _SPELL_SCHOOL_TO_SKILL_ID as _MAGIC_SCHOOL_TO_SKILL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1449,7 +1453,14 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
     )
     adapter["magic"] = magic.replace(spell_memory=new_mem)
 
-    return adapter.build(), not failed
+    # Skill practice after cast (regardless of success/failure).
+    # Cite: vendor/nethack/src/weapon.c:1424 (use_skill).
+    built = adapter.build()
+    school = int(_SPELL_TABLE[sid][0])
+    safe_school = max(0, min(school, _MAGIC_SCHOOL_TO_SKILL.shape[0] - 1))
+    spell_skill_id = int(_MAGIC_SCHOOL_TO_SKILL[safe_school])
+    built = _skills_use_skill(built, jnp.int32(spell_skill_id), 1)
+    return built, not failed
 
 
 # ---------------------------------------------------------------------------

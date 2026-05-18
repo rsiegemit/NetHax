@@ -1061,3 +1061,38 @@ def handle_zap(state: WandState, rng: jax.Array) -> WandState:
     direction = jnp.int32(2)
 
     return zap_wand(state, rng, slot_idx, direction)
+
+
+# ---------------------------------------------------------------------------
+# EnvState-level self-zap for wand of polymorph  (zap.c::zapyourself)
+# ---------------------------------------------------------------------------
+
+def zap_polymorph_at_self(state, rng: jax.Array, slot_idx: jax.Array):
+    """Apply a wand-of-polymorph self-zap to the full EnvState.
+
+    vendor/nethack/src/zap.c::zapyourself WAN_POLYMORPH branch:
+      calls polyself() which routes to polymorph_player with a random form.
+
+    This function operates on a full EnvState (not WandState) because
+    polymorph_player needs the entire state.  It is called from callers
+    that detect direction==self (direction sentinel 0 or explicit self-zap).
+
+    Cite: zap.c::zapyourself (WAN_POLYMORPH branch).
+    Cite: polyself.c:280 for valid-form selection.
+    """
+    from Nethax.nethax.subsystems.polymorph import (
+        polymorph_player,
+        choose_random_polymorph_form,
+    )
+    # Decrement charges using inventory slice.
+    inv = state.inventory
+    old_charges = inv.items.charges
+    new_charges = old_charges.at[slot_idx].add(jnp.int8(-1))
+    new_charges = jnp.maximum(new_charges, jnp.int8(0))
+    new_inv = inv.replace(items=inv.items.replace(charges=new_charges))
+    state = state.replace(inventory=new_inv)
+
+    rng, sub = jax.random.split(rng)
+    form = choose_random_polymorph_form(state, sub)
+    rng, sub2 = jax.random.split(rng)
+    return polymorph_player(state, sub2, form, controlled=False)

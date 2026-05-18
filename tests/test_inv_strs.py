@@ -92,6 +92,7 @@ def _make_inv_state(items: Item) -> InventoryState:
         alternate_weapon_slot=jnp.int8(-1),
         worn_armor_ac_bonus=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.int8),
         user_names=jnp.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=jnp.int8),
+        wielded_artifact_idx=jnp.int8(-1),
     )
 
 
@@ -324,7 +325,7 @@ class TestRingMail:
 
 
 class TestWandCharges:
-    """Slot 2 with an identified wand — charges shown as (N:8)."""
+    """Slot 2 with an identified wand — charges shown as (recharged:charges) per objnam.c:1486."""
 
     def setup_method(self):
         # Find any wand
@@ -349,7 +350,7 @@ class TestWandCharges:
         state = _make_state_with_inv(inv)
         result = build_inv_strs(state)
         s = _decode(result[2])
-        assert "(5:8)" in s, f"expected '(5:8)' charges in: {s!r}"
+        assert "(0:5)" in s, f"expected '(0:5)' charges in: {s!r}"
 
     def test_charges_not_shown_when_unidentified(self):
         from Nethax.nethax.obs.inv_strs import build_inv_strs

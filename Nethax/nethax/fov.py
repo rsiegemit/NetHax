@@ -20,6 +20,11 @@ from Nethax.nethax.constants import OPAQUE_TILES
 # "Normal" line-of-sight radius used in lit rooms and outdoors.
 DEFAULT_SIGHT_RADIUS: int = 7
 
+# Reduced sight radius in dark (unlit) rooms — see adjacent tiles only.
+# Vendor: vision.c line 321 — "If dark, set COULD_SEE so various spells work".
+# In a dark room the player can only perceive immediately adjacent tiles.
+DARK_ROOM_SIGHT_RADIUS: int = 2
+
 # Minimum sight radius when the player is blind — adjacent tiles only.
 BLIND_SIGHT_RADIUS: int = 1
 
