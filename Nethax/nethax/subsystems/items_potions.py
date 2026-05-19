@@ -541,17 +541,37 @@ def _effect_speed(state, rng, buc):
 # ---- hostile/negative effects ---------------------------------------------
 
 def _effect_paralysis(state, rng, buc):
-    """potion of paralysis — freeze the player.
+    """potion of paralysis — byte-equal to vendor peffect_paralysis.
 
-    Canonical: peffect_paralysis — nomul(-(rn1(10, 25-12*bcsign))).
-    Wave 3: 20 turns (blessed 8, cursed 28) of FROZEN status.
+    vendor/nethack/src/potion.c::peffect_paralysis:
+        if (Free_action) {  /* no paralysis */
+            You("stiffen briefly.");
+        } else {
+            nomul(-(rn1(10, 25 - 12 * bcsign(otmp))));
+        }
+
+    rn1(N, M) = rn2(N) + M = uniform [M, M+N-1]. With bcsign=blessed-cursed:
+        cursed   bcsign=-1 → rn1(10, 37) → 37..46 turns
+        uncursed bcsign= 0 → rn1(10, 25) → 25..34 turns
+        blessed  bcsign=+1 → rn1(10, 13) → 13..22 turns
     """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    from Nethax.nethax.rng import rn2
+
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
-    turns   = jnp.where(blessed, jnp.int32(8),
-              jnp.where(cursed,  jnp.int32(28), jnp.int32(20)))
+    bcsign  = jnp.where(blessed, jnp.int32(1),
+              jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+    m_base  = jnp.int32(25) - jnp.int32(12) * bcsign  # 37/25/13
+    n_part  = rn2(rng, 10).astype(jnp.int32)          # 0..9
+    turns   = n_part + m_base                          # M..M+9
+
+    # Free_action immunity: brief stiffen, no paralysis.
+    has_free_action = state.status.intrinsics[int(Intrinsic.FREE_ACTION)]
+    final_turns = jnp.where(has_free_action, jnp.int32(0), turns)
+
     cur = state.status.timed_statuses[int(TimedStatus.FROZEN)]
-    new_val = jnp.maximum(cur, turns)
+    new_val = jnp.maximum(cur, final_turns)
     new_ts  = state.status.timed_statuses.at[int(TimedStatus.FROZEN)].set(new_val)
     new_status = state.status.replace(timed_statuses=new_ts)
     return state.replace(status=new_status)
