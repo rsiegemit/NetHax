@@ -579,28 +579,51 @@ def _effect_gold_detection(state, rng, buc):
     """scroll of gold detection — sense gold; confused/cursed reveals traps.
 
     vendor/nethack/src/read.c::seffect_gold_detection (~2035):
-      if (confused || scursed): trap_detect(sobj) — reveal all traps on level.
-    On confused or cursed: set traps.revealed[flat_lv, :, :] = True.
-    TrapState uses flat level index branch*max_levels + (level-1).
+      if (confused || scursed): trap_detect(sobj)
+      else:                     gold_detect(sobj)
+    Both vendor branches were collapsed into trap-only here; this now
+    implements the proper bifurcation. Gold detection marks every tile on
+    the current level that contains a COIN-category ground item as
+    explored, so the player's observation shows the gold positions.
+    Cite: vendor/nethack/src/detect.c::gold_detect (~line 335).
     """
+    from Nethax.nethax.subsystems.inventory import ItemCategory as _IC
+
     cursed   = _is_cursed(buc)
     confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
-    reveal   = confused | cursed
+    do_traps = confused | cursed
+    do_gold  = ~do_traps
 
     b       = state.dungeon.current_branch.astype(jnp.int32)
     lv      = state.dungeon.current_level.astype(jnp.int32) - 1
     max_lv  = jnp.int32(state.terrain.shape[1])
     flat_lv = b * max_lv + lv
 
-    old_revealed = state.traps.revealed  # [num_levels, map_h, map_w]
+    # --- trap-detect branch (confused/cursed) -------------------------------
+    old_revealed = state.traps.revealed
     new_row      = jnp.ones_like(old_revealed[flat_lv])
     new_revealed = jnp.where(
-        reveal,
+        do_traps,
         old_revealed.at[flat_lv].set(new_row),
         old_revealed,
     )
-    new_traps = state.traps.replace(revealed=new_revealed)
-    return state.replace(traps=new_traps)
+    state = state.replace(traps=state.traps.replace(revealed=new_revealed))
+
+    # --- gold-detect branch (blessed/uncursed) ------------------------------
+    # ground_items: [n_branches, max_levels, map_h, map_w, stack]
+    # state.explored: [n_branches, max_levels, map_h, map_w] bool
+    # Mark explored where any stack-slot category == COIN on current level.
+    gi_cat   = state.ground_items.category[b, lv]               # [H, W, stack]
+    has_gold = jnp.any(gi_cat == jnp.int8(_IC.COIN), axis=-1)   # [H, W] bool
+    old_lvl_expl = state.explored[b, lv]                        # [H, W] bool
+    new_lvl_expl = jnp.where(
+        do_gold,
+        old_lvl_expl | has_gold,
+        old_lvl_expl,
+    )
+    new_expl = state.explored.at[b, lv].set(new_lvl_expl)
+    state = state.replace(explored=new_expl)
+    return state
 
 
 def _effect_food_detection(state, rng, buc):
