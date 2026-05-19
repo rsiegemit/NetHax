@@ -684,17 +684,48 @@ def _effect_sickness(state, rng, buc):
 
 
 def _effect_acid(state, rng, buc):
-    """potion of acid — deal acid damage.
+    """potion of acid — byte-equal to vendor peffect_acid.
 
-    Canonical: peffect_acid — losehp(d(cursed?2:1, blessed?4:8)).
-    Wave 3: 4 HP (blessed 2, cursed 8); acid-resistant characters take 1.
+    vendor/nethack/src/potion.c:1297-1315:
+        if (Acid_resistance) { /* no damage */ }
+        else {
+            dmg = d(otmp->cursed ? 2 : 1, otmp->blessed ? 4 : 8);
+            losehp(Maybe_Half_Phys(dmg), "potion of acid", KILLED_BY_AN);
+        }
+        if (Stoned) fix_petrification();
+
+    Damage dice (n, sides):
+        uncursed → d(1, 8) → 1..8
+        cursed   → d(2, 8) → 2..16
+        blessed  → d(1, 4) → 1..4
+    HALF_PHDAM halves damage. Acid_resistance grants full immunity. Acid
+    also fix-petrifies a stoning hero.
     """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    from Nethax.nethax.rng import dice_roll
+
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
-    dmg     = jnp.where(blessed, jnp.int32(2),
-              jnp.where(cursed,  jnp.int32(8), jnp.int32(4)))
-    new_hp  = jnp.maximum(state.player_hp - dmg, jnp.int32(1))
-    return state.replace(player_hp=new_hp)
+    n_dice  = jnp.where(cursed, jnp.int32(2), jnp.int32(1))
+    sides   = jnp.where(blessed, jnp.int32(4), jnp.int32(8))
+    raw_dmg = dice_roll(rng, n_dice.astype(jnp.int32), sides.astype(jnp.int32))
+
+    # Maybe_Half_Phys: halve damage when HALF_PHDAM intrinsic active.
+    has_half_phys = state.status.intrinsics[int(Intrinsic.HALF_PHYSICAL_DAMAGE)]
+    dmg = jnp.where(has_half_phys, (raw_dmg + jnp.int32(1)) // jnp.int32(2), raw_dmg)
+
+    # Acid_resistance → zero damage.
+    has_acid_res = state.status.intrinsics[int(Intrinsic.RESIST_ACID)]
+    dmg = jnp.where(has_acid_res, jnp.int32(0), dmg)
+
+    new_hp = state.player_hp - dmg  # let HP go ≤ 0 → death handled in env loop
+
+    # fix_petrification — clear STONED timer when acid quaffed.
+    cur_stoned = state.status.timed_statuses[int(TimedStatus.STONED)]
+    new_stoned = jnp.int32(0)  # always cleared by acid (vendor)
+    new_ts = state.status.timed_statuses.at[int(TimedStatus.STONED)].set(new_stoned)
+    new_status = state.status.replace(timed_statuses=new_ts)
+    return state.replace(player_hp=new_hp, status=new_status)
 
 
 def _effect_oil(state, rng, buc):
