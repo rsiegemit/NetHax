@@ -35,6 +35,10 @@ from Nethax.nethax.subsystems.inventory import (
 )
 from Nethax.nethax.subsystems.items_potions import apply_potion_to_monster
 from Nethax.nethax.subsystems.scoring import record_kill as _scoring_record_kill
+from Nethax.nethax.subsystems.experience import (
+    experience as _xp_experience,
+    more_experienced as _xp_more_experienced,
+)
 # Module-level imports to avoid lazy-import tracer leaks (module-level jnp.array
 # builds must happen outside any JIT trace).  Cite: tests show wave9 inline
 # imports inside _single_melee_strike trigger jax.errors.UnexpectedTracerError.
@@ -167,25 +171,6 @@ def _build_monster_symbol_table() -> jnp.ndarray:
 
 
 _MONSTER_SYMBOL_TABLE: jnp.ndarray = _build_monster_symbol_table()
-
-# ---------------------------------------------------------------------------
-# Monster primary-attack damage-type table — adtyp of attack[0] per entry.
-# Vendor reference: vendor/nethack/src/uhitm.c::mhitm_ad_were (line 4265);
-# src/were.c::set_ulycn (line 234).  Used to dispatch AD_WERE infection.
-# Built once at module load; never traced inside a jit boundary.
-# ---------------------------------------------------------------------------
-def _build_monster_primary_adtyp_table() -> jnp.ndarray:
-    from Nethax.nethax.constants.monsters import MONSTERS  # noqa: PLC0415
-    return jnp.array(
-        [int(m.attacks[0][1]) if m.attacks else 0 for m in MONSTERS],
-        dtype=jnp.int32,
-    )
-
-
-_MONSTER_PRIMARY_ADTYP_TABLE: jnp.ndarray = _build_monster_primary_adtyp_table()
-
-# AD_WERE = 29  (mirrors DamageType.AD_WERE; plain int for use in lax.cond).
-_AD_WERE: int = 29
 
 # vendor/nethack/include/defsym.h: S_HUMANOID=8, S_HUMAN=53.
 _S_HUMANOID: int = 8
@@ -943,7 +928,7 @@ def _single_melee_strike(
     rolled from the form's attack dice rather than the weapon.
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
-    key_hit, key_dmg, key_monk, key_samurai, key_backstab, key_ac = split_n(rng, 6)
+    key_hit, key_dmg, key_monk, key_samurai, key_backstab, key_ac, key_silver = split_n(rng, 7)
     idx = target_monster_idx.astype(jnp.int32)
     mai = state.monster_ai
 
@@ -1106,6 +1091,70 @@ def _single_melee_strike(
     stun_dmg_penalty = jnp.where(stunned_timer > jnp.int32(0), jnp.int32(-1), jnp.int32(0))
     base_dmg = jnp.maximum(base_dmg + stun_dmg_penalty, jnp.int32(0)).astype(jnp.int32)
 
+    # vendor/nethack/src/weapon.c:331-332 — silver weapon vs hates_silver target:
+    #   if (objects[otyp].oc_material == SILVER && hates_silver(mdat))
+    #       tmp += rnd(20);
+    # entry_idx maps monster slot -> MONSTERS table row.  type_id==-1 (bare
+    # hands) clamps to index 0 (which is not SILVER), so is_silver is False.
+    wep_type_silver = _wielded_type_id(state)
+    safe_wep_for_mat = jnp.clip(wep_type_silver, 0, _OBJECT_MATERIAL.shape[0] - 1)
+    wep_material = _OBJECT_MATERIAL[safe_wep_for_mat].astype(jnp.int32)
+    is_silver_weapon = (wep_type_silver >= jnp.int32(0)) & (wep_material == jnp.int32(_MATERIAL_SILVER))
+    silver_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, _HATES_SILVER.shape[0] - 1)
+    target_hates_silver_m = _HATES_SILVER[silver_entry]
+    silver_d20 = rnd(key_silver, 20).astype(jnp.int32)
+    silver_bonus_m = jnp.where(
+        is_silver_weapon & target_hates_silver_m & ~is_poly,
+        silver_d20,
+        jnp.int32(0),
+    )
+    base_dmg = (base_dmg + silver_bonus_m).astype(jnp.int32)
+
+    # vendor/nethack/src/uhitm.c:5424-5670 (hmonas) — when the hero is
+    # polymorphed and the form has multiple natural attacks, slot 0 is the
+    # primary strike (poly_dmg above) and slots 1..NATTK-1 add their own
+    # dice rolls to the same target.  Slot 0 dice are already included in
+    # poly_dmg.  We accumulate extra-slot damage with a static Python loop
+    # using a simpler dice formula (slot_dice * (slot_sides+1)//2 expected
+    # value with a random offset) to keep the JIT trace minimal.
+    from Nethax.nethax.subsystems.polymorph import NATTK as _NATTK
+    from Nethax.nethax.constants.monsters import AttackType as _AttackType
+    AT_NONE_VAL = jnp.uint8(int(_AttackType.AT_NONE))
+    poly_types = (
+        poly.attack_types if (poly is not None and hasattr(poly, "attack_types"))
+        else jnp.zeros((_NATTK,), dtype=jnp.uint8)
+    )
+    poly_ndice = (
+        poly.attack_n_dice if (poly is not None and hasattr(poly, "attack_n_dice"))
+        else jnp.zeros((_NATTK,), dtype=jnp.uint8)
+    )
+    poly_nsides = (
+        poly.attack_n_sides if (poly is not None and hasattr(poly, "attack_n_sides"))
+        else jnp.zeros((_NATTK,), dtype=jnp.uint8)
+    )
+    key_multi = jax.random.fold_in(key_dmg, jnp.uint32(0xA771))
+    multi_keys = split_n(key_multi, _NATTK)
+    extra_multi_total = jnp.int32(0)
+    for i in range(1, _NATTK):  # slot 0 is primary; slots 1..5 are extras
+        slot_type = poly_types[i]
+        slot_dice = poly_ndice[i].astype(jnp.int32)
+        slot_sides = poly_nsides[i].astype(jnp.int32)
+        slot_active = (
+            (slot_type != AT_NONE_VAL)
+            & (slot_dice > jnp.int32(0))
+            & (slot_sides > jnp.int32(0))
+        )
+        # Single uniform draw scaled by (sides * dice) approximates the sum
+        # of `dice` rolls of d`sides` — keeps compile cost flat.
+        max_val = jnp.maximum(slot_dice * slot_sides, jnp.int32(1))
+        roll = jax.random.randint(
+            multi_keys[i], (), minval=1, maxval=max_val + jnp.int32(1), dtype=jnp.int32,
+        )
+        extra_multi_total = extra_multi_total + jnp.where(
+            slot_active, roll, jnp.int32(0)
+        ).astype(jnp.int32)
+    base_dmg = (base_dmg + jnp.where(is_poly, extra_multi_total, jnp.int32(0))).astype(jnp.int32)
+
     dmg = jnp.where(hit, base_dmg, jnp.int32(0)).astype(jnp.int32)
 
     new_hp = jnp.maximum(mai.hp[idx] - dmg, jnp.int32(0)).astype(jnp.int32)
@@ -1145,22 +1194,24 @@ def _single_melee_strike(
     new_state = mark_violated_if(new_state, int(Conduct.PACIFIST), killed)
 
     # Award XP/score for kill.
-    # Vendor reference: vendor/nethack/src/mon.c::experience() — XP is based
-    # on monster level (mlevel).  We use MONSTERS[entry_idx].level as the
-    # mon_xp value (same table as monster_ai._MONSTER_LEVEL_TABLE).
-    # JIT-safe: jnp.where gates the update; no Python branch on tracers.
+    # Vendor reference: vendor/nethack/src/exper.c::experience (table-driven
+    # XP value) followed by more_experienced (uexp / urexp accumulation;
+    # exper.c:168-203).  kill_count gates the repeated-kill halving in
+    # vendor — we pass scoring.monsters_killed as a running approximation
+    # since per-pm-vital kill counters aren't tracked yet.
     entry = jnp.clip(
         mai.entry_idx[idx].astype(jnp.int32),
         0, _MONSTER_XP_TABLE.shape[0] - 1,
     )
-    mon_xp = _MONSTER_XP_TABLE[entry]
-    new_scoring = jax.lax.cond(
+    kill_count = new_state.scoring.monsters_killed
+    mcloned = new_state.monster_ai.mcloned[idx]
+    xp_award = _xp_experience(entry, kill_count, mcloned=mcloned)
+    new_state = jax.lax.cond(
         killed,
-        lambda s: _scoring_record_kill(s, jnp.int32(mon_xp)),
+        lambda s: _xp_more_experienced(s, xp_award, jnp.int32(0)),
         lambda s: s,
-        new_state.scoring,
+        new_state,
     )
-    new_state = new_state.replace(scoring=new_scoring)
 
     # vendor/nethack/src/mondead.c::xkilled — death drops a corpse on the floor.
     # Most monsters leave a corpse; elementals, ghosts, vortices do not.
@@ -1284,6 +1335,7 @@ def melee_attack(
         return s2, dmg1 + dmg2, hit1 | hit2
 
     rng_a, rng_b = split_n(rng, 2)
+
     return jax.lax.cond(two_weap, _double, _single, (rng_a, rng_b))
 
 
@@ -1397,11 +1449,113 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
     _, rolls = jax.lax.scan(roll_one, jnp.int32(0), keys)
     take_mask = jnp.arange(8, dtype=jnp.int32) < n_dice
     raw_dmg = jnp.sum(jnp.where(take_mask, rolls, jnp.int32(0))).astype(jnp.int32)
-    dmg = jnp.where(hit, raw_dmg, jnp.int32(0)).astype(jnp.int32)
 
-    new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(0)).astype(jnp.int32)
-    new_done = state.done | (new_hp <= 0)
-    new_state = state.replace(player_hp=new_hp, done=new_done)
+    # vendor/nethack/src/mhitu.c:1455-1530 — adtyp-based damage dispatch.
+    # The monster's primary-attack damage-type controls how the rolled dmg is
+    # applied: physical, elemental (with resistance halving), drain-life, or
+    # sleep.  We dispatch via lax.switch on a small index mapped from adtyp.
+    safe_entry = jnp.clip(
+        mai.entry_idx[idx].astype(jnp.int32),
+        0,
+        _MONSTER_PRIMARY_ADTYP_TABLE.shape[0] - 1,
+    )
+    adtyp = _MONSTER_PRIMARY_ADTYP_TABLE[safe_entry]
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intr, TimedStatus as _TS
+    intr = state.status.intrinsics
+    fire_res  = intr[int(_Intr.RESIST_FIRE)]
+    cold_res  = intr[int(_Intr.RESIST_COLD)]
+    shock_res = intr[int(_Intr.RESIST_SHOCK)]
+    acid_res  = intr[int(_Intr.RESIST_ACID)]
+    sleep_res = intr[int(_Intr.RESIST_SLEEP)]
+
+    # Damage-type sentinels (constants/monsters.py DamageType).
+    _AD_PHYS_V = jnp.int32(0)
+    _AD_FIRE_V = jnp.int32(2)
+    _AD_COLD_V = jnp.int32(3)
+    _AD_SLEE_V = jnp.int32(4)
+    _AD_ELEC_V = jnp.int32(6)
+    _AD_ACID_V = jnp.int32(8)
+    _AD_DREN_V = jnp.int32(16)
+
+    # Branch index: 0=PHYS 1=FIRE 2=COLD 3=SLEE 4=ELEC 5=ACID 6=DREN, default 0.
+    idx_phys = jnp.int32(0)
+    branch_idx = jnp.where(adtyp == _AD_FIRE_V, jnp.int32(1), idx_phys)
+    branch_idx = jnp.where(adtyp == _AD_COLD_V, jnp.int32(2), branch_idx)
+    branch_idx = jnp.where(adtyp == _AD_SLEE_V, jnp.int32(3), branch_idx)
+    branch_idx = jnp.where(adtyp == _AD_ELEC_V, jnp.int32(4), branch_idx)
+    branch_idx = jnp.where(adtyp == _AD_ACID_V, jnp.int32(5), branch_idx)
+    branch_idx = jnp.where(adtyp == _AD_DREN_V, jnp.int32(6), branch_idx)
+
+    def _b_phys(args):
+        s, base = args
+        return s, base
+
+    def _b_fire(args):
+        s, base = args
+        halved = jnp.where(fire_res, base // jnp.int32(2), base)
+        return s, halved
+
+    def _b_cold(args):
+        s, base = args
+        halved = jnp.where(cold_res, base // jnp.int32(2), base)
+        return s, halved
+
+    def _b_slee(args):
+        # Physical damage applied; if not RESIST_SLEEP, also add sleep timer.
+        s, base = args
+        sleep_dur = jnp.int32(10)
+        cur_timer = s.status.timed_statuses[int(_TS.SLEEP)].astype(jnp.int32)
+        new_sleep_timer = jnp.where(
+            sleep_res, cur_timer, cur_timer + sleep_dur,
+        )
+        new_timed = s.status.timed_statuses.at[int(_TS.SLEEP)].set(new_sleep_timer)
+        new_status = s.status.replace(timed_statuses=new_timed)
+        # Gate: only apply on hit (we'll re-gate after the switch result is
+        # multiplied through; this branch is reached even when hit=False
+        # because lax.switch always evaluates; defer the hit gate below).
+        return s.replace(status=new_status), base
+
+    def _b_elec(args):
+        s, base = args
+        halved = jnp.where(shock_res, base // jnp.int32(2), base)
+        return s, halved
+
+    def _b_acid(args):
+        s, base = args
+        halved = jnp.where(acid_res, base // jnp.int32(2), base)
+        return s, halved
+
+    def _b_dren(args):
+        # AD_DREN — drain XL (losexp).  Mirrors prayer._apply_drain_level:
+        # XL -= 1 (floor 1); HP_max shaved; HP clamped.  No raw HP damage on
+        # top (vendor: drain attacks deal HP via dmg roll separately, but the
+        # canonical model is XL loss as the primary effect).
+        s, base = args
+        new_xl = jnp.maximum(s.player_xl.astype(jnp.int32) - jnp.int32(1), jnp.int32(1)).astype(jnp.int32)
+        new_hp_max = jnp.maximum(s.player_hp_max.astype(jnp.int32) - jnp.int32(5), jnp.int32(5)).astype(jnp.int32)
+        s2 = s.replace(player_xl=new_xl, player_hp_max=new_hp_max)
+        return s2, base
+
+    # Apply switch.  When hit=False we still run the switch (purity), but the
+    # final dmg is zeroed by the outer gate; side-effect branches (sleep/drain)
+    # are gated below via lax.cond on `hit`.
+    def _do_switch(s):
+        return jax.lax.switch(
+            branch_idx,
+            [_b_phys, _b_fire, _b_cold, _b_slee, _b_elec, _b_acid, _b_dren],
+            (s, raw_dmg),
+        )
+
+    def _skip_switch(s):
+        return s, raw_dmg
+
+    state_post_dispatch, eff_dmg = jax.lax.cond(hit, _do_switch, _skip_switch, state)
+
+    dmg = jnp.where(hit, eff_dmg, jnp.int32(0)).astype(jnp.int32)
+
+    new_hp = jnp.maximum(state_post_dispatch.player_hp - dmg, jnp.int32(0)).astype(jnp.int32)
+    new_done = state_post_dispatch.done | (new_hp <= 0)
+    new_state = state_post_dispatch.replace(player_hp=new_hp, done=new_done)
 
     # ------------------------------------------------------------------
     # AD_WERE lycanthropy infection — vendor/nethack/src/uhitm.c:mhitm_ad_were
@@ -1410,12 +1564,6 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
     # Gates: attack landed, player not already lycanthropic, no
     # Protection_from_shape_changers intrinsic.
     # ------------------------------------------------------------------
-    safe_entry = jnp.clip(
-        mai.entry_idx[idx].astype(jnp.int32),
-        0,
-        _MONSTER_PRIMARY_ADTYP_TABLE.shape[0] - 1,
-    )
-    adtyp = _MONSTER_PRIMARY_ADTYP_TABLE[safe_entry]
 
     poly = new_state.polymorph
     already_lycan = poly.lycanthropy_form >= jnp.int8(0)

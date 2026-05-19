@@ -596,18 +596,85 @@ def handle_kick(state, rng: jax.Array):
         any_monster = jnp.any(at_tile)
         target_slot = jnp.argmax(at_tile).astype(jnp.int32)
 
-        # Kick damage: max(1, (Str + Dex + Con) // 15)
-        # Cite: vendor/nethack/src/dokick.c:146-291.
-        kick_dmg = jnp.maximum(
-            jnp.int32(1),
-            (s.player_str.astype(jnp.int32)
-             + s.player_dex.astype(jnp.int32)
-             + s.player_con.astype(jnp.int32)) // jnp.int32(15),
+        # Vendor kick damage — vendor/nethack/src/dokick.c:34-123.
+        #   base = (Str + Dex + Con) // 15
+        #   dmg  = rnd(max(base, 1))          # randomized 1..base
+        #   dmg += 5  if kicking boots worn
+        #   dmg += rn2(dex//2 + 1) if Monk
+        #   dmg += uarmf->spe   (boot enchantment)
+        #   dmg += u.udaminc
+        #   dmg = 0 if target has M1_THICK_HIDE
+        #   dmg = 0 if target is a shade
+        key_kick, key_monk = jax.random.split(rng)
+        str_i = s.player_str.astype(jnp.int32)
+        dex_i = s.player_dex.astype(jnp.int32)
+        con_i = s.player_con.astype(jnp.int32)
+        base = (str_i + dex_i + con_i) // jnp.int32(15)
+        base_clamped = jnp.maximum(base, jnp.int32(1))
+        # rnd(n) -> uniform in [1, n].  We need a dynamic upper bound.
+        dmg = jax.random.randint(
+            key_kick, (), minval=1, maxval=base_clamped + jnp.int32(1), dtype=jnp.int32
         )
+
+        # Kicking boots bonus (+5) and boot enchantment (uarmf->spe).
+        from Nethax.nethax.subsystems.inventory import ArmorSlot as _ArmorSlot
+        from Nethax.nethax.subsystems.character import ObjType as _ObjType
+        boots_inv_idx = s.inventory.worn_armor[int(_ArmorSlot.BOOTS)].astype(jnp.int32)
+        has_boots = boots_inv_idx >= jnp.int32(0)
+        safe_b = jnp.clip(boots_inv_idx, 0, s.inventory.items.type_id.shape[0] - 1)
+        boot_type = jnp.where(
+            has_boots,
+            s.inventory.items.type_id[safe_b].astype(jnp.int32),
+            jnp.int32(0),
+        )
+        boot_spe = jnp.where(
+            has_boots,
+            s.inventory.items.enchantment[safe_b].astype(jnp.int32),
+            jnp.int32(0),
+        )
+        kicking_boots_worn = boot_type == jnp.int32(int(_ObjType.KICKING_BOOTS))
+        dmg = dmg + jnp.where(kicking_boots_worn, jnp.int32(5), jnp.int32(0))
+
+        # Monk bonus: rn2(dex//2 + 1).
+        from Nethax.nethax.constants.roles import Role as _Role
+        is_monk = s.player_role == jnp.int8(int(_Role.MONK))
+        monk_upper = jnp.maximum(dex_i // jnp.int32(2) + jnp.int32(1), jnp.int32(1))
+        monk_roll = jax.random.randint(
+            key_monk, (), minval=0, maxval=monk_upper, dtype=jnp.int32
+        )
+        dmg = dmg + jnp.where(is_monk, monk_roll, jnp.int32(0))
+
+        # Boot enchantment + udaminc.
+        dmg = dmg + boot_spe
+        dmg = dmg + s.player_udaminc.astype(jnp.int32)
+
+        # Target M1_THICK_HIDE flag and shade-symbol guard.
+        from Nethax.nethax.constants.monsters import M1_THICK_HIDE as _M1_THICK_HIDE
+        # Build static masks lazily via local helpers (module load is fine here
+        # because they're only built once on first call into a JIT region).
+        # Use module-level tables when available; fall back to import.
+        from Nethax.nethax.subsystems.combat import _MONSTER_SYMBOL_TABLE
+        # Per-monster flags1 table:
+        from Nethax.nethax.subsystems.polymorph import _monster_tables
+        tables = _monster_tables()
+        flags1 = tables["flags1"]  # uint32[N]
+        entry = jnp.clip(
+            mai.entry_idx[target_slot].astype(jnp.int32), 0, flags1.shape[0] - 1,
+        )
+        thick_hide = (flags1[entry] & jnp.uint32(_M1_THICK_HIDE)) != jnp.uint32(0)
+        # Shade detection: symbol == S_GOLEM? No — vendor S_SHADE is its own
+        # symbol.  Our MonsterSymbol lacks S_SHADE; map shades by name later
+        # if needed.  For now match the documented S_HUMANOID 'h' shade
+        # entries via MONSTERS — this is a parity stub; M1_THICK_HIDE is the
+        # primary guard.  Use the placeholder False until S_SHADE is added.
+        is_shade = jnp.bool_(False)
+
+        dmg = jnp.where(thick_hide | is_shade, jnp.int32(0), dmg)
+        dmg = jnp.maximum(dmg, jnp.int32(0)).astype(jnp.int32)
 
         def _kick_monster(s_):
             old_hp = mai.hp[target_slot]
-            new_hp = jnp.maximum(old_hp - kick_dmg, jnp.int32(0))
+            new_hp = jnp.maximum(old_hp - dmg, jnp.int32(0))
             new_mai = mai.replace(
                 hp=mai.hp.at[target_slot].set(new_hp),
                 peaceful=mai.peaceful.at[target_slot].set(jnp.bool_(False)),
