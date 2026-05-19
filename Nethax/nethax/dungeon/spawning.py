@@ -292,10 +292,63 @@ _MONSTER_KIT_BY_ENTRY: jnp.ndarray = _compute_kit_per_entry()   # [NUMMONS] int8
 
 
 # ---------------------------------------------------------------------------
+# Peace-minded table — precomputed [NUMMONS, 3] at module load.
+# Cite: vendor/nethack/src/makemon.c::peace_minded.
+#
+# Vendor formula (makemon.c::peace_minded ~lines 2003-2042):
+#   * always_peaceful(ptr) → True
+#   * always_hostile(ptr)  → False
+#   * sgn(mon.maligntyp) != sgn(player.alignment) → False
+#   * else → True if player's align-record >= 0 (we collapse this to the
+#           same-sign branch since at spawn the record is initialised to 0).
+#
+# Player alignment encoding (vendor align.h):
+#   -1 = chaotic, 0 = neutral, +1 = lawful.
+# We store the table as a [N_MONSTERS, 3] bool array indexed by
+# (entry_idx, align_bucket) where align_bucket = align + 1 (0=chaotic,
+# 1=neutral, 2=lawful).
+# ---------------------------------------------------------------------------
+
+def _compute_peace_minded_table() -> jnp.ndarray:
+    """Build [NUMMONS, 3] bool table per vendor makemon.c::peace_minded."""
+    from Nethax.nethax.constants.monsters import (
+        MONSTERS, M2_PEACEFUL, M2_HOSTILE,
+    )
+    n = len(MONSTERS)
+    out = [[False, False, False] for _ in range(n)]
+    for i, m in enumerate(MONSTERS):
+        f2 = int(m.flags2) & 0xFFFFFFFF
+        always_peace = bool(f2 & (int(M2_PEACEFUL) & 0xFFFFFFFF))
+        always_host  = bool(f2 & (int(M2_HOSTILE)  & 0xFFFFFFFF))
+        mal = int(getattr(m, "alignment", 0))
+        for align in (-1, 0, 1):
+            bucket = align + 1
+            if always_peace:
+                out[i][bucket] = True
+                continue
+            if always_host:
+                out[i][bucket] = False
+                continue
+            # Same-sign alignment ⇒ peaceful candidate; vendor uses the
+            # alignment record at align==0 (record default ≥ 0 ⇒ True).
+            if (mal > 0) != (align > 0):
+                out[i][bucket] = False
+                continue
+            if (mal < 0) != (align < 0):
+                out[i][bucket] = False
+                continue
+            out[i][bucket] = True
+    return jnp.array(out, dtype=jnp.bool_)
+
+
+_PEACE_MINDED_TABLE: jnp.ndarray = _compute_peace_minded_table()   # [NUMMONS, 3] bool
+
+
+# ---------------------------------------------------------------------------
 # Eligible-monster mask
 # ---------------------------------------------------------------------------
 
-def eligible_monsters_for_depth(depth: int) -> jnp.ndarray:
+def eligible_monsters_for_depth(depth: int, genocided=None) -> jnp.ndarray:
     """Return a bool mask [NUMMONS] of monsters that can spawn at ``depth``.
 
     Eligibility criteria (mirrors vendor makemon.c::pm_gen / rndmonst()):
@@ -308,9 +361,15 @@ def eligible_monsters_for_depth(depth: int) -> jnp.ndarray:
         AND NOT G_UNIQ                    (unique placement is handled
                                             separately by m_initweap /
                                             place_special)
+        AND NOT genocided_species[i]      (vendor/nethack/src/read.c:2826-3015
+                                            do_genocide — genocided species
+                                            never re-spawn)
     Citation: vendor/nle/src/makemon.c lines 1185-1244 (rndmonst -- where
     ``mons[i].difficulty > zlevel + 4`` rejects the entry); also
     vendor/nle/src/makemon.c::pm_gen (gen_freq weighting).
+
+    The optional ``genocided`` argument is a bool[NUMMONS] mask
+    (state.genocided_species) — entries True are filtered out.
 
     Wave 3 note: G_HELL / G_NOHELL filtering is deferred to Wave 5.
     """
@@ -321,6 +380,8 @@ def eligible_monsters_for_depth(depth: int) -> jnp.ndarray:
     # never produced by rndmonst (vendor makemon.c pm_gen weighting).
     has_freq = _GEN_FREQS > jnp.int32(0)
     eligible = in_window & has_freq & ~_IS_NOGEN & ~_IS_UNIQ
+    if genocided is not None:
+        eligible = eligible & ~genocided.astype(jnp.bool_)
     return eligible
 
 
@@ -328,17 +389,19 @@ def eligible_monsters_for_depth(depth: int) -> jnp.ndarray:
 # Pick one monster type for a given depth
 # ---------------------------------------------------------------------------
 
-def pick_monster_for_level(rng: jax.Array, depth: int) -> jnp.ndarray:
+def pick_monster_for_level(rng: jax.Array, depth: int,
+                           genocided=None) -> jnp.ndarray:
     """Sample one monster type index (int32) for the given dungeon depth.
 
     Vendor reference: ``makemon.c::rndmonst()`` / ``pm_gen()``.  Weights are
     the monster's ``gen_freq`` (vendor: low byte of ``permonst.geno`` -- the
     set_mons_freq value populated by monst.c::G_FREQ).  Eligibility filters
-    out G_NOGEN/G_UNIQ entries plus those whose ``diff_lvl > depth + 5``.
+    out G_NOGEN/G_UNIQ entries plus those whose ``diff_lvl > depth + 5``,
+    and any species marked genocided in ``state.genocided_species``.
 
     Returns a scalar jnp.int32 in [0, NUMMONS).
     """
-    mask = eligible_monsters_for_depth(depth)
+    mask = eligible_monsters_for_depth(depth, genocided=genocided)
     weights = jnp.where(mask, _GEN_FREQS, jnp.int32(0)).astype(jnp.float32)
     # Guard: if all weights zero (very unusual depth), fall back to uniform over eligible.
     total = jnp.sum(weights)
@@ -467,6 +530,7 @@ def spawn_initial_monsters(
     valid_tiles_mask: jnp.ndarray,
     map_h: int,
     map_w: int,
+    genocided=None,
 ) -> tuple:
     """Spawn ``n_monsters`` monsters for dungeon level ``depth``.
 
@@ -497,7 +561,7 @@ def spawn_initial_monsters(
     def _spawn_one(i, carry):
         positions, type_ids, hps, max_hps = carry
 
-        type_id = pick_monster_for_level(type_keys[i], depth)
+        type_id = pick_monster_for_level(type_keys[i], depth, genocided=genocided)
         level = MONSTR_DIFFICULTIES[type_id]
         hp = _roll_hp(hp_keys[i], level)
         pos = _pick_valid_tile(pos_keys[i], valid_tiles_mask, map_h, map_w)
@@ -548,9 +612,18 @@ def populate_level_with_monsters(
     positions, type_ids, hps, max_hps, count = spawn_initial_monsters(
         rng, depth=1, n_monsters=n_monsters, valid_tiles_mask=valid_tiles_mask,
         map_h=map_h, map_w=map_w,
+        genocided=state.genocided_species,
     )
 
     mai = state.monster_ai
+
+    # Player alignment bucket for vendor peace_minded lookup.
+    # Cite: vendor/nethack/src/makemon.c::peace_minded (line ~2003-2042).
+    # Bucket = align + 1 (clamped to [0, 2]).
+    player_align_bucket = jnp.clip(
+        state.player_align.astype(jnp.int32) + jnp.int32(1),
+        0, _PEACE_MINDED_TABLE.shape[1] - 1,
+    )
 
     # Write slots [0, n_monsters) from spawn results.
     # Use fori_loop to stay JIT-compatible.
@@ -566,6 +639,15 @@ def populate_level_with_monsters(
         new_atk_s     = mai_carry.attack_dice_sides.at[i].set(_ATK_DICE_S[type_id])
         new_strategy  = mai_carry.mstrategy.at[i].set(jnp.int8(0))  # NONE until awakened
         new_entry     = mai_carry.entry_idx.at[i].set(type_id.astype(jnp.int16))
+        # Vendor makemon.c sets mtmp->movement = NORMAL_SPEED so a freshly-
+        # spawned monster can act on its very next tick.  Mirror that here.
+        new_mp        = mai_carry.movement_points.at[i].set(jnp.int16(12))
+        # peace_minded lookup — vendor makemon.c::peace_minded.
+        peace_bit = _PEACE_MINDED_TABLE[
+            jnp.clip(type_id.astype(jnp.int32), 0, _PEACE_MINDED_TABLE.shape[0] - 1),
+            player_align_bucket,
+        ]
+        new_peaceful  = mai_carry.peaceful.at[i].set(peace_bit)
         # Per-monster resist/undead/nonliving from MONSTERS table.
         # Cite: vendor/nethack/src/monst.c MON() mr1 field.
         tid           = type_id.astype(jnp.int32)
@@ -599,6 +681,8 @@ def populate_level_with_monsters(
             attack_dice_sides=new_atk_s,
             mstrategy=new_strategy,
             entry_idx=new_entry,
+            peaceful=new_peaceful,
+            movement_points=new_mp,
             inv_category=new_invc,
             inv_type_id=new_invt,
             inv_quantity=new_invq,

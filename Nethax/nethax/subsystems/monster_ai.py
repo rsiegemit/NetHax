@@ -187,6 +187,66 @@ def _build_ignores_elbereth_table() -> jnp.ndarray:
 # Elbereth exemption table indexed by entry_idx.  Built once at module load.
 _IGNORES_ELBERETH: jnp.ndarray = _build_ignores_elbereth_table()
 
+
+def _build_monster_primary_attack_table() -> tuple:
+    """Precompute the first non-passive (n_dice, sides, base_ac, level)
+    fields per MONSTERS[i] for the mattackm path.
+
+    The first attack with ``dice_n > 0`` and ``atyp != AT_NONE`` is used as
+    the monster's "primary" melee attack.  Defaults: 1d4 (matches vendor
+    fallback in makemon.c::newmonhp for atype-less entries).
+
+    Cite: vendor/nethack/src/mhitm.c lines 1024-1100 (mattackm — pulls
+    mtmp->data->mattk[0].damn/damd to roll damage; AC pulled from
+    mtmp->data->ac).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, AttackType
+    n_arr, s_arr, ac_arr = [], [], []
+    for m in MONSTERS:
+        n, s = 1, 4
+        for atk in (m.attacks or ()):
+            if int(atk[0]) != int(AttackType.AT_NONE) and int(atk[2]) > 0:
+                n, s = int(atk[2]), int(atk[3])
+                break
+        n_arr.append(n)
+        s_arr.append(s)
+        ac_arr.append(int(m.ac))
+    # int16 to safely contain the rare 255-sentinel sides field.
+    return (
+        jnp.array(n_arr, dtype=jnp.int16),
+        jnp.array(s_arr, dtype=jnp.int16),
+        jnp.array(ac_arr, dtype=jnp.int8),
+    )
+
+
+# (n_dice, sides, base_ac) per MONSTERS[i].
+(_MONSTER_PRIMARY_ATTACK_N,
+ _MONSTER_PRIMARY_ATTACK_S,
+ _MONSTER_PRIMARY_ATTACK_AC) = _build_monster_primary_attack_table()
+# Convenience alias — fields packed as a stacked table for callers that want
+# (n, s, ac) as one column.  Each column is independently accessed below.
+_MONSTER_PRIMARY_ATTACK_TABLE: tuple = (
+    _MONSTER_PRIMARY_ATTACK_N,
+    _MONSTER_PRIMARY_ATTACK_S,
+    _MONSTER_PRIMARY_ATTACK_AC,
+)
+
+
+def _build_monster_move_speed_table() -> jnp.ndarray:
+    """Precompute MONSTERS[i].move_speed eagerly at module load.
+
+    Used by the speed-energy accumulator (monsters_step_all) to compute
+    per-tick movement-point gain.  Vendor NORMAL_SPEED = 12.
+
+    Cite: vendor/nethack/src/monmove.c line 1731 (per-turn movement gain);
+          vendor/nethack/src/allmain.c lines 233-234 (mtmp->movement loop).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS
+    return jnp.array([int(m.move_speed) for m in MONSTERS], dtype=jnp.int16)
+
+
+_MONSTER_MOVE_SPEED_TABLE: jnp.ndarray = _build_monster_move_speed_table()
+
 # ---- Item category / type IDs (mirrors subsystems/inventory.ItemCategory
 # and subsystems/items_{potions,scrolls,wands}.<Effect>) ------------------
 # Kept as plain ints so we don't import the inventory module (avoids cycles
@@ -380,6 +440,14 @@ class MonsterAIState:
     # Cite: vendor/nethack/src/zap.c WAN_CANCELLATION.
     cancelled: jnp.ndarray         # [MAX_MONSTERS_PER_LEVEL]  bool
 
+    # Cloned flag — True iff this monster was produced by clone_mon
+    # (or any later wand/scroll-driven cloning).  Vendor uses MON_WEP and
+    # the mtmp->mcloned bit (vendor/nethack/include/monst.h::mcloned) to gate
+    # corpse/XP drops on clones.  Wave 16e wires the bit; downstream drop
+    # gating remains a follow-up.
+    # Cite: vendor/nethack/src/makemon.c::clone_mon lines 837-944.
+    mcloned: jnp.ndarray           # [MAX_MONSTERS_PER_LEVEL]  bool
+
 
 def make_monster_ai_state() -> MonsterAIState:
     """Return a zero-initialized MonsterAIState for one level."""
@@ -426,6 +494,7 @@ def make_monster_ai_state() -> MonsterAIState:
         nonliving=jnp.zeros(n, dtype=jnp.bool_),
         speed_mod=jnp.zeros(n, dtype=jnp.int8),
         cancelled=jnp.zeros(n, dtype=jnp.bool_),
+        mcloned=jnp.zeros(n, dtype=jnp.bool_),
     )
 
 
@@ -1602,28 +1671,347 @@ def monster_turn(state, rng: jax.Array, monster_idx: jnp.ndarray) -> object:
 
 
 # ---------------------------------------------------------------------------
+# clone_mon  — vendor/nethack/src/makemon.c::clone_mon lines 837-944.
+# ---------------------------------------------------------------------------
+
+# 8-neighbour offsets (row, col) — vendor xdir[]/ydir[] order, NW first.
+_CLONE_DR: jnp.ndarray = jnp.array([-1, -1, -1, 0, 0, 1, 1, 1], dtype=jnp.int32)
+_CLONE_DC: jnp.ndarray = jnp.array([-1,  0,  1, -1, 1, -1, 0, 1], dtype=jnp.int32)
+
+
+def clone_mon(state, mon_idx: jnp.ndarray, rng: jax.Array) -> object:
+    """Clone monster ``mon_idx`` into an empty adjacent cell at half HP.
+
+    Vendor reference: ``src/makemon.c::clone_mon`` lines 837-944.  The clone
+    inherits the original's type, alignment (peaceful / tame), and gets
+    ``mhp = (orig_mhp + 1) / 2`` with the parent's HP halved likewise.
+    The new monster's ``mcloned`` bit is set so corpse / XP gating can
+    later drop drops on the clone.
+
+    The 8-neighbour search uses vendor xdir[]/ydir[] order and picks the
+    first walkable empty cell; if none exist, the clone is suppressed
+    (vendor falls back to mksobj_at on no_empty_tile).  An empty live-slot
+    must also be available (we cap at MAX_MONSTERS_PER_LEVEL).
+
+    JIT-pure: lax.scan over 8 directions for the cell search; lax.cond for
+    the apply / no-op branch.
+    """
+    idx = mon_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    parent_alive = mai.alive[idx]
+    parent_pos = mai.pos[idx].astype(jnp.int32)
+    pr, pc = parent_pos[0], parent_pos[1]
+
+    # ---- Find first empty adjacent cell (8-neighbour scan) -----------------
+    terrain = _current_level_terrain(state)
+    map_h = terrain.shape[0]
+    map_w = terrain.shape[1]
+
+    # Per-monster occupancy mask for the current level.
+    mon_r = mai.pos[:, 0].astype(jnp.int32)
+    mon_c = mai.pos[:, 1].astype(jnp.int32)
+    # Player tile is also off-limits to spawn into.
+    ppos = state.player_pos.astype(jnp.int32)
+
+    def _check_dir(carry, args):
+        # carry: (found, tgt_r, tgt_c)
+        found, tgt_r, tgt_c = carry
+        dr, dc = args
+        cand_r = pr + dr
+        cand_c = pc + dc
+        in_bounds = (cand_r >= 0) & (cand_r < map_h) & (cand_c >= 0) & (cand_c < map_w)
+        # Passable terrain (FLOOR/CORRIDOR/OPEN_DOOR via existing helper).
+        safe_r = jnp.clip(cand_r, 0, map_h - 1)
+        safe_c = jnp.clip(cand_c, 0, map_w - 1)
+        passable = _tile_passable(terrain, safe_r, safe_c) & in_bounds
+        # Empty: no live monster occupies, and not the player tile.
+        occ_mask = mai.alive & (mon_r == cand_r) & (mon_c == cand_c)
+        not_occ = ~jnp.any(occ_mask)
+        not_player = ~((cand_r == ppos[0]) & (cand_c == ppos[1]))
+        is_empty = passable & not_occ & not_player
+        take = is_empty & ~found
+        new_r = jnp.where(take, cand_r, tgt_r)
+        new_c = jnp.where(take, cand_c, tgt_c)
+        new_found = found | is_empty
+        return (new_found, new_r, new_c), None
+
+    (found_cell, tgt_r, tgt_c), _ = jax.lax.scan(
+        _check_dir,
+        (jnp.bool_(False), jnp.int32(0), jnp.int32(0)),
+        (_CLONE_DR, _CLONE_DC),
+    )
+
+    # ---- Find first dead slot ---------------------------------------------
+    dead_mask = ~mai.alive
+    has_dead = jnp.any(dead_mask)
+    dead_idx = jnp.argmax(dead_mask).astype(jnp.int32)
+
+    can_clone = parent_alive & found_cell & has_dead
+
+    # ---- Build clone state -------------------------------------------------
+    half_hp = jnp.maximum(jnp.int32(1),
+                          (mai.hp[idx].astype(jnp.int32) + 1) // jnp.int32(2))
+    new_pos = jnp.stack([tgt_r.astype(jnp.int16), tgt_c.astype(jnp.int16)])
+
+    def _do_clone(s):
+        m = s.monster_ai
+        new_alive    = m.alive.at[dead_idx].set(jnp.bool_(True))
+        new_pos_arr  = m.pos.at[dead_idx].set(new_pos)
+        new_hp       = m.hp.at[dead_idx].set(half_hp)
+        new_hp_max   = m.hp_max.at[dead_idx].set(half_hp)
+        new_entry    = m.entry_idx.at[dead_idx].set(m.entry_idx[idx])
+        new_peaceful = m.peaceful.at[dead_idx].set(m.peaceful[idx])
+        new_tame     = m.tame.at[dead_idx].set(m.tame[idx])
+        new_ac       = m.ac.at[dead_idx].set(m.ac[idx])
+        new_atk_n    = m.attack_dice_n.at[dead_idx].set(m.attack_dice_n[idx])
+        new_atk_s    = m.attack_dice_sides.at[dead_idx].set(m.attack_dice_sides[idx])
+        new_resists  = m.resists.at[dead_idx].set(m.resists[idx])
+        new_undead   = m.undead.at[dead_idx].set(m.undead[idx])
+        new_nonliving = m.nonliving.at[dead_idx].set(m.nonliving[idx])
+        new_invisible = m.invisible.at[dead_idx].set(m.invisible[idx])
+        new_is_large  = m.is_large.at[dead_idx].set(m.is_large[idx])
+        new_asleep_v  = m.asleep.at[dead_idx].set(jnp.bool_(False))
+        new_mstrat    = m.mstrategy.at[dead_idx].set(jnp.int8(MoveStrategy.HUNT))
+        new_mcloned   = m.mcloned.at[dead_idx].set(jnp.bool_(True))
+        # Halve parent HP too (vendor splits HP between original and clone).
+        new_hp_parent = new_hp.at[idx].set(half_hp)
+
+        new_m = m.replace(
+            alive=new_alive,
+            pos=new_pos_arr,
+            hp=new_hp_parent,
+            hp_max=new_hp_max,
+            entry_idx=new_entry,
+            peaceful=new_peaceful,
+            tame=new_tame,
+            ac=new_ac,
+            attack_dice_n=new_atk_n,
+            attack_dice_sides=new_atk_s,
+            resists=new_resists,
+            undead=new_undead,
+            nonliving=new_nonliving,
+            invisible=new_invisible,
+            is_large=new_is_large,
+            asleep=new_asleep_v,
+            mstrategy=new_mstrat,
+            mcloned=new_mcloned,
+        )
+        return s.replace(monster_ai=new_m)
+
+    return jax.lax.cond(can_clone, _do_clone, lambda s: s, state)
+
+
+# ---------------------------------------------------------------------------
+# mattackm  — vendor/nethack/src/mhitm.c::mattackm lines 1024-1100.
+# ---------------------------------------------------------------------------
+
+def mattackm(state, attacker_idx: jnp.ndarray, defender_idx: jnp.ndarray,
+             rng: jax.Array) -> object:
+    """Monster-vs-monster melee attack.
+
+    Reads the attacker's primary (n_dice, sides) from
+    ``_MONSTER_PRIMARY_ATTACK_TABLE`` and the defender's effective AC from
+    ``MonsterAIState.ac``.  Rolls to-hit using a vendor-style accumulator
+    (``tmp = AC_VALUE(def_ac) + 10 + attacker_level``, hit iff ``tmp > rnd(20)``)
+    then rolls damage (1d{sides} per die).
+
+    Gates: both slots alive, attacker != defender.
+
+    Cite: vendor/nethack/src/mhitm.c::mattackm (lines 1024-1100).
+    """
+    a = attacker_idx.astype(jnp.int32)
+    d = defender_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    key_hit, key_dmg = jax.random.split(rng)
+
+    same_slot = (a == d)
+    both_alive = mai.alive[a] & mai.alive[d]
+    can_strike = both_alive & ~same_slot
+
+    # Attacker primary attack — clipped to table bounds.
+    a_entry = jnp.clip(
+        mai.entry_idx[a].astype(jnp.int32),
+        0, _MONSTER_PRIMARY_ATTACK_N.shape[0] - 1,
+    )
+    n_dice_raw = _MONSTER_PRIMARY_ATTACK_N[a_entry].astype(jnp.int32)
+    sides_raw  = _MONSTER_PRIMARY_ATTACK_S[a_entry].astype(jnp.int32)
+    n_dice = jnp.clip(n_dice_raw, 1, 8)
+    sides  = jnp.clip(sides_raw, 1, 12)
+
+    # Attacker level: derived from MONSTERS[entry].level (precomputed table).
+    a_lev = jnp.clip(_MONSTER_LEVEL_TABLE[a_entry].astype(jnp.int32), 1, 30)
+
+    # Defender AC: per-slot ``ac`` field.  Negative AC uses vendor AC_VALUE
+    # softening (rnd(-ac)) per vendor/nethack/src/hack.h:1538.
+    def_ac_raw = mai.ac[d].astype(jnp.int32)
+    key_hit, key_ac = jax.random.split(key_hit)
+    ac_neg_roll = jax.random.randint(
+        key_ac, (), 1, jnp.maximum(-def_ac_raw + 1, 2), dtype=jnp.int32
+    )
+    ac_value = jnp.where(def_ac_raw >= 0, def_ac_raw, -ac_neg_roll)
+    tmp = jnp.maximum(ac_value + jnp.int32(10) + a_lev, jnp.int32(1))
+
+    roll = jax.random.randint(key_hit, (), 1, 21, dtype=jnp.int32)
+    hit = (tmp > roll) & can_strike
+
+    # Roll damage — bounded scan over 8 dice (mirrors monster_attack_player).
+    def _roll_one(carry, key):
+        sub = jax.random.randint(key, (), 1, sides + 1, dtype=jnp.int32)
+        return carry, sub
+
+    keys_d = jax.random.split(key_dmg, 8)
+    _, rolls = jax.lax.scan(_roll_one, jnp.int32(0), keys_d)
+    take = jnp.arange(8, dtype=jnp.int32) < n_dice
+    raw_dmg = jnp.sum(jnp.where(take, rolls, jnp.int32(0))).astype(jnp.int32)
+    dmg = jnp.where(hit, raw_dmg, jnp.int32(0))
+
+    new_def_hp = jnp.maximum(mai.hp[d] - dmg, jnp.int32(0)).astype(jnp.int32)
+    new_alive_d = mai.alive[d] & (new_def_hp > jnp.int32(0))
+
+    new_hp_arr    = mai.hp.at[d].set(new_def_hp)
+    new_alive_arr = mai.alive.at[d].set(new_alive_d)
+
+    new_mai = mai.replace(hp=new_hp_arr, alive=new_alive_arr)
+    return state.replace(monster_ai=new_mai)
+
+
+# ---------------------------------------------------------------------------
 # All-monsters step  (jax.lax.scan over slots)
 # ---------------------------------------------------------------------------
+
+# Per-tick movement-point threshold; vendor NORMAL_SPEED = 12 and a monster
+# acts when its accumulator reaches NORMAL_SPEED.
+# Cite: vendor/nethack/src/monmove.c line 1731; allmain.c lines 233-234.
+_MOVEMENT_THRESHOLD: int = 12
+
+
+def _faction(mai, idx: jnp.ndarray) -> jnp.ndarray:
+    """Return faction id: 0 = hostile, 1 = peaceful (non-tame), 2 = tame.
+
+    Used to gate monster-vs-monster combat — only different-faction
+    monsters fight each other.
+    """
+    i = idx.astype(jnp.int32)
+    is_tame = mai.tame[i]
+    is_peace = mai.peaceful[i] & ~is_tame
+    return jnp.where(is_tame, jnp.int32(2),
+                     jnp.where(is_peace, jnp.int32(1), jnp.int32(0)))
+
 
 def monsters_step_all(state, rng: jax.Array) -> object:
     """Advance all monster slots by one game tick.
 
-    Uses jax.lax.scan over MAX_MONSTERS_PER_LEVEL slots.  Each slot gets
-    an independent RNG subkey via sequential splitting.
+    Speed-energy accumulator (vendor allmain.c:233-234 + monmove.c:1731):
+    each tick adds ``move_speed * speed_factor`` movement points to every
+    alive monster's accumulator, where ``speed_factor`` is 0.5 / 1.0 / 1.5
+    for ``speed_mod`` < 0 / == 0 / > 0.  A slot only takes its turn when
+    its accumulator reaches ``_MOVEMENT_THRESHOLD`` (12), and we deduct
+    12 from the accumulator on action.
 
-    After all turns, decrement status timers by 1 (clamped at 0) and sync
-    the boolean asleep flag from sleep_timer > 0.
-    JIT-pure: jnp.maximum(timer - 1, 0) for each int16/int32 array.
+    After all turns, any pair of alive different-faction monsters that are
+    Chebyshev-adjacent run a single ``mattackm`` exchange (attacker = lower
+    slot id, defender = higher slot id) so pet-vs-hostile combat resolves
+    on the same tick as movement.
+
+    Cite: vendor/nethack/src/monmove.c line 1731 (per-turn movement gain);
+          vendor/nethack/src/allmain.c lines 233-234 (mtmp->movement loop);
+          vendor/nethack/src/mhitm.c lines 1024-1100 (mattackm).
     """
-    keys = jax.random.split(rng, MAX_MONSTERS_PER_LEVEL)
+    mai = state.monster_ai
+
+    # ---- Speed-energy accumulation (vendor monmove.c:1731) ----
+    safe_entry = jnp.clip(
+        mai.entry_idx.astype(jnp.int32),
+        0, _MONSTER_MOVE_SPEED_TABLE.shape[0] - 1,
+    )
+    base_speed = _MONSTER_MOVE_SPEED_TABLE[safe_entry].astype(jnp.int32)
+    smod = mai.speed_mod.astype(jnp.int32)
+    # Vendor WAN_SLOW halves effective speed; WAN_SPEED bumps by 1.5×.
+    # Use integer math to stay JIT-pure: multiply by (1,2,3) then divide by 2.
+    factor_num = jnp.where(smod < 0, jnp.int32(1),
+                  jnp.where(smod > 0, jnp.int32(3), jnp.int32(2)))
+    factor_den = jnp.int32(2)
+    add_points = (base_speed * factor_num) // factor_den
+    add_points = jnp.where(mai.alive, add_points, jnp.int32(0))
+    new_acc = mai.movement_points.astype(jnp.int32) + add_points
+
+    can_act = new_acc >= jnp.int32(_MOVEMENT_THRESHOLD)
+    # Deduct threshold on action.
+    post_acc = jnp.where(can_act, new_acc - jnp.int32(_MOVEMENT_THRESHOLD), new_acc)
+    new_mp = jnp.clip(post_acc, 0, 32000).astype(jnp.int16)
+
+    mai = mai.replace(movement_points=new_mp)
+    state = state.replace(monster_ai=mai)
+
+    # ---- Per-slot turn dispatch ----
+    keys = jax.random.split(rng, MAX_MONSTERS_PER_LEVEL * 2)
+    turn_keys = keys[:MAX_MONSTERS_PER_LEVEL]
+    mhit_keys = keys[MAX_MONSTERS_PER_LEVEL:]
     indices = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
 
     def _body(carry, xs):
-        slot_idx, key = xs
-        new_carry = monster_turn(carry, key, slot_idx)
+        slot_idx, key, may_act = xs
+
+        def _do_turn(s):
+            return monster_turn(s, key, slot_idx)
+
+        new_carry = jax.lax.cond(may_act, _do_turn, lambda s: s, carry)
         return new_carry, None
 
-    final_state, _ = jax.lax.scan(_body, state, (indices, keys))
+    final_state, _ = jax.lax.scan(_body, state, (indices, turn_keys, can_act))
+
+    # ---- Monster-vs-monster melee (mattackm) ----
+    # For each attacker slot i, find the first alive different-faction
+    # monster j > i that is Chebyshev-adjacent, then run a single
+    # mattackm(i → j) exchange.  This keeps the sweep O(N) JIT-traced ops
+    # rather than O(N²) (factions × position search are vectorised against
+    # the full slot table inside the scan body).
+    def _strike_body(carry, args):
+        i, key_i = args
+        mi = carry.monster_ai
+        i32 = i.astype(jnp.int32)
+
+        # Attacker viability.
+        atk_alive = mi.alive[i32]
+
+        # Position of attacker.
+        pi = mi.pos[i32].astype(jnp.int32)
+
+        # Compute adjacency / different-faction mask against all other slots.
+        all_pos = mi.pos.astype(jnp.int32)            # [N, 2]
+        d_row = jnp.abs(all_pos[:, 0] - pi[0])
+        d_col = jnp.abs(all_pos[:, 1] - pi[1])
+        adj = jnp.maximum(d_row, d_col) == 1
+
+        # Faction of every slot.
+        is_tame_all = mi.tame
+        is_peace_all = mi.peaceful & ~is_tame_all
+        all_faction = jnp.where(is_tame_all, jnp.int32(2),
+                       jnp.where(is_peace_all, jnp.int32(1), jnp.int32(0)))
+        # Attacker faction.
+        a_faction = all_faction[i32]
+        diff_faction = all_faction != a_faction
+
+        # Don't strike self.  Also restrict to slots > i so each pair is
+        # only resolved once per tick.
+        idx_arr = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
+        pair_ok = idx_arr > i32
+
+        candidates = mi.alive & adj & diff_faction & pair_ok
+        has_target = jnp.any(candidates)
+        # argmax of bool returns first True (or 0 if none).
+        j_idx = jnp.argmax(candidates).astype(jnp.int32)
+
+        do_strike = atk_alive & has_target
+
+        def _strike(ss):
+            return mattackm(ss, i32, j_idx, key_i)
+
+        return jax.lax.cond(do_strike, _strike, lambda ss: ss, carry), None
+
+    final_state, _ = jax.lax.scan(_strike_body, final_state, (indices, mhit_keys))
 
     # Tick status timers (vendor src/timeout.c::run_timers pattern).
     mai = final_state.monster_ai
