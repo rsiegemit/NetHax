@@ -1,17 +1,13 @@
 """NetHack race enumeration and byte-equal vendor ``races[]`` table.
 
-Canonical source: ``vendor/nle/src/role.c::races[]`` (lines 617-726).
-Struct layout reference: ``vendor/nle/include/you.h::struct Race`` (lines 181-219).
-
-The vendor file ``vendor/nethack/src/role.c`` *declares* the symbol
-``races[NUM_RACES + 1]`` at line 581 but the data definition was refactored
-into NLE's ``vendor/nle/src/role.c`` (NetHack 3.6.2 release).  We use NLE as
-the canonical source -- it is byte-equal to the 3.6 vendor distribution.
+Canonical source: ``vendor/nethack/src/role.c::races[]`` (lines 581-685).
+Struct layout reference: ``vendor/nethack/include/you.h::struct Race`` (lines 257-294).
 
 Attribute order (matches ``include/attrib.h``):
 ``A_STR, A_INT, A_WIS, A_DEX, A_CON, A_CHA``.
 
-Wave 6 Phase B+ parity port -- replaces the Wave 1 stub.
+Wave 16b: byte-equal vendor parity -- adds ``individual`` (race-gendered
+name), ``mummynum``, ``zombienum`` fields per vendor struct Race.
 """
 
 from __future__ import annotations
@@ -55,13 +51,21 @@ class RaceAdvance:
 
 @dataclass(frozen=True)
 class RaceEntry:
-    """One row of role.c::races[]; mirrors vendor ``struct Race`` (you.h:181-219)."""
+    """One row of role.c::races[]; mirrors vendor ``struct Race`` (you.h:257-294)."""
     noun: str
     adj: str
     coll: str
     filecode: str
+    # Race-gendered individual name ("man"/"woman" for human; 0,0 == use noun).
+    # Cite: you.h:263 ``struct RoleName individual;``  role.c:587 etc.
+    individual: Tuple[str | None, str | None]
+    # NLE-style id retained for back-compat with existing helpers; mnum in
+    # vendor 3.7 collapses to a single short.  We keep both so callers can
+    # query by either name.
     malenum: int
     femalenum: int
+    mummynum: int                                   # PM_ as a mummy
+    zombienum: int                                  # PM_ as a zombie
     allow: int
     selfmask: int
     lovemask: int
@@ -99,6 +103,18 @@ PM_GNOME = 357
 PM_ORC   = 358
 NON_PM   = -1
 
+# Mummy / zombie PM_ ids (role.c .mummynum / .zombienum). Opaque tags.
+PM_HUMAN_MUMMY  = 600  # role.c:589
+PM_ELF_MUMMY    = 601  # role.c:610
+PM_DWARF_MUMMY  = 602  # role.c:630
+PM_GNOME_MUMMY  = 603  # role.c:650
+PM_ORC_MUMMY    = 604  # role.c:670
+PM_HUMAN_ZOMBIE = 700  # role.c:590
+PM_ELF_ZOMBIE   = 701  # role.c:611
+PM_DWARF_ZOMBIE = 702  # role.c:631
+PM_GNOME_ZOMBIE = 703  # role.c:651
+PM_ORC_ZOMBIE   = 704  # role.c:671
+
 
 # ---------------------------------------------------------------------------
 # RACES table -- direct byte-equal port from vendor/nle/src/role.c::races[].
@@ -106,61 +122,76 @@ NON_PM   = -1
 # ---------------------------------------------------------------------------
 
 RACES: Tuple[RaceEntry, ...] = (
-    # Human  -- role.c lines 618-639
+    # Human  -- role.c lines 582-602
     RaceEntry(
         noun="human", adj="human", coll="humanity", filecode="Hum",
+        individual=("man", "woman"),                    # role.c:587
         malenum=PM_HUMAN, femalenum=NON_PM,
+        mummynum=PM_HUMAN_MUMMY,                        # role.c:589
+        zombienum=PM_HUMAN_ZOMBIE,                      # role.c:590
         allow=(MH_HUMAN | ROLE_MALE | ROLE_FEMALE
-               | ROLE_LAWFUL | ROLE_NEUTRAL | ROLE_CHAOTIC),
-        selfmask=MH_HUMAN, lovemask=0, hatemask=(MH_GNOME | MH_ORC),
-        attrmin=(3, 3, 3, 3, 3, 3),                     # role.c:634
-        attrmax=(STR18(100), 18, 18, 18, 18, 18),       # role.c:635
-        hpadv=RaceAdvance(2, 0, 0, 2, 1, 0),            # role.c:637
-        enadv=RaceAdvance(1, 0, 2, 0, 2, 0),            # role.c:638
+               | ROLE_LAWFUL | ROLE_NEUTRAL | ROLE_CHAOTIC),  # role.c:591-592
+        selfmask=MH_HUMAN, lovemask=0, hatemask=(MH_GNOME | MH_ORC),  # role.c:593-595
+        attrmin=(3, 3, 3, 3, 3, 3),                     # role.c:597
+        attrmax=(STR18(100), 18, 18, 18, 18, 18),       # role.c:598
+        hpadv=RaceAdvance(2, 0, 0, 2, 1, 0),            # role.c:600
+        enadv=RaceAdvance(1, 0, 2, 0, 2, 0),            # role.c:601
     ),
-    # Elf  -- role.c lines 640-660
+    # Elf  -- role.c lines 603-622
     RaceEntry(
         noun="elf", adj="elven", coll="elvenkind", filecode="Elf",
+        individual=(None, None),                        # role.c:608  {0, 0}
         malenum=PM_ELF, femalenum=NON_PM,
-        allow=(MH_ELF | ROLE_MALE | ROLE_FEMALE | ROLE_CHAOTIC),
-        selfmask=MH_ELF, lovemask=MH_ELF, hatemask=MH_ORC,
-        attrmin=(3, 3, 3, 3, 3, 3),                     # role.c:655
-        attrmax=(18, 20, 20, 18, 16, 18),               # role.c:656
-        hpadv=RaceAdvance(1, 0, 0, 1, 1, 0),            # role.c:658
-        enadv=RaceAdvance(2, 0, 3, 0, 3, 0),            # role.c:659
+        mummynum=PM_ELF_MUMMY,                          # role.c:610
+        zombienum=PM_ELF_ZOMBIE,                        # role.c:611
+        allow=(MH_ELF | ROLE_MALE | ROLE_FEMALE | ROLE_CHAOTIC),  # role.c:612
+        selfmask=MH_ELF, lovemask=MH_ELF, hatemask=MH_ORC,        # role.c:613-615
+        attrmin=(3, 3, 3, 3, 3, 3),                     # role.c:617
+        attrmax=(18, 20, 20, 18, 16, 18),               # role.c:618
+        hpadv=RaceAdvance(1, 0, 0, 1, 1, 0),            # role.c:620
+        enadv=RaceAdvance(2, 0, 3, 0, 3, 0),            # role.c:621
     ),
-    # Dwarf  -- role.c lines 661-681
+    # Dwarf  -- role.c lines 623-642
     RaceEntry(
         noun="dwarf", adj="dwarven", coll="dwarvenkind", filecode="Dwa",
+        individual=(None, None),                        # role.c:628  {0, 0}
         malenum=PM_DWARF, femalenum=NON_PM,
-        allow=(MH_DWARF | ROLE_MALE | ROLE_FEMALE | ROLE_LAWFUL),
-        selfmask=MH_DWARF, lovemask=(MH_DWARF | MH_GNOME), hatemask=MH_ORC,
-        attrmin=(3, 3, 3, 3, 3, 3),                     # role.c:676
-        attrmax=(STR18(100), 16, 16, 20, 20, 16),       # role.c:677 -- CON cap 20
-        hpadv=RaceAdvance(4, 0, 0, 3, 2, 0),            # role.c:679
-        enadv=RaceAdvance(0, 0, 0, 0, 0, 0),            # role.c:680
+        mummynum=PM_DWARF_MUMMY,                        # role.c:630
+        zombienum=PM_DWARF_ZOMBIE,                      # role.c:631
+        allow=(MH_DWARF | ROLE_MALE | ROLE_FEMALE | ROLE_LAWFUL),     # role.c:632
+        selfmask=MH_DWARF, lovemask=(MH_DWARF | MH_GNOME), hatemask=MH_ORC,  # role.c:633-635
+        attrmin=(3, 3, 3, 3, 3, 3),                     # role.c:637
+        attrmax=(STR18(100), 16, 16, 20, 20, 16),       # role.c:638 -- CON cap 20
+        hpadv=RaceAdvance(4, 0, 0, 3, 2, 0),            # role.c:640
+        enadv=RaceAdvance(0, 0, 0, 0, 0, 0),            # role.c:641
     ),
-    # Gnome  -- role.c lines 682-702
+    # Gnome  -- role.c lines 643-662
     RaceEntry(
         noun="gnome", adj="gnomish", coll="gnomehood", filecode="Gno",
+        individual=(None, None),                        # role.c:648  {0, 0}
         malenum=PM_GNOME, femalenum=NON_PM,
-        allow=(MH_GNOME | ROLE_MALE | ROLE_FEMALE | ROLE_NEUTRAL),
-        selfmask=MH_GNOME, lovemask=(MH_DWARF | MH_GNOME), hatemask=MH_HUMAN,
-        attrmin=(3, 3, 3, 3, 3, 3),                     # role.c:697
-        attrmax=(STR18(50), 19, 18, 18, 18, 18),        # role.c:698 -- STR cap 18/50
-        hpadv=RaceAdvance(1, 0, 0, 1, 0, 0),            # role.c:700
-        enadv=RaceAdvance(2, 0, 2, 0, 2, 0),            # role.c:701
+        mummynum=PM_GNOME_MUMMY,                        # role.c:650
+        zombienum=PM_GNOME_ZOMBIE,                      # role.c:651
+        allow=(MH_GNOME | ROLE_MALE | ROLE_FEMALE | ROLE_NEUTRAL),    # role.c:652
+        selfmask=MH_GNOME, lovemask=(MH_DWARF | MH_GNOME), hatemask=MH_HUMAN,  # role.c:653-655
+        attrmin=(3, 3, 3, 3, 3, 3),                     # role.c:657
+        attrmax=(STR18(50), 19, 18, 18, 18, 18),        # role.c:658 -- STR cap 18/50
+        hpadv=RaceAdvance(1, 0, 0, 1, 0, 0),            # role.c:660
+        enadv=RaceAdvance(2, 0, 2, 0, 2, 0),            # role.c:661
     ),
-    # Orc  -- role.c lines 703-723
+    # Orc  -- role.c lines 663-682
     RaceEntry(
         noun="orc", adj="orcish", coll="orcdom", filecode="Orc",
+        individual=(None, None),                        # role.c:668  {0, 0}
         malenum=PM_ORC, femalenum=NON_PM,
-        allow=(MH_ORC | ROLE_MALE | ROLE_FEMALE | ROLE_CHAOTIC),
-        selfmask=MH_ORC, lovemask=0, hatemask=(MH_HUMAN | MH_ELF | MH_DWARF),
-        attrmin=(3, 3, 3, 3, 3, 3),                     # role.c:718
-        attrmax=(STR18(50), 16, 16, 18, 18, 16),        # role.c:719 -- WIS cap 16
-        hpadv=RaceAdvance(1, 0, 0, 1, 0, 0),            # role.c:721
-        enadv=RaceAdvance(1, 0, 1, 0, 1, 0),            # role.c:722
+        mummynum=PM_ORC_MUMMY,                          # role.c:670
+        zombienum=PM_ORC_ZOMBIE,                        # role.c:671
+        allow=(MH_ORC | ROLE_MALE | ROLE_FEMALE | ROLE_CHAOTIC),      # role.c:672
+        selfmask=MH_ORC, lovemask=0, hatemask=(MH_HUMAN | MH_ELF | MH_DWARF),  # role.c:673-675
+        attrmin=(3, 3, 3, 3, 3, 3),                     # role.c:677
+        attrmax=(STR18(50), 16, 16, 18, 18, 16),        # role.c:678 -- WIS cap 16
+        hpadv=RaceAdvance(1, 0, 0, 1, 0, 0),            # role.c:680
+        enadv=RaceAdvance(1, 0, 1, 0, 1, 0),            # role.c:681
     ),
 )
 

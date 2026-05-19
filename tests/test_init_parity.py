@@ -93,23 +93,29 @@ def test_wizard_initial_int_18():
 
 
 def test_priest_initial_alignment_record_5():
-    """Priest starts with u.ualign.record = role.initrecord = 5.
+    """Priest starts with u.ualign.record = role.initrecord = 0.
+
+    Wave 16b vendor-parity fix: Priest's ``initrecord`` field in
+    ``vendor/nethack/src/role.c:308`` is ``0``, not 5.  An earlier port
+    confused the slot with ``spelheal``/``spelshld`` (one field off from
+    vendor struct order).  The test name is preserved for archeology; the
+    expected value is now the byte-equal vendor truth.
 
     Vendor: u_init.c::ini_hpwp at ulevel==0 copies role.initrecord into
-    u.ualign.record (vendor/nle/src/attrib.c lines 992-995, vendor 3.7 line
-    1094).  PrayerState.alignment_record mirrors this field.
+    u.ualign.record (vendor/nethack/src/u_init.c).  PrayerState.alignment_record
+    mirrors this field.
     """
     from Nethax.nethax.constants.roles import Role, get_role
 
-    # Vendor table value.
-    assert int(get_role(Role.PRIEST).initrecord) == 5, (
-        "vendor role.c Priest initrecord must be 5"
+    # Vendor table value (role.c:308).
+    assert int(get_role(Role.PRIEST).initrecord) == 0, (
+        "vendor role.c:308 Priest initrecord must be 0"
     )
 
     state = _reset_as(Role.PRIEST)
     rec = int(state.prayer.alignment_record)
-    assert rec == 5, (
-        f"Priest alignment_record={rec}, expected 5 from role.initrecord"
+    assert rec == 0, (
+        f"Priest alignment_record={rec}, expected 0 from role.initrecord"
     )
 
 

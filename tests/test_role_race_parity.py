@@ -152,9 +152,20 @@ def test_healer_attrbase_high_cha():
 # ---------------------------------------------------------------------------
 
 def test_priest_initrec_alignment_record_starts_at_5():
-    """Priest begins as a faithful servant -- initial alignment record == 5."""
+    """Priest's ``initrecord`` field == 0 per vendor role.c:308.
+
+    Historical note: an earlier port stored ``spelheal``/``spelshld`` in the
+    ``initrecord`` slot (one field off from vendor struct order), which made
+    Priest appear to start at 5.  Wave 16b fixed the schema; vendor truth is
+    Priest=0 (role.c:308), Archeologist=10, Barbarian=10, Caveman=0,
+    Healer=10, Knight=10, Monk=10, Ranger=10, Rogue=10, Samurai=10,
+    Tourist=0, Valkyrie=0, Wizard=0.
+
+    The test name is preserved so CI archeology still resolves; the docstring
+    reflects the post-Wave-16b vendor truth.
+    """
     p = get_role(Role.PRIEST)
-    assert p.initrecord == 5
+    assert p.initrecord == 0
 
 
 # ---------------------------------------------------------------------------

@@ -624,12 +624,32 @@ def init_skills(role) -> SkillState:
     weapon.c::init_weapons which we do not yet model; keeping them at 0
     is conservative and consistent with the default).
 
-    Cite: vendor/nethack/src/u_init.c — Skill_X tables; weapon.c::init_weapons.
+    Additional vendor parity: roles whose ``petnum == PM_PONY`` (Knight)
+    start with ``P_SKILL(P_RIDING) = P_BASIC`` per vendor
+    ``weapon.c::skill_init`` lines 1787-1789:
+
+        /* Roles that start with a horse know how to ride it */
+        if (gu.urole.petnum == PM_PONY)
+            P_SKILL(P_RIDING) = P_BASIC;
+
+    Cite: vendor/nethack/src/u_init.c — Skill_X tables;
+          vendor/nethack/src/weapon.c::skill_init lines 1737-1810.
     """
+    from Nethax.nethax.constants.roles import get_role, PM_PONY
+
     role_idx = int(role) if not isinstance(role, int) else role
     caps = _ROLE_SKILL_CAPS[role_idx]  # [N_SKILLS] int8
+
+    # Vendor weapon.c:1787-1789 — pony-starting roles begin at P_BASIC riding.
+    initial_levels = jnp.zeros((N_SKILLS,), dtype=jnp.int8)
+    role_entry = get_role(role_idx)
+    if role_entry.petnum == PM_PONY:
+        initial_levels = initial_levels.at[int(SkillId.RIDING)].set(
+            jnp.int8(SkillLevel.P_BASIC)
+        )
+
     return SkillState(
-        level=jnp.zeros((N_SKILLS,), dtype=jnp.int8),
+        level=initial_levels,
         advance=jnp.zeros((N_SKILLS,), dtype=jnp.int32),
         max_level=caps,
     )
