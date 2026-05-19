@@ -34,6 +34,7 @@ from Nethax.nethax.subsystems.character import create_character, get_starting_pe
 from Nethax.nethax.subsystems.skills import init_skills
 from Nethax.nethax.subsystems.digging import dig_tick as _dig_tick
 from Nethax.nethax.subsystems.swallow import digest_tick as _digest_tick
+from Nethax.nethax.subsystems.experience import newexplevel as _newexplevel
 
 
 class NethaxEnv:
@@ -219,7 +220,7 @@ def _step_impl(state, action, rng):
         timestep increases; no separate decrement call is needed here.
         Cite: vendor/nethack/src/light.c::do_light_sources.
     """
-    rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow = jax.random.split(rng, 6)
+    rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow, rng_explvl = jax.random.split(rng, 7)
     already_done = state.done
 
     def _do_step(_):
@@ -254,6 +255,11 @@ def _step_impl(state, action, rng):
             player_pw=new_pw,
             done=new_done,
         )
+
+        # 4a. Experience-level check — vendor exper.c::newexplevel called from
+        #    allmain.c (after nh_timeout / before the next turn).  Promotes
+        #    ulevel when uexp crosses the next newuexp(ulevel) threshold.
+        ns = _newexplevel(ns, rng_explvl)
 
         # 4b. Swallow/engulf digestion tick — vendor/nethack/src/mhitu.c:1418.
         ns = _digest_tick(ns, rng_swallow)

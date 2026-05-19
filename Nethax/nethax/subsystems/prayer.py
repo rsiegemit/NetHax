@@ -850,14 +850,11 @@ def _apply_luck_giving(state):
 def _apply_drain_level(state):
     """DRAIN_LEVEL: angrygods cases 2-3 losexp() effect (pray.c:742).
 
-    Decrements XL by 1 (floor 1) and shaves matching HP_max.
+    Delegates to vendor/nethack/src/exper.c::losexp — XL-=1, HP/Pw maxima
+    shaved by the per-level uhpinc/ueninc, uexp resynced to newuexp(ulevel)-1.
     """
-    new_xl = jnp.maximum(state.player_xl - jnp.int32(1), jnp.int32(1)).astype(jnp.int32)
-    new_hp_max = jnp.maximum(state.player_hp_max - jnp.int32(5), jnp.int32(5)).astype(jnp.int32)
-    new_hp = jnp.minimum(state.player_hp, new_hp_max).astype(jnp.int32)
-    return state.replace(
-        player_xl=new_xl, player_hp_max=new_hp_max, player_hp=new_hp,
-    )
+    from Nethax.nethax.subsystems.experience import losexp as _xp_losexp
+    return _xp_losexp(state)
 
 
 def _apply_smite_3d6(state, rng: jax.Array):

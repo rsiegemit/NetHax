@@ -875,7 +875,7 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int):
     # Vendor: u.urace.attrmax[] set during init_attr from race.attrmax[].
     # STR cap > 18 (18/** range) is clamped to 18 here since int8 can't
     # hold values > 127; restore_ability uses this as the per-stat ceiling.
-    # Stat order matches _STAT_NAMES: str(0), int(1), wis(2), dex(3), con(4), cha(5).
+    # Stat order matches _STAT_NAMES: str, int, wis, dex, con, cha.
     # Cite: vendor/nethack/src/u_init.c lines 250-580;
     #       vendor/nethack/src/potion.c::peffect_restore_ability (full_restore).
     race_entry = get_race(race)

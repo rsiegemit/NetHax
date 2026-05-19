@@ -355,7 +355,13 @@ def compute_final_score(state) -> jnp.ndarray:
     """
     scoring = state.scoring
 
-    xp_pts    = jnp.int32(scoring.experience_points)
+    # u.urexp is the vendor 64-bit running-score accumulator (you.h:399;
+    # topten.c:675 ``t0->points = u.urexp``).  ``more_experienced`` keeps
+    # ScoringState.experience_points (int32) in sync with player_urexp so
+    # both fields are valid sources; take the max to remain backward-compat
+    # with callers that wrote only experience_points pre-wave16a.
+    urexp_i32 = jnp.int32(state.player_urexp)
+    xp_pts    = jnp.maximum(urexp_i32, jnp.int32(scoring.experience_points))
     gold      = jnp.int32(state.player_gold)
     deepest   = jnp.int32(scoring.deepest_level)
 

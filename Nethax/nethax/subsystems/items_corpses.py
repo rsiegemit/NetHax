@@ -261,10 +261,19 @@ def apply_corpse_postfx(
     # 4. Special one-off effects
     # ------------------------------------------------------------------
 
-    # Wraith: +1 XL (pluslvl)  cite: eat.c:1141-1142
+    # Wraith: +1 XL via pluslvl(incr=False)  cite: eat.c:1141-1142.
+    # Vendor calls pluslvl(FALSE) which rolls newhp()/newpw() and sets
+    # uexp = newuexp(ulevel); we route through experience.pluslvl so the
+    # uhpinc / ueninc / urexp bookkeeping stays consistent.
     is_wraith  = is_corpse & (safe_idx == jnp.int32(_WRAITH_IDX_NP))
-    new_xl = jnp.where(is_wraith, state.player_xl + jnp.int32(1), state.player_xl)
-    state  = state.replace(player_xl=new_xl)
+    from Nethax.nethax.subsystems.experience import pluslvl as _xp_pluslvl
+    rng, rng_wraith = jax.random.split(rng)
+    state = jax.lax.cond(
+        is_wraith,
+        lambda s: _xp_pluslvl(s, rng_wraith, incr=False),
+        lambda s: s,
+        state,
+    )
 
     # Newt: eye_of_newt_buzz — small chance to bump pw_max
     # cite: eat.c:1311 ``if (attacktype(ptr, AT_MAGC) || pm == PM_NEWT) eye_of_newt_buzz()``

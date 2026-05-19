@@ -116,8 +116,19 @@ class EnvState:
     player_hp_max: jax.Array    # int32
     player_pw: jax.Array        # int32
     player_pw_max: jax.Array    # int32
-    player_xp: jax.Array        # int32  experience points
-    player_xl: jax.Array        # int32  experience level
+    player_xp: jax.Array        # int32  experience points (u.uexp)
+    player_xl: jax.Array        # int32  experience level (u.ulevel)
+    # u.urexp — vendor 64-bit running score accumulator (you.h:399).  Bumped
+    # by ``more_experienced`` (exper.c:168-203) with 4*xp + extra rexp; used as
+    # the final-score base in really_done (end.c:1325-1352) / topten.c:675.
+    player_urexp: jax.Array     # int64  u.urexp
+    # u.uhpinc[MAXULEV] / u.ueninc[MAXULEV] — per-level HP/Pw increments saved
+    # by newhp()/newpw() so losexp() can subtract the same amount when a level
+    # is drained.  Cite: vendor/nethack/include/you.h:480-481;
+    # exper.c::losexp (lines 251, 269).
+    # Spec uses [31] (MAXULEV+1) so index by ulevel directly without -1.
+    player_uhpinc: jax.Array    # int16[31]
+    player_ueninc: jax.Array    # int16[31]
     player_role: jax.Array      # int8   Role enum value
     player_race: jax.Array      # int8   Race enum value
     player_align: jax.Array     # int8   Alignment enum value
@@ -148,11 +159,11 @@ class EnvState:
 
     # ---- Per-stat race+role attribute maxima (vendor u.urace.attrmax[]) ----
     # int8[6]: per-stat racial/role max for STR/INT/WIS/DEX/CON/CHA (attrib.h order).
-    # STR is capped at 18 in this field (18/** percentile range NOT encoded here).
+    # STR is capped at 18 in this field (the 18/** percentile range is NOT encoded
+    # here — restore_ability clamps to this value).
     # Cite: vendor/nethack/src/u_init.c lines 250-580 (init_attr race cap loop);
     #       vendor/nethack/src/potion.c::peffect_restore_ability (full_restore).
     player_amax:      jax.Array  # int8[6]
-
     # TODO (post-Wave-6): mirror u.uintrinsic[] timed-intrinsic array and
     # u.uprops[LAST_PROP+1] property timers — currently fielded indirectly
     # through StatusState (status_effects.py); revisit when an end-to-end
@@ -264,6 +275,9 @@ class EnvState:
             player_pw_max=jnp.int32(0),
             player_xp=jnp.int32(0),
             player_xl=jnp.int32(1),
+            player_urexp=jnp.int64(0),
+            player_uhpinc=jnp.zeros((31,), dtype=jnp.int16),
+            player_ueninc=jnp.zeros((31,), dtype=jnp.int16),
             player_role=jnp.int8(0),
             player_race=jnp.int8(0),
             player_align=jnp.int8(0),
@@ -290,7 +304,7 @@ class EnvState:
             player_killer_mid=jnp.uint32(0),
             player_mortality=jnp.int32(0),
             # per-stat attribute maxima (vendor u.urace.attrmax[]; init_attr race cap)
-            # Default: 18 for all stats (human unconstrained cap, capped at int8 max).
+            # Default: 18 for all stats (human unconstrained cap).
             # Cite: vendor/nethack/src/u_init.c init_attr; potion.c peffect_restore_ability.
             player_amax=jnp.full((6,), 18, dtype=jnp.int8),
             # artifact invoke cooldown

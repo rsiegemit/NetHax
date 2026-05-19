@@ -97,8 +97,11 @@ def test_score_includes_xp_and_gold():
     """Final score = experience_points + gold + dlevel_bonus + conduct + ..."""
     state = _violate_all_conducts(_fresh_state())
     # Inject XP and gold; deepest_level=1 (no dlevel bonus); no amulet/ascend.
+    # wave16a: compute_final_score now reads u.urexp (state.player_urexp);
+    # mirror the test addend there too.
     state = state.replace(
         scoring=add_experience(state.scoring, jnp.int32(123)),
+        player_urexp=jnp.int64(123),
         player_gold=jnp.int32(50),
     )
     assert int(compute_final_score(state)) == 123 + 50
@@ -153,6 +156,7 @@ def test_score_ascension_doubles_xp():
     state = _violate_all_conducts(_fresh_state())
     state = state.replace(
         scoring=add_experience(mark_ascended(state.scoring), jnp.int32(500)),
+        player_urexp=jnp.int64(500),
     )
     assert int(compute_final_score(state)) == 1000
 
