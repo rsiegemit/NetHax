@@ -578,17 +578,37 @@ def _effect_paralysis(state, rng, buc):
 
 
 def _effect_sleeping(state, rng, buc):
-    """potion of sleeping — put the player to sleep.
+    """potion of sleeping — byte-equal to vendor peffect_sleeping.
 
-    Canonical: peffect_sleeping — fall_asleep(-rn1(10,25-12*bcsign)).
-    Wave 3: 20 turns (blessed 8, cursed 28) of SLEEP status.
+    vendor/nethack/src/potion.c::peffect_sleeping:
+        if (Sleep_resistance) {
+            monstseesu(M_SEEN_SLEEP);  /* no sleep */
+        } else {
+            fall_asleep(-(rn1(10, 25 - 12 * bcsign(otmp))), TRUE);
+        }
+
+    rn1(10, M) = uniform [M, M+9] with M = 25-12*bcsign:
+        cursed   → [37, 46]
+        uncursed → [25, 34]
+        blessed  → [13, 22]
+    SLEEP_RES intrinsic gives immunity.
     """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    from Nethax.nethax.rng import rn2
+
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
-    turns   = jnp.where(blessed, jnp.int32(8),
-              jnp.where(cursed,  jnp.int32(28), jnp.int32(20)))
+    bcsign  = jnp.where(blessed, jnp.int32(1),
+              jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+    m_base  = jnp.int32(25) - jnp.int32(12) * bcsign
+    n_part  = rn2(rng, 10).astype(jnp.int32)
+    turns   = n_part + m_base
+
+    has_sleep_res = state.status.intrinsics[int(Intrinsic.RESIST_SLEEP)]
+    final_turns = jnp.where(has_sleep_res, jnp.int32(0), turns)
+
     cur = state.status.timed_statuses[int(TimedStatus.SLEEP)]
-    new_val = jnp.maximum(cur, turns)
+    new_val = jnp.maximum(cur, final_turns)
     new_ts  = state.status.timed_statuses.at[int(TimedStatus.SLEEP)].set(new_val)
     new_status = state.status.replace(timed_statuses=new_ts)
     return state.replace(status=new_status)
