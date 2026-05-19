@@ -543,6 +543,15 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
     # Ground item at top of stack (index 0)
     ground_cat  = ground_items.category[branch, level, row, col, 0]
     has_item    = ground_cat != 0
+    # Vendor pickup.c::pickup — gold is handled via add_to_money(quan), never
+    # consumes an inventory letter. Detect COIN_CLASS here so we route the
+    # quantity into u.umoney0 (state.player_gold) instead of an inventory slot.
+    is_gold = has_item & (ground_cat == jnp.int8(ItemCategory.COIN))
+    gold_qty = jnp.where(
+        is_gold,
+        ground_items.quantity[branch, level, row, col, 0].astype(jnp.int32),
+        jnp.int32(0),
+    )
 
     # Find first empty inventory slot via lax.scan
     def _find_slot(carry, idx):
@@ -557,47 +566,49 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
         (jnp.bool_(False), jnp.int32(0)),
         jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32),
     )
-    can_pickup = has_item & found
+    # Non-gold items still need a slot; gold pickup ignores the slot check.
+    can_pickup = (has_item & found & ~is_gold) | is_gold
 
     # Helpers to read one scalar field from a ground tile position
     def _g(field, default):
         val = field[branch, level, row, col, 0]
         return jnp.where(can_pickup, val, default)
 
-    # Write ground item into the chosen inventory slot
+    # Write ground item into the chosen inventory slot (skip for gold).
     safe_slot = jnp.clip(free_slot, 0, MAX_INVENTORY_SLOTS - 1)
     new_items = state.inventory.items
+    write_slot = can_pickup & ~is_gold
 
     new_items = new_items.replace(
         category   = new_items.category.at[safe_slot].set(
-            jnp.where(can_pickup, ground_items.category[branch, level, row, col, 0], new_items.category[safe_slot])
+            jnp.where(write_slot, ground_items.category[branch, level, row, col, 0], new_items.category[safe_slot])
         ),
         type_id    = new_items.type_id.at[safe_slot].set(
-            jnp.where(can_pickup, ground_items.type_id[branch, level, row, col, 0], new_items.type_id[safe_slot])
+            jnp.where(write_slot, ground_items.type_id[branch, level, row, col, 0], new_items.type_id[safe_slot])
         ),
         buc_status = new_items.buc_status.at[safe_slot].set(
-            jnp.where(can_pickup, ground_items.buc_status[branch, level, row, col, 0], new_items.buc_status[safe_slot])
+            jnp.where(write_slot, ground_items.buc_status[branch, level, row, col, 0], new_items.buc_status[safe_slot])
         ),
         enchantment = new_items.enchantment.at[safe_slot].set(
-            jnp.where(can_pickup, ground_items.enchantment[branch, level, row, col, 0], new_items.enchantment[safe_slot])
+            jnp.where(write_slot, ground_items.enchantment[branch, level, row, col, 0], new_items.enchantment[safe_slot])
         ),
         charges    = new_items.charges.at[safe_slot].set(
-            jnp.where(can_pickup, ground_items.charges[branch, level, row, col, 0], new_items.charges[safe_slot])
+            jnp.where(write_slot, ground_items.charges[branch, level, row, col, 0], new_items.charges[safe_slot])
         ),
         identified = new_items.identified.at[safe_slot].set(
-            jnp.where(can_pickup, ground_items.identified[branch, level, row, col, 0], new_items.identified[safe_slot])
+            jnp.where(write_slot, ground_items.identified[branch, level, row, col, 0], new_items.identified[safe_slot])
         ),
         quantity   = new_items.quantity.at[safe_slot].set(
-            jnp.where(can_pickup, ground_items.quantity[branch, level, row, col, 0], new_items.quantity[safe_slot])
+            jnp.where(write_slot, ground_items.quantity[branch, level, row, col, 0], new_items.quantity[safe_slot])
         ),
         weight     = new_items.weight.at[safe_slot].set(
-            jnp.where(can_pickup, ground_items.weight[branch, level, row, col, 0], new_items.weight[safe_slot])
+            jnp.where(write_slot, ground_items.weight[branch, level, row, col, 0], new_items.weight[safe_slot])
         ),
         ac_bonus   = new_items.ac_bonus.at[safe_slot].set(
-            jnp.where(can_pickup, ground_items.ac_bonus[branch, level, row, col, 0], new_items.ac_bonus[safe_slot])
+            jnp.where(write_slot, ground_items.ac_bonus[branch, level, row, col, 0], new_items.ac_bonus[safe_slot])
         ),
         is_two_handed = new_items.is_two_handed.at[safe_slot].set(
-            jnp.where(can_pickup, ground_items.is_two_handed[branch, level, row, col, 0], new_items.is_two_handed[safe_slot])
+            jnp.where(write_slot, ground_items.is_two_handed[branch, level, row, col, 0], new_items.is_two_handed[safe_slot])
         ),
     )
 
@@ -612,7 +623,9 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
         items=new_items,
         total_weight=total_weight(new_items),
     )
-    new_state = state.replace(inventory=new_inv)
+    # Vendor pickup.c::pickup — gold goes to u.umoney0 (state.player_gold).
+    new_gold = state.player_gold + gold_qty
+    new_state = state.replace(inventory=new_inv, player_gold=new_gold)
     return new_state, new_ground_items
 
 

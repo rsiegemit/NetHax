@@ -630,28 +630,31 @@ def compute_encumbrance(
 ) -> jnp.ndarray:
     """Map current carried weight vs capacity to Encumbrance level.
 
-    Threshold table (hack.c near_capacity / weight_cap):
-      weight ≤ capacity       → UNENCUMBERED (0)
-      weight ≤ capacity × 1.5 → BURDENED     (1)
-      weight ≤ capacity × 2.5 → STRESSED     (2)
-      weight ≤ capacity × 4.5 → STRAINED     (3)
-      weight ≤ capacity × 6.0 → OVERTAXED    (4)
-      weight  > capacity × 6.0 → OVERLOADED  (5)
+    Byte-equal to vendor/nethack/src/hack.c::calc_capacity lines 4372-4382:
 
-    Uses integer arithmetic scaled by 2 to avoid floats:
-      × 1.5 cap → weight * 2 ≤ cap * 3
-      × 2.5 cap → weight * 2 ≤ cap * 5
-      × 4.5 cap → weight * 2 ≤ cap * 9
-      × 6.0 cap → weight * 1 ≤ cap * 6
+        int cap, wt = inv_weight() + xtra_wt;
+        if (wt <= 0)        return UNENCUMBERED;
+        if (gw.wc <= 1)     return OVERLOADED;
+        cap = (wt * 2 / gw.wc) + 1;
+        return min(cap, OVERLOADED);
+
+    Note: any positive weight already puts the hero at BURDENED (cap≥1).
+    Earlier Nethax thresholds (×1.5/×2.5/×4.5/×6.0) were a fabrication.
     """
-    w2 = jnp.int32(weight) * jnp.int32(2)
-    cap = jnp.int32(capacity)
-    enc = jnp.where(w2 <= cap * jnp.int32(2),  jnp.int8(Encumbrance.UNENCUMBERED),
-          jnp.where(w2 <= cap * jnp.int32(3),  jnp.int8(Encumbrance.BURDENED),
-          jnp.where(w2 <= cap * jnp.int32(5),  jnp.int8(Encumbrance.STRESSED),
-          jnp.where(w2 <= cap * jnp.int32(9),  jnp.int8(Encumbrance.STRAINED),
-          jnp.where(w2 <= cap * jnp.int32(12), jnp.int8(Encumbrance.OVERTAXED),
-                                                jnp.int8(Encumbrance.OVERLOADED))))))
+    wt = jnp.int32(weight)
+    cap_w = jnp.int32(capacity)
+    raw_cap = (wt * jnp.int32(2)) // jnp.maximum(cap_w, jnp.int32(1)) + jnp.int32(1)
+    clamped = jnp.minimum(raw_cap, jnp.int32(Encumbrance.OVERLOADED))
+    # wt <= 0 → UNENCUMBERED; capacity <= 1 (edge) → OVERLOADED.
+    enc = jnp.where(
+        wt <= jnp.int32(0),
+        jnp.int8(Encumbrance.UNENCUMBERED),
+        jnp.where(
+            cap_w <= jnp.int32(1),
+            jnp.int8(Encumbrance.OVERLOADED),
+            clamped.astype(jnp.int8),
+        ),
+    )
     return enc
 
 

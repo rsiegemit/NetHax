@@ -271,11 +271,22 @@ _NON_RL_ACTIONS = (
     Command.WHATIS,
 )
 
-# USEFUL_ACTIONS: 101-action RL subset.
-# Matches vendor/nle: drops only the 20 NON_RL_ACTIONS; keeps all TextCharacters.
-_useful = [a for a in ACTIONS if a not in _NON_RL_ACTIONS]
+# USEFUL_ACTIONS: 86-action RL subset.
+# Matches vendor/nle/nle/nethack/actions.py:247-251 byte-for-byte:
+#   _USEFUL_ACTIONS = list(ACTIONS)
+#   for action in NON_RL_ACTIONS + tuple(TextCharacters):
+#       _USEFUL_ACTIONS.remove(action)
+#   _USEFUL_ACTIONS.append(TextCharacters.SPACE)
+# NOTE: list.remove() removes the FIRST == match. Because Command.SEEAMULET
+# (=='"') and TextCharacters.QUOTE share an int value, etc., the QUOTE
+# iteration actually removes SEEAMULET (it comes first in ACTIONS); QUOTE
+# itself stays in the list. Same for DOLLAR/SEEGOLD and PLUS/SEESPELLS.
+_useful = list(ACTIONS)
+for _act in _NON_RL_ACTIONS + tuple(TextCharacters):
+    _useful.remove(_act)
+_useful.append(TextCharacters.SPACE)
 USEFUL_ACTIONS: tuple = tuple(_useful)
-del _useful
+del _useful, _act
 
 # ---------------------------------------------------------------------------
 # TODO (Wave 2+):
