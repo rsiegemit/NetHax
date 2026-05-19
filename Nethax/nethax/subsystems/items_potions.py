@@ -207,32 +207,136 @@ def _effect_gain_energy(state, rng, buc):
 # ---- ability score group --------------------------------------------------
 
 def _effect_gain_ability(state, rng, buc):
-    """potion of gain ability — random stat increase (or all stats if blessed).
+    """potion of gain ability — stat changes by BUC.
 
-    Canonical: peffect_gain_ability — adjattrib(random stat, +1).
-    Wave 3: blessed → +1 STR; uncursed → +1 STR; cursed → -1 STR.
+    Canonical: vendor/nethack/src/potion.c:1030 peffect_gain_ability.
+      blessed  : +1 to ALL six stats (STR/INT/WIS/DEX/CON/CHA), clipped 3..25.
+      uncursed : pick one of the six stats uniformly (rn2(6)) and +1 it.
+      cursed   : -1 to STR (existing behaviour preserved).
+
+    Stat order in lax.switch: STR(0) INT(1) WIS(2) DEX(3) CON(4) CHA(5).
     """
-    cursed = _is_cursed(buc)
-    delta  = jnp.where(cursed, jnp.int16(-1), jnp.int16(1))
-    new_str = jnp.clip(state.player_str + delta, jnp.int16(3), jnp.int16(25))
-    return state.replace(player_str=new_str)
+    from Nethax.nethax.rng import rn2
+
+    cursed  = _is_cursed(buc)
+    blessed = _is_blessed(buc)
+
+    # --- Cursed branch: STR -1 (existing).
+    str_cursed = jnp.clip(state.player_str + jnp.int16(-1), jnp.int16(3), jnp.int16(25))
+
+    # --- Blessed branch: +1 to all six stats, clipped to [3, 25].
+    str_blessed = jnp.clip(state.player_str + jnp.int16(1), jnp.int16(3), jnp.int16(25))
+    int_blessed = jnp.clip(state.player_int.astype(jnp.int16) + jnp.int16(1),
+                           jnp.int16(3), jnp.int16(25)).astype(jnp.int8)
+    wis_blessed = jnp.clip(state.player_wis.astype(jnp.int16) + jnp.int16(1),
+                           jnp.int16(3), jnp.int16(25)).astype(jnp.int8)
+    dex_blessed = jnp.clip(state.player_dex.astype(jnp.int16) + jnp.int16(1),
+                           jnp.int16(3), jnp.int16(25)).astype(jnp.int8)
+    con_blessed = jnp.clip(state.player_con.astype(jnp.int16) + jnp.int16(1),
+                           jnp.int16(3), jnp.int16(25)).astype(jnp.int8)
+    cha_blessed = jnp.clip(state.player_cha.astype(jnp.int16) + jnp.int16(1),
+                           jnp.int16(3), jnp.int16(25)).astype(jnp.int8)
+
+    # --- Uncursed branch: rn2(6) picks one stat to +1.
+    pick = rn2(rng, 6)  # 0..5
+
+    def _inc_str(_):
+        new_s = jnp.clip(state.player_str + jnp.int16(1), jnp.int16(3), jnp.int16(25))
+        return (new_s, state.player_int, state.player_wis,
+                state.player_dex, state.player_con, state.player_cha)
+
+    def _inc_int(_):
+        new_i = jnp.clip(state.player_int.astype(jnp.int16) + jnp.int16(1),
+                         jnp.int16(3), jnp.int16(25)).astype(jnp.int8)
+        return (state.player_str, new_i, state.player_wis,
+                state.player_dex, state.player_con, state.player_cha)
+
+    def _inc_wis(_):
+        new_w = jnp.clip(state.player_wis.astype(jnp.int16) + jnp.int16(1),
+                         jnp.int16(3), jnp.int16(25)).astype(jnp.int8)
+        return (state.player_str, state.player_int, new_w,
+                state.player_dex, state.player_con, state.player_cha)
+
+    def _inc_dex(_):
+        new_d = jnp.clip(state.player_dex.astype(jnp.int16) + jnp.int16(1),
+                         jnp.int16(3), jnp.int16(25)).astype(jnp.int8)
+        return (state.player_str, state.player_int, state.player_wis,
+                new_d, state.player_con, state.player_cha)
+
+    def _inc_con(_):
+        new_c = jnp.clip(state.player_con.astype(jnp.int16) + jnp.int16(1),
+                         jnp.int16(3), jnp.int16(25)).astype(jnp.int8)
+        return (state.player_str, state.player_int, state.player_wis,
+                state.player_dex, new_c, state.player_cha)
+
+    def _inc_cha(_):
+        new_ch = jnp.clip(state.player_cha.astype(jnp.int16) + jnp.int16(1),
+                          jnp.int16(3), jnp.int16(25)).astype(jnp.int8)
+        return (state.player_str, state.player_int, state.player_wis,
+                state.player_dex, state.player_con, new_ch)
+
+    (str_un, int_un, wis_un, dex_un, con_un, cha_un) = jax.lax.switch(
+        pick.astype(jnp.int32),
+        [_inc_str, _inc_int, _inc_wis, _inc_dex, _inc_con, _inc_cha],
+        None,
+    )
+
+    # --- Select by BUC.
+    final_str = jnp.where(
+        cursed, str_cursed,
+        jnp.where(blessed, str_blessed, str_un),
+    )
+    final_int = jnp.where(
+        cursed, state.player_int,
+        jnp.where(blessed, int_blessed, int_un),
+    )
+    final_wis = jnp.where(
+        cursed, state.player_wis,
+        jnp.where(blessed, wis_blessed, wis_un),
+    )
+    final_dex = jnp.where(
+        cursed, state.player_dex,
+        jnp.where(blessed, dex_blessed, dex_un),
+    )
+    final_con = jnp.where(
+        cursed, state.player_con,
+        jnp.where(blessed, con_blessed, con_un),
+    )
+    final_cha = jnp.where(
+        cursed, state.player_cha,
+        jnp.where(blessed, cha_blessed, cha_un),
+    )
+
+    return state.replace(
+        player_str=final_str,
+        player_int=final_int,
+        player_wis=final_wis,
+        player_dex=final_dex,
+        player_con=final_con,
+        player_cha=final_cha,
+    )
 
 
 def _effect_restore_ability(state, rng, buc):
     """potion of restore ability — restore drained stats to race/role maxima.
 
     Canonical: peffect_restore_ability (potion.c) — calls full_restore() which
-    sets each stat to its undrained maximum (u.urace.attrmax).  We use
-    state.player_amax[i] as the per-stat ceiling, matching vendor u.urace.attrmax[].
-    Only raises stats below amax; never lowers a stat already above amax.
+    restores every drained stat to its exercise-adjusted maximum (u.urace.attrmax).
+    We use state.player_amax[i] as the per-stat ceiling, matching vendor
+    u.urace.attrmax[] populated during init_attr.
 
-    Stat order in player_amax: str(0) int(1) wis(2) dex(3) con(4) cha(5).
-    STR is int16; the rest are int8.
+    Stat order in player_amax matches _STAT_NAMES: str(0) int(1) wis(2) dex(3) con(4) cha(5).
+    STR is int16 (0..125 range); rest are int8.
 
     Cite: vendor/nethack/src/potion.c::peffect_restore_ability;
           vendor/nethack/src/u_init.c lines 250-580 (init_attr race cap).
     """
     amax = state.player_amax  # int8[6]: str,int,wis,dex,con,cha
+    new_str = jnp.minimum(
+        jnp.maximum(state.player_str, jnp.int16(amax[0])),
+        state.player_str,   # never raise above current if already above amax
+    )
+    # restore: set to amax[i] if current < amax[i], else leave unchanged
     new_str = jnp.where(state.player_str < amax[0].astype(jnp.int16),
                         amax[0].astype(jnp.int16), state.player_str)
     new_dex = jnp.where(state.player_dex < amax[3], amax[3], state.player_dex)

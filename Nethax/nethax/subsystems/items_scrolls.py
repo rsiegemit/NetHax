@@ -235,11 +235,44 @@ _GENOCIDE_CLASS_POOL: jnp.ndarray = jnp.array(
 )
 
 
-def _kill_all_of_symbol(state, chosen_class):
-    """Kill every live monster on the current level whose MONSTERS[entry].symbol
-    equals ``chosen_class`` (jnp int32 scalar).
+def apply_genocide_single(state, entry_idx) -> object:
+    """Genocide a single monster species by MONSTERS index (mndx).
 
-    JIT-safe.  Always marks GENOCIDELESS regardless of whether any matched.
+    Vendor reference: vendor/nethack/src/read.c::do_genocide lines 2826-3015.
+    When the player names a single creature (vendor "specific" path), every
+    live monster with that exact ``mndx`` is killed and the species flag is
+    set in ``state.genocided_species[entry_idx]``.
+
+    JIT-pure: index masking via jnp.where; always flips GENOCIDELESS.
+    """
+    from Nethax.nethax.subsystems.conduct import Conduct, mark_violated
+
+    mai = state.monster_ai
+    ei = jnp.int32(entry_idx)
+    safe_entry = jnp.clip(mai.entry_idx.astype(jnp.int32),
+                          0, _MONSTER_SYMBOL_TABLE.shape[0] - 1)
+    is_match = mai.alive & (safe_entry == ei)
+    new_alive = jnp.where(is_match, jnp.bool_(False), mai.alive)
+    new_hp    = jnp.where(is_match, jnp.int32(0), mai.hp)
+    new_mai   = mai.replace(alive=new_alive, hp=new_hp)
+
+    n_species = state.genocided_species.shape[0]
+    safe_ei = jnp.clip(ei, 0, n_species - 1)
+    new_geno = state.genocided_species.at[safe_ei].set(jnp.bool_(True))
+
+    new_state = state.replace(monster_ai=new_mai, genocided_species=new_geno)
+    return mark_violated(new_state, int(Conduct.GENOCIDELESS))
+
+
+def _kill_all_of_symbol(state, chosen_class):
+    """Kill every live monster whose MONSTERS[entry].symbol equals
+    ``chosen_class`` (jnp int32 scalar) by applying the single-mndx genocide
+    sweep to every matching mndx.
+
+    Per vendor/nethack/src/read.c::do_genocide (lines 2826-3015), genociding
+    by class iterates every mndx in that class — implemented here as a
+    single vectorised sweep + per-mndx flag update so this remains JIT-safe.
+    Always marks GENOCIDELESS regardless of whether any monsters matched.
     """
     from Nethax.nethax.subsystems.conduct import Conduct, mark_violated
 
@@ -249,28 +282,61 @@ def _kill_all_of_symbol(state, chosen_class):
                           0, symbol_table.shape[0] - 1)
     mon_symbols = symbol_table[safe_entry].astype(jnp.int32)
 
+    # Mark every mndx in the class as genocided (single-mndx semantics
+    # applied per-entry; mirrors vendor's per-mndx loop within do_genocide).
+    symbol_match_table = symbol_table.astype(jnp.int32) == jnp.int32(chosen_class)
+    new_genocided = jnp.where(
+        symbol_match_table, jnp.bool_(True), state.genocided_species
+    )
+
+    # Sweep live monsters of the class.
     is_match = mai.alive & (mon_symbols == jnp.int32(chosen_class))
     new_alive = jnp.where(is_match, jnp.bool_(False), mai.alive)
     new_hp    = jnp.where(is_match, jnp.int32(0), mai.hp)
-
     new_mai = mai.replace(alive=new_alive, hp=new_hp)
-    symbol_match_table = symbol_table.astype(jnp.int32) == jnp.int32(chosen_class)
-    new_genocided = jnp.where(symbol_match_table, jnp.bool_(True), state.genocided_species)
+
     new_state = state.replace(monster_ai=new_mai, genocided_species=new_genocided)
     return mark_violated(new_state, int(Conduct.GENOCIDELESS))
 
 
-def _apply_genocide(state, rng):
+def _apply_genocide(state, rng, buc=None):
     """Random-class genocide for the scroll-read flow (Wave 5 simplification).
 
     The player picks a class letter in vendor; we sample a class uniformly
     from ``_GENOCIDE_CLASS_POOL`` until a higher-layer UI supplies the pick.
+
+    Self-genocide (vendor read.c:2826-3015, Your_Own_Race macro read.c:9):
+        When the scroll is cursed AND the random class pick collides with the
+        player's race symbol, the player dies (player_hp = -1).
+        Race → symbol map:
+            HUMAN(0)/ELF(1) → S_HUMAN(53)
+            DWARF(2)        → S_HUMANOID(8)
+            GNOME(3)        → S_GNOME(33)
+            ORC(4)          → S_ORC(15)
     """
     class_pool = _GENOCIDE_CLASS_POOL
     n_classes = class_pool.shape[0]
     pick_idx = jax.random.randint(rng, (), 0, n_classes).astype(jnp.int32)
     chosen_class = class_pool[pick_idx].astype(jnp.int32)
-    return _kill_all_of_symbol(state, chosen_class)
+    new_state = _kill_all_of_symbol(state, chosen_class)
+
+    if buc is None:
+        return new_state
+
+    # Self-genocide check: cursed scroll + chosen class matches player's race symbol.
+    cursed = _is_cursed(buc)
+
+    # Race-index → symbol lookup table (HUMAN=0, ELF=1, DWARF=2, GNOME=3, ORC=4).
+    # Cite: vendor/nethack/src/read.c:9 Your_Own_Race(mndx) macro.
+    _RACE_TO_SYMBOL = jnp.array([53, 53, 8, 33, 15], dtype=jnp.int32)
+    race_idx = jnp.clip(new_state.player_race.astype(jnp.int32), 0, 4)
+    player_race_symbol = _RACE_TO_SYMBOL[race_idx]
+
+    is_own_race = chosen_class == player_race_symbol
+    kill_self = cursed & is_own_race
+
+    new_hp = jnp.where(kill_self, jnp.int32(-1), new_state.player_hp)
+    return new_state.replace(player_hp=new_hp)
 
 
 def apply_genocide(state, rng, class_letter=None):
@@ -812,11 +878,15 @@ def _effect_genocide(state, rng, buc):
     candidate list ``_GENOCIDE_CLASSES`` and kill every monster whose
     MONSTERS[entry_idx].symbol matches that class.
 
+    Self-genocide (vendor read.c:2826-3015, Your_Own_Race read.c:9):
+        Cursed scrolls that pick the player's own race symbol kill the
+        player (player_hp = -1).  ``buc`` is threaded in to gate this.
+
     Conduct: vendor/nethack/src/read.c::do_genocide — GENOCIDELESS broken on
     any successful genocide.  We mark the violation whenever the scroll is
     read (always, since the spell/scroll always executes a class pick).
     """
-    return _apply_genocide(state, rng)
+    return _apply_genocide(state, rng, buc)
 
 
 # ---- harmful effects -------------------------------------------------------

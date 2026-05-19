@@ -115,6 +115,8 @@ from Nethax.nethax.subsystems.prayer import handle_pray as _prayer_handle_pray
 from Nethax.nethax.subsystems.containers import (
     handle_loot as _containers_handle_loot,
     handle_apply_container as _containers_handle_apply,
+    cancel_bag_of_holding as _containers_cancel_boh,
+    ContainerType as _ContainerType,
 )
 from Nethax.nethax.subsystems.status_effects import (
     handle_eat as _status_handle_eat,
@@ -134,9 +136,7 @@ from Nethax.nethax.subsystems.riding import (
     try_mount as _riding_try_mount,
     try_dismount as _riding_try_dismount,
 )
-from Nethax.nethax.subsystems.monster_ai import (
-    pet_follow_on_stair as _pet_follow_on_stair,
-)
+from Nethax.nethax.subsystems.monster_ai import pet_follow_on_stair as _pet_follow_on_stair
 
 
 # ---------------------------------------------------------------------------
@@ -439,22 +439,25 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
 
     def _attack_branch(s):
         # Capture pre-attack alive flag at the matched slot so we can grant
-        # XP on kill (vendor/nethack/src/exper.c::experience).  Use a simple
-        # heuristic (max-hp / 4 + 1) since the full vendor formula depends
-        # on monst flags not currently materialized in state.
+        # XP on kill (vendor/nethack/src/exper.c::experience +
+        # more_experienced; exper.c:83-203).
         was_alive = s.monster_ai.alive[monster_idx]
         attacked, _dmg, _hit = _combat_melee_attack(s, rng, monster_idx)
         killed = was_alive & ~attacked.monster_ai.alive[monster_idx]
-        hp_max_killed = attacked.monster_ai.hp_max[monster_idx].astype(jnp.int32)
-        xp_gain = jnp.where(
+        from Nethax.nethax.subsystems.experience import (
+            experience as _xp_experience,
+            more_experienced as _xp_more_experienced,
+        )
+        entry_post = attacked.monster_ai.entry_idx[monster_idx].astype(jnp.int32)
+        kc = attacked.scoring.monsters_killed
+        mcl = attacked.monster_ai.mcloned[monster_idx]
+        xp_award = _xp_experience(entry_post, kc, mcloned=mcl)
+        attacked = jax.lax.cond(
             killed,
-            jnp.maximum(jnp.int32(1), hp_max_killed // jnp.int32(4) + jnp.int32(1)),
-            jnp.int32(0),
+            lambda s_: _xp_more_experienced(s_, xp_award, jnp.int32(0)),
+            lambda s_: s_,
+            attacked,
         )
-        new_xp = (attacked.player_xp.astype(jnp.int32) + xp_gain).astype(
-            attacked.player_xp.dtype
-        )
-        attacked = attacked.replace(player_xp=new_xp)
 
         # Confuse-attack-on-hit: if confuse_attack_pending is set and the
         # strike landed (target still alive indicates a hit occurred even if
@@ -872,7 +875,7 @@ def _stair_down(state, rng):
     new_state   = state.replace(dungeon=new_dungeon, scoring=new_scoring)
     # Move adjacent tame pets to follow the player down the stair.
     # Citation: vendor/nethack/src/dog.c::stair_pet.
-    new_state   = _pet_follow_on_stair(new_state)
+    new_state = _pet_follow_on_stair(new_state)
     return _on_quest_leader_level(_apply_fov(new_state))
 
 
@@ -1032,12 +1035,50 @@ def _handle_zap(state, rng):
     new_terrain  = state.terrain.at[b, lv].set(new_wand.terrain)
     new_explored = state.explored.at[b, lv].set(new_wand.explored)
 
-    return state.replace(
+    mid_state = state.replace(
         monster_ai = new_monster_ai,
         terrain    = new_terrain,
         explored   = new_explored,
         inventory  = new_wand.inventory,
     )
+
+    # ---- Bag-of-holding cancellation (zap.c::cancel_item line 720) ----
+    # When a wand of cancellation fires, check all container slots for a
+    # BAG_OF_HOLDING and implode any that are present.
+    # Cite: vendor/nethack/src/zap.c::cancel_item line 720.
+    _WAN_CANCELLATION = jnp.int16(10)   # WandEffect.CANCELLATION ordinal
+    slot_idx_for_cancel = state.inventory.items.type_id.shape[0]  # Python int
+    # Find first wand in inventory to read the type_id that was just zapped.
+    # We re-read from the pre-zap slot (before charges decrement mutated inv).
+    wand_cat = state.inventory.items.category
+    from Nethax.nethax.subsystems.items_wands import ITEM_CATEGORY_WAND as _WAND_CAT
+    is_wand_slot = wand_cat == jnp.int8(_WAND_CAT)
+    w_slot = jnp.argmax(is_wand_slot).astype(jnp.int32)
+    zapped_type_id = jnp.where(
+        jnp.any(is_wand_slot),
+        state.inventory.items.type_id[w_slot].astype(jnp.int16),
+        jnp.int16(-1),
+    )
+    is_cancellation = zapped_type_id == _WAN_CANCELLATION
+
+    def _maybe_cancel_boh(s, c_idx: int):
+        """Cancel BoH at container index c_idx if cancellation wand was zapped."""
+        has_boh = s.containers.container_type[c_idx] == jnp.int8(
+            int(_ContainerType.BAG_OF_HOLDING)
+        )
+        return jax.lax.cond(
+            is_cancellation & has_boh,
+            lambda st: _containers_cancel_boh(st, c_idx),
+            lambda st: st,
+            s,
+        )
+
+    from Nethax.nethax.subsystems.containers import N_CONTAINERS as _N_CONTAINERS
+    final_state = mid_state
+    for _ci in range(_N_CONTAINERS):
+        final_state = _maybe_cancel_boh(final_state, _ci)
+
+    return final_state
 
 
 def _handle_cast(state, rng):
@@ -1455,6 +1496,165 @@ def _handle_enhance(state, rng):
 
 
 # ---------------------------------------------------------------------------
+# DIP — vendor/nethack/src/potion.c::dodip line 2267, H2Opotion_dip 1498-1589
+# ---------------------------------------------------------------------------
+
+# Vendor potion type_ids (objects.h order; _POTION_BASE_ID=68).
+_POT_OIL_TYPE_ID   = 92   # POT_OIL    = base 68 + 24
+_POT_WATER_TYPE_ID = 93   # POT_WATER  = base 68 + 25
+
+# BUC sentinel ints (matches items.BUCStatus).
+_DIP_BUC_CURSED   = 1
+_DIP_BUC_UNCURSED = 2
+_DIP_BUC_BLESSED  = 3
+
+
+def _handle_dip(state, rng):
+    """DIP — vendor/nethack/src/potion.c::dodip line 2267.
+
+    Dip the first non-potion inventory item ("target") into the first POT_WATER
+    or POT_OIL ("vehicle") in inventory.
+
+    Behaviour:
+      POT_WATER + BLESSED   → target cursed(1)→uncursed(2) or uncursed(2)→blessed(3).
+      POT_WATER + CURSED    → target blessed(3)→uncursed(2) or uncursed(2)→cursed(1).
+      POT_OIL               → target.greased = True.
+    Vehicle quantity is decremented by 1.
+    Cite: vendor/nethack/src/potion.c::H2Opotion_dip lines 1498-1589.
+
+    JIT-pure: jnp ops + lax.cond, no Python branching on traced values.
+    """
+    items = state.inventory.items
+    cats     = items.category
+    types    = items.type_id
+    bucs     = items.buc_status
+    greased  = items.greased
+    quants   = items.quantity
+
+    # --- Locate vehicle: first POT_WATER, else first POT_OIL.
+    is_potion_cat = cats == jnp.int8(ObjectClass.POTION_CLASS)
+    has_qty       = quants > jnp.int16(0)
+    is_water      = is_potion_cat & has_qty & (types == jnp.int16(_POT_WATER_TYPE_ID))
+    is_oil        = is_potion_cat & has_qty & (types == jnp.int16(_POT_OIL_TYPE_ID))
+
+    found_water = jnp.any(is_water)
+    found_oil   = jnp.any(is_oil)
+    veh_water_idx = jnp.argmax(is_water).astype(jnp.int32)
+    veh_oil_idx   = jnp.argmax(is_oil).astype(jnp.int32)
+
+    # Prefer water as vehicle; fall back to oil.
+    veh_idx = jnp.where(found_water, veh_water_idx, veh_oil_idx)
+    veh_is_water = found_water
+    veh_is_oil   = (~found_water) & found_oil
+    have_vehicle = found_water | found_oil
+
+    # --- Locate target: first non-potion occupied slot.
+    is_target = (cats != jnp.int8(0)) & ~is_potion_cat & has_qty
+    found_target = jnp.any(is_target)
+    target_idx   = jnp.argmax(is_target).astype(jnp.int32)
+
+    can_dip = have_vehicle & found_target
+
+    def _do_dip(s):
+        it = s.inventory.items
+        tgt_buc = it.buc_status[target_idx].astype(jnp.int32)
+
+        # Water effects.
+        veh_buc = it.buc_status[veh_idx].astype(jnp.int32)
+        water_blessed = veh_is_water & (veh_buc == jnp.int32(_DIP_BUC_BLESSED))
+        water_cursed  = veh_is_water & (veh_buc == jnp.int32(_DIP_BUC_CURSED))
+
+        # Blessed water: cursed→uncursed, uncursed→blessed.
+        new_buc_blessed_water = jnp.where(
+            tgt_buc == jnp.int32(_DIP_BUC_CURSED), jnp.int32(_DIP_BUC_UNCURSED),
+            jnp.where(tgt_buc == jnp.int32(_DIP_BUC_UNCURSED), jnp.int32(_DIP_BUC_BLESSED),
+                      tgt_buc),
+        )
+        # Cursed water: blessed→uncursed, uncursed→cursed.
+        new_buc_cursed_water = jnp.where(
+            tgt_buc == jnp.int32(_DIP_BUC_BLESSED), jnp.int32(_DIP_BUC_UNCURSED),
+            jnp.where(tgt_buc == jnp.int32(_DIP_BUC_UNCURSED), jnp.int32(_DIP_BUC_CURSED),
+                      tgt_buc),
+        )
+
+        new_tgt_buc = jnp.where(
+            water_blessed, new_buc_blessed_water,
+            jnp.where(water_cursed, new_buc_cursed_water, tgt_buc),
+        ).astype(jnp.int8)
+
+        new_buc_arr = it.buc_status.at[target_idx].set(new_tgt_buc)
+
+        # Oil: target.greased = True.
+        new_greased_val = jnp.where(veh_is_oil, jnp.bool_(True), it.greased[target_idx])
+        new_greased_arr = it.greased.at[target_idx].set(new_greased_val)
+
+        # Decrement vehicle quantity by 1; clear category if exhausted.
+        old_qty = it.quantity[veh_idx]
+        new_veh_qty = jnp.maximum(old_qty - jnp.int16(1), jnp.int16(0))
+        new_qty_arr = it.quantity.at[veh_idx].set(new_veh_qty)
+        old_cat = it.category[veh_idx]
+        new_veh_cat = jnp.where(new_veh_qty == jnp.int16(0), jnp.int8(0), old_cat)
+        new_cat_arr = it.category.at[veh_idx].set(new_veh_cat)
+
+        new_items = it.replace(
+            buc_status=new_buc_arr,
+            greased=new_greased_arr,
+            quantity=new_qty_arr,
+            category=new_cat_arr,
+        )
+        return s.replace(inventory=s.inventory.replace(items=new_items))
+
+    return jax.lax.cond(can_dip, _do_dip, lambda s: s, state)
+
+
+def _handle_tip_down(state, rng):
+    """#tip / M-T — wired to WAN_DIGGING down-dig path.
+
+    Per the wave16d brief, M-T is routed to invoke the down-dig branch added
+    to _effect_digging (direction == 8 sentinel → create HOLE at player_pos).
+    Cite: vendor/nethack/src/dig.c::zap_dig line 1548;
+          vendor/nethack/src/dig.c::digactualhole line 640.
+
+    Projects EnvState → WandState, calls _effect_digging with direction=8,
+    then writes the new terrain back.
+    """
+    from Nethax.nethax.subsystems.items_wands import _effect_digging
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _ZapIntrinsic
+
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - 1
+    terrain_2d  = state.terrain[b, lv]
+    explored_2d = state.explored[b, lv]
+
+    mai = state.monster_ai
+    wand_state = WandState(
+        mon_pos       = mai.pos,
+        mon_hp        = mai.hp,
+        mon_hp_max    = mai.hp_max,
+        mon_type      = mai.entry_idx,
+        mon_alive     = mai.alive,
+        mon_asleep    = mai.asleep,
+        mon_undead    = mai.undead,
+        mon_invisible = mai.invisible,
+        mon_resists   = mai.resists,
+        mon_speed_mod = mai.speed_mod,
+        mon_cancelled = mai.cancelled,
+        terrain       = terrain_2d,
+        explored      = explored_2d,
+        inventory     = state.inventory,
+        player_pos    = state.player_pos,
+        dungeon_level = state.dungeon.current_level.astype(jnp.int8),
+        probed_hp     = jnp.int32(0),
+        probed_idx    = jnp.int32(-1),
+        player_reflecting = state.status.intrinsics[int(_ZapIntrinsic.REFLECTING)],
+    )
+
+    new_wand, _ = _effect_digging(wand_state, rng, direction=jnp.int32(8))
+    new_terrain = state.terrain.at[b, lv].set(new_wand.terrain)
+    return state.replace(terrain=new_terrain)
+
+
+# ---------------------------------------------------------------------------
 # Handler tuple — indexed by handler slot (0 = noop, 1-8 = move, 9-16 = run,
 #                                          17 = stair_up, 18 = stair_down,
 #                                          19 = wait, 20+ = Wave 4 actions)
@@ -1507,6 +1707,8 @@ _HANDLERS = (
     _handle_ride,       # 43  vendor/nethack/src/steed.c::doride
     _handle_invoke,     # 44  vendor/nethack/src/artifact.c::arti_invoke
     _handle_enhance,    # 45  vendor/nethack/src/weapon.c::enhance_weapon_skill line 1329
+    _handle_dip,        # 46  vendor/nethack/src/potion.c::dodip line 2267
+    _handle_tip_down,   # 47  vendor/nethack/src/dig.c::zap_dig line 1548 (down-dig)
 )
 
 # Slot indices for each named handler.
@@ -1563,6 +1765,10 @@ _SLOT_RIDE       = 43
 _SLOT_INVOKE     = 44
 # #enhance — advance weapon/spell skill (M-e per vendor cmd.c:1716).
 _SLOT_ENHANCE    = 45
+# #dip (M-d) — vendor/nethack/src/potion.c::dodip line 2267.
+_SLOT_DIP        = 46
+# #tip down-dig (M-T) — vendor/nethack/src/dig.c::zap_dig line 1548.
+_SLOT_TIP_DOWN   = 47
 
 # ---------------------------------------------------------------------------
 # 256-entry lookup table: action ASCII value → handler slot index
@@ -1738,7 +1944,7 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     table[_M_byte("A")] = _SLOT_NOOP   # cmd.c::donamelevel (annotate)
     table[_M_byte("c")] = _SLOT_NOOP   # cmd.c::dotalk (chat)
     table[_M_byte("C")] = _SLOT_NOOP   # cmd.c::doconduct
-    table[_M_byte("d")] = _SLOT_NOOP   # cmd.c::dodip
+    table[_M_byte("d")] = _SLOT_DIP    # cmd.c::dodip — potion.c::dodip line 2267
     table[_M_byte("e")] = _SLOT_ENHANCE  # cmd.c:1716 — M('e') → enhance_weapon_skill
     table[_M_byte("f")] = _SLOT_NOOP   # cmd.c::doforce
     table[_M_byte("g")] = _SLOT_NOOP   # cmd.c::dogenocided
@@ -1754,7 +1960,7 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     table[_M_byte("R")] = _SLOT_RIDE   # cmd.c::doride — steed.c:178
     table[_M_byte("s")] = _SLOT_NOOP   # cmd.c::dosit
     table[_M_byte("t")] = _SLOT_NOOP   # cmd.c::doturn
-    table[_M_byte("T")] = _SLOT_NOOP   # cmd.c::dotip
+    table[_M_byte("T")] = _SLOT_TIP_DOWN  # cmd.c::dotip → WAN_DIGGING down-dig (dig.c:1548)
     table[_M_byte("u")] = _SLOT_NOOP   # cmd.c::dountrap
     table[_M_byte("v")] = _SLOT_NOOP   # cmd.c::doextversion
     table[_M_byte("V")] = _SLOT_NOOP   # cmd.c::dovanquished
@@ -1857,6 +2063,8 @@ _COMPACT_NAME       = 28
 _COMPACT_INVOKE     = 29
 _COMPACT_RIDE       = 30
 _COMPACT_ENHANCE    = 31
+_COMPACT_DIP        = 32
+_COMPACT_TIP_DOWN   = 33
 
 
 def _build_compact_handlers():
@@ -1894,6 +2102,8 @@ def _build_compact_handlers():
         _wrap_no_dir(_handle_invoke), # 29  COMPACT_INVOKE
         _wrap_no_dir(_handle_ride),   # 30  COMPACT_RIDE  — steed.c:178
         _wrap_no_dir(_handle_enhance),# 31  COMPACT_ENHANCE — weapon.c:1329
+        _wrap_no_dir(_handle_dip),    # 32  COMPACT_DIP — potion.c::dodip line 2267
+        _wrap_no_dir(_handle_tip_down),  # 33  COMPACT_TIP_DOWN — dig.c::zap_dig line 1548
     )
 
 
@@ -1901,8 +2111,8 @@ _COMPACT_HANDLERS: tuple = _build_compact_handlers()
 
 
 def _build_slot_to_compact() -> jnp.ndarray:
-    """Map legacy handler slot (0..45) → compact slot (0..31)."""
-    table = [0] * 46
+    """Map legacy handler slot (0..47) → compact slot (0..33)."""
+    table = [0] * 48
     # Movement slots 1..8 → COMPACT_MOVE.
     for s in (_SLOT_MOVE_N, _SLOT_MOVE_E, _SLOT_MOVE_S, _SLOT_MOVE_W,
               _SLOT_MOVE_NE, _SLOT_MOVE_SE, _SLOT_MOVE_SW, _SLOT_MOVE_NW):
@@ -1941,6 +2151,8 @@ def _build_slot_to_compact() -> jnp.ndarray:
     table[_SLOT_RIDE]       = _COMPACT_RIDE   # steed.c:178 doride
     table[_SLOT_INVOKE]     = _COMPACT_INVOKE
     table[_SLOT_ENHANCE]    = _COMPACT_ENHANCE  # weapon.c:1329 enhance_weapon_skill
+    table[_SLOT_DIP]        = _COMPACT_DIP       # potion.c::dodip line 2267
+    table[_SLOT_TIP_DOWN]   = _COMPACT_TIP_DOWN  # dig.c::zap_dig line 1548
     return jnp.array(table, dtype=jnp.int32)
 
 
@@ -1950,7 +2162,7 @@ def _build_slot_to_dir_idx() -> jnp.ndarray:
     Non-movement slots map to 0 (the direction is unused for those branches).
     The order matches ``_DIR_TABLE``: N=0, E=1, S=2, W=3, NE=4, SE=5, SW=6, NW=7.
     """
-    table = [0] * 46
+    table = [0] * 48
     # Move slots.
     table[_SLOT_MOVE_N]  = 0
     table[_SLOT_MOVE_E]  = 1

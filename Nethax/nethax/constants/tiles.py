@@ -44,6 +44,10 @@ class TileType(IntEnum):
     TREE = 20          # Tree (T) — used in big-room random terrain overlays
                        # and elsewhere.  Walkable.
                        # Citation: vendor/nethack/include/rm.h TREE.
+    HOLE = 21          # Hole in the floor (^), descend one level if walked on.
+                       # Created by WAN_DIGGING down-zap and pickaxe down-dig.
+                       # Citation: vendor/nethack/src/dig.c::digactualhole line 640;
+                       #            vendor/nethack/src/dig.c::zap_dig line 1548.
 
 
 NUM_TILE_TYPES: int = len(TileType)

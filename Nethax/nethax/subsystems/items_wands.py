@@ -971,32 +971,55 @@ def _effect_digging(
 
     vendor/nethack/src/zap.c: zap_updown() for up/down; dig_map() for
     cardinal directions.  We replace WALL tiles with CORRIDOR along the ray.
+
+    Down-dig (direction == 8):
+        Vendor zap.c::zap_dig line 1548 routes downward zap into
+        digactualhole() (dig.c line 640) which sets the player's tile to
+        levl[u.ux][u.uy].typ = HOLE.  We mirror by setting
+        terrain[player_row, player_col] = TileType.HOLE.
     """
-    dy = _DIR_DY[direction].astype(jnp.int16)
-    dx = _DIR_DX[direction].astype(jnp.int16)
     map_h, map_w = state.terrain.shape
+    dir_idx = jnp.int32(direction)
 
-    def _dig_step(carry, step_i):
-        terrain, pos = carry
-        next_pos = pos + jnp.array([dy, dx], dtype=jnp.int16)
-        nr = jnp.clip(next_pos[0], 0, map_h - 1)
-        nc = jnp.clip(next_pos[1], 0, map_w - 1)
-        is_wall = terrain[nr, nc] == int(TileType.WALL)
-        is_void = terrain[nr, nc] == int(TileType.VOID)
-        should_dig = is_wall | is_void
-        new_terrain = lax.cond(
-            should_dig,
-            lambda t: t.at[nr, nc].set(jnp.int8(DIG_TILE)),
-            lambda t: t,
-            terrain,
+    def _set_hole(t):
+        """Down-dig (direction==8): create HOLE at player_pos.
+        Cite: vendor/nethack/src/dig.c::digactualhole line 640;
+              vendor/nethack/src/dig.c::zap_dig line 1548.
+        """
+        pr = state.player_pos[0].astype(jnp.int32)
+        pc = state.player_pos[1].astype(jnp.int32)
+        return t.at[pr, pc].set(jnp.int8(TileType.HOLE))
+
+    def _normal_dig(t):
+        """Horizontal ray dig — carve WALL/VOID tiles into CORRIDOR."""
+        safe_dir = jnp.clip(dir_idx, 0, 7)
+        dy = _DIR_DY[safe_dir].astype(jnp.int16)
+        dx = _DIR_DX[safe_dir].astype(jnp.int16)
+
+        def _dig_step(carry, step_i):
+            terrain, pos = carry
+            next_pos = pos + jnp.array([dy, dx], dtype=jnp.int16)
+            nr = jnp.clip(next_pos[0], 0, map_h - 1)
+            nc = jnp.clip(next_pos[1], 0, map_w - 1)
+            is_wall = terrain[nr, nc] == int(TileType.WALL)
+            is_void = terrain[nr, nc] == int(TileType.VOID)
+            should_dig = is_wall | is_void
+            new_terrain = lax.cond(
+                should_dig,
+                lambda t2: t2.at[nr, nc].set(jnp.int8(DIG_TILE)),
+                lambda t2: t2,
+                terrain,
+            )
+            return (new_terrain, jnp.array([nr, nc], dtype=jnp.int16)), None
+
+        (out_terrain, _), _ = lax.scan(
+            _dig_step,
+            (t, state.player_pos.astype(jnp.int16)),
+            jnp.arange(DEFAULT_RAY_RANGE, dtype=jnp.int32),
         )
-        return (new_terrain, jnp.array([nr, nc], dtype=jnp.int16)), None
+        return out_terrain
 
-    (new_terrain, _), _ = lax.scan(
-        _dig_step,
-        (state.terrain, state.player_pos.astype(jnp.int16)),
-        jnp.arange(DEFAULT_RAY_RANGE, dtype=jnp.int32),
-    )
+    new_terrain = lax.cond(dir_idx == jnp.int32(8), _set_hole, _normal_dig, state.terrain)
     return state.replace(terrain=new_terrain), rng
 
 
