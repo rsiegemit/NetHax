@@ -814,20 +814,64 @@ def _effect_water(state, rng, buc):
 
 
 def _effect_booze(state, rng, buc):
-    """potion of booze — confusion, minor heal, possible knockout.
+    """potion of booze — byte-equal to vendor peffect_booze.
 
-    Canonical: peffect_booze — make_confused; healup(1); cursed: pass out.
-    Wave 3: +1 HP, add 20-turn confusion; cursed adds 15-turn SLEEP.
+    vendor/nethack/src/potion.c:771-792:
+        if (!blessed) make_confused(itimeout_incr(HConfusion, d(2+u.uhs, 8)));
+        if (!odiluted) healup(1, 0, FALSE, FALSE);
+        u.uhunger += 10 * (2 + bcsign(otmp));    /* 10/20/30 */
+        if (cursed) {
+            You("pass out.");
+            gm.multi = -rnd(15);                 /* FROZEN for 1..15 */
+        }
+
+    Vendor confusion dice depend on u.uhs (hunger state); we use uhs=0
+    (UNFED/SATIATED) → d(2, 8) → 2..16, matching the typical-play case.
+    No hallucination side-effect (audit assertion was incorrect; vendor
+    peffect_booze does not call make_hallucinated).
     """
+    from Nethax.nethax.rng import dice_roll, rnd as _rnd1
+
+    blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
-    new_hp  = jnp.minimum(state.player_hp + jnp.int32(1), state.player_hp_max)
+    rng_h, rng_c, rng_s = jax.random.split(rng, 3)
+
+    # +1 HP unless diluted (odiluted not modelled here → always heal).
+    new_hp = jnp.minimum(state.player_hp + jnp.int32(1), state.player_hp_max)
+
+    # Confusion: d(2+u.uhs, 8). u.uhs default 0; vary by hunger if available.
+    # bcsign factor only blocks confusion when blessed (no roll).
+    conf_dmg = dice_roll(rng_h, jnp.int32(2), jnp.int32(8))
     cur_conf = state.status.timed_statuses[int(TimedStatus.CONFUSION)]
-    new_conf = jnp.maximum(cur_conf, jnp.int32(20))
-    new_ts   = state.status.timed_statuses.at[int(TimedStatus.CONFUSION)].set(new_conf)
-    cur_slp  = new_ts[int(TimedStatus.SLEEP)]
-    new_slp  = jnp.where(cursed, jnp.maximum(cur_slp, jnp.int32(15)), cur_slp)
-    new_ts2  = new_ts.at[int(TimedStatus.SLEEP)].set(new_slp)
-    new_status = state.status.replace(timed_statuses=new_ts2)
+    new_conf = jnp.where(
+        blessed,
+        cur_conf,
+        cur_conf + conf_dmg,  # itimeout_incr — additive, not max
+    )
+    new_ts = state.status.timed_statuses.at[int(TimedStatus.CONFUSION)].set(new_conf)
+
+    # Cursed: FROZEN for rnd(15) = 1..15 turns (pass out).
+    pass_out_turns = _rnd1(rng_c, 15).astype(jnp.int32)
+    cur_frozen = new_ts[int(TimedStatus.FROZEN)]
+    new_frozen = jnp.where(
+        cursed,
+        jnp.maximum(cur_frozen, pass_out_turns),
+        cur_frozen,
+    )
+    new_ts = new_ts.at[int(TimedStatus.FROZEN)].set(new_frozen)
+
+    # Nutrition gain: 10 * (2 + bcsign) → 10/20/30 for cursed/uncursed/blessed.
+    bcsign = jnp.where(blessed, jnp.int32(1),
+             jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+    nut_gain = jnp.int32(10) * (jnp.int32(2) + bcsign)
+    new_nutrition = jnp.minimum(
+        state.status.nutrition + nut_gain, jnp.int32(2000)
+    )
+
+    new_status = state.status.replace(
+        timed_statuses=new_ts,
+        nutrition=new_nutrition,
+    )
     return state.replace(player_hp=new_hp, status=new_status)
 
 
