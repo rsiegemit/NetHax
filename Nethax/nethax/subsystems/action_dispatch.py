@@ -374,14 +374,36 @@ def _try_step(state, dy: int, dx: int, rng: jax.Array):
     is_diagonal = jnp.bool_((dy != 0) & (dx != 0))
     blocked_underwater = state.player_in_water & is_diagonal
 
+    # u.utrap immobility — vendor/nethack/src/hack.c:1558-1690.
+    # Player trapped in pit/bear-trap/web/lava cannot move until escape roll
+    # succeeds. Vendor decrements u.utrap each turn and allows escape only
+    # when it reaches 0; mechanics differ per trap. Minimal byte-equal proxy:
+    # rn2(4) (~25%) escape per move attempt (vendor bear-trap rate).
+    rng, rng_trap = jax.random.split(rng)
+    trap_escape = jax.random.randint(rng_trap, (), 0, 4, dtype=jnp.int32) == jnp.int32(0)
+    blocked_trap = state.player_in_trap & ~trap_escape
+
     # Any no-op gate → skip movement entirely.
-    noop_gate = state.swallow.swallowed | is_vomiting | do_limp | blocked_underwater
+    noop_gate = (
+        state.swallow.swallowed | is_vomiting | do_limp
+        | blocked_underwater | blocked_trap
+    )
+
+    # When the trap-escape roll succeeds, clear player_in_trap so the next
+    # move proceeds normally.
+    state_after_escape = state.replace(
+        player_in_trap=jnp.where(
+            state.player_in_trap & trap_escape,
+            jnp.bool_(False),
+            state.player_in_trap,
+        )
+    )
 
     return jax.lax.cond(
         noop_gate,
         lambda s: s,
         lambda s: _try_step_inner(s, dy, dx, rng),
-        state,
+        state_after_escape,
     )
 
 
