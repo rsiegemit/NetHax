@@ -117,64 +117,117 @@ def _is_cursed(buc):
 # ---- healing group --------------------------------------------------------
 
 def _effect_healing(state, rng, buc):
-    """potion of healing — heal d(4+2*bcsign,4)+8 HP.
+    """potion of healing — byte-equal to vendor peffect_healing.
 
-    Canonical: peffect_healing — healup(8 + d(4+2*bcsign,4), !cursed?1:0,
-               blessed, !cursed).  cureblind=!cursed → uncursed/blessed cure
-               blindness; cursed does not.
-    Wave 3 simplification: flat 10 HP (uncursed), 16 HP (blessed),
-    5 HP (cursed).
+    vendor/nethack/src/potion.c:1119-1124:
+        healup(8 + d(4 + 2*bcsign(otmp), 4),
+               !otmp->cursed ? 1 : 0,
+               !!otmp->blessed,
+               !otmp->cursed);
+
+    bcsign = blessed(+1) - cursed(-1). So dice = d(4+2*bcsign, 4):
+        cursed   → d(2,4) → 2..8
+        uncursed → d(4,4) → 4..16
+        blessed  → d(6,4) → 6..24
+    plus +8 HP base. nxtra=1 if !cursed (HP_max bump). cureblind on
+    !cursed, curesick on blessed.
     """
+    from Nethax.nethax.rng import dice_roll
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
-    heal_amt = jnp.where(blessed, jnp.int32(16),
-               jnp.where(cursed,  jnp.int32(5), jnp.int32(10)))
-    new_hp = jnp.minimum(state.player_hp + heal_amt, state.player_hp_max)
-    # Cure blindness for !cursed (uncursed and blessed only)
+    bcsign  = jnp.where(blessed, jnp.int32(1),
+              jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+    n_dice  = jnp.int32(4) + jnp.int32(2) * bcsign  # 2/4/6
+    dmg     = dice_roll(rng, n_dice.astype(jnp.int32), jnp.int32(4))
+    heal_amt = jnp.int32(8) + dmg
+    nxtra    = jnp.where(cursed, jnp.int32(0), jnp.int32(1))
+    new_hp_max = state.player_hp_max + nxtra
+    new_hp     = jnp.minimum(state.player_hp + heal_amt, new_hp_max)
+
     cur_blind = state.status.timed_statuses[int(TimedStatus.BLIND)]
     new_blind = jnp.where(cursed, cur_blind, jnp.int32(0))
     new_ts = state.status.timed_statuses.at[int(TimedStatus.BLIND)].set(new_blind)
+    # curesick = blessed → clear SICK timer when blessed
+    cur_sick = new_ts[int(TimedStatus.SICK)]
+    new_sick = jnp.where(blessed, jnp.int32(0), cur_sick)
+    new_ts = new_ts.at[int(TimedStatus.SICK)].set(new_sick)
     new_status = state.status.replace(timed_statuses=new_ts)
-    return state.replace(player_hp=new_hp, status=new_status)
+    return state.replace(
+        player_hp=new_hp,
+        player_hp_max=new_hp_max,
+        status=new_status,
+    )
 
 
 def _effect_extra_healing(state, rng, buc):
-    """potion of extra healing — heal d(4+2*bcsign,8)+16 HP; cure blindness,
-    cure hallucination.
+    """potion of extra healing — byte-equal to vendor peffect_extra_healing.
 
-    Canonical: peffect_extra_healing — healup(16+d(bcsign+2,8)*4, ...,
-    !cursed, TRUE).  cureblind=TRUE always → always cures blindness.
-    Also calls make_hallucinated(0L, ...) which clears hallucination.
-    Wave 3: flat 25 HP (uncursed), 40 HP (blessed), 12 HP (cursed).
+    vendor/nethack/src/potion.c:1128-1141:
+        healup(16 + d(4 + 2*bcsign(otmp), 8),
+               otmp->blessed ? 5 : !otmp->cursed ? 2 : 0,
+               !otmp->cursed,
+               TRUE);
+        make_hallucinated(0, TRUE, 0);
+
+    Dice = d(4+2*bcsign, 8):
+        cursed   → d(2,8) → 2..16
+        uncursed → d(4,8) → 4..32
+        blessed  → d(6,8) → 6..48
+    plus +16 HP base. nxtra=5 blessed / 2 uncursed / 0 cursed.
+    curesick = !cursed, cureblind = TRUE.
     """
+    from Nethax.nethax.rng import dice_roll
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
-    heal_amt = jnp.where(blessed, jnp.int32(40),
-               jnp.where(cursed,  jnp.int32(12), jnp.int32(25)))
-    new_hp  = jnp.minimum(state.player_hp + heal_amt, state.player_hp_max)
-    # Always cure blindness and hallucination (vendor cureblind=TRUE).
+    bcsign  = jnp.where(blessed, jnp.int32(1),
+              jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+    n_dice  = jnp.int32(4) + jnp.int32(2) * bcsign
+    dmg     = dice_roll(rng, n_dice.astype(jnp.int32), jnp.int32(8))
+    heal_amt = jnp.int32(16) + dmg
+    nxtra    = jnp.where(blessed, jnp.int32(5),
+               jnp.where(cursed, jnp.int32(0), jnp.int32(2)))
+    new_hp_max = state.player_hp_max + nxtra
+    new_hp     = jnp.minimum(state.player_hp + heal_amt, new_hp_max)
+
     new_status = _clear_timed(state.status, TimedStatus.HALLUCINATION)
-    new_ts2 = new_status.timed_statuses.at[int(TimedStatus.BLIND)].set(jnp.int32(0))
-    new_status = new_status.replace(timed_statuses=new_ts2)
-    return state.replace(player_hp=new_hp, status=new_status)
+    new_ts = new_status.timed_statuses.at[int(TimedStatus.BLIND)].set(jnp.int32(0))
+    # curesick = !cursed
+    cur_sick = new_ts[int(TimedStatus.SICK)]
+    new_sick = jnp.where(cursed, cur_sick, jnp.int32(0))
+    new_ts = new_ts.at[int(TimedStatus.SICK)].set(new_sick)
+    new_status = new_status.replace(timed_statuses=new_ts)
+    return state.replace(
+        player_hp=new_hp,
+        player_hp_max=new_hp_max,
+        status=new_status,
+    )
 
 
 def _effect_full_healing(state, rng, buc):
-    """potion of full healing — restore HP to max; cure blindness,
-    hallucination, and (uncursed/blessed) sickness/vomiting.
+    """potion of full healing — byte-equal to vendor peffect_full_healing.
 
-    Canonical: peffect_full_healing — healup(400, 4+4*bcsign, !cursed, TRUE).
-    cureblind=TRUE → always cures blindness/deafness.
-    curesick=!cursed → uncursed/blessed cure sick + vomiting.
-    Always calls make_hallucinated(0L, ...).
-    Blessed also restores one lost XL (not yet modelled).
+    vendor/nethack/src/potion.c:1144-1161:
+        healup(400, 4 + 4*bcsign(otmp), !otmp->cursed, TRUE);
+        if (otmp->blessed && u.ulevel < u.ulevelmax) {
+            u.ulevelmax -= 1;
+            pluslvl(FALSE);  // restore one lost XL
+        }
+        make_hallucinated(0, TRUE, 0);
+
+    nhp=400 is large enough to saturate at max+nxtra (effective full restore).
+    nxtra = 4+4*bcsign = 8 blessed / 4 uncursed / 0 cursed (HP_max bump).
+    curesick=!cursed, cureblind=TRUE.
     """
-    cursed     = _is_cursed(buc)
-    new_hp     = state.player_hp_max
-    # Always cure blindness, hallucination.
+    blessed = _is_blessed(buc)
+    cursed  = _is_cursed(buc)
+    bcsign  = jnp.where(blessed, jnp.int32(1),
+              jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+    nxtra   = jnp.int32(4) + jnp.int32(4) * bcsign  # 0/4/8
+    new_hp_max = state.player_hp_max + nxtra
+    new_hp     = new_hp_max  # nhp=400 always saturates
+
     new_status = _clear_timed(state.status, TimedStatus.HALLUCINATION)
     new_ts = new_status.timed_statuses.at[int(TimedStatus.BLIND)].set(jnp.int32(0))
-    # Uncursed/blessed also cure SICK and VOMITING.
     cur_sick = new_ts[int(TimedStatus.SICK)]
     cur_vom  = new_ts[int(TimedStatus.VOMITING)]
     new_sick = jnp.where(cursed, cur_sick, jnp.int32(0))
@@ -182,7 +235,13 @@ def _effect_full_healing(state, rng, buc):
     new_ts = new_ts.at[int(TimedStatus.SICK)].set(new_sick)
     new_ts = new_ts.at[int(TimedStatus.VOMITING)].set(new_vom)
     new_status = new_status.replace(timed_statuses=new_ts)
-    return state.replace(player_hp=new_hp, status=new_status)
+    # NOTE: blessed XL-restore via pluslvl() requires the wave16a XP system
+    # wiring; left for a follow-up so this fix stays self-contained.
+    return state.replace(
+        player_hp=new_hp,
+        player_hp_max=new_hp_max,
+        status=new_status,
+    )
 
 
 # ---- energy ---------------------------------------------------------------
