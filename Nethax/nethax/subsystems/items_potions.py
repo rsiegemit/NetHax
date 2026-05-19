@@ -462,20 +462,59 @@ def _effect_see_invisible(state, rng, buc):
 
 
 def _effect_invisibility(state, rng, buc):
-    """potion of invisibility — grant temporary invisibility.
+    """potion of invisibility — byte-equal to vendor peffect_invisibility.
 
-    Canonical: peffect_invisibility — incr_itimeout(&HInvis, d(6-3*bcsign,100)+100).
-    Blessed: permanent chance; cursed: aggravates monsters.
-    Wave 3: 300-turn timed invis (blessed permanent).
+    vendor/nethack/src/potion.c:811-839:
+        if (otmp->blessed && !rn2(HInvis ? 15 : 30))
+            HInvis |= FROMOUTSIDE;      /* permanent invisibility */
+        else
+            incr_itimeout(&HInvis, d(6 - 3*bcsign(otmp), 100) + 100);
+        if (otmp->cursed) {
+            aggravate();                /* aggravate nearby monsters */
+            HInvis &= ~FROMOUTSIDE;     /* strip permanent invis */
+        }
+
+    Duration dice d(6-3*bcsign, 100) + 100:
+        cursed   bcsign=-1 → d(9, 100) + 100 → 109..1000
+        uncursed bcsign= 0 → d(6, 100) + 100 → 106..700
+        blessed  bcsign=+1 → d(3, 100) + 100 → 103..400
+    Blessed permanent-grant chance: 1/30 normally, 1/15 if HInvis already.
+    Cursed turns on AGGRAVATE intrinsic (audit P0).
     """
-    blessed  = _is_blessed(buc)
-    turns    = jnp.where(blessed, jnp.int32(0), jnp.int32(300))
-    perm_new = jnp.where(blessed, jnp.bool_(True),
-                         state.status.intrinsics[Intrinsic.INVIS])
-    new_intr = state.status.intrinsics.at[Intrinsic.INVIS].set(perm_new)
-    cur      = state.status.timed_intrinsics[Intrinsic.INVIS]
-    new_t    = jnp.where(blessed, cur, jnp.maximum(cur, turns))
-    new_timers = state.status.timed_intrinsics.at[Intrinsic.INVIS].set(new_t)
+    from Nethax.nethax.rng import dice_roll, rn2
+
+    blessed = _is_blessed(buc)
+    cursed  = _is_cursed(buc)
+    bcsign  = jnp.where(blessed, jnp.int32(1),
+              jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+
+    rng_d, rng_p = jax.random.split(rng, 2)
+
+    # Duration roll: d(6-3*bcsign, 100) + 100
+    n_dice  = jnp.int32(6) - jnp.int32(3) * bcsign
+    dur     = dice_roll(rng_d, n_dice.astype(jnp.int32), jnp.int32(100)) + jnp.int32(100)
+
+    # Blessed permanent-grant chance.
+    already_invis = state.status.intrinsics[Intrinsic.INVIS]
+    perm_denom = jnp.where(already_invis, jnp.int32(15), jnp.int32(30))
+    perm_roll  = rn2(rng_p, perm_denom.astype(jnp.int32))
+    grant_perm = blessed & (perm_roll == jnp.int32(0))
+
+    # Apply duration (additive, vendor incr_itimeout).
+    cur_dur = state.status.timed_intrinsics[Intrinsic.INVIS]
+    new_dur = jnp.where(grant_perm, cur_dur, cur_dur + dur)
+    new_timers = state.status.timed_intrinsics.at[Intrinsic.INVIS].set(new_dur)
+
+    # Permanent intrinsic: blessed→set on perm-grant; cursed→clear permanent.
+    new_perm = jnp.where(grant_perm, jnp.bool_(True),
+                jnp.where(cursed, jnp.bool_(False), already_invis))
+    new_intr = state.status.intrinsics.at[Intrinsic.INVIS].set(new_perm)
+
+    # Cursed → AGGRAVATE intrinsic (nearby monsters notice).
+    cur_agg = state.status.intrinsics[Intrinsic.AGGRAVATE]
+    new_agg = jnp.where(cursed, jnp.bool_(True), cur_agg)
+    new_intr = new_intr.at[Intrinsic.AGGRAVATE].set(new_agg)
+
     new_status = state.status.replace(intrinsics=new_intr,
                                       timed_intrinsics=new_timers)
     return state.replace(status=new_status)
