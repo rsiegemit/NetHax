@@ -554,11 +554,21 @@ def handle_open(state, rng: jax.Array):
 def handle_close(state, rng: jax.Array):
     """Close the door at the player's current tile (Wave 3 simplified).
 
+    Vendor lock.c::doclose lines 1023-1024 calls obstructed(x, y) and bails
+    out when a monster, object, or boulder occupies the door tile.  Here we
+    compute ``blocked`` = any alive monster shares the door tile, threaded
+    into close_door so the OPEN→CLOSED transition is suppressed.
+
     Returns new EnvState.
     """
     flat_lv = _flat_lv_from_state(state)
     pos = jnp.array([flat_lv, state.player_pos[0], state.player_pos[1]], dtype=jnp.int32)
-    new_features = close_door(state.features, pos)
+    # Obstruction: any alive monster on the door tile blocks the close.
+    mai = state.monster_ai
+    same_row = mai.pos[:, 0] == state.player_pos[0]
+    same_col = mai.pos[:, 1] == state.player_pos[1]
+    blocked = jnp.any(mai.alive & same_row & same_col)
+    new_features = close_door(state.features, pos, blocked=blocked)
     return state.replace(features=new_features)
 
 
