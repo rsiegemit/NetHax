@@ -182,7 +182,10 @@ def test_save_load_engrave_preserved(tmp_path: Path) -> None:
     state = _fresh_state()
     eng = state.engrave
 
-    elbereth = jnp.array(list(b"Elbereth"), dtype=jnp.int8)
+    # ENGRAVE_TEXT_LEN (engrave.py:44) is 80; pad "Elbereth" with NULs.
+    from Nethax.nethax.subsystems.engrave import ENGRAVE_TEXT_LEN
+    elbereth_pad = bytes(b"Elbereth") + b"\0" * (ENGRAVE_TEXT_LEN - 8)
+    elbereth = jnp.array(list(elbereth_pad), dtype=jnp.int8)
     new_text = eng.text.at[3, 4, :].set(elbereth)
     new_has = eng.has_engraving.at[3, 4].set(jnp.bool_(True))
     new_kind = eng.engraving_kind.at[3, 4].set(jnp.int8(1))  # ENGR_DUST
