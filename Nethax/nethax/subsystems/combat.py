@@ -194,9 +194,11 @@ N_WEAPON_SKILLS = 40
 
 # Practice required to advance to the next tier
 # (vendor/nethack/include/skills.h:106 — practice_needed_to_advance(level) =
-#  level * level * 20).  Indexed by current tier.
+#  level * level * 20).  Vendor's macro is keyed by its 1-based skill level
+# (P_UNSKILLED=1 … P_GRAND_MASTER=6) so the vendor-byte-equal output for our
+# 0-based tier ``t`` is (t+1)^2 * 20.  Indexed by current tier.
 _PRACTICE_TO_ADVANCE = jnp.array(
-    [tier * tier * 20 for tier in range(N_SKILL_TIERS)],
+    [(tier + 1) * (tier + 1) * 20 for tier in range(N_SKILL_TIERS)],
     dtype=jnp.int32,
 )
 
@@ -760,7 +762,8 @@ def damage_roll(
 def practice_skill(state, weapon_type: jnp.ndarray):
     """Increment practice for ``weapon_type``; advance tier if threshold hit.
 
-    practice_needed_to_advance(tier) = tier * tier * 20  (skills.h:106).
+    practice_needed_to_advance(tier) = (tier+1) * (tier+1) * 20  (skills.h:106
+    keyed off vendor's 1-based level, see _PRACTICE_TO_ADVANCE above).
     Caps at SKILL_GRAND_MASTER.
     """
     skill_id = jnp.clip(weapon_type.astype(jnp.int32), 0, N_WEAPON_SKILLS - 1)

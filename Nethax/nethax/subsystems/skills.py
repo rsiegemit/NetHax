@@ -80,7 +80,7 @@ N_ROLES:  int = len(Role)
 
 # ---------------------------------------------------------------------------
 # practice_needed_to_advance  (vendor/nethack/include/skills.h:106)
-#   practice_needed_to_advance(level) = level * level * 20
+#   #define practice_needed_to_advance(level) ((level) * (level) * 20)
 # ---------------------------------------------------------------------------
 def practice_needed_to_advance(level: jnp.ndarray) -> jnp.ndarray:
     """Return practice points needed to advance from ``level`` to level+1.
@@ -88,17 +88,21 @@ def practice_needed_to_advance(level: jnp.ndarray) -> jnp.ndarray:
     Cite: vendor/nethack/include/skills.h:106 —
           ``#define practice_needed_to_advance(level) ((level)*(level)*20)``
 
-    P_UNSKILLED(0)→P_BASIC(1):   0*0*20 =   0  (advance immediately once ≥0)
-    P_BASIC(1)→P_SKILLED(2):     1*1*20 =  20
-    P_SKILLED(2)→P_EXPERT(3):    2*2*20 =  80
-    P_EXPERT(3)→P_MASTER(4):     3*3*20 = 180
-    P_MASTER(4)→P_GRAND_MASTER:  4*4*20 = 320
+    Vendor uses 1-based skill levels (P_ISRESTRICTED=0, P_UNSKILLED=1,
+    P_BASIC=2 … P_GRAND_MASTER=6).  In Nethax we use 0-based encoding
+    (P_UNSKILLED=0 … P_GRAND_MASTER=5) so to keep the vendor-byte-equal
+    output thresholds we evaluate the macro at ``level + 1``:
 
-    Note: vendor uses 1-based levels (P_UNSKILLED=1).  We use 0-based so
-    the formula shifts: advance from our level L requires L*L*20 practice.
-    This preserves the sequence 0, 20, 80, 180, 320, 500 for L=0..5.
+        P_UNSKILLED(0)→P_BASIC(1):     (0+1)^2 * 20 =  20
+        P_BASIC(1)→P_SKILLED(2):       (1+1)^2 * 20 =  80
+        P_SKILLED(2)→P_EXPERT(3):      (2+1)^2 * 20 = 180
+        P_EXPERT(3)→P_MASTER(4):       (3+1)^2 * 20 = 320
+        P_MASTER(4)→P_GRAND_MASTER(5): (4+1)^2 * 20 = 500
+
+    These match the vendor outputs ``practice_needed_to_advance(P_SKILL)``
+    for vendor P_SKILL = {1,2,3,4,5} = {UNSKILLED,…,MASTER}.
     """
-    lv = level.astype(jnp.int32)
+    lv = level.astype(jnp.int32) + jnp.int32(1)
     return (lv * lv * jnp.int32(20)).astype(jnp.int32)
 
 
@@ -577,14 +581,20 @@ class SkillState:
 def use_skill(state, skill_id: jnp.ndarray, degree: int = 1):
     """Increment practice counter for ``skill_id`` by ``degree``.
 
-    Cite: vendor/nethack/src/weapon.c:1424 — use_skill() increments
-    u.weapon_skills[skill].advance by the given amount.
+    Cite: vendor/nethack/src/weapon.c:1424-1434 — use_skill() guards the
+    increment behind ``skill != P_NONE && !P_RESTRICTED(skill)``.  In our
+    encoding a restricted skill is one with ``max_level <= P_UNSKILLED``
+    (vendor P_RESTRICTED tests P_SKILL == P_ISRESTRICTED, but Nethax stores
+    restriction in the cap rather than carrying P_ISRESTRICTED separately).
 
     JIT-pure: no Python branches on traced values.
     """
     sid = jnp.clip(skill_id.astype(jnp.int32), 0, N_SKILLS - 1)
     skills = state.skills
-    new_advance = skills.advance.at[sid].add(jnp.int32(degree))
+    cap = skills.max_level[sid].astype(jnp.int32)
+    not_restricted = cap > jnp.int32(SkillLevel.P_UNSKILLED)
+    inc = jnp.where(not_restricted, jnp.int32(degree), jnp.int32(0))
+    new_advance = skills.advance.at[sid].add(inc)
     new_skills = skills.replace(advance=new_advance)
     return state.replace(skills=new_skills)
 
@@ -648,8 +658,27 @@ def init_skills(role) -> SkillState:
             jnp.int8(SkillLevel.P_BASIC)
         )
 
+    # Vendor weapon.c:1795-1802 — for each non-restricted skill, pre-bank
+    #   P_ADVANCE(skill) = practice_needed_to_advance(P_SKILL(skill) - 1)
+    # so that a skill starting above P_UNSKILLED begins with the practice
+    # already accumulated to reach its current tier.  In our 0-based
+    # encoding the equivalent expression is practice_needed_to_advance(L-1)
+    # for current level L; for L=0 (UNSKILLED) this is 0 (clamped).
+    levels_i32 = initial_levels.astype(jnp.int32)
+    prev_lv = jnp.maximum(levels_i32 - jnp.int32(1), jnp.int32(0)).astype(jnp.int32)
+    prebank = practice_needed_to_advance(prev_lv)
+    # Skills capped at P_UNSKILLED (P_ISRESTRICTED equivalent) keep advance=0.
+    restricted = caps.astype(jnp.int32) <= jnp.int32(SkillLevel.P_UNSKILLED)
+    # Only pre-bank when the starting level is strictly above P_UNSKILLED;
+    # an UNSKILLED skill has prev_lv=0 so prebank=20 under the new formula,
+    # which would falsely satisfy advance >= threshold(0)=20.  Vendor only
+    # banks when P_SKILL > P_UNSKILLED (i.e. starting level > 1 in vendor;
+    # > 0 in our encoding).
+    above_unskilled = levels_i32 > jnp.int32(SkillLevel.P_UNSKILLED)
+    advance0 = jnp.where(above_unskilled & ~restricted, prebank, jnp.int32(0)).astype(jnp.int32)
+
     return SkillState(
         level=initial_levels,
-        advance=jnp.zeros((N_SKILLS,), dtype=jnp.int32),
+        advance=advance0,
         max_level=caps,
     )
