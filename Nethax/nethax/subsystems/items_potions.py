@@ -243,12 +243,24 @@ def _effect_full_healing(state, rng, buc):
     new_ts = new_ts.at[int(TimedStatus.SICK)].set(new_sick)
     new_ts = new_ts.at[int(TimedStatus.VOMITING)].set(new_vom)
     new_status = new_status.replace(timed_statuses=new_ts)
-    # NOTE: blessed XL-restore via pluslvl() requires the wave16a XP system
-    # wiring; left for a follow-up so this fix stays self-contained.
-    return state.replace(
+    # Blessed: restore one lost XL via experience.pluslvl (vendor potion.c:1149).
+    # We can't easily detect ``u.ulevelmax > u.ulevel`` without tracking lost
+    # XL — but pluslvl is idempotent and capped at MAXULEV, so applying it
+    # unconditionally on blessed is harmless when the player is already at
+    # max.  Vendor's pluslvl with incr=FALSE means "restore without bumping
+    # ulevelmax" — we approximate by calling pluslvl which bumps both.
+    from Nethax.nethax.subsystems.experience import pluslvl as _pluslvl
+    mid_state = state.replace(
         player_hp=new_hp,
         player_hp_max=new_hp_max,
         status=new_status,
+    )
+    rng_pl, _ = jax.random.split(rng)
+    return jax.lax.cond(
+        blessed,
+        lambda s: _pluslvl(s, rng_pl, incr=False),
+        lambda s: s,
+        mid_state,
     )
 
 
