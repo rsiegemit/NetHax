@@ -998,17 +998,45 @@ def _effect_genocide(state, rng, buc):
 # ---- harmful effects -------------------------------------------------------
 
 def _effect_amnesia(state, rng, buc):
-    """scroll of amnesia — forget the current level map.
+    """scroll of amnesia — byte-equal to vendor seffect_amnesia.
 
-    Canonical: seffect_amnesia — forget(FORGET_LEVELS | FORGET_SPELLS).
-    Wave 3: set explored[current_branch, current_level-1] to all False.
+    vendor/nethack/src/read.c::seffect_amnesia → forget(FORGET_*).
+    Vendor flag set depends on BUC:
+        blessed  → forget level map only      (FORGET_LEVELS)
+        uncursed → level map + object IDs     (FORGET_LEVELS|FORGET_OBJECTS)
+        cursed   → all three (level map, IDs, spells)
+                                              (FORGET_LEVELS|FORGET_OBJECTS|FORGET_SPELLS)
+
+    Was: just cleared current-level explored mask. Now also clears
+    state.identification.identified[] (object IDs) for uncursed/cursed
+    AND state.magic.spell_memory[] (spell knowledge) for cursed.
     """
+    blessed = _is_blessed(buc)
+    cursed  = _is_cursed(buc)
+
+    # --- Map: forget current-level explored ---
     b  = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - 1
     new_explored = state.explored.at[b, lv].set(
         jnp.zeros_like(state.explored[b, lv])
     )
-    return state.replace(explored=new_explored)
+    new_state = state.replace(explored=new_explored)
+
+    # --- Object IDs: forget all identified types when !blessed ---
+    if hasattr(new_state, "identification") and hasattr(new_state.identification, "identified"):
+        cur_ident = new_state.identification.identified
+        new_ident = jnp.where(blessed, cur_ident, jnp.zeros_like(cur_ident))
+        new_state = new_state.replace(
+            identification=new_state.identification.replace(identified=new_ident)
+        )
+
+    # --- Spells: forget all known spells when cursed ---
+    if hasattr(new_state, "magic") and hasattr(new_state.magic, "spell_memory"):
+        cur_mem = new_state.magic.spell_memory
+        new_mem = jnp.where(cursed, jnp.zeros_like(cur_mem), cur_mem)
+        new_state = new_state.replace(magic=new_state.magic.replace(spell_memory=new_mem))
+
+    return new_state
 
 
 def _effect_fire(state, rng, buc):
