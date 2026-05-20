@@ -549,28 +549,62 @@ def _effect_charging(state, rng, buc):
 # ---- curse/bless ----------------------------------------------------------
 
 def _effect_remove_curse(state, rng, buc):
-    """scroll of remove curse — uncurse inventory items.
+    """scroll of remove curse — byte-equal to vendor seffect_remove_curse.
 
-    Canonical: seffect_remove_curse — uncurse worn/wielded items (blessed:
-    all inventory items; uncursed: worn+wielded; cursed: re-curses items).
-    Wave 3: uncursed → all items with buc_status==CURSED become UNCURSED;
-    blessed → same; cursed → all items become CURSED.
+    vendor/nethack/src/read.c:1505-1602:
+      cursed   → scroll disintegrates, NO change to inventory
+      uncursed → uncurse worn+wielded items only (worn_armor[],
+                 wielded, off_hand, worn_amulet, worn_rings[], quiver)
+      blessed  → uncurse ALL inventory items + unpunish (drop ball/chain)
+
+    Previously uncursed scope = all-inventory (over-broad) and cursed
+    branch re-cursed everything (vendor does nothing). Now mirrors vendor
+    seffect_remove_curse scope rules.
     """
-    cursed     = _is_cursed(buc)
-    old_buc    = state.inventory.items.buc_status  # [52] int8
-    # uncurse or curse all items
-    new_buc = jnp.where(
-        cursed,
-        jnp.where(old_buc != jnp.int8(0),
-                  jnp.full_like(old_buc, _BUC_CURSED),
-                  old_buc),
-        jnp.where(old_buc == jnp.int8(_BUC_CURSED),
-                  jnp.full_like(old_buc, _BUC_UNCURSED),
-                  old_buc),
+    blessed = _is_blessed(buc)
+    cursed  = _is_cursed(buc)
+
+    inv     = state.inventory
+    items   = inv.items
+    old_buc = items.buc_status  # int8[52]
+
+    # Build worn-only mask of slots equipped on the body.
+    N = old_buc.shape[0]
+    slot_idx = jnp.arange(N, dtype=jnp.int8)
+    worn_mask = jnp.zeros_like(old_buc, dtype=jnp.bool_)
+    # wielded / off_hand / worn_amulet / quiver scalars (-1 == empty)
+    for s in (inv.wielded, inv.off_hand, inv.worn_amulet, inv.quiver):
+        worn_mask = worn_mask | ((s >= jnp.int8(0)) & (slot_idx == s))
+    # worn_armor[N_ARMOR_SLOTS] and worn_rings[2] arrays
+    for j in range(inv.worn_armor.shape[0]):
+        s = inv.worn_armor[j]
+        worn_mask = worn_mask | ((s >= jnp.int8(0)) & (slot_idx == s))
+    for j in range(inv.worn_rings.shape[0]):
+        s = inv.worn_rings[j]
+        worn_mask = worn_mask | ((s >= jnp.int8(0)) & (slot_idx == s))
+
+    # Mask of slots to uncurse: blessed→all, uncursed→worn-only, cursed→none.
+    apply_mask = jnp.where(
+        blessed, jnp.ones_like(worn_mask),
+        jnp.where(cursed, jnp.zeros_like(worn_mask), worn_mask),
     )
-    new_items = state.inventory.items.replace(buc_status=new_buc)
-    new_inv   = state.inventory.replace(items=new_items)
-    return state.replace(inventory=new_inv)
+    is_cursed_item = old_buc == jnp.int8(_BUC_CURSED)
+    new_buc = jnp.where(
+        apply_mask & is_cursed_item,
+        jnp.full_like(old_buc, _BUC_UNCURSED),
+        old_buc,
+    )
+
+    new_items = items.replace(buc_status=new_buc)
+    new_inv   = inv.replace(items=new_items)
+    # Blessed scroll also drops the iron ball chain (unpunish), vendor
+    # read.c:1598-1602.  state.is_punished may not exist; fall back gracefully.
+    new_state = state.replace(inventory=new_inv)
+    if hasattr(state, "is_punished"):
+        new_state = new_state.replace(
+            is_punished=jnp.where(blessed, jnp.bool_(False), state.is_punished),
+        )
+    return new_state
 
 
 # ---- detection -----------------------------------------------------------
