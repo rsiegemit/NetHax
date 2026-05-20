@@ -68,10 +68,15 @@ N_SPELLBOOK_TYPES = 46   # 43 spells + SPE_BLANK_PAPER + SPE_NOVEL + SPE_BOOK_OF
 # description is fixed and is excluded from the shuffle by obj_shuffle_range).
 POT_WATER_INDEX = N_POTION_TYPES - 1
 
-# TODO(wave3): derive NUM_OBJECTS from vendor/nethack/include/decl.h LAST_OBJECT
-# enum, or run `nethack --dumpenums`.  Placeholder value covers known categories
-# with headroom; do not use for array allocation until verified.
-NUM_OBJECTS = 512  # placeholder — see TODO above
+# Total object types in the OBJECTS table.  Derived at import time so the
+# value stays in sync if the vendor objects list is regenerated.
+# Cite: vendor/nethack/include/decl.h LAST_OBJECT.
+def _num_objects_at_import() -> int:
+    from Nethax.nethax.constants.objects import OBJECTS
+    return len(OBJECTS)
+
+
+NUM_OBJECTS: int = _num_objects_at_import()
 
 
 # ---------------------------------------------------------------------------
