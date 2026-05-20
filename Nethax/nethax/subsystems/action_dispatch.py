@@ -607,7 +607,60 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     # Opening a closed door blocks movement for this turn.
     # Locked door also blocks.
     door_blocked = target_is_closed_door  # any closed door bump: no movement
-    can_move = in_bounds & ~is_solid & ~door_blocked
+
+    # vendor/nethack/src/hack.c:1153-1170 — diagonal corner block.
+    # When moving diagonally (dx && dy) and both adjacent cardinal tiles
+    # (ux,y) and (x,uy) are "bad rock" (solid stone/wall), the diagonal
+    # move is blocked.  Skip when player Passes_walls (M1_WALLWALK).
+    is_diagonal_move = (jnp.int32(dy) != jnp.int32(0)) & (jnp.int32(dx) != jnp.int32(0))
+    cardA_row = pos[0] + jnp.int32(dy)   # (ux + dy, uy)  → (target_row, current_col)
+    cardA_col = pos[1]
+    cardB_row = pos[0]
+    cardB_col = pos[1] + jnp.int32(dx)   # (ux, uy + dx)  → (current_row, target_col)
+    cardA_safe_r = jnp.clip(cardA_row, 0, map_h - 1)
+    cardA_safe_c = jnp.clip(cardA_col, 0, map_w - 1)
+    cardB_safe_r = jnp.clip(cardB_row, 0, map_h - 1)
+    cardB_safe_c = jnp.clip(cardB_col, 0, map_w - 1)
+    cardA_tile = jnp.clip(terrain_2d[cardA_safe_r, cardA_safe_c].astype(jnp.int32),
+                          0, _NUM_TILE_TYPES - 1)
+    cardB_tile = jnp.clip(terrain_2d[cardB_safe_r, cardB_safe_c].astype(jnp.int32),
+                          0, _NUM_TILE_TYPES - 1)
+    cardA_solid = _IS_SOLID[cardA_tile]
+    cardB_solid = _IS_SOLID[cardB_tile]
+    # Passes_walls intrinsic bypass — vendor `!Passes_walls` gate.
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _PWIntr
+    passes_walls = (
+        state.status.intrinsics[int(_PWIntr.PASSES_WALLS)]
+        | (state.status.timed_intrinsics[int(_PWIntr.PASSES_WALLS)] > jnp.int32(0))
+    )
+    diagonal_corner_blocked = (
+        is_diagonal_move & cardA_solid & cardB_solid & ~passes_walls
+    )
+
+    # vendor/nethack/src/hack.c:1140 — diagonal-into-doorway block; and
+    # hack.c:1208 — diagonal-out-of-doorway block.  Approximation: when
+    # diagonal and either source or target tile is a door (OPEN_DOOR or
+    # CLOSED_DOOR), block the move.  Skip with Passes_walls.
+    src_tile = jnp.clip(terrain_2d[
+        jnp.clip(pos[0], 0, map_h - 1),
+        jnp.clip(pos[1], 0, map_w - 1),
+    ].astype(jnp.int32), 0, _NUM_TILE_TYPES - 1)
+    src_is_door = (
+        (src_tile == jnp.int32(TileType.OPEN_DOOR))
+        | (src_tile == jnp.int32(TileType.CLOSED_DOOR))
+    )
+    tgt_is_door = (
+        (tile_val == jnp.int32(TileType.OPEN_DOOR))
+        | (tile_val == jnp.int32(TileType.CLOSED_DOOR))
+    )
+    diagonal_door_blocked = (
+        is_diagonal_move & (src_is_door | tgt_is_door) & ~passes_walls
+    )
+
+    can_move = (
+        in_bounds & ~is_solid & ~door_blocked
+        & ~diagonal_corner_blocked & ~diagonal_door_blocked
+    )
 
     new_pos = jnp.where(can_move, target, pos).astype(jnp.int16)
 
@@ -701,6 +754,67 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     )
     state_final = state_final.replace(
         engrave=state_final.engrave.replace(has_engraving=new_has_engraving)
+    )
+
+    # --- Lava entry (trap.c::lava_effects line 6794) ---
+    # vendor/nethack/src/trap.c::lava_effects — entering a lava tile without
+    # any of Fire_resistance / Levitation / Flying / Water-walking burns the
+    # hero to a crisp (BURNING death).  With Wwalking but no Fire_res,
+    # take d(6,6) damage (only fatal if exceeds HP).  With Fire_res only,
+    # sink into lava trap (modeled as no-op for now; full TT_LAVA trap
+    # state is in trap subsystem).
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _LavaIntr
+    _lava_r = state_final.player_pos[0].astype(jnp.int32)
+    _lava_c = state_final.player_pos[1].astype(jnp.int32)
+    _lava_tile = _current_level_terrain(state_final)[
+        jnp.clip(_lava_r, 0, map_h - 1),
+        jnp.clip(_lava_c, 0, map_w - 1),
+    ].astype(jnp.int32)
+    _on_lava = (_lava_tile == jnp.int32(TileType.LAVA))
+    _has_fire_res = (
+        state_final.status.intrinsics[int(_LavaIntr.RESIST_FIRE)]
+        | (state_final.status.timed_intrinsics[int(_LavaIntr.RESIST_FIRE)] > jnp.int32(0))
+    )
+    _has_levitation = (
+        state_final.status.intrinsics[int(_LavaIntr.LEVITATION)]
+        | (state_final.status.timed_intrinsics[int(_LavaIntr.LEVITATION)] > jnp.int32(0))
+    )
+    _has_flying = (
+        state_final.status.intrinsics[int(_LavaIntr.FLYING)]
+        | (state_final.status.timed_intrinsics[int(_LavaIntr.FLYING)] > jnp.int32(0))
+    )
+    _has_wwalk = (
+        state_final.status.intrinsics[int(_LavaIntr.WWALKING)]
+        | (state_final.status.timed_intrinsics[int(_LavaIntr.WWALKING)] > jnp.int32(0))
+    )
+    # Lava damage: d(6, 6) per vendor trap.c:6800
+    lava_rng, new_rng_after_lava = jax.random.split(state_final.rng)
+    lava_rolls = jax.random.randint(lava_rng, (6,), 0, 6, dtype=jnp.int32) + jnp.int32(1)
+    lava_dmg = jnp.sum(lava_rolls).astype(jnp.int32)  # d(6,6)
+    # Survive iff Fire_resistance OR (Wwalking AND dmg < HP) OR Lev OR Flying
+    _survives_lava = (
+        _has_fire_res | _has_levitation | _has_flying
+        | (_has_wwalk & (lava_dmg < state_final.player_hp))
+    )
+    # No protections at all → instakill.
+    _lava_kills = _on_lava & actually_moved & ~_survives_lava
+    # Wwalking-only: take damage but live.
+    _wwalk_dmg = (
+        _on_lava & actually_moved & _has_wwalk
+        & ~_has_fire_res & ~_has_levitation & ~_has_flying
+    )
+    new_hp_after_lava = jnp.where(
+        _lava_kills,
+        jnp.int32(0),
+        jnp.where(_wwalk_dmg,
+                  jnp.maximum(state_final.player_hp - lava_dmg, jnp.int32(0)),
+                  state_final.player_hp),
+    )
+    new_done_after_lava = state_final.done | _lava_kills
+    state_final = state_final.replace(
+        player_hp=new_hp_after_lava,
+        done=new_done_after_lava,
+        rng=new_rng_after_lava,
     )
 
     # --- Water entry/exit (hack.c::pooleffects line 3304 / swimeffect line 3237) ---

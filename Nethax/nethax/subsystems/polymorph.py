@@ -307,26 +307,58 @@ _FORM_FLAGS2: jnp.ndarray = _build_form_flags2()
 #       vendor/nethack/src/polyself.c:75-110 (PROPSET adoption set).
 # ---------------------------------------------------------------------------
 
-# Vendor PM_ indices used by polymon (extracted from
-# Nethax/nethax/constants/monster_entries/chunk*.py).
-PM_GRAY_DRAGON: int   = 147   # chunk3.py:331 — first chromatic dragon
-PM_YELLOW_DRAGON: int = 156   # chunk3.py:501 — last chromatic dragon
-PM_STONE_GOLEM: int   = 265   # chunk5.py:131 — vendor PM_STONE_GOLEM
+# Vendor PM_ constants are recovered by name lookup at build time so they
+# stay correct even when the local MONSTERS table reorders.  See
+# _resolve_pm_indices below.
+def _resolve_pm_indices() -> dict[str, int]:
+    """Map vendor PM_ names → local MONSTERS index by `m.name` lookup.
 
-# golemhp(type) lookup table — exact vendor values from makemon.c:2233.
+    Vendor names (from include/monsters.h) and our MONSTERS[].name use the
+    same spelling, so a 1:1 lookup works.  Returns -1 for any name we
+    cannot find — defensive only; missing entries would indicate a real
+    table divergence to investigate.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS
+    wanted = (
+        "gray dragon", "yellow dragon", "silver dragon",
+        "straw golem", "paper golem", "rope golem", "gold golem",
+        "leather golem", "wood golem", "flesh golem", "clay golem",
+        "stone golem", "glass golem", "iron golem",
+    )
+    out: dict[str, int] = {n: -1 for n in wanted}
+    for i, m in enumerate(MONSTERS):
+        if m.name in out and out[m.name] == -1:
+            out[m.name] = i
+    return out
+
+
+_PM = _resolve_pm_indices()
+
+# Vendor PM_GRAY_DRAGON..PM_YELLOW_DRAGON spans the 9 adult chromatic
+# dragons.  In the local MONSTERS table they are contiguous, so we use
+# the resolved [gray, yellow] range to flag adult dragons.
+PM_GRAY_DRAGON: int   = _PM["gray dragon"]
+PM_YELLOW_DRAGON: int = _PM["yellow dragon"]
+PM_STONE_GOLEM: int   = _PM["stone golem"]
+
+# golemhp(type) lookup — vendor values from makemon.c:2233.  Keyed by
+# local MONSTERS index resolved via name (PM_ enum values themselves
+# vary across vendor versions; the HP values are the canonical data).
 _GOLEM_HP_BY_PM: dict[int, int] = {
-    256: 20,   # PM_STRAW_GOLEM
-    257: 20,   # PM_PAPER_GOLEM
-    258: 30,   # PM_ROPE_GOLEM
-    259: 60,   # PM_GOLD_GOLEM
-    261: 40,   # PM_LEATHER_GOLEM
-    262: 50,   # PM_WOOD_GOLEM
-    263: 40,   # PM_FLESH_GOLEM
-    264: 70,   # PM_CLAY_GOLEM
-    265: 100,  # PM_STONE_GOLEM
-    266: 80,   # PM_GLASS_GOLEM
-    267: 120,  # PM_IRON_GOLEM
+    _PM["straw golem"]:   20,
+    _PM["paper golem"]:   20,
+    _PM["rope golem"]:    30,
+    _PM["gold golem"]:    60,
+    _PM["leather golem"]: 40,
+    _PM["wood golem"]:    50,
+    _PM["flesh golem"]:   40,
+    _PM["clay golem"]:    70,
+    _PM["stone golem"]:  100,
+    _PM["glass golem"]:   80,
+    _PM["iron golem"]:   120,
 }
+# Drop any sentinel -1 entries (missing names) so they cannot poison the table.
+_GOLEM_HP_BY_PM = {k: v for k, v in _GOLEM_HP_BY_PM.items() if k >= 0}
 
 
 def _build_form_strongmonst() -> jnp.ndarray:
@@ -615,18 +647,63 @@ def _form_ac(form_idx: jnp.ndarray) -> jnp.ndarray:
 
 
 def _form_hp_max(form_idx: jnp.ndarray, rng: jax.Array) -> jnp.ndarray:
-    """Return a fresh HP_max roll for a monster form.
+    """Return a fresh HP_max roll for the player polymorph form (byte-equal).
 
-    NetHack rolls hp_max for new monsters as ``d8 * (mlevel + 1)``-ish.
-    We use a simplified (level+1) * 8 max so the result is deterministic
-    given rng, matching ``mons[].mlevel`` semantics in mon.c::newmonhp.
+    vendor/nethack/src/polyself.c:860-870 — polymon u.mhmax computation::
+
+        mlvl = mons[mntmp].mlevel;
+        if (mlet == S_DRAGON && mntmp >= PM_GRAY_DRAGON) {
+            u.mhmax = In_endgame ? (8 * mlvl) : (4 * mlvl + d(mlvl, 4));
+        } else if (is_golem(mons[mntmp])) {
+            u.mhmax = golemhp(mntmp);
+        } else {
+            if (!mlvl) u.mhmax = rnd(4);
+            else       u.mhmax = d(mlvl, 8);
+            if (is_home_elemental(mons[mntmp])) u.mhmax *= 3;
+        }
+
+    JIT-pure via lax.switch over the three branches; In_endgame is False
+    in nethax (no Planes-of-X), so the dragon branch always uses the
+    4*mlvl + d(mlvl,4) form.
     """
     tables = _monster_tables()
-    level = tables["level"][form_idx.astype(jnp.int32)].astype(jnp.int32)
-    base = jnp.maximum(level + 1, jnp.int32(1)) * jnp.int32(8)
-    # Add small RNG-driven jitter in [0, base) for variability.
-    roll = jax.random.randint(rng, (), 0, jnp.maximum(base, jnp.int32(1)))
-    return (base + roll).astype(jnp.int32)
+    idx = form_idx.astype(jnp.int32)
+    mlvl = tables["level"][idx].astype(jnp.int32)
+
+    is_dragon = _FORM_IS_ADULT_DRAGON[idx]
+    is_golem  = _FORM_IS_GOLEM[idx]
+    is_home_e = _FORM_IS_HOME_ELEMENTAL[idx]
+    golem_hp  = _FORM_GOLEM_HP[idx].astype(jnp.int32)
+
+    # Static-shape masked roll: d(N, S) with traced N.
+    # Vendor d(N, S) = sum_{i=1..N} (1 + rn2(S)).
+    _MAX_DICE = 32  # vendor mlvl ≤ ~20; 32 is safe upper bound for dice count.
+
+    def _dice_sum(rng_in, n: jnp.ndarray, sides: jnp.ndarray) -> jnp.ndarray:
+        # n,sides traced int32 scalars. Roll _MAX_DICE dice; mask first n.
+        rolls = jax.random.randint(
+            rng_in, (_MAX_DICE,), 0, jnp.maximum(sides, jnp.int32(1)),
+            dtype=jnp.int32,
+        ) + jnp.int32(1)
+        active = jnp.arange(_MAX_DICE, dtype=jnp.int32) < n
+        return jnp.sum(jnp.where(active, rolls, jnp.int32(0))).astype(jnp.int32)
+
+    rng_dragon, rng_normal, rng_zero = jax.random.split(rng, 3)
+
+    # Dragon branch: 4*mlvl + d(mlvl, 4)
+    dragon_hp = jnp.int32(4) * mlvl + _dice_sum(rng_dragon, mlvl, jnp.int32(4))
+
+    # Normal branch: mlvl==0 → rnd(4) = 1..4 ; mlvl>0 → d(mlvl, 8)
+    rnd4 = (jax.random.randint(rng_zero, (), 0, jnp.int32(4), dtype=jnp.int32)
+            + jnp.int32(1))
+    d_mlvl_8 = _dice_sum(rng_normal, mlvl, jnp.int32(8))
+    base_hp = jnp.where(mlvl == jnp.int32(0), rnd4, d_mlvl_8)
+    base_hp = jnp.where(is_home_e, base_hp * jnp.int32(3), base_hp)
+
+    # Pick branch: dragon → golem → normal (matching vendor priority).
+    result = jnp.where(is_golem, golem_hp, base_hp)
+    result = jnp.where(is_dragon, dragon_hp, result)
+    return jnp.maximum(result, jnp.int32(1)).astype(jnp.int32)
 
 
 def _form_attacks(form_idx: jnp.ndarray):
@@ -954,10 +1031,22 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool = 
     rng, sub = jax.random.split(rng)
     new_hp_max = _form_hp_max(form_i16, sub)
 
-    # poly_timer ∈ [500, 1000)
+    # poly_timer = rn1(500, 500) → [500, 1000).
     rng, sub2 = jax.random.split(rng)
     timer = (jnp.int16(_POLY_TIMER_BASE)
              + jax.random.randint(sub2, (), 0, _POLY_TIMER_RANGE).astype(jnp.int16))
+
+    # vendor/nethack/src/polyself.c:874 — low-level chars get shorter poly
+    # timers when transforming into high-level forms::
+    #     if (u.ulevel < mlvl)
+    #         u.mtimedone = u.mtimedone * u.ulevel / mlvl;
+    # Skip when ulevel >= mlvl (no scaling).
+    tables_local = _monster_tables()
+    mlvl_form = tables_local["level"][form_i16.astype(jnp.int32)].astype(jnp.int32)
+    ulevel = state.player_xl.astype(jnp.int32)
+    safe_mlvl = jnp.maximum(mlvl_form, jnp.int32(1))
+    scaled_timer = (timer.astype(jnp.int32) * ulevel // safe_mlvl).astype(jnp.int16)
+    timer = jnp.where(ulevel < mlvl_form, scaled_timer, timer)
 
     new_count = jnp.where(controlled_b,
                           poly.controlled_poly_count + jnp.int8(1),
