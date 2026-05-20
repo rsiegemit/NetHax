@@ -585,9 +585,10 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         current_ = f.door_state[lv_, row_, col_].astype(jnp.int32)
         is_closed_ = current_ == jnp.int32(DoorState.CLOSED)
         is_trapped_ = f.door_trapped[lv_, row_, col_]
+        # Vendor lock.c:909 — trapped door bumps to D_NODOOR (GONE), not BROKEN.
         new_val_ = jnp.where(
             is_closed_ & is_trapped_,
-            jnp.int32(DoorState.BROKEN),
+            jnp.int32(DoorState.GONE),
             jnp.where(is_closed_ & ~is_trapped_, jnp.int32(DoorState.OPEN), current_),
         ).astype(jnp.int8)
         damage_ = jnp.where(is_closed_ & is_trapped_, bump_trap_dmg_roll, jnp.int32(0))
@@ -1081,6 +1082,17 @@ def _stair_up(state, rng):
     if src_b is not None and src_lv is not None:
         new_state = restore_monsters_and_features(new_state, src_b, int(new_level))
 
+    # Emit "You climb up the stairs." when the action actually traversed.
+    # Cite: vendor/nethack/src/do.c::doup — pline("You climb up the stairs.").
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    new_messages = jax.lax.cond(
+        on_stair,
+        lambda m: _msg_emit(m, int(_MsgId.GO_UP_STAIRS)),
+        lambda m: m,
+        new_state.messages,
+    )
+    new_state = new_state.replace(messages=new_messages)
+
     return _on_quest_leader_level(_apply_fov(new_state))
 
 
@@ -1132,12 +1144,29 @@ def _stair_down(state, rng):
     if src_b is not None and src_lv is not None:
         new_state = restore_monsters_and_features(new_state, src_b, int(new_level))
 
+    # Emit "You climb down the stairs." when the action actually traversed.
+    # Cite: vendor/nethack/src/do.c::dodown — pline("You climb down the stairs.").
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    new_messages = jax.lax.cond(
+        on_stair,
+        lambda m: _msg_emit(m, int(_MsgId.GO_DOWN_STAIRS)),
+        lambda m: m,
+        new_state.messages,
+    )
+    new_state = new_state.replace(messages=new_messages)
+
     return _on_quest_leader_level(_apply_fov(new_state))
 
 
 def _wait(state, rng):
-    """Rest one turn — state is unchanged (outer loop ticks the timestep)."""
-    return state
+    """Rest one turn — state is unchanged (outer loop ticks the timestep).
+
+    Emits "You wait." per vendor/nethack/src/cmd.c::dowait.
+    """
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    return state.replace(
+        messages=_msg_emit(state.messages, int(_MsgId.YOU_WAIT)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1221,6 +1250,17 @@ def _handle_eat(state, rng):
     # Use jnp.where on the idx so the postfx sees -1 when not a corpse → no-op.
     effective_corpse_idx = jnp.where(is_corpse_item, corpse_idx, jnp.int32(-1))
     new_state = _corpse_postfx(new_state, rng, effective_corpse_idx)
+
+    # Emit "You eat the food." when the action consumed something.
+    # Cite: vendor/nethack/src/eat.c::eatcorpse — pline("You eat ...").
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    new_messages = jax.lax.cond(
+        found,
+        lambda m: _msg_emit(m, int(_MsgId.EAT_FOOD)),
+        lambda m: m,
+        new_state.messages,
+    )
+    new_state = new_state.replace(messages=new_messages)
 
     return new_state
 
@@ -1749,8 +1789,12 @@ def _handle_enhance(state, rng):
       SKILLED(2)→EXPERT(3):     180
       EXPERT(3)→MASTER(4):      320
       MASTER(4)→GRAND_MASTER(5):500
-    The uniform formula is byte-equal to vendor for all non-martial-arts skills.
-    TODO: martial arts uses a separate vendor table (weapon.c::Skill_M); skip for now.
+    The uniform formula is byte-equal to vendor for all skills, including
+    martial arts.  Vendor weapon.c::can_advance uses the same
+    practice_needed_to_advance macro for every skill (line 1167); the only
+    differences for unarmed/martial are the per-tier cap (GRAND_MASTER vs
+    EXPERT) and `slots_required` halving (weapon.c:1144), both surfacing
+    via skill table data elsewhere.
 
     Note: vendor gates enhancement on weapon_slots; that is not yet modelled.
     """

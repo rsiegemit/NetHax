@@ -88,9 +88,12 @@ class TestTrappedDoor:
         assert int(damage) == 0, f"Normal door should deal 0 damage, got {int(damage)}"
 
     def test_trapped_door_becomes_broken(self):
-        """Opening a trapped door results in BROKEN state, not OPEN.
+        """Opening a trapped door results in GONE state (D_NODOOR), not OPEN.
 
-        Vendor: trapsounding() destroys the door (D_BROKEN).
+        Vendor: vendor/nethack/src/lock.c:907-913 — after b_trapped() the
+        doormask is set to D_NODOOR (the trap obliterates the door rather
+        than breaking it off its hinges).  In our DoorState enum this is
+        DoorState.GONE (0).
         """
         state = _make_state()
         state = _set_door(state, 3, 3, DoorState.CLOSED, trapped=True)
@@ -100,8 +103,8 @@ class TestTrappedDoor:
 
         flat = _flat_lv(state)
         new_ds = int(new_features.door_state[flat, 3, 3])
-        assert new_ds == int(DoorState.BROKEN), (
-            f"Trapped door should become BROKEN (1), got {new_ds}"
+        assert new_ds == int(DoorState.GONE), (
+            f"Trapped door should become GONE (0), got {new_ds}"
         )
 
     def test_trapped_bit_cleared_after_spring(self):

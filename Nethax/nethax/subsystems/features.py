@@ -202,9 +202,13 @@ def open_door(
 
     State transitions:
       CLOSED + not trapped → OPEN (2), damage = 0
-      CLOSED + trapped     → BROKEN (1), damage = rnd(5 + (lvl<5 ? lvl :
-                             2 + lvl/2)), trapped bit cleared
+      CLOSED + trapped     → GONE (D_NODOOR, 0), damage = rnd(5 + (lvl<5 ?
+                             lvl : 2 + lvl/2)), trapped bit cleared
       All other states     → unchanged, damage = 0
+
+    Vendor lock.c:907-913 sets ``door->doormask = D_NODOOR`` after
+    ``b_trapped()``, NOT D_BROKEN — the trap obliterates the door rather
+    than breaking it off its hinges.
 
     Returns (new_state, damage: int32).
     """
@@ -224,10 +228,11 @@ def open_door(
         rng, (), minval=1, maxval=dmg_upper + jnp.int32(1), dtype=jnp.int32,
     )
 
-    # Door state: trapped → BROKEN, else → OPEN (only when was CLOSED)
+    # Door state: trapped → GONE (D_NODOOR per lock.c:909),
+    # else → OPEN (only when was CLOSED).
     new_val = jnp.where(
         is_closed & is_trapped,
-        jnp.int32(DoorState.BROKEN),
+        jnp.int32(DoorState.GONE),
         jnp.where(is_closed & ~is_trapped, jnp.int32(DoorState.OPEN), current),
     ).astype(jnp.int8)
 
@@ -672,14 +677,14 @@ def handle_open(state, rng: jax.Array):
     Direction prompting (vendor get_adjacent_loc at lock.c:804) is upstream;
     callers are expected to have moved the player onto the target tile.
     Trapped doors are handled via open_door — vendor lock.c:907-913 sets the
-    doormask to D_NODOOR after b_trapped() but our open_door() leaves the
-    door in BROKEN; trap damage is applied to player_hp here.  See
-    open_door() above for the exact state transition and damage roll.
+    doormask to D_NODOOR after b_trapped() and our open_door() now mirrors
+    this (GONE, not BROKEN); trap damage is applied to player_hp here.
+    See open_door() above for the exact state transition and damage roll.
 
     Vendor resist roll (vendor/nethack/src/lock.c:904):
         ``if (rnl(20) < (ACURRSTR + ACURR(A_DEX) + ACURR(A_CON)) / 3) ...``
-    On success the door opens (CLOSED → OPEN, or BROKEN if trapped);
-    otherwise it sticks shut.  We model ``rnl(20)`` as the plain
+    On success the door opens (CLOSED → OPEN, or GONE if trapped per
+    lock.c:909); otherwise it sticks shut.  We model ``rnl(20)`` as the plain
     uniform ``rn2(Str+Dex+Con)`` form documented in older NetHack
     sources (see task spec: ``rn2(ACURR(A_STR)+ACURR(A_DEX)+ACURR(A_CON))
     < 30``) which is byte-equal to the 3.7 source recompiled with
