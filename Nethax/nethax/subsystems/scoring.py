@@ -365,18 +365,29 @@ def compute_final_score(state) -> jnp.ndarray:
     gold      = jnp.int32(state.player_gold)
     deepest   = jnp.int32(scoring.deepest_level)
 
-    # Ascension doubles XP (end.c:1344-1351 — full-alignment keeps x2).
-    ascend_xp = jnp.where(scoring.ascended, xp_pts, jnp.int32(0))
+    # Vendor end.c:1334-1340 — gold adjustment (10% deducted on death,
+    # not on PANIC) and deepest-level bonuses:
+    #   tmp = max(0, gold_net)
+    #   if how < PANICKED: tmp -= tmp / 10        (death tax)
+    #   tmp += 50 * (deepest - 1)                 (travel bonus)
+    #   if deepest > 20:
+    #       tmp += 1000 * min(10, deepest - 20)   (deep bonus, capped at 10)
+    gold_capped = jnp.maximum(gold, jnp.int32(0))
+    gold_adj    = gold_capped - (gold_capped // jnp.int32(10))  # 10% death tax
+    travel_b    = jnp.int32(50) * jnp.maximum(deepest - jnp.int32(1), jnp.int32(0))
+    deep_excess = jnp.maximum(deepest - jnp.int32(20), jnp.int32(0))
+    deep_b      = jnp.int32(1000) * jnp.minimum(deep_excess, jnp.int32(10))
 
-    # Deep-level bonus: 100 * max(0, deepest - 20)  (end.c:1339-1340).
-    deep_b    = jnp.int32(DEEP_LEVEL_BONUS) * jnp.maximum(deepest - 20, jnp.int32(0))
+    # Ascension doubles the entire (urexp + tmp), end.c:1344-1351.
+    base    = xp_pts + gold_adj + travel_b + deep_b
+    asc_b   = jnp.where(scoring.ascended, base, jnp.int32(0))
 
     # Artifact bonus: 50 * n_artifacts (end.c:1452); 0 until tracking added.
     artifact_b = jnp.int32(0)
 
     conduct_b = compute_conduct_bonus(state)
 
-    total = xp_pts + ascend_xp + gold + deep_b + artifact_b + conduct_b
+    total = base + asc_b + artifact_b + conduct_b
     return jnp.int32(total)
 
 
