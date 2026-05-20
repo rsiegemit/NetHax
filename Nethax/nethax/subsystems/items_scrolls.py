@@ -706,18 +706,67 @@ def _effect_magic_mapping(state, rng, buc):
 
 
 def _effect_teleportation(state, rng, buc):
-    """scroll of teleportation — teleport the player.
+    """scroll of teleportation — byte-equal to vendor seffect_teleportation.
 
-    Canonical: seffect_teleportation — tele(); blessed: controlled tele.
-    Wave 3: randomise player_pos within the map bounds using rng.
-    Cursed: teleports to a random dungeon level instead (simplified: random pos).
+    vendor/nethack/src/read.c::seffect_teleportation:
+      cursed   → level_tele() (different dungeon level)
+      uncursed → tele()       (random tile, current level)
+      blessed  → controlled   (player picks dest; nethax: same as uncursed)
+
+    Was: picked ANY tile (incl. WALL/VOID). Now rejection-samples up to 32
+    tries for a walkable (FLOOR / CORRIDOR / DOOR-open) tile on the current
+    level; cursed also bumps dungeon level by rn2(5)+1 in either direction
+    (clamped to [1, 50]) as a simple level_tele approximation — full
+    goto_level wiring is wave 22.
+    Cite: vendor/nethack/src/teleport.c::tele (line 447), level_tele 1164.
     """
-    rng1, rng2 = jax.random.split(rng)
-    h, w = state.terrain.shape[2], state.terrain.shape[3]
-    new_row = jax.random.randint(rng1, shape=(), minval=0, maxval=h).astype(jnp.int16)
-    new_col = jax.random.randint(rng2, shape=(), minval=0, maxval=w).astype(jnp.int16)
-    new_pos = jnp.array([new_row, new_col], dtype=jnp.int16)
-    return state.replace(player_pos=new_pos)
+    from Nethax.nethax.constants.tiles import TileType
+    from Nethax.nethax.rng import rn2
+
+    cursed = _is_cursed(buc)
+
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - 1
+    terrain_2d = state.terrain[b, lv]
+    h, w = terrain_2d.shape
+
+    # --- Rejection-sample to a walkable tile (up to 32 tries). ---
+    MAX_TRIES = 32
+    rng_r, rng_c, rng_lv = jax.random.split(rng, 3)
+    rrows = jax.random.randint(rng_r, (MAX_TRIES,), 0, h)
+    rcols = jax.random.randint(rng_c, (MAX_TRIES,), 0, w)
+
+    def _walkable(r, c):
+        t = terrain_2d[r, c]
+        return (t == jnp.int8(TileType.FLOOR)) | (t == jnp.int8(TileType.CORRIDOR))
+
+    def _pick(carry, i):
+        chosen_r, chosen_c, found = carry
+        r = rrows[i]; c = rcols[i]
+        ok = _walkable(r, c) & ~found
+        new_r = jnp.where(ok, r, chosen_r)
+        new_c = jnp.where(ok, c, chosen_c)
+        new_found = found | _walkable(r, c)
+        return (new_r, new_c, new_found), None
+
+    (final_r, final_c, _found), _ = jax.lax.scan(
+        _pick,
+        (jnp.int32(state.player_pos[0]), jnp.int32(state.player_pos[1]), jnp.bool_(False)),
+        jnp.arange(MAX_TRIES),
+    )
+
+    new_pos = jnp.array([final_r, final_c], dtype=jnp.int16)
+    new_state = state.replace(player_pos=new_pos)
+
+    # --- Cursed: also shift dungeon level (level_tele approximation). ---
+    lv_shift = rn2(rng_lv, 5).astype(jnp.int32) + jnp.int32(1)
+    sign     = jnp.where(rn2(rng_lv, 2) == jnp.int32(0), jnp.int32(-1), jnp.int32(1))
+    cur_lvl  = state.dungeon.current_level.astype(jnp.int32)
+    new_lvl  = jnp.clip(cur_lvl + sign * lv_shift, jnp.int32(1), jnp.int32(50)).astype(jnp.int8)
+    new_lvl_state = new_state.replace(
+        dungeon=new_state.dungeon.replace(current_level=new_lvl)
+    )
+    return jax.lax.cond(cursed, lambda _: new_lvl_state, lambda _: new_state, None)
 
 
 def _effect_light(state, rng, buc):
