@@ -1100,6 +1100,19 @@ def _handle_zap(state, rng):
     for _ci in range(_N_CONTAINERS):
         final_state = _maybe_cancel_boh(final_state, _ci)
 
+    # Use-identification: zapping a wand identifies its type, vendor
+    # zap.c:123-147 learnwand(otmp) → makeknown(obj->otyp).
+    # Flip identified=True on the wand slot we just zapped.
+    new_id_flags = final_state.inventory.items.identified.at[w_slot].set(
+        jnp.where(jnp.any(is_wand_slot), jnp.bool_(True),
+                  final_state.inventory.items.identified[w_slot])
+    )
+    final_state = final_state.replace(
+        inventory=final_state.inventory.replace(
+            items=final_state.inventory.items.replace(identified=new_id_flags)
+        )
+    )
+
     return final_state
 
 
