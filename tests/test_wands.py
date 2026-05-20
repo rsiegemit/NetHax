@@ -314,13 +314,27 @@ def test_handle_zap_uses_first_wand():
 # ---------------------------------------------------------------------------
 
 def test_light_explores_map():
-    """WAN_LIGHT must mark the full map as explored."""
-    state = _make_state()
+    """WAN_LIGHT must light a radius-5 disc around the player.
+
+    Cite: vendor/nethack/src/read.c::litroom line 2601 calls
+      do_clear_area(u.ux, u.uy, blessed_effect ? 9 : 5, set_lit, ...)
+    so an uncursed wand of light marks tiles within Euclidean disc radius
+    5 as lit/explored.  Tiles outside the disc must remain unexplored.
+    """
+    state = _make_state(player_row=10, player_col=10)
     state = _with_wand(state, WandEffect.LIGHT, charges=5)
 
     result = zap_wand(state, _RNG, slot_idx=jnp.int32(0), direction=jnp.int32(2))
 
-    assert jnp.all(result.explored), "WAN_LIGHT should mark all tiles as explored"
+    # Player tile must be lit.
+    assert bool(result.explored[10, 10]), "WAN_LIGHT must light the player tile"
+    # Tile within radius 5 (3,4) of player should be lit: dist^2 = 49 + 16 = 65 > 25?
+    # Actually (10+3, 10+4) is far: 9+16=25 -> ok at the edge.
+    assert bool(result.explored[13, 14]), "WAN_LIGHT must light a tile at distance 5"
+    # Tile far from player must remain dark.
+    assert not bool(result.explored[0, 0]), (
+        "WAN_LIGHT must not light tiles beyond radius 5"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -407,10 +407,19 @@ def test_scroll_scare_monster_is_noop_in_wave3():
 # ===========================================================================
 
 def test_wand_light_marks_all_explored():
-    """WAN_LIGHT — vendor do_clear_area illuminates tiles."""
-    state = _wand_state_with_wand(WandEffect.LIGHT)
+    """WAN_LIGHT — vendor litroom() lights a radius-5 disc around @.
+
+    Cite: vendor/nethack/src/read.c::litroom line 2601:
+      do_clear_area(u.ux, u.uy, blessed_effect ? 9 : 5, set_lit, ...)
+    so an uncursed wand of light lights tiles within disc radius 5 around
+    the hero — NOT the entire map.
+    """
+    state = _wand_state_with_wand(WandEffect.LIGHT, player_row=10, player_col=10)
     result = zap_wand(state, _RNG, slot_idx=jnp.int32(0), direction=jnp.int32(2))
-    assert bool(jnp.all(result.explored))
+    # Player tile lit.
+    assert bool(result.explored[10, 10])
+    # Tile beyond radius 5 must stay dark.
+    assert not bool(result.explored[0, 0])
 
 
 def test_wand_digging_carves_wall():

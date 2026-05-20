@@ -13,8 +13,11 @@ Design notes:
   - All per-effect handlers are pure functions compatible with jax.jit.
   - jax.lax.switch is used for effect dispatch (static-shape requirement).
   - jax.lax.scan is used for ray stepping (no Python loops in jit path).
-  - Bresenham stepping is approximated with unit-step integer direction
-    vectors (the eight compass directions used by NetHack's buzz()).
+  - Ray stepping uses unit-step integer direction vectors (dx, dy in
+    {-1, 0, 1}).  This matches vendor exactly: vendor/nethack/src/zap.c
+    dobuzz (lines 4829-4833) and bhit (lines 3870-3877) advance one
+    tile per loop iteration along (ddx, ddy) — there is no Bresenham
+    line-drawing in NetHack's ray code.
   - Monster table is a flat array; slot 0 is reserved / always dead so
     "no hit" returns index 0 safely.
 """
@@ -476,13 +479,27 @@ def _deal_damage(state: WandState, mon_idx: jax.Array, dmg: jax.Array) -> WandSt
 # ---------------------------------------------------------------------------
 
 def _effect_light(state: WandState, rng: jax.Array) -> tuple[WandState, jax.Array]:
-    """WAN_LIGHT — illuminate the entire map (set explored=True everywhere).
+    """WAN_LIGHT — illuminate a radius-5 disk around the player.
 
-    vendor/nethack/src/zap.c: dozap() WAN_LIGHT calls do_clear_area() which
-    marks all tiles within radius as lit and explored.  We simplify to full
-    level exploration for JIT compatibility.
+    Cite: vendor/nethack/src/read.c::litroom line 2601 calls
+      do_clear_area(u.ux, u.uy, blessed_effect ? 9 : 5, set_lit, ...)
+    so an uncursed wand of light lights tiles within Euclidean-disc radius
+    5 around the hero (vendor/nethack/src/vision.c::do_clear_area uses
+    ``circle_ptr(range)`` to compute the row-major disc limits).
+
+    Implementation: mark every tile whose squared distance from the player
+    is <= 5*5 as explored.  JIT-pure (broadcast comparison; no Python loop).
     """
-    new_explored = jnp.ones_like(state.explored)
+    map_h, map_w = state.explored.shape
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    rows = jnp.arange(map_h, dtype=jnp.int32)[:, None]
+    cols = jnp.arange(map_w, dtype=jnp.int32)[None, :]
+    dy = rows - pr
+    dx = cols - pc
+    # Euclidean disc with vendor uncursed radius=5.
+    in_disc = (dy * dy + dx * dx) <= jnp.int32(5 * 5)
+    new_explored = state.explored | in_disc
     return state.replace(explored=new_explored), rng
 
 
@@ -496,16 +513,32 @@ def _effect_nothing(
 def _effect_secret_door_detection(
     state: WandState, rng: jax.Array
 ) -> tuple[WandState, jax.Array]:
-    """WAN_SECRET_DOOR_DETECTION — reveals SDOOR/SCORR tiles only.
+    """WAN_SECRET_DOOR_DETECTION — reveal SDOOR/SCORR within BOLT_LIM of @.
 
-    Cite: vendor/nethack/src/detect.c::findone (line ~1093). The wand
-    converts SDOOR→DOOR (closed) and SCORR→CORR on the current level.
-    It does NOT reveal arbitrary terrain, only the hidden ones.
+    Cite: vendor/nethack/src/detect.c::findit line 1815:
+      do_clear_area(u.ux, u.uy, BOLT_LIM, findone, ...)
+    where BOLT_LIM = 8 (vendor/nethack/include/hack.h line 49).  findone()
+    converts SDOOR -> DOOR (closed) and SCORR -> CORR, but only at tiles
+    visited by do_clear_area's disc walk (i.e. within radius 8 of @).
+
+    Implementation: mask the SDOOR/SCORR replacement by a radius-8 disc
+    centred on player_pos so tiles further away keep their hidden type.
+    JIT-pure (broadcast comparison; no Python loop).
     """
     from Nethax.nethax.constants.tiles import VendorTileType
-    # SDOOR (14) → CLOSED_DOOR; SCORR (15) → CORRIDOR.
-    is_sdoor = state.terrain == jnp.int8(int(VendorTileType.SDOOR))
-    is_scorr = state.terrain == jnp.int8(int(VendorTileType.SCORR))
+
+    map_h, map_w = state.terrain.shape
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    rows = jnp.arange(map_h, dtype=jnp.int32)[:, None]
+    cols = jnp.arange(map_w, dtype=jnp.int32)[None, :]
+    dy = rows - pr
+    dx = cols - pc
+    # BOLT_LIM = 8 — vendor/nethack/include/hack.h line 49.
+    in_disc = (dy * dy + dx * dx) <= jnp.int32(8 * 8)
+
+    is_sdoor = (state.terrain == jnp.int8(int(VendorTileType.SDOOR))) & in_disc
+    is_scorr = (state.terrain == jnp.int8(int(VendorTileType.SCORR))) & in_disc
     new_terrain = jnp.where(is_sdoor,
                             jnp.int8(int(TileType.CLOSED_DOOR)),
                             state.terrain)
@@ -518,12 +551,27 @@ def _effect_secret_door_detection(
 def _effect_opening(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_OPENING — RAY: opens the first closed/locked door along the path.
+    """WAN_OPENING — IMMEDIATE beam: opens the first closed door along path.
 
-    Cite: vendor/nethack/src/zap.c::wand_unlock (line ~4600) — beam stops at
-    the first closed/locked door, opening it.  RAY propagation matches the
-    other directed wands (cite zap.c::buzz line 4823: rn1(7,7) range).
-    Also unlocks containers on the targeted tile (TODO: wire container hits).
+    Cite: vendor/nethack/src/zap.c::bhit line 4056-4074 — when bhit walks a
+    ZAPPED_WAND over a tile with IS_DOOR(typ) or typ == SDOOR, it calls
+    doorlock(obj, x, y) for WAN_OPENING/LOCKING/STRIKING.  The handler
+    doorlock() (vendor/nethack/src/lock.c::doorlock line 1102) translates
+    door state per wand type.
+
+    Container handling: vendor/nethack/src/zap.c::bhitpile dispatches each
+    object at the tile to boxlock() (vendor/nethack/src/lock.c line 1056),
+    which sets obj->olocked = 0 for WAN_OPENING.  Our WandState does not
+    carry the level's floor-object table (containers live in
+    ``state.containers`` on the full EnvState).  Floor-container unlocking
+    therefore happens on the EnvState dispatch path, not here.  See
+    Nethax/nethax/subsystems/containers.py::open_container.
+
+    Door tile mapping in our local enum:
+      * Our TileType.CLOSED_DOOR collapses vendor's {D_CLOSED, D_LOCKED}
+        because we lack a per-tile doormask bit.  Opening therefore
+        transitions CLOSED_DOOR -> OPEN_DOOR (which subsumes the vendor
+        D_LOCKED -> D_CLOSED unlock).
     """
     def on_hit_door(s, r, pos):
         # Open the door at this tile.
@@ -547,9 +595,17 @@ def _effect_opening(
 def _effect_locking(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_LOCKING — RAY: closes the first open door along the path.
+    """WAN_LOCKING — IMMEDIATE beam: closes the first open door along path.
 
-    Cite: vendor/nethack/src/zap.c::wand_unlock + locking branch.
+    Cite: vendor/nethack/src/lock.c::doorlock line 1135 WAN_LOCKING branch —
+    transitions D_ISOPEN -> D_LOCKED (with D_CLOSED -> D_LOCKED for already
+    closed doors).  Our local enum collapses D_LOCKED and D_CLOSED into
+    TileType.CLOSED_DOOR, so we simply transition OPEN_DOOR -> CLOSED_DOOR.
+
+    Floor-container locking: vendor/nethack/src/lock.c::boxlock line 1061
+    sets obj->olocked = 1.  As with WAN_OPENING above, floor containers live
+    in ``state.containers`` on the full EnvState and are not part of the
+    minimal WandState consumed by this handler.
     """
     def on_hit_door(s, r, pos):
         tr, tc = pos[0], pos[1]
@@ -621,11 +677,16 @@ def _cast_ray_terrain_predicate(state, rng, direction, target, on_tile_fn,
 def _effect_probing(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_PROBING — BEAM, reveal first monster hit; store HP + slot index.
+    """WAN_PROBING — IMMEDIATE beam, reveal first monster hit.
 
-    Cite: vendor/nethack/src/zap.c probe_monster ~line 4700.
-    Stores the hit monster's current HP in state.probed_hp and its slot
-    index in state.probed_idx for UI inspection.
+    Cite: vendor/nethack/src/zap.c::probe_monster line 626:
+      mstatusline(mtmp);
+      ... if (mtmp->minvent) probe_objchain(mtmp->minvent); ...
+    The vendor effect prints the monster's HP status line and inventory.
+    We persist the essential numeric state — current HP and the slot index
+    — into ``state.probed_hp`` / ``state.probed_idx`` for inspection by the
+    observation layer.  The vendor message-line output is a UI-only effect
+    and is intentionally not part of the JIT-pure state slice.
     """
     def on_hit(s, r, mon_idx):
         hp = s.mon_hp[mon_idx]
@@ -1115,8 +1176,14 @@ def _effect_wishing(
     update WISHLESS / ARTIWISHLESS here; that is handled by callers routing
     through action_dispatch on a full EnvState.
     """
-    # Placeholder: add a potion-of-object-detection style item (recharge wands
-    # as a JIT-pure detectable side-effect, matching the stub contract).
+    # WandState fallback path (no full EnvState available):
+    # vendor wishing requires the wish-parser (vendor/nethack/src/wizard.c::
+    # makewish) and the full object table, neither of which fits on the
+    # minimal WandState shape.  We grant a detectable JIT-pure side-effect
+    # by recharging every wand in inventory to 15 charges — the maximum
+    # zappable count under vendor charging conventions (vendor/nethack/src/
+    # zap.c::recharge ~line 1100).  Callers that have a real EnvState route
+    # through Nethax/nethax/subsystems/wish.handle_wand_of_wishing instead.
     inv = state.inventory
     is_wand = inv.items.category == ITEM_CATEGORY_WAND
     new_charges = jnp.where(is_wand, jnp.int8(15), inv.items.charges)
