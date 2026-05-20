@@ -369,6 +369,10 @@ class InventoryState:
     alternate_weapon_slot: jnp.ndarray  # scalar int8 (Wave 5)
     worn_armor: jnp.ndarray        # [N_ARMOR_SLOTS] int8
     worn_armor_ac_bonus: jnp.ndarray  # [N_ARMOR_SLOTS] int8 (Wave 5)
+    armor_stat_bonus: jnp.ndarray  # [6] int8 — additive [str,dex,con,int,wis,cha]
+                                   # bonus sourced only from worn armor.
+                                   # Recomputed by armor_effects.apply_armor_effects
+                                   # after every wear/take-off (Wave 31).
     worn_amulet: jnp.ndarray       # scalar int8
     worn_rings: jnp.ndarray        # [2] int8
     quiver: jnp.ndarray            # scalar int8
@@ -394,6 +398,7 @@ class InventoryState:
             alternate_weapon_slot=jnp.int8(-1),
             worn_armor=jnp.full((N_ARMOR_SLOTS,), -1, dtype=jnp.int8),
             worn_armor_ac_bonus=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.int8),
+            armor_stat_bonus=jnp.zeros((6,), dtype=jnp.int8),
             worn_amulet=jnp.int8(-1),
             worn_rings=jnp.full((2,), -1, dtype=jnp.int8),
             quiver=jnp.int8(-1),
@@ -419,6 +424,7 @@ class InventoryState:
             alternate_weapon_slot=jnp.int8(-1),
             worn_armor=jnp.full((N_ARMOR_SLOTS,), -1, dtype=jnp.int8),
             worn_armor_ac_bonus=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.int8),
+            armor_stat_bonus=jnp.zeros((6,), dtype=jnp.int8),
             worn_amulet=jnp.int8(-1),
             worn_rings=jnp.full((2,), -1, dtype=jnp.int8),
             quiver=jnp.int8(-1),
@@ -860,11 +866,15 @@ def wear_armor(state, slot_idx: int, armor_slot: ArmorSlot):
         worn_armor_welded=new_worn_armor_welded,
         items=state.inventory.items.replace(identified=new_items_id),
     )
-    return state.replace(
+    new_state = state.replace(
         inventory=new_inv,
         player_ac=new_ac,
         identification=state.identification.replace(identified=new_type_mask),
     )
+    # Wave 31b: recompute armor-sourced intrinsics + stat bonuses.
+    # cite: vendor/nethack/src/do_wear.c Boots_on/Cloak_on/Helmet_on/Gloves_on.
+    from Nethax.nethax.subsystems.armor_effects import apply_armor_effects
+    return apply_armor_effects(new_state)
 
 
 def take_off_armor(state, armor_slot: ArmorSlot):
@@ -902,7 +912,11 @@ def take_off_armor(state, armor_slot: ArmorSlot):
         worn_armor=new_worn_armor,
         worn_armor_ac_bonus=new_worn_ac_bonus,
     )
-    return state.replace(inventory=new_inv, player_ac=new_ac)
+    new_state = state.replace(inventory=new_inv, player_ac=new_ac)
+    # Wave 31b: recompute armor-sourced intrinsics + stat bonuses.
+    # cite: vendor/nethack/src/do_wear.c Boots_off/Cloak_off/Helmet_off/Gloves_off.
+    from Nethax.nethax.subsystems.armor_effects import apply_armor_effects
+    return apply_armor_effects(new_state)
 
 
 # ---------------------------------------------------------------------------
