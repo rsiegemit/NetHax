@@ -733,8 +733,10 @@ def _effect_teleportation(state, rng, buc):
     # --- Rejection-sample to a walkable tile (up to 32 tries). ---
     MAX_TRIES = 32
     rng_r, rng_c, rng_lv = jax.random.split(rng, 3)
-    rrows = jax.random.randint(rng_r, (MAX_TRIES,), 0, h)
-    rcols = jax.random.randint(rng_c, (MAX_TRIES,), 0, w)
+    # Force int32; inside lax.switch dispatchers JAX promotes default-dtype
+    # randint outputs to int64 which breaks carry-type matching.
+    rrows = jax.random.randint(rng_r, (MAX_TRIES,), 0, h, dtype=jnp.int32)
+    rcols = jax.random.randint(rng_c, (MAX_TRIES,), 0, w, dtype=jnp.int32)
 
     def _walkable(r, c):
         t = terrain_2d[r, c]
@@ -742,10 +744,10 @@ def _effect_teleportation(state, rng, buc):
 
     def _pick(carry, i):
         chosen_r, chosen_c, found = carry
-        r = rrows[i]; c = rcols[i]
+        r = rrows[i].astype(jnp.int32); c = rcols[i].astype(jnp.int32)
         ok = _walkable(r, c) & ~found
-        new_r = jnp.where(ok, r, chosen_r)
-        new_c = jnp.where(ok, c, chosen_c)
+        new_r = jnp.where(ok, r, chosen_r).astype(jnp.int32)
+        new_c = jnp.where(ok, c, chosen_c).astype(jnp.int32)
         new_found = found | _walkable(r, c)
         return (new_r, new_c, new_found), None
 
