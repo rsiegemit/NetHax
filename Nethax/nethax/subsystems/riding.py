@@ -32,20 +32,63 @@ from Nethax.nethax.subsystems.skills import SkillId, SkillLevel
 # ---------------------------------------------------------------------------
 _N_MONSTERS = 381
 
-# Indices that are unconditionally rideable (pony=99, horse=103, warhorse=104).
-# Determined by: .venv/bin/python -c "from Nethax.nethax.constants.monsters import MONSTERS;
-#   print([(i,m.name) for i,m in enumerate(MONSTERS) if any(x in m.name.lower()
-#   for x in ['pony','horse','warhorse'])])"
-# Result: [(99, 'pony'), (103, 'horse'), (104, 'warhorse')]
-_RIDEABLE_INDICES = frozenset([99, 103, 104])
-# TODO: dragons (e.g. baby gray dragon), unicorns — require special handling per
-# steed.c:can_ride() (steeds[] symbol check, MZ_MEDIUM size gate).
+# Vendor-byte-equal rideable filter.  Cite: vendor/nethack/src/steed.c:25-32
+# can_saddle / can_ride.
+#
+#   bool can_ride(ptr) :=
+#         strchr(steeds, ptr->mlet) != NULL          # S_QUADRUPED, S_UNICORN,
+#                                                    # S_ANGEL, S_CENTAUR,
+#                                                    # S_DRAGON, S_JABBERWOCK
+#       && ptr->msize >= MZ_MEDIUM
+#       && (!humanoid(ptr) || ptr->mlet == S_CENTAUR)
+#       && !amorphous(ptr)
+#       && !noncorporeal(ptr)
+#       && !is_whirly(ptr)
+#       && !unsolid(ptr)
+#
+# vendor/nethack/include/mondata.h:
+#     noncorporeal(ptr) = mlet == S_GHOST
+#     is_whirly(ptr)    = mlet == S_VORTEX || ptr == PM_AIR_ELEMENTAL
+#     unsolid(ptr)      = flags1 & M1_UNSOLID
+#     humanoid(ptr)     = flags1 & M1_HUMANOID
+#     amorphous(ptr)    = flags1 & M1_AMORPHOUS
 
 
 def _build_is_rideable() -> jnp.ndarray:
-    table = [False] * _N_MONSTERS
-    for idx in _RIDEABLE_INDICES:
-        table[idx] = True
+    """Compute the per-monster rideability mask byte-equal to vendor can_ride.
+
+    Uses MonsterSymbol enum + flag bits from constants/monsters.py.  Returns
+    bool[N_MONSTERS].  Includes ponies/horses/warhorses (S_QUADRUPED),
+    unicorns, centaurs, angels, dragons (adult only via MZ_MEDIUM gate),
+    jabberwocks — and excludes ghosts/vortices/air-elemental/humanoids
+    other than centaurs.
+    """
+    from Nethax.nethax.constants.monsters import (
+        MonsterSymbol, MZ_MEDIUM,
+        M1_HUMANOID, M1_AMORPHOUS, M1_UNSOLID,
+    )
+    _STEEDS = {
+        MonsterSymbol.S_QUADRUPED, MonsterSymbol.S_UNICORN,
+        MonsterSymbol.S_ANGEL,     MonsterSymbol.S_CENTAUR,
+        MonsterSymbol.S_DRAGON,    MonsterSymbol.S_JABBERWOCK,
+    }
+    _S_GHOST  = getattr(MonsterSymbol, "S_GHOST",  None)
+    _S_VORTEX = getattr(MonsterSymbol, "S_VORTEX", None)
+
+    table = []
+    for m in MONSTERS:
+        sym_ok       = m.symbol in _STEEDS
+        sz_ok        = m.size >= MZ_MEDIUM
+        f1           = int(m.flags1)
+        humanoid_ok  = (not bool(f1 & M1_HUMANOID)) or m.symbol == MonsterSymbol.S_CENTAUR
+        amorph_ok    = not bool(f1 & M1_AMORPHOUS)
+        unsolid_ok   = not bool(f1 & M1_UNSOLID)
+        noncorp_ok   = (_S_GHOST  is None) or (m.symbol != _S_GHOST)
+        whirly_ok    = (_S_VORTEX is None) or (m.symbol != _S_VORTEX)
+        table.append(
+            sym_ok and sz_ok and humanoid_ok and amorph_ok
+            and unsolid_ok and noncorp_ok and whirly_ok
+        )
     return jnp.array(table, dtype=bool)
 
 
