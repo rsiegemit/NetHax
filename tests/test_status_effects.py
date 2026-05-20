@@ -123,27 +123,40 @@ class TestComputeHungerState:
 # ---------------------------------------------------------------------------
 
 class TestComputeEncumbrance:
-    def test_unencumbered(self):
-        assert int(compute_encumbrance(jnp.int32(100), jnp.int32(100))) == Encumbrance.UNENCUMBERED
+    """Vendor calc_capacity formula (hack.c:4372-4382):
 
-    def test_burdened(self):
-        # 150 vs cap 100 → weight * 2 = 300 ≤ cap * 3 = 300 → BURDENED
-        assert int(compute_encumbrance(jnp.int32(150), jnp.int32(100))) == Encumbrance.BURDENED
+        if (wt <= 0)    return UNENCUMBERED;
+        if (gw.wc <= 1) return OVERLOADED;
+        cap = (wt * 2 / gw.wc) + 1;
+        return min(cap, OVERLOADED);
 
-    def test_stressed(self):
-        # 200 vs cap 100 → w*2=400 > 3*100=300, ≤ 5*100=500 → STRESSED
-        assert int(compute_encumbrance(jnp.int32(200), jnp.int32(100))) == Encumbrance.STRESSED
+    Tests pass absolute (weight, capacity) — wave16-followup replaced
+    the earlier fabricated ×1.5/×2.5/×4.5/×6.0 thresholds with this
+    vendor (wt*2/wc)+1 ramp.
+    """
 
-    def test_strained(self):
-        # 300 vs cap 100 → w*2=600 > 500, ≤ 900 → STRAINED
-        assert int(compute_encumbrance(jnp.int32(300), jnp.int32(100))) == Encumbrance.STRAINED
+    def test_zero_weight_unencumbered(self):
+        # wt=0 → UNENCUMBERED (vendor early-return).
+        assert int(compute_encumbrance(jnp.int32(0), jnp.int32(100))) == Encumbrance.UNENCUMBERED
+
+    def test_small_weight_burdened(self):
+        # wt=50, wc=100 → (50*2/100)+1 = 2  STRESSED (>1 = BURDENED+)
+        assert int(compute_encumbrance(jnp.int32(50), jnp.int32(100))) == Encumbrance.STRESSED
+
+    def test_weight_at_capacity_strained(self):
+        # wt=100, wc=100 → (200/100)+1 = 3 = STRAINED
+        assert int(compute_encumbrance(jnp.int32(100), jnp.int32(100))) == Encumbrance.STRAINED
 
     def test_overtaxed(self):
-        # 500 vs cap 100 → w*2=1000 > 900, ≤ 1200 → OVERTAXED
-        assert int(compute_encumbrance(jnp.int32(500), jnp.int32(100))) == Encumbrance.OVERTAXED
+        # wt=150, wc=100 → (300/100)+1 = 4 = OVERTAXED
+        assert int(compute_encumbrance(jnp.int32(150), jnp.int32(100))) == Encumbrance.OVERTAXED
+
+    def test_overloaded_at_2x_capacity(self):
+        # wt=200, wc=100 → (400/100)+1 = 5 = OVERLOADED (clamped)
+        assert int(compute_encumbrance(jnp.int32(200), jnp.int32(100))) == Encumbrance.OVERLOADED
 
     def test_overloaded(self):
-        # 700 vs cap 100 → w*2=1400 > 1200 → OVERLOADED
+        # wt=700, wc=100 → (1400/100)+1 = 15 → clamp 5 = OVERLOADED
         assert int(compute_encumbrance(jnp.int32(700), jnp.int32(100))) == Encumbrance.OVERLOADED
 
 
