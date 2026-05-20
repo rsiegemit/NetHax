@@ -138,7 +138,12 @@ def _effect_healing(state, rng, buc):
     bcsign  = jnp.where(blessed, jnp.int32(1),
               jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
     n_dice  = jnp.int32(4) + jnp.int32(2) * bcsign  # 2/4/6
-    dmg     = dice_roll(rng, n_dice.astype(jnp.int32), jnp.int32(4))
+    # Static-shape masked roll: dice_roll requires Python-int n. We roll the
+    # maximum (6 for blessed bcsign=+1) and mask to n_dice.
+    MAX_N = 6
+    rolls = jax.random.randint(rng, (MAX_N,), 1, 5, dtype=jnp.int32)  # d4
+    mask  = jnp.arange(MAX_N, dtype=jnp.int32) < n_dice
+    dmg   = jnp.sum(jnp.where(mask, rolls, jnp.int32(0))).astype(jnp.int32)
     heal_amt = jnp.int32(8) + dmg
     nxtra    = jnp.where(cursed, jnp.int32(0), jnp.int32(1))
     new_hp_max = state.player_hp_max + nxtra
@@ -182,7 +187,10 @@ def _effect_extra_healing(state, rng, buc):
     bcsign  = jnp.where(blessed, jnp.int32(1),
               jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
     n_dice  = jnp.int32(4) + jnp.int32(2) * bcsign
-    dmg     = dice_roll(rng, n_dice.astype(jnp.int32), jnp.int32(8))
+    MAX_N = 6  # blessed bcsign=+1 → 6 dice
+    rolls = jax.random.randint(rng, (MAX_N,), 1, 9, dtype=jnp.int32)  # d8
+    mask  = jnp.arange(MAX_N, dtype=jnp.int32) < n_dice
+    dmg   = jnp.sum(jnp.where(mask, rolls, jnp.int32(0))).astype(jnp.int32)
     heal_amt = jnp.int32(16) + dmg
     nxtra    = jnp.where(blessed, jnp.int32(5),
                jnp.where(cursed, jnp.int32(0), jnp.int32(2)))
@@ -481,7 +489,7 @@ def _effect_invisibility(state, rng, buc):
     Blessed permanent-grant chance: 1/30 normally, 1/15 if HInvis already.
     Cursed turns on AGGRAVATE intrinsic (audit P0).
     """
-    from Nethax.nethax.rng import dice_roll, rn2
+    from Nethax.nethax.rng import rn2
 
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
@@ -491,8 +499,12 @@ def _effect_invisibility(state, rng, buc):
     rng_d, rng_p = jax.random.split(rng, 2)
 
     # Duration roll: d(6-3*bcsign, 100) + 100
-    n_dice  = jnp.int32(6) - jnp.int32(3) * bcsign
-    dur     = dice_roll(rng_d, n_dice.astype(jnp.int32), jnp.int32(100)) + jnp.int32(100)
+    n_dice  = jnp.int32(6) - jnp.int32(3) * bcsign  # 3/6/9
+    # Static-shape: roll MAX_N d100 and mask down to n_dice.
+    MAX_N = 9
+    rolls = jax.random.randint(rng_d, (MAX_N,), 1, 101, dtype=jnp.int32)
+    mask  = jnp.arange(MAX_N, dtype=jnp.int32) < n_dice
+    dur   = jnp.sum(jnp.where(mask, rolls, jnp.int32(0))).astype(jnp.int32) + jnp.int32(100)
 
     # Blessed permanent-grant chance.
     already_invis = state.status.intrinsics[Intrinsic.INVIS]
@@ -741,13 +753,18 @@ def _effect_acid(state, rng, buc):
     also fix-petrifies a stoning hero.
     """
     from Nethax.nethax.subsystems.status_effects import Intrinsic
-    from Nethax.nethax.rng import dice_roll
 
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
     n_dice  = jnp.where(cursed, jnp.int32(2), jnp.int32(1))
     sides   = jnp.where(blessed, jnp.int32(4), jnp.int32(8))
-    raw_dmg = dice_roll(rng, n_dice.astype(jnp.int32), sides.astype(jnp.int32))
+    # Static-shape, traced-sides die roll: uniform-floor + clip to [1, sides].
+    MAX_N = 2
+    rand = jax.random.uniform(rng, (MAX_N,))
+    rolls = jnp.floor(rand * sides.astype(jnp.float32)).astype(jnp.int32) + 1
+    rolls = jnp.clip(rolls, jnp.int32(1), sides)
+    mask  = jnp.arange(MAX_N, dtype=jnp.int32) < n_dice
+    raw_dmg = jnp.sum(jnp.where(mask, rolls, jnp.int32(0))).astype(jnp.int32)
 
     # Maybe_Half_Phys: halve damage when HALF_PHDAM intrinsic active.
     has_half_phys = state.status.intrinsics[int(Intrinsic.HALF_PHYSICAL_DAMAGE)]
@@ -880,7 +897,9 @@ def _effect_booze(state, rng, buc):
 
     # Confusion: d(2+u.uhs, 8). u.uhs default 0; vary by hunger if available.
     # bcsign factor only blocks confusion when blessed (no roll).
-    conf_dmg = dice_roll(rng_h, jnp.int32(2), jnp.int32(8))
+    # Static n=2 (Python int, not jnp wrapper) so dice_roll's (n,) shape stays
+    # concrete in the JIT trace.
+    conf_dmg = dice_roll(rng_h, 2, 8)
     cur_conf = state.status.timed_statuses[int(TimedStatus.CONFUSION)]
     new_conf = jnp.where(
         blessed,
