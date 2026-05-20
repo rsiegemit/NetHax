@@ -1949,17 +1949,55 @@ MAX_INVENTORY_SLOTS_C: int = 52
 # ---------------------------------------------------------------------------
 # Two-weapon toggle (vendor/nethack/src/wield.c::dotwoweapon)
 # ---------------------------------------------------------------------------
+def can_twoweapon(state) -> jnp.ndarray:
+    """Return True iff the player may toggle two-weapon combat ON.
+
+    Mirrors vendor/nethack/src/wield.c::can_twoweapon (line 761).  The relevant
+    state-side checks (we cannot easily reproduce role/polymorph guards in
+    JIT, so those degrade to ``True``) are:
+
+      * uwep must be set (a weapon is wielded);
+      * the wielded weapon must not be two-handed (``bimanual(uwep)``,
+        vendor wield.c line 786);
+      * no shield equipped (``uarms``, vendor wield.c line 789).
+
+    Returns a scalar bool JAX array suitable for ``jax.lax.cond``.
+
+    Cite: vendor/nethack/src/wield.c::can_twoweapon lines 761-803.
+    """
+    wielded = state.inventory.wielded.astype(jnp.int32)
+    has_wep = wielded >= jnp.int32(0)
+    safe = jnp.clip(wielded, 0, state.inventory.items.is_two_handed.shape[0] - 1)
+    is_2h = state.inventory.items.is_two_handed[safe] & has_wep
+
+    # Shield slot occupied?
+    from Nethax.nethax.subsystems.inventory import ArmorSlot as _ArmorSlot
+    shield_slot = jnp.int32(int(_ArmorSlot.SHIELD))
+    has_shield = state.inventory.worn_armor[shield_slot] >= jnp.int8(0)
+
+    return has_wep & (~is_2h) & (~has_shield)
+
+
 def handle_twoweapon(state, rng):
     """Toggle the two-weapon combat flag.
 
-    Mirrors vendor/nethack/src/wield.c::dotwoweapon — when an alternate
-    weapon is wielded the player can toggle two-weapon mode.  In Wave 5
-    we simply flip the bit; the alternate-weapon slot is whatever the
-    caller has stored in ``state.inventory.alternate_weapon_slot`` (set
-    by future wield-related actions).
+    Mirrors vendor/nethack/src/wield.c::dotwoweapon (line 845).  The vendor
+    semantics are: turning two-weapon OFF always succeeds; turning it ON
+    succeeds only when ``can_twoweapon()`` returns true (no shield, no 2H
+    wielded weapon, both hands have a one-handed weapon).
+
+    Cite: vendor/nethack/src/wield.c::dotwoweapon lines 845-864.
     """
+    is_on = state.combat.two_weapon
+    allow_turn_on = can_twoweapon(state)
+    # OFF always toggles to False; ON only toggles to True when allowed.
+    new_two_weapon = jnp.where(
+        is_on,
+        jnp.bool_(False),                       # always allowed: turn off
+        jnp.where(allow_turn_on, jnp.bool_(True), jnp.bool_(False)),
+    )
     new_combat = state.combat.replace(
-        two_weapon=~state.combat.two_weapon,
+        two_weapon=new_two_weapon,
     )
     return state.replace(combat=new_combat)
 

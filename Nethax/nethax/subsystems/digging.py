@@ -32,32 +32,35 @@ MATTOCK_TYPE_ID: int = 50
 DIG_DOWN: int = 8
 
 # Effort table: maps TileType int-value to effort-needed (int32).
-# Vendor dig.c: WALL/STONE/ROCK all require the same effort (~200 swing-points),
-# BOULDER is lighter (100).  Floor and other passable tiles are not diggable (0).
-# Cite: vendor/nethack/src/dig.c::dig_typ and dodig (line ~445).
+# Vendor dig.c: WALL/STONE/ROCK take the full swing-budget (~200 effort);
+# closed doors (and secret doors that appear as WALL until discovered) yield
+# at half the effort.  Trees match the rock budget.  Floor and other passable
+# tiles are not diggable (0).
+# Cite: vendor/nethack/src/dig.c::dig_typ (line 169) and dodig (line ~445);
+#       vendor/nethack/src/dig.c lines 488-516 (WALL/SDOOR/closed-door cases).
 _HARDNESS_TABLE: jnp.ndarray = jnp.array(
     [
         0,    # VOID        = 0
         0,    # FLOOR       = 1
         0,    # CORRIDOR    = 2
-        200,  # WALL        = 3
-        0,    # CLOSED_DOOR = 4
+        200,  # WALL        = 3   (also covers SDOOR which displays as WALL)
+        50,   # CLOSED_DOOR = 4   vendor dig.c line 507-516 (door breaks easier)
         0,    # OPEN_DOOR   = 5
         0,    # STAIRCASE_UP= 6
         0,    # STAIRCASE_DOWN=7
         0,    # WATER       = 8
         0,    # LAVA        = 9
-        0,    # ALTAR       = 10
+        0,    # ALTAR       = 10  (vendor dig_check fails on altar)
         0,    # FOUNTAIN    = 11
         0,    # TRAP        = 12
         0,    # HIDDEN_TRAP = 13
-        0,    # THRONE      = 14
+        0,    # THRONE      = 14  (vendor dig_check fails on throne)
         0,    # GRAVE       = 15
         0,    # SHOP_FLOOR  = 16
         0,    # DRAWBRIDGE  = 17
         0,    # ICE_FLOOR   = 18
         0,    # POOL        = 19
-        0,    # TREE        = 20
+        200,  # TREE        = 20  vendor dig.c line 477-487 (cut down tree)
     ],
     dtype=jnp.int32,
 )
@@ -225,12 +228,14 @@ def _complete_dig(state):
         jnp.int8(TileType.CORRIDOR)
     )
 
-    # Down: carve player tile into HOLE (use STAIRCASE_DOWN as proxy; no HOLE
-    # tile type exists in this enum) and advance level by 1.
+    # Down: carve player tile into HOLE and advance level by 1.
+    # Cite: vendor/nethack/src/dig.c::digactualhole (line 640) sets
+    #       levl[u.ux][u.uy].typ = HOLE; vendor/nethack/src/dig.c::zap_dig
+    #       (line 1548) routes wand-of-digging downward into digactualhole.
     prow = state.player_pos[0].astype(jnp.int32)
     pcol = state.player_pos[1].astype(jnp.int32)
     new_terrain_down = state.terrain.at[b, lv, prow, pcol].set(
-        jnp.int8(TileType.STAIRCASE_DOWN)
+        jnp.int8(TileType.HOLE)
     )
 
     new_terrain = jnp.where(is_down, new_terrain_down, new_terrain_horiz)
@@ -307,3 +312,41 @@ def dig_tick(state, rng):
         return s2
 
     return jax.lax.cond(state.dig.active, _tick, lambda s: s, operand=state)
+
+
+# ---------------------------------------------------------------------------
+# Vendor-named public entry points
+# ---------------------------------------------------------------------------
+
+def dig(state, rng, direction: int = 0):
+    """Vendor-named alias for the dig action — one swing of the pickaxe.
+
+    Mirrors vendor/nethack/src/dig.c::dig (the occupation callback at line 425
+    invoked once per turn).  In the JAX port the multi-turn occupation is
+    split into ``start_dig`` (initiate) and ``dig_tick`` (per-turn effort).
+    ``dig(state, rng, direction)`` exposes the vendor entry name: if no dig is
+    active it starts one in the given direction; otherwise it advances the
+    in-progress dig by one tick.
+
+    Cite: vendor/nethack/src/dig.c::dig (line 425, occupation callback).
+    """
+    started = start_dig(state, direction=direction)
+    return jax.lax.cond(
+        state.dig.active,
+        lambda s: dig_tick(s, rng),
+        lambda s: started,
+        operand=state,
+    )
+
+
+def dig_down(state, rng):
+    """Vendor-named wrapper for downward pickaxe-dig — create HOLE, descend.
+
+    Mirrors vendor/nethack/src/dig.c::zap_dig (line 1548), specifically the
+    ``u.dz > 0`` branch which routes through ``dighole`` → ``digactualhole``
+    to set ``levl[u.ux][u.uy].typ = HOLE`` and drop the player one level.
+
+    Cite: vendor/nethack/src/dig.c::zap_dig line 1548;
+          vendor/nethack/src/dig.c::digactualhole line 640 (HOLE creation).
+    """
+    return dig(state, rng, direction=DIG_DOWN)
