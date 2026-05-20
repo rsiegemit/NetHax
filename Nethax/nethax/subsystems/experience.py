@@ -330,9 +330,12 @@ _LONG_MAX_I64 = jnp.asarray(_np.int64((1 << 63) - 1))
 def more_experienced(state, exper, rexp):
     """Add ``exper`` to ``u.uexp`` and ``4*exper + rexp`` to ``u.urexp``.
 
-    Wraparound guard (exper.c:177-181): if the new value goes negative while
-    the increment was positive, clamp to LONG_MAX (we use INT64_MAX as the
-    Python/jax 64-bit analog).
+    Byte-equal port of vendor/nethack/src/exper.c::more_experienced (lines
+    168-203).  Vendor only touches ``u.uexp`` and ``u.urexp`` here — kill
+    counters, running score, and display flags (``disp.botl``) are *not*
+    modified.  Wraparound guard (exper.c:177-181): if the new value goes
+    negative while the increment was positive, clamp to LONG_MAX (we use
+    INT64_MAX as the Python/jax 64-bit analog).
     """
     exper_i = jnp.int64(exper)
     rexp_i  = jnp.int64(rexp)
@@ -350,27 +353,20 @@ def more_experienced(state, exper, rexp):
     new_rexp = jnp.where((new_rexp < jnp.int64(0)) & (rexp_incr > jnp.int64(0)),
                          _LONG_MAX_I64, new_rexp)
 
-    # Also update scoring.experience_points (running int32 accumulator the
-    # rest of the codebase uses for bl_score / reward); clamp to int32 max
-    # to mirror NLE topten.c behavior in the running display.
     return state.replace(
         player_xp=new_exp.astype(state.player_xp.dtype),
         player_urexp=new_rexp.astype(state.player_urexp.dtype),
-        scoring=state.scoring.replace(
-            score=(state.scoring.score + exper_i.astype(state.scoring.score.dtype)).astype(state.scoring.score.dtype),
-            experience_points=(state.scoring.experience_points
-                               + exper_i.astype(state.scoring.experience_points.dtype)).astype(state.scoring.experience_points.dtype),
-            monsters_killed=(state.scoring.monsters_killed + jnp.int32(1)).astype(state.scoring.monsters_killed.dtype),
-        ),
     )
 
 
 # ---------------------------------------------------------------------------
 # newhp() / newpw() — used by pluslvl().  Vendor attrib.c:1079, exper.c:43-81.
-# These are intentionally simpler than the C originals: we omit the
-# polymorph-time HP-throttling at level == MAXULEV branch and the Pw 1200/600
-# clamp, but the per-level increment that gets stored in uhpinc/ueninc is
-# byte-equal for ulevel < MAXULEV.
+# Byte-equal for the ulevel >= 1 path: both the ulevel < MAXULEV branch (which
+# records uhpinc/ueninc[ulevel] for losexp) and the ulevel >= MAXULEV throttle
+# branch (max(1, 5 - uhpmax/300) for HP; max(1, 4 - uenmax/200) for Pw) are
+# implemented.  The ulevel == 0 init branch is out of scope here — character
+# creation rolls initial HP/Pw in u_init.c and the result is stored directly
+# into EnvState.default; pluslvl/newexplevel only fire for ulevel >= 1.
 # ---------------------------------------------------------------------------
 
 def _rnd_pos(rng, n):
@@ -422,8 +418,15 @@ def newhp(state, rng):
     hp = hp + conplus
     hp = jnp.maximum(hp, jnp.int32(1))
 
-    # Store increment in u.uhpinc[ulevel] (only valid when ulevel < MAXULEV).
+    # Vendor attrib.c:1129-1140 — at MAXULEV+ throttle the increment to
+    # ``max(1, 5 - uhpmax/300)``; otherwise record uhpinc[ulevel] for losexp.
     in_range = (ulev >= jnp.int32(0)) & (ulev < jnp.int32(MAXULEV))
+    lim = jnp.maximum(jnp.int32(5) - jnp.int32(state.player_hp_max) // jnp.int32(300),
+                      jnp.int32(1))
+    hp_capped = jnp.where(hp > lim, lim, hp)
+    hp = jnp.where(in_range, hp, hp_capped)
+
+    # Store increment in u.uhpinc[ulevel] (only valid when ulevel < MAXULEV).
     safe_ulev = jnp.clip(ulev, jnp.int32(0), jnp.int32(state.player_uhpinc.shape[0] - 1))
     new_uhpinc = state.player_uhpinc.at[safe_ulev].set(
         jnp.where(in_range, hp.astype(state.player_uhpinc.dtype),
@@ -473,7 +476,14 @@ def newpw(state, rng):
     en = enermod(base, state.player_role)
     en = jnp.maximum(en, jnp.int32(1))
 
+    # Vendor exper.c:68-79 — at MAXULEV+ throttle the increment to
+    # ``max(1, 4 - uenmax/200)``; otherwise record ueninc[ulevel] for losexp.
     in_range = (ulev >= jnp.int32(0)) & (ulev < jnp.int32(MAXULEV))
+    lim = jnp.maximum(jnp.int32(4) - jnp.int32(state.player_pw_max) // jnp.int32(200),
+                      jnp.int32(1))
+    en_capped = jnp.where(en > lim, lim, en)
+    en = jnp.where(in_range, en, en_capped)
+
     safe_ulev = jnp.clip(ulev, jnp.int32(0), jnp.int32(state.player_ueninc.shape[0] - 1))
     new_ueninc = state.player_ueninc.at[safe_ulev].set(
         jnp.where(in_range, en.astype(state.player_ueninc.dtype),
@@ -549,48 +559,58 @@ def losexp(state):
 # ---------------------------------------------------------------------------
 
 def pluslvl(state, rng, incr: bool = True):
-    """Gain one experience level.
+    """Gain one experience level — byte-equal port of exper.c::pluslvl.
 
-    Vendor exper.c:306-372.  Polymorph branch is skipped (not modelled here).
-    On level-up we:
-        * HP_max += newhp();  HP += newhp()
-        * Pw_max += newpw();  Pw += newpw()  (already enermod-scaled)
-        * ulevel += 1 (clamped to MAXULEV)
-        * if (incr): uexp = min(uexp, newuexp(ulevel+1) - 1)
-          else:      uexp = newuexp(ulevel)
+    Vendor exper.c:306-372.  Polymorph branch (lines 319-323) and the
+    ``u.ulevelmax`` / ``u.uenpeak`` / ``u.ulevelpeak`` peak-trackers are not
+    modelled (EnvState lacks those fields).  All other behavior is preserved:
+
+      * ``hpinc = newhp()`` is called unconditionally (even at MAXULEV; the
+        throttle branch inside ``newhp`` clamps the increment so the bump is
+        still applied).  ``u.uhp += hpinc``; ``u.uhpmax += hpinc`` then clamp
+        ``u.uhp`` to ``u.uhpmax`` (vendor's ``setuhpmax(.., TRUE)``).
+      * ``eninc = newpw()`` is also called unconditionally; vendor does NOT
+        clamp ``u.uen`` to ``u.uenmax`` here (lines 330-334), but mathematically
+        the result is identical when pre-bump ``uen <= uenmax``.
+      * ``++u.ulevel`` only when ``u.ulevel < MAXULEV``.
+      * uexp resync uses the OLD ulevel (vendor lines 341-348, before ++):
+          incr=True:  if uexp >= newuexp(old+1):  uexp = newuexp(old+1) - 1
+          incr=False:                              uexp = newuexp(old)
     """
     rng_hp, rng_pw = jax.random.split(rng)
 
     ulev = jnp.int32(state.player_xl)
     can_level = ulev < jnp.int32(MAXULEV)
 
+    # Vendor calls newhp() / newpw() unconditionally — at MAXULEV the throttle
+    # branch inside those functions clamps the increment to lim, but the bump
+    # is still applied to u.uhp / u.uenmax / u.uen.
     hp_inc, state = newhp(state, rng_hp)
     en_inc, state = newpw(state, rng_pw)
 
-    # Only apply increments when can_level (vendor: at MAXULEV the throttle
-    # branch of newhp/newpw clamps the increment, but we follow the simpler
-    # rule of skipping the bump at the cap).
-    hp_inc_eff = jnp.where(can_level, hp_inc, jnp.int32(0))
-    en_inc_eff = jnp.where(can_level, en_inc, jnp.int32(0))
-
-    new_hp_max = jnp.int32(state.player_hp_max) + hp_inc_eff
-    new_hp = jnp.int32(state.player_hp) + hp_inc_eff
+    new_hp_max = jnp.int32(state.player_hp_max) + hp_inc
+    new_hp = jnp.int32(state.player_hp) + hp_inc
+    # Vendor: setuhpmax(u.uhpmax + hpinc, TRUE) caps u.uhp at u.uhpmax.
     new_hp = jnp.minimum(new_hp, new_hp_max)
 
-    new_pw_max = jnp.int32(state.player_pw_max) + en_inc_eff
-    new_pw = jnp.int32(state.player_pw) + en_inc_eff
-    new_pw = jnp.minimum(new_pw, new_pw_max)
+    new_pw_max = jnp.int32(state.player_pw_max) + en_inc
+    new_pw = jnp.int32(state.player_pw) + en_inc
+    # Vendor does NOT clamp u.uen to u.uenmax here (lines 330-334); we follow
+    # vendor.  Pre-bump invariant uen <= uenmax keeps post-bump in-range.
 
     new_ulev = jnp.where(can_level, ulev + jnp.int32(1), ulev)
 
-    # uexp resync.
+    # uexp resync — vendor uses the OLD u.ulevel here (the increment to
+    # ``++u.ulevel`` happens on line 349, *after* this block at 341-348).
     cur_uexp = jnp.int64(state.player_xp)
     if incr:
-        # vendor: if (u.uexp >= newuexp(u.ulevel+1)) u.uexp = newuexp(u.ulevel+1) - 1
-        thresh = newuexp(new_ulev + jnp.int32(1)) - jnp.int64(1)
-        new_uexp = jnp.where(can_level & (cur_uexp >= thresh + jnp.int64(1)), thresh, cur_uexp)
+        # vendor: tmp = newuexp(u.ulevel + 1); if (u.uexp >= tmp) u.uexp = tmp - 1
+        thresh_old = newuexp(ulev + jnp.int32(1))
+        clamped = thresh_old - jnp.int64(1)
+        new_uexp = jnp.where(can_level & (cur_uexp >= thresh_old), clamped, cur_uexp)
     else:
-        new_uexp = jnp.where(can_level, newuexp(new_ulev), cur_uexp)
+        # vendor: u.uexp = newuexp(u.ulevel)  (still the OLD ulevel)
+        new_uexp = jnp.where(can_level, newuexp(ulev), cur_uexp)
 
     return state.replace(
         player_xl=new_ulev.astype(state.player_xl.dtype),
@@ -609,6 +629,11 @@ def pluslvl(state, rng, incr: bool = True):
 def newexplevel(state, rng):
     """If ulevel<MAXULEV and uexp >= newuexp(ulevel), call pluslvl(TRUE).
 
+    Byte-equal port of vendor exper.c:299-304::
+
+        if (u.ulevel < MAXULEV && u.uexp >= newuexp(u.ulevel))
+            pluslvl(TRUE);
+
     JIT-pure: ``lax.cond`` gates the level-up branch.
     """
     ulev = jnp.int32(state.player_xl)
@@ -621,3 +646,30 @@ def newexplevel(state, rng):
         lambda s: s,
         state,
     )
+
+
+# ---------------------------------------------------------------------------
+# adjabil(oldlevel, newlevel) — vendor attrib.c:1005-1074
+# ---------------------------------------------------------------------------
+
+def adjabil(state, oldlevel, newlevel):
+    """Recompute intrinsics on experience-level change.
+
+    Vendor ``attrib.c::adjabil`` (lines 1005-1074) walks the per-role and
+    per-race ``innate`` intrinsic tables and toggles ability bits in
+    ``u.uprops[]`` (gain on level-up, lose on level-loss).  It also calls
+    ``add_weapon_skill`` / ``lose_weapon_skill`` to grant or revoke weapon
+    practice slots.
+
+    Nethax does not yet model the per-property intrinsic timer array nor the
+    weapon-skill practice-slot pool, so this function is a no-op stub.  When
+    those subsystems land, this stub should walk ROLES[role].intrinsics /
+    RACES[race].intrinsics and flip the ``FROMEXPER`` / ``FROMRACE`` bits in
+    the appropriate property timer.  See vendor/nethack/src/attrib.c:1028-1066
+    for the intrinsic walk and lines 1068-1073 for the weapon-skill delta.
+    """
+    # No-op: state passes through unchanged.  Signature mirrors vendor for
+    # call-site parity with pluslvl(oldlevel, newlevel) and losexp(oldlevel,
+    # newlevel) when those eventually wire intrinsics through this hook.
+    del oldlevel, newlevel
+    return state

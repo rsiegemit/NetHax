@@ -1339,7 +1339,21 @@ def melee_attack(
 
     rng_a, rng_b = split_n(rng, 2)
 
-    return jax.lax.cond(two_weap, _double, _single, (rng_a, rng_b))
+    new_state, dmg, hit_landed = jax.lax.cond(
+        two_weap, _double, _single, (rng_a, rng_b)
+    )
+
+    # Emit "You hit the monster." message on landing a melee strike.
+    # Cite: vendor/nethack/src/uhitm.c::hmon — pline("You hit %s.", ...).
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    new_messages = jax.lax.cond(
+        hit_landed,
+        lambda m: _msg_emit(m, int(_MsgId.YOU_HIT_MONSTER)),
+        lambda m: m,
+        new_state.messages,
+    )
+    new_state = new_state.replace(messages=new_messages)
+    return new_state, dmg, hit_landed
 
 
 # ---------------------------------------------------------------------------
@@ -1611,6 +1625,17 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
         new_state,
     )
 
+    # Emit "The monster hits!" message when a hit landed.
+    # Cite: vendor/nethack/src/mhitu.c::mattacku — pline("%s hits!", ...).
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    new_messages = jax.lax.cond(
+        hit,
+        lambda m: _msg_emit(m, int(_MsgId.MONSTER_HITS_YOU)),
+        lambda m: m,
+        new_state.messages,
+    )
+    new_state = new_state.replace(messages=new_messages)
+
     return new_state, dmg
 
 
@@ -1748,7 +1773,7 @@ def thrown_attack(
     valid_throw = has_item & found_hit
 
     # --- To-hit roll ---
-    key_hit, key_dmg, key_silver, key_boom, key_break = split_n(rng, 5)
+    key_hit, key_dmg, key_silver, key_boom, key_break, key_mjol = split_n(rng, 6)
     target_ac = mai.ac[target_idx].astype(jnp.int32)
     target_alive = mai.alive[target_idx]
     roll = rnd(key_hit, 20).astype(jnp.int32)
@@ -1870,14 +1895,26 @@ def thrown_attack(
     catches = boom_roll <= catch_threshold
     # Returning and caught: undo the inventory decrement.
     boomerang_return = is_returning & catches & ~hit_landed & has_item
-    return_qty = jnp.where(boomerang_return, old_qty, new_items.quantity[slot])
-    return_cat = jnp.where(boomerang_return, items.category[slot], new_items.category[slot])
+
+    # --- Mjollnir auto-return (dothrow.c:1710-1759, artilist.h:97-108) ---
+    # Mjollnir thrown by Valkyrie with STR>=25 returns 99% of the time.
+    # Implemented via mjollnir_throw_returns helper (artifact_powers.py).
+    # The artifact-keyed gate (is_mjollnir & is_valk & has_str25) is checked
+    # inside the helper; here we simply OR the result into the return path.
+    from Nethax.nethax.subsystems.artifact_powers import (
+        mjollnir_throw_returns as _mjollnir_returns,
+    )
+    mjol_return = _mjollnir_returns(state, key_mjol) & ~hit_landed & has_item
+
+    any_return = boomerang_return | mjol_return
+    return_qty = jnp.where(any_return, old_qty, new_items.quantity[slot])
+    return_cat = jnp.where(any_return, items.category[slot], new_items.category[slot])
     new_items = new_items.replace(
         quantity=new_items.quantity.at[slot].set(return_qty),
         category=new_items.category.at[slot].set(return_cat),
     )
-    # A caught boomerang must not also land on the floor.
-    should_drop = should_drop & ~boomerang_return
+    # A caught returning weapon must not also land on the floor.
+    should_drop = should_drop & ~any_return
 
     gi = state.ground_items
     # Find first empty slot in the ground stack at the terminal tile.
