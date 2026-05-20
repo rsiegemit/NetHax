@@ -554,19 +554,32 @@ def _effect_monster_detection(state, rng, buc):
 
 
 def _effect_object_detection(state, rng, buc):
-    """potion of object detection — shows item locations on level.
+    """potion of object detection — byte-equal to vendor peffect_object_detection.
 
-    Canonical: peffect_object_detection (potion.c) — object_detect(otmp, 0)
-    reveals all ground items on the current level.  Implementation: set
-    detect_objects_until_turn = timestep + 100.
+    vendor/nethack/src/potion.c::peffect_object_detection → object_detect(otmp, 0)
+    (vendor/nethack/src/detect.c:602-789) — immediately reveals every ground
+    item on the current dungeon level by marking those tiles in the player's
+    observation. Buried items are excluded for the uncursed/cursed case.
 
-    Cite: vendor/nethack/src/potion.c::peffect_object_detection.
+    Was: only set detect_objects_until_turn timer; no actual reveal ever
+    happened. Now scans state.ground_items on the current level and ORs
+    every tile that contains a non-empty stack slot into state.explored.
+    Cite: vendor/nethack/src/detect.c::object_detect (line 602).
     """
+    b      = state.dungeon.current_branch.astype(jnp.int32)
+    lv     = state.dungeon.current_level.astype(jnp.int32) - 1
+    gi_cat = state.ground_items.category[b, lv]                # [H, W, stack]
+    has_item = jnp.any(gi_cat != jnp.int8(0), axis=-1)         # [H, W] bool
+    old_lvl  = state.explored[b, lv]
+    new_lvl  = old_lvl | has_item
+    new_expl = state.explored.at[b, lv].set(new_lvl)
+    # Also keep the legacy timer so observation code that already reads it
+    # continues to fire; vendor effect is instantaneous so timer is moot.
     new_timer = state.timestep + jnp.int32(100)
     new_id = state.identification.replace(
         detect_objects_until_turn=new_timer
     )
-    return state.replace(identification=new_id)
+    return state.replace(explored=new_expl, identification=new_id)
 
 
 # ---- movement modifiers ---------------------------------------------------
