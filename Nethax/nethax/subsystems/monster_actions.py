@@ -62,9 +62,21 @@ _IDX_GREEN_DRAGON:  int = 155
 _IDX_YELLOW_DRAGON: int = 156
 _IDX_LICH_FIRST:    int = 187
 _IDX_LICH_LAST:     int = 190
-# Chunk5 (indices 261-321): succubus=298, incubus=300
-_IDX_SUCCUBUS:      int = 298
-_IDX_INCUBUS:       int = 300
+# Chunk5: succubus/incubus — resolved by name lookup against MONSTERS so the
+# values stay correct if the local table reorders (mirrors
+# polymorph._resolve_pm_indices pattern).
+def _resolve_sedu_indices() -> tuple[int, int]:
+    from Nethax.nethax.constants.monsters import MONSTERS
+    succ = inc = -1
+    for i, m in enumerate(MONSTERS):
+        if m.name == "succubus" and succ == -1:
+            succ = i
+        elif m.name == "incubus" and inc == -1:
+            inc = i
+    return succ, inc
+
+
+_IDX_SUCCUBUS, _IDX_INCUBUS = _resolve_sedu_indices()
 # Chunk6 (indices 322+): kraken is entry #6 in chunk6, base=322 → 328
 _IDX_KRAKEN:        int = 328
 
