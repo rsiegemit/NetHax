@@ -953,11 +953,18 @@ def _write_ground_slot(state, b: int, lv: int, r: int, c: int, gslot: int,
 
 
 def _mark_wish_conducts(state, artifact: bool):
-    """Set WISHLESS and (optionally) ARTIWISHLESS on EnvState.conduct."""
-    vios = state.conduct.violations.at[int(Conduct.WISHLESS)].set(True)
+    """Bump WISHLESS (and ARTIWISHLESS if artifact) counters on EnvState.conduct.
+
+    Vendor: ``u.uconduct.wishes++`` on every wish, plus ``u.uconduct.wisharti++``
+    when the wish granted an artifact (insight.c lines ~2183-2202 consume both
+    counter values for display: ``"used %ld wish%s"`` / ``"%ld for artifacts"``;
+    topten.c:385-386 emits ``wish_cnt`` / ``arti_wish_cnt`` to xlog).
+    """
+    from Nethax.nethax.subsystems.conduct import increment_counter
+    state = increment_counter(state, int(Conduct.WISHLESS))
     if artifact:
-        vios = vios.at[int(Conduct.ARTIWISHLESS)].set(True)
-    return state.replace(conduct=state.conduct.replace(violations=vios))
+        state = increment_counter(state, int(Conduct.ARTIWISHLESS))
+    return state
 
 
 def _set_user_name_at(state, slot_idx: int, name_bytes: bytes):

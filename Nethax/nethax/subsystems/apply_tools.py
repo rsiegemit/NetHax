@@ -709,14 +709,15 @@ def _h_expensive_camera(state, rng: jax.Array) -> object:
 # adjacent LOCKED door; simplified here to the player tile).
 # ---------------------------------------------------------------------------
 def _h_lock_pick(state, rng: jax.Array) -> object:
-    # Cite: vendor/nethack/src/lock.c::picklock (line 636-644).
-    # Dex-based chance formula:
-    #   LOCK_PICK    → ch = 3 * ACURR(A_DEX)           (lock.c:636)
-    #   SKELETON_KEY → ch = 70 + ACURR(A_DEX)           (lock.c:638)
-    #   CREDIT_CARD  → ch = 2 * ACURR(A_DEX)            (lock.c:640)
+    # Cite: vendor/nethack/src/lock.c::pick_lock (lines 632-644).
+    # Dex/Role-based chance formula:
+    #   LOCK_PICK    → ch = 3 * ACURR(A_DEX) + 30 * Role_if(PM_ROGUE) (lock.c:636-637)
+    #   SKELETON_KEY → ch = 70 + ACURR(A_DEX)                         (lock.c:639-640)
+    #   CREDIT_CARD  → ch = 2 * ACURR(A_DEX) + 20 * Role_if(PM_ROGUE) (lock.c:633-634)
     # Roll rn2(100) < ch; success → LOCKED door becomes CLOSED.
     # picklock_door is JIT-pure when passed an rng + integer player_dex.
     from Nethax.nethax.subsystems.features import picklock_door, _flat_lv_from_state
+    from Nethax.nethax.constants.roles import Role as _Role
 
     inv = state.inventory
     marker_slot = inv.wielded.astype(jnp.int32)
@@ -726,11 +727,14 @@ def _h_lock_pick(state, rng: jax.Array) -> object:
                     jnp.int32(_LOCK_PICK_TYPE_ID))
 
     dex = state.player_dex.astype(jnp.int32)
+    is_rogue = state.player_role.astype(jnp.int32) == jnp.int32(int(_Role.ROGUE))
+    rogue_lock_bonus   = jnp.where(is_rogue, jnp.int32(30), jnp.int32(0))
+    rogue_credit_bonus = jnp.where(is_rogue, jnp.int32(20), jnp.int32(0))
 
     # Compute per-tool chance (capped at 99 to keep rn2(100) meaningful).
-    ch_lock   = jnp.minimum(jnp.int32(3) * dex, jnp.int32(99))
-    ch_skel   = jnp.minimum(jnp.int32(70) + dex, jnp.int32(99))
-    ch_credit = jnp.minimum(jnp.int32(2) * dex, jnp.int32(99))
+    ch_lock   = jnp.minimum(jnp.int32(3) * dex + rogue_lock_bonus,   jnp.int32(99))
+    ch_skel   = jnp.minimum(jnp.int32(70) + dex,                     jnp.int32(99))
+    ch_credit = jnp.minimum(jnp.int32(2) * dex + rogue_credit_bonus, jnp.int32(99))
 
     chance = jnp.where(tid == jnp.int32(_SKELETON_KEY_TYPE_ID), ch_skel,
              jnp.where(tid == jnp.int32(_CREDIT_CARD_TYPE_ID),  ch_credit,
