@@ -738,7 +738,7 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     new_traps, trap_dmg, trap_se = jax.lax.cond(
         on_trap,
         lambda ts: trigger_trap(ts, trap_rng, trap_pos),
-        lambda ts: (ts, jnp.int32(0), jnp.zeros(4, dtype=jnp.int32)),
+        lambda ts: (ts, jnp.int32(0), jnp.zeros(5, dtype=jnp.int32)),
         state_mid.traps,
     )
 
@@ -751,6 +751,7 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     # Apply timed side-effects: freeze turns and sleep turns.
     # side_effects[0] = freeze turns, side_effects[1] = sleep turns.
     from Nethax.nethax.subsystems.status_effects import TimedStatus
+    from Nethax.nethax.subsystems.traps import _SE_LEVEL_DESCEND
     freeze_turns = trap_se[0]
     sleep_turns  = trap_se[1]
 
@@ -770,6 +771,27 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         player_hp=new_hp,
         status=new_status,
         rng=new_rng,
+    )
+
+    # HOLE / TRAPDOOR — descend one dungeon level.
+    # Cite: vendor/nethack/src/trap.c::dotrap TT_HOLE / TT_TRAPDOOR cases
+    # (lines ~1950-2050) — losehp(rnd(6), ...) then goto_level(level+1, ...).
+    # trap_se[_SE_LEVEL_DESCEND] is set by traps.py for HOLE/TRAPDOOR;
+    # we bump current_level by +1 (clamped to per-branch max) and update
+    # the deepest_level scoring trace, mirroring _stair_down's level bump.
+    descend = trap_se[_SE_LEVEL_DESCEND] > jnp.int32(0)
+    _max_level_branch = jnp.int8(state_final.terrain.shape[1])
+    _bumped_level = jnp.minimum(
+        state_final.dungeon.current_level + jnp.int8(1),
+        _max_level_branch,
+    )
+    _new_level = jnp.where(descend, _bumped_level, state_final.dungeon.current_level)
+    _new_deepest = jnp.maximum(
+        state_final.scoring.deepest_level, _new_level.astype(jnp.int8)
+    )
+    state_final = state_final.replace(
+        dungeon=state_final.dungeon.replace(current_level=_new_level),
+        scoring=state_final.scoring.replace(deepest_level=_new_deepest),
     )
 
     # Elbereth dust wipe when player steps over an engraved tile.
@@ -1702,12 +1724,14 @@ def _handle_enhance(state, rng):
 
     JIT-pure: iterates skills via lax.fori_loop, stops at first eligible.
 
-    Thresholds (vendor/nethack/include/skills.h:106 — level*level*20, 0-based):
-      UNSKILLED(0)→BASIC(1):      0
-      BASIC(1)→SKILLED(2):       20
-      SKILLED(2)→EXPERT(3):      80
-      EXPERT(3)→MASTER(4):      180
-      MASTER(4)→GRAND_MASTER(5): 320
+    Thresholds (vendor/nethack/include/skills.h:106 — vendor's macro is
+    (L)*(L)*20 with vendor 1-based L; in our 0-based encoding this is
+    (L+1)*(L+1)*20 — see skills.py::practice_needed_to_advance):
+      UNSKILLED(0)→BASIC(1):     20
+      BASIC(1)→SKILLED(2):       80
+      SKILLED(2)→EXPERT(3):     180
+      EXPERT(3)→MASTER(4):      320
+      MASTER(4)→GRAND_MASTER(5):500
     The uniform formula is byte-equal to vendor for all non-martial-arts skills.
     TODO: martial arts uses a separate vendor table (weapon.c::Skill_M); skip for now.
 

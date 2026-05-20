@@ -62,16 +62,20 @@ N_TRAP_TYPES: int = 26  # vendor/nethack/include/trap.h :: TRAPNUM
 
 
 # ---------------------------------------------------------------------------
-# Side-effect encoding (int32[4])
+# Side-effect encoding (int32[5])
 # Index 0 : freeze turns (FROZEN timed status to set)
 # Index 1 : sleep turns (SLEEP timed status to set)
 # Index 2 : teleport flag (1 = random teleport requested)
 # Index 3 : wake monsters flag (1 = wake nearby monsters requested)
+# Index 4 : level-descend flag (1 = descend one dungeon level)
+#           Set by HOLE / TRAPDOOR — vendor/nethack/src/trap.c::dotrap
+#           TT_HOLE / TT_TRAPDOOR cases call goto_level(level+1, ...).
 # ---------------------------------------------------------------------------
-_SE_FREEZE  = 0
-_SE_SLEEP   = 1
-_SE_TELE    = 2
-_SE_WAKE    = 3
+_SE_FREEZE         = 0
+_SE_SLEEP          = 1
+_SE_TELE           = 2
+_SE_WAKE           = 3
+_SE_LEVEL_DESCEND  = 4
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +121,7 @@ def _d(rng: jax.Array, sides: int) -> jnp.ndarray:
 
 
 def _no_se() -> jnp.ndarray:
-    return jnp.zeros(4, dtype=jnp.int32)
+    return jnp.zeros(5, dtype=jnp.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +155,10 @@ def trigger_trap(
     -------
     new_state    : TrapState with revealed[victim_pos] = True
     damage       : int32 — HP damage dealt (0 if none)
-    side_effects : int32[4]
+    side_effects : int32[5]
                    [0] freeze turns, [1] sleep turns,
-                   [2] teleport flag, [3] wake-monsters flag
+                   [2] teleport flag, [3] wake-monsters flag,
+                   [4] level-descend flag (HOLE / TRAPDOOR)
 
     Trap dispatch mirrors vendor/nethack/src/trap.c :: dotrap().
     """
@@ -209,6 +214,11 @@ def trigger_trap(
 
     # TELEP_TRAP / LEVEL_TELEP: request teleport
     se_tele = se_zeros.at[_SE_TELE].set(1)
+
+    # HOLE / TRAPDOOR: request descend one dungeon level.
+    # vendor/nethack/src/trap.c::dotrap TT_HOLE / TT_TRAPDOOR cases
+    # (lines ~1950-2050) — losehp(rnd(6), ...) then goto_level(level+1, ...).
+    se_descend = se_zeros.at[_SE_LEVEL_DESCEND].set(1)
 
     # WEB: held rn1(4,2) = rn2(4)+2 = 2..5 turns (avg-strength hero).
     # vendor trap.c:2187-2188 — STR 9..11 → tim = rn1(4, 2).
@@ -278,8 +288,8 @@ def trigger_trap(
         se_zeros,       # FIRE_TRAP
         se_pit,         # PIT
         se_spiked_pit,  # SPIKED_PIT
-        se_tele,        # HOLE (stub: same-level tele)
-        se_tele,        # TRAPDOOR (stub: same-level tele)
+        se_descend,     # HOLE — descend one level (vendor trap.c::dotrap TT_HOLE)
+        se_descend,     # TRAPDOOR — descend one level (vendor trap.c::dotrap TT_TRAPDOOR)
         se_tele,        # TELEP_TRAP
         se_tele,        # LEVEL_TELEP (stub: same-level tele)
         se_tele,        # MAGIC_PORTAL (stub)
