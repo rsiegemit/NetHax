@@ -119,13 +119,13 @@ _MONSTER_GEN_LEVEL: jax.Array = jnp.array(
     [m.level for m in MONSTERS], dtype=jnp.int8
 )
 
-# int32[N_MONSTERS] — simplified hp_max for polymorph form rescaling.
-# new_hp_max = max(level + 1, 1) * 8 — mirrors polymorph.py::_form_hp_max
-# deterministic path.  Used by _effect_polymorph on_hit.
-# Cite: vendor/nethack/src/zap.c::newcham HP-scaling, makemon.c::newmonhp.
-_POLY_FORM_HP_MAX: jax.Array = jnp.array(
-    [max(m.level + 1, 1) * 8 for m in MONSTERS], dtype=jnp.int32
-)
+# Byte-equal new-form HP roll lives in polymorph._form_hp_max (imported at
+# the call site to avoid a circular module load).  It mirrors vendor
+# makemon.c:1012-1054 newmonhp:
+#   mlvl==0           → rnd(4)
+#   mlvl> 0           → d(mlvl, 8)   (+ home_elemental*3, dragon/golem branches)
+# Cite: vendor/nethack/src/zap.c:5373 newcham → newmonhp(mtmp, monsndx(mdat));
+#       vendor/nethack/src/makemon.c:1012 newmonhp.
 
 
 # ---------------------------------------------------------------------------
@@ -730,11 +730,14 @@ def _effect_polymorph(
 
     Implementation mirrors polymorph.py::polymorph_monster (zap.c::newcham):
       1. Rejection-sample a valid form using _POLY_FORM_VALID.
-      2. Roll new_hp_max = (new_form_level + 1) * 8 (simplified newmonhp).
+      2. Roll new_hp_max via polymorph._form_hp_max (byte-equal newmonhp:
+         rnd(4) for mlvl==0; d(mlvl, 8) otherwise; +home_elemental*3 /
+         dragon / golem branches).  Cite: vendor/nethack/src/zap.c:5373
+         newcham → newmonhp; makemon.c:1012-1054.
       3. Scale current HP proportionally: new_hp = cur_hp * new_max / old_max.
       4. Update entry_idx (mon_type) and hp arrays.
     """
-    from Nethax.nethax.subsystems.polymorph import _POLY_FORM_VALID
+    from Nethax.nethax.subsystems.polymorph import _POLY_FORM_VALID, _form_hp_max
 
     def on_hit(s, r, mon_idx):
         # Rejection-sample a _POLY_FORM_VALID index in [1, N_MONSTERS-1].
@@ -755,9 +758,10 @@ def _effect_polymorph(
         r, new_type = lax.while_loop(_cond, _body, (r, init_c))
         new_type = new_type.astype(jnp.int32)
 
-        # Proportional HP scaling (newcham / polymorph_monster logic).
-        # new_hp_max = (level + 1) * 8 — mirrors _form_hp_max simplified path.
-        new_hp_max = jnp.take(_POLY_FORM_HP_MAX, new_type, axis=0)
+        # Byte-equal newmonhp roll (vendor/nethack/src/makemon.c:1012).
+        r, sub_hp = jax.random.split(r)
+        new_hp_max = _form_hp_max(new_type.astype(jnp.int16),
+                                  sub_hp).astype(jnp.int32)
         old_hp_max = jnp.maximum(s.mon_hp_max[mon_idx].astype(jnp.float32),
                                  jnp.float32(1.0))
         ratio  = s.mon_hp[mon_idx].astype(jnp.float32) / old_hp_max

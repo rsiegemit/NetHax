@@ -377,18 +377,38 @@ _FORM_STRONGMONST: jnp.ndarray = _build_form_strongmonst()
 
 
 def _build_form_is_giant() -> jnp.ndarray:
-    """bool[N_MONSTERS]: True iff form is a giant (STR cap = 25 in vendor).
+    """bool[N_MONSTERS]: True iff form has M2_GIANT flag.
 
-    vendor/nethack/include/mondata.h is_giant: ptr->mlet == S_GIANT (S=20).
-    Cite: vendor/nethack/src/polyself.c uasmon_maxStr — giants get 25.
+    vendor/nethack/include/mondata.h:107 — #define is_giant(ptr)
+        (((ptr)->mflags2 & M2_GIANT) != 0L).
+    Cite: vendor/nethack/src/polyself.c:1103 uasmon_maxStr — is_giant(ptr).
+    Includes Lord Surtur, Cyclops, giant zombie, giant mummy in addition
+    to the six S_GIANT monsters.
     """
-    from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
+    from Nethax.nethax.constants.monsters import MONSTERS, M2_GIANT
     return jnp.array(
-        [m.symbol == MonsterSymbol.S_GIANT for m in MONSTERS], dtype=jnp.bool_,
+        [bool(m.flags2 & M2_GIANT) for m in MONSTERS], dtype=jnp.bool_,
     )
 
 
 _FORM_IS_GIANT: jnp.ndarray = _build_form_is_giant()
+
+
+def _build_form_is_undead() -> jnp.ndarray:
+    """bool[N_MONSTERS]: True iff form has M2_UNDEAD flag.
+
+    vendor/nethack/include/mondata.h:95 — #define is_undead(ptr)
+        (((ptr)->mflags2 & M2_UNDEAD) != 0L).
+    Cite: vendor/nethack/src/polyself.c:1103 uasmon_maxStr — !is_undead(ptr)
+    gates the giant STR19(19) bonus (giant zombies/mummies don't qualify).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, M2_UNDEAD
+    return jnp.array(
+        [bool(m.flags2 & M2_UNDEAD) for m in MONSTERS], dtype=jnp.bool_,
+    )
+
+
+_FORM_IS_UNDEAD: jnp.ndarray = _build_form_is_undead()
 
 
 def _build_form_is_golem() -> jnp.ndarray:
@@ -1078,6 +1098,36 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool = 
         player_pw=jnp.minimum(state.player_pw, state.player_pw_max),
     )
     state = _recompute_ac(state, form_i16)
+
+    # --- 4a. Adopt uasmon_maxStr (polyself.c:1077-1119 + 820-832).
+    # vendor: newMaxStr = uasmon_maxStr();
+    #   if (strongmonst(&mons[mntmp])) ABASE(A_STR) = AMAX(A_STR) = newMaxStr;
+    #   else                           AMAX(A_STR) = newMaxStr;
+    # uasmon_maxStr returns:
+    #   strongmonst + is_giant + !is_undead → STR19(19) = 119
+    #   strongmonst else                    → STR18(100) = 118
+    #   !strongmonst                        → 18
+    # (Race-based branch R->attrmax[A_STR] for orc/elf/dwarf/gnome forms is
+    #  not applied here per task spec; player_str encoding is int16
+    #  3..18 normal, 19..118 = STR18/01..100, 119..125 = STR19/+.)
+    form_i32   = form_i16.astype(jnp.int32)
+    is_strong  = _FORM_STRONGMONST[form_i32]
+    is_giant_f = _FORM_IS_GIANT[form_i32]
+    is_undead_f= _FORM_IS_UNDEAD[form_i32]
+    live_H     = is_giant_f & (~is_undead_f)
+    new_max_str = jnp.where(
+        is_strong & live_H,
+        jnp.int16(119),                        # STR19(19)
+        jnp.where(is_strong, jnp.int16(118),   # STR18(100)
+                  jnp.int16(18)),
+    )
+    cur_str = state.player_str.astype(jnp.int16)
+    # strongmonst: set both ABASE and AMAX → player_str = new_max_str.
+    # non-strongmonst: AMAX = new_max_str; current strength clamped down.
+    updated_str = jnp.where(is_strong,
+                            new_max_str,
+                            jnp.minimum(cur_str, new_max_str))
+    state = state.replace(player_str=updated_str.astype(state.player_str.dtype))
 
     # --- 4b. Mount-on-poly: if riding and form cannot ride, force dismount.
     # polyself.c:1412 — when can_ride() fails after poly, dismount_steed().
