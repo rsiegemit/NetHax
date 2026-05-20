@@ -544,13 +544,47 @@ def _effect_invisibility(state, rng, buc):
 
 
 def _effect_monster_detection(state, rng, buc):
-    """potion of monster detection — timed DETECT_MONSTERS intrinsic.
+    """potion of monster detection — byte-equal to vendor peffect_monster_detection.
 
-    Canonical: peffect_monster_detection — incr_itimeout(&HDetect_monsters, ...).
-    Wave 3: 100-turn timed detect.
+    vendor/nethack/src/potion.c:914-940:
+        if (otmp->blessed) {
+            if ((HDetect_monsters & TIMEOUT) >= 300L) i = 1;
+            else                                       i = rn2(100) + 100;
+            incr_itimeout(&HDetect_monsters, i);
+            (reveal map of monster positions)
+        } else if (otmp->cursed) {
+            (wake all monsters on level)
+        } else {
+            (uncursed: just reveal monsters at current LOS)
+        }
+
+    Blessed → timed detect [100, 199] (or +1 if already ≥300).
+    Cursed  → wake all alive monsters (clear sleeping flags).
+    Uncursed → same as blessed but timed-reveal only.
     """
-    new_status = add_timed_intrinsic(state.status, Intrinsic.DETECT_MONSTERS, 100)
-    return state.replace(status=new_status)
+    from Nethax.nethax.rng import rn2
+
+    blessed = _is_blessed(buc)
+    cursed  = _is_cursed(buc)
+
+    # Blessed/uncursed: incr_itimeout by rn2(100)+100=[100,199], capped at +1
+    # if already ≥300.
+    cur_t = state.status.timed_intrinsics[Intrinsic.DETECT_MONSTERS]
+    base  = rn2(rng, 100).astype(jnp.int32) + jnp.int32(100)
+    saturated = cur_t >= jnp.int32(300)
+    incr  = jnp.where(saturated, jnp.int32(1), base)
+    new_t = jnp.where(cursed, cur_t, cur_t + incr)
+    new_timers = state.status.timed_intrinsics.at[Intrinsic.DETECT_MONSTERS].set(new_t)
+
+    # Cursed: wake all sleeping monsters on current level.
+    mai = state.monster_ai
+    new_asleep = jnp.where(cursed,
+                           jnp.zeros_like(mai.asleep),
+                           mai.asleep)
+    new_mai = mai.replace(asleep=new_asleep)
+
+    new_status = state.status.replace(timed_intrinsics=new_timers)
+    return state.replace(status=new_status, monster_ai=new_mai)
 
 
 def _effect_object_detection(state, rng, buc):
