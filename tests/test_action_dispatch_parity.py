@@ -66,6 +66,7 @@ from Nethax.nethax.subsystems.action_dispatch import (
     _SLOT_APPLY,
     _SLOT_ENGRAVE,
     _SLOT_NAME,
+    _SLOT_ENHANCE,
 )
 
 
