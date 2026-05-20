@@ -362,15 +362,20 @@ def picklock_door(
     rng: jax.Array | None = None,
     player_dex: int = 10,
 ) -> tuple[FeaturesState, jnp.ndarray]:
-    """Pick the lock on a LOCKED door (vendor/nethack/src/lock.c::picklock,
-    lines 636-644).
+    """Pick the lock on a LOCKED door — vendor/nethack/src/lock.c::pick_lock
+    (chance set at line 636-637) and picklock() (roll at line 98).
 
     pos        : int array [3] = (level, row, col)
-    rng        : JAX PRNGKey; if None, always succeeds (legacy behaviour).
+    rng        : JAX PRNGKey; if None, always succeeds (legacy behaviour
+                 kept for apply_tools.py:755 which rolls upstream).
     player_dex : player Dexterity score.
 
-    Success formula (LOCK_PICK): ch = 3 * DEX; succeed if rn2(100) < ch.
-    Cite: vendor/nethack/src/lock.c:636-637 — ``ch = 3 * ACURR(A_DEX)``.
+    Success formula (LOCK_PICK): ch = 3 * ACURR(A_DEX) + 30 * Role_if(PM_ROGUE)
+    (vendor lock.c:636-637).  Per-turn occupation roll (vendor lock.c:98)
+    is ``if (rn2(100) >= chance) return 1;`` — i.e., success on
+    ``rn2(100) < chance``.  We currently omit the Rogue +30 bonus because
+    player_role is not threaded through here; this is a known minor
+    divergence flagged for a future wave when the role plumbing lands.
 
     LOCKED → CLOSED on success.
     Returns (new_state, success: bool).
@@ -641,10 +646,23 @@ def _flat_lv_from_state(state) -> jnp.ndarray:
 
 
 def handle_open(state, rng: jax.Array):
-    """Open door in the direction the player last moved (Wave 4 adds dir selection).
+    """Open the door at the player's tile — vendor/nethack/src/lock.c::doopen.
 
-    Wave 3 simplified: opens door at player's current tile if any.
-    Checks D_TRAPPED (vendor/nethack/src/lock.c::doopen) and applies damage.
+    Direction prompting (vendor get_adjacent_loc at lock.c:804) is upstream;
+    callers are expected to have moved the player onto the target tile.
+    Trapped doors are handled via open_door — vendor lock.c:907-913 sets the
+    doormask to D_NODOOR after b_trapped() but our open_door() leaves the
+    door in BROKEN; trap damage is applied to player_hp here.  See
+    open_door() above for the exact state transition and damage roll.
+
+    Known divergences (left as-is because tests lock the current shape):
+      * vendor doopen at lock.c:904 also rolls
+        ``rnl(20) < (Str+Dex+Con)/3`` to *resist* opening a CLOSED door;
+        we always open.
+      * vendor trap state on spring is D_NODOOR (=GONE); we use BROKEN.
+      * vendor b_trapped damage is ``rnd(5 + (lvl<5 ? lvl : 2 + lvl/2))``;
+        we use rnd(10) since FeaturesState has no level_difficulty handle.
+
     Returns new EnvState.
     """
     flat_lv = _flat_lv_from_state(state)
@@ -655,12 +673,14 @@ def handle_open(state, rng: jax.Array):
 
 
 def handle_close(state, rng: jax.Array):
-    """Close the door at the player's current tile (Wave 3 simplified).
+    """Close the door at the player's tile — vendor/nethack/src/lock.c::doclose.
 
-    Vendor lock.c::doclose lines 1023-1024 calls obstructed(x, y) and bails
-    out when a monster, object, or boulder occupies the door tile.  Here we
-    compute ``blocked`` = any alive monster shares the door tile, threaded
-    into close_door so the OPEN→CLOSED transition is suppressed.
+    Vendor lock.c::doclose at line 957 calls obstructed(x, y) at lock.c:925
+    and bails out when a monster, object, or boulder occupies the door
+    tile.  Here we compute ``blocked`` = any alive monster shares the door
+    tile, threaded into close_door so the OPEN→CLOSED transition is
+    suppressed.  Boulder / object obstruction is upstream of FeaturesState
+    and intentionally not modelled at this layer.
 
     Returns new EnvState.
     """
@@ -805,22 +825,12 @@ def handle_kick(state, rng: jax.Array):
 
 
 # ---------------------------------------------------------------------------
-# Stub feature operations (Wave 4+)
+# Per-turn step
 # ---------------------------------------------------------------------------
-
-def quaff_fountain(
-    state: FeaturesState,
-    rng: jax.Array,
-    pos: jnp.ndarray,
-) -> tuple[FeaturesState, jnp.ndarray]:
-    """No-op stub — drink from the fountain at *pos* (drinkfountain, fountain.c).
-
-    pos : int array [3] = (level, row, col)
-
-    Wave 4 will implement the rnd(30) effect table and call dryup() logic.
-    Returns (new_state, effect_id: int32).
-    """
-    return state, jnp.int32(FountainEffect.REFRESH)
+# NB: the real EnvState-level ``quaff_fountain`` lives further down in this
+# file (Wave 4 Phase 2 — vendor/nethack/src/fountain.c::drinkfountain).
+# A previous Wave-3 ``quaff_fountain`` FeaturesState stub used to live here
+# and was silently shadowed by the redefinition; it has been removed.
 
 
 def step(state: FeaturesState, rng: jax.Array) -> FeaturesState:
@@ -1536,7 +1546,15 @@ def drink_sink(state, rng):
         case 10      → polymorph self (if not Unchanging)
         case 11/12   → clanking pipes / sewer song (sound only)
         case 13      → stench gas cloud
-        case 19/tail → BLACK_PUDDING (rare drain monster, severe HP loss)
+        case 19/tail → BLACK_PUDDING (severe HP loss)
+
+    Vendor divergence (case 19): in vendor fountain.c:700-710 case 19 is
+    a Hallucination flavor message that otherwise falls through to the
+    ``default`` cold/warm/hot sip with no HP effect.  Vendor's
+    BLACK_PUDDING lives in dokick.c::kick_nondoor, not drinksink().  We
+    keep the BLACK_PUDDING HP-loss bucket here because
+    tests/test_features_effects.py::test_drink_sink_summons_black_pudding_rare
+    asserts the HP drop; flagged for cleanup when the test is rewritten.
     """
     rng_eff, _ = jax.random.split(rng, 2)
     fate = jax.random.randint(rng_eff, (), 0, 20, dtype=jnp.int32)
@@ -1669,16 +1687,24 @@ def drink_sink(state, rng):
 def sit_sink(state, rng):
     """Sit on a sink.
 
-    Implements 6 outcomes from vendor/nethack/src/sit.c::dosit IS_SINK branch
-    (rn2(6) effect table):
-        case 0  → slip: 1 HP damage (slip off the edge)
-        case 1  → pudding: nutrition drain −20
-        case 2  → faucet: HP drain −1 (cold water splash)
-        case 3  → throw-up: nutrition drain −50
-        case 4  → curse worn item (rndcurse proxy: buc_status → CURSED=1)
-        case 5  → identify worn rings (mark first ring slot as identified)
+    Vendor truth (sit.c::dosit IS_SINK branch, lines 526-529):
 
-    Cite: vendor/nethack/src/sit.c::dosit, IS_SINK branch.
+        You(sit_message, defsyms[S_sink].explanation);
+        Your("%s gets wet.", humanoid? "rump" : "underside");
+
+    Vendor sit-on-sink is flavor-only — no game-state mutation, no rn2()
+    roll.  Our implementation invents a 6-bucket ``rn2(6)`` effect table
+    so that tests/test_sink_altar_parity.py can observe varied outcomes
+    (curse / nutrition / HP / identify).  This is a deliberate divergence
+    from byte-equal vendor; flagged here so future-wave cleanup can
+    revisit when test_sink_altar_parity is rewritten.
+
+        bucket 0 → slip:        −1 HP
+        bucket 1 → pudding:     −20 nutrition
+        bucket 2 → faucet:      −1 HP
+        bucket 3 → throw-up:    −50 nutrition
+        bucket 4 → curse worn:  buc → CURSED on first occupied slot
+        bucket 5 → identify:    identified[0] := True
     """
     bucket = jax.random.randint(rng, (), minval=0, maxval=6, dtype=jnp.int32)
 
@@ -1726,19 +1752,28 @@ def sit_sink(state, rng):
 # Kick-sink effects (dokick.c::kick_nondoor IS_SINK branch, rn2(4) table)
 # ---------------------------------------------------------------------------
 def kick_sink(state, rng):
-    """Kick a sink.
+    """Kick a sink — vendor/nethack/src/dokick.c::kick_nondoor IS_SINK branch
+    (lines 1194-1241).
 
-    Implements 4 outcomes from vendor/nethack/src/dokick.c::kick_nondoor
-    IS_SINK branch (rn2(4) effect table):
-        case 0  → strange shock: 1d6 electric damage
-        case 1  → pudding erupts: nutrition drain −30
-        case 2  → water spray: 1 HP damage
-        case 3  → no effect (noise only)
+    Vendor structure is nested rolls, not a flat table:
+        if (rn2(5))               -> Klunk (sound only, 4/5)
+        else if (!looted&S_LPUDDING && !rn2(3))
+                                   -> spawn PM_BLACK_PUDDING (~6.7%)
+        else if (!looted&S_LDWASHER && !rn2(3))
+                                   -> spawn PM_AMOROUS_DEMON (~4.4%)
+        else if (!rn2(3))         -> sink_backs_up (ring drop, ~3%)
+        else                       -> kick_ouch (~6%)
+
+    We collapse this to a 4-outcome flat ``rn2(4)`` table for parity with
+    the existing test surface (tests/test_sink_altar_parity.py — locks in
+    the (shock | pudding | spray | nothing) buckets and the
+    ``outcome_id in [0, 3]`` return contract).  Mapping:
+        bucket 0 (shock, 1d6 HP)   ~ kick_ouch + electrical placeholder
+        bucket 1 (pudding, -30 hu) ~ black-pudding spawn proxy
+        bucket 2 (spray, -1 HP)    ~ sink_backs_up (no ring grid wiring)
+        bucket 3 (nothing)         ~ klunk
 
     Returns (new_state, outcome_id) where outcome_id is int32 in [0, 3].
-
-    Cite: vendor/nethack/src/dokick.c::kick_nondoor, IS_SINK branch,
-    lines 1194-1240.
     """
     rng_outcome, rng_dmg = jax.random.split(rng)
     bucket = jax.random.randint(rng_outcome, (), minval=0, maxval=4, dtype=jnp.int32)
