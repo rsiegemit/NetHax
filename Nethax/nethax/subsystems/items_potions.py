@@ -694,34 +694,55 @@ def _effect_confusion(state, rng, buc):
 
 
 def _effect_hallucination(state, rng, buc):
-    """potion of hallucination — add hallucination timer.
+    """potion of hallucination — byte-equal to vendor peffect_hallucination.
 
-    Canonical: peffect_hallucination — make_hallucinated(rn1(200, 600-300*bcsign)).
-    Wave 3: 600 turns (blessed 300, cursed 900).
+    vendor/nethack/src/potion.c::peffect_hallucination:
+        make_hallucinated(itimeout_incr(HHallucination,
+            rn1(200, 600 - 300 * bcsign(otmp))), TRUE, 0);
+
+    rn1(200, M) = uniform [M, M+199] where M = 600 - 300*bcsign:
+        cursed   bcsign=-1 → [900, 1099]
+        uncursed bcsign= 0 → [600, 799]
+        blessed  bcsign=+1 → [300, 499]
+    Was fixed 300/600/900 turns (off-by-200 ceiling).
     """
+    from Nethax.nethax.rng import rn2
+
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
-    turns   = jnp.where(blessed, jnp.int32(300),
-              jnp.where(cursed,  jnp.int32(900), jnp.int32(600)))
+    bcsign  = jnp.where(blessed, jnp.int32(1),
+              jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+    m_base  = jnp.int32(600) - jnp.int32(300) * bcsign  # 900/600/300
+    turns   = rn2(rng, 200).astype(jnp.int32) + m_base  # [M, M+199]
     cur = state.status.timed_statuses[int(TimedStatus.HALLUCINATION)]
-    new_val = jnp.maximum(cur, turns)
+    new_val = cur + turns  # incr_itimeout — additive
     new_ts  = state.status.timed_statuses.at[int(TimedStatus.HALLUCINATION)].set(new_val)
     new_status = state.status.replace(timed_statuses=new_ts)
     return state.replace(status=new_status)
 
 
 def _effect_blindness(state, rng, buc):
-    """potion of blindness — add blindness timer.
+    """potion of blindness — byte-equal to vendor peffect_blindness.
 
-    Canonical: peffect_blindness — make_blinded(incr(BlindedTimeout, rn1(200,250-125*bcsign))).
-    Wave 3: 250 turns (blessed 125, cursed 375).
+    vendor/nethack/src/potion.c:1073-1080:
+        make_blinded(itimeout_incr(BlindedTimeout,
+                                   rn1(200, 250 - 125*bcsign(otmp))),
+                     !Blind);
+
+    rn1(200, M) = [M, M+199] with M = 250-125*bcsign:
+        cursed   → [375, 574]
+        uncursed → [250, 449]
+        blessed  → [125, 324]
     """
+    from Nethax.nethax.rng import rn2
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
-    turns   = jnp.where(blessed, jnp.int32(125),
-              jnp.where(cursed,  jnp.int32(375), jnp.int32(250)))
+    bcsign  = jnp.where(blessed, jnp.int32(1),
+              jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+    m_base  = jnp.int32(250) - jnp.int32(125) * bcsign  # 375/250/125
+    turns   = rn2(rng, 200).astype(jnp.int32) + m_base  # [M, M+199]
     cur = state.status.timed_statuses[int(TimedStatus.BLIND)]
-    new_val = jnp.maximum(cur, turns)
+    new_val = cur + turns  # incr_itimeout
     new_ts  = state.status.timed_statuses.at[int(TimedStatus.BLIND)].set(new_val)
     new_status = state.status.replace(timed_statuses=new_ts)
     return state.replace(status=new_status)
