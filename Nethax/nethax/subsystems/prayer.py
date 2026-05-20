@@ -364,21 +364,58 @@ def in_trouble(state) -> jnp.ndarray:
     is_collapsing = state.status.encumbrance.astype(jnp.int32) >= jnp.int32(5)  # OVERLOADED
     # pray.c:226  stuck_in_wall() — xorn wedged in solid rock (Wave 6 #78).
     is_stuck_wall = state.prayer.stuck_in_wall
-    # pray.c:228-231  cursed levitation gear — we approximate as
-    # "LEVITATION_TMP active AND any worn item is cursed".
+    # pray.c:228-231  cursed levitation gear:
+    #     Cursed_obj(uarmf, LEVITATION_BOOTS)
+    #     || stuck_ring(uleft, RIN_LEVITATION)
+    #     || stuck_ring(uright, RIN_LEVITATION)
+    # Wave 27a: byte-equal — only fires when the specific worn item is the
+    # cursed levitation source (boots otyp 149 worn on feet, or ring otyp 160
+    # cursed on left/right finger).
+    from Nethax.nethax.subsystems.inventory import ArmorSlot
+    _LEVIT_BOOTS_OTYP = 149   # objects.py id 149 = levitation boots
+    _LEVIT_RING_OTYP  = 160   # objects.py id 160 = ring of levitation
+    inv = state.inventory
+    boots_idx = inv.worn_armor[int(ArmorSlot.BOOTS)].astype(jnp.int32)
+    ringL_idx = inv.worn_rings[0].astype(jnp.int32)
+    ringR_idx = inv.worn_rings[1].astype(jnp.int32)
+    boots_otyp = jnp.where(
+        boots_idx >= jnp.int32(0), items.type_id[boots_idx], jnp.int32(-1)
+    )
+    ringL_otyp = jnp.where(
+        ringL_idx >= jnp.int32(0), items.type_id[ringL_idx], jnp.int32(-1)
+    )
+    ringR_otyp = jnp.where(
+        ringR_idx >= jnp.int32(0), items.type_id[ringR_idx], jnp.int32(-1)
+    )
+    boots_cursed = jnp.where(
+        boots_idx >= jnp.int32(0), items.buc_status[boots_idx], jnp.int8(0)
+    )
+    ringL_cursed = jnp.where(
+        ringL_idx >= jnp.int32(0), items.buc_status[ringL_idx], jnp.int8(0)
+    )
+    ringR_cursed = jnp.where(
+        ringR_idx >= jnp.int32(0), items.buc_status[ringR_idx], jnp.int8(0)
+    )
     is_cursed_levit = (
-        (timed[int(TimedStatus.LEVITATION_TMP)] > jnp.int32(0))
-        & jnp.any(items.buc_status == jnp.int8(1))
+        ((boots_otyp == jnp.int32(_LEVIT_BOOTS_OTYP))
+         & (boots_cursed == jnp.int8(1)))
+        | ((ringL_otyp == jnp.int32(_LEVIT_RING_OTYP))
+           & (ringL_cursed == jnp.int8(1)))
+        | ((ringR_otyp == jnp.int32(_LEVIT_RING_OTYP))
+           & (ringR_cursed == jnp.int8(1)))
     )
     # pray.c:232-241  unuseable hands (welded weapon / nohands form).
     is_unuse_hands = timed[int(TimedStatus.GLIB)] > jnp.int32(0)
-    # pray.c:242-243  cursed blindfold — blinded by a cursed blindfold/towel.
-    # Wave 6 #78: detect via inventory item type 208 (blindfold) with
-    # buc_status == cursed (1).  vendor/nle/src/objects.c:208.
+    # pray.c:242-243  cursed blindfold — Blindfolded && ublindf->cursed.
+    # Wave 27a byte-equal: only the worn blindfold matters.  We approximate
+    # "Blindfolded" as BLIND status > 0 AND a cursed blindfold (otyp 208) is
+    # present in inventory.  The vendor exact check requires ublindf pointer
+    # which is not exposed; this is the closest JIT-safe approximation.
     _BLINDFOLD_OTYP = 208
     is_blindfold = items.type_id == jnp.int32(_BLINDFOLD_OTYP)
     is_cursed_item = items.buc_status == jnp.int8(1)
-    is_cursed_blindfold = jnp.any(is_blindfold & is_cursed_item)
+    is_blinded = timed[int(TimedStatus.BLIND)] > jnp.int32(0)
+    is_cursed_blindfold = is_blinded & jnp.any(is_blindfold & is_cursed_item)
 
     # --- Minor troubles (pray.c:248-282) ---
     # pray.c:248-249  Punished — heavy-iron-ball / chain.  Wave 6 #78.
@@ -1498,6 +1535,42 @@ def sacrifice_on_altar(state, rng: jax.Array, slot_idx: jnp.ndarray):
         cur_ugangr,
     ).astype(jnp.int32)
 
+    # ---- Wave 27a — sacrifice_your_race side-effects (pray.c:1741, 1765-1773) -
+    # Vendor sacrifice_your_race(otmp, highaltar, altaralign):
+    #   if (u.ualign.type != A_CHAOTIC) {  // non-chaotic player
+    #       adjalign(-5);            // already folded into ``delta`` above
+    #       u.ugangr += 3;
+    #       (void) adjattrib(A_WIS, -1, TRUE);
+    #       if (!Inhell) angrygods(u.ualign.type);
+    #       change_luck(-5);
+    #   } else {                     // chaotic player
+    #       adjalign(5);             // already folded into ``delta``
+    #   }
+    #   // Earlier on line 1741, when chaotic player + chaotic altar (the
+    #   // only path that reaches the "blood covers the altar" demon-summon
+    #   // branch when altaralign != A_NONE):
+    #   //   change_luck(altaralign == A_NONE ? -2 : 2);
+    # is_cross_human gates the whole branch (player_race == HUMAN AND corpse
+    # is HUMAN AND altar mismatches player alignment).
+    new_ugangr = jnp.where(
+        is_cross_human & (~is_chaotic_p),
+        new_ugangr + jnp.int32(3),
+        new_ugangr,
+    ).astype(jnp.int32)
+    # WIS-1 (capped at floor 3 per vendor adjattrib semantics).
+    new_wis = jnp.where(
+        is_cross_human & (~is_chaotic_p),
+        jnp.maximum(new_wis - jnp.int8(1), jnp.int8(3)),
+        new_wis,
+    )
+    # Luck change: -5 for non-chaotic player; +2 for chaotic player on a
+    # non-A_NONE altar.  (A_NONE is altar_align==-128 internally; our
+    # altar_align >= 0 gate already excludes A_NONE so the chaotic branch
+    # always sees +2 here.)
+    luck_delta_cross = jnp.where(
+        is_chaotic_p, jnp.int32(2), jnp.int32(-5),
+    )
+
     # ---- Wave 17f C.9 — ublesscnt decrement (pray.c:2065-2087) -------------
     # Vendor:
     #   if (u.ublesscnt > 0) {
@@ -1544,6 +1617,19 @@ def sacrifice_on_altar(state, rng: jax.Array, slot_idx: jnp.ndarray):
         jnp.clip(orig_luck + luck_inc_clamped, jnp.int32(-13), jnp.int32(13)),
         orig_luck,
     ).astype(jnp.int8)
+
+    # Wave 27a — sacrifice_your_race luck adjustment (pray.c:1741, 1771).
+    # Non-chaotic player on cross-aligned human sacrifice: change_luck(-5).
+    # Chaotic player on chaotic altar (non-A_NONE): change_luck(+2).
+    # Apply on top of the standard luck-gain path so the two effects compose.
+    new_luck_sac = jnp.where(
+        is_cross_human,
+        jnp.clip(
+            new_luck_sac.astype(jnp.int32) + luck_delta_cross,
+            jnp.int32(-13), jnp.int32(13),
+        ).astype(jnp.int8),
+        new_luck_sac,
+    )
 
     new_prayer = state.prayer.replace(
         alignment_record=new_record,
