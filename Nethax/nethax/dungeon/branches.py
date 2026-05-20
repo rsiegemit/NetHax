@@ -775,95 +775,165 @@ def generate_mines_level(rng, depth: int):
 # Sokoban — 8 hand-encoded layouts
 # ---------------------------------------------------------------------------
 #
-# Citation: vendor/nethack/dat/sokoban1a.des, sokoban1b.des, sokoban2a.des,
-#           sokoban2b.des, sokoban3a.des, sokoban3b.des, sokoban4a.des,
-#           sokoban4b.des.  These are simplified hand-encoded approximations
-#           — exact .des parsing is deferred to Wave 5 special_levels work.
+# Citation: vendor/nle/dat/sokoban.des — single consolidated file containing
+#           all 8 maps (soko4-1, soko4-2, soko3-1, soko3-2, soko2-1, soko2-2,
+#           soko1-1, soko1-2).  In vendor numbering soko4-* is the BOTTOM
+#           (entry from main dungeon) and soko1-* is the TOP (final reward).
+#           Our local naming convention uses floor_number 1 = deepest/final
+#           reward (= vendor soko1-*) and floor_number 4 = entry (= vendor
+#           soko4-*); the mapping is therefore inverted between the two.
+#
+# Each layout below preserves the vendor MAP geometry byte-equal and overlays
+# the vendor OBJECT:boulder, TRAP:pit, TRAP:hole, and STAIR:up/down coordinates
+# at their exact (col,row) positions.  Counts per vendor:
+#   soko4-1:  10 boulders,  9 pits, 0 holes
+#   soko4-2:  12 boulders, 10 pits, 0 holes
+#   soko3-1:  20 boulders,  0 pits,15 holes
+#   soko3-2:  16 boulders,  0 pits,12 holes
+#   soko2-1:  13 boulders,  0 pits,10 holes
+#   soko2-2:  16 boulders,  0 pits,11 holes
+#   soko1-1:  18 boulders,  0 pits,16 holes
+#   soko1-2:  20 boulders,  0 pits,18 holes
 #
 # Legend:
 #   '.' = floor      '|' / '-' = wall (we collapse both to WALL)
 #   ' ' = void       '<' = up-stair        '>' = down-stair
-#   '^' = trap pit   '0' = boulder         '_' = altar (final floor reward)
+#   '^' = pit trap   'H' = hole trap       '0' = boulder
+#   '+' = closed door (vendor MAP literal; not modified by DOOR: directives)
 # ---------------------------------------------------------------------------
 
-_SOKO_LAYOUT_1A = [
-    "--------------",
-    "|............|",
-    "|...0........|",
-    "|......^.....|",
-    "|...0..^.....|",
-    "|......^.....|",
-    "|...0........|",
-    "|<...........|",
-    "|...........>|",
-    "--------------",
+_SOKO_LAYOUT_1A = [  # vendor: soko1-1
+    "--------------------------",
+    "|>......HHHHHHHHHHHHHHHH.|",
+    "|.......|---------------.|",
+    "-------.------         |.|",
+    " |...........|         |.|",
+    " |.0.0.0.0.0.|         |.|",
+    "--------.-----         |.|",
+    "|...0.0..0.0.|         |.|",
+    "|...0........|         |.|",
+    "-----.--------   ------|.|",
+    " |..0.0.0...|  --|.....|.|",
+    " |.....0....|  |.+.....|.|",
+    " |.0.0...0.|-  |-|.....|.|",
+    "-------.----   |.+.....+.|",
+    "|..0.....|     |-|.....|--",
+    "|........|     |.+.....|  ",
+    "|...|-----     --|.....|  ",
+    "-----            -------  ",
 ]
 
-_SOKO_LAYOUT_1B = [
-    "---------------",
-    "|.............|",
-    "|.0..^........|",
-    "|..0.^........|",
-    "|...0^........|",
-    "|.<..^........|",
-    "|....^.......>|",
-    "---------------",
+_SOKO_LAYOUT_1B = [  # vendor: soko1-2
+    "  ------------------------",
+    "  |..HHHHHHHHHHHHHHHHHH..|",
+    "  |..-------------------.|",
+    "----.|    -----        |.|",
+    "|..|0--  --...|        |.|",
+    "|.....|--|.0..|        |.|",
+    "|.00..|..|..0.|        |.|",
+    "--..00|...00.--        |.|",
+    " |0..0...|0..|   ------|.|",
+    " |.00.|..|..0| --|.....|.|",
+    " |.0.0|--|.0.| |.+.....|.|",
+    " |.......|..-- |-|.....|.|",
+    " ----.0..|.--  |.+.....+.|",
+    "    ---.--.|   |-|.....|--",
+    "     |.0...|   |.+.....|  ",
+    "     |>.|..|   --|.....|  ",
+    "     -------     -------  ",
 ]
 
-_SOKO_LAYOUT_2A = [
-    "------------",
-    "|..........|",
-    "|.0..^...0.|",
-    "|..0.^...0.|",
-    "|.<..^.....|",
-    "|....^....>|",
-    "------------",
+_SOKO_LAYOUT_2A = [  # vendor: soko2-1
+    "--------------------",
+    "|........|...|.....|",
+    "|.00..-00|.-.|.....|",
+    "|..|.0.0.|00.|.....|",
+    "|-.|..-..|.-.|..<..|",
+    "|...--.......|.....|",
+    "|...|.0.-...-|.....|",
+    "|.0.|0.|...--|.....|",
+    "|-0.|..|----------+|",
+    "|..0....HHHHHHHHHH.|",
+    "|...|.>|------------",
+    "--------            ",
 ]
 
-_SOKO_LAYOUT_2B = [
-    "-------------",
-    "|...........|",
-    "|.0.0.0.0.0.|",
-    "|.^.^.^.^.^.|",
-    "|<..........|",
-    "|..........>|",
-    "-------------",
+_SOKO_LAYOUT_2B = [  # vendor: soko2-2
+    "  --------          ",
+    "--|.|....|          ",
+    "|...0....|----------",
+    "|.-.00-00|.|.......|",
+    "|.00-......|.......|",
+    "|.-..0.|...|.......|",
+    "|....-0--0-|...<...|",
+    "|..00..0...|.......|",
+    "|.--...|...|.......|",
+    "|....-0|---|.......|",
+    "--|..0.|----------+|",
+    "  |..0>HHHHHHHHHHH.|",
+    "  ------------------",
 ]
 
-_SOKO_LAYOUT_3A = [
-    "-----------",
-    "|.........|",
-    "|.0.^.0.^.|",
-    "|.0.^.0.^.|",
-    "|<.......>|",
-    "-----------",
+_SOKO_LAYOUT_3A = [  # vendor: soko3-1
+    "-----------       -----------",
+    "|....|....|--     |.........|",
+    "|..00|00...>|     |.........|",
+    "|.....0...|--     |.........|",
+    "|....|....|       |....<....|",
+    "|-.---------      |.........|",
+    "|..0.|.....|      |.........|",
+    "|.00.|0.0.0|      |.........|",
+    "|..0.....0.|      |.........|",
+    "|.000|0..0.|---------------+|",
+    "|....|..0.0.HHHHHHHHHHHHHHH.|",
+    "-----------------------------",
 ]
 
-_SOKO_LAYOUT_3B = [
-    "------------",
-    "|..........|",
-    "|.000....^.|",
-    "|.^^^^.....|",
-    "|<........>|",
-    "------------",
+_SOKO_LAYOUT_3B = [  # vendor: soko3-2
+    " ----          -----------",
+    "-|.>|-------   |.........|",
+    "|..........|   |.........|",
+    "|.0-----0-.|   |.........|",
+    "|..|...|.0.|   |....<....|",
+    "|.0.0....0-|   |.........|",
+    "|.0..0..|..|   |.........|",
+    "|.----0.--.|   |.........|",
+    "|..0...0.|.--  |.........|",
+    "|.---0-...0.------------+|",
+    "|...|..0-.0.HHHHHHHHHHHH.|",
+    "|..0......----------------",
+    "----|..|..|               ",
+    "    -------               ",
 ]
 
-_SOKO_LAYOUT_4A = [
-    "------------",
-    "|..........|",
-    "|...0..0...|",
-    "|...^..^...|",
-    "|<........_|",   # _ = altar reward on final floor
-    "------------",
+_SOKO_LAYOUT_4A = [  # vendor: soko4-1
+    "------  ----- ",
+    "|....|  |...| ",
+    "|.0..----.0.| ",
+    "|.0......0..| ",
+    "|..|-|.|-|0.| ",
+    "---------|.---",
+    "|..^^^<|.....|",
+    "|..----|0....|",
+    "--^|   |.0...|",
+    " |^|---|.0...|",
+    " |..^^^^0.0..|",
+    " |..|---------",
+    " ----         ",
 ]
 
-_SOKO_LAYOUT_4B = [
-    "-------------",
-    "|...........|",
-    "|.0..0..0...|",
-    "|.^..^..^...|",
-    "|<........._|",
-    "-------------",
+_SOKO_LAYOUT_4B = [  # vendor: soko4-2
+    "-------- ------",
+    "|<|....|-|....|",
+    "|^|-.00....0..|",
+    "|^||..00|.0.0.|",
+    "|^||....|.....|",
+    "|^|-----|0-----",
+    "|^|    |......|",
+    "|^-----|......|",
+    "|..^^^^0000...|",
+    "|..|---|......|",
+    "----   --------",
 ]
 
 _SOKO_LAYOUTS = (
@@ -907,10 +977,20 @@ def _stamp_soko_layout(layout, h: int, w: int):
                 terrain[r, c] = int(TileType.STAIRCASE_DOWN)
             elif ch == "^":
                 terrain[r, c] = int(TileType.TRAP)
+            elif ch == "H":
+                # Hole trap — distinct from pit, drops to next dungeon level.
+                # Citation: vendor/nle/dat/sokoban.des soko3-*/soko2-*/soko1-*
+                #           TRAP:"hole" directives.
+                terrain[r, c] = int(TileType.HOLE)
             elif ch == "0":
                 terrain[r, c] = BOULDER_TILE
             elif ch == "_":
                 terrain[r, c] = int(TileType.ALTAR)
+            elif ch == "+":
+                # Closed door — vendor MAP literal '+' for reward-room doors.
+                # Citation: vendor/nle/dat/sokoban.des soko*-1/-2 MAP blocks
+                #           contain literal '+' for the reward-room doors.
+                terrain[r, c] = int(TileType.CLOSED_DOOR)
             # ' ' / unknown stays VOID
     return terrain
 
@@ -949,8 +1029,15 @@ def generate_sokoban_level(rng, floor_number: int):
 
     terrain_np = _stamp_soko_layout(layout, MAP_H, MAP_W)
 
-    # Collect boulder + pit positions for the caller (Wave 5 will use these
-    # to seed proper Boulder objects in the item layer).
+    # Collect boulder + pit/hole positions for the caller (Wave 5 will use
+    # these to seed proper Boulder objects in the item layer).  In vendor
+    # Sokoban, the entry floor (soko4-*) uses TRAP:"pit" and the upper floors
+    # (soko3-*..soko1-*) use TRAP:"hole"; both are returned in pit_positions
+    # so callers see all "fall" traps.  Counts per vendor:
+    #   soko4-1: 9 pits;   soko4-2: 10 pits
+    #   soko3-1:15 holes;  soko3-2:12 holes
+    #   soko2-1:10 holes;  soko2-2:11 holes
+    #   soko1-1:16 holes;  soko1-2:18 holes
     boulder_positions: list[tuple[int, int]] = []
     pit_positions:    list[tuple[int, int]] = []
     from Nethax.nethax.constants.tiles import TileType
@@ -960,7 +1047,7 @@ def generate_sokoban_level(rng, floor_number: int):
             t = int(terrain_np[r, c])
             if t == BOULDER_TILE:
                 boulder_positions.append((r, c))
-            elif t == int(TileType.TRAP):
+            elif t == int(TileType.TRAP) or t == int(TileType.HOLE):
                 pit_positions.append((r, c))
 
     return jnp.asarray(terrain_np, dtype=jnp.int8), boulder_positions, pit_positions
