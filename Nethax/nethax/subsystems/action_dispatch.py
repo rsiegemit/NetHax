@@ -482,6 +482,9 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
             experience as _xp_experience,
             more_experienced as _xp_more_experienced,
         )
+        from Nethax.nethax.subsystems.scoring import (
+            record_kill as _scoring_record_kill,
+        )
         entry_post = attacked.monster_ai.entry_idx[monster_idx].astype(jnp.int32)
         kc = attacked.scoring.monsters_killed
         mcl = attacked.monster_ai.mcloned[monster_idx]
@@ -489,6 +492,17 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
         attacked = jax.lax.cond(
             killed,
             lambda s_: _xp_more_experienced(s_, xp_award, jnp.int32(0)),
+            lambda s_: s_,
+            attacked,
+        )
+        # Wave 30d: more_experienced is byte-equal vendor exper.c:168-203 and
+        # only touches u.uexp / u.urexp.  Kill-counter and running-score side
+        # effects (vendor end.c::done tracks per-genus/per-class kill counts)
+        # are bumped here via scoring.record_kill, gated on the same
+        # ``killed`` flag.
+        attacked = jax.lax.cond(
+            killed,
+            lambda s_: s_.replace(scoring=_scoring_record_kill(s_.scoring, xp_award)),
             lambda s_: s_,
             attacked,
         )
