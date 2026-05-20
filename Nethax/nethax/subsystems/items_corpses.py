@@ -210,38 +210,54 @@ def apply_corpse_postfx(
     safe_idx  = jnp.clip(monster_entry_idx, 0, NUMMONS - 1)
 
     # ------------------------------------------------------------------
-    # 1. Poisonous side-effects
-    # cite: eat.c cprefx / cpostfx 1130-1145 — poisonous corpse deals
-    #       rnd(15) hp damage and may drain STR unless player has POISON_RES.
-    # ------------------------------------------------------------------
-    is_poisonous  = _MONSTER_IS_POISONOUS[safe_idx]
-    has_poison_res = state.status.intrinsics[int(Intrinsic.RESIST_POISON)]
-    rng, rng_p    = jax.random.split(rng)
-    poison_dmg    = jax.random.randint(rng_p, (), 1, 16).astype(jnp.int32)  # rnd(15)
-    do_poison_dmg = is_corpse & is_poisonous & ~has_poison_res
-    new_hp        = jnp.where(
-        do_poison_dmg,
-        jnp.maximum(state.player_hp - poison_dmg, jnp.int32(0)),
-        state.player_hp,
-    )
-    state = state.replace(player_hp=new_hp)
-
-    # ------------------------------------------------------------------
-    # 2. Acidic side-effects
-    # cite: eat.c 1140-1145 — acidic corpse deals rnd(15) hp damage
-    #       unless player has ACID_RES.
+    # 1. Acidic side-effects (vendor checks acid FIRST via else-if chain).
+    # cite: eat.c::eatcorpse lines 1923-1927 —
+    #     else if (acidic(&mons[mnum]) && !Acid_resistance) {
+    #         tp++; losehp(rnd(15), "acidic corpse", KILLED_BY_AN);
+    #     }
     # ------------------------------------------------------------------
     is_acidic    = _MONSTER_IS_ACIDIC[safe_idx]
     has_acid_res = state.status.intrinsics[int(Intrinsic.RESIST_ACID)]
     rng, rng_a   = jax.random.split(rng)
     acid_dmg     = jax.random.randint(rng_a, (), 1, 16).astype(jnp.int32)   # rnd(15)
     do_acid_dmg  = is_corpse & is_acidic & ~has_acid_res
-    new_hp2      = jnp.where(
+    new_hp_acid  = jnp.where(
         do_acid_dmg,
         jnp.maximum(state.player_hp - acid_dmg, jnp.int32(0)),
         state.player_hp,
     )
-    state = state.replace(player_hp=new_hp2)
+    state = state.replace(player_hp=new_hp_acid)
+
+    # ------------------------------------------------------------------
+    # 2. Poisonous side-effects (vendor: only if NOT already taken acid branch).
+    # cite: eat.c::eatcorpse lines 1928-1937 —
+    #     else if (poisonous(&mons[mnum]) && rn2(5)) {
+    #         tp++;
+    #         if (!Poison_resistance)
+    #             poison_strdmg(rnd(4), rnd(15), "poisonous corpse", KILLED_BY_AN);
+    #     }
+    # poison_strdmg deals rnd(4) STR damage AND rnd(15) HP damage.
+    # ------------------------------------------------------------------
+    is_poisonous   = _MONSTER_IS_POISONOUS[safe_idx]
+    has_poison_res = state.status.intrinsics[int(Intrinsic.RESIST_POISON)]
+    rng, rng_p_gate, rng_p_hp, rng_p_str = jax.random.split(rng, 4)
+    # Vendor's `rn2(5)` is truthy when result is non-zero — 4/5 chance to trigger.
+    poison_gate    = jax.random.randint(rng_p_gate, (), 0, 5, dtype=jnp.int32) != jnp.int32(0)
+    poison_dmg     = jax.random.randint(rng_p_hp, (), 1, 16).astype(jnp.int32)  # rnd(15)
+    poison_str_loss = jax.random.randint(rng_p_str, (), 1, 5).astype(jnp.int16)  # rnd(4)
+    # Acid path takes precedence (vendor "else if").
+    do_poison_dmg = is_corpse & is_poisonous & poison_gate & ~has_poison_res & ~do_acid_dmg
+    new_hp        = jnp.where(
+        do_poison_dmg,
+        jnp.maximum(state.player_hp - poison_dmg, jnp.int32(0)),
+        state.player_hp,
+    )
+    new_str_pois  = jnp.where(
+        do_poison_dmg,
+        jnp.maximum(state.player_str - poison_str_loss, jnp.int16(3)),
+        state.player_str,
+    )
+    state = state.replace(player_hp=new_hp, player_str=new_str_pois)
 
     # ------------------------------------------------------------------
     # 3. Intrinsic award (probabilistic reservoir selection)
@@ -269,6 +285,19 @@ def apply_corpse_postfx(
         (jnp.int32(-1), jnp.int32(0), rng),
         jnp.arange(N_INTRINSICS, dtype=jnp.int32),
     )
+
+    # Vendor mind flayer +INT branch (eat.c:1281-1291) does `break;` (NOT
+    # fallthrough) on successful +INT bump — skipping the corpse_intrinsic /
+    # givit call entirely.  We pre-compute the +INT roll here so we can
+    # suppress the intrinsic award downstream.
+    _mf_pre = is_corpse & (
+        (safe_idx == jnp.int32(_MIND_FLAYER_IDX_NP))
+        | (safe_idx == jnp.int32(_MASTER_MIND_FLAYER_IDX_NP))
+    )
+    rng, _rng_mf_pre = jax.random.split(rng)
+    _mf_pre_roll = jax.random.randint(_rng_mf_pre, (), 0, 2, dtype=jnp.int32)
+    _mf_int_lt_cap = state.player_int < jnp.int8(25)
+    _mf_eats_brain = _mf_pre & _mf_int_lt_cap & (_mf_pre_roll == jnp.int32(0))
 
     # Wave 17f — should_givit chance gate (vendor eat.c::should_givit 961-989).
     #   chance = 15  (default)
@@ -302,8 +331,11 @@ def apply_corpse_postfx(
     chance_roll = jax.random.randint(rng_giv, (), 0, safe_chance, dtype=jnp.int32)
     pass_gate = mlev > chance_roll  # vendor: ptr->mlevel > rn2(chance)
 
-    # Apply chosen intrinsic if valid AND is_corpse AND chance gate passes.
-    has_intrinsic_to_grant = is_corpse & (chosen_intr >= jnp.int32(0)) & pass_gate
+    # Apply chosen intrinsic if valid AND is_corpse AND chance gate passes
+    # AND not suppressed by the mind-flayer +INT branch (vendor break;).
+    has_intrinsic_to_grant = (
+        is_corpse & (chosen_intr >= jnp.int32(0)) & pass_gate & ~_mf_eats_brain
+    )
     old_intrinsics = state.status.intrinsics
     # Set the chosen intrinsic slot to True (lax.cond to avoid conditional
     # on tracer; use dynamic_update_slice pattern via .at[].set + where).
@@ -325,14 +357,18 @@ def apply_corpse_postfx(
     new_status = state.status.replace(intrinsics=new_intrinsics, intrinsic_source=new_src)
     state = state.replace(status=new_status)
 
-    # Wave 17f — temp_givit (vendor eat.c::temp_givit 992-997):
-    #   STONE_RES: chance = 6; if ptr->mlevel > rn2(6) → incr_itimeout d(3,6)
-    #   ACID_RES:  chance = 3; if ptr->mlevel > rn2(3) → incr_itimeout d(3,6)
-    # Both add a timed intrinsic via incr_itimeout(&HStone_resistance, d(3,6)).
+    # Wave 17f — temp_givit (vendor eat.c::temp_givit 992-997 + givit 1007):
+    #   givit() at eat.c:1007: `if (!should_givit && !temp_givit) return;`
+    #   temp_givit returns TRUE only for STONE_RES (chance 6) or ACID_RES (chance 3).
+    #   Crucially, temp_givit fires for the SELECTED intrinsic only — not both.
+    # cite: vendor/nethack/src/eat.c::temp_givit lines 991-997.
     rng, rng_t_stone, rng_t_acid, rng_d_stone, rng_d_acid = jax.random.split(rng, 5)
-    # STONE_RES temp gain.
+    chose_stone = (chosen_intr == jnp.int32(int(Intrinsic.RESIST_STONE)))
+    chose_acid  = (chosen_intr == jnp.int32(int(Intrinsic.RESIST_ACID)))
+    # STONE_RES temp gain — gated on chosen intrinsic == RESIST_STONE.
+    # Suppressed when mind-flayer +INT branch took the early-break path.
     stone_roll = jax.random.randint(rng_t_stone, (), 0, 6, dtype=jnp.int32)
-    do_stone_temp = is_corpse & (mlev > stone_roll)
+    do_stone_temp = is_corpse & chose_stone & (mlev > stone_roll) & ~_mf_eats_brain
     # d(3,6) = sum of 3 dice each 1..6  → range [3, 18], triangular dist.
     # Roll 3 independent d6 to match vendor's distribution byte-equal.
     _stone_keys = jax.random.split(rng_d_stone, 3)
@@ -345,9 +381,9 @@ def apply_corpse_postfx(
         cur_t_stone + stone_d36,
         cur_t_stone,
     )
-    # ACID_RES temp gain.
+    # ACID_RES temp gain — gated on chosen intrinsic == RESIST_ACID.
     acid_roll = jax.random.randint(rng_t_acid, (), 0, 3, dtype=jnp.int32)
-    do_acid_temp = is_corpse & (mlev > acid_roll)
+    do_acid_temp = is_corpse & chose_acid & (mlev > acid_roll) & ~_mf_eats_brain
     _acid_keys = jax.random.split(rng_d_acid, 3)
     acid_d36 = jnp.sum(jnp.stack([
         jax.random.randint(k, (), 1, 7, dtype=jnp.int32) for k in _acid_keys
@@ -392,10 +428,17 @@ def apply_corpse_postfx(
     new_pw_max = jnp.where(do_pw_bump, state.player_pw_max + jnp.int32(1), state.player_pw_max)
     state = state.replace(player_pw_max=new_pw_max)
 
-    # Nurse: restore HP to max  cite: eat.c:1154-1158
+    # Nurse: restore HP to max + cure blindness.
+    # cite: vendor/nethack/src/eat.c::cpostfx lines 1153-1160
+    #   if (Upolyd) u.mh = u.mhmax; else u.uhp = u.uhpmax;
+    #   make_blinded(0L, !u.ucreamed);
     is_nurse  = is_corpse & (safe_idx == jnp.int32(_NURSE_IDX_NP))
     new_hp3   = jnp.where(is_nurse, state.player_hp_max, state.player_hp)
     state = state.replace(player_hp=new_hp3)
+    cur_blind = state.status.timed_statuses[int(TimedStatus.BLIND)]
+    new_blind = jnp.where(is_nurse, jnp.int32(0), cur_blind)
+    new_ts_nurse = state.status.timed_statuses.at[int(TimedStatus.BLIND)].set(new_blind)
+    state = state.replace(status=state.status.replace(timed_statuses=new_ts_nurse))
 
     # Quantum mechanic: toggle FAST intrinsic  cite: eat.c:1227-1235
     is_qm = is_corpse & (safe_idx == jnp.int32(_QUANTUM_MECHANIC_IDX_NP))
@@ -433,15 +476,9 @@ def apply_corpse_postfx(
     # through to the generic intrinsic-award path above (which the table
     # already includes TELEPAT for mind flayers).
     # ------------------------------------------------------------------
-    is_mind_flayer = is_corpse & (
-        (safe_idx == jnp.int32(_MIND_FLAYER_IDX_NP))
-        | (safe_idx == jnp.int32(_MASTER_MIND_FLAYER_IDX_NP))
-    )
-    rng, rng_mf = jax.random.split(rng)
-    mf_roll = jax.random.randint(rng_mf, (), 0, 2, dtype=jnp.int32)  # !rn2(2) → roll == 0
-    do_int_bump = is_mind_flayer & (mf_roll == jnp.int32(0)) & (
-        state.player_int < jnp.int8(25)
-    )
+    # Re-use the pre-computed roll from above so the +INT branch and the
+    # intrinsic-suppression decision stay in lock-step.
+    do_int_bump = _mf_eats_brain
     new_int = jnp.where(
         do_int_bump,
         jnp.minimum(state.player_int + jnp.int8(1), jnp.int8(25)),
@@ -474,8 +511,15 @@ def apply_corpse_postfx(
         state.status.intrinsics.at[int(Intrinsic.SEE_INVIS)].set(True),
         state.status.intrinsics,
     )
+    # Stalker FALLTHROUGH to PM_GIANT_BAT/PM_BAT — make_stunned((HStun&TIMEOUT)+30).
+    # cite: vendor/nethack/src/eat.c::cpostfx lines 1174-1183.
+    cur_stun = state.status.timed_statuses[int(TimedStatus.STUNNED)]
+    new_stun = jnp.where(is_stalker, cur_stun + jnp.int32(30), cur_stun)
+    new_ts_stalk = state.status.timed_statuses.at[int(TimedStatus.STUNNED)].set(new_stun)
     new_status3 = state.status.replace(
-        timed_intrinsics=new_t_intr, intrinsics=new_intrinsics2
+        timed_intrinsics=new_t_intr,
+        intrinsics=new_intrinsics2,
+        timed_statuses=new_ts_stalk,
     )
     state = state.replace(status=new_status3)
 
@@ -516,15 +560,19 @@ def apply_old_corpse_effects(state, rng: jax.Array, is_old: jnp.ndarray):
     When corpse_creation_turn is tracked: is_old = (timestep - creation) > 50.
     JIT-pure.
     """
+    # Vendor eat.c:1909 `sick_time = (long) rn1(10, 10)` = 10 + rn2(10) → [10,19].
     rng, rng_sick = jax.random.split(rng)
-    sick_time = jax.random.randint(rng_sick, (), 11, 21).astype(jnp.int32)
+    sick_time = (jnp.int32(10) + jax.random.randint(rng_sick, (), 0, 10, dtype=jnp.int32))
 
     cur_sick = state.status.timed_statuses[int(TimedStatus.SICK)]
     new_sick = jnp.where(is_old, jnp.maximum(cur_sick, sick_time), cur_sick)
     new_ts = state.status.timed_statuses.at[int(TimedStatus.SICK)].set(new_sick)
 
+    # Vendor make_sick(..., SICK_VOMITABLE) sets up vomiting indirectly via the
+    # sick timer (see status.c). We keep a separate VOMITING timer for parity
+    # with the existing tests; rn1(15, 10) used by tin rotten path = 10+rn2(15).
     rng, rng_vom = jax.random.split(rng)
-    vom_time = jax.random.randint(rng_vom, (), 11, 26).astype(jnp.int32)
+    vom_time = (jnp.int32(10) + jax.random.randint(rng_vom, (), 0, 15, dtype=jnp.int32))
     cur_vom = new_ts[int(TimedStatus.VOMITING)]
     new_vom = jnp.where(is_old, jnp.maximum(cur_vom, vom_time), cur_vom)
     new_ts = new_ts.at[int(TimedStatus.VOMITING)].set(new_vom)
