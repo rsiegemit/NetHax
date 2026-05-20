@@ -121,8 +121,13 @@ class TestCastHealing:
             f"Pw should decrease by {expected_cost}: {pw_before} → {pw_after}"
         )
 
-    def test_healing_decrements_spell_memory(self):
-        """Casting decrements spell_memory by 1."""
+    def test_healing_does_not_change_spell_memory(self):
+        """Casting does NOT change spell_memory — vendor parity.
+
+        Vendor spell.c::spelleffects (~line 1325) does not touch sp_know on
+        cast.  Memory decays via age_spells (spell.c:669-682) once per turn.
+        Cite: vendor/nethack/src/spell.c::spelleffects, ::age_spells.
+        """
         state = _state_with_known_spell(SpellId.HEALING, pw=50)
         rng = jax.random.PRNGKey(3)
         mem_before = int(state.magic.spell_memory[SpellId.HEALING])
@@ -130,8 +135,8 @@ class TestCastHealing:
         new_state, _ = cast_spell(state, rng, SpellId.HEALING)
 
         mem_after = int(new_state.magic.spell_memory[SpellId.HEALING])
-        assert mem_after == mem_before - 1, (
-            f"spell_memory should decrease by 1: {mem_before} → {mem_after}"
+        assert mem_after == mem_before, (
+            f"spell_memory should not change on cast: {mem_before} → {mem_after}"
         )
 
 
