@@ -153,9 +153,14 @@ def water_step(state, rng):
 
         # Every 5 turns: insta-drown check.
         # Vendor trap.c::drown line 5059: if (rnl(50) <= turns_underwater) → drown.
-        # We approximate rnl(50) as uniform [0, 50).
+        # Use the luck-adjusted rnl() helper (rng.py) so good luck reduces
+        # drown risk and bad luck increases it (vendor rnd.c::rnl byte-equal).
+        from Nethax.nethax.rng import rnl as _rnl
         on_check_turn = (new_turns % jnp.int16(5)) == jnp.int16(0)
-        roll = jax.random.randint(rng_drown, (), minval=0, maxval=50, dtype=jnp.int32)
+        # Luck is not currently threaded through to this scope; using 0 leaves
+        # the call uniform [0, 50) but routes through the same helper used
+        # elsewhere so future luck-plumbing benefits this site automatically.
+        roll = _rnl(rng_drown, 50, luck=0)
         insta_drown = on_check_turn & (roll <= new_turns.astype(jnp.int32))
 
         # Apply: insta-drown sets HP to 0; safe-in-water suppresses both paths.
