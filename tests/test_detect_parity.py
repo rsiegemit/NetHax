@@ -180,7 +180,15 @@ class TestClairvoyance:
                 )
 
     def test_clairvoyance_does_not_reveal_beyond_radius(self):
-        """Cells more than 2 away from the player stay unexplored."""
+        """Cells outside the vendor asymmetric rectangle stay unexplored.
+
+        Cite: vendor/nethack/src/detect.c::do_vicinity_map lines 1464-1467:
+            lo_y = max(0, u.uy - 5); hi_y = min(ROWNO-1, u.uy + 6)
+            lo_x = max(1, u.ux - 9); hi_x = min(COLNO-1, u.ux + 10)
+        For player at (pr=10, pc=10) the inclusive box covers
+        rows ∈ [5, 16] and cols ∈ [1, 20]. Cells strictly outside that
+        rectangle must remain unexplored.
+        """
         state = _state()
         state = state.replace(player_pos=jnp.array([10, 10], dtype=jnp.int16))
         b = int(state.dungeon.current_branch)
@@ -188,5 +196,9 @@ class TestClairvoyance:
 
         result = _detect.clairvoyance(state, RNG)
 
-        # Cell at (10, 13) is 3 columns away — outside 5x5 — must be unexplored.
-        assert not bool(result.explored[b, lv, 10, 13])
+        # (10, 21) is one column east of hi_x=20 — outside rectangle.
+        assert not bool(result.explored[b, lv, 10, 21])
+        # (17, 10) is one row south of hi_y=16 — outside rectangle.
+        assert not bool(result.explored[b, lv, 17, 10])
+        # (4, 10) is one row north of lo_y=5 — outside rectangle.
+        assert not bool(result.explored[b, lv, 4, 10])

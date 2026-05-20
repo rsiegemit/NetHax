@@ -231,18 +231,46 @@ def test_detect_treasure_sets_flag():
     assert int(new_state.identification.detect_treasure_until_turn) == 100
 
 
-def test_clairvoyance_sets_all_explored_true():
-    """CLAIRVOYANCE: explored[branch, level, :, :] = True.
+def test_clairvoyance_reveals_vendor_rectangle():
+    """CLAIRVOYANCE: explored rectangle matches vendor do_vicinity_map.
 
-    Cite: vendor/nethack/src/detect.c::do_vicinity_map (extended scope).
+    Cite: vendor/nethack/src/detect.c::do_vicinity_map lines 1464-1500:
+        lo_y = max(0, u.uy - 5); hi_y = min(ROWNO-1, u.uy + 6)
+        lo_x = max(1, u.ux - 9); hi_x = min(COLNO-1, u.ux + 10)
+        for (zx = lo_x; zx <= hi_x; zx++)
+            for (zy = lo_y; zy <= hi_y; zy++) { show_map_spot(...); }
+    With player at default pos (pr=0, pc=0) and MAP_H=21, MAP_W=80,
+    revealed rows ∈ [0, 7) and cols ∈ [0, 11). All tiles inside the
+    rectangle must be explored; all tiles outside must remain unexplored.
     """
     state = _base_state()
     new_state = _run_effect(SpellId.CLAIRVOYANCE, state, seed=10)
     br = int(new_state.dungeon.current_branch)
     lv = int(new_state.dungeon.current_level) - 1
-    assert bool(jnp.all(new_state.explored[br, lv])), (
-        "entire current level should be marked explored"
-    )
+
+    pr = int(state.player_pos[0])
+    pc = int(state.player_pos[1])
+    H, W = new_state.explored.shape[2], new_state.explored.shape[3]
+    row_lo = max(0, pr - 5)
+    row_hi = min(H, pr + 7)  # exclusive
+    col_lo = max(0, pc - 9)
+    col_hi = min(W, pc + 11)  # exclusive
+
+    explored = new_state.explored[br, lv]
+    # Inside the vendor rectangle: every tile must be explored.
+    for r in range(row_lo, row_hi):
+        for c in range(col_lo, col_hi):
+            assert bool(explored[r, c]), (
+                f"tile ({r},{c}) inside vendor rectangle should be explored"
+            )
+    # Outside the vendor rectangle: tiles must remain unexplored.
+    for r in range(H):
+        for c in range(W):
+            if row_lo <= r < row_hi and col_lo <= c < col_hi:
+                continue
+            assert not bool(explored[r, c]), (
+                f"tile ({r},{c}) outside vendor rectangle should not be explored"
+            )
 
 
 def test_remove_curse_uncurses_worn_items():
