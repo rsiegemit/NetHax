@@ -46,28 +46,45 @@ from Nethax.nethax.subsystems.prayer import Alignment
 # base object name used by the underlying Item.type_id.
 # ---------------------------------------------------------------------------
 _ARTIFACTS: tuple[tuple[str, str], ...] = (
-    ("Excalibur",                "long sword"),
-    ("Snickersnee",              "katana"),
-    ("Stormbringer",             "runesword"),
-    ("Mjollnir",                 "war hammer"),
-    ("Cleaver",                  "battle-axe"),
-    ("Sting",                    "elven dagger"),
-    ("Orcrist",                  "elven broadsword"),
-    ("Grayswandir",              "silver saber"),
-    ("Vorpal Blade",             "long sword"),
-    ("Sceptre of Might",         "mace"),
-    ("Tsurugi of Muramasa",      "tsurugi"),
-    ("Magic Mirror of Merlin",   "mirror"),
-    ("Orb of Detection",         "crystal ball"),
-    ("Heart of Ahriman",         "luckstone"),
-    ("Staff of Aesculapius",     "quarterstaff"),
-    ("Eyes of the Overworld",    "pair of lenses"),
-    ("Mitre of Holiness",        "helmet"),
-    ("Longbow of Diana",         "bow"),
-    ("Master Key of Thievery",   "skeleton key"),
-    ("Yendorian Express Card",   "credit card"),
-    ("Orb of Fate",              "crystal ball"),
-    ("Eye of the Aethiopica",    "amulet of ESP"),
+    ("Excalibur",                "long sword"),                # 0
+    ("Snickersnee",              "katana"),                    # 1
+    ("Stormbringer",             "runesword"),                 # 2
+    ("Mjollnir",                 "war hammer"),                # 3
+    ("Cleaver",                  "battle-axe"),                # 4
+    ("Sting",                    "elven dagger"),              # 5
+    ("Orcrist",                  "elven broadsword"),          # 6
+    ("Grayswandir",              "silver saber"),              # 7
+    ("Vorpal Blade",             "long sword"),                # 8
+    ("Sceptre of Might",         "mace"),                      # 9
+    ("Tsurugi of Muramasa",      "tsurugi"),                   # 10
+    ("Magic Mirror of Merlin",   "mirror"),                    # 11
+    ("Orb of Detection",         "crystal ball"),              # 12
+    ("Heart of Ahriman",         "luckstone"),                 # 13
+    ("Staff of Aesculapius",     "quarterstaff"),              # 14
+    ("Eyes of the Overworld",    "pair of lenses"),            # 15
+    ("Mitre of Holiness",        "helmet"),                    # 16
+    ("Longbow of Diana",         "bow"),                       # 17
+    ("Master Key of Thievery",   "skeleton key"),              # 18
+    ("Yendorian Express Card",   "credit card"),               # 19
+    ("Orb of Fate",              "crystal ball"),              # 20
+    ("Eye of the Aethiopica",    "amulet of ESP"),             # 21
+    # ---------------------------------------------------------------
+    # wave17a: P0 #1 — 11 missing artifacts appended (byte-equal vendor
+    # artilist.h order).  Indices 22-32 align with artifact_powers.py
+    # _ARTIFACT_BONUS_TABLE entries and tests in test_artifact_powers_parity.
+    # Cite: vendor/nethack/include/artilist.h lines 149-212 + 123 + 145.
+    # ---------------------------------------------------------------
+    ("Frost Brand",              "long sword"),                # 22  artilist.h:149
+    ("Fire Brand",               "long sword"),                # 23  artilist.h:153
+    ("Dragonbane",               "broadsword"),                # 24  artilist.h:157
+    ("Demonbane",                "silver mace"),               # 25  artilist.h:162
+    ("Werebane",                 "silver saber"),              # 26  artilist.h:166
+    ("Trollsbane",               "morning star"),              # 27  artilist.h:182
+    ("Grimtooth",                "orcish dagger"),             # 28  artilist.h:123
+    ("Magicbane",                "athame"),                    # 29  artilist.h:145
+    ("Giantslayer",              "long sword"),                # 30  artilist.h:174
+    ("Ogresmasher",              "war hammer"),                # 31  artilist.h:178
+    ("Sunsword",                 "long sword"),                # 32  artilist.h:209
 )
 
 
@@ -487,6 +504,18 @@ def _artifact_alignment(artifact_idx: int) -> int:
         19: int(Alignment.NEUTRAL),    # Yendorian Express Card
         20: int(Alignment.NEUTRAL),    # Orb of Fate
         21: int(Alignment.NEUTRAL),    # Eye of the Aethiopica
+        # wave17a: P0 #1 — 11 newly added artifacts (cite artilist.h al col).
+        22: int(Alignment.UNALIGNED),  # Frost Brand   A_NONE   (artilist.h:150)
+        23: int(Alignment.UNALIGNED),  # Fire Brand    A_NONE   (artilist.h:154)
+        24: int(Alignment.UNALIGNED),  # Dragonbane    A_NONE   (artilist.h:159)
+        25: int(Alignment.LAWFUL),     # Demonbane     A_LAWFUL (artilist.h:163)
+        26: int(Alignment.UNALIGNED),  # Werebane      A_NONE   (artilist.h:167)
+        27: int(Alignment.UNALIGNED),  # Trollsbane    A_NONE   (artilist.h:183)
+        28: int(Alignment.CHAOTIC),    # Grimtooth     A_CHAOTIC (artilist.h:125)
+        29: int(Alignment.NEUTRAL),    # Magicbane     A_NEUTRAL (artilist.h:146)
+        30: int(Alignment.NEUTRAL),    # Giantslayer   A_NEUTRAL (artilist.h:175)
+        31: int(Alignment.UNALIGNED),  # Ogresmasher   A_NONE   (artilist.h:179)
+        32: int(Alignment.LAWFUL),     # Sunsword      A_LAWFUL (artilist.h:210)
     }
     return table.get(artifact_idx, int(Alignment.UNALIGNED))
 
@@ -554,6 +583,93 @@ def apply_artifact_restrictions(parsed: dict, player_align: int,
     return out
 
 
+# wave17h P0 #1: quantity prefix parser (objnam.c:3982-3987).
+def _strip_quantity_prefix(text: str) -> tuple[str, int]:
+    """Strip leading integer quantity prefix.
+
+    Cite: vendor/nethack/src/objnam.c::readobjnam lines 3982-3987:
+        else if (!d->cnt && digit(*d->bp) && strcmp(d->bp, "0")) {
+            d->cnt = atoi(d->bp);
+            while (digit(*d->bp)) d->bp++;
+            while (*d->bp == ' ') d->bp++;
+        }
+    Returns (remaining_text, cnt). cnt=0 when no prefix present.
+    """
+    text = text.lstrip()
+    if not text or not text[0].isdigit():
+        return text, 0
+    i = 0
+    while i < len(text) and text[i].isdigit():
+        i += 1
+    digits = text[:i]
+    # vendor: strcmp(d->bp, "0") guard — a bare "0" is rejected.
+    if digits == "0":
+        return text[i:].lstrip(), 0
+    try:
+        n = int(digits)
+    except ValueError:
+        return text, 0
+    return text[i:].lstrip(), n
+
+
+# wave17h P0 #2: gold-wish constants (objnam.c:4533-4546).
+_GOLD_PIECE_TYPE_ID: int = 410   # objects.py: gold piece index 410
+
+
+def _try_gold_wish(text: str) -> bool:
+    """Detect a gold-piece wish keyword.
+
+    Cite: vendor/nethack/src/objnam.c::readobjnam lines 4533-4536:
+        if (!BSTRCMPI(d->bp, d->p - 10, "gold piece")
+            || !BSTRCMPI(d->bp, d->p - 7, "zorkmid")
+            || !strcmpi(d->bp, "gold") || !strcmpi(d->bp, "money")
+            || !strcmpi(d->bp, "coin") || *d->bp == GOLD_SYM)
+    """
+    if not text:
+        return False
+    lower = text.lower()
+    if lower in ("gold", "money", "coin", "coins", "zorkmid", "zorkmids",
+                 "gold piece", "gold pieces"):
+        return True
+    if text.startswith("$") or text == "$":
+        return True
+    if lower.endswith("gold piece") or lower.endswith("gold pieces"):
+        return True
+    if lower.endswith("zorkmid") or lower.endswith("zorkmids"):
+        return True
+    return False
+
+
+# wave17h P0 #3: nowish/wizard-only substitutions (objnam.c:5001-5025).
+# Each entry maps a "wizard-only" object name to its safe substitute.
+_NOWISH_SUBSTITUTIONS: dict = {
+    "Amulet of Yendor":           "cheap plastic imitation of the Amulet of Yendor",
+    "Candelabrum of Invocation":  "tallow candle",   # rnd_class(TALLOW_CANDLE,WAX_CANDLE)
+    "Bell of Opening":            "bell",
+    "Book of the Dead":           "blank paper",     # SPE_BOOK_OF_THE_DEAD -> SPE_BLANK_PAPER
+    "magic lamp":                 "oil lamp",
+}
+
+
+def _maybe_substitute_nowish(type_id: int) -> int:
+    """Apply vendor nowish substitution table when not in wizard mode.
+
+    Cite: vendor/nethack/src/objnam.c::readobjnam lines 5001-5025.
+    Since this env has no wizard-mode flag, substitution is always active
+    (matches vendor default non-wizard behavior).
+    """
+    if type_id < 0 or type_id >= len(OBJECTS):
+        return type_id
+    entry = OBJECTS[type_id]
+    sub_name = _NOWISH_SUBSTITUTIONS.get(entry.name)
+    if sub_name is None:
+        return type_id
+    sub_id = _OBJECT_BY_NAME.get(sub_name, -1)
+    if sub_id < 0:
+        sub_id = _fuzzy_object_lookup(sub_name)
+    return sub_id if sub_id >= 0 else type_id
+
+
 def wishymatch(wish_bytes) -> dict:
     """Full vendor wishymatch parser (Wave 6 Phase B+).
 
@@ -567,6 +683,8 @@ def wishymatch(wish_bytes) -> dict:
           'user_name': bytes,     # b'' when no "named X" clause
           'erodeproof': bool,
           'greased': bool,
+          'quantity': int,        # wave17h P0: parsed cnt (gated by oc_merge)
+          'is_gold': bool,        # wave17h P0: gold-piece wish flag
           'parsed': bool,         # False when name lookup fails
         }
 
@@ -581,6 +699,8 @@ def wishymatch(wish_bytes) -> dict:
         "user_name": b"",
         "erodeproof": False,
         "greased": False,
+        "quantity": 1,
+        "is_gold": False,
         "parsed": False,
     }
     text = _decode(wish_bytes)
@@ -590,6 +710,9 @@ def wishymatch(wish_bytes) -> dict:
     # 1. Strip trailing "named X" / "called X".
     text, user_name = _strip_named_suffix(text)
     out["user_name"] = user_name
+
+    # wave17h P0 #1: parse leading integer quantity (objnam.c:3982-3987).
+    text, cnt = _strip_quantity_prefix(text)
 
     # 2. Walk left-to-right modifier keywords + enchantment.
     mods = _consume_modifiers(text)
@@ -602,6 +725,20 @@ def wishymatch(wish_bytes) -> dict:
 
     text = text.strip()
     if not text:
+        return out
+
+    # wave17h P0 #2: gold-piece wish detection (objnam.c:4533-4546).
+    if _try_gold_wish(text):
+        gcnt = cnt
+        if gcnt > 5000:
+            gcnt = 5000
+        if gcnt < 1:
+            gcnt = 1
+        out["category"]     = int(OBJECTS[_GOLD_PIECE_TYPE_ID].class_)
+        out["type_id"]      = _GOLD_PIECE_TYPE_ID
+        out["quantity"]     = gcnt
+        out["is_gold"]      = True
+        out["parsed"]       = True
         return out
 
     # 3. Plural normalization first (so "the scrolls of identify" works
@@ -637,8 +774,34 @@ def wishymatch(wish_bytes) -> dict:
         type_id = _fuzzy_object_lookup(text)
     if type_id < 0:
         return out
+
+    # wave17h P0 #3: nowish substitutions (objnam.c:5001-5025).
+    type_id = _maybe_substitute_nowish(type_id)
+
     out["category"] = int(OBJECTS[type_id].class_)
     out["type_id"]  = type_id
+    # wave17h P0 #1: apply oc_merge gate. Vendor oc_merge is true for stackable
+    # classes (COIN, SCROLL, POTION, FOOD, GEM, ROCK, WEAPON arrows/darts, ...).
+    # We model the gate as: only allow cnt > 1 for the inherently stackable
+    # classes; otherwise clamp to 1. Cite: vendor/nethack/include/objclass.h
+    # oc_merge bit + objnam.c:5040-5072 quantity-honoring branch.
+    cls = int(OBJECTS[type_id].class_)
+    _MERGEABLE_CLASSES = {
+        9,    # SCROLL_CLASS
+        8,    # POTION_CLASS
+        7,    # FOOD_CLASS
+        12,   # COIN_CLASS
+        13,   # GEM_CLASS
+        14,   # ROCK_CLASS
+        17,   # VENOM_CLASS
+    }
+    if cnt > 1 and cls in _MERGEABLE_CLASSES:
+        # vendor: !wizard caps at 5000 (objnam.c:4537), but for non-gold
+        # objects we mirror the spirit of the cap.
+        cnt_q = min(max(cnt, 1), 5000)
+        out["quantity"] = cnt_q
+    else:
+        out["quantity"] = 1
     out["parsed"]   = True
     return out
 
@@ -741,7 +904,7 @@ def _find_first_empty_ground_slot(ground_items, b, lv, r, c) -> int:
 
 
 def _write_inventory_slot(state, slot_idx: int, category: int, type_id: int,
-                          buc: int, enchant: int, weight: int):
+                          buc: int, enchant: int, weight: int, quantity: int = 1):
     """Return new state with the given inventory slot populated with the wished item."""
     items = state.inventory.items
     new_items = items.replace(
@@ -751,8 +914,8 @@ def _write_inventory_slot(state, slot_idx: int, category: int, type_id: int,
         enchantment = items.enchantment.at[slot_idx].set(jnp.int8(enchant)),
         charges     = items.charges.at[slot_idx].set(jnp.int8(0)),
         identified  = items.identified.at[slot_idx].set(jnp.bool_(True)),
-        quantity    = items.quantity.at[slot_idx].set(jnp.int16(1)),
-        weight      = items.weight.at[slot_idx].set(jnp.int32(weight)),
+        quantity    = items.quantity.at[slot_idx].set(jnp.int16(quantity)),
+        weight      = items.weight.at[slot_idx].set(jnp.int32(weight * quantity)),
         ac_bonus    = items.ac_bonus.at[slot_idx].set(jnp.int8(0)),
         is_two_handed = items.is_two_handed.at[slot_idx].set(jnp.bool_(False)),
     )
@@ -762,7 +925,7 @@ def _write_inventory_slot(state, slot_idx: int, category: int, type_id: int,
 
 def _write_ground_slot(state, b: int, lv: int, r: int, c: int, gslot: int,
                        category: int, type_id: int, buc: int, enchant: int,
-                       weight: int):
+                       weight: int, quantity: int = 1):
     """Return new state with the wished item placed on the ground stack."""
     g = state.ground_items
     new_g = g.replace(
@@ -772,8 +935,8 @@ def _write_ground_slot(state, b: int, lv: int, r: int, c: int, gslot: int,
         enchantment = g.enchantment.at[b, lv, r, c, gslot].set(jnp.int8(enchant)),
         charges     = g.charges.at[b, lv, r, c, gslot].set(jnp.int8(0)),
         identified  = g.identified.at[b, lv, r, c, gslot].set(jnp.bool_(True)),
-        quantity    = g.quantity.at[b, lv, r, c, gslot].set(jnp.int16(1)),
-        weight      = g.weight.at[b, lv, r, c, gslot].set(jnp.int32(weight)),
+        quantity    = g.quantity.at[b, lv, r, c, gslot].set(jnp.int16(quantity)),
+        weight      = g.weight.at[b, lv, r, c, gslot].set(jnp.int32(weight * quantity)),
         ac_bonus    = g.ac_bonus.at[b, lv, r, c, gslot].set(jnp.int8(0)),
         is_two_handed = g.is_two_handed.at[b, lv, r, c, gslot].set(jnp.bool_(False)),
     )
@@ -830,6 +993,7 @@ def grant_wish(state, rng, wish_string):
     enchant      = parsed["enchant"]
     artifact_idx = parsed["artifact_idx"]
     user_name    = parsed["user_name"]
+    quantity     = int(parsed.get("quantity", 1))
 
     # Artifact SPFX restriction.  Vendor objnam.c::readobjnam (line 5362)
     # flips u.uconduct.wisharti when the wish *text* was an artifact name,
@@ -845,7 +1009,8 @@ def grant_wish(state, rng, wish_string):
     # Place item: prefer inventory; fall back to ground stack.
     slot = _find_first_empty_slot(state.inventory.items)
     if slot >= 0:
-        state = _write_inventory_slot(state, slot, category, type_id, buc, enchant, weight)
+        state = _write_inventory_slot(state, slot, category, type_id, buc,
+                                      enchant, weight, quantity=quantity)
         if user_name:
             state = _set_user_name_at(state, slot, user_name)
     else:
@@ -856,7 +1021,8 @@ def grant_wish(state, rng, wish_string):
         gslot = _find_first_empty_ground_slot(state.ground_items, b, lv, r, c)
         if gslot >= 0:
             state = _write_ground_slot(state, b, lv, r, c, gslot,
-                                       category, type_id, buc, enchant, weight)
+                                       category, type_id, buc, enchant, weight,
+                                       quantity=quantity)
         # else: nowhere to put it; vendor would print "nothing happens".
 
     return _mark_wish_conducts(state, artifact=(artifact_idx >= 0))

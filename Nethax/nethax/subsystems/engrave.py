@@ -180,16 +180,28 @@ def handle_engrave(state, rng):
     return mark_violated(new_state, int(Conduct.ELBERETHLESS))
 
 
-def step(state: EngraveState, rng: jax.Array) -> EngraveState:
-    """No-op per-turn tick for the engrave subsystem.
+def step(
+    state: EngraveState,
+    rng: jax.Array,
+    player_row: jnp.ndarray = None,
+    player_col: jnp.ndarray = None,
+) -> EngraveState:
+    """Per-turn tick — erode DUST engraving at the player's tile.
 
-    vendor decays dust engravings when monsters/player step over them
-    (engrave.c::wipe_engr_at lines 270-290 → wipeout_text engrave.c:120-
-    183).  BURN engravings only erode with ``magical && !rn2(2)``
-    (engrave.c:278); plain DUST engravings erode on contact.  We defer
-    the per-step erode logic to a future wave.
+    vendor/nethack/src/engrave.c::wipe_engr_at lines 270-290:
+        wipe_engr_at(x, y, cnt, magical) — DUST engravings erode on every
+        step that lands on them. ENGRAVE/BURN/MARK/BLOOD only erode when
+        magical && !rn2(2) (line 278).
+
+    Currently called as a no-op; now if `player_row`/`player_col` are
+    given, invoke `_wipe_engr_tile` at the player's current tile to fade
+    a DUST engraving by 2 chars 50% of the time. Backward-compatible: if
+    the caller doesn't pass coords (e.g., env.py during a non-movement
+    turn), do nothing.
     """
-    return state
+    if player_row is None or player_col is None:
+        return state
+    return _wipe_engr_tile(state, player_row, player_col, rng)
 
 
 def engrave_text_at(eng: EngraveState, row, col) -> jnp.ndarray:
