@@ -43,65 +43,71 @@ def _type_id(name: str) -> int:
 # ---------------------------------------------------------------------------
 
 def test_parse_simple():
-    """'long sword' -> name='long sword', buc=UNCURSED (default), enchantment=0."""
+    """'long sword' -> type_id matches long sword, buc=UNCURSED, enchant=0.
+
+    Note: parse_wish_string_dict returns the vendor wishymatch dict, whose
+    keys are ``type_id`` / ``enchant`` / ``artifact_idx`` / ``user_name``
+    (bytes, b"" when absent) — not a high-level ``name`` string. Test now
+    asserts against the vendor dict schema.
+    """
     r = parse_wish_string_dict("long sword")
-    assert r["name"] == "long sword"
-    # BUC defaults to UNCURSED when no BUC keyword is present.
+    assert r["type_id"] == _type_id("long sword")
     assert r["buc"] == int(BUCStatus.UNCURSED)
-    assert r["enchantment"] == 0
-    assert r["is_artifact"] is False
+    assert r["enchant"] == 0
     assert r["artifact_idx"] == -1
-    assert r["user_name"] is None
+    assert r["user_name"] == b""
+    assert r["parsed"] is True
 
 
 def test_parse_blessed_plus_3():
-    """'blessed +3 long sword' -> buc=BLESSED, enchantment=3."""
+    """'blessed +3 long sword' -> buc=BLESSED, enchant=3."""
     r = parse_wish_string_dict("blessed +3 long sword")
     assert r["buc"] == int(BUCStatus.BLESSED)
-    assert r["enchantment"] == 3
-    assert r["name"] == "long sword"
-    assert r["is_artifact"] is False
+    assert r["enchant"] == 3
+    assert r["type_id"] == _type_id("long sword")
+    assert r["artifact_idx"] == -1
 
 
 def test_parse_potion_of():
     """'potion of healing' resolves to the healing potion entry."""
     r = parse_wish_string_dict("potion of healing")
-    # The canonical bare name in OBJECTS for healing potions is "healing".
-    assert r["name"] == "healing"
-    assert r["is_artifact"] is False
+    # OBJECTS table lists potions by their bare effect name ("healing").
+    assert r["type_id"] == _type_id("healing")
+    assert int(OBJECTS[r["type_id"]].class_) == int(ObjectClass.POTION_CLASS)
+    assert r["artifact_idx"] == -1
 
 
 def test_parse_artifact_name():
-    """'Excalibur' -> is_artifact=True, artifact_idx matches _ARTIFACTS entry."""
+    """'Excalibur' -> artifact_idx >= 0 and base type_id is long sword."""
     r = parse_wish_string_dict("Excalibur")
-    assert r["is_artifact"] is True
     assert r["artifact_idx"] >= 0
     # Verify the index actually maps to Excalibur in the table.
     art_name, art_base = _ARTIFACTS[r["artifact_idx"]]
     assert art_name == "Excalibur"
     assert art_base == "long sword"
-    # The canonical object name should be the base.
-    assert r["name"] == "long sword"
+    # The canonical object type_id should be the base item.
+    assert r["type_id"] == _type_id("long sword")
 
 
 def test_parse_called():
-    """'amulet called Bob' -> user_name='Bob'."""
+    """'amulet called Bob' -> user_name=b'Bob' (bytes)."""
     r = parse_wish_string_dict("amulet called Bob")
-    assert r["user_name"] == "Bob"
+    # Vendor wishymatch stores user_name as bytes (b"" when absent).
+    assert r["user_name"] == b"Bob"
 
 
 def test_parse_cursed_minus_1():
-    """'cursed -1 dagger' -> buc=CURSED, enchantment=-1."""
+    """'cursed -1 dagger' -> buc=CURSED, enchant=-1."""
     r = parse_wish_string_dict("cursed -1 dagger")
     assert r["buc"] == int(BUCStatus.CURSED)
-    assert r["enchantment"] == -1
+    assert r["enchant"] == -1
 
 
 def test_parse_greased():
     """'greased long sword' -> greased=True."""
     r = parse_wish_string_dict("greased long sword")
     assert r["greased"] is True
-    assert r["name"] == "long sword"
+    assert r["type_id"] == _type_id("long sword")
 
 
 # ---------------------------------------------------------------------------
@@ -148,11 +154,17 @@ def test_grant_wish_neutral_luck_succeeds():
     assert int(new_state.inventory.items.type_id[0]) == _type_id("long sword")
 
 
-def test_grant_wish_max_bad_luck_always_fails():
-    """Luck=-10 always blocks (100% fail probability)."""
+def test_grant_wish_luck_does_not_block():
+    """Luck does not gate wand-of-wishing grants in vendor.
+
+    Vendor wizard.c/zap.c::makewish has no Luck branch — wishes always
+    succeed when readobjnam parses the wish text. Previous nethax
+    behavior gated on Luck < 0 (wrong); this test now asserts the
+    vendor-correct path: Luck=-10 still grants the item.
+    Cite: vendor/nethack/src/zap.c::makewish (line 6314).
+    """
     state = _fresh_state()
     state = state.replace(player_luck=jnp.int8(-10))
     new_state = grant_wish_from_string(state, "long sword")
-    # State should be unchanged — no item granted.
-    assert int(new_state.inventory.items.category[0]) == 0
-    assert bool(new_state.conduct.violations[int(Conduct.WISHLESS)]) is False
+    assert int(new_state.inventory.items.type_id[0]) == _type_id("long sword")
+    assert bool(new_state.conduct.violations[int(Conduct.WISHLESS)]) is True
