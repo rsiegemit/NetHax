@@ -35,6 +35,7 @@ from Nethax.nethax.subsystems.skills import init_skills
 from Nethax.nethax.subsystems.digging import dig_tick as _dig_tick
 from Nethax.nethax.subsystems.swallow import digest_tick as _digest_tick
 from Nethax.nethax.subsystems.experience import newexplevel as _newexplevel
+from Nethax.nethax.subsystems.regions import run_regions as _run_regions
 
 
 class NethaxEnv:
@@ -220,7 +221,7 @@ def _step_impl(state, action, rng):
         timestep increases; no separate decrement call is needed here.
         Cite: vendor/nethack/src/light.c::do_light_sources.
     """
-    rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow, rng_explvl = jax.random.split(rng, 7)
+    rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow, rng_explvl, rng_regions = jax.random.split(rng, 8)
     already_done = state.done
 
     def _do_step(_):
@@ -232,6 +233,11 @@ def _step_impl(state, action, rng):
 
         # 2. Monster turn — allmain.c line 212 (movemon).
         ns = _monster_ai_step(ns, rng_monsters)
+
+        # 2b. Per-turn region tick — vendor/nethack/src/region.c::run_regions
+        #     (line 414).  Ages every active region by 1 and applies
+        #     gas-cloud damage to the player when they stand inside one.
+        ns = _run_regions(ns, rng_regions)
 
         # 3. Increment turn counter — allmain.c line 244 (svm.moves++).
         ns = ns.replace(timestep=ns.timestep + jnp.int32(1))

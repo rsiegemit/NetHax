@@ -1267,10 +1267,11 @@ def _effect_stinking_cloud(state, rng, buc):
     vendor/nethack/src/read.c::do_stinking_cloud (~3082):
       create_gas_cloud(cc.x, cc.y, 15+10*bcsign, 8+4*bcsign)
       turns = 8+4*bcsign: uncursed=8, blessed=12, cursed=4.
-    Sets cloud_pos = player_pos, cloud_radius = 3, cloud_turns per BUC.
-    Also sets VOMITING status for the player.
-    TODO: wire per-turn tick in env.py step.
+    Spawns a region-table entry via regions.create_gas_cloud (region.c:1213),
+    keeps the legacy ``cloud_*`` scalars for back-compat, and sets VOMITING.
     """
+    from Nethax.nethax.subsystems.regions import create_gas_cloud as _create_gas_cloud
+
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
 
@@ -1282,6 +1283,19 @@ def _effect_stinking_cloud(state, rng, buc):
         cloud_radius=jnp.int8(3),
         cloud_turns=cloud_turns,
     )
+
+    # Spawn the actual region: vendor read.c arg (15+10*bcsign, 8+4*bcsign).
+    # bcsign = +1 blessed / -1 cursed / 0 uncursed.
+    size = jnp.where(blessed, jnp.int32(25),
+           jnp.where(cursed,  jnp.int32(5),  jnp.int32(15)))
+    # AD_DRST damage strength — region.c:1192 takes the ``damage`` arg from
+    # do_stinking_cloud (8+4*bcsign).  We re-use cloud_turns for parity.
+    dmg = cloud_turns.astype(jnp.int32)
+    # Vendor coords: x = col, y = row.
+    cx = state.player_pos[1].astype(jnp.int32)
+    cy = state.player_pos[0].astype(jnp.int32)
+    rng_cloud, _ = jax.random.split(rng, 2)
+    st1 = _create_gas_cloud(st1, rng_cloud, cx, cy, size, dmg)
 
     turns   = jnp.where(blessed, jnp.int32(0),
               jnp.where(cursed,  jnp.int32(30), jnp.int32(15)))
