@@ -458,6 +458,79 @@ class NLECompat(_GymEnvBase):  # type: ignore[misc,valid-type]
         """Release resources. NethaxEnv is pure JAX so this is a no-op."""
         self._state = None
 
+    # ------------------------------------------------------------------
+    # Vendor-parity menu-skipping / quit-game stubs.
+    # Citations:
+    #   vendor/nle/nle/env/base.py::_perform_known_steps  (lines 545-578)
+    #   vendor/nle/nle/env/base.py::reset menu-cycle loop (lines 418-433)
+    #   vendor/nle/nle/env/base.py::_quit_game            (lines 580-602)
+    # nethax has no in-game menus, --More-- prompts, y/n questions, or getlin
+    # text-input states, so these methods are no-op stubs preserving the
+    # vendor API surface for trace parity with NLE.
+    # ------------------------------------------------------------------
+
+    # ASCII keycodes used by vendor for menu skipping.
+    _ASCII_ESC: int = 27
+    _ASCII_SPACE: int = 32
+
+    def _perform_known_steps(
+        self,
+        observation: Any = None,
+        done: bool = False,
+        exceptions: bool = True,
+    ) -> Tuple[Any, bool]:
+        """No-op stub of vendor ``NLE._perform_known_steps``.
+
+        Vendor (base.py:545-578) loops on ``observation[internal][3]``
+        (xwaitforspace), ``internal[1]`` (in_yn_function) and
+        ``internal[2]`` (in_getlin), auto-injecting ESC/SPACE until none
+        of these prompt-flags is set.  In nethax these internal slots are
+        always zero (build_internal() in nle_obs.py:823-825), so this
+        method simply returns ``(observation, done)`` unchanged.
+        """
+        del exceptions  # unused — kept for vendor signature parity
+        if observation is None:
+            observation = self.last_observation
+        return observation, bool(done)
+
+    def _menu_cycle_reset(self, max_iters: int = 1000) -> None:
+        """No-op stub of vendor reset() menu-cycling loop.
+
+        Vendor (base.py:418-433) calls ``nethack.step(ASCII_SPACE)`` up to
+        1000 times after a fresh reset to dismiss role/race/align selection
+        menus and the initial --More-- prompt.  nethax pre-creates the
+        character in ``NethaxEnv.reset`` (no menus exist), so this loop
+        terminates immediately on the first iteration.
+        """
+        # Cap iterations defensively; the body never executes because nethax
+        # has no pending menu state after reset.
+        for _ in range(int(max_iters)):
+            # build_internal() guarantees in_yn / in_getlin / xwaitforspace
+            # are all zero (nle_obs.py:823-825), so the loop exits at once.
+            break
+
+    def _quit_game(
+        self,
+        observation: Any = None,
+        done: bool = False,
+    ) -> Tuple[Any, bool]:
+        """Smoothly quit the game.  Mirrors vendor base.py:580-602.
+
+        Sets ``end_status=QUIT`` and ``done=True`` so subsequent ``step``
+        calls observe the terminal flag.  Does not invoke further engine
+        steps because nethax has no `M-q y` quit-confirmation cycle.
+        """
+        # Clear any pending menus (no-op in nethax).
+        observation, done = self._perform_known_steps(
+            observation, done, exceptions=False,
+        )
+        # Mark the episode as quit-terminated.  StepStatus has no QUIT
+        # member in nethax's IntEnum (vendor base.py adds QUIT=2 only on
+        # NetHackStaircase); fall back to DEATH which is the closest
+        # available terminal status.
+        self._last_end_status = self.StepStatus.DEATH
+        return observation, True
+
     def seed(
         self,
         core: Optional[int] = None,
@@ -645,6 +718,295 @@ class NLECompat(_GymEnvBase):  # type: ignore[misc,valid-type]
         """True if ``glyph`` is a statue glyph."""
         g = int(glyph)
         return GLYPH_STATUE_OFF <= g < GLYPH_STATUE_OFF + NUMMONS
+
+
+# ---------------------------------------------------------------------------
+# Task wrappers — gymnasium-compatible MiniHack-style env subclasses.
+# Mirror vendor/nle/nle/env/tasks.py:18-372 byte-equal where feasible.
+#
+# Each task overrides ``_reward_fn`` (and sometimes ``_is_episode_end``) to
+# alter the reward shape relative to the base NLECompat env.  ``StepStatus``
+# is extended with TASK_SUCCESSFUL when the task can be cleared.
+# ---------------------------------------------------------------------------
+
+
+def _bl_score(blstats_arr) -> int:
+    """Read the BL_SCORE column from a blstats observation row."""
+    from Nethax.nethax.constants.blstats import BL_SCORE  # type: ignore
+    return int(np.asarray(blstats_arr)[BL_SCORE])
+
+
+def _bl_time(blstats_arr) -> int:
+    from Nethax.nethax.constants.blstats import BL_TIME  # type: ignore
+    return int(np.asarray(blstats_arr)[BL_TIME])
+
+
+def _bl_gold(blstats_arr) -> int:
+    from Nethax.nethax.constants.blstats import BL_GOLD  # type: ignore
+    return int(np.asarray(blstats_arr)[BL_GOLD])
+
+
+def _bl_dnum(blstats_arr) -> int:
+    from Nethax.nethax.constants.blstats import BL_DNUM  # type: ignore
+    return int(np.asarray(blstats_arr)[BL_DNUM])
+
+
+def _bl_dlevel(blstats_arr) -> int:
+    from Nethax.nethax.constants.blstats import BL_DLEVEL  # type: ignore
+    return int(np.asarray(blstats_arr)[BL_DLEVEL])
+
+
+def _obs_blstats(obs):
+    """Return the blstats array from either a tuple- or dict-style obs."""
+    if isinstance(obs, dict):
+        return obs.get("blstats")
+    # NLECompat stores last_observation as a tuple in _observation_keys order;
+    # we can't index by name without keys, so callers using tuples must look up
+    # by self._observation_keys.index("blstats") instead.  This helper is only
+    # used for dict obs from gymnasium-style reset/step.
+    return None
+
+
+def _obs_internal(obs):
+    if isinstance(obs, dict):
+        return obs.get("internal")
+    return None
+
+
+def _obs_glyphs(obs):
+    if isinstance(obs, dict):
+        return obs.get("glyphs")
+    return None
+
+
+class NetHackScore(NLECompat):
+    """Score task.  Vendor: vendor/nle/nle/env/tasks.py:18-90.
+
+    Reward is :math:`\\Delta\\text{score} + \\text{time-penalty}`, where the
+    time-penalty grows when the in-game turn counter stalls.
+    """
+
+    def __init__(
+        self,
+        *args,
+        penalty_mode: str = "constant",
+        penalty_step: float = -0.01,
+        penalty_time: float = -0.0,
+        **kwargs,
+    ):
+        self.penalty_mode = str(penalty_mode)
+        self.penalty_step = float(penalty_step)
+        self.penalty_time = float(penalty_time)
+        self._frozen_steps = 0
+        self._last_score = 0
+        self._last_time = 0
+        super().__init__(*args, **kwargs)
+
+    def _get_time_penalty(self, old_time: int, new_time: int) -> float:
+        if old_time == new_time:
+            self._frozen_steps += 1
+        else:
+            self._frozen_steps = 0
+
+        penalty = 0.0
+        if self.penalty_mode == "constant":
+            if self._frozen_steps > 0:
+                penalty += self.penalty_step
+        elif self.penalty_mode == "exp":
+            penalty += (2 ** self._frozen_steps) * self.penalty_step
+        elif self.penalty_mode == "square":
+            penalty += (self._frozen_steps ** 2) * self.penalty_step
+        elif self.penalty_mode == "linear":
+            penalty += self._frozen_steps * self.penalty_step
+        elif self.penalty_mode == "always":
+            penalty += self.penalty_step
+        else:
+            raise ValueError(f"Unknown penalty_mode {self.penalty_mode!r}")
+        penalty += (new_time - old_time) * self.penalty_time
+        return float(penalty)
+
+    def _reward_fn(self, old_score, old_time, new_score, new_time) -> float:
+        """Score delta with frozen-step penalty.  Vendor parity tasks.py:84-90."""
+        return (new_score - old_score) + self._get_time_penalty(old_time, new_time)
+
+    def reset(self, *, seed=None, options=None):
+        self._frozen_steps = 0
+        self._last_score = 0
+        self._last_time = 0
+        return super().reset(seed=seed, options=options)
+
+    def step(self, action):
+        obs, _engine_reward, terminated, truncated, info = super().step(action)
+        bl = _obs_blstats(obs)
+        new_score = _bl_score(bl) if bl is not None else 0
+        new_time = _bl_time(bl) if bl is not None else 0
+        reward = self._reward_fn(
+            self._last_score, self._last_time, new_score, new_time,
+        )
+        self._last_score = new_score
+        self._last_time = new_time
+        return obs, float(reward), terminated, truncated, info
+
+
+class NetHackStaircase(NetHackScore):
+    """Staircase task.  Vendor tasks.py:93-122.  Reward +1 on stairs down."""
+
+    class StepStatus(enum.IntEnum):  # type: ignore[misc]
+        ABORTED = -1
+        RUNNING = 0
+        DEATH = 1
+        TASK_SUCCESSFUL = 2
+
+    def _is_episode_end(self, obs) -> "NetHackStaircase.StepStatus":
+        internal = _obs_internal(obs)
+        if internal is not None:
+            stairs_down = int(np.asarray(internal)[4])
+            if stairs_down:
+                return self.StepStatus.TASK_SUCCESSFUL
+        return self.StepStatus.RUNNING
+
+    def step(self, action):
+        obs, _r, terminated, truncated, info = NLECompat.step(self, action)
+        bl = _obs_blstats(obs)
+        new_time = _bl_time(bl) if bl is not None else 0
+        time_penalty = self._get_time_penalty(self._last_time, new_time)
+        self._last_time = new_time
+        status = self._is_episode_end(obs)
+        reward = (1.0 if status == self.StepStatus.TASK_SUCCESSFUL else 0.0) + time_penalty
+        if status == self.StepStatus.TASK_SUCCESSFUL:
+            terminated = True
+            info["end_status"] = status
+        return obs, float(reward), terminated, truncated, info
+
+
+class NetHackEat(NetHackScore):
+    """Eat task.  Vendor tasks.py:220-247.
+
+    Reward = max(0, Δuhunger) + time-penalty.  ``uhunger`` lives at
+    ``internal[7]`` per winrl.cc:285.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._last_uhunger = 0
+        super().__init__(*args, **kwargs)
+
+    def reset(self, *, seed=None, options=None):
+        self._last_uhunger = 0
+        return super().reset(seed=seed, options=options)
+
+    def step(self, action):
+        obs, _r, terminated, truncated, info = NLECompat.step(self, action)
+        bl = _obs_blstats(obs)
+        new_time = _bl_time(bl) if bl is not None else 0
+        internal = _obs_internal(obs)
+        new_uhunger = int(np.asarray(internal)[7]) if internal is not None else 0
+        time_penalty = self._get_time_penalty(self._last_time, new_time)
+        reward = max(0, new_uhunger - self._last_uhunger) + time_penalty
+        self._last_uhunger = new_uhunger
+        self._last_time = new_time
+        return obs, float(reward), terminated, truncated, info
+
+
+class NetHackGold(NetHackScore):
+    """Gold task.  Vendor tasks.py:173-213.  Reward = Δgold + time-penalty."""
+
+    def __init__(self, *args, **kwargs):
+        self._last_gold = 0
+        super().__init__(*args, **kwargs)
+
+    def reset(self, *, seed=None, options=None):
+        self._last_gold = 0
+        return super().reset(seed=seed, options=options)
+
+    def step(self, action):
+        obs, _r, terminated, truncated, info = NLECompat.step(self, action)
+        bl = _obs_blstats(obs)
+        new_gold = _bl_gold(bl) if bl is not None else 0
+        new_time = _bl_time(bl) if bl is not None else 0
+        time_penalty = self._get_time_penalty(self._last_time, new_time)
+        reward = (new_gold - self._last_gold) + time_penalty
+        self._last_gold = new_gold
+        self._last_time = new_time
+        return obs, float(reward), terminated, truncated, info
+
+
+class NetHackScout(NetHackScore):
+    """Scout task.  Vendor tasks.py:250-284.
+
+    Reward = newly-discovered glyph cells on the current dungeon level.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.dungeon_explored: Dict[Tuple[int, int], int] = {}
+        super().__init__(*args, **kwargs)
+
+    def reset(self, *, seed=None, options=None):
+        self.dungeon_explored = {}
+        return super().reset(seed=seed, options=options)
+
+    def step(self, action):
+        obs, _r, terminated, truncated, info = NLECompat.step(self, action)
+        bl = _obs_blstats(obs)
+        glyphs = _obs_glyphs(obs)
+        new_time = _bl_time(bl) if bl is not None else 0
+        time_penalty = self._get_time_penalty(self._last_time, new_time)
+        reward = 0.0
+        if bl is not None and glyphs is not None:
+            key = (_bl_dnum(bl), _bl_dlevel(bl))
+            # Vendor uses GLYPH_CMAP_OFF as the unexplored sentinel.
+            explored = int(np.sum(np.asarray(glyphs) != GLYPH_CMAP_OFF))
+            old_explored = self.dungeon_explored.get(key, 0)
+            reward = float(explored - old_explored)
+            self.dungeon_explored[key] = explored
+        reward += time_penalty
+        self._last_time = new_time
+        return obs, float(reward), terminated, truncated, info
+
+
+class NetHackChallenge(NetHackScore):
+    """NetHack Challenge wrapper.  Vendor tasks.py:287-372.
+
+    Score reward with the challenge defaults:
+        * full keyboard action space (already exposed as NLECompat.actions),
+        * no menu / --More-- skipping (we never skip; nethax has none),
+        * starting character randomly assigned (``character='@'``).
+    """
+
+    def __init__(
+        self,
+        *args,
+        character: str = "@",
+        allow_all_yn_questions: bool = True,
+        allow_all_modes: bool = True,
+        penalty_mode: str = "constant",
+        penalty_step: float = -0.00,
+        penalty_time: float = -0.0,
+        max_episode_steps: int = 1_000_000,
+        no_progress_timeout: int = 10_000,
+        **kwargs,
+    ):
+        super().__init__(
+            *args,
+            character=character,
+            allow_all_yn_questions=allow_all_yn_questions,
+            allow_all_modes=allow_all_modes,
+            penalty_mode=penalty_mode,
+            penalty_step=penalty_step,
+            penalty_time=penalty_time,
+            max_episode_steps=max_episode_steps,
+            **kwargs,
+        )
+        self.no_progress_timeout = int(no_progress_timeout)
+        self._turns: Optional[int] = None
+        self._no_progress_count = 0
+
+    def reset(self, *, seed=None, options=None):
+        self._turns = None
+        self._no_progress_count = 0
+        return super().reset(seed=seed, options=options)
+
+    def seed(self, core=None, disp=None, reseed=True):
+        raise RuntimeError("NetHackChallenge doesn't allow seed changes")
 
 
 # Module-level convenience aliases (callable as plain functions, matching

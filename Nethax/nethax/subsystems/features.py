@@ -479,6 +479,109 @@ def destroy_drawbridge(
     return state, new_terrain
 
 
+def open_drawbridge(
+    state: FeaturesState,
+    terrain: jnp.ndarray,
+    pos: jnp.ndarray,
+) -> tuple[FeaturesState, jnp.ndarray]:
+    """Open (lower) the drawbridge at *pos*.
+
+    Vendor citation: vendor/nethack/src/dbridge.c::open_drawbridge lines
+    840-882.  Vendor logic:
+        if (lev1->typ != DRAWBRIDGE_UP) return;
+        lev1->typ = DRAWBRIDGE_DOWN;
+        lev2->typ = DOOR;
+        lev2->doormask = D_NODOOR;
+
+    JAX model: the bridge tile (DRAWBRIDGE_UP) becomes FLOOR (we lack a
+    distinct DRAWBRIDGE_DOWN in our local TileType enum); any adjacent
+    DRAWBRIDGE_UP-typed wall tile becomes OPEN_DOOR (D_NODOOR ≈ no-door
+    doorway).
+
+    pos     : int array [4] = (branch, level, row, col)
+    terrain : int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]
+
+    Returns (new_features_state, new_terrain).
+    """
+    from Nethax.nethax.constants.tiles import TileType
+    b, lv, row, col = pos[0], pos[1], pos[2], pos[3]
+    FLOOR      = jnp.int8(int(TileType.FLOOR))
+    OPEN_DOOR  = jnp.int8(int(TileType.OPEN_DOOR))
+    DBRIDGE_UP = jnp.int8(int(TileType.DRAWBRIDGE_UP))
+
+    cur = terrain[b, lv, row, col]
+    is_up = cur == DBRIDGE_UP
+    # Bridge tile: only flips when currently DRAWBRIDGE_UP.
+    new_terrain = terrain.at[b, lv, row, col].set(
+        jnp.where(is_up, FLOOR, cur)
+    )
+    # Adjacent paired wall (we sweep all 4 neighbours and only convert
+    # DRAWBRIDGE_UP-typed walls).
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        rr = row + jnp.int32(dr)
+        cc = col + jnp.int32(dc)
+        rr_safe = jnp.clip(rr, 0, terrain.shape[2] - 1)
+        cc_safe = jnp.clip(cc, 0, terrain.shape[3] - 1)
+        in_bounds = (rr >= 0) & (rr < terrain.shape[2]) & \
+                    (cc >= 0) & (cc < terrain.shape[3])
+        neighbour = new_terrain[b, lv, rr_safe, cc_safe]
+        replace = is_up & in_bounds & (neighbour == DBRIDGE_UP)
+        new_val = jnp.where(replace, OPEN_DOOR, neighbour)
+        new_terrain = new_terrain.at[b, lv, rr_safe, cc_safe].set(new_val)
+    return state, new_terrain
+
+
+def close_drawbridge(
+    state: FeaturesState,
+    terrain: jnp.ndarray,
+    pos: jnp.ndarray,
+) -> tuple[FeaturesState, jnp.ndarray]:
+    """Close (raise) the drawbridge at *pos*.
+
+    Vendor citation: vendor/nethack/src/dbridge.c::close_drawbridge lines
+    775-834.  Vendor logic:
+        if (lev1->typ != DRAWBRIDGE_DOWN) return;
+        lev1->typ = DRAWBRIDGE_UP;
+        lev2->typ = DBWALL;
+
+    JAX model: the bridge tile (currently FLOOR / DRAWBRIDGE_DOWN) becomes
+    DRAWBRIDGE_UP; any adjacent OPEN_DOOR-typed companion becomes
+    DRAWBRIDGE_UP (we don't have DBWALL; the up-tile carries the closed
+    state both for the bridge and its paired wall).
+
+    pos     : int array [4] = (branch, level, row, col)
+    terrain : int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]
+
+    Returns (new_features_state, new_terrain).
+    """
+    from Nethax.nethax.constants.tiles import TileType
+    b, lv, row, col = pos[0], pos[1], pos[2], pos[3]
+    FLOOR      = jnp.int8(int(TileType.FLOOR))
+    OPEN_DOOR  = jnp.int8(int(TileType.OPEN_DOOR))
+    DBRIDGE_UP = jnp.int8(int(TileType.DRAWBRIDGE_UP))
+
+    cur = terrain[b, lv, row, col]
+    # Only raise from "lowered" tile (DBRIDGE_DOWN encoded as FLOOR in our enum).
+    is_down = cur == FLOOR
+    new_terrain = terrain.at[b, lv, row, col].set(
+        jnp.where(is_down, DBRIDGE_UP, cur)
+    )
+    # Re-raise the companion wall: any adjacent OPEN_DOOR becomes
+    # DRAWBRIDGE_UP (mirrors vendor lev2->typ = DBWALL).
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        rr = row + jnp.int32(dr)
+        cc = col + jnp.int32(dc)
+        rr_safe = jnp.clip(rr, 0, terrain.shape[2] - 1)
+        cc_safe = jnp.clip(cc, 0, terrain.shape[3] - 1)
+        in_bounds = (rr >= 0) & (rr < terrain.shape[2]) & \
+                    (cc >= 0) & (cc < terrain.shape[3])
+        neighbour = new_terrain[b, lv, rr_safe, cc_safe]
+        replace = is_down & in_bounds & (neighbour == OPEN_DOOR)
+        new_val = jnp.where(replace, DBRIDGE_UP, neighbour)
+        new_terrain = new_terrain.at[b, lv, rr_safe, cc_safe].set(new_val)
+    return state, new_terrain
+
+
 def handle_search(state, rng: jax.Array):
     """SEARCH action — vendor/nethack/src/detect.c::dosearch0 (lines 2016-2093).
 
@@ -746,6 +849,12 @@ def altar_buc_sense(state):
     Cite: vendor/nethack/src/sit.c (altar branch of dosit) — touching an
     altar of your own alignment forces a BUC-identify of carried items.
 
+    wave17h P0 (CURSE/BUC #2 + #3):
+      - pray.c:1383-1410 water_prayer: POT_WATER on aligned altar becomes
+        blessed (holy water); on opposite-aligned altar becomes cursed.
+      - invent.c:1864 set_bknown: altar drop reveals BUC via flash color;
+        mirror by flipping bknown=True for occupied carried items.
+
     JIT-safe; pure functional: no Python control flow on traced values.
     Returns: new EnvState.
     """
@@ -759,6 +868,9 @@ def altar_buc_sense(state):
     on_aligned_altar = (altar_align >= jnp.int32(0)) & (
         altar_align == state.player_align.astype(jnp.int32)
     )
+    on_opposite_altar = (altar_align >= jnp.int32(0)) & (
+        altar_align != state.player_align.astype(jnp.int32)
+    )
     items = state.inventory.items
     occupied = items.category != jnp.int8(0)
     # Reveal: bump unknown (0) buc to uncursed (2); existing 1/2/3 unchanged.
@@ -768,14 +880,118 @@ def altar_buc_sense(state):
         jnp.int8(2),
         items.buc_status,
     )
+    # wave17h P0 (CURSE/BUC #2): POT_WATER → holy/unholy on (un)aligned altar.
+    # Cite: vendor/nethack/src/pray.c lines 1395-1399.
+    _POT_WATER_TID = jnp.int16(93)
+    _POTION_CAT    = jnp.int8(8)   # ObjectClass.POTION_CLASS == 8
+    is_water = (items.type_id == _POT_WATER_TID) & (items.category == _POTION_CAT)
+    new_buc = jnp.where(
+        on_aligned_altar & is_water & (new_buc != jnp.int8(3)),
+        jnp.int8(3), new_buc,
+    )
+    new_buc = jnp.where(
+        on_opposite_altar & is_water & (new_buc != jnp.int8(1)),
+        jnp.int8(1), new_buc,
+    )
     new_identified = jnp.where(
         on_aligned_altar & occupied,
         jnp.bool_(True),
         items.identified,
     )
-    new_items = items.replace(buc_status=new_buc, identified=new_identified)
+    # wave17h P0 (CURSE/BUC #3): set_bknown on altar drop (invent.c:1864).
+    on_any_altar = on_aligned_altar | on_opposite_altar
+    new_bknown = jnp.where(
+        on_any_altar & occupied,
+        jnp.bool_(True),
+        items.bknown,
+    )
+    new_items = items.replace(
+        buc_status=new_buc,
+        identified=new_identified,
+        bknown=new_bknown,
+    )
     new_inv = state.inventory.replace(items=new_items)
     return state.replace(inventory=new_inv)
+
+
+# ---------------------------------------------------------------------------
+# Wave 17f — Sit on altar / altar_wrath (vendor pray.c::altar_wrath 2651-2673)
+# ---------------------------------------------------------------------------
+
+def sit_on_altar(state, rng):
+    """Sit on an altar — vendor sit.c:530-532 calls altar_wrath(u.ux, u.uy).
+
+    altar_wrath (vendor/nethack/src/pray.c lines 2651-2673):
+        if (u.ualign.type == altaralign && u.ualign.record > -rn2(4)) {
+            (void) adjattrib(A_WIS, -1, FALSE);
+            u.ualign.record--;
+        } else {
+            if (Luck > -5 && rn2(Luck + 6))
+                change_luck(rn2(20) ? -1 : -2);
+        }
+
+    Also retains the BUC-reveal side-effect (Wave 4 altar_buc_sense) so
+    sitting still functions as a BUC-identify when the altar is aligned.
+
+    Returns the new EnvState.
+    """
+    # Aligned-altar branch under player.
+    max_levels = state.terrain.shape[1]
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - 1
+    flat_lv = b * jnp.int32(max_levels) + lv
+    row = state.player_pos[0].astype(jnp.int32)
+    col = state.player_pos[1].astype(jnp.int32)
+    altar_align = state.features.altar_alignment[flat_lv, row, col].astype(jnp.int32)
+    player_align_i = state.player_align.astype(jnp.int32)
+    on_altar = altar_align >= jnp.int32(0)
+
+    rng_a, rng_l1, rng_l2, rng_l3 = jax.random.split(rng, 4)
+
+    # Branch 1 (vendor 2656): same-aligned altar AND record > -rn2(4) →
+    # -1 WIS, record--.
+    same_aligned = on_altar & (altar_align == player_align_i)
+    record = state.prayer.alignment_record.astype(jnp.int32)
+    threshold = -jax.random.randint(rng_a, (), 0, 4, dtype=jnp.int32)  # -rn2(4)
+    record_gate = record > threshold
+    do_wrath_same = same_aligned & record_gate
+
+    new_wis = jnp.where(
+        do_wrath_same,
+        jnp.maximum(state.player_wis - jnp.int8(1), jnp.int8(3)),
+        state.player_wis,
+    )
+    new_record = jnp.where(
+        do_wrath_same,
+        (state.prayer.alignment_record - jnp.int16(1)).astype(jnp.int16),
+        state.prayer.alignment_record,
+    )
+
+    # Branch 2 (vendor 2660-2672): different alignment OR same-but-below-floor →
+    #   if Luck > -5 && rn2(Luck + 6): change_luck(rn2(20) ? -1 : -2)
+    do_wrath_other = on_altar & ~do_wrath_same
+    luck = state.player_luck.astype(jnp.int32)
+    luck_eligible = do_wrath_other & (luck > jnp.int32(-5))
+    upper = jnp.maximum(luck + jnp.int32(6), jnp.int32(1))
+    luck_roll = jax.random.randint(rng_l1, (), 0, upper, dtype=jnp.int32)
+    luck_active = luck_eligible & (luck_roll != jnp.int32(0))
+    rn20 = jax.random.randint(rng_l2, (), 0, 20, dtype=jnp.int32)
+    luck_delta = jnp.where(rn20 != jnp.int32(0), jnp.int32(-1), jnp.int32(-2))
+    new_luck = jnp.where(
+        luck_active,
+        jnp.clip(luck + luck_delta, jnp.int32(-13), jnp.int32(13)),
+        luck,
+    ).astype(jnp.int8)
+
+    new_prayer = state.prayer.replace(alignment_record=new_record)
+    new_state = state.replace(
+        player_wis=new_wis,
+        player_luck=new_luck,
+        prayer=new_prayer,
+    )
+
+    # Retain BUC-reveal side-effect (Wave 4 altar_buc_sense semantics).
+    return altar_buc_sense(new_state)
 
 
 # ===========================================================================

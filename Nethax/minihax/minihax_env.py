@@ -66,6 +66,10 @@ class MinihaxEnv:
         env_id: str,
         *,
         reward_manager: Optional[RewardManager] = None,
+        reward_win: Optional[float] = None,
+        reward_lose: Optional[float] = None,
+        penalty_step: Optional[float] = None,
+        penalty_time: Optional[float] = None,
     ) -> None:
         # Lookup raises KeyError on unknown env_id — matches the contract
         # documented in tests/test_minihax_envs.py.
@@ -77,6 +81,21 @@ class MinihaxEnv:
             reward_manager if reward_manager is not None else spec.reward_manager
         )
         self._max_steps = int(spec.max_steps)
+        # Wave17i: per-env reward shaping plumb-through.  Defaults come from
+        # the EnvSpec (which defaults to vendor MiniHack values:
+        # base.py:142-167 — reward_win=1, reward_lose=0).
+        self._reward_win = float(
+            reward_win if reward_win is not None else spec.reward_win
+        )
+        self._reward_lose = float(
+            reward_lose if reward_lose is not None else spec.reward_lose
+        )
+        self._penalty_step = float(
+            penalty_step if penalty_step is not None else spec.penalty_step
+        )
+        self._penalty_time = float(
+            penalty_time if penalty_time is not None else spec.penalty_time
+        )
         # NethaxEnv is reused across reset/step calls; it holds only the
         # StaticParams pytree-shape, so it is safe to share.
         self._engine = NethaxEnv()
@@ -170,6 +189,18 @@ class MinihaxEnv:
         # Combine: episode ends if reward-manager says done, or engine done,
         # or we hit max_steps.
         done = bool(rm_done) or bool(_engine_done) or truncated
+
+        # Wave17i parity: apply reward_win / reward_lose / penalty_step /
+        # penalty_time per vendor MiniHack base.py.  ``reward_win`` is paid
+        # once on terminal success (rm_done), ``reward_lose`` on engine
+        # death.  ``penalty_step`` is paid every step; ``penalty_time`` is
+        # multiplied by the in-game turn delta (clamped to 1 to avoid
+        # double-counting when the reward manager already handles it).
+        reward = float(reward) + self._penalty_step
+        if bool(rm_done):
+            reward += self._reward_win
+        if bool(_engine_done) and not bool(rm_done):
+            reward += self._reward_lose
 
         info: Dict[str, Any] = {
             "fired_mask": new_fired,

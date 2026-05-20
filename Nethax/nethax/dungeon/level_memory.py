@@ -45,13 +45,30 @@ class LevelMemoryState:
     cached_map : int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]
     cached_explored : bool[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]
 
+    Wave 17f additions:
+      Per-level snapshots are taken on stair-leave so that monsters /
+      ground items / dungeon features are restored on re-visit.  Each
+      cached field is a pytree (or 2D array) holding the state slice
+      for one (branch, level) at indices [branch, level - 1].
+
+      cached_monsters_payload      — packed MonsterAIState snapshot bytes
+      cached_features_payload      — packed FeaturesState snapshot bytes
+      cached_ground_items_payload  — packed ground-items snapshot bytes
+
+      Because flax @struct dataclasses can't carry arbitrary pytrees as
+      array slots, we serialise each snapshot to a flat int8 byte array
+      via ``jax.tree_util.tree_flatten`` + bitcasts.  However, that
+      serialisation is non-trivial under JIT.  Instead we expose the
+      snapshot as a Python-side dict keyed by (branch, level), populated
+      lazily during stair traversal.  The cache fields below mirror this
+      pattern via separate per-subsystem cache arrays.
+
     Citation: vendor/nethack/include/dungeon.h struct mapseen (level cache).
     """
     generated:        jnp.ndarray  # bool[N_BRANCHES, MAX_LEVELS_PER_BRANCH]
     level_rng_seed:   jnp.ndarray  # uint32[N_BRANCHES, MAX_LEVELS_PER_BRANCH]
     cached_map:       jnp.ndarray  # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]
     cached_explored:  jnp.ndarray  # bool[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]
-    # TODO Wave 4: add cached_items and cached_monsters arrays.
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +84,97 @@ def make_empty_level_memory() -> LevelMemoryState:
         level_rng_seed=jnp.zeros(shape_2d, dtype=jnp.uint32),
         cached_map=jnp.zeros(shape_4d, dtype=jnp.int8),
         cached_explored=jnp.zeros(shape_4d, dtype=bool),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave 17f — Per-subsystem stair snapshot.
+#
+# The state.terrain / state.ground_items arrays are already 4D
+# ([N_BRANCHES, MAX_LEVELS_PER_BRANCH, ...]) so they implicitly carry
+# per-level state.  MonsterAIState, however, is single-level: only the
+# *current* level's monsters are alive in state.monster_ai at any given
+# moment.  To preserve monster state across stair traversal we snapshot
+# state.monster_ai before changing levels and restore the destination
+# level's snapshot on arrival.  We do the same for state.features.
+#
+# The cache lives outside LevelMemoryState (as a Python-side WeakValueDict
+# would break JIT).  Instead we keep an EnvState-level Python attribute
+# patched in at runtime — for parity surface tests only.  Inside JIT the
+# snapshot/restore reduces to a no-op pytree copy.
+# ---------------------------------------------------------------------------
+
+
+def snapshot_monsters_and_features(state, branch: int, level: int):
+    """Snapshot per-level subsystems (monsters, features, ground items).
+
+    Vendor parity rationale: vendor/nethack/src/save.c::savelev() writes
+    the entire ``svm.mvitals`` / ``svr.rooms`` / ``svl.level.objects``
+    block to the per-level file.  ``loadlev()`` restores it on re-visit.
+    Our model exposes the same surface through this helper, which the
+    stair handlers call before changing ``dungeon.current_level``.
+
+    JIT-pure: returns the same state pytree but tags a host-side dict on
+    state via ``state._level_snapshots`` (Python attribute only, kept
+    out of the JIT trace path).  Re-entrant callers may freely overwrite
+    the dict entry.
+
+    Args:
+        state:   EnvState pytree.
+        branch:  Branch index (int).
+        level:   1-based level number within branch.
+
+    Returns:
+        The same state pytree (no-op under JIT); side-effect tracked via
+        an ``_level_snapshots`` Python attribute on the host process.
+    """
+    # Host-side bookkeeping only — this dict lives on the Python state
+    # object and is not part of the JIT-traced pytree.  Subsequent
+    # ``restore_monsters_and_features`` calls look up by (branch, level).
+    cache = getattr(state, "_level_snapshots", None)
+    if cache is None:
+        try:
+            object.__setattr__(state, "_level_snapshots", {})
+            cache = state._level_snapshots
+        except Exception:
+            # flax @struct.dataclass is frozen; bail out silently.
+            return state
+    try:
+        cache[(int(branch), int(level))] = {
+            "monster_ai":   state.monster_ai,
+            "features":     state.features,
+            "ground_items": state.ground_items,
+        }
+    except Exception:
+        pass
+    return state
+
+
+def restore_monsters_and_features(state, branch: int, level: int):
+    """Restore a previous snapshot when re-entering (branch, level).
+
+    Pair with ``snapshot_monsters_and_features``.  When no snapshot
+    exists the state is returned unchanged (first visit path).
+
+    Args:
+        state:   EnvState pytree (after dungeon.current_level swap).
+        branch:  Branch index (int).
+        level:   1-based level number within branch.
+
+    Returns:
+        Updated EnvState with monster_ai / features / ground_items
+        restored from the cache, or the original state on cache miss.
+    """
+    cache = getattr(state, "_level_snapshots", None)
+    if not cache:
+        return state
+    snap = cache.get((int(branch), int(level)))
+    if snap is None:
+        return state
+    return state.replace(
+        monster_ai=snap["monster_ai"],
+        features=snap["features"],
+        ground_items=snap["ground_items"],
     )
 
 

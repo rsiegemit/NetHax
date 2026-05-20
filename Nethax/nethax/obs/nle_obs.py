@@ -827,8 +827,15 @@ def build_internal(env_state) -> jnp.ndarray:
     out = out.at[5].set(jnp.int32(0))                              # legacy core seed
     out = out.at[6].set(jnp.int32(0))                              # legacy disp seed
     # Vendor parity (Wave 8): raw u.uhunger nutrition counter (0..2000+).
+    # winrl.cc:285 — obs->internal[7] = u.uhunger.
     out = out.at[7].set(jnp.int32(env_state.status.nutrition))
-    out = out.at[8].set(jnp.int32(env_state.scoring.score))
+    # Vendor parity (wave17i): winrl.cc:286-287 — obs->internal[8] = u.urexp,
+    # the running 64-bit "real experience" accumulator (you.h:399).  This is
+    # distinct from blstats[BL_EXP] (= u.uexp) and from botl_score() which
+    # populates blstats[BL_SCORE].  Previously this slot collapsed onto
+    # scoring.score; now it reads the dedicated player_urexp field added in
+    # wave16a.
+    out = out.at[8].set(jnp.int32(env_state.player_urexp))
     return out
 
 
@@ -857,30 +864,26 @@ def build_screen_descriptions(env_state) -> jnp.ndarray:
 def build_program_state(env_state) -> jnp.ndarray:
     """NLE program_state vector. Shape (6,) int32.
 
-    Fields per vendor/nle/win/rl/winrl.cc::fill_obs (lines 262-271):
-        [0] gameover               — 1 if really_done (post-death menu)
-        [1] panicking              — 1 if NetHack panicked
-        [2] exiting                — 1 if exiting normally
-        [3] in_moveloop            — 1 during normal turn loop
-        [4] in_impossible          — 1 if currently in an impossible() call
-        [5] something_worth_saving — 1 once the game has begun
+    Fields per vendor/nle/win/rl/winrl.cc::fill_obs (lines 262-268):
+        [0] gameover               — 1 when game is over (state.done)
+        [1] panicking              — always 0 in nethax
+        [2] exiting                — 1 when game is over (state.done)
+        [3] in_moveloop            — always 1 after reset
+        [4] in_impossible          — always 0 in nethax
+        [5] something_worth_saving — always 1 after reset
 
-    nethax has no menus or panic states; in_moveloop=1 and
-    something_worth_saving=1 are set as soon as env.reset() has produced
-    a state (i.e., always after reset — matching NLE's behavior on
-    `fill_obs` from the first turn).  in_impossible is always 0.
+    nethax has no panic states; in_moveloop=1 and something_worth_saving=1
+    from the first turn.  gameover and exiting both mirror state.done.
 
     Returns:
         int32[6]
     """
-    done = env_state.done.astype(jnp.int32)
+    done = jnp.int32(env_state.done)
     out = jnp.zeros((6,), dtype=jnp.int32)
-    # vendor/nle/win/rl/winrl.cc:263,265 — both gameover and exiting flip on
-    # terminal frame; in_moveloop drops to 0.
-    out = out.at[0].set(done)                          # gameover
-    out = out.at[2].set(done)                          # exiting
-    out = out.at[3].set(jnp.int32(1) - done)           # in_moveloop
-    out = out.at[5].set(jnp.int32(1))                  # something_worth_saving
+    out = out.at[0].set(done)            # gameover
+    out = out.at[2].set(done)            # exiting
+    out = out.at[3].set(jnp.int32(1))   # in_moveloop
+    out = out.at[5].set(jnp.int32(1))   # something_worth_saving
     return out
 
 
@@ -1118,7 +1121,77 @@ def _uint_to_bytes(value, width):
 
 
 # Precomputed static byte sequences for status rows (module-load).
+# Legacy "Player the Adventurer" header — retained as a fallback when the
+# (role, xlevel) -> rank lookup yields no usable title.  Cite: vendor
+# botl.c::do_statusline1 line 51 ("%s the %s", plname, rank_of(...)).
 _S_NAME_PREFIX  = _str_to_bytes("Player the Adventurer")
+
+
+# ---------------------------------------------------------------------------
+# Wave17i parity: precomputed (role, rank) -> "Player the <Title>" byte rows.
+# Each row is padded to 27 bytes (the header column the status line allocates
+# before the stats group "St:NN Dx:NN ...").
+# Cite: vendor/nethack/src/botl.c::do_statusline1 — header is
+#   sprintf(newbot, "%s the %s", plname, rank_of(u.ulevel, ..., u.ufemale)).
+# ---------------------------------------------------------------------------
+
+_HEADER_PAD_W = 27   # status row 1 reserves cols 0..26 for "<Name> the <Title>".
+
+def _build_role_header_table() -> jnp.ndarray:
+    """Return uint8[N_ROLES, N_RANKS, _HEADER_PAD_W] of header bytes.
+
+    For role r, xlevel-rank k the row is "Player the <title>" left-justified,
+    right-padded with spaces to _HEADER_PAD_W bytes.
+    """
+    n_roles = len(_ROLE_RANK_TITLES)
+    n_ranks = 9  # vendor rank_of returns 0..8
+    rows = []
+    for r in range(n_roles):
+        for k in range(n_ranks):
+            title = _ROLE_RANK_TITLES[r][k]
+            s = f"Player the {title}"[:_HEADER_PAD_W]
+            s = s.ljust(_HEADER_PAD_W)
+            rows.append([ord(c) & 0xFF for c in s])
+    arr = jnp.array(rows, dtype=jnp.uint8)
+    return arr.reshape(n_roles, n_ranks, _HEADER_PAD_W)
+
+# Default fallback row (matches the legacy hardcoded header).
+_DEFAULT_HEADER_ROW = jnp.array(
+    [ord(c) & 0xFF for c in "Player the Adventurer".ljust(_HEADER_PAD_W)],
+    dtype=jnp.uint8,
+)
+
+_ROLE_HEADER_TABLE = _build_role_header_table()
+_N_HEADER_ROLES, _N_HEADER_RANKS, _ = _ROLE_HEADER_TABLE.shape
+
+
+def _xlev_to_rank_jax(xlev) -> jnp.ndarray:
+    """JIT-friendly vendor rank_of(u.ulevel) — botl.c::xlev_to_rank.
+
+    Maps experience level → rank index in [0..8]:
+        xlev <= 2     → 0
+        2 < xlev <=30 → (xlev + 2) // 4
+        xlev > 30     → 8
+    """
+    xl = jnp.int32(xlev)
+    base = (xl + jnp.int32(2)) // jnp.int32(4)
+    rank = jnp.where(xl <= 2, jnp.int32(0),
+                     jnp.where(xl <= 30, base, jnp.int32(8)))
+    return jnp.clip(rank, 0, _N_HEADER_RANKS - 1)
+
+
+def _role_header_bytes(role_idx, xlevel) -> jnp.ndarray:
+    """Return uint8[_HEADER_PAD_W] for the ``(role, xlevel)`` header row.
+
+    Falls back to the legacy "Player the Adventurer" row when role_idx is
+    outside the table range (e.g. uninitialised state).
+    """
+    r = jnp.int32(role_idx)
+    in_range = (r >= 0) & (r < _N_HEADER_ROLES)
+    safe_r = jnp.where(in_range, r, jnp.int32(0))
+    rank = _xlev_to_rank_jax(xlevel)
+    candidate = _ROLE_HEADER_TABLE[safe_r, rank]
+    return jnp.where(in_range, candidate, _DEFAULT_HEADER_ROW)
 _S_ST           = _str_to_bytes("St:")
 _S_SP_DX        = _str_to_bytes(" Dx:")
 _S_SP_CO        = _str_to_bytes(" Co:")
@@ -1163,8 +1236,11 @@ def _build_status_row1(env_state, blstats) -> jnp.ndarray:
         jnp.where(is_neutral, _S_ALIGN_NEU, _S_ALIGN_LAW),
     )
 
-    # Header: name + padding to col 27.
-    header = _pad_to(_S_NAME_PREFIX, 27)
+    # Header: "Player the <RankTitle>" left-padded to col 27.
+    # Wave17i parity: use the role-aware rank title (botl.c::rank_of) instead
+    # of the legacy hardcoded "Adventurer" suffix.  ``player_role`` is the
+    # Role enum int8; ``player_xl`` (u.ulevel) drives xlev_to_rank.
+    header = _role_header_bytes(env_state.player_role, env_state.player_xl)
 
     # Stats fragment.
     parts = [
@@ -1357,8 +1433,19 @@ def build_blstats(env_state) -> jnp.ndarray:
     result = result.at[BL_WIS].set(jnp.int64(env_state.player_wis))
     result = result.at[BL_CHA].set(jnp.int64(env_state.player_cha))
 
-    # Score
-    result = result.at[BL_SCORE].set(jnp.int64(env_state.scoring.score))
+    # Score — vendor BL_SCORE = botl_score() (winrl.cc:544).  In nethax we
+    # track the *displayed* running score in ``scoring.score`` (which is
+    # what botl.c::botl_score() returns mid-game) until the game ends; at
+    # end-of-game ``scoring.final_score`` is populated by
+    # compute_final_score (end.c:1325-1352).  Use the cached final value
+    # when nonzero so post-death observations report the canonical score
+    # the vendor would surface in ``end.c``; otherwise fall back to the
+    # running counter.  This matches winrl.cc:544's behaviour (which reads
+    # botl_score() — a function that switches to the final tally once
+    # really_done() has fired).
+    _final = jnp.int64(env_state.scoring.final_score)
+    _running = jnp.int64(env_state.scoring.score)
+    result = result.at[BL_SCORE].set(jnp.where(_final > 0, _final, _running))
 
     # HP
     result = result.at[BL_HP].set(jnp.int64(env_state.player_hp))

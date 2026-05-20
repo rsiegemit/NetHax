@@ -146,6 +146,32 @@ _NURSE_IDX_NP: int = next(
 _QUANTUM_MECHANIC_IDX_NP: int = next(
     (i for i, m in enumerate(MONSTERS) if m.name == "quantum mechanic"), -1
 )
+# Wave 17f: mind flayer / stalker / displacer beast special-case indices.
+# Cite: vendor/nethack/src/eat.c::cpostfx lines 1162-1268.
+_MIND_FLAYER_IDX_NP: int = next(
+    (i for i, m in enumerate(MONSTERS) if m.name == "mind flayer"), -1
+)
+_MASTER_MIND_FLAYER_IDX_NP: int = next(
+    (i for i, m in enumerate(MONSTERS) if m.name == "master mind flayer"), -1
+)
+_STALKER_IDX_NP: int = next(
+    (i for i, m in enumerate(MONSTERS) if m.name == "stalker"), -1
+)
+_DISPLACER_BEAST_IDX_NP: int = next(
+    (i for i, m in enumerate(MONSTERS) if m.name == "displacer beast"), -1
+)
+_KILLER_BEE_IDX_NP: int = next(
+    (i for i, m in enumerate(MONSTERS) if m.name == "killer bee"), -1
+)
+_SCORPION_IDX_NP: int = next(
+    (i for i, m in enumerate(MONSTERS) if m.name == "scorpion"), -1
+)
+
+# Per-monster mlevel (vendor permonst.mlevel) — gate input to ptr->mlevel > rn2(chance).
+_MONSTER_MLEVEL_NP: np.ndarray = np.array(
+    [int(m.level) for m in MONSTERS], dtype=np.int32
+)
+_MONSTER_MLEVEL: jnp.ndarray = jnp.array(_MONSTER_MLEVEL_NP)
 
 # JAX versions
 _MONSTER_IS_POISONOUS: jnp.ndarray = jnp.array(_MONSTER_IS_POISONOUS_NP)
@@ -244,8 +270,40 @@ def apply_corpse_postfx(
         jnp.arange(N_INTRINSICS, dtype=jnp.int32),
     )
 
-    # Apply chosen intrinsic if valid and is_corpse.
-    has_intrinsic_to_grant = is_corpse & (chosen_intr >= jnp.int32(0))
+    # Wave 17f — should_givit chance gate (vendor eat.c::should_givit 961-989).
+    #   chance = 15  (default)
+    #         = 15   (POISON_RES; but 1 for killer-bee / scorpion if !rn2(4))
+    #         = 10   (TELEPORT)
+    #         = 12   (TELEPORT_CONTROL)
+    #         = 1    (TELEPAT)
+    # Vendor returns ``ptr->mlevel > rn2(chance)``.
+    safe_chosen = jnp.maximum(chosen_intr, jnp.int32(0))
+    # Per-intrinsic chance lookup (only differs for the four cases above).
+    chance = jnp.where(safe_chosen == jnp.int32(int(Intrinsic.TELEPORT)),
+                       jnp.int32(10),
+                       jnp.where(safe_chosen == jnp.int32(int(Intrinsic.TELEPORT_CONTROL)),
+                                 jnp.int32(12),
+                                 jnp.where(safe_chosen == jnp.int32(int(Intrinsic.TELEPATHY)),
+                                           jnp.int32(1),
+                                           jnp.int32(15))))
+    # killer-bee / scorpion POISON_RES fast-track: chance = 1 when !rn2(4).
+    rng, rng_pres = jax.random.split(rng)
+    is_bee_or_scorp = (safe_idx == jnp.int32(_KILLER_BEE_IDX_NP)) | (
+        safe_idx == jnp.int32(_SCORPION_IDX_NP)
+    )
+    pres_fast = is_bee_or_scorp & (safe_chosen == jnp.int32(int(Intrinsic.RESIST_POISON))) & (
+        jax.random.randint(rng_pres, (), 0, 4, dtype=jnp.int32) == jnp.int32(0)
+    )
+    chance = jnp.where(pres_fast, jnp.int32(1), chance)
+
+    rng, rng_giv = jax.random.split(rng)
+    safe_chance = jnp.maximum(chance, jnp.int32(1))
+    mlev = _MONSTER_MLEVEL[safe_idx]
+    chance_roll = jax.random.randint(rng_giv, (), 0, safe_chance, dtype=jnp.int32)
+    pass_gate = mlev > chance_roll  # vendor: ptr->mlevel > rn2(chance)
+
+    # Apply chosen intrinsic if valid AND is_corpse AND chance gate passes.
+    has_intrinsic_to_grant = is_corpse & (chosen_intr >= jnp.int32(0)) & pass_gate
     old_intrinsics = state.status.intrinsics
     # Set the chosen intrinsic slot to True (lax.cond to avoid conditional
     # on tracer; use dynamic_update_slice pattern via .at[].set + where).
@@ -254,8 +312,49 @@ def apply_corpse_postfx(
         old_intrinsics.at[chosen_intr].set(True),
         old_intrinsics,
     )
-    new_status = state.status.replace(intrinsics=new_intrinsics)
+    # Wave 17f: tag the source as FROMOUTSIDE — vendor "HFire_resistance |= FROMOUTSIDE"
+    # at eat.c:1015 (and identical lines for the other corpse-conveyed props).
+    # Cite: vendor/nethack/src/eat.c::givit lines 1010-1080.
+    from Nethax.nethax.subsystems.status_effects import FROMOUTSIDE as _FROMOUTSIDE
+    cur_src = state.status.intrinsic_source
+    new_src = jnp.where(
+        has_intrinsic_to_grant,
+        cur_src.at[chosen_intr].set((cur_src[chosen_intr] | jnp.int8(_FROMOUTSIDE)).astype(jnp.int8)),
+        cur_src,
+    )
+    new_status = state.status.replace(intrinsics=new_intrinsics, intrinsic_source=new_src)
     state = state.replace(status=new_status)
+
+    # Wave 17f — temp_givit (vendor eat.c::temp_givit 992-997):
+    #   STONE_RES: chance = 6; if ptr->mlevel > rn2(6) → incr_itimeout d(3,6)
+    #   ACID_RES:  chance = 3; if ptr->mlevel > rn2(3) → incr_itimeout d(3,6)
+    # Both add a timed intrinsic via incr_itimeout(&HStone_resistance, d(3,6)).
+    rng, rng_t_stone, rng_t_acid, rng_d_stone, rng_d_acid = jax.random.split(rng, 5)
+    # STONE_RES temp gain.
+    stone_roll = jax.random.randint(rng_t_stone, (), 0, 6, dtype=jnp.int32)
+    do_stone_temp = is_corpse & (mlev > stone_roll)
+    # d(3,6) = sum of 3 dice each 1..6  → range [3, 18].  We approximate as
+    # 3 + rn2(16) for JIT simplicity (matches the same uniform-ish distribution).
+    stone_d36 = jnp.int32(3) + jax.random.randint(rng_d_stone, (), 0, 16, dtype=jnp.int32)
+    cur_t_stone = state.status.timed_intrinsics[int(Intrinsic.RESIST_STONE)]
+    new_t_stone = jnp.where(
+        do_stone_temp,
+        cur_t_stone + stone_d36,
+        cur_t_stone,
+    )
+    # ACID_RES temp gain.
+    acid_roll = jax.random.randint(rng_t_acid, (), 0, 3, dtype=jnp.int32)
+    do_acid_temp = is_corpse & (mlev > acid_roll)
+    acid_d36 = jnp.int32(3) + jax.random.randint(rng_d_acid, (), 0, 16, dtype=jnp.int32)
+    cur_t_acid = state.status.timed_intrinsics[int(Intrinsic.RESIST_ACID)]
+    new_t_acid = jnp.where(
+        do_acid_temp,
+        cur_t_acid + acid_d36,
+        cur_t_acid,
+    )
+    new_timed = state.status.timed_intrinsics.at[int(Intrinsic.RESIST_STONE)].set(new_t_stone)
+    new_timed = new_timed.at[int(Intrinsic.RESIST_ACID)].set(new_t_acid)
+    state = state.replace(status=state.status.replace(timed_intrinsics=new_timed))
 
     # ------------------------------------------------------------------
     # 4. Special one-off effects
@@ -313,6 +412,81 @@ def apply_corpse_postfx(
         state.player_str,
     )
     state = state.replace(player_str=new_str)
+
+    # ------------------------------------------------------------------
+    # Wave 17f — Mind flayer / master mind flayer
+    # cite: vendor/nethack/src/eat.c::cpostfx lines 1281-1297:
+    #     if (ABASE(A_INT) < ATTRMAX(A_INT)) {
+    #         if (!rn2(2)) {
+    #             (void) adjattrib(A_INT, 1, FALSE);
+    #             break;
+    #         }
+    #     }
+    #     /* falls through to default → may grant telepathy via corpse_intrinsic */
+    # 50% chance of +1 INT (up to attrmax) when not yet capped, else passes
+    # through to the generic intrinsic-award path above (which the table
+    # already includes TELEPAT for mind flayers).
+    # ------------------------------------------------------------------
+    is_mind_flayer = is_corpse & (
+        (safe_idx == jnp.int32(_MIND_FLAYER_IDX_NP))
+        | (safe_idx == jnp.int32(_MASTER_MIND_FLAYER_IDX_NP))
+    )
+    rng, rng_mf = jax.random.split(rng)
+    mf_roll = jax.random.randint(rng_mf, (), 0, 2, dtype=jnp.int32)  # !rn2(2) → roll == 0
+    do_int_bump = is_mind_flayer & (mf_roll == jnp.int32(0)) & (
+        state.player_int < jnp.int8(25)
+    )
+    new_int = jnp.where(
+        do_int_bump,
+        jnp.minimum(state.player_int + jnp.int8(1), jnp.int8(25)),
+        state.player_int,
+    )
+    state = state.replace(player_int=new_int)
+
+    # ------------------------------------------------------------------
+    # Wave 17f — Stalker (PM_STALKER).
+    # cite: vendor/nethack/src/eat.c::cpostfx lines 1162-1172:
+    #     if (!Invis) {
+    #         set_itimeout(&HInvis, rn1(100, 50));
+    #     } else {
+    #         HInvis |= FROMOUTSIDE;
+    #         HSee_invisible |= FROMOUTSIDE;
+    #     }
+    # Approximation: grant temporary INVIS (1..149 turns) and SEE_INVIS
+    # intrinsic (FROMOUTSIDE source bit) when a stalker corpse is eaten.
+    # ------------------------------------------------------------------
+    is_stalker = is_corpse & (safe_idx == jnp.int32(_STALKER_IDX_NP))
+    rng, rng_st = jax.random.split(rng)
+    # rn1(100, 50) = 50 + rn2(100)  → uniform in [50, 149]
+    invis_turns = jnp.int32(50) + jax.random.randint(rng_st, (), 0, 100, dtype=jnp.int32)
+    cur_invis = state.status.timed_intrinsics[int(Intrinsic.INVIS)]
+    new_invis_t = jnp.where(is_stalker, jnp.maximum(cur_invis, invis_turns), cur_invis)
+    new_t_intr = state.status.timed_intrinsics.at[int(Intrinsic.INVIS)].set(new_invis_t)
+    # SEE_INVIS as permanent intrinsic (FROMOUTSIDE) — see vendor 1171.
+    new_intrinsics2 = jnp.where(
+        is_stalker,
+        state.status.intrinsics.at[int(Intrinsic.SEE_INVIS)].set(True),
+        state.status.intrinsics,
+    )
+    new_status3 = state.status.replace(
+        timed_intrinsics=new_t_intr, intrinsics=new_intrinsics2
+    )
+    state = state.replace(status=new_status3)
+
+    # ------------------------------------------------------------------
+    # Wave 17f — Displacer beast (PM_DISPLACER_BEAST).
+    # cite: vendor/nethack/src/eat.c::cpostfx lines 1265-1268:
+    #     if (!Displaced) toggle_displacement(...);
+    #     incr_itimeout(&HDisplaced, d(6, 6));
+    # ------------------------------------------------------------------
+    is_displacer = is_corpse & (safe_idx == jnp.int32(_DISPLACER_BEAST_IDX_NP))
+    rng, rng_dp = jax.random.split(rng)
+    # d(6,6) ≈ 6 + rn2(31)  → [6, 36]; uniform-ish approximation of dice sum.
+    disp_turns = jnp.int32(6) + jax.random.randint(rng_dp, (), 0, 31, dtype=jnp.int32)
+    cur_disp = state.status.timed_intrinsics[int(Intrinsic.DISPLACED)]
+    new_disp = jnp.where(is_displacer, cur_disp + disp_turns, cur_disp)
+    new_t_intr2 = state.status.timed_intrinsics.at[int(Intrinsic.DISPLACED)].set(new_disp)
+    state = state.replace(status=state.status.replace(timed_intrinsics=new_t_intr2))
 
     return state
 

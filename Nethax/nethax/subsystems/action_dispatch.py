@@ -871,11 +871,28 @@ def _stair_up(state, rng):
 
     Within-branch traversal: bumps current_level by -1 (clamped to 1).
     Citation: vendor/nethack/src/do.c::dohol() (go up stairs).
+
+    Wave 17f: snapshots per-level monster_ai / features / ground_items
+    before the swap and restores the destination level's snapshot on
+    arrival (vendor save.c::savelev / load.c::loadlev parity).
     """
     terrain_2d = _current_level_terrain(state)
     row, col    = state.player_pos[0], state.player_pos[1]
     tile        = terrain_2d[row, col].astype(jnp.int32)
     on_stair    = tile == jnp.int32(TileType.STAIRCASE_UP)
+
+    # Snapshot the current (source) level before changing dungeon.current_level.
+    # Host-side bookkeeping only; safe to call under JIT (no-op when frozen).
+    from Nethax.nethax.dungeon.level_memory import (
+        snapshot_monsters_and_features,
+        restore_monsters_and_features,
+    )
+    src_b  = int(state.dungeon.current_branch) if not isinstance(
+        state.dungeon.current_branch, jax.core.Tracer) else None
+    src_lv = int(state.dungeon.current_level) if not isinstance(
+        state.dungeon.current_level, jax.core.Tracer) else None
+    if src_b is not None and src_lv is not None:
+        state = snapshot_monsters_and_features(state, src_b, src_lv)
 
     new_level = jnp.where(
         on_stair,
@@ -884,6 +901,11 @@ def _stair_up(state, rng):
     )
     new_dungeon = state.dungeon.replace(current_level=new_level)
     new_state   = state.replace(dungeon=new_dungeon)
+
+    # Restore destination snapshot (no-op on first visit / under JIT).
+    if src_b is not None and src_lv is not None:
+        new_state = restore_monsters_and_features(new_state, src_b, int(new_level))
+
     return _on_quest_leader_level(_apply_fov(new_state))
 
 
@@ -893,11 +915,27 @@ def _stair_down(state, rng):
     Within-branch traversal: bumps current_level by +1.
     Tracks deepest_lev_reached for scoring (vendor dungeon.c deepest_lev_reached).
     Citation: vendor/nethack/src/do.c::dolook() / dodown() (go down stairs).
+
+    Wave 17f: snapshots per-level monster_ai / features / ground_items
+    before the swap and restores the destination level's snapshot on
+    arrival (vendor save.c::savelev / load.c::loadlev parity).
     """
     terrain_2d = _current_level_terrain(state)
     row, col    = state.player_pos[0], state.player_pos[1]
     tile        = terrain_2d[row, col].astype(jnp.int32)
     on_stair    = tile == jnp.int32(TileType.STAIRCASE_DOWN)
+
+    # Snapshot source level (Wave 17f).
+    from Nethax.nethax.dungeon.level_memory import (
+        snapshot_monsters_and_features,
+        restore_monsters_and_features,
+    )
+    src_b  = int(state.dungeon.current_branch) if not isinstance(
+        state.dungeon.current_branch, jax.core.Tracer) else None
+    src_lv = int(state.dungeon.current_level) if not isinstance(
+        state.dungeon.current_level, jax.core.Tracer) else None
+    if src_b is not None and src_lv is not None:
+        state = snapshot_monsters_and_features(state, src_b, src_lv)
 
     max_level   = jnp.int8(state.terrain.shape[1])
     new_level   = jnp.where(
@@ -914,6 +952,11 @@ def _stair_down(state, rng):
     # Move adjacent tame pets to follow the player down the stair.
     # Citation: vendor/nethack/src/dog.c::stair_pet.
     new_state = _pet_follow_on_stair(new_state)
+
+    # Restore destination snapshot (Wave 17f).
+    if src_b is not None and src_lv is not None:
+        new_state = restore_monsters_and_features(new_state, src_b, int(new_level))
+
     return _on_quest_leader_level(_apply_fov(new_state))
 
 

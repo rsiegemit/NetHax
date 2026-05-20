@@ -271,6 +271,26 @@ class StatusState:
     intrinsics              : permanent intrinsic flags gained (bool per property)
     timed_intrinsics        : turns remaining for timed versions of intrinsics (int32)
     timed_statuses          : turns remaining for each TimedStatus (int32)
+    extrinsic               : per-prop bitmask of currently-active extrinsic
+                              sources (worn armor / wielded artifact / ring /
+                              amulet).  Mirrors vendor ``struct prop.extrinsic``
+                              (vendor/nethack/include/prop.h::97).  Any non-zero
+                              value means an extrinsic source is granting the
+                              property right now.
+    blocked                 : per-prop bitmask of "blocked" sources (e.g. cursed
+                              gear that suppresses an intrinsic).  Mirrors
+                              vendor ``struct prop.blocked``.
+    intrinsic_source        : per-prop int8 bitfield carrying the same FROMxxx
+                              source bits that vendor's ``upp->intrinsic`` low
+                              byte encodes (FROMOUTSIDE=1, FROMRACE=2,
+                              FROMEXPER=4, FROMFORM=8, FROMTIMEOUT=16).
+                              Source-aware code paths (corpse intrinsic gift,
+                              attribute decay, timed expiry) consult this byte
+                              to decide whether a property may still be lost
+                              when its timer hits zero.
+                              Cite: vendor/nethack/include/prop.h::FROMOUTSIDE
+                              (line 109), FROMRACE (110), FROMEXPER (111),
+                              FROMFORM (112), TIMEOUT (113).
     hunger_state            : current HungerState (int8)
     nutrition               : raw nutrition counter; canonical max ~2000 (int32)
     encumbrance             : current Encumbrance level (int8)
@@ -284,6 +304,10 @@ class StatusState:
     intrinsics:              jnp.ndarray  # [N_INTRINSICS]       bool
     timed_intrinsics:        jnp.ndarray  # [N_INTRINSICS]       int32
     timed_statuses:          jnp.ndarray  # [N_TIMED_STATUSES]   int32
+    # Wave 17f: full vendor prop bit-decomposition (prop.h:97).
+    extrinsic:               jnp.ndarray  # [N_INTRINSICS]       int32  bitmask
+    blocked:                 jnp.ndarray  # [N_INTRINSICS]       int32  bitmask
+    intrinsic_source:        jnp.ndarray  # [N_INTRINSICS]       int8   FROMxxx bits
     hunger_state:            jnp.ndarray  # scalar               int8
     nutrition:               jnp.ndarray  # scalar               int32
     encumbrance:             jnp.ndarray  # scalar               int8
@@ -302,6 +326,10 @@ class StatusState:
             intrinsics=jnp.zeros((N_INTRINSICS,), dtype=jnp.bool_),
             timed_intrinsics=jnp.zeros((N_INTRINSICS,), dtype=jnp.int32),
             timed_statuses=jnp.zeros((N_TIMED_STATUSES,), dtype=jnp.int32),
+            # Wave 17f additions — vendor prop.h:97 bit-decomposition.
+            extrinsic=jnp.zeros((N_INTRINSICS,), dtype=jnp.int32),
+            blocked=jnp.zeros((N_INTRINSICS,), dtype=jnp.int32),
+            intrinsic_source=jnp.zeros((N_INTRINSICS,), dtype=jnp.int8),
             hunger_state=jnp.int8(HungerState.NOT_HUNGRY),
             nutrition=jnp.int32(900),
             encumbrance=jnp.int8(Encumbrance.UNENCUMBERED),
@@ -310,6 +338,18 @@ class StatusState:
             pw_regen_counter=jnp.int32(0),
             confuse_attack_pending=jnp.bool_(False),
         )
+
+
+# ---------------------------------------------------------------------------
+# Vendor FROMxxx source bits (vendor/nethack/include/prop.h lines 109-113)
+# These flags are packed into the low byte of upp->intrinsic.  We mirror
+# them on intrinsic_source[N_INTRINSICS] (one byte per prop).
+# ---------------------------------------------------------------------------
+FROMOUTSIDE = 0x01   # gained from corpse / potion / spell (vendor prop.h:109)
+FROMRACE    = 0x02   # innate from race (prop.h:110)
+FROMEXPER   = 0x04   # gained from XL gain (prop.h:111)
+FROMFORM    = 0x08   # gained from being polymorphed (prop.h:112)
+FROMTIMEOUT = 0x10   # extrinsic gained from a timed effect (prop.h:113)
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +620,9 @@ def tick_timers(state: StatusState) -> StatusState:
     step(), which read the *pre-decrement* timer value and compare against 1
     (i.e. "was this the last tick?").
 
+    Per-prop expiry callbacks are delegated to ``nh_timeout`` below, which
+    mirrors vendor/nethack/src/timeout.c::nh_timeout (lines 588-948).
+
     Wave 4:
       SLIMED → slime_age() → polymorph into green slime → death
     """
@@ -589,6 +632,100 @@ def tick_timers(state: StatusState) -> StatusState:
         timed_statuses=new_statuses,
         timed_intrinsics=new_timed_intrinsics,
     )
+
+
+# ---------------------------------------------------------------------------
+# Wave 17f — nh_timeout per-prop expiry callbacks.
+#
+# Vendor (vendor/nethack/src/timeout.c::nh_timeout lines 670-944) walks
+# u.uprops; for each prop whose timer ticks from 1 → 0 it emits the per-prop
+# expiry message and may clear other state.  We mirror the subset of cases
+# that are observable in this codebase's StatusState surface:
+#
+#   FIRE_RES  / ACID_RES  / COLD_RES / SHOCK_RES / POISON_RES
+#   DISPLACED / WARN_OF_MON / PASSES_WALLS / MAGICAL_BREATHING
+#   DETECT_MONSTERS / SEE_INVIS / INVIS / FAST / FUMBLING / SLEEPY
+#   LEVITATION / FLYING
+#
+# For each prop the expiry rule is:
+#
+#   if timer == 0 AND prev_timer == 1 AND ~intrinsics[prop] AND ~extrinsic[prop]:
+#       (intrinsic is FALSE — vendor "if (!Fire_resistance)" guard)
+#       — emit message (we track expiry via a returned per-prop bool array)
+#
+# This function returns (new_state, expired_mask[N_INTRINSICS]) so callers
+# can wire the expiry messages or follow-up consequences.
+# ---------------------------------------------------------------------------
+
+# Vendor prop index → Intrinsic index map (for callbacks documented above).
+# Cite per line: vendor/nethack/src/timeout.c::nh_timeout lines 725-944.
+_TIMEOUT_PROP_INDICES = (
+    int(Intrinsic.RESIST_FIRE),       # timeout.c:845
+    int(Intrinsic.RESIST_COLD),       # timeout.c (same case as FIRE_RES branch)
+    int(Intrinsic.RESIST_SHOCK),      # ibid
+    int(Intrinsic.RESIST_POISON),     # ibid
+    int(Intrinsic.RESIST_ACID),       # timeout.c:813
+    int(Intrinsic.DISPLACED),         # timeout.c:858
+    int(Intrinsic.WARN_OF_MON),       # timeout.c:862
+    int(Intrinsic.PASSES_WALLS),      # timeout.c:874
+    int(Intrinsic.MAGIC_BREATHING),   # timeout.c:883 (MAGICAL_BREATHING)
+    int(Intrinsic.DETECT_MONSTERS),   # timeout.c:932
+    int(Intrinsic.SEE_INVIS),         # timeout.c:768
+    int(Intrinsic.INVIS),             # timeout.c:759
+    int(Intrinsic.FAST),              # timeout.c:725
+    # FUMBLING tracked via timed_statuses, not timed_intrinsics; expiry
+    # message lives in apply_* helpers.  We still expose the index for
+    # symmetry with the vendor list.
+    int(Intrinsic.LEVITATION),        # timeout.c:794
+    int(Intrinsic.FLYING),            # timeout.c:805
+)
+
+
+def nh_timeout(state: StatusState) -> tuple:
+    """Apply per-prop expiry callbacks (vendor timeout.c::nh_timeout 670-944).
+
+    Vendor loop (timeout.c:670-671):
+        for (upp = u.uprops; upp < u.uprops + SIZE(u.uprops); upp++)
+            if ((upp->intrinsic & TIMEOUT)
+                && !(--upp->intrinsic & TIMEOUT)) {
+                /* per-prop switch */
+            }
+
+    Each tracked prop fires its callback when the timer hits 0 this turn,
+    AND the player does not have the corresponding permanent (intrinsic)
+    or extrinsic source still active.  Mirrors vendor's "if (!Fire_resistance)"
+    guard at timeout.c:850.
+
+    Returns
+    -------
+    (new_state, expired_mask : bool[N_INTRINSICS])
+
+    The expired_mask flags the props whose timer just hit zero and which
+    no longer have any other source — i.e. props whose vendor message
+    would fire this turn.  Callers may use this to push messages or
+    update downstream state (e.g. visible monsters when SEE_INVIS expires).
+
+    JIT-safe: pure functional, no Python control flow on traced values.
+    """
+    pre = state.timed_intrinsics
+    post = jnp.maximum(pre - 1, 0)
+    # Vendor: timer ticked 1 → 0 this turn (pre > 0 AND post == 0).
+    just_expired = (pre > jnp.int32(0)) & (post == jnp.int32(0))
+
+    # Per-prop "still has source" check: vendor uses "if (!Fire_resistance)" —
+    # i.e. only fire the callback if no permanent intrinsic / extrinsic
+    # is still granting the property.
+    has_other_source = state.intrinsics | (state.extrinsic > jnp.int32(0))
+
+    # Mask out props that aren't in our tracked timeout list.
+    tracked_mask = jnp.zeros((N_INTRINSICS,), dtype=jnp.bool_)
+    for idx in _TIMEOUT_PROP_INDICES:
+        tracked_mask = tracked_mask.at[idx].set(True)
+
+    expired_mask = just_expired & ~has_other_source & tracked_mask
+
+    new_state = state.replace(timed_intrinsics=post)
+    return new_state, expired_mask
 
 
 # ---------------------------------------------------------------------------

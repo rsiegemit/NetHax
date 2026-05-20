@@ -173,16 +173,20 @@ def _register_corridor_envs(register_fn) -> None:
 # MazeWalk envs (Group B — procedural)
 # ---------------------------------------------------------------------------
 def _mazewalk_builder(w: int, h: int) -> Callable[[LevelGenerator], None]:
-    """Build a ``w × h`` open room with stairs in the far corner.
+    """Build a ``w × h`` perfect maze with stairs in the far corner.
 
-    Wave 4 simplification: the MiniHack ``MAZEWALK`` directive carves a
-    perfect maze.  We approximate with an open room + goal; full maze gen
-    lands in Wave 5.  The agent still has to navigate from the start to
-    the goal corner, so the env is non-trivial for RL.
+    Wave17i: replaces the legacy "open room" substitute with a real
+    recursive-backtracker maze carve via ``LevelGenerator.add_mazewalk``
+    (cite vendor MAZEWALK des-file directive → mklev.c::walkfrom).
+    The agent starts at the top-left and the goal stair is at the
+    bottom-right corner.
     """
     def build(lg: LevelGenerator) -> None:
-        lg.set_start_pos(0, 0)
-        lg.add_stair_down(x=w - 1, y=h - 1)
+        # Carve a perfect maze covering the active (h, w) area.
+        lg.add_mazewalk(coord=(1, 1), dir="east")
+        lg.set_start_pos(1, 1)
+        lg.add_stair_down(x=w - 2 if w > 2 else w - 1,
+                          y=h - 2 if h > 2 else h - 1)
     return build
 
 

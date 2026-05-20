@@ -990,9 +990,10 @@ def pray(state, rng: jax.Array):
     """
     trouble = in_trouble(state)
 
-    # --- Cross-aligned altar check (pray.c can_pray / god_zaps_you branch) --
-    # pray.c: if on a cross-aligned altar the deity zaps you immediately.
-    # We detect altar alignment via features.altar_alignment at player pos.
+    # --- Altar / alignment scaling (pray.c::can_pray lines 2142-2147) -------
+    # Vendor scales record by ½ on a different-aligned altar, and *negates*
+    # it on an opposite-aligned altar.  We use this scaled value for the
+    # anger gates below (vendor "alignment" local in can_pray).
     max_levels = state.terrain.shape[1]
     _b  = state.dungeon.current_branch.astype(jnp.int32)
     _lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
@@ -1002,21 +1003,59 @@ def pray(state, rng: jax.Array):
     altar_align = state.features.altar_alignment[_flat_lv, _row, _col].astype(jnp.int32)
     player_align_i = state.player_align.astype(jnp.int32)
     # altar_align == -1 means no altar; >= 0 means an altar is present.
-    on_cross_altar = (altar_align >= jnp.int32(0)) & (altar_align != player_align_i)
-    rng, rng_cross_zap = jax.random.split(rng)
-    state = jax.lax.cond(
-        on_cross_altar,
-        lambda s: god_zaps_you(s, rng_cross_zap),
-        lambda s: s,
-        state,
+    on_altar = altar_align >= jnp.int32(0)
+    on_cross_altar = on_altar & (altar_align != player_align_i)
+    record_raw = state.prayer.alignment_record.astype(jnp.int32)
+
+    # vendor pray.c:2142-2147 — alignment scaling:
+    #   opposite (u.ualign.type == -gp.p_aligntyp): alignment = -u.ualign.record
+    #   different (u.ualign.type != gp.p_aligntyp): alignment = u.ualign.record / 2
+    #   same: alignment = u.ualign.record
+    # Our Alignment enum: 0=chaotic, 1=neutral, 2=lawful — "opposite" is
+    # |player - altar| == 2 (chaotic vs lawful).
+    align_diff = jnp.abs(altar_align - player_align_i)
+    is_opposite_altar = on_altar & (align_diff == jnp.int32(2))
+    is_diff_altar     = on_altar & (align_diff == jnp.int32(1))
+    scaled_record = jnp.where(
+        is_opposite_altar, -record_raw,
+        jnp.where(is_diff_altar, record_raw // jnp.int32(2), record_raw),
     )
 
-    # --- Anger gates (pray.c::can_pray) -------------------------------------
+    # --- Cross-aligned altar pleased response (pray.c:1085-1087) ------------
+    # Vendor: in pleased() branch, on_altar() && p_aligntyp != u.ualign.type
+    #   → adjalign(-1); return;
+    # We model this by deducting 1 from alignment_record up-front and then
+    # short-circuiting the rest of the prayer (no zap, no bucket pick).
+    # Note vendor previously applied god_zaps_you here in our code — that
+    # was the wrong handler (god_zaps_you is the angry-bolt default at
+    # pray.c:774-777).
+    short_circuit_cross = on_cross_altar
+
+    # --- Anger gates (pray.c::can_pray lines 2151-2155) ---------------------
+    # Vendor:
+    #   if ((trouble > 0) ? (u.ublesscnt > 200)
+    #       : (trouble < 0) ? (u.ublesscnt > 100)
+    #         : (u.ublesscnt > 0))   gp.p_type = 0;   /* too soon... */
+    #   else if (Luck < 0 || u.ugangr || alignment < 0)
+    #                                gp.p_type = 1;   /* too naughty... */
     pray_timeout = state.prayer.pray_timeout
-    record = state.prayer.alignment_record.astype(jnp.int32)
-    timeout_active = pray_timeout > jnp.int32(0)
-    record_below_threshold = record < jnp.int32(PRAY_RECORD_THRESHOLD)
-    angry = timeout_active | record_below_threshold
+    trouble_pos = trouble > jnp.int32(0)
+    trouble_neg = trouble < jnp.int32(0)
+    timeout_thresh = jnp.where(
+        trouble_pos, jnp.int32(200),
+        jnp.where(trouble_neg, jnp.int32(100), jnp.int32(0)),
+    )
+    timeout_active = pray_timeout > timeout_thresh
+
+    # Anger gate uses Luck, ugangr (god_anger), and *scaled* alignment record.
+    luck_i = state.player_luck.astype(jnp.int32)
+    ugangr = state.prayer.god_anger.astype(jnp.int32)
+    angry = (
+        timeout_active
+        | (luck_i < jnp.int32(0))
+        | (ugangr > jnp.int32(0))
+        | (scaled_record < jnp.int32(0))
+    )
 
     # --- RNG splits ---------------------------------------------------------
     (rng_roll, rng_zap, rng_timeout, rng_fix,
@@ -1134,53 +1173,70 @@ def pray(state, rng: jax.Array):
     )
 
     # --- Angry path (pray.c::angrygods 703-784) -----------------------------
-    # 8 vendor anger buckets:
-    #   0..12   "displeased" warning   — case 0-1, pray.c:725-730
-    #   13..25  SMITE_3D6              — case 2-3, pray.c:732-743 (Wis/XL hit)
-    #   26..37  DRAIN_LEVEL            — extracted from case 2-3 losexp branch
-    #   38..50  DESTROY_ARMOR          — case 4-5/6, pray.c:752-759 (rndcurse)
-    #   51..62  INFLICT_BLINDNESS      — minor punish branch
-    #   63..74  INFLICT_WEAKNESS       — stat-drain branch
-    #   75..86  SUMMON_DEMON           — case 7-8, pray.c:760-772
-    #   87..99  ANGER_BOLT             — default, god_zaps_you (pray.c:774-777)
-    #   ZAP_FORM_CHANGE is folded into ANGER_BOLT via god_zaps_you wide-angle.
+    # Wave 17f — replace the 0..99 roll buckets with vendor's
+    # rn2(maxanger) switch (pray.c:714-723):
+    #   if (resp_god != u.ualign.type)
+    #       maxanger = u.ualign.record/2 + (Luck > 0 ? -Luck/3 : -Luck);
+    #   else
+    #       maxanger = 3*u.ugangr + ((Luck > 0 || u.ualign.record >= STRIDENT)
+    #                                ? -Luck/3 : -Luck);
+    #   if (maxanger < 1)  maxanger = 1;
+    #   if (maxanger > 15) maxanger = 15;
+    #   switch (rn2(maxanger))   /* cases 0..15 */
+    #
+    # Vendor case map (pray.c:725-777):
+    #   0,1   → "displeased" no-op (warn)
+    #   2,3   → SMITE_3D6: WIS-1 + losexp
+    #   4,5,6 → DESTROY_ARMOR (rndcurse), case 6 → punish if !Punished
+    #   7,8   → SUMMON_DEMON
+    #   default → god_zaps_you (anger bolt)
+    rng_max = jax.random.PRNGKey(0)  # placeholder; rng_smite reused below
+    record_for_anger = state.prayer.alignment_record.astype(jnp.int32)
+    luck_for_anger = state.player_luck.astype(jnp.int32)
+    ugangr_a = state.prayer.god_anger.astype(jnp.int32)
+    # neg_luck_part follows the vendor ternaries.
+    neg_luck_low = jnp.where(
+        luck_for_anger > jnp.int32(0),
+        -(luck_for_anger // jnp.int32(3)),
+        -luck_for_anger,
+    )
+    neg_luck_high = jnp.where(
+        (luck_for_anger > jnp.int32(0)) | (record_for_anger >= jnp.int32(STRIDENT)),
+        -(luck_for_anger // jnp.int32(3)),
+        -luck_for_anger,
+    )
+    # Cross-aligned altar → use the "different alignment" branch (vendor
+    # resp_god != u.ualign.type test on line 714).
+    maxanger_cross = record_for_anger // jnp.int32(2) + neg_luck_low
+    maxanger_same  = jnp.int32(3) * ugangr_a + neg_luck_high
+    maxanger = jnp.where(on_cross_altar, maxanger_cross, maxanger_same)
+    maxanger = jnp.clip(maxanger, jnp.int32(1), jnp.int32(15))
+
+    # Re-roll using a fresh sub-key so we get a [0, maxanger) sample.
+    rng_anger_bucket = jax.random.fold_in(rng_smite, 1)
+    anger_bucket = jax.random.randint(
+        rng_anger_bucket, (), 0, jnp.maximum(maxanger, jnp.int32(1)), dtype=jnp.int32
+    )
+
     def _angry_branch(s):
         s_warn    = s                              # case 0-1 no-op
         s_smite   = _apply_smite_3d6(s, rng_smite)
-        s_drain   = _apply_drain_level(s)
         s_destroy = _apply_destroy_armor(s)
-        s_blind   = _apply_inflict_blindness(s)
-        s_weak    = _apply_inflict_weakness(s)
         s_summon  = _apply_summon_demon(s)
         s_bolt    = god_zaps_you(s, rng_zap)
         return jax.lax.cond(
-            roll < jnp.int32(13),
+            anger_bucket <= jnp.int32(1),
             lambda _: s_warn,
             lambda _: jax.lax.cond(
-                roll < jnp.int32(26),
+                anger_bucket <= jnp.int32(3),
                 lambda _: s_smite,
                 lambda _: jax.lax.cond(
-                    roll < jnp.int32(38),
-                    lambda _: s_drain,
+                    anger_bucket <= jnp.int32(6),
+                    lambda _: s_destroy,
                     lambda _: jax.lax.cond(
-                        roll < jnp.int32(51),
-                        lambda _: s_destroy,
-                        lambda _: jax.lax.cond(
-                            roll < jnp.int32(63),
-                            lambda _: s_blind,
-                            lambda _: jax.lax.cond(
-                                roll < jnp.int32(75),
-                                lambda _: s_weak,
-                                lambda _: jax.lax.cond(
-                                    roll < jnp.int32(87),
-                                    lambda _: s_summon,
-                                    lambda _: s_bolt,
-                                    operand=0,
-                                ),
-                                operand=0,
-                            ),
-                            operand=0,
-                        ),
+                        anger_bucket <= jnp.int32(8),
+                        lambda _: s_summon,
+                        lambda _: s_bolt,
                         operand=0,
                     ),
                     operand=0,
@@ -1195,6 +1251,21 @@ def pray(state, rng: jax.Array):
         _angry_branch,
         lambda s: s,
         state_pleased,
+    )
+
+    # Cross-aligned altar short-circuit (pray.c::pleased lines 1085-1087).
+    # Vendor: adjalign(-1); return; — done up-front, overriding the bucket
+    # selection above.  We apply it via a final lax.cond so all prior
+    # branches' state mutations are discarded when on_cross_altar.
+    def _cross_altar_adjalign(s):
+        new_record_cross = (s.prayer.alignment_record - jnp.int16(1)).astype(jnp.int16)
+        return s.replace(prayer=s.prayer.replace(alignment_record=new_record_cross))
+
+    state_final = jax.lax.cond(
+        short_circuit_cross,
+        lambda s: _cross_altar_adjalign(state),  # discard bucket effects
+        lambda s: s,
+        state_final,
     )
 
     # --- Reset pray_timeout = 300 + rn2(700) (pray.c:1356, rnz(350)) --------
@@ -1326,11 +1397,37 @@ def sacrifice_on_altar(state, rng: jax.Array, slot_idx: jnp.ndarray):
     # proportional to monster level.  Formula: delta = base * (1 + level/10).
     # Cited: pray.c:2030-2065.
     monster_level = items.enchantment[safe_slot].astype(jnp.int32)
-    # Scale factor: (10 + level) / 10, applied to base deltas.
-    level_scale_num = jnp.int32(10) + jnp.maximum(monster_level, jnp.int32(0))
+
+    # --- Wave 17f C.7 — Corpse age check (pray.c::sacrifice_value 1843-1849) -
+    #   if (otmp->corpsenm == PM_ACID_BLOB
+    #       || (svm.moves <= peek_at_iced_corpse_age(otmp) + 50))
+    #       value = mons[otmp->corpsenm].difficulty + 1;
+    #   else value = 0;
+    # We approximate "ACID_BLOB exemption" via corpse_creation_turn == -1
+    # (sentinel for "never expires"); the timed branch checks
+    # ``timestep <= corpse_creation_turn + 50``.
+    creation_turn = items.corpse_creation_turn[safe_slot].astype(jnp.int32)
+    moves = state.timestep.astype(jnp.int32)
+    is_fresh = (creation_turn < jnp.int32(0)) | (moves <= creation_turn + jnp.int32(50))
+    # Sacrifice value: 0 if stale; otherwise proportional to (mlevel + 1).
+    # We use enchantment as proxy for difficulty (kept compat with prior code).
+    sac_value = jnp.where(
+        is_fresh & can_sacrifice,
+        jnp.maximum(monster_level + jnp.int32(1), jnp.int32(0)),
+        jnp.int32(0),
+    )
+
+    # Scale factor: (10 + level) / 10, applied to base deltas — kept for the
+    # alignment-record delta path below.  Set to 1.0 (level_scale_num == 10)
+    # when corpse is stale so deltas collapse to 0.
+    level_scale_num = jnp.where(
+        is_fresh,
+        jnp.int32(10) + jnp.maximum(monster_level, jnp.int32(0)),
+        jnp.int32(0),
+    )
 
     def _scale(base: int) -> jnp.ndarray:
-        """Return base * (1 + level/10), as int16."""
+        """Return base * (1 + level/10), as int16; 0 when corpse is stale."""
         return (jnp.int32(base) * level_scale_num // jnp.int32(10)).astype(jnp.int16)
 
     def _scale_neg(base: int) -> jnp.ndarray:
@@ -1382,9 +1479,77 @@ def sacrifice_on_altar(state, rng: jax.Array, slot_idx: jnp.ndarray):
         ),
     )
     new_record = state.prayer.alignment_record + delta
+
+    # ---- Wave 17f C.8 — Sacrifice ugangr reduction (pray.c:2031-2057) ------
+    # Vendor:
+    #   u.ugangr -= ((value * (u.ualign.type == A_CHAOTIC ? 2 : 3)) / MAXVALUE);
+    #   if (u.ugangr < 0) u.ugangr = 0;
+    # MAXVALUE constant from pray.c (vendor #define MAXVALUE 24).  We use the
+    # sac_value computed above (gated by is_fresh).
+    MAXVALUE = jnp.int32(24)
+    is_chaotic_p = player_align == jnp.int32(0)  # Alignment.CHAOTIC
+    ugangr_mult = jnp.where(is_chaotic_p, jnp.int32(2), jnp.int32(3))
+    ugangr_dec = (sac_value * ugangr_mult) // MAXVALUE
+    cur_ugangr = state.prayer.god_anger.astype(jnp.int32)
+    do_ugangr_path = can_sacrifice & (cur_ugangr > jnp.int32(0))
+    new_ugangr = jnp.where(
+        do_ugangr_path,
+        jnp.maximum(cur_ugangr - ugangr_dec, jnp.int32(0)),
+        cur_ugangr,
+    ).astype(jnp.int32)
+
+    # ---- Wave 17f C.9 — ublesscnt decrement (pray.c:2065-2087) -------------
+    # Vendor:
+    #   if (u.ublesscnt > 0) {
+    #       u.ublesscnt -= ((value * (u.ualign.type == A_CHAOTIC ? 500 : 300))
+    #                       / MAXVALUE);
+    #       if (u.ublesscnt < 0) u.ublesscnt = 0;
+    #   }
+    bless_mult = jnp.where(is_chaotic_p, jnp.int32(500), jnp.int32(300))
+    bless_dec = (sac_value * bless_mult) // MAXVALUE
+    cur_bless = state.prayer.pray_timeout.astype(jnp.int32)
+    do_bless_path = can_sacrifice & (cur_ugangr == jnp.int32(0)) & (cur_bless > jnp.int32(0))
+    new_bless = jnp.where(
+        do_bless_path,
+        jnp.maximum(cur_bless - bless_dec, jnp.int32(0)),
+        cur_bless,
+    ).astype(jnp.int32)
+
+    # ---- Wave 17f C.10 — Luck-gain path (pray.c:2089-2118) -----------------
+    # Vendor (only when ugangr == 0 AND ublesscnt == 0):
+    #   luck_increase = (value * LUCKMAX) / (MAXVALUE * 2);
+    #   if (orig_luck > value) luck_increase = 0;
+    #   else if (orig_luck + luck_increase > value)
+    #       luck_increase = value - orig_luck;
+    #   change_luck(luck_increase);
+    LUCKMAX = jnp.int32(13)
+    luck_increase_raw = (sac_value * LUCKMAX) // (MAXVALUE * jnp.int32(2))
+    orig_luck = state.player_luck.astype(jnp.int32)
+    luck_inc_clamped = jnp.where(
+        orig_luck > sac_value, jnp.int32(0),
+        jnp.where(
+            orig_luck + luck_increase_raw > sac_value,
+            sac_value - orig_luck,
+            luck_increase_raw,
+        ),
+    )
+    do_luck_path = (
+        can_sacrifice
+        & (cur_ugangr == jnp.int32(0))
+        & (cur_bless == jnp.int32(0))
+        & ~is_mighty  # bestow_artifact return-early path (pray.c:2091)
+    )
+    new_luck_sac = jnp.where(
+        do_luck_path,
+        jnp.clip(orig_luck + luck_inc_clamped, jnp.int32(-13), jnp.int32(13)),
+        orig_luck,
+    ).astype(jnp.int8)
+
     new_prayer = state.prayer.replace(
         alignment_record=new_record,
-        god_anger=new_anger,
+        god_anger=new_ugangr,
+        pray_timeout=new_bless,
+        prayer_timeout=new_bless,
     )
 
     # Consume the corpse.
@@ -1408,6 +1573,7 @@ def sacrifice_on_altar(state, rng: jax.Array, slot_idx: jnp.ndarray):
         prayer=new_prayer,
         inventory=new_inv,
         player_wis=new_wis,
+        player_luck=new_luck_sac,
     )
 
 

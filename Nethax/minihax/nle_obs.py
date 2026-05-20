@@ -311,6 +311,13 @@ def _build_obs_dict(glyphs, player_position, crop_size):
     specials = jnp.zeros_like(glyphs)
     message = jnp.zeros(256, dtype=jnp.uint8)
 
+    # Wave17i parity: vendor MiniHack base.py:61-110 declares additional
+    # cropped observation keys: tty_chars_crop, tty_colors_crop, and
+    # pixel_crop.  We reuse the underlying maps (chars/colors) as the
+    # tty-style content since the minihax pipeline doesn't synthesise a
+    # full vendor tty.  pixel_crop is left as a zero placeholder of the
+    # canonical 3-channel uint8 shape (N_TILE_PIXEL = 16 per
+    # vendor/minihack/tiles).
     return {
         "glyphs": glyphs,
         "chars": chars,
@@ -321,6 +328,12 @@ def _build_obs_dict(glyphs, player_position, crop_size):
         "chars_crop": build_crop(chars, player_position, crop_size, ord(' ')),
         "colors_crop": build_crop(colors, player_position, crop_size, 0),
         "specials_crop": build_crop(specials, player_position, crop_size, 0),
+        # Wave17i additions: tty/ pixel crops.
+        "tty_chars_crop": build_crop(chars, player_position, crop_size, ord(' ')),
+        "tty_colors_crop": build_crop(colors, player_position, crop_size, 0),
+        "pixel_crop": jnp.zeros(
+            (crop_size * 16, crop_size * 16, 3), dtype=jnp.uint8,
+        ),
     }
 
 
@@ -528,5 +541,12 @@ def nle_observation_space(map_height, map_width, crop_size=DEFAULT_CROP_SIZE):
         "chars_crop": {"shape": (crop_size, crop_size), "dtype": jnp.uint8},
         "colors_crop": {"shape": (crop_size, crop_size), "dtype": jnp.uint8},
         "specials_crop": {"shape": (crop_size, crop_size), "dtype": jnp.uint8},
+        # Wave17i parity: vendor MiniHack base.py:61-110 crop variants.
+        "tty_chars_crop": {"shape": (crop_size, crop_size), "dtype": jnp.uint8},
+        "tty_colors_crop": {"shape": (crop_size, crop_size), "dtype": jnp.uint8},
+        "pixel_crop": {
+            "shape": (crop_size * 16, crop_size * 16, 3),
+            "dtype": jnp.uint8,
+        },
         "prev_actions": {"shape": (), "dtype": jnp.int32},
     }

@@ -211,6 +211,37 @@ class _GoalPosDirective:
 
 
 # ---------------------------------------------------------------------------
+# Wave17i additions: directive types for add_altar / add_sink / add_gold /
+# add_mazewalk.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class _AltarOverride:
+    x: int = -1
+    y: int = -1
+    place: Place = None
+
+
+@dataclasses.dataclass
+class _SinkOverride:
+    place: Place = None
+
+
+@dataclasses.dataclass
+class _GoldDirective:
+    amount: int
+    place: Place = None
+
+
+@dataclasses.dataclass
+class _MazeWalkDirective:
+    x: int
+    y: int
+    direction: str
+
+
+# ---------------------------------------------------------------------------
 # LevelGenerator
 # ---------------------------------------------------------------------------
 
@@ -297,11 +328,50 @@ class LevelGenerator:
         """Carve an L-shaped corridor between two ``(x, y)`` endpoints."""
         self._directives.append(_CorridorDirective(src=tuple(src), dst=tuple(dst)))
 
-    def add_door(self, x: int, y: int, state: str = "closed") -> None:
-        """Place a door tile.  ``state`` is one of closed/open/locked/nodoor/random."""
-        if state not in ("closed", "open", "locked", "nodoor", "random"):
-            raise ValueError(f"unknown door state: {state!r}")
-        self._directives.append(_DoorDirective(x=x, y=y, state=state))
+    def add_door(self, *args, state: str = "closed", place=None) -> None:
+        """Vendor-parity add_door.
+
+        Two signatures supported (Wave17i):
+          * Vendor (level_generator.py): ``add_door(state, place=(x, y))``
+            where ``state`` is a string and ``place`` is a ``(col, row)``
+            coord tuple.
+          * Legacy nethax: ``add_door(x, y, state="closed")``.
+        """
+        # Decode positional args.
+        x: int = -1
+        y: int = -1
+        if len(args) == 1 and isinstance(args[0], str):
+            # Vendor form: add_door("closed", place=(x, y))
+            state = args[0]
+        elif len(args) == 1 and isinstance(args[0], tuple):
+            # add_door((x, y), state=...)
+            x, y = int(args[0][0]), int(args[0][1])
+        elif len(args) == 2:
+            a0, a1 = args
+            if isinstance(a0, int) and isinstance(a1, int):
+                # Legacy: add_door(x, y, state=...)
+                x, y = int(a0), int(a1)
+            elif isinstance(a0, str):
+                # add_door("closed", (x, y))
+                state = a0
+                if isinstance(a1, tuple) and len(a1) == 2:
+                    x, y = int(a1[0]), int(a1[1])
+        elif len(args) == 3:
+            # Legacy: add_door(x, y, state)
+            x, y, state = int(args[0]), int(args[1]), str(args[2])
+        elif len(args) == 0:
+            pass  # state/place as kwargs only
+        else:
+            raise TypeError(f"add_door: too many positional args ({len(args)})")
+
+        if place is not None:
+            if isinstance(place, tuple) and len(place) == 2:
+                x, y = int(place[0]), int(place[1])
+
+        s = str(state)
+        if s not in ("closed", "open", "locked", "nodoor", "random"):
+            raise ValueError(f"unknown door state: {s!r}")
+        self._directives.append(_DoorDirective(x=x, y=y, state=s))
 
     def add_monster(
         self,
@@ -351,14 +421,23 @@ class LevelGenerator:
 
     def add_stair_down(
         self,
-        x: int = -1,
+        x=-1,
         y: int = -1,
         *,
         place: Place = None,
     ) -> None:
-        """Add a down-staircase tile (also the canonical 'goal' tile)."""
+        """Add a down-staircase tile (also the canonical 'goal' tile).
+
+        Vendor-parity (Wave17i): accepts either ``add_stair_down((x, y))`` or
+        ``add_stair_down(x, y)`` to match vendor level_generator.py which
+        passes a ``coord`` tuple.
+        """
+        if isinstance(x, tuple) and len(x) == 2:
+            cx, cy = int(x[0]), int(x[1])
+        else:
+            cx, cy = int(x), int(y)
         self._directives.append(_StairDirective(
-            direction="down", x=x, y=y, place=place,
+            direction="down", x=cx, y=cy, place=place,
         ))
 
     def fill_terrain(
@@ -376,15 +455,107 @@ class LevelGenerator:
             terrain=terrain, x1=x1, y1=y1, x2=x2, y2=y2,
         ))
 
-    def set_start_pos(self, x: int, y: int) -> None:
-        """Place the player at MiniHack ``(x, y)``."""
-        self._directives.append(_StartPosDirective(x=x, y=y))
+    def set_start_pos(self, x, y: int = -1) -> None:
+        """Place the player at MiniHack ``(x, y)``.
 
-    def set_goal_pos(self, x: int, y: int) -> None:
+        Vendor-parity (Wave17i): accepts ``set_start_pos((x, y))`` or
+        ``set_start_pos(x, y)``.
+        """
+        if isinstance(x, tuple) and len(x) == 2:
+            cx, cy = int(x[0]), int(x[1])
+        else:
+            cx, cy = int(x), int(y)
+        self._directives.append(_StartPosDirective(x=cx, y=cy))
+
+    def set_goal_pos(self, x, y: int = -1) -> None:
         """Mark a goal tile.  Stored as a STAIRCASE_DOWN tile for symmetry
         with MiniHack's ``add_goal_pos == add_stair_down`` alias.
         """
-        self._directives.append(_GoalPosDirective(x=x, y=y))
+        if isinstance(x, tuple) and len(x) == 2:
+            cx, cy = int(x[0]), int(x[1])
+        else:
+            cx, cy = int(x), int(y)
+        self._directives.append(_GoalPosDirective(x=cx, y=cy))
+
+    # ------------------------------------------------------------------
+    # Wave17i: missing vendor methods
+    # Cite: vendor/minihack/minihack/level_generator.py add_altar/add_sink/
+    #       add_gold/add_boulder/add_mazewalk.
+    # ------------------------------------------------------------------
+    def add_altar(
+        self,
+        place: Place = None,
+        align: str = "noalign",
+        type: str = "altar",
+    ) -> None:
+        """Place an altar tile.  Vendor add_altar(place, align, type)."""
+        del align, type  # nethax has a single altar tile
+        # Resolve a concrete (x, y) at factory time; here we emit a
+        # FillTerrainDirective covering a 1×1 region.
+        if isinstance(place, tuple) and len(place) == 2:
+            x, y = int(place[0]), int(place[1])
+            self._directives.append(_FillTerrainDirective(
+                terrain="\\",  # backslash maps to THRONE; altar uses '_' which
+                                # we substitute via an inline directive below.
+                x1=x, y1=y, x2=x, y2=y,
+            ))
+            # Replace the throne tile with ALTAR via a direct override
+            # directive (handled by writing the proper tile in pass 2).
+            self._directives.append(_AltarOverride(x=x, y=y))
+        else:
+            self._directives.append(_AltarOverride(x=-1, y=-1, place=place))
+
+    def add_sink(self, place: Place = None) -> None:
+        """Place a sink (vendor add_sink).  nethax uses FOUNTAIN as a stand-in
+        because no dedicated SINK tile exists yet."""
+        if isinstance(place, tuple) and len(place) == 2:
+            x, y = int(place[0]), int(place[1])
+            self._directives.append(_FillTerrainDirective(
+                terrain="{", x1=x, y1=y, x2=x, y2=y,
+            ))
+        else:
+            self._directives.append(_SinkOverride(place=place))
+
+    def add_gold(
+        self,
+        amount: int = 1,
+        place: Place = None,
+    ) -> None:
+        """Spawn a gold pile.  Vendor add_gold(amount, place=(x, y))."""
+        # Gold maps to OBJECTS table entry "gold piece".
+        # We dispatch through the existing _ObjectDirective with a custom
+        # quantity annotation.
+        self._directives.append(_GoldDirective(amount=int(amount), place=place))
+
+    def add_boulder(self, place: Place = None) -> None:
+        """Add a boulder.  Vendor add_boulder(place=(x, y))."""
+        # Reuse add_object: vendor "boulder" exists in OBJECTS.
+        self._directives.append(_ObjectDirective(
+            name="boulder", symbol=None, place=place, cursestate="uncursed",
+        ))
+
+    def add_mazewalk(
+        self,
+        coord=None,
+        dir: str = "east",
+    ) -> None:
+        """Carve a recursive-backtracker maze starting at ``coord``.
+
+        Vendor MAZEWALK directive (level_generator.py + dat/lib des-file
+        ``MAZEWALK: place,dir``) carves a perfect maze across the entire
+        map starting from ``coord`` and propagating in ``dir``.
+
+        nethax implementation (Wave17i): records a directive that triggers
+        a recursive-backtracker carve in the factory pass (replaces the
+        legacy "open room" stand-in in canonical.py:175-186).
+        """
+        if isinstance(coord, tuple) and len(coord) == 2:
+            x, y = int(coord[0]), int(coord[1])
+        else:
+            x, y = 0, 0
+        self._directives.append(_MazeWalkDirective(
+            x=x, y=y, direction=str(dir),
+        ))
 
     # ---- Factory --------------------------------------------------------
 
@@ -521,6 +692,50 @@ def _apply_directives(
                 ground, stack_index, pos_rc, obj_idx,
             )
             lg.last_object_entry_ids.append(obj_idx)
+        elif isinstance(d, _AltarOverride):
+            # Place an ALTAR tile.  Resolve coordinates if needed.
+            if d.x >= 0 and d.y >= 0:
+                row, col = d.y, d.x
+            else:
+                rc = _resolve_place(
+                    d.place, terrain_np, w, h, resolved_rooms, _next_key,
+                )
+                if rc is None:
+                    continue
+                row, col = rc
+            terrain_np = _set_tile(
+                terrain_np, row, col, int(TileType.ALTAR), w, h,
+            )
+        elif isinstance(d, _SinkOverride):
+            # No dedicated SINK tile in nethax — use FOUNTAIN as analogue.
+            rc = _resolve_place(
+                d.place, terrain_np, w, h, resolved_rooms, _next_key,
+            )
+            if rc is None:
+                continue
+            terrain_np = _set_tile(
+                terrain_np, rc[0], rc[1], int(TileType.FOUNTAIN), w, h,
+            )
+        elif isinstance(d, _GoldDirective):
+            # Gold pile — emit as a ground item with type "gold piece".
+            gold_idx = _OBJECT_NAME_TO_IDX.get(
+                "gold piece", _OBJECT_NAME_TO_IDX.get("gold", 0),
+            )
+            rc = _resolve_place(
+                d.place, terrain_np, w, h, resolved_rooms, _next_key,
+            )
+            if rc is None:
+                continue
+            ground, stack_index = _write_ground_item(
+                ground, stack_index, rc, gold_idx,
+            )
+            lg.last_object_entry_ids.append(gold_idx)
+        elif isinstance(d, _MazeWalkDirective):
+            # Wave17i: recursive-backtracker maze starting at (d.x, d.y).
+            # Carves CORRIDOR tiles through a WALL-filled region.
+            terrain_np = _carve_maze(
+                terrain_np, d.x, d.y, w, h, _next_key,
+            )
         else:
             # Defensive: an unknown directive class signals a programming bug.
             raise RuntimeError(f"unhandled directive type: {type(d).__name__}")
@@ -911,3 +1126,92 @@ def _write_ground_item(
     new_stack = dict(stack_index)
     new_stack[key] = depth + 1
     return new_ground, new_stack
+
+
+# ---------------------------------------------------------------------------
+# Wave17i: recursive-backtracker maze carver for ``add_mazewalk``.
+# Cite: vendor MiniHack uses NetHack's MAZEWALK des-file directive which
+# triggers a recursive maze dig in mklev.c::makemaz / sp_lev.c::create_maze.
+# We approximate the layout with a standard recursive-backtracker on a
+# grid that walks in 2-cell strides (the same algorithm used by NetHack's
+# walkfrom in mklev.c).
+# ---------------------------------------------------------------------------
+
+
+def _carve_maze(
+    terrain_np: jax.Array,
+    start_x: int,
+    start_y: int,
+    w: int,
+    h: int,
+    next_key,
+) -> jax.Array:
+    """Recursive-backtracker maze carve into the (h, w) top-left subregion.
+
+    The maze is carved with WALL tiles separating CORRIDOR cells.  We walk in
+    2-cell steps so each "stride" carves both the bridge cell and the target
+    cell, matching the vendor's walkfrom() behaviour
+    (vendor/nethack/src/mklev.c::walkfrom).
+
+    Args:
+        terrain_np: current terrain array.
+        start_x:    starting column.
+        start_y:    starting row.
+        w, h:       active map extent.
+        next_key:   PRNG factory for shuffling neighbour order.
+
+    Returns:
+        terrain_np with maze carved in.
+    """
+    import numpy as _np
+
+    # Materialise the sub-region into a host-side numpy array for the
+    # iterative carve (this entire function runs at Python init time, so
+    # converting to numpy is fine).
+    sub = _np.asarray(terrain_np[0, 0, :h, :w])
+    wall = int(TileType.WALL)
+    corridor = int(TileType.CORRIDOR)
+    # Fill with WALL first.
+    sub = _np.full_like(sub, wall, dtype=sub.dtype)
+
+    sx = max(0, min(int(start_x), w - 1))
+    sy = max(0, min(int(start_y), h - 1))
+    # Align to odd coords so the 2-stride walk stays in-bounds.
+    if sx % 2 == 0:
+        sx = min(w - 1, sx + 1)
+    if sy % 2 == 0:
+        sy = min(h - 1, sy + 1)
+
+    visited = _np.zeros((h, w), dtype=_np.bool_)
+    stack = [(sy, sx)]
+    visited[sy, sx] = True
+    sub[sy, sx] = corridor
+
+    # Use jax PRNG to derive a seed for the host-side shuffle so the
+    # function stays deterministic with respect to the input key.
+    key = next_key()
+    rng_seed = int(jax.random.randint(key, (), 0, 2**31 - 1))
+    pyrng = _np.random.RandomState(rng_seed)
+
+    while stack:
+        r, c = stack[-1]
+        neighbours = []
+        for dr, dc in ((-2, 0), (2, 0), (0, -2), (0, 2)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+                neighbours.append((nr, nc, dr, dc))
+        if not neighbours:
+            stack.pop()
+            continue
+        idx = pyrng.randint(0, len(neighbours))
+        nr, nc, dr, dc = neighbours[idx]
+        # Carve bridge cell + neighbour.
+        br, bc = r + dr // 2, c + dc // 2
+        sub[br, bc] = corridor
+        sub[nr, nc] = corridor
+        visited[nr, nc] = True
+        stack.append((nr, nc))
+
+    # Write the carved sub-region back.
+    new_terrain = terrain_np.at[0, 0, :h, :w].set(jnp.asarray(sub))
+    return new_terrain

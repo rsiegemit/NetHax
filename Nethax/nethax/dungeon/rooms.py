@@ -310,6 +310,186 @@ def generate_rooms(
     ), active_f
 
 
+# ---------------------------------------------------------------------------
+# Wave 17f — Special-room assignment
+#
+# Vendor (vendor/nethack/src/mklev.c::makelevel lines 1344-1376) makes up to
+# one special room per level, with type-dependent probability gated on
+# u_depth.  The cascade is:
+#
+#   u_depth > 1  & rn2(u_depth) < 3 → SHOPBASE  (shop)
+#   u_depth > 4  & !rn2(6)          → COURT
+#   u_depth > 5  & !rn2(8)          → LEPREHALL
+#   u_depth > 6  & !rn2(7)          → ZOO
+#   u_depth > 8  & !rn2(5)          → TEMPLE
+#   u_depth > 9  & !rn2(5)          → BEEHIVE
+#   u_depth > 11 & !rn2(6)          → MORGUE
+#   u_depth > 12 & !rn2(8)          → ANTHOLE
+#   u_depth > 14 & !rn2(4)          → BARRACKS
+#   u_depth > 15 & !rn2(6)          → SWAMP
+#   u_depth > 16 & !rn2(8)          → COCKNEST
+#
+# The table below encodes (depth_gate, rn2_modulus, room_type) tuples so
+# `assign_special_room` can walk them in vendor order under JIT.
+# ---------------------------------------------------------------------------
+
+# (min_depth_exclusive, rn2_modulus, room_type)  — vendor order matters.
+_ROOM_PROBS = (
+    (1,  None, int(RoomType.SHOPBASE)),    # special: rn2(u_depth) < 3
+    (4,  6,    int(RoomType.COURT)),
+    (5,  8,    int(RoomType.LEPREHALL)),
+    (6,  7,    int(RoomType.ZOO)),
+    (8,  5,    int(RoomType.TEMPLE)),
+    (9,  5,    int(RoomType.BEEHIVE)),
+    (11, 6,    int(RoomType.MORGUE)),
+    (12, 8,    int(RoomType.ANTHOLE)),
+    (14, 4,    int(RoomType.BARRACKS)),
+    (15, 6,    int(RoomType.SWAMP)),
+    (16, 8,    int(RoomType.COCKNEST)),
+)
+
+
+def assign_special_room(
+    rng: jnp.ndarray,
+    rooms: Room,
+    active: jnp.ndarray,
+    u_depth: int,
+) -> Room:
+    """Assign at most one special room per level following vendor mklev.c.
+
+    Vendor (mklev.c lines 1344-1376): walk the table in order; first
+    matching depth + rn2 success picks the room type.  Then mkshop /
+    mkzoo / mktemple / mkswamp pick the *first* active OROOM slot and
+    flip its rtype.
+
+    JIT-pure: uses jnp.where on the room_type array and walks the table
+    via Python iteration (table is static, so the loop unrolls).
+
+    Args:
+        rng:     JAX PRNG key.
+        rooms:   Room pytree (room_type currently all ORDINARY).
+        active: bool[MAX_ROOMS_PER_LEVEL] mask.
+        u_depth: 1-based depth in dungeon (compile-time int).
+
+    Returns:
+        Updated Room pytree with at most one slot flipped to a special type.
+    """
+    rng, key_pick = jax.random.split(rng)
+    # First active slot index (vendor: scan svr.rooms[0..nroom] for OROOM).
+    first_active_idx = jnp.argmax(active).astype(jnp.int32)
+    any_active = jnp.any(active)
+
+    # Build a single int32 "chosen_type" via vendor cascade.  Walks the
+    # static _ROOM_PROBS table; first hit wins (later cases skipped).
+    chosen = jnp.int32(int(RoomType.ORDINARY))
+    decided = jnp.bool_(False)
+
+    keys = jax.random.split(key_pick, len(_ROOM_PROBS))
+    for i, (min_depth, modulus, rtype) in enumerate(_ROOM_PROBS):
+        depth_ok = u_depth > min_depth
+        if modulus is None:
+            # SHOPBASE special case: rn2(u_depth) < 3
+            roll = jax.random.randint(keys[i], (), 0,
+                                       max(int(u_depth), 1),
+                                       dtype=jnp.int32)
+            pass_ = depth_ok & (roll < jnp.int32(3))
+        else:
+            roll = jax.random.randint(keys[i], (), 0, modulus, dtype=jnp.int32)
+            pass_ = depth_ok & (roll == jnp.int32(0))   # !rn2(modulus)
+        take = pass_ & ~decided
+        chosen = jnp.where(take, jnp.int32(rtype), chosen)
+        decided = decided | take
+
+    do_assign = decided & any_active
+    new_room_type = jnp.where(
+        do_assign,
+        rooms.room_type.at[first_active_idx].set(chosen.astype(jnp.int8)),
+        rooms.room_type,
+    )
+    return rooms.replace(room_type=new_room_type)
+
+
+def fill_special_room(
+    rng: jnp.ndarray,
+    rooms: Room,
+    active: jnp.ndarray,
+    terrain: jnp.ndarray,
+) -> jnp.ndarray:
+    """Apply the per-type fill pass for whichever room is flagged special.
+
+    Vendor (mkroom.c::do_mkroom):
+      mkshop          — picks random shop type; floor unchanged.
+      mkzoo(COURT)    — places throne tile at room center.
+      mkzoo(ZOO/MORGUE/...) — sets has_*; tile fill done at monster spawn.
+      mkswamp         — converts alternating interior cells to POOL.
+      mktemple        — places ALTAR at shrine_pos (room center).
+
+    This JAX implementation:
+      * COURT  → set room center to THRONE.
+      * TEMPLE → set room center to ALTAR.
+      * SWAMP  → set (sx + sy) % 2 == 1 interior cells to POOL (vendor 554).
+    All other special types are tile-fill no-ops here (monsters/items are
+    populated by the spawning subsystem when the room is first entered).
+
+    Args:
+        rng:     JAX PRNG key (currently unused — fill is deterministic).
+        rooms:   Room pytree (with room_type set by assign_special_room).
+        active:  bool[MAX_ROOMS_PER_LEVEL] mask.
+        terrain: int8[MAP_H, MAP_W] terrain map.
+
+    Returns:
+        Updated terrain int8[MAP_H, MAP_W].
+    """
+    from Nethax.nethax.constants.tiles import TileType
+    h, w = terrain.shape
+    THRONE = jnp.int8(int(TileType.THRONE))
+    ALTAR  = jnp.int8(int(TileType.ALTAR))
+    POOL   = jnp.int8(int(TileType.POOL))
+    FLOOR  = jnp.int8(int(TileType.FLOOR))
+
+    def fill_one(terrain_, i):
+        y1 = rooms.y1[i].astype(jnp.int32)
+        x1 = rooms.x1[i].astype(jnp.int32)
+        y2 = rooms.y2[i].astype(jnp.int32)
+        x2 = rooms.x2[i].astype(jnp.int32)
+        rt = rooms.room_type[i].astype(jnp.int32)
+        act = active[i]
+
+        # Centre point (vendor shrine_pos / court throne).
+        cy = ((y1 + y2) // 2).astype(jnp.int32)
+        cx = ((x1 + x2) // 2).astype(jnp.int32)
+        cy_safe = jnp.clip(cy, 0, h - 1)
+        cx_safe = jnp.clip(cx, 0, w - 1)
+
+        is_court  = act & (rt == jnp.int32(int(RoomType.COURT)))
+        is_temple = act & (rt == jnp.int32(int(RoomType.TEMPLE)))
+        is_swamp  = act & (rt == jnp.int32(int(RoomType.SWAMP)))
+
+        # COURT: throne at centre (mkroom.c:421-423).
+        center_val = terrain_[cy_safe, cx_safe]
+        new_center = jnp.where(is_court, THRONE,
+                     jnp.where(is_temple, ALTAR, center_val))
+        terrain_ = terrain_.at[cy_safe, cx_safe].set(new_center)
+
+        # SWAMP: alternating floor cells → POOL (mkroom.c:554, sx + sy % 2).
+        rows = jnp.arange(h, dtype=jnp.int32)
+        cols = jnp.arange(w, dtype=jnp.int32)
+        row_mask = (rows >= y1) & (rows <= y2)
+        col_mask = (cols >= x1) & (cols <= x2)
+        interior = row_mask[:, None] & col_mask[None, :]
+        # parity = (r + c) % 2 == 1 (vendor: (sx + sy) % 2)
+        rr, cc = jnp.meshgrid(rows, cols, indexing="ij")
+        parity = ((rr + cc) % jnp.int32(2)) == jnp.int32(1)
+        swamp_mask = is_swamp & interior & parity & (terrain_ == FLOOR)
+        terrain_ = jnp.where(swamp_mask, POOL, terrain_)
+        return terrain_, None
+
+    terrain_out, _ = lax.scan(
+        fill_one, terrain, jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32)
+    )
+    return terrain_out
+
+
 def carve_rooms_into_terrain(
     terrain: jnp.ndarray,
     rooms: Room,

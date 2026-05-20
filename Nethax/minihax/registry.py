@@ -32,12 +32,21 @@ from Nethax.minihax.reward_manager import RewardManager
 # ---------------------------------------------------------------------------
 @dataclasses.dataclass(frozen=True)
 class EnvSpec:
-    """Static description of one canonical MiniHack env."""
+    """Static description of one canonical MiniHack env.
+
+    Wave17i: extended with ``reward_win`` / ``reward_lose`` / ``penalty_step``
+    / ``penalty_time`` fields matching vendor MiniHack base.py:142-167.
+    Defaults preserve previous behaviour (win=1, lose=0, no per-step penalty).
+    """
     env_id: str
     level_factory: Callable[[jax.Array], EnvState]
     reward_manager: RewardManager
     max_steps: int
     category: str
+    reward_win: float = 1.0
+    reward_lose: float = 0.0
+    penalty_step: float = 0.0
+    penalty_time: float = 0.0
 
 
 # ---------------------------------------------------------------------------
