@@ -299,6 +299,65 @@ def put_on_ring(state, rng: jax.Array, slot_idx: int, hand: int):
             status=add_timed(state.status, TimedStatus.HUNGER_RING, 999)
         )
 
+    # Use-identification: wearing an observably-effecting ring discovers its
+    # type via learnring → makeknown(obj->otyp).
+    # Cite: vendor/nethack/src/do_wear.c::Ring_on lines 1242-1344 — calls
+    # learnring(obj, TRUE) when the wear has an observable effect (invisibility,
+    # see-invisible, levitation, +N protection where N!=0, stat adjustments via
+    # adjust_attrib, and the always-observable extrinsic-granters like
+    # regeneration/warning/conflict/teleport/teleport-control/polymorph-control/
+    # slow-digestion/aggravate-monster).
+    # vendor hack.h:1530 #define makeknown(x) discover_object((x),TRUE,TRUE,TRUE).
+    _OBSERVABLE_RINGS = {
+        RingEffect.INVISIBILITY,
+        RingEffect.SEE_INVISIBLE,
+        RingEffect.LEVITATION,
+        RingEffect.REGENERATION,
+        RingEffect.WARNING,
+        RingEffect.CONFLICT,
+        RingEffect.TELEPORTATION,
+        RingEffect.TELEPORT_CONTROL,
+        RingEffect.POLYMORPH_CONTROL,
+        RingEffect.SLOW_DIGESTION,
+        RingEffect.AGGRAVATE_MONSTER,
+        RingEffect.GAIN_STRENGTH,
+        RingEffect.GAIN_CONSTITUTION,
+        RingEffect.ADORNMENT,
+        RingEffect.INCREASE_ACCURACY,
+        RingEffect.INCREASE_DAMAGE,
+    }
+    is_observable_static = ring_effect in _OBSERVABLE_RINGS
+    # Protection only learns when spe != 0 (vendor do_wear.c:1338).
+    is_protection_observable = (
+        ring_effect == RingEffect.PROTECTION and enchantment != 0
+    )
+    if is_observable_static or is_protection_observable:
+        # Index the per-type identification mask by the wearing ring's
+        # canonical objects-table type_id (not the RingEffect sub-index).
+        raw_type_arr = state.inventory.items.type_id
+        otyp = (
+            raw_type_arr[slot_idx].astype(jnp.int32)
+            if raw_type_arr.ndim > 0
+            else jnp.asarray(raw_type_arr, dtype=jnp.int32)
+        )
+        type_mask = state.identification.identified
+        safe_otyp = jnp.clip(
+            otyp, jnp.int32(0), jnp.int32(type_mask.shape[0] - 1)
+        )
+        new_type_mask = type_mask.at[safe_otyp].set(jnp.bool_(True))
+        # Also flip the per-item identified flag (vendor learnring also
+        # sets obj->dknown, which is the per-item analogue).
+        items_id = state.inventory.items.identified
+        new_items_id = items_id.at[slot_idx].set(jnp.bool_(True))
+        state = state.replace(
+            inventory=state.inventory.replace(
+                items=state.inventory.items.replace(identified=new_items_id),
+            ),
+            identification=state.identification.replace(
+                identified=new_type_mask
+            ),
+        )
+
     return state
 
 

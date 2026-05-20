@@ -773,7 +773,19 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     buc_status  = inv_state.items.buc_status[safe_idx].astype(jnp.int32)
     enchantment = inv_state.items.enchantment[safe_idx].astype(jnp.int32)
     charges     = inv_state.items.charges[safe_idx].astype(jnp.int32)
-    identified  = inv_state.items.identified[safe_idx]
+    # Identification gate: vendor xname (objnam.c:208) uses the per-type
+    # ``ocl->oc_name_known`` as the primary gate; per-item ``dknown``/``known``
+    # only modulate enchantment/BUC display.  We OR the per-item identified
+    # flag with the per-type ``state.identification.identified[type_id]`` so
+    # items of a type discovered via learnwand/learnring/learnscroll/learnpotion
+    # render with their canonical name.
+    # Cite: vendor/nethack/src/objnam.c::xname line 208 ``nn = ocl->oc_name_known``.
+    _per_item_id   = inv_state.items.identified[safe_idx]
+    _type_mask     = id_state.identified
+    _safe_otyp     = jnp.clip(type_id, jnp.int32(0),
+                              jnp.int32(_type_mask.shape[0] - 1))
+    _per_type_id   = _type_mask[_safe_otyp]
+    identified  = _per_item_id | _per_type_id
     quantity    = inv_state.items.quantity[safe_idx].astype(jnp.int32)
     # recharged: vendor obj.h recharged field -- recharge counter for wands.
     # vendor/nethack/src/objnam.c:1486: ConcatF2(bp,0," (%d:%d)",(int)obj->recharged,obj->spe)

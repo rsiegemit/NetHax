@@ -1336,15 +1336,32 @@ def _handle_zap(state, rng):
 
     # Use-identification: zapping a wand identifies its type, vendor
     # zap.c:123-147 learnwand(otmp) → makeknown(obj->otyp).
-    # Flip identified=True on the wand slot we just zapped.
+    # Flip identified=True on the wand slot we just zapped AND on the
+    # per-type oc_name_known mask in state.identification.identified so
+    # all future wands of this type render with their true name
+    # (objnam.c::xname line 208 ``nn = ocl->oc_name_known``).
+    # Cite: vendor/nethack/src/zap.c::learnwand lines 123-147 →
+    #       makeknown(obj->otyp) (hack.h:1530 discover_object).
+    has_wand = jnp.any(is_wand_slot)
     new_id_flags = final_state.inventory.items.identified.at[w_slot].set(
-        jnp.where(jnp.any(is_wand_slot), jnp.bool_(True),
+        jnp.where(has_wand, jnp.bool_(True),
                   final_state.inventory.items.identified[w_slot])
+    )
+    # Per-type makeknown via identification.learn_by_use.
+    zapped_otyp = state.inventory.items.type_id[w_slot].astype(jnp.int32)
+    type_mask   = final_state.identification.identified
+    safe_otyp   = jnp.clip(zapped_otyp, jnp.int32(0),
+                           jnp.int32(type_mask.shape[0] - 1))
+    new_type_mask = type_mask.at[safe_otyp].set(
+        jnp.where(has_wand, jnp.bool_(True), type_mask[safe_otyp])
     )
     final_state = final_state.replace(
         inventory=final_state.inventory.replace(
             items=final_state.inventory.items.replace(identified=new_id_flags)
-        )
+        ),
+        identification=final_state.identification.replace(
+            identified=new_type_mask
+        ),
     )
 
     return final_state

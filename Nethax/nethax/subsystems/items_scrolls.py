@@ -1532,6 +1532,29 @@ def read_scroll(state, rng, slot_idx):
             sane_state,
         )
 
+        # Use-identification: on any successful read, discover the scroll
+        # type — vendor/nethack/src/read.c::doread lines 635-641 calls
+        # learnscroll(scroll) → makeknown(otyp) after seffects() succeeds.
+        # We mirror this by flipping both the per-item flag and the
+        # per-type oc_name_known mask (state.identification.identified).
+        # vendor hack.h:1530 #define makeknown(x) discover_object((x),TRUE,...).
+        new_items_id = new_state.inventory.items.identified.at[_slot_idx].set(
+            jnp.bool_(True)
+        )
+        type_mask = new_state.identification.identified
+        safe_otyp = jnp.clip(
+            type_id, jnp.int32(0), jnp.int32(type_mask.shape[0] - 1)
+        )
+        new_type_mask = type_mask.at[safe_otyp].set(jnp.bool_(True))
+        new_state = new_state.replace(
+            inventory=new_state.inventory.replace(
+                items=new_state.inventory.items.replace(identified=new_items_id),
+            ),
+            identification=new_state.identification.replace(
+                identified=new_type_mask
+            ),
+        )
+
         # Decrement quantity; clear category when exhausted.
         old_qty  = new_state.inventory.items.quantity[_slot_idx]
         new_qty  = jnp.maximum(old_qty - jnp.int16(1), jnp.int16(0))
