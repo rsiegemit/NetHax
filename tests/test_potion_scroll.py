@@ -248,7 +248,15 @@ def test_magic_mapping_reveals_entire_level():
 
 
 def test_remove_curse_uncurses_items():
-    """scroll of remove curse → cursed items become uncursed."""
+    """scroll of remove curse (uncursed) → uncurses worn/wielded items only.
+
+    Vendor seffect_remove_curse (read.c:1505-1602):
+      uncursed → uncurse worn+wielded items only
+      blessed  → uncurse ALL inventory items + unpunish
+
+    Slot 1 weapon must be wielded for the uncursed scroll to affect it.
+    Slot 2 weapon stays in pack and remains cursed.
+    """
     # Slot 0: scroll of remove curse (uncursed)
     scroll_type_id = _SCROLL_BASE_ID + int(ScrollEffect.REMOVE_CURSE)
     scroll = make_item(
@@ -257,21 +265,62 @@ def test_remove_curse_uncurses_items():
         quantity=1,
         buc_status=_BUC_UNCURSED,
     )
-    # Slot 1: a cursed weapon
-    cursed_weapon = make_item(
+    # Slot 1: a cursed weapon (will be wielded)
+    wielded_cursed_weapon = make_item(
         category=int(ItemCategory.WEAPON),
         type_id=1,
         quantity=1,
         buc_status=_BUC_CURSED,
     )
-    state  = EnvState.default(_RNG)
-    state  = state.replace(
-        inventory=InventoryState.from_items([scroll, cursed_weapon])
+    # Slot 2: another cursed weapon (in pack, not worn)
+    packed_cursed_weapon = make_item(
+        category=int(ItemCategory.WEAPON),
+        type_id=2,
+        quantity=1,
+        buc_status=_BUC_CURSED,
+    )
+    state = EnvState.default(_RNG)
+    inv   = InventoryState.from_items(
+        [scroll, wielded_cursed_weapon, packed_cursed_weapon]
+    )
+    inv   = inv.replace(wielded=jnp.int8(1))
+    state = state.replace(inventory=inv)
+    result = read_scroll(state, _RNG, 0)
+    # Wielded weapon (slot 1) gets uncursed.
+    assert int(result.inventory.items.buc_status[1]) != _BUC_CURSED, (
+        "Wielded item at slot 1 should be uncursed by uncursed scroll; "
+        f"buc={int(result.inventory.items.buc_status[1])}"
+    )
+    # Pack weapon (slot 2) remains cursed under vendor worn-only scope.
+    assert int(result.inventory.items.buc_status[2]) == _BUC_CURSED, (
+        "Unworn item at slot 2 must stay cursed under vendor worn-only "
+        f"scope; buc={int(result.inventory.items.buc_status[2])}"
+    )
+
+
+def test_remove_curse_blessed_uncurses_all_inventory():
+    """blessed scroll of remove curse → uncurses ALL inventory items."""
+    scroll_type_id = _SCROLL_BASE_ID + int(ScrollEffect.REMOVE_CURSE)
+    scroll = make_item(
+        category=int(ItemCategory.SCROLL),
+        type_id=scroll_type_id,
+        quantity=1,
+        buc_status=_BUC_BLESSED,
+    )
+    packed_cursed_weapon = make_item(
+        category=int(ItemCategory.WEAPON),
+        type_id=2,
+        quantity=1,
+        buc_status=_BUC_CURSED,
+    )
+    state = EnvState.default(_RNG)
+    state = state.replace(
+        inventory=InventoryState.from_items([scroll, packed_cursed_weapon])
     )
     result = read_scroll(state, _RNG, 0)
-    after_buc = int(result.inventory.items.buc_status[1])
-    assert after_buc != _BUC_CURSED, (
-        f"Item at slot 1 should not be cursed after remove-curse; buc={after_buc}"
+    assert int(result.inventory.items.buc_status[1]) != _BUC_CURSED, (
+        "Blessed remove-curse should uncurse pack items too; "
+        f"buc={int(result.inventory.items.buc_status[1])}"
     )
 
 
@@ -379,10 +428,25 @@ def test_scroll_decrements_quantity():
 
 
 def test_teleportation_moves_player():
-    """scroll of teleportation → player_pos changes."""
+    """scroll of teleportation → player_pos changes.
+
+    Vendor seffect_teleportation rejection-samples to a walkable
+    (FLOOR/CORRIDOR) tile; default EnvState terrain is all VOID, so we
+    must paint a floor swath before reading the scroll or the player
+    stays put (no valid landing site).
+    """
+    from Nethax.nethax.constants.tiles import TileType
     state  = _state_with_scroll(ScrollEffect.TELEPORTATION)
     state  = state.replace(
         player_pos=jnp.array([10, 10], dtype=jnp.int16)
+    )
+    # Paint the current level fully walkable so rejection sampling
+    # can find a destination.
+    b  = int(state.dungeon.current_branch)
+    lv = int(state.dungeon.current_level) - 1
+    floor_level = jnp.full_like(state.terrain[b, lv], int(TileType.FLOOR))
+    state = state.replace(
+        terrain=state.terrain.at[b, lv].set(floor_level)
     )
     # Run a few times to reduce flakiness (random pos might land on same tile).
     moved = False

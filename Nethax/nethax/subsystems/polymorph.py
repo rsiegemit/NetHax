@@ -299,6 +299,237 @@ def _build_form_flags2() -> jnp.ndarray:
 _FORM_FLAGS2: jnp.ndarray = _build_form_flags2()
 
 
+# ---------------------------------------------------------------------------
+# Vendor-byte-equal monster-form lookup tables for polymon HP/STR/intrinsics
+# Cite: vendor/nethack/src/polyself.c:735 (polymon HP formula),
+#       vendor/nethack/src/makemon.c:2233 (golemhp table),
+#       vendor/nethack/src/mondata.c:80   (poly_when_stoned),
+#       vendor/nethack/src/polyself.c:75-110 (PROPSET adoption set).
+# ---------------------------------------------------------------------------
+
+# Vendor PM_ indices used by polymon (extracted from
+# Nethax/nethax/constants/monster_entries/chunk*.py).
+PM_GRAY_DRAGON: int   = 147   # chunk3.py:331 — first chromatic dragon
+PM_YELLOW_DRAGON: int = 156   # chunk3.py:501 — last chromatic dragon
+PM_STONE_GOLEM: int   = 265   # chunk5.py:131 — vendor PM_STONE_GOLEM
+
+# golemhp(type) lookup table — exact vendor values from makemon.c:2233.
+_GOLEM_HP_BY_PM: dict[int, int] = {
+    256: 20,   # PM_STRAW_GOLEM
+    257: 20,   # PM_PAPER_GOLEM
+    258: 30,   # PM_ROPE_GOLEM
+    259: 60,   # PM_GOLD_GOLEM
+    261: 40,   # PM_LEATHER_GOLEM
+    262: 50,   # PM_WOOD_GOLEM
+    263: 40,   # PM_FLESH_GOLEM
+    264: 70,   # PM_CLAY_GOLEM
+    265: 100,  # PM_STONE_GOLEM
+    266: 80,   # PM_GLASS_GOLEM
+    267: 120,  # PM_IRON_GOLEM
+}
+
+
+def _build_form_strongmonst() -> jnp.ndarray:
+    """bool[N_MONSTERS]: True iff form has M2_STRONG flag.
+
+    vendor/nethack/src/polyself.c:821 — strongmonst(&mons[mntmp]) test;
+    if true, ABASE(STR)=AMAX(STR)=newMaxStr (=STR18/100, or 25 for giants).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, M2_STRONG
+    return jnp.array(
+        [bool(m.flags2 & M2_STRONG) for m in MONSTERS], dtype=jnp.bool_,
+    )
+
+
+_FORM_STRONGMONST: jnp.ndarray = _build_form_strongmonst()
+
+
+def _build_form_is_giant() -> jnp.ndarray:
+    """bool[N_MONSTERS]: True iff form is a giant (STR cap = 25 in vendor).
+
+    vendor/nethack/include/mondata.h is_giant: ptr->mlet == S_GIANT (S=20).
+    Cite: vendor/nethack/src/polyself.c uasmon_maxStr — giants get 25.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
+    return jnp.array(
+        [m.symbol == MonsterSymbol.S_GIANT for m in MONSTERS], dtype=jnp.bool_,
+    )
+
+
+_FORM_IS_GIANT: jnp.ndarray = _build_form_is_giant()
+
+
+def _build_form_is_golem() -> jnp.ndarray:
+    """bool[N_MONSTERS]: True iff form is a golem (mlet == S_GOLEM).
+
+    vendor/nethack/include/mondata.h:108 — #define is_golem(ptr) ((ptr)->mlet == S_GOLEM).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
+    return jnp.array(
+        [m.symbol == MonsterSymbol.S_GOLEM for m in MONSTERS], dtype=jnp.bool_,
+    )
+
+
+_FORM_IS_GOLEM: jnp.ndarray = _build_form_is_golem()
+
+
+def _build_form_is_dragon() -> jnp.ndarray:
+    """bool[N_MONSTERS]: True iff form is an adult dragon (S_DRAGON,
+    PM_GRAY_DRAGON..PM_YELLOW_DRAGON range).  Babies excluded.
+
+    Cite: vendor/nethack/src/polyself.c:860 — mlet == S_DRAGON && mntmp >= PM_GRAY_DRAGON.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
+    result = []
+    for i, m in enumerate(MONSTERS):
+        is_adult = (m.symbol == MonsterSymbol.S_DRAGON
+                    and PM_GRAY_DRAGON <= i <= PM_YELLOW_DRAGON)
+        result.append(is_adult)
+    return jnp.array(result, dtype=jnp.bool_)
+
+
+_FORM_IS_ADULT_DRAGON: jnp.ndarray = _build_form_is_dragon()
+
+
+def _build_form_is_home_elemental() -> jnp.ndarray:
+    """bool[N_MONSTERS]: True iff form is a home (Plane) elemental.
+
+    vendor/nethack/src/mondata.c::is_home_elemental — Plane-of-X resident
+    elementals (fire/water/air/earth) on their respective Planes.  We
+    approximate via M2_ELEMENTAL flag if present, else off (Planes-of-X
+    are postgame).  Field gated by polymon's branch but currently always
+    False since nethax flags do not record M2_ELEMENTAL distinctly.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
+    # Vendor: elementals are mlet==S_ELEMENTAL; "home" means the player is
+    # on the matching Plane (e.g. fire elemental on Plane of Fire).  Since
+    # nethax does not currently model the Planes, we return False everywhere;
+    # the *3 multiplier is left dormant until Plane state lands.
+    _ = MONSTERS, MonsterSymbol  # silence linters
+    return jnp.zeros((len(MONSTERS),), dtype=jnp.bool_)
+
+
+_FORM_IS_HOME_ELEMENTAL: jnp.ndarray = _build_form_is_home_elemental()
+
+
+def _build_form_golemhp() -> jnp.ndarray:
+    """int32[N_MONSTERS]: golemhp(form_idx) result, 0 for non-golems.
+
+    Cite: vendor/nethack/src/makemon.c:2233 (golemhp switch).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS
+    arr = [_GOLEM_HP_BY_PM.get(i, 0) for i in range(len(MONSTERS))]
+    return jnp.array(arr, dtype=jnp.int32)
+
+
+_FORM_GOLEM_HP: jnp.ndarray = _build_form_golemhp()
+
+
+# ---------------------------------------------------------------------------
+# Vendor PROPSET adoption table (polyself.c:88-109)
+#
+# For each form, pre-compute the set of intrinsics that polymorphing into
+# that form should grant (PROPSET sets the FROMOUTSIDE bit on the property).
+# We store one bool[N_MONSTERS] table per property; status.intrinsics gets
+# updated accordingly inside polymorph_player.
+# ---------------------------------------------------------------------------
+
+def _build_form_props():
+    """Return a dict of bool[N_MONSTERS] arrays for each PROPSET property.
+
+    Properties cited (polyself.c:88-109):
+      TELEPORT       — can_teleport(mdat): M1_TPORT
+      LEVITATION     — is_floater(mdat):   M1_FLOAT
+      FLYING         — is_flyer(mdat) && !is_floater
+      SWIMMING       — is_swimmer(mdat):   M1_SWIM
+      PASSES_WALLS   — passes_walls(mdat): M1_WALLWALK
+      REGENERATION   — regenerates(mdat):  M1_REGEN
+      REFLECTING     — PM_SILVER_DRAGON
+      BLINDED        — !haseyes(mdat)
+      BLND_RES       — dmgtype(mdat, AD_BLND, AT_EXPL/AT_GAZE)
+      MAGIC_BREATHING — M1_AMPHIBIOUS or M1_BREATHLESS
+    """
+    from Nethax.nethax.constants.monsters import (
+        MONSTERS,
+        M1_TPORT, M1_FLY, M1_SWIM, M1_AMPHIBIOUS, M1_BREATHLESS,
+        M1_REGEN, MonsterSymbol,
+    )
+    # Vendor is_floater(ptr) := (ptr->mlet == S_EYE || ptr->mlet == S_LIGHT)
+    # (mondata.h:20).  There is no M1_FLOAT bit; floater-ness is symbol-based.
+    # M1_WALLWALK / M1_NOEYES bit positions (see constants/monsters.py:354,361)
+    M1_WALLWALK = 0x00000008
+    M1_NOEYES   = 0x00001000
+
+    n = len(MONSTERS)
+    teleport     = []
+    levitation   = []
+    flying       = []
+    swimming     = []
+    passes_walls = []
+    regeneration = []
+    reflecting   = []
+    blinded      = []
+    blnd_res     = []
+    magic_breath = []
+
+    # Silver dragon by name lookup
+    silver_dragon_idx = None
+    for i, m in enumerate(MONSTERS):
+        if m.name == "silver dragon":
+            silver_dragon_idx = i
+            break
+
+    from Nethax.nethax.constants.monsters import AttackType, DamageType
+    for i, m in enumerate(MONSTERS):
+        f1 = int(m.flags1)
+        is_tport  = bool(f1 & M1_TPORT)
+        # is_floater: mlet == S_EYE or S_LIGHT (mondata.h:20)
+        is_float  = m.symbol in (MonsterSymbol.S_EYE, MonsterSymbol.S_LIGHT)
+        is_fly    = bool(f1 & M1_FLY) and not is_float
+        is_swim   = bool(f1 & M1_SWIM)
+        is_wallw  = bool(f1 & M1_WALLWALK)
+        is_regen  = bool(f1 & M1_REGEN)
+        noeyes    = bool(f1 & M1_NOEYES)
+        # MAGICAL_BREATHING: amphibious or breathless
+        magbr     = bool(f1 & (M1_AMPHIBIOUS | M1_BREATHLESS))
+        # AD_BLND attacks via AT_EXPL or AT_GAZE → BLND_RES
+        has_blnd_atk = False
+        for a in m.attacks:
+            if int(a[1]) == int(DamageType.AD_BLND) and int(a[0]) in (
+                int(AttackType.AT_EXPL), int(AttackType.AT_GAZE),
+            ):
+                has_blnd_atk = True
+                break
+        is_silver = (silver_dragon_idx is not None and i == silver_dragon_idx)
+
+        teleport.append(is_tport)
+        levitation.append(is_float)
+        flying.append(is_fly)
+        swimming.append(is_swim)
+        passes_walls.append(is_wallw)
+        regeneration.append(is_regen)
+        reflecting.append(is_silver)
+        blinded.append(noeyes)
+        blnd_res.append(has_blnd_atk)
+        magic_breath.append(magbr)
+
+    return {
+        "TELEPORT":        jnp.array(teleport,     dtype=jnp.bool_),
+        "LEVITATION":      jnp.array(levitation,   dtype=jnp.bool_),
+        "FLYING":          jnp.array(flying,       dtype=jnp.bool_),
+        "SWIMMING":        jnp.array(swimming,     dtype=jnp.bool_),
+        "PASSES_WALLS":    jnp.array(passes_walls, dtype=jnp.bool_),
+        "REGEN":           jnp.array(regeneration, dtype=jnp.bool_),
+        "REFLECTING":      jnp.array(reflecting,   dtype=jnp.bool_),
+        "BLINDED":         jnp.array(blinded,      dtype=jnp.bool_),
+        "BLND_RES":        jnp.array(blnd_res,     dtype=jnp.bool_),
+        "MAGIC_BREATHING": jnp.array(magic_breath, dtype=jnp.bool_),
+    }
+
+
+_FORM_PROPS: dict = _build_form_props()
+
+
 def choose_random_polymorph_form(state, rng: jax.Array) -> jnp.ndarray:
     """Pick a random valid polymorph target form index.  JIT-pure.
 
@@ -664,7 +895,7 @@ def _recompute_ac(state, form_idx: jnp.ndarray):
 # Player polymorph  (src/polyself.c::polyself + polymon)
 # ---------------------------------------------------------------------------
 
-def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool):
+def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool = False):
     """Transform the player into a new monster form (full fidelity).
 
     Sequence (polyself.c::polyself → polymon):

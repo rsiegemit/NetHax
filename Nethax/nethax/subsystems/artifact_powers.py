@@ -17,17 +17,37 @@ Part C: special on-hit effects — Vorpal Blade beheading, Magicbane status effe
 Part D: Excalibur alignment damage.
         Cite: vendor/nethack/src/artifact.c::Wield_artifact_unaligned
 
+Part E (wave17a — 15 P0 byte-equal vendor parity entry points):
+    P0 #2  touch_artifact_blast              artifact.c:944-959
+    P0 #3  apply_tsurugi_slice               artifact.c:1551-1594
+    P0 #4  apply_carried_artifact_extrinsics artifact.c:set_artifact_intrinsic
+    P0 #5  apply_sceptre_dalign              artifact.c:1031-1034
+    P0 #6  apply_mitre_of_holiness           artifact.c:set_artifact_intrinsic
+    P0 #7  Mjollnir AD_ELEC broadened        _ARTIFACT_BONUS_TABLE
+    P0 #8  Excalibur PHYS(5,10) always       _ARTIFACT_BONUS_TABLE
+    P0 #9  magicbane_mb_hit (tier dmg)       artifact.c:1287-1298
+    P0 #10 magicbane_mb_hit (STUN/SCARE/...) artifact.c:1314-1406
+    P0 #11 touch_artifact_blast (generic)    artifact.c:908-974
+    P0 #12 mk_artifact                       artifact.c:171-309
+    P0 #13 artiexist_mark/check              artifact.c:70 (uniqueness)
+    P0 #14 mjollnir_throw_returns            artilist.h:97-108
+    P0 #15 stormbringer_drli_hit             artifact.c:1645-1721
+
 JIT-pure: artifact_bonus_damage uses only JAX ops.  apply_artifact_intrinsics
 is Python-side (called at wield/unwield time, not inside the per-step loop).
 
-Artifact indices (0-based) mirror wish.py _ARTIFACTS table:
+Artifact indices (0-based) mirror wish.py _ARTIFACTS table (wave17a):
     0  Excalibur        8   Vorpal Blade     22  Frost Brand
-    1  Snickersnee      10  Tsurugi          23  Fire Brand
-    3  Mjollnir         16  Mitre of Holiness 24  Dragonbane
-    5  Sting            21  Eye of Aethiopica 25  Demonbane
-    6  Orcrist          7   Magicbane (idx 7) 26  Werebane
-                                             27  Trollsbane
+    1  Snickersnee     10   Tsurugi          23  Fire Brand
+    2  Stormbringer    16   Mitre Holiness   24  Dragonbane
+    3  Mjollnir        21   Eye Aethiopica   25  Demonbane
+    5  Sting            7   Grayswandir      26  Werebane
+    6  Orcrist          9   Sceptre of Might 27  Trollsbane
                                              28  Grimtooth
+                                             29  Magicbane
+                                             30  Giantslayer
+                                             31  Ogresmasher
+                                             32  Sunsword
 """
 from __future__ import annotations
 
