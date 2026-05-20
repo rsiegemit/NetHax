@@ -459,15 +459,17 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
     monster_idx = jnp.argmax(monster_match).astype(jnp.int32)
     monster_present = jnp.any(monster_match)
     # Vendor hack.c:1925-1995 (domove_bump_mon / domove_attackmon_at) —
-    # peaceful and pet monsters are NOT auto-attacked on bump; vendor prompts
-    # for confirmation (y/n) and defaults to no. Nethax has no interactive
-    # prompt, so treat peaceful/tame bump as "do nothing" — the player neither
-    # moves nor attacks (player_in_trap-style noop).
+    # peaceful monsters are NOT auto-attacked on bump; vendor prompts for
+    # confirmation (y/n) and defaults to no.  Nethax has no interactive
+    # prompt, so treat peaceful (non-tame) bump as "do nothing".
+    # Tame (pet) monsters use the swap-places branch instead — see
+    # vendor/nethack/src/hack.c:2098 domove_swap_with_pet.
     target_peaceful = mai.peaceful[monster_idx]
     target_tame     = mai.tame[monster_idx] > jnp.int8(0)
-    is_friendly_bump = monster_present & (target_peaceful | target_tame)
+    is_pet_swap     = monster_present & target_tame
+    is_peaceful_bump = monster_present & target_peaceful & ~target_tame
     # Only attack if monster is present AND not friendly.
-    monster_present = monster_present & ~is_friendly_bump
+    monster_present = monster_present & ~target_peaceful & ~target_tame
 
     def _attack_branch(s):
         # Capture pre-attack alive flag at the matched slot so we can grant
@@ -509,17 +511,38 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
         new_status = attacked.status.replace(confuse_attack_pending=new_pending)
         return attacked.replace(monster_ai=new_mai, status=new_status)
 
+    def _pet_swap_branch(s):
+        # vendor/nethack/src/hack.c:2098 domove_swap_with_pet — when the hero
+        # bumps an adjacent tame pet, swap positions instead of attacking
+        # or stalling.  Move the pet to the hero's prior tile; move the
+        # hero into the pet's tile.
+        old_pos = s.player_pos.astype(jnp.int32)
+        new_player_pos = target.astype(jnp.int16)
+        mai_in = s.monster_ai
+        new_mon_pos = mai_in.pos.at[monster_idx].set(old_pos.astype(mai_in.pos.dtype))
+        new_mai = mai_in.replace(pos=new_mon_pos)
+        s2 = s.replace(player_pos=new_player_pos, monster_ai=new_mai)
+        # Re-apply FOV from new player position.
+        return _apply_fov(s2)
+
     # _attack_branch must return the same pytree shape as _move_branch
-    # (below).  We construct that by computing the full movement state and
-    # selecting via lax.cond at the very end.
-    # Friendly-bump path: do nothing (no move, no attack).
+    # (below).  Selection order:
+    #   1. Pet swap (tame) → swap positions.
+    #   2. Peaceful (non-tame) bump → no-op.
+    #   3. Hostile bump → attack.
+    #   4. Empty target tile → move.
     return jax.lax.cond(
-        is_friendly_bump,
-        lambda s: s,                                              # friendly bump → no-op
+        is_pet_swap,
+        _pet_swap_branch,
         lambda s: jax.lax.cond(
-            monster_present,
-            _attack_branch,
-            lambda s2: _move_branch(s2, eff_dy, eff_dx, rng, target, in_bounds, terrain_2d, map_h, map_w),
+            is_peaceful_bump,
+            lambda s_: s_,                                        # peaceful bump → no-op
+            lambda s_: jax.lax.cond(
+                monster_present,
+                _attack_branch,
+                lambda s2: _move_branch(s2, eff_dy, eff_dx, rng, target, in_bounds, terrain_2d, map_h, map_w),
+                s_,
+            ),
             s,
         ),
         state,
