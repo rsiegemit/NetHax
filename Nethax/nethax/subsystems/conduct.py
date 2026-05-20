@@ -69,23 +69,33 @@ N_CONDUCTS = len(Conduct)
 # ---------------------------------------------------------------------------
 @struct.dataclass
 class ConductState:
-    """Per-conduct violation flags for the current game.
+    """Per-conduct violation counters for the current game.
+
+    Mirrors vendor ``struct u_conduct`` (vendor/nethack/include/you.h:147-167)
+    which stores one ``long`` counter per conduct ("number of times..." a
+    challenge has been violated).  Counter values are used by vendor display
+    code (insight.c::show_conduct, lines ~2141, 2150, 2170, 2178, 2186-2202)
+    and by xlog output (topten.c:385-386 wish_cnt / arti_wish_cnt).
 
     Fields
     ------
+    counters   : int32 array of shape [N_CONDUCTS]
+                 Per-conduct increment counter (vendor: u.uconduct.<field>++).
+                 0 = conduct still kept; >0 = number of violations.
     violations : bool array of shape [N_CONDUCTS]
-                 False = conduct still kept (unviolated)
-                 True  = conduct broken at least once
-                 (mirrors the counter fields in u.uconduct; we store a bool
-                  because JAX RL environments only need kept/broken, not counts)
+                 Derived ``counters > 0`` mask kept explicit for back-compat
+                 with existing callers (scoring, scoreboard).  Always equals
+                 ``counters > 0``; maintained by ``increment_counter``.
     """
 
-    violations: jnp.ndarray  # [N_CONDUCTS]  bool
+    counters: jnp.ndarray    # [N_CONDUCTS]  int32 — vendor long counter
+    violations: jnp.ndarray  # [N_CONDUCTS]  bool  — derived counters>0 mask
 
     @classmethod
     def default(cls) -> "ConductState":
         """Return a clean ConductState (all conducts intact) for a new game."""
         return cls(
+            counters=jnp.zeros((N_CONDUCTS,), dtype=jnp.int32),
             violations=jnp.zeros((N_CONDUCTS,), dtype=jnp.bool_),
         )
 
@@ -94,38 +104,63 @@ class ConductState:
 # Violation helpers
 # ---------------------------------------------------------------------------
 def violate(state: ConductState, conduct: int) -> ConductState:
-    """Mark a single conduct as violated on a ConductState slice.
+    """Bump the counter and set the derived violations bit on a ConductState.
 
-    Mirrors u.uconduct.<field>++ from vendor/nethack/src/insight.c (we collapse
-    counts to a single broken/intact bit).
+    Mirrors ``u.uconduct.<field>++`` from vendor/nethack/src/insight.c (the
+    counter); also maintains the derived ``violations`` mask.
+    Cite: vendor/nethack/include/you.h:147-167 ``struct u_conduct``.
     """
+    new_counters = state.counters.at[conduct].add(jnp.int32(1))
     new_violations = state.violations.at[conduct].set(True)
-    return state.replace(violations=new_violations)
+    return state.replace(counters=new_counters, violations=new_violations)
 
 
-def mark_violated(env_state, conduct_idx: int):
-    """Mark conduct_idx on the EnvState.conduct slice.
+def increment_counter(env_state, conduct_idx: int):
+    """Bump counters[conduct_idx] by 1 and set violations[conduct_idx]=True.
 
-    JAX-safe — uses .at[idx].set(True) and immutable replace chaining.
-    Cite: vendor/nethack/include/you.h::struct u_conduct.
+    Mirrors vendor ``u.uconduct.<field>++`` increment-on-violation pattern
+    (e.g. eat.c, pray.c, polyself.c, wish-grant paths).  JAX-safe via .at[].
+    Cite: vendor/nethack/include/you.h:147-167 ``struct u_conduct``;
+          vendor/nethack/src/insight.c::show_conduct lines ~2141, 2170, 2178,
+          2186 (counter values consumed for display).
     """
-    new_violations = env_state.conduct.violations.at[conduct_idx].set(True)
+    cur_counts = env_state.conduct.counters
+    cur_vio    = env_state.conduct.violations
+    new_counters   = cur_counts.at[conduct_idx].add(jnp.int32(1))
+    new_violations = cur_vio.at[conduct_idx].set(True)
     return env_state.replace(
-        conduct=env_state.conduct.replace(violations=new_violations)
+        conduct=env_state.conduct.replace(
+            counters=new_counters, violations=new_violations
+        )
     )
 
 
-def mark_violated_if(env_state, conduct_idx: int, condition):
-    """Conditionally mark conduct_idx on EnvState.conduct (JIT-safe).
+# Back-compat alias: existing callers say `mark_violated`.  Forward to
+# `increment_counter` so every violation also bumps the vendor counter.
+mark_violated = increment_counter
 
-    Uses jnp.where so this is traceable; ``condition`` may be a traced bool.
-    Cite: vendor/nethack/include/you.h::struct u_conduct.
+
+def increment_counter_if(env_state, conduct_idx: int, condition):
+    """Conditionally bump counters[conduct_idx] (and set violations) JIT-safely.
+
+    ``condition`` may be a traced bool.  When True: bump counter by 1 and set
+    the derived violations bit.  When False: leave both unchanged.
+    Cite: vendor/nethack/include/you.h:147-167 ``struct u_conduct``.
     """
-    cur = env_state.conduct.violations
-    new_violations = cur.at[conduct_idx].set(cur[conduct_idx] | condition)
+    cur_counts = env_state.conduct.counters
+    cur_vio    = env_state.conduct.violations
+    inc        = jnp.where(condition, jnp.int32(1), jnp.int32(0))
+    new_counters   = cur_counts.at[conduct_idx].add(inc)
+    new_violations = cur_vio.at[conduct_idx].set(cur_vio[conduct_idx] | condition)
     return env_state.replace(
-        conduct=env_state.conduct.replace(violations=new_violations)
+        conduct=env_state.conduct.replace(
+            counters=new_counters, violations=new_violations
+        )
     )
+
+
+# Back-compat alias: existing callers say `mark_violated_if`.
+mark_violated_if = increment_counter_if
 
 
 # ---------------------------------------------------------------------------
