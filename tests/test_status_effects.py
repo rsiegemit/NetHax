@@ -203,41 +203,53 @@ class TestHPRegenWithRing:
 
     def test_regen_faster_with_ring(self):
         """Ring of REGEN heals every turn unconditionally (vendor:
-        allmain.c lines 649-665 — ring bypasses the moves%20 and rn2(100)
-        gates).  Without the ring, regen requires moves%20==0 AND
-        XL+CON > rn2(100); we pick a non-multiple-of-20 timestep so the
-        non-ring path is guaranteed to miss."""
+        allmain.c U_CAN_REGEN forces heal += 1 on the non-Upolyd path).
+        Without the ring, the per-turn probabilistic check ``(XL+CON) > rn2(100)``
+        is the sole gate — no moves%20 throttle on the non-Upolyd path.
+        With XL=1, CON=10, sum=11 and rn2(100) effectively almost always
+        exceeds 11, so a single tick without the ring is overwhelmingly
+        likely to miss (for this seed it does).
+        """
         state_with_ring = _make_state()
         new_intrinsics = state_with_ring.intrinsics.at[Intrinsic.REGEN].set(True)
         state_with_ring = state_with_ring.replace(intrinsics=new_intrinsics)
         state_without_ring = _make_state()
 
-        # timestep = 5 → moves % 20 != 0 → non-ring path can never heal.
-        # Ring user heals every turn regardless.
+        # Ring forces heal regardless of XL/CON/rn2(100).
         _, hp_ring = self._tick(state_with_ring, 8, 10, xl=1, role=0,
                                 con=10, timestep=5, key=42)
+        # Pick a seed whose rn2(100) draw exceeds 11 → no heal without ring.
+        # PRNGKey(42) → roll > 10 for these dims, verified empirically.
         _, hp_no_ring = self._tick(state_without_ring, 8, 10, xl=1, role=0,
                                    con=10, timestep=5, key=42)
         assert int(hp_ring) == 9
         assert int(hp_no_ring) == 8
 
-    def test_regen_fires_on_multiple_of_20_when_check_passes(self):
-        """When moves % 20 == 0 and XL+CON > rn2(100), vendor regen
-        fires.  We force the probability check to succeed by setting a
-        very high (XL + CON), so the rn2(100) draw cannot beat it.
+    def test_regen_fires_when_check_passes(self):
+        """When (XL+CON) > rn2(100), vendor regen fires.  We force the
+        probability check by setting a very high (XL + CON) so the rn2(100)
+        draw cannot beat it.  No moves%20 gate on the non-Upolyd path.
+
+        Cite: vendor/nethack/src/allmain.c::regen_hp lines 664-665.
         """
         state = _make_state()
         # XL=50, CON=99 → XL+CON=149 > any rn2(100) ∈ [0,99] → always passes.
-        _, hp_after = self._tick(state, 5, 10, xl=50, role=0,
-                                 con=99, timestep=20, key=0)
-        assert int(hp_after) == 6
-
-    def test_regen_skipped_when_not_multiple_of_20(self):
-        """Without ring, moves % 20 != 0 → no heal regardless of rn2(100)."""
-        state = _make_state()
+        # Timestep is irrelevant on the non-Upolyd path (no moves%20 gate).
         _, hp_after = self._tick(state, 5, 10, xl=50, role=0,
                                  con=99, timestep=19, key=0)
-        assert int(hp_after) == 5
+        assert int(hp_after) == 6
+
+    def test_regen_fires_on_arbitrary_timestep(self):
+        """Non-Upolyd vendor regen has no moves%20 gate — high (XL+CON) heals
+        on any turn, including timesteps not divisible by 20.
+
+        Cite: vendor/nethack/src/allmain.c::regen_hp lines 664-665.
+        """
+        state = _make_state()
+        # XL=50, CON=99 → always passes; timestep=7 (not a multiple of 20).
+        _, hp_after = self._tick(state, 5, 10, xl=50, role=0,
+                                 con=99, timestep=7, key=0)
+        assert int(hp_after) == 6
 
     def test_regen_skipped_when_starving(self):
         """Regen is blocked when hunger_state >= WEAK (vendor: encumbrance_ok

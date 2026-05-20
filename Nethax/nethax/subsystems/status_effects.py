@@ -858,19 +858,30 @@ def hp_regen_tick(state: StatusState, player_hp: jnp.ndarray,
                   rng: jax.Array) -> tuple:
     """Probabilistic HP regen, vendor-parity with allmain.c::regen_hp.
 
-    Vendor logic (allmain.c lines 649-665, Wave 6 #78 cleanup):
-      - When ring of regeneration (REGEN intrinsic) is active, gain +1 HP
-        every turn unconditionally.
-      - Otherwise, on turns where ``moves % 20 == 0`` and
-        ``(ulevel + ACURR(A_CON)) > rn2(100)``, gain +1 HP.
-      - Regen is skipped when starving (hunger_state >= WEAK), matching the
-        ``encumbrance_ok`` gate combined with the WEAK-starves-regen rule.
+    Vendor logic for the non-Upolyd path (allmain.c lines 664-665):
 
-    Wave 6 #78: legacy deterministic interval path removed.  All callers must
-    supply ``player_con``, ``timestep`` and ``rng`` (vendor truth is the only
-    path).
+        if (u.uhp < u.uhpmax && (encumbrance_ok || U_CAN_REGEN())) {
+            heal = (u.ulevel + (int)ACURR(A_CON)) > rn2(100);
+            if (U_CAN_REGEN()) heal += 1;
+            ...
+        }
 
-    Cite: vendor/nethack/src/allmain.c::regen_hp lines 649-665.
+    There is NO ``moves % 20`` gate in the non-Upolyd branch — the
+    probabilistic ``(XL + CON) > rn2(100)`` roll fires every turn.  The
+    ``moves % 20`` gate only applies to the Upolyd branch
+    (allmain.c:649).  This subsystem currently models only the non-Upolyd
+    path, so the gate is omitted.
+
+    - REGEN intrinsic (ring of regeneration / U_CAN_REGEN()) forces +1 HP
+      every turn unconditionally.
+    - Otherwise the per-turn probabilistic check applies.
+    - Regen is skipped when starving (hunger_state >= WEAK), matching the
+      vendor ``encumbrance_ok`` gate combined with the WEAK-starves-regen
+      rule.
+
+    Cite: vendor/nethack/src/allmain.c::regen_hp lines 664-665 (non-Upolyd
+    path).  The legacy Upolyd ``moves % 20`` gate (line 649) does NOT apply
+    here.
 
     Returns (new_status_state, new_player_hp).
     """
@@ -880,21 +891,17 @@ def hp_regen_tick(state: StatusState, player_hp: jnp.ndarray,
         | (state.timed_intrinsics[Intrinsic.REGEN] > jnp.int32(0))
     )
 
-    moves = jnp.int32(timestep)
     con = jnp.int32(player_con)
     xl = jnp.int32(player_xl)
-    moves_mod_20_zero = (moves % jnp.int32(20)) == jnp.int32(0)
 
     # rn2(100) — uniform 0..99
     roll = jax.random.randint(rng, (), 0, 100).astype(jnp.int32)
     prob_check = (xl + con) > roll
 
-    # REGEN ring fires every turn unconditionally; otherwise need both gates.
-    do_heal = jnp.where(
-        has_regen,
-        jnp.bool_(True),
-        moves_mod_20_zero & prob_check,
-    ) & ~too_hungry
+    # REGEN ring fires every turn unconditionally; otherwise the per-turn
+    # probabilistic check is the sole gate — there is no moves%20 throttle on
+    # the non-Upolyd vendor path.
+    do_heal = (has_regen | prob_check) & ~too_hungry
 
     healed_hp = jnp.where(
         do_heal,

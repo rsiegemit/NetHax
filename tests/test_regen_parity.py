@@ -95,20 +95,18 @@ def _pw_ticks_until_regen(state, pw, pw_max, xl, role,
 # ---------------------------------------------------------------------------
 
 class TestHpRegenInterval:
-    # Wave 6 parity-fix: updated to vendor allmain.c:649-665 (CA #73).
-    # Legacy simplified interval (max(1, 20 - XL)) replaced with the vendor
-    # probabilistic path:
-    #     fires only on turns where moves % 20 == 0, and then with
-    #     probability (XL + ACURR(A_CON)) / 100.
-    # These tests now pin the firing turn (must be a multiple of 20) and
-    # that "high XL + CON" reliably heals within a single firing cycle.
+    # Wave 28a parity-fix: vendor allmain.c:664-665 — the non-Upolyd HP
+    # regen path has NO moves%20 throttle.  The probabilistic check
+    # ``(XL + ACURR(A_CON)) > rn2(100)`` fires every turn.  These tests
+    # now pin the per-turn behaviour: a heal can land on ANY turn (not
+    # exclusively multiples of 20), and high (XL + CON) reliably heals
+    # within a handful of turns.
 
     def test_hp_regen_interval_xl1_19_turns(self):
-        """XL=1 CON=15: first heal must land on a moves%20==0 turn.
+        """XL=1 CON=15: heal can land on any turn — probability 16% per turn.
 
-        Probability per firing turn is (1+15)/100 = 16%, so within a handful
-        of firing cycles a heal is overwhelmingly likely.
-        Cite: vendor/nethack/src/allmain.c::regen_hp line 665.
+        Cite: vendor/nethack/src/allmain.c::regen_hp lines 664-665 (non-Upolyd
+        path has no moves%20 gate).
         """
         state = _make_state()
         n, _, healed = _hp_ticks_until_heal(
@@ -120,11 +118,12 @@ class TestHpRegenInterval:
             player_con=jnp.int8(15),
             seed=0,
         )
-        assert n % 20 == 0, f"XL=1 HP regen must fire on moves%20==0; got {n}"
+        # At 16%/turn expected first-heal turn is ~6; cap at 100 with margin.
+        assert 1 <= n <= 100, f"XL=1 HP regen should heal quickly; got {n}"
         assert healed == 6
 
     def test_hp_regen_interval_xl5_curve(self):
-        """XL=5 CON=15: firing turn must be a multiple of 20."""
+        """XL=5 CON=15: any turn can fire (no moves%20 gate)."""
         state = _make_state()
         n, _, healed = _hp_ticks_until_heal(
             state,
@@ -135,13 +134,14 @@ class TestHpRegenInterval:
             player_con=jnp.int8(15),
             seed=0,
         )
-        assert n % 20 == 0, f"XL=5 HP regen must fire on moves%20==0; got {n}"
+        assert 1 <= n <= 100, f"XL=5 HP regen should heal quickly; got {n}"
         assert healed == 6
 
     def test_hp_regen_xl19_curve(self):
-        """XL=19 CON=18: probability per firing turn = 37%; first firing turn often heals.
+        """XL=19 CON=18: probability per turn = 37%; first heal often within
+        a few turns.
 
-        Cite: vendor/nethack/src/allmain.c::regen_hp line 665.
+        Cite: vendor/nethack/src/allmain.c::regen_hp lines 664-665.
         """
         state = _make_state()
         n, _, healed = _hp_ticks_until_heal(
@@ -153,13 +153,13 @@ class TestHpRegenInterval:
             player_con=jnp.int8(18),
             seed=0,
         )
-        assert n % 20 == 0, f"XL=19 HP regen must fire on moves%20==0; got {n}"
+        assert 1 <= n <= 50, f"XL=19 HP regen should heal quickly; got {n}"
         assert healed == 6
 
     def test_hp_regen_xl30_max_rate(self):
-        """XL=30 CON=18: (30+18)=48 > rn2(100) often; first firing turn likely heals.
+        """XL=30 CON=18: (30+18)=48 > rn2(100) often; first heal is fast.
 
-        Cite: vendor/nethack/src/allmain.c::regen_hp line 665.
+        Cite: vendor/nethack/src/allmain.c::regen_hp lines 664-665.
         """
         state = _make_state()
         n, _, healed = _hp_ticks_until_heal(
@@ -171,7 +171,7 @@ class TestHpRegenInterval:
             player_con=jnp.int8(18),
             seed=0,
         )
-        assert n % 20 == 0, f"XL=30 HP regen must fire on moves%20==0; got {n}"
+        assert 1 <= n <= 20, f"XL=30 HP regen should heal very fast; got {n}"
         assert healed == 6
 
 
@@ -508,18 +508,20 @@ class TestPwRegenVendorFormula:
 # ---------------------------------------------------------------------------
 
 class TestHpRegenVendorFormula:
-    """Wave 6 #73: assert vendor allmain.c::regen_hp probabilistic formula.
+    """Wave 28a: assert vendor allmain.c::regen_hp non-Upolyd formula.
 
-      moves % 20 == 0 AND (XL + ACURR(A_CON)) > rn2(100) → HP += 1.
+      (XL + ACURR(A_CON)) > rn2(100) → HP += 1 EVERY turn (no moves%20 gate).
       REGEN intrinsic → HP +1 every turn unconditionally.
     """
 
-    def test_hp_regen_uses_xl_con_probability_at_moves_mod_20(self):
-        """For XL=10 CON=15, probability of HP +1 each ``moves%20==0`` turn
-        is 25/100 = 25%.  Over 10,000 trials on the firing turn, empirical
-        rate should be within ±5pp of 25%.
+    def test_hp_regen_uses_xl_con_probability(self):
+        """For XL=10 CON=15, probability of HP +1 each turn is 25/100 = 25%.
 
-        Cite: vendor/nethack/src/allmain.c::regen_hp line 665.
+        Over 10,000 trials on an arbitrary turn, empirical rate should be
+        within ±5pp of 25%.  Per vendor allmain.c:664-665 the non-Upolyd
+        path fires the probabilistic check every turn — no moves%20 gate.
+
+        Cite: vendor/nethack/src/allmain.c::regen_hp lines 664-665.
         """
         state = _make_state()
         n_trials = 10_000
@@ -533,7 +535,7 @@ class TestHpRegenVendorFormula:
                 jnp.int32(10),                # xl
                 jnp.int8(0),                  # role (unused on this path)
                 player_con=jnp.int8(15),
-                timestep=jnp.int32(20),       # 20 % 20 == 0
+                timestep=jnp.int32(20),       # any turn — gate removed
                 rng=rng,
             )
             if int(new_hp) > 50:
@@ -541,18 +543,21 @@ class TestHpRegenVendorFormula:
 
         empirical_pct = 100 * heals / n_trials
         assert 20.0 <= empirical_pct <= 30.0, (
-            f"XL=10 CON=15 should heal ~25% per firing turn; got {empirical_pct:.1f}% "
+            f"XL=10 CON=15 should heal ~25%/turn; got {empirical_pct:.1f}% "
             f"({heals}/{n_trials})"
         )
 
-    def test_hp_regen_skipped_on_non_mod_20_turns(self):
-        """Without REGEN intrinsic, no HP regen on turns where moves%20 != 0.
+    def test_hp_regen_fires_on_any_turn(self):
+        """Non-Upolyd vendor regen has NO moves%20 gate — high (XL+CON) heals
+        on arbitrary turns including those not divisible by 20.
 
-        Cite: vendor/nethack/src/allmain.c::regen_hp line 649.
+        Cite: vendor/nethack/src/allmain.c::regen_hp lines 664-665.
         """
         state = _make_state()
-        # Try many seeds on turn 7 (not divisible by 20) — none should heal.
-        for seed in range(50):
+        # High XL=30 CON=18 → 48% per turn.  On turn 7 (not mod 20), a
+        # majority of seeds should heal.
+        heals_on_turn_7 = 0
+        for seed in range(200):
             rng = jax.random.PRNGKey(seed)
             _, new_hp = hp_regen_tick(
                 state,
@@ -561,12 +566,17 @@ class TestHpRegenVendorFormula:
                 jnp.int32(30),                # high XL
                 jnp.int8(0),
                 player_con=jnp.int8(18),      # max CON
-                timestep=jnp.int32(7),        # 7 % 20 != 0
+                timestep=jnp.int32(7),        # explicitly NOT a multiple of 20
                 rng=rng,
             )
-            assert int(new_hp) == 50, (
-                f"No regen on moves=7 (mod 20 != 0); got {int(new_hp)} (seed={seed})"
-            )
+            if int(new_hp) == 51:
+                heals_on_turn_7 += 1
+        # Expect ~48% empirical; assert at least a strong fraction.  This
+        # would be 0% under the legacy moves%20 gate.
+        assert heals_on_turn_7 >= 50, (
+            f"Vendor non-Upolyd regen must fire on moves=7; only "
+            f"{heals_on_turn_7}/200 heals seen — moves%20 gate still active?"
+        )
 
     def test_hp_regen_ring_fires_every_turn(self):
         """REGEN intrinsic → HP +1 every turn regardless of moves%20.
