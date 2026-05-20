@@ -308,22 +308,22 @@ class TestDrinkSink:
         )
 
     def test_drink_sink_summons_black_pudding_rare(self):
-        """rn2(20) == 19 → BLACK_PUDDING → hp drops by ~8.
+        """rn2(20) == 19 falls through to default cold-water sip — no HP loss.
 
-        Rare (~5%) but reachable in 200 rngs.
+        Cite: vendor/nethack/src/fountain.c:700-710 — case 19 is a
+        Hallucination flavor pline with FALLTHROUGH to the default
+        cold/warm/hot sip; no BLACK_PUDDING summon (vendor's pudding
+        lives in dokick.c::kick_nondoor, not drinksink()).
         """
         state = _make_state()
-        any_pudding = False
+        # Sweep 400 rngs; no bucket may deal the legacy -8 HP drop.
         for i in range(400):
             rng_i = jax.random.PRNGKey(10000 + i)
             out = drink_sink(state, rng_i)
-            # BLACK_PUDDING drops hp by 8.  Other buckets at most -3.
-            if int(out.player_hp) <= int(state.player_hp) - 6:
-                any_pudding = True
-                break
-        assert any_pudding, (
-            "Expected at least one BLACK_PUDDING outcome in 400 rngs"
-        )
+            assert int(out.player_hp) >= int(state.player_hp) - 5, (
+                f"No drink_sink bucket should deal more than -5 HP; "
+                f"got {int(out.player_hp) - int(state.player_hp)} at seed {i}"
+            )
 
     def test_drink_sink_breaksink_marks_used(self):
         """rn2(20) == 6 → breaksink → mark sinks_used[player_pos] = True."""

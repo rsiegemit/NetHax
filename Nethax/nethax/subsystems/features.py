@@ -1580,7 +1580,6 @@ _SINK_DRAIN_NUTRITION = 8   # cases 8-9
 _SINK_POLYMORPH       = 9   # case 10
 _SINK_NOISE           = 10  # cases 11-12 (sound only)
 _SINK_STENCH          = 11  # case 13 (create_gas_cloud)
-_SINK_BLACK_PUDDING   = 12  # rare (rn2(20) tail, vendor case 19)
 
 
 def drink_sink(state, rng):
@@ -1602,13 +1601,11 @@ def drink_sink(state, rng):
         case 13      → stench gas cloud
         case 19/tail → BLACK_PUDDING (severe HP loss)
 
-    Vendor divergence (case 19): in vendor fountain.c:700-710 case 19 is
-    a Hallucination flavor message that otherwise falls through to the
-    ``default`` cold/warm/hot sip with no HP effect.  Vendor's
-    BLACK_PUDDING lives in dokick.c::kick_nondoor, not drinksink().  We
-    keep the BLACK_PUDDING HP-loss bucket here because
-    tests/test_features_effects.py::test_drink_sink_summons_black_pudding_rare
-    asserts the HP drop; flagged for cleanup when the test is rewritten.
+    Case 19 (vendor fountain.c:700-710) is a Hallucination flavor pline
+    that FALLTHROUGHs to ``default`` (cold/warm/hot sip — no HP effect).
+    Vendor's BLACK_PUDDING summon lives in dokick.c::kick_nondoor, not
+    drinksink().  We map fate==19 to the default cold-water sip to
+    preserve byte-equal vendor parity.
     """
     rng_eff, _ = jax.random.split(rng, 2)
     fate = jax.random.randint(rng_eff, (), 0, 20, dtype=jnp.int32)
@@ -1633,7 +1630,7 @@ def drink_sink(state, rng):
         _SINK_COLD_WATER,        # 16
         _SINK_COLD_WATER,        # 17
         _SINK_COLD_WATER,        # 18
-        _SINK_BLACK_PUDDING,     # 19 (rare tail; vendor case 19 hallucination)
+        _SINK_COLD_WATER,        # 19 (vendor case 19 falls through to default)
     ], dtype=jnp.int32)
     bucket = bucket_table[fate]
 
@@ -1712,10 +1709,6 @@ def drink_sink(state, rng):
         return s.replace(status=s.status.replace(
             nutrition=s.status.nutrition - jnp.int32(5)))
 
-    def _black_pudding(s):
-        # Rare drain monster eruption: severe HP damage.
-        return s.replace(player_hp=jnp.maximum(jnp.int32(0), s.player_hp - jnp.int32(8)))
-
     branches = (
         _cold_water,        #  0
         _warm_water,        #  1
@@ -1729,7 +1722,6 @@ def drink_sink(state, rng):
         _polymorph,         #  9
         _noise,             # 10
         _stench,            # 11
-        _black_pudding,     # 12
     )
     new_state = jax.lax.switch(bucket, branches, state)
     return new_state
