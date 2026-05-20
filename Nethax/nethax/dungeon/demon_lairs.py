@@ -248,9 +248,12 @@ _ORCUS_MAP = """\
 #   - "skeleton"     -> chunk4.py:1299
 #   - "snake"        -> chunk4.py:593
 #   - "red naga"     -> chunk4.py:253   (closest hydra proxy)
-# Gnolls and flinds are NOT in our monster table — TODO Wave 6: add them.
-# We substitute a generic _MON_GNOLL / _MON_FLIND sentinel and leave a
-# TODO so the loader can decide on a fallback.
+# Documented divergence: vendor NetHack 3.7 has no PM_GNOLL / PM_FLIND /
+# PM_HYDRA monster entries (verified absent in
+# vendor/nethack/include/monsters.h and vendor/nethack/src/monst.c — they
+# survive only in dat/data.base lore).  These sentinels are kept as proxy
+# ids so the loader can substitute closest-equivalent vendor monsters
+# (orc-family for gnoll/flind, red naga for hydra) at runtime.
 # ---------------------------------------------------------------------------
 
 _MON_ASMODEUS    = 100
@@ -272,9 +275,9 @@ _MON_GREEN_SLIME = 118
 _MON_LICH        = 119
 _MON_SKELETON    = 120
 _MON_SNAKE       = 121
-_MON_HYDRA       = 122   # TODO Wave 6: no "hydra" entry — use red naga proxy.
-_MON_GNOLL       = 123   # TODO Wave 6: no "gnoll" entry — use generic orc proxy.
-_MON_FLIND       = 124   # TODO Wave 6: no "flind" entry — use generic orc proxy.
+_MON_HYDRA       = 122   # documented divergence; vendor PM_HYDRA absent in 3.7 — red naga proxy.
+_MON_GNOLL       = 123   # documented divergence; vendor PM_GNOLL absent in 3.7 — generic orc proxy.
+_MON_FLIND       = 124   # documented divergence; vendor PM_FLIND absent in 3.7 — generic orc proxy.
 
 _ITEM_GOLD       = 2
 _ITEM_GEM        = 3
@@ -686,9 +689,11 @@ def generate_yeenoghu_lair(rng):
     the canonical "gnoll fortress" flavour: 4 barracks-row rows around a
     central throne room.  Yeenoghu sits on the throne.
 
-    TODO Wave 6: substitute real "gnoll"/"flind" monster IDs once those
-    entries are added to monsters.py (current proxies: _MON_GNOLL /
-    _MON_FLIND placeholder ids).
+    Documented divergence: vendor NetHack 3.7 has no PM_GNOLL / PM_FLIND
+    monster entries (verified absent in vendor/nethack/include/monsters.h
+    and vendor/nethack/src/monst.c — they survive only in dat/data.base
+    lore).  Current proxies _MON_GNOLL / _MON_FLIND are substituted with
+    closest-equivalent orc-family monsters at loader time.
     """
     terrain = _encode_map(_YEENOGHU_ROWS)
 
@@ -784,8 +789,10 @@ def generate_demogorgon_lair(rng):
     wide expanse of POOL (acid/poisonous water) interlaced with corpse
     paths.  As the deepest Gehennom level, this level has NO stair-down.
 
-    TODO Wave 6: substitute a real "hydra" entry once added (currently
-    falls back to red-naga proxy via _MON_HYDRA sentinel).
+    Documented divergence: vendor NetHack 3.7 has no PM_HYDRA monster
+    entry (verified absent in vendor/nethack/include/monsters.h and
+    vendor/nethack/src/monst.c).  _MON_HYDRA falls back to the red-naga
+    proxy at loader time.
     """
     terrain = _encode_map(_DEMOGORGON_ROWS)
 

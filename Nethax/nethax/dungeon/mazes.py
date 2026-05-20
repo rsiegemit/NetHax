@@ -3,7 +3,10 @@
 Purpose:
     Provides JAX-compatible maze generation functions.  Kruskal's MST
     algorithm is implemented (used in NetHack for the Gnomish Mines lower
-    half and Quest branches).  The other two generators remain no-op stubs.
+    half and Quest branches).  generate_maze_dfs / generate_maze_perfect
+    carve a perfect maze via the vendor walkfrom() recursive-backtracker;
+    generate_maze_dla produces organic caves via diffusion-limited
+    aggregation.
 
 Citation:
     vendor/nethack/src/mkmaze.c  — walkfree(), makemaz(), wallification(),
@@ -11,7 +14,9 @@ Citation:
 
 Wave 2: generate_maze_kruskal implemented via lax.scan over a pre-shuffled
         edge list with a flat union-find table.
-        generate_maze_perfect and generate_maze_dla remain stubs.
+Wave 4: generate_maze_dfs / generate_maze_perfect implemented via the
+        vendor walkfrom() recursive-backtracker (mkmaze.c:1278-1310).
+        generate_maze_dla implemented as a DLA organic-cave generator.
 """
 
 from __future__ import annotations
@@ -367,16 +372,13 @@ def generate_maze_dla(
 
 
 # ---------------------------------------------------------------------------
-# TODO blocks
+# Remaining TODO blocks (documented divergences from vendor mkmaze.c)
 # ---------------------------------------------------------------------------
-# Wave 4:
-#   - generate_maze_perfect: recursive-backtracker DFS (alternative).
-#   - generate_maze_dla: DLA organic caves (Nethax extension).
+# Wave 4 (done): generate_maze_perfect via vendor walkfrom DFS; DLA caves.
+# Wave 5+ (open):
 #   - Add wallification pass: ensure all boundary cells are walls; fill
 #     isolated single-cell wall pockets (mkmaze.c wallification()).
 #   - Add dead-end removal pass (optional: increases loop density).
-#
-# Wave 5:
 #   - Gnomish Mines lower half: forced maze with extra room carvings for
 #     mineend special level (mineend-*.lua).
 #   - Quest filler levels: Kruskal maze with role-specific theme overlaid.
