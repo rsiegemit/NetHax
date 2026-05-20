@@ -333,9 +333,12 @@ def apply_corpse_postfx(
     # STONE_RES temp gain.
     stone_roll = jax.random.randint(rng_t_stone, (), 0, 6, dtype=jnp.int32)
     do_stone_temp = is_corpse & (mlev > stone_roll)
-    # d(3,6) = sum of 3 dice each 1..6  → range [3, 18].  We approximate as
-    # 3 + rn2(16) for JIT simplicity (matches the same uniform-ish distribution).
-    stone_d36 = jnp.int32(3) + jax.random.randint(rng_d_stone, (), 0, 16, dtype=jnp.int32)
+    # d(3,6) = sum of 3 dice each 1..6  → range [3, 18], triangular dist.
+    # Roll 3 independent d6 to match vendor's distribution byte-equal.
+    _stone_keys = jax.random.split(rng_d_stone, 3)
+    stone_d36 = jnp.sum(jnp.stack([
+        jax.random.randint(k, (), 1, 7, dtype=jnp.int32) for k in _stone_keys
+    ])).astype(jnp.int32)
     cur_t_stone = state.status.timed_intrinsics[int(Intrinsic.RESIST_STONE)]
     new_t_stone = jnp.where(
         do_stone_temp,
@@ -345,7 +348,10 @@ def apply_corpse_postfx(
     # ACID_RES temp gain.
     acid_roll = jax.random.randint(rng_t_acid, (), 0, 3, dtype=jnp.int32)
     do_acid_temp = is_corpse & (mlev > acid_roll)
-    acid_d36 = jnp.int32(3) + jax.random.randint(rng_d_acid, (), 0, 16, dtype=jnp.int32)
+    _acid_keys = jax.random.split(rng_d_acid, 3)
+    acid_d36 = jnp.sum(jnp.stack([
+        jax.random.randint(k, (), 1, 7, dtype=jnp.int32) for k in _acid_keys
+    ])).astype(jnp.int32)
     cur_t_acid = state.status.timed_intrinsics[int(Intrinsic.RESIST_ACID)]
     new_t_acid = jnp.where(
         do_acid_temp,
