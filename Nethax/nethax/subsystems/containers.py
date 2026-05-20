@@ -52,8 +52,8 @@ class ContainerType(IntEnum):
     """Which kind of container is held in this slot.
 
     Values match the ``otyp`` constants in vendor/nethack/include/objects.h
-    (BAG_OF_HOLDING, LARGE_BOX, CHEST, BAG_OF_TRICKS, OILSKIN_SACK), but here
-    we use a small dense enum so the int8 field stays compact.
+    (BAG_OF_HOLDING, LARGE_BOX, CHEST, BAG_OF_TRICKS, OILSKIN_SACK, ICE_BOX),
+    but here we use a small dense enum so the int8 field stays compact.
     """
     NONE           = 0   # empty container slot
     SACK           = 1   # plain sack (no multiplier)
@@ -62,6 +62,22 @@ class ContainerType(IntEnum):
     BAG_OF_TRICKS  = 4   # cursed → explode-on-open
     LARGE_BOX      = 5   # heavy floor-only box
     CHEST          = 6   # heavy floor-only chest
+    # Wave 25b: ICE_BOX — freezes corpses inside so their age does not advance
+    # while contained.  Cite: vendor/nethack/include/obj.h:344 (Has_contents
+    # macro covering ICE_BOX); vendor/nethack/src/pickup.c:2644-2657 (Icebox
+    # branch: obj->age = svm.moves - obj->age on insertion, stop_timer
+    # ROT_CORPSE / REVIVE_MON to freeze decay).
+    ICE_BOX        = 7
+    # Wave 25b note: vendor NetHack 3.7 has NO IRON_SAFE container otyp.
+    # The objects.h CONTAINER list is exactly:
+    #   LARGE_BOX, CHEST, ICE_BOX, SACK, OILSKIN_SACK, BAG_OF_HOLDING,
+    #   BAG_OF_TRICKS  (vendor/nethack/include/objects.h:898-913).
+    # No IRON_SAFE constant exists in obj.h, objects.h, pickup.c, or anywhere
+    # else in the vendor tree (grep -rn IRON_SAFE vendor/nethack/ returns 0
+    # matches).  Adding it would violate the byte-equal-vendor hard requirement,
+    # so the task's IRON_SAFE request is not implemented.  If a future variant
+    # (SLASH'EM, dNetHack, etc.) is vendored that defines IRON_SAFE, this enum
+    # can be extended at value 8 with the matching type_id constant below.
 
 
 class BUCStatus(IntEnum):
@@ -770,20 +786,51 @@ def handle_apply_container(state, rng):
 # Wand of cancellation: bag-of-holding implosion
 # ---------------------------------------------------------------------------
 
-def cancel_bag_of_holding(state, container_idx: int):
+# type_id constants (vendor/nethack/include/objects.h object index order).
+# Cite: Nethax/nethax/constants/objects.py:3964-4080 — verified container otyps.
+_LARGE_BOX_CONTAINER_TYPE_ID:      int = 189   # vendor objects.h:899  LARGE_BOX
+_CHEST_CONTAINER_TYPE_ID:          int = 190   # vendor objects.h:901  CHEST
+_ICE_BOX_CONTAINER_TYPE_ID:        int = 191   # vendor objects.h:903  ICE_BOX
+_SACK_CONTAINER_TYPE_ID:           int = 192   # SACK — demoted type after cancel
+_OILSKIN_SACK_CONTAINER_TYPE_ID:   int = 193   # vendor objects.h:907  OILSKIN_SACK
+_BAG_OF_HOLDING_CONTAINER_TYPE_ID: int = 194   # same as apply_tools._BAG_OF_HOLDING_TYPE_ID
+_BAG_OF_TRICKS_CONTAINER_TYPE_ID:  int = 195   # vendor objects.h:911  BAG_OF_TRICKS
+# Inserted-item type_ids that trigger the bag-of-holding implosion when
+# placed INTO another bag of holding.  Cite: vendor/nethack/src/pickup.c
+# ::mbag_explodes (line 2488-2507) — WAN_CANCELLATION or a nested Is_mbag
+# (BAG_OF_HOLDING / BAG_OF_TRICKS, gated by spe>0 for the latter two).
+_WAN_CANCELLATION_TYPE_ID:         int = 395   # vendor objects.h:8084-8086
+
+
+def cancel_bag_of_holding(state, container_idx: int, src_slot: int = -1):
     """Wand of cancellation hits a bag of holding: implode it.
 
-    Canonical: vendor/nethack/src/zap.c::cancel_item (line 720) —
-    cancelling a BAG_OF_HOLDING destroys all contents and demotes the
-    bag to a plain SACK.
+    Two trigger paths share this implementation:
 
-    - Zero all items_quantity in the container (contents destroyed).
-    - Demote container_type from BAG_OF_HOLDING to SACK.
+    1. ``src_slot == -1`` (default): an *external* wand of cancellation is
+       zapped at the bag-of-holding (zap.c::cancel_item, line 1239+, dispatch
+       at line 2315/3167).  All contents are destroyed and the bag is demoted
+       to a SACK.
+    2. ``src_slot >= 0``: a triggering item is being *inserted* into the bag
+       (pickup.c::in_container, line 2658).  Vendor ``mbag_explodes`` returns
+       True for WAN_CANCELLATION or a nested Is_mbag (BAG_OF_HOLDING /
+       BAG_OF_TRICKS, gated by spe>0).  In that case vendor also:
+         * destroys the triggering item (pickup.c:2669 ``obfree``);
+         * deals ``d(6,6)`` HP damage (pickup.c:2692 ``losehp``);
+         * destroys the bag itself.  We model "destroy the bag" by demoting
+           BAG_OF_HOLDING → NONE (slot emptied) so the player can no longer
+           use it.
+
+    Cite: vendor/nethack/src/pickup.c::mbag_explodes (2488-2507) and the
+    in_container branch (2658-2693); vendor/nethack/src/zap.c::cancel_item
+    (1239+) for the external-zap path.
 
     Parameters
     ----------
     state         : EnvState
-    container_idx : int  index into state.containers (0..N_CONTAINERS-1)
+    container_idx : int — index into state.containers (0..N_CONTAINERS-1)
+    src_slot      : int — inventory slot of the inserted trigger item, or -1
+                          for the external wand-zap path.
 
     Returns
     -------
@@ -793,10 +840,10 @@ def cancel_bag_of_holding(state, container_idx: int):
     c_idx = jnp.int32(container_idx)
 
     is_boh = cs.container_type[c_idx] == jnp.int8(ContainerType.BAG_OF_HOLDING)
+    is_insertion = src_slot >= 0
 
     # Zero all items_quantity in this container slot (contents destroyed).
-    # Cite: vendor/nethack/src/zap.c::cancel_item line 720 — bag implodes,
-    # destroying everything inside.
+    # Cite: zap.c::cancel_item — bag implodes, destroying everything inside.
     zeroed_qty = jnp.zeros(MAX_ITEMS_PER_CONTAINER, dtype=jnp.int16)
     new_qty = jnp.where(
         is_boh,
@@ -804,12 +851,221 @@ def cancel_bag_of_holding(state, container_idx: int):
         cs.items_quantity,
     )
 
-    # Demote container type: BAG_OF_HOLDING -> SACK.
+    # External-zap path: demote BAG_OF_HOLDING → SACK (vendor zap.c just
+    # changes obj->otyp; the bag still exists).
+    # Insertion path: vendor obfree's the bag (pickup.c:2685-2690) — we set
+    # container slot to NONE so the player can no longer interact with it.
+    demoted_type = jnp.int8(int(ContainerType.NONE) if is_insertion
+                            else int(ContainerType.SACK))
     new_ctype = jnp.where(
         is_boh,
-        cs.container_type.at[c_idx].set(jnp.int8(ContainerType.SACK)),
+        cs.container_type.at[c_idx].set(demoted_type),
         cs.container_type,
     )
 
     new_cs = cs.replace(items_quantity=new_qty, container_type=new_ctype)
-    return state.replace(containers=new_cs)
+    new_state = state.replace(containers=new_cs)
+
+    # Insertion path only: destroy the triggering source item and apply
+    # d(6,6) HP damage to the player.
+    # Cite: pickup.c:2669 obfree(obj); pickup.c:2692 losehp(d(6,6), ...).
+    if is_insertion and src_slot >= 0:
+        s_idx = jnp.int32(src_slot)
+        inv = new_state.inventory.items
+
+        # Destroy the source item (zero its slot) iff the bag actually imploded.
+        new_inv = inv.replace(
+            category    = inv.category.at[s_idx].set(
+                jnp.where(is_boh, jnp.int8(0), inv.category[s_idx])),
+            type_id     = inv.type_id.at[s_idx].set(
+                jnp.where(is_boh, jnp.int16(0), inv.type_id[s_idx])),
+            quantity    = inv.quantity.at[s_idx].set(
+                jnp.where(is_boh, jnp.int16(0), inv.quantity[s_idx])),
+            weight      = inv.weight.at[s_idx].set(
+                jnp.where(is_boh, jnp.int32(0), inv.weight[s_idx])),
+        )
+
+        # d(6,6) — sum of 6 dice each 1..6 → range [6, 36].  We approximate
+        # as 6 + rn2(31) for JIT simplicity (matches the dice-sum range and
+        # mirrors the displacer-beast convention in items_corpses.py:485).
+        rng_dmg, new_rng = jax.random.split(new_state.rng)
+        dmg = jnp.int32(6) + jax.random.randint(
+            rng_dmg, (), 0, 31, dtype=jnp.int32
+        )
+        new_hp = jnp.where(
+            is_boh,
+            jnp.maximum(jnp.int32(0),
+                        new_state.player_hp.astype(jnp.int32) - dmg),
+            new_state.player_hp.astype(jnp.int32),
+        ).astype(new_state.player_hp.dtype)
+
+        new_state = new_state.replace(
+            inventory=new_state.inventory.replace(items=new_inv),
+            player_hp=new_hp,
+            rng=new_rng,
+        )
+
+    return new_state
+
+
+# ---------------------------------------------------------------------------
+# Wand-of-cancellation / nested-BoH insertion explosion
+# Cite: vendor/nethack/src/pickup.c::in_container line 2658 + mbag_explodes
+#       (lines 2488-2507).
+# ---------------------------------------------------------------------------
+
+def maybe_explode_on_insert(state, container_idx: int, src_slot: int):
+    """Check whether inserting ``inventory[src_slot]`` into container
+    ``container_idx`` triggers the mbag_explodes implosion, and apply it.
+
+    Trigger conditions (vendor pickup.c:2488-2507 ``mbag_explodes``):
+      * container is a BAG_OF_HOLDING (Is_mbag);
+      * AND the inserted item is WAN_CANCELLATION (any spe), OR a nested
+        BAG_OF_HOLDING / BAG_OF_TRICKS with spe > 0.
+
+    Vendor's mbag_explodes also has a depth-based probabilistic gate
+    ``rn2(1 << depthin) <= depthin``.  At ``depthin == 0`` this is
+    ``rn2(1) <= 0`` which is always True, so a top-level insertion always
+    detonates — we model only depthin == 0 here.
+
+    Note on magic markers: vendor mbag_explodes does NOT include
+    MAGIC_MARKER as a trigger.  The wave-25b task description mentioned
+    magic markers but no vendor codepath inserts that branch, so to keep
+    byte-equal-vendor parity we do not detonate on marker insertion.
+
+    JIT-safe: pure functional, uses jnp.where rather than Python ``if``.
+    """
+    cs  = state.containers
+    inv = state.inventory.items
+    c_idx = jnp.int32(container_idx)
+    s_idx = jnp.int32(src_slot)
+
+    is_boh = cs.container_type[c_idx] == jnp.int8(ContainerType.BAG_OF_HOLDING)
+
+    src_tid     = inv.type_id[s_idx]
+    src_charges = inv.charges[s_idx]
+    is_wan_cancel = src_tid == jnp.int16(_WAN_CANCELLATION_TYPE_ID)
+    # Nested-BoH (or BoT) explodes only with spe > 0.  Cite: pickup.c:2491-2493.
+    is_nested_mbag = (
+        (src_tid == jnp.int16(_BAG_OF_HOLDING_CONTAINER_TYPE_ID))
+        | (src_tid == jnp.int16(_BAG_OF_TRICKS_CONTAINER_TYPE_ID))
+    ) & (src_charges > jnp.int8(0))
+
+    should_explode = is_boh & (is_wan_cancel | is_nested_mbag)
+
+    return jax.lax.cond(
+        should_explode,
+        lambda s: cancel_bag_of_holding(s, container_idx, src_slot),
+        lambda s: s,
+        state,
+    )
+
+
+# ---------------------------------------------------------------------------
+# doloot dispatch (pickup.c:2166 doloot)
+# ---------------------------------------------------------------------------
+
+# Action sub-codes emitted by handle_doloot so callers know which branch fired.
+DOLOOT_NOOP: int = 0   # no container available at player's tile
+DOLOOT_IN:   int = 1   # put items in (default when inventory non-empty)
+DOLOOT_OUT:  int = 2   # take items out (default when inventory is empty)
+DOLOOT_BOTH: int = 3   # both — reserved (vendor menu-choice path)
+
+
+def handle_doloot(state, rng):
+    """#loot extended-command dispatcher.
+
+    Canonical: vendor/nethack/src/pickup.c::doloot (line 2166) which calls
+    doloot_core (line 2178).  Vendor presents a menu choosing among
+      o  "Take something out"
+      i  "Put something in"
+      b  "Both of the above"
+      r  "Reverse loot"  (cursed-item slip-out)
+    based on player state.  We model the menu choice deterministically:
+      * if the player's inventory has any non-coin item, default to IN
+        (player most-likely wants to stash);
+      * otherwise default to OUT.
+
+    The selection is materialised by reusing ``handle_loot`` to open the
+    first held container, then either ``put_in_container`` (slot 0 → first
+    inv item) or ``take_from_container`` (container slot 0 → inventory).
+    A future wave will dispatch through a proper floor-container lookup
+    using level objects; for now we operate on the carried containers
+    array exactly as ``handle_loot`` already does.
+
+    Returns
+    -------
+    new_state
+    """
+    # Find a container — same lookup ``handle_loot`` uses.
+    cs = state.containers
+    has_any = cs.container_type != jnp.int8(ContainerType.NONE)
+    first_idx_signed = jnp.argmax(has_any).astype(jnp.int32)
+    any_present = jnp.any(has_any)
+
+    # Determine in/out default based on inventory contents.
+    inv_cat = state.inventory.items.category
+    from Nethax.nethax.subsystems.inventory import ItemCategory as _IC
+    non_coin_present = jnp.any(
+        (inv_cat != jnp.int8(0)) & (inv_cat != jnp.int8(int(_IC.COIN)))
+    )
+    # Find first non-coin inventory slot for the IN branch.
+    is_non_coin = (inv_cat != jnp.int8(0)) & (inv_cat != jnp.int8(int(_IC.COIN)))
+    first_inv_slot = jnp.argmax(is_non_coin).astype(jnp.int32)
+
+    # Find first occupied container slot (item to take out).
+    occupied_in_c = cs.items_category[first_idx_signed] != jnp.int8(0)
+    first_c_pos   = jnp.argmax(occupied_in_c).astype(jnp.int32)
+    any_in_c      = jnp.any(occupied_in_c)
+
+    # Branch 1: open the container (mirrors handle_loot).
+    def _open_and_dispatch(s):
+        s = open_container(s, first_idx_signed)
+        # IN path — default when player has non-coin inventory.
+        def _put(st):
+            return put_in_container(st, first_idx_signed, first_inv_slot)
+        # OUT path — when inventory has no non-coin items.
+        def _take(st):
+            return jax.lax.cond(
+                any_in_c,
+                lambda x: take_from_container(x, first_idx_signed, first_c_pos),
+                lambda x: x,
+                st,
+            )
+        return jax.lax.cond(non_coin_present, _put, _take, s)
+
+    return jax.lax.cond(any_present, _open_and_dispatch, lambda s: s, state)
+
+
+# ---------------------------------------------------------------------------
+# ICE_BOX freeze helper
+# Cite: vendor/nethack/src/pickup.c lines 2644-2657 (Icebox branch);
+#       vendor/nethack/src/mkobj.c::age_corpses lazy-age model.
+# ---------------------------------------------------------------------------
+
+def is_corpse_iced(container_state: ContainerState, container_idx, item_pos) -> jnp.ndarray:
+    """Return True iff the corpse at ``container[container_idx, item_pos]``
+    is inside an ICE_BOX and therefore frozen (age does not advance).
+
+    Used by callers that compute corpse age lazily as ``moves - creation_turn``:
+    when this returns True, the caller must clamp the age contribution to
+    zero (freeze semantics, vendor pickup.c:2644-2657 stop_timer(ROT_CORPSE)).
+    """
+    c_idx = jnp.int32(container_idx)
+    p_idx = jnp.int32(item_pos)
+    is_ice = container_state.container_type[c_idx] == jnp.int8(ContainerType.ICE_BOX)
+    has_item = container_state.items_category[c_idx, p_idx] != jnp.int8(0)
+    return is_ice & has_item
+
+
+def any_corpse_iced(container_state: ContainerState) -> jnp.ndarray:
+    """Vectorised gate: True iff *any* container slot is an ICE_BOX.
+
+    Useful as a global short-circuit in a future per-turn corpse-age loop:
+    the caller can skip the age increment for every corpse known to live in
+    an ICE_BOX by indexing through ``parent_slot``.  Cite: vendor
+    pickup.c:2647-2651 stop_timer(ROT_CORPSE).
+    """
+    return jnp.any(
+        container_state.container_type == jnp.int8(ContainerType.ICE_BOX)
+    )

@@ -161,30 +161,46 @@ def rne(rng: jax.Array, x: int, cap: int = 9) -> jnp.int32:
 
 
 def rnl(rng: jax.Array, x: int, luck: int = 0) -> jnp.int32:
-    """Luck-adjusted uniform in [0, x).
+    """Luck-adjusted uniform in [0, x) — byte-equal to vendor rnd.c::rnl.
 
-    Vendor formula (rnd.c::rnl):
+    Vendor formula (vendor/nethack/src/rnd.c:111-150)::
+
+        if (x <= 15):
+            adjustment = (|Luck| + 1) / 3 * sgn(Luck)    # rounded away from 0
+        else:
+            adjustment = Luck
         i = rn2(x)
-        if (Luck && rn2(50 - 2*Luck)):
-            i += Luck * (x / 50 - 1)
-            clamp i to [0, x-1]
+        if (adjustment != 0) and rn2(37 + |adjustment|) != 0:
+            i -= adjustment
+            clamp i to [0, x - 1]
         return i
 
-    For Wave 6 simplification, accept luck as a Python int (-13..+13).
+    Good luck (positive) drives i toward 0; bad luck (negative) drives i
+    toward x-1.
 
-    Returns
-    -------
-    jnp.int32 in [0, x).
+    ``luck`` is a Python int; the formula is evaluated entirely at trace
+    time (no Python conditionals on traced values), so it remains JIT-pure.
     """
     rng_a, rng_b = jax.random.split(rng, 2)
     i = rn2(rng_a, x)
-    # Adjustment: if luck != 0 and a side-roll fires, shift i by luck.
+
     if luck == 0:
         return i
-    adj_chance_denom = max(1, 50 - 2 * int(luck))
-    side = rn2(rng_b, adj_chance_denom)
-    delta = jnp.int32(int(luck) * max(1, (x // 50) - 1))
-    i_adjusted = jnp.where(side != 0, i, i + delta)
+
+    if x <= 15:
+        adjustment = (abs(int(luck)) + 1) // 3
+        if luck < 0:
+            adjustment = -adjustment
+    else:
+        adjustment = int(luck)
+
+    if adjustment == 0:
+        return i
+
+    # rn2(37 + |adjustment|) — non-zero result fires the adjustment.
+    gate = rn2(rng_b, 37 + abs(adjustment))
+    delta = jnp.int32(adjustment)
+    i_adjusted = jnp.where(gate != 0, i - delta, i)
     return jnp.clip(i_adjusted, 0, x - 1).astype(jnp.int32)
 
 
