@@ -732,7 +732,10 @@ def nh_timeout(state: StatusState) -> tuple:
 # Derived-state helpers (pure functions, no state mutation)
 # ---------------------------------------------------------------------------
 
-def compute_hunger_state(nutrition: jnp.ndarray) -> jnp.ndarray:
+def compute_hunger_state(
+    nutrition: jnp.ndarray,
+    con: jnp.ndarray = jnp.int32(11),
+) -> jnp.ndarray:
     """Map raw nutrition counter to HungerState (vectorised, JIT-compatible).
 
     Vendor threshold table (eat.c::newuhs lines 3369-3372):
@@ -740,23 +743,30 @@ def compute_hunger_state(nutrition: jnp.ndarray) -> jnp.ndarray:
       nutrition >  150 → NOT_HUNGRY (1)
       nutrition >   50 → HUNGRY     (2)
       nutrition >    0 → WEAK       (3)
-      nutrition > -800 → FAINTING   (4)
-      nutrition ≤ -800 → STARVED    (6)
 
-    Wave 6 #73: thresholds updated to vendor-exact values per
-    vendor/nethack/src/eat.c::newuhs lines 3369-3372 and the
-    HUNGER_STARVED = -800 death-cliff for forced game-over.
+    Starvation death-cliff (eat.c:3437):
+      u.uhunger < -(100 + 10 * ACURR(A_CON)) → STARVED
+      otherwise                              → FAINTING
+
+    Cite: vendor/nethack/src/eat.c::newuhs line 3437
+      ``else if (u.uhunger < -(100 + 10 * (int) ACURR(A_CON))) { u.uhs = STARVED; ...}``.
+
+    The CON parameter defaults to 11 (the vendor neutral baseline) so legacy
+    callers that do not know the hero's CON still get a reasonable
+    classification; ``hunger_tick`` (and any other vendor-parity caller) is
+    expected to thread the live CON value through.
 
     HungerState.FAINTED (5) is a runtime flag set by apply_starvation when
     the player actually falls over; it is never returned here.
     """
     n = jnp.int32(nutrition)
+    starve_floor = -(jnp.int32(100) + jnp.int32(10) * jnp.int32(con))
     # Walk thresholds in decreasing order; first match wins.
     state = jnp.where(n > jnp.int32(1000), jnp.int8(HungerState.SATIATED),
             jnp.where(n > jnp.int32(150),  jnp.int8(HungerState.NOT_HUNGRY),
             jnp.where(n > jnp.int32(50),   jnp.int8(HungerState.HUNGRY),
             jnp.where(n > jnp.int32(0),    jnp.int8(HungerState.WEAK),
-            jnp.where(n > jnp.int32(-800), jnp.int8(HungerState.FAINTING),
+            jnp.where(n >= starve_floor,   jnp.int8(HungerState.FAINTING),
                                             jnp.int8(HungerState.STARVED))))))
     return state
 
@@ -799,7 +809,10 @@ def compute_encumbrance(
 # Hunger tick
 # ---------------------------------------------------------------------------
 
-def hunger_tick(state: StatusState) -> StatusState:
+def hunger_tick(
+    state: StatusState,
+    con: jnp.ndarray = jnp.int32(11),
+) -> StatusState:
     """Drain nutrition by one turn; update hunger_state.
 
     Drain rate (eat.c):
@@ -807,8 +820,13 @@ def hunger_tick(state: StatusState) -> StatusState:
       - Ring of hunger (HUNGER_RING timed status active): +1 extra drain (×2).
       - Ring of slow digestion (SLOW_DIGESTION intrinsic): drain = 0 (no drain).
 
-    After drain, compute new hunger_state via compute_hunger_state().
-    FAINTED state is preserved when player has already fainted (apply_starvation sets it).
+    After drain, compute new hunger_state via compute_hunger_state(); the
+    STARVED death-cliff is CON-dependent per vendor eat.c:3437 — passes the
+    live CON through so the threshold is ``-(100 + 10 * con)`` rather than a
+    flat constant.
+
+    FAINTED state is preserved when player has already fainted
+    (apply_starvation manages the transition back to FAINTING).
     """
     # Slow digestion intrinsic (permanent or timed) blocks all drain.
     has_slow_dig = (
@@ -820,7 +838,7 @@ def hunger_tick(state: StatusState) -> StatusState:
     drain = jnp.where(has_slow_dig, jnp.int32(0),
             jnp.where(hunger_ring_active, jnp.int32(2), jnp.int32(1)))
     new_nutrition = state.nutrition - drain
-    raw_state = compute_hunger_state(new_nutrition)
+    raw_state = compute_hunger_state(new_nutrition, con=con)
     # Preserve FAINTED if already fainted (apply_starvation manages the transition
     # back to FAINTING when the player regains consciousness).
     already_fainted = state.hunger_state == jnp.int8(HungerState.FAINTED)
@@ -1195,14 +1213,6 @@ def step(
     # --- 2. Decrement all timers ---
     state = tick_timers(state)
 
-    # --- 3. Hunger drain ---
-    state = hunger_tick(state)
-
-    # --- 3b. POISONED damage tick — vendor/nethack/src/status.c.
-    # Applied after tick_timers so the post-decrement timer drives the check.
-    state, player_hp = apply_poisoned_tick(state, player_hp)
-
-    # --- 4. HP regen (vendor-parity only path) ---
     # Defaults are supplied here for legacy step() callers that omit
     # CON/INT/WIS/timestep; vendor regen functions themselves no longer
     # accept None — Wave 6 #78 removed the duplicate interval path.
@@ -1210,6 +1220,16 @@ def step(
     _wis = player_wis if player_wis is not None else jnp.int32(11)
     _int = player_int if player_int is not None else jnp.int32(11)
     _moves = timestep if timestep is not None else jnp.int32(0)
+
+    # --- 3. Hunger drain (CON threads through so the STARVED death-cliff is
+    # CON-dependent per vendor eat.c:3437). ---
+    state = hunger_tick(state, con=_con)
+
+    # --- 3b. POISONED damage tick — vendor/nethack/src/status.c.
+    # Applied after tick_timers so the post-decrement timer drives the check.
+    state, player_hp = apply_poisoned_tick(state, player_hp)
+
+    # --- 4. HP regen (vendor-parity only path) ---
 
     # Vendor allmain.c::moveloop only calls regen_hp / regen_pw when the
     # hero is still alive (line 290 — `if (!Upolyd ? (u.uhp < u.uhpmax) ...)`

@@ -135,18 +135,50 @@ class TestHungerThresholdTransitions:
             f"At nutrition={HUNGER_FAINTING} expected FAINTING, got {int(s)}"
         )
 
-    def test_starvation_at_minus_800(self):
-        """At nutrition = -800 (well past FAINTING floor) → STARVED state.
+    def test_starvation_is_con_dependent(self):
+        """STARVED death-cliff is CON-dependent per vendor eat.c:3437.
 
-        ``compute_hunger_state`` returns STARVED for any nutrition ≤ -200;
-        -800 is comfortably below the death-cliff and must classify as
-        STARVED.  Vendor's actual death formula
-        (``u.uhunger < -(100 + 10*Con)`` in eat.c line 3437) yields death
-        between -110 and -280 depending on Con; -800 is always lethal.
+        Vendor: ``else if (u.uhunger < -(100 + 10 * (int) ACURR(A_CON)))
+                  { u.uhs = STARVED; ... done(STARVING); }``.
+
+        At CON=11 (vendor default), the threshold is -210 — i.e. any
+        nutrition below -210 must classify as STARVED, and exactly -210 must
+        still be FAINTING (vendor uses strict ``<``, so n >= -210 → FAINTING).
+        At CON=18 (max), the threshold is -280.  At CON=3 (min), -130.
+
+        Cite: vendor/nethack/src/eat.c::newuhs line 3437.
         """
-        s = compute_hunger_state(jnp.int32(HUNGER_STARVED))  # -800
+        # CON=11 — threshold -(100 + 10*11) = -210.
+        s = compute_hunger_state(jnp.int32(-211), con=jnp.int32(11))
         assert int(s) == HungerState.STARVED, (
-            f"At nutrition={HUNGER_STARVED} expected STARVED, got {int(s)}"
+            f"CON=11: nutrition=-211 < -210 must be STARVED, got {int(s)}"
+        )
+        s_boundary = compute_hunger_state(jnp.int32(-210), con=jnp.int32(11))
+        assert int(s_boundary) == HungerState.FAINTING, (
+            f"CON=11: nutrition=-210 (== floor) must still be FAINTING, "
+            f"got {int(s_boundary)}"
+        )
+
+        # CON=18 — threshold -(100 + 10*18) = -280.
+        s_hi = compute_hunger_state(jnp.int32(-281), con=jnp.int32(18))
+        assert int(s_hi) == HungerState.STARVED
+        s_hi_b = compute_hunger_state(jnp.int32(-280), con=jnp.int32(18))
+        assert int(s_hi_b) == HungerState.FAINTING
+
+        # CON=3 — threshold -(100 + 10*3) = -130.
+        s_lo = compute_hunger_state(jnp.int32(-131), con=jnp.int32(3))
+        assert int(s_lo) == HungerState.STARVED
+        s_lo_b = compute_hunger_state(jnp.int32(-130), con=jnp.int32(3))
+        assert int(s_lo_b) == HungerState.FAINTING
+
+        # The legacy flat HUNGER_STARVED=-800 constant remains exposed for
+        # callers that want a "always lethal" floor.  Even at max CON=25 the
+        # threshold is -350, so -800 is always STARVED.
+        s_legacy = compute_hunger_state(jnp.int32(HUNGER_STARVED),
+                                         con=jnp.int32(25))
+        assert int(s_legacy) == HungerState.STARVED, (
+            f"At nutrition={HUNGER_STARVED} (legacy floor) expected STARVED, "
+            f"got {int(s_legacy)}"
         )
 
     def test_satiated_threshold(self):
@@ -241,19 +273,32 @@ class TestHungerVendorBoundary:
         s = compute_hunger_state(jnp.int32(151))
         assert int(s) == HungerState.NOT_HUNGRY
 
-    def test_hunger_starved_at_minus_800(self):
-        """At nutrition == -800, vendor death-cliff fires STARVED.
+    def test_hunger_starved_uses_vendor_con_floor(self):
+        """STARVED transition follows vendor eat.c:3437 ``u.uhunger < -(100+10*Con)``.
 
-        Wave 6 #73: HUNGER_STARVED = -800 (status_effects module constant).
-        Below this floor the game enforces game-over per the vendor's
-        ``u.uhunger < -(100 + 10*Con)`` death formula at maximum-CON.
+        The legacy HUNGER_STARVED=-800 module constant is retained as a
+        symbolic "always lethal" floor; the actual classification is
+        CON-dependent.  At the default CON=11 used by ``compute_hunger_state``
+        when no CON argument is supplied, the threshold is -210 and ANY
+        nutrition below that is STARVED — so -800, -799, and -211 all
+        classify as STARVED, while -210 is the last FAINTING value.
+
+        Cite: vendor/nethack/src/eat.c::newuhs line 3437.
         """
+        # Default CON=11 → threshold -210.
         s = compute_hunger_state(jnp.int32(-800))
         assert int(s) == HungerState.STARVED
 
         s2 = compute_hunger_state(jnp.int32(-801))
         assert int(s2) == HungerState.STARVED
 
-        # Just above -800 → still FAINTING.
+        # -799 is BELOW -210 → vendor STARVED (not FAINTING as the pre-fix
+        # flat-floor code claimed).
         s3 = compute_hunger_state(jnp.int32(-799))
-        assert int(s3) == HungerState.FAINTING
+        assert int(s3) == HungerState.STARVED, (
+            f"At CON=11, -799 < -210 → vendor STARVED; got {int(s3)}"
+        )
+
+        # -210 (== floor) is FAINTING (vendor uses strict ``<``).
+        s4 = compute_hunger_state(jnp.int32(-210))
+        assert int(s4) == HungerState.FAINTING
