@@ -1129,14 +1129,19 @@ def _effect_earth(state, rng, buc):
 
 
 def _effect_punishment(state, rng, buc):
-    """scroll of punishment — attach iron ball and chain.
+    """scroll of punishment — byte-equal to vendor seffect_punishment.
 
-    vendor/nethack/src/read.c::seffect_punishment (~1976).
-      uncursed/cursed: set is_punished=True, ball_pos=player_pos.
-      blessed: "you feel guilty" — no ball attached.
+    vendor/nethack/src/read.c:1976-1988:
+        if (confused || blessed) { You_feel("guilty."); return; }
+        punish(sobj);
+
+    Blessed OR confused → no ball/chain (just "feel guilty").
+    Was: blessed-only "guilty" branch; cursed/uncursed-confused still
+    attached the ball. Now also gates on CONFUSION timer.
     """
-    blessed = _is_blessed(buc)
-    guilty  = blessed
+    blessed  = _is_blessed(buc)
+    confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
+    guilty   = blessed | confused
     new_is_punished = jnp.where(guilty, state.is_punished, jnp.bool_(True))
     new_ball_pos    = jnp.where(guilty, state.ball_pos,    state.player_pos)
     return state.replace(is_punished=new_is_punished, ball_pos=new_ball_pos)
