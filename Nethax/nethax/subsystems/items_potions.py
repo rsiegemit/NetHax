@@ -585,29 +585,52 @@ def _effect_object_detection(state, rng, buc):
 # ---- movement modifiers ---------------------------------------------------
 
 def _effect_levitation(state, rng, buc):
-    """potion of levitation — timed LEVITATION intrinsic.
+    """potion of levitation — byte-equal to vendor peffect_levitation.
 
-    Canonical: peffect_levitation — incr_itimeout(&HLevitation, rn1(140,10)).
-    Wave 3: 150-turn timed levitation.
+    vendor/nethack/src/potion.c::peffect_levitation:
+        incr_itimeout(&HLevitation, rn1(140, 10));
+
+    rn1(140, 10) = uniform [10, 149].
+    Was: fixed 150 turns. Now uniform [10, 149] additive (incr_itimeout).
     """
-    turns      = jnp.int32(150)
+    from Nethax.nethax.rng import rn2
+
+    turns = rn2(rng, 140).astype(jnp.int32) + jnp.int32(10)  # [10, 149]
     new_status = add_timed_intrinsic(state.status, Intrinsic.LEVITATION, turns)
     return state.replace(status=new_status)
 
 
 def _effect_speed(state, rng, buc):
-    """potion of speed — timed FAST intrinsic.
+    """potion of speed — byte-equal to vendor peffect_speed.
 
-    Canonical: peffect_speed — speed_up(rn1(10,100+60*bcsign)).
-    Wave 3: 160-turn timed fast (blessed permanent).
+    vendor/nethack/src/potion.c:1052-1070:
+        speed_up(rn1(10, 100 + 60 * bcsign(otmp)));
+        if (!cursed && !(HFast & INTRINSIC)) HFast |= FROMOUTSIDE;
+
+    rn1(10, M) = [M, M+9] with M = 100+60*bcsign:
+        cursed   → [40, 49]
+        uncursed → [100, 109]
+        blessed  → [160, 169]
+    Non-cursed (uncursed AND blessed) grants intrinsic Fast permanently.
+    Was: blessed-only permanent, fixed 160 turns timer.
     """
-    blessed  = _is_blessed(buc)
-    perm_new = jnp.where(blessed, jnp.bool_(True),
-                         state.status.intrinsics[Intrinsic.FAST])
+    from Nethax.nethax.rng import rn2
+
+    cursed  = _is_cursed(buc)
+    blessed = _is_blessed(buc)
+    bcsign  = jnp.where(blessed, jnp.int32(1),
+              jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+    m_base  = jnp.int32(100) + jnp.int32(60) * bcsign  # 40/100/160
+    turns   = rn2(rng, 10).astype(jnp.int32) + m_base   # [M, M+9]
+
+    cur_perm = state.status.intrinsics[Intrinsic.FAST]
+    perm_new = jnp.where(~cursed, jnp.bool_(True), cur_perm)
     new_intr = state.status.intrinsics.at[Intrinsic.FAST].set(perm_new)
-    cur      = state.status.timed_intrinsics[Intrinsic.FAST]
-    new_t    = jnp.where(blessed, cur, jnp.maximum(cur, jnp.int32(160)))
+
+    cur = state.status.timed_intrinsics[Intrinsic.FAST]
+    new_t = cur + turns  # incr_itimeout — additive
     new_timers = state.status.timed_intrinsics.at[Intrinsic.FAST].set(new_t)
+
     new_status = state.status.replace(intrinsics=new_intr,
                                       timed_intrinsics=new_timers)
     return state.replace(status=new_status)
