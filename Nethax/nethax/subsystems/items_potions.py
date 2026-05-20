@@ -817,16 +817,18 @@ def _effect_oil(state, rng, buc):
     )
     new_items = state.inventory.items.replace(greased=new_greased)
 
-    # Fire damage if wielding a lit lamp (type_id 92 = oil lamp as proxy;
-    # check greased-before-update as "was already lit/oiled").
-    # Simplified trigger: if wielded item was already greased, it's "lit" →
-    # 2d4 fire damage (vendor: losehp(d(2,4), ...)).
-    was_lit = has_wielded & cur_greased[jnp.maximum(wslot, jnp.int32(0))]
-    rng, sub = jax.random.split(rng)
-    fire_dmg = (jax.random.randint(sub, (), 1, 5, dtype=jnp.int32) +
-                jax.random.randint(sub, (), 1, 5, dtype=jnp.int32))
-    new_hp = jnp.where(was_lit,
-                       jnp.maximum(state.player_hp - fire_dmg, jnp.int32(1)),
+    # Open-flame check: vendor peffect_oil — if any inventory item is lit
+    # (lamp/candle/candelabrum), the potion vapor ignites for 2d4 fire damage.
+    # Fire_resistance halves damage.
+    # Was: "greased-before-update" proxy (wrong — that's the OIL flag, not lit).
+    any_lit = jnp.any(state.inventory.items.lamplit)
+    rng, sub_a, sub_b = jax.random.split(rng, 3)
+    fire_dmg = (jax.random.randint(sub_a, (), 1, 5, dtype=jnp.int32) +
+                jax.random.randint(sub_b, (), 1, 5, dtype=jnp.int32))  # 2d4
+    has_fire_res = state.status.intrinsics[int(Intrinsic.RESIST_FIRE)]
+    fire_dmg = jnp.where(has_fire_res, (fire_dmg + jnp.int32(1)) // jnp.int32(2), fire_dmg)
+    new_hp = jnp.where(any_lit,
+                       jnp.maximum(state.player_hp - fire_dmg, jnp.int32(0)),
                        state.player_hp)
 
     new_inv = state.inventory.replace(items=new_items)
