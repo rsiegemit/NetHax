@@ -2087,18 +2087,21 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
         0b. Eat floor food: if hungry (pet_hunger <= 0) and a FOOD item is on
             the pet's tile, eat it — restore HP by food_value/4, remove the
             food, reset hunger to 1000. (dogmove.c:520 dog_eat)
+        0b'. Pick up item: pet picks up non-food, non-cursed item on its
+             current tile if an inventory slot is free.  Mirrors vendor
+             dog_invent pickup branch.  (dogmove.c:400 dog_invent)
         0c. Flee on low HP: if hp < hp_max/4 and not fearless (not undead /
             demon), move AWAY from player. (dogmove.c:1100)
 
-    Movement:
+    Movement (vendor priority: attack hostile > pick up item > follow > wander):
         1. If a hostile alive monster is adjacent (Chebyshev <= 1) → attack it
            (dogmove.c:1150 mattackm).
         2. Else if pet is within 6 Chebyshev tiles of player → FOLLOW mode:
            step toward player using BFS pathfind (mfndpos).
         3. Else → EXPLORE mode: random walk (dogmove.c:629 gx=FARAWAY).
 
-    Cite: vendor/nethack/src/dogmove.c::dog_move lines 520, 566-644, 1014,
-          1100, 1150; vendor/nethack/src/dog.c:380.
+    Cite: vendor/nethack/src/dogmove.c::dog_move lines 400, 520, 566-644,
+          1014, 1100, 1150; vendor/nethack/src/dog.c:380.
     JIT-pure: all branches via jax.lax.cond / jnp.where.
 
     Returns updated state.
@@ -2162,6 +2165,64 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
     )
     new_ground = state.ground_items.replace(category=new_ground_cat)
     state = state.replace(monster_ai=mai_e, ground_items=new_ground)
+    mai = state.monster_ai
+
+    # -----------------------------------------------------------------------
+    # 0b'. Pick up item at current tile — dogmove.c:400 dog_invent
+    # Vendor priority is: attack hostile > pick up item > follow > wander.
+    # Pet picks up a non-cursed, non-food ground item on its current tile if
+    # an inventory slot is free.  Food was already consumed in step 0b above.
+    # apport gating is intentionally deterministic here (rn2 omitted for JIT
+    # purity); the higher-fidelity stochastic gate lives in mpickstuff.
+    # Cite: vendor/nethack/src/dogmove.c::dog_invent (lines 426-475).
+    # -----------------------------------------------------------------------
+    mpos2 = mai.pos[idx].astype(jnp.int32)
+    pr2 = jnp.clip(mpos2[0], 0, _MAP_H - 1)
+    pc2 = jnp.clip(mpos2[1], 0, _MAP_W - 1)
+    g_cat = state.ground_items.category[b, lv, pr2, pc2, 0].astype(jnp.int32)
+    g_buc = state.ground_items.buc_status[b, lv, pr2, pc2, 0].astype(jnp.int32)
+    has_item_here = g_cat != jnp.int32(0)
+    not_food = g_cat != jnp.int32(_CAT_FOOD_LOCAL)
+    not_cursed = g_buc >= jnp.int32(0)  # buc_status: -1=cursed, 0=uncursed, +1=blessed
+    empty_mask = mai.inv_category[idx] == jnp.int8(0)
+    has_empty = jnp.any(empty_mask)
+    pick_slot = jnp.argmax(empty_mask.astype(jnp.int32)).astype(jnp.int32)
+    can_pickup = is_pet & has_item_here & not_food & not_cursed & has_empty
+
+    g_type = state.ground_items.type_id[b, lv, pr2, pc2, 0]
+    g_qty  = state.ground_items.quantity[b, lv, pr2, pc2, 0]
+    g_chg  = state.ground_items.charges[b, lv, pr2, pc2, 0]
+
+    new_inv_cat = mai.inv_category.at[idx, pick_slot].set(
+        jnp.where(can_pickup, g_cat.astype(jnp.int8),
+                  mai.inv_category[idx, pick_slot])
+    )
+    new_inv_type = mai.inv_type_id.at[idx, pick_slot].set(
+        jnp.where(can_pickup, g_type, mai.inv_type_id[idx, pick_slot])
+    )
+    new_inv_qty = mai.inv_quantity.at[idx, pick_slot].set(
+        jnp.where(can_pickup, g_qty, mai.inv_quantity[idx, pick_slot])
+    )
+    new_inv_buc = mai.inv_buc.at[idx, pick_slot].set(
+        jnp.where(can_pickup, g_buc.astype(jnp.int8),
+                  mai.inv_buc[idx, pick_slot])
+    )
+    new_inv_chg = mai.inv_charges.at[idx, pick_slot].set(
+        jnp.where(can_pickup, g_chg, mai.inv_charges[idx, pick_slot])
+    )
+    new_ground_cat2 = state.ground_items.category.at[b, lv, pr2, pc2, 0].set(
+        jnp.where(can_pickup, jnp.int8(0),
+                  state.ground_items.category[b, lv, pr2, pc2, 0])
+    )
+    mai_p = mai.replace(
+        inv_category=new_inv_cat,
+        inv_type_id=new_inv_type,
+        inv_quantity=new_inv_qty,
+        inv_buc=new_inv_buc,
+        inv_charges=new_inv_chg,
+    )
+    new_ground2 = state.ground_items.replace(category=new_ground_cat2)
+    state = state.replace(monster_ai=mai_p, ground_items=new_ground2)
     mai = state.monster_ai
 
     # -----------------------------------------------------------------------
