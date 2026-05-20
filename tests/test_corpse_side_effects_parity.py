@@ -73,23 +73,32 @@ def _with_resist_acid(state: EnvState) -> EnvState:
 
 
 # ---------------------------------------------------------------------------
-# 1. Poisonous corpse deals 1-15 HP damage without RESIST_POISON
-#    cite: eat.c:1130
+# 1. Poisonous corpse deals 1-15 HP damage without RESIST_POISON, gated by rn2(5)
+#    cite: eat.c:1923-1939 — `else if (poisonous(&mons[mnum]) && rn2(5))`
+#          rn2(5) is truthy 4/5 of the time, so ~4/5 of trials deal rnd(15) HP
+#          (and rnd(4) STR) damage, while ~1/5 skip silently.
 # ---------------------------------------------------------------------------
 
 def test_poisonous_corpse_damages():
-    """Eating a kobold corpse without RESIST_POISON decreases HP."""
+    """Eating a kobold corpse without RESIST_POISON decreases HP on the rn2(5) branch."""
     state = _base_state(hp=100)
     results = [
         apply_corpse_postfx(state, jax.random.PRNGKey(i), jnp.int32(_KOBOLD_IDX))
         for i in range(40)
     ]
     hp_reductions = [100 - int(r.player_hp) for r in results]
-    # At least some damage must occur across trials.
-    assert any(d > 0 for d in hp_reductions), "Expected HP loss from poisonous corpse"
-    # All damage in range [1, 15] (rnd(15)).
+
+    hits = sum(1 for d in hp_reductions if d > 0)
+    skips = sum(1 for d in hp_reductions if d == 0)
+
+    # Vendor: rn2(5) is non-zero in 4/5 of trials. Across 40 trials we expect
+    # ~32 hits and ~8 skips; allow loose bounds to absorb PRNG variance.
+    assert hits >= 24, f"Expected ~32 poison hits over 40 trials, got {hits}"
+    assert skips >= 1, f"Expected ~8 rn2(5)==0 skips over 40 trials, got {skips}"
+
+    # When damage fires, it must be rnd(15) → in [1, 15].
     for d in hp_reductions:
-        assert 1 <= d <= 15, f"Damage {d} out of rnd(15) range"
+        assert 0 <= d <= 15, f"Damage {d} out of rnd(15) range (or unexpected skip value)"
 
 
 # ---------------------------------------------------------------------------

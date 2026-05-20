@@ -531,8 +531,12 @@ def apply_corpse_postfx(
     # ------------------------------------------------------------------
     is_displacer = is_corpse & (safe_idx == jnp.int32(_DISPLACER_BEAST_IDX_NP))
     rng, rng_dp = jax.random.split(rng)
-    # d(6,6) ≈ 6 + rn2(31)  → [6, 36]; uniform-ish approximation of dice sum.
-    disp_turns = jnp.int32(6) + jax.random.randint(rng_dp, (), 0, 31, dtype=jnp.int32)
+    # d(6,6) = sum of 6 d6 rolls (triangular distribution [6, 36], mean 21).
+    # Byte-equal to vendor `d(6, 6)`.
+    _dp_keys = jax.random.split(rng_dp, 6)
+    disp_turns = jnp.sum(jnp.stack([
+        jax.random.randint(k, (), 1, 7, dtype=jnp.int32) for k in _dp_keys
+    ])).astype(jnp.int32)
     cur_disp = state.status.timed_intrinsics[int(Intrinsic.DISPLACED)]
     new_disp = jnp.where(is_displacer, cur_disp + disp_turns, cur_disp)
     new_t_intr2 = state.status.timed_intrinsics.at[int(Intrinsic.DISPLACED)].set(new_disp)
