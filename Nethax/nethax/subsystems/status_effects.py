@@ -908,6 +908,7 @@ def pw_regen_tick(state: StatusState, player_pw: jnp.ndarray,
       Wizard role → 3, all other roles → 4.
       When ``moves % period == 0`` (or Energy_regeneration), gain
       ``rn1((WIS+INT)/15 + 1, 1) = 1 + rand(0..upper-1)`` Pw.
+      If EMagical_breathing extrinsic is active, ``upper += 2`` (allmain.c:616).
 
     Wave 6 #78: legacy interval-based path removed.  All callers must supply
     ``player_int``, ``player_wis``, ``timestep`` and ``rng`` — vendor truth
@@ -933,8 +934,11 @@ def pw_regen_tick(state: StatusState, player_pw: jnp.ndarray,
     do_regen = moves_mod_period_zero | has_energy_regen
 
     # upper = (WIS + INT)/15 + 1; gain rn1(upper, 1) = 1 + rand(0..upper-1).
+    # Vendor allmain.c:615-616: `if (EMagical_breathing) upper += 2;`
     stat_sum = jnp.int32(player_wis) + jnp.int32(player_int)
     upper = (stat_sum // jnp.int32(15)) + jnp.int32(1)
+    has_emagical_breathing = state.extrinsic[Intrinsic.MAGIC_BREATHING] > jnp.int32(0)
+    upper = jnp.where(has_emagical_breathing, upper + jnp.int32(2), upper)
     # rn1(N, x) = x + rand(N) where rand(N) is uniform 0..N-1.
     upper_safe = jnp.maximum(upper, jnp.int32(1))
     roll = jax.random.randint(rng, (), 0, jnp.maximum(upper_safe, jnp.int32(1))).astype(jnp.int32)
