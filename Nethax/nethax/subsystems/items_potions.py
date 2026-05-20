@@ -424,25 +424,36 @@ def _effect_restore_ability(state, rng, buc):
 # ---- level/XP group -------------------------------------------------------
 
 def _effect_gain_level(state, rng, buc):
-    """potion of gain level — gain one experience level.
+    """potion of gain level — byte-equal to vendor peffect_gain_level.
 
-    Canonical: peffect_gain_level (potion.c) — uncursed/blessed: pluslvl(FALSE)
-    → XL+1.  Cursed: goto_level(current_level - 1) i.e. ascend one dungeon
-    level; no effect if already at level 1.
+    vendor/nethack/src/potion.c::peffect_gain_level:
+        if (otmp->cursed) {
+            if (Antimagic || u.uz.dlevel == 1) /* no effect */;
+            else next_level(FALSE);            /* ascend one dlvl */
+        } else {
+            pluslvl(otmp->blessed);            /* XL+1 with HP/Pw reroll */
+        }
 
-    Cite: vendor/nethack/src/potion.c::peffect_gain_level.
+    The non-cursed branch routes through experience.pluslvl() so the wave16a
+    XP system handles HP_max, Pw_max, urexp, and uexp bookkeeping properly.
+    Cursed branch ascends one dungeon level; floor at 1 (vendor: do nothing
+    when on Dlvl 1 unless Antimagic). Antimagic intrinsic not yet modelled.
     """
-    cursed = _is_cursed(buc)
-    # Uncursed/blessed: increment XL (capped at 30).
-    new_xl = jnp.where(cursed, state.player_xl,
-                       jnp.minimum(state.player_xl + jnp.int32(1), jnp.int32(30)))
-    # Cursed: ascend one dungeon level (current_level -= 1), floor at 1.
+    from Nethax.nethax.subsystems.experience import pluslvl as _pluslvl
+
+    cursed  = _is_cursed(buc)
+
+    # --- Cursed branch: ascend one dungeon level (floor at 1) ---
     cur_lv  = state.dungeon.current_level.astype(jnp.int32)
-    new_lv  = jnp.where(cursed,
-                        jnp.maximum(cur_lv - jnp.int32(1), jnp.int32(1)),
-                        cur_lv).astype(jnp.int8)
-    new_dungeon = state.dungeon.replace(current_level=new_lv)
-    return state.replace(player_xl=new_xl, dungeon=new_dungeon)
+    new_lv  = jnp.maximum(cur_lv - jnp.int32(1), jnp.int32(1)).astype(jnp.int8)
+    state_cursed = state.replace(
+        dungeon=state.dungeon.replace(current_level=new_lv),
+    )
+
+    # --- Non-cursed: pluslvl(blessed) — XL+1 + HP/Pw reroll, urexp bumped ---
+    state_lvlup = _pluslvl(state, rng, incr=True)
+
+    return jax.lax.cond(cursed, lambda _: state_cursed, lambda _: state_lvlup, None)
 
 
 # ---- vision group ---------------------------------------------------------
