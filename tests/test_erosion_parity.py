@@ -89,6 +89,11 @@ def _make_inv_state(items: Item) -> InventoryState:
         total_weight=jnp.int32(0),
         user_names=jnp.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=jnp.int8),
         wielded_artifact_idx=jnp.int8(-1),
+        # Cursed-stuck (welded) flags added per vendor wield.c::welded()
+        welded=jnp.bool_(False),
+        worn_armor_welded=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.bool_),
+        worn_amulet_welded=jnp.bool_(False),
+        worn_rings_welded=jnp.zeros((2,), dtype=jnp.bool_),
     )
 
 
