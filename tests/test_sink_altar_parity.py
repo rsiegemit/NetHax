@@ -66,21 +66,47 @@ def _set_altar(state: EnvState, alignment: int) -> EnvState:
 # ---------------------------------------------------------------------------
 
 class TestKickSink:
-    def test_kick_sink_strange_shock(self):
-        """Kicking a sink sometimes deals HP damage (shock/pudding outcomes).
+    def test_kick_sink_klunk_is_dominant_outcome(self):
+        """Vendor's first rn2(5) check makes klunk (no-op) the 4/5 outcome.
 
-        Cite: vendor/nethack/src/dokick.c::kick_nondoor lines 1194-1240.
-        Over 80 rngs, at least one must reduce HP.
+        Cite: vendor/nethack/src/dokick.c::kick_nondoor line 1171
+              ``if (rn2(5)) { pline("Klunk!  ..."); return 1; }``.
+        Over 500 trials at default state, ~80% of outcomes should be
+        klunk (outcome_id == 3 in our encoding, with no HP change).
+        """
+        state = _make_state()
+        klunk_no_dmg = 0
+        for i in range(500):
+            rng_i = jax.random.PRNGKey(100 + i)
+            new_state, outcome = kick_sink(state, rng_i)
+            if int(outcome) == 3 and int(new_state.player_hp) == int(state.player_hp):
+                klunk_no_dmg += 1
+        # Klunk is 4/5 = 80%; allow generous margin for the cascade's
+        # downstream dishwasher branch that also folds into outcome=3.
+        assert klunk_no_dmg >= 350, (
+            f"Klunk should dominate ~80% of outcomes; got {klunk_no_dmg}/500"
+        )
+
+    def test_kick_sink_ouch_deals_hp_damage(self):
+        """The ``ouch`` (kick_ouch) tail of the cascade deals rnd(5) HP.
+
+        Cite: vendor/nethack/src/dokick.c::kick_nondoor lines 1227-1244 —
+        ``ouch:`` label hits ``losehp(Maybe_Half_Phys(rnd(...)))``.
+        With probability ~6% per trial, 200 trials almost always include at
+        least one ouch outcome.
         """
         state = _make_state()
         any_damage = False
-        for i in range(80):
+        for i in range(200):
             rng_i = jax.random.PRNGKey(100 + i)
-            new_state, _ = kick_sink(state, rng_i)
+            new_state, outcome = kick_sink(state, rng_i)
             if int(new_state.player_hp) < int(state.player_hp):
+                # Damage outcomes must report id=0 (kick_ouch).
+                assert int(outcome) == 0, (
+                    f"HP-reducing outcome must be id=0 (ouch); got {int(outcome)}"
+                )
                 any_damage = True
-                break
-        assert any_damage, "Expected at least one HP-reducing outcome in 80 kick_sink trials"
+        assert any_damage, "Expected at least one ouch outcome in 200 trials"
 
     def test_kick_sink_jit_safe(self):
         """kick_sink must be jit-compilable."""

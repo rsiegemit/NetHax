@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 from flax import struct
 
-from Nethax.nethax.rng import rnd, split_n
+from Nethax.nethax.rng import rn2, rnd, split_n
 
 
 # ---------------------------------------------------------------------------
@@ -70,28 +70,81 @@ class SwallowState:
 # Core functions
 # ---------------------------------------------------------------------------
 
-def try_engulf(state, attacker_slot: jnp.ndarray, rng: jax.Array):
+def try_engulf(
+    state,
+    attacker_slot: jnp.ndarray,
+    rng: jax.Array,
+    attack_is_dgst=None,
+    m_lev=None,
+    con=None,
+    uac=None,
+):
     """Attempt to engulf the player.
 
     Called when an AT_ENGL attack lands.  No-ops if the player is already
     swallowed by another monster.
 
-    Vendor: vendor/nethack/src/mhitu.c::gulpmu line 1287 (``if (!u.uswallow)``).
+    Vendor: vendor/nethack/src/mhitu.c::gulpmu lines 1287, 1380-1395.
 
     Parameters
     ----------
     state         : EnvState
     attacker_slot : monster_ai slot index of the engulfer (int32 scalar)
     rng           : JAX PRNG key
+    attack_is_dgst : optional bool/int32 — when provided (along with ``m_lev``,
+                    ``con``, ``uac``), uswldtim is computed via the vendor
+                    formula at mhitu.c:1380-1395:
+                      if AD_DGST: tim_tmp = max(0, CON + 10 - uac + rn2(20))
+                                  tim_tmp = tim_tmp / m_lev + 3
+                      else      : tim_tmp = rnd(m_lev + 5)        # 10/2 == 5
+                      uswldtim  = max(2, tim_tmp)
+                    When ``attack_is_dgst`` is ``None``, falls back to the
+                    legacy uniform [25, 100) approximation (3.6's rn1(25, 75)
+                    shape for non-AD_DGST attacks).
+    m_lev         : engulfer monster level (int32 scalar) — required when
+                    ``attack_is_dgst`` is provided.
+    con           : player CON (int32 scalar) — required for AD_DGST branch.
+    uac           : player AC (int32 scalar) — required for AD_DGST branch.
     """
     already = state.swallow.swallowed
 
-    # Approximation: vendor mhitu.c:1380-1395 computes uswldtim from the
-    # specific attack type (AD_DGST uses CON+AC+rn2(20); others use
-    # rnd(m_lev+5)).  We don't have AD_DGST vs other separation at this
-    # call site, so use a uniform [25, 100) — same shape as 3.6's
-    # rn1(25, 75) for non-AD_DGST.  Clamp to >= 2 mirrors line 1395.
-    total = jnp.maximum(jnp.int32(25) + rnd(rng, 75), jnp.int32(2))
+    if attack_is_dgst is None:
+        # Legacy fallback: vendor 3.6 non-AD_DGST shape ``rn1(25, 75)`` ≈
+        # uniform [25, 100).  Clamp to >= 2 mirrors mhitu.c:1395.
+        total = jnp.maximum(jnp.int32(25) + rnd(rng, 75), jnp.int32(2))
+    else:
+        # Vendor mhitu.c:1380-1395 — split by attack adtyp == AD_DGST.
+        rng_dgst, rng_other = jax.random.split(rng, 2)
+        is_dgst = jnp.asarray(attack_is_dgst, dtype=jnp.bool_)
+        m_lev_i = jnp.asarray(m_lev, dtype=jnp.int32)
+        con_i   = jnp.asarray(con,   dtype=jnp.int32)
+        uac_i   = jnp.asarray(uac,   dtype=jnp.int32)
+
+        # AD_DGST branch (mhitu.c:1381-1389):
+        #   tim_tmp = (int)ACURR(A_CON) + 10 - (int)u.uac + rn2(20);
+        #   if (tim_tmp < 0) tim_tmp = 0;
+        #   tim_tmp /= (int) mtmp->m_lev;
+        #   tim_tmp += 3;
+        dgst_raw = con_i + jnp.int32(10) - uac_i + rn2(rng_dgst, 20)
+        dgst_clamped = jnp.maximum(dgst_raw, jnp.int32(0))
+        # Avoid div-by-zero: m_lev guaranteed >= 1 in vendor; clamp defensively.
+        safe_m_lev = jnp.maximum(m_lev_i, jnp.int32(1))
+        dgst_tim = (dgst_clamped // safe_m_lev) + jnp.int32(3)
+
+        # Non-AD_DGST branch (mhitu.c:1392): rnd((int) mtmp->m_lev + 10 / 2)
+        # In C, 10/2 is evaluated as integer 5, so this is rnd(m_lev + 5),
+        # i.e. uniform in [1, m_lev + 5].  We implement this inline because
+        # rng.rnd takes a static Python upper bound but m_lev is traced.
+        # Use uniform(0,1) * n + 1, floor — uniform across integer values.
+        non_dgst_max = safe_m_lev + jnp.int32(5)
+        u = jax.random.uniform(rng_other, (), dtype=jnp.float32)
+        non_dgst_tim = jnp.int32(1) + jnp.floor(u * non_dgst_max.astype(jnp.float32)).astype(jnp.int32)
+        # Guard against the (measure-zero) u == 1.0 corner.
+        non_dgst_tim = jnp.minimum(non_dgst_tim, non_dgst_max)
+
+        tim_tmp = jnp.where(is_dgst, dgst_tim, non_dgst_tim)
+        # Vendor mhitu.c:1395: u.uswldtim = (tim_tmp < 2) ? 2 : tim_tmp;
+        total = jnp.maximum(tim_tmp, jnp.int32(2))
 
     # Player's pos moves to the engulfer's pos (they are now inside).
     # vendor/nethack/src/mhitu.c:1301 — sets u.ux/u.uy to mtmp->mx/mtmp->my.

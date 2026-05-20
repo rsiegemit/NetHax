@@ -94,14 +94,25 @@ _OBJECT_CLASS: jnp.ndarray = jnp.array(
 # Canonical: vendor/nethack/src/objnam.c::add_erosion_words() lines 1142-1191
 # ---------------------------------------------------------------------------
 
-# Per-object erosion material class:
-#   0 = no erosion applicable
-#   1 = rustprone  (IRON/METAL/MITHRIL/PLATINUM)
-#   2 = flammable  (LEATHER/WOOD/CLOTH/PAPER/WAX/VEGGY/FLESH)
-#   3 = corrodeable-only (COPPER/SILVER/GOLD — oeroded2->corrode, no oeroded word)
-# Mirrors: is_rustprone / is_flammable / is_corrodeable in vendor/nethack/src/obj*.
-_EROSION_RUST_MAT = {int(Material.IRON), int(Material.METAL), int(Material.MITHRIL), int(Material.PLATINUM)}
-_EROSION_CORRODE_MAT = {int(Material.COPPER), int(Material.SILVER), int(Material.GOLD)}
+# Per-object erosion material class — vendor-equal classification.
+# Vendor macros (vendor/nethack/include/objclass.h lines 199-212):
+#   is_rustprone(otmp)   := oc_material == IRON
+#   is_corrodeable(otmp) := oc_material == COPPER || oc_material == IRON
+#   is_flammable(otmp)   := LEATHER|WOOD|CLOTH|PAPER|WAX|VEGGY|FLESH (mkobj.c)
+#
+# Class encoding (consumed by _vulnerable_for_kind in subsystems/items.py and
+# by the erosion-word tables below):
+#   0 = no erosion applicable        — SILVER, GOLD, MITHRIL, PLATINUM, METAL,
+#                                       GLASS (non-armor), GEMSTONE, MINERAL, etc.
+#   1 = rustprone (also corrodeable) — IRON only (vendor is_rustprone)
+#   2 = flammable (also rottable)    — LEATHER/WOOD/CLOTH/PAPER/WAX/VEGGY/FLESH
+#   3 = corrodeable-only             — COPPER only (vendor is_corrodeable
+#                                       minus IRON; no rust word produced)
+#
+# _vulnerable_for_kind treats CORRODE as (class 1 | class 3), matching
+# is_corrodeable = COPPER || IRON.
+_EROSION_RUST_MAT = {int(Material.IRON)}
+_EROSION_CORRODE_MAT = {int(Material.COPPER)}
 _EROSION_FLAME_MAT = {
     int(Material.LEATHER),
     int(Material.WOOD),

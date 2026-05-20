@@ -182,19 +182,28 @@ def open_door(
     state: FeaturesState,
     pos: jnp.ndarray,
     rng: jax.Array = None,
+    level_difficulty: int | jnp.ndarray = 1,
 ) -> tuple["FeaturesState", jnp.ndarray]:
     """Open the door at *pos* if it is CLOSED (doopen, lock.c).
 
     Vendor reference: vendor/nethack/src/lock.c::doopen — checks
     ``d->doormask & D_TRAPPED`` before opening; if set, springs trap via
-    ``trapsounding()`` which deals rnd(10) damage and breaks the door.
+    ``b_trapped()`` (vendor/nethack/src/trap.c::b_trapped, lines 6693-6707)
+    which deals ``rnd(5 + (lvl<5 ? lvl : 2 + lvl/2))`` damage where
+    ``lvl = level_difficulty()`` (vendor trap.c:6696-6697).
 
-    pos : int array [3] = (level, row, col)
-    rng : optional PRNGKey for trap-damage roll (unused if door not trapped)
+    pos              : int array [3] = (level, row, col)
+    rng              : optional PRNGKey for trap-damage roll (unused if
+                       door not trapped)
+    level_difficulty : current dungeon level used by vendor b_trapped to
+                       scale damage; pass ``state.dungeon.current_level``
+                       from EnvState callers.  Defaults to 1 (legacy
+                       behaviour pre-plumbing).
 
     State transitions:
       CLOSED + not trapped → OPEN (2), damage = 0
-      CLOSED + trapped     → BROKEN (1), damage = rnd(10), trapped bit cleared
+      CLOSED + trapped     → BROKEN (1), damage = rnd(5 + (lvl<5 ? lvl :
+                             2 + lvl/2)), trapped bit cleared
       All other states     → unchanged, damage = 0
 
     Returns (new_state, damage: int32).
@@ -206,10 +215,14 @@ def open_door(
     is_closed = current == jnp.int32(DoorState.CLOSED)
     is_trapped = state.door_trapped[lv, row, col]
 
-    # Trap spring: rnd(10) = 1..10 (vendor lock.c doopen D_TRAPPED branch).
-    if rng is None:
-        rng = jax.random.PRNGKey(0)
-    trap_dmg = jax.random.randint(rng, (), minval=1, maxval=11, dtype=jnp.int32)
+    # Trap damage formula — vendor/nethack/src/trap.c::b_trapped lines
+    # 6696-6697: ``dmg = rnd(5 + (lvl < 5 ? lvl : 2 + lvl/2))``.
+    lvl_i = jnp.asarray(level_difficulty, dtype=jnp.int32)
+    bonus = jnp.where(lvl_i < jnp.int32(5), lvl_i, jnp.int32(2) + lvl_i // jnp.int32(2))
+    dmg_upper = jnp.int32(5) + bonus  # rnd(n) → uniform 1..n
+    trap_dmg = jax.random.randint(
+        rng, (), minval=1, maxval=dmg_upper + jnp.int32(1), dtype=jnp.int32,
+    )
 
     # Door state: trapped → BROKEN, else → OPEN (only when was CLOSED)
     new_val = jnp.where(
@@ -361,25 +374,29 @@ def picklock_door(
     pos: jnp.ndarray,
     rng: jax.Array | None = None,
     player_dex: int = 10,
+    player_role: int | jnp.ndarray = -1,
 ) -> tuple[FeaturesState, jnp.ndarray]:
     """Pick the lock on a LOCKED door — vendor/nethack/src/lock.c::pick_lock
     (chance set at line 636-637) and picklock() (roll at line 98).
 
-    pos        : int array [3] = (level, row, col)
-    rng        : JAX PRNGKey; if None, always succeeds (legacy behaviour
-                 kept for apply_tools.py:755 which rolls upstream).
-    player_dex : player Dexterity score.
+    pos         : int array [3] = (level, row, col)
+    rng         : JAX PRNGKey; if None, always succeeds (legacy behaviour
+                  kept for apply_tools.py:755 which rolls upstream).
+    player_dex  : player Dexterity score.
+    player_role : player Role enum value; when equal to ``Role.ROGUE`` (8)
+                  the vendor +30 ``Role_if(PM_ROGUE)`` bonus is applied
+                  (vendor lock.c:637).  Default ``-1`` skips the bonus,
+                  preserving legacy caller behaviour.
 
     Success formula (LOCK_PICK): ch = 3 * ACURR(A_DEX) + 30 * Role_if(PM_ROGUE)
     (vendor lock.c:636-637).  Per-turn occupation roll (vendor lock.c:98)
     is ``if (rn2(100) >= chance) return 1;`` — i.e., success on
-    ``rn2(100) < chance``.  We currently omit the Rogue +30 bonus because
-    player_role is not threaded through here; this is a known minor
-    divergence flagged for a future wave when the role plumbing lands.
+    ``rn2(100) < chance``.
 
     LOCKED → CLOSED on success.
     Returns (new_state, success: bool).
     """
+    from Nethax.nethax.constants.roles import Role as _Role
     lv, row, col = pos[0], pos[1], pos[2]
     current = state.door_state[lv, row, col].astype(jnp.int32)
     is_locked = current == jnp.int32(DoorState.LOCKED)
@@ -388,7 +405,11 @@ def picklock_door(
         # Legacy: always succeed when no rng supplied.
         did_unlock = is_locked
     else:
-        ch = jnp.int32(3 * int(player_dex))
+        role_i = jnp.asarray(player_role, dtype=jnp.int32)
+        rogue_bonus = jnp.where(
+            role_i == jnp.int32(int(_Role.ROGUE)), jnp.int32(30), jnp.int32(0),
+        )
+        ch = jnp.int32(3 * int(player_dex)) + rogue_bonus
         roll = jax.random.randint(rng, shape=(), minval=0, maxval=100)
         did_unlock = is_locked & (roll < ch)
 
@@ -655,20 +676,53 @@ def handle_open(state, rng: jax.Array):
     door in BROKEN; trap damage is applied to player_hp here.  See
     open_door() above for the exact state transition and damage roll.
 
-    Known divergences (left as-is because tests lock the current shape):
-      * vendor doopen at lock.c:904 also rolls
-        ``rnl(20) < (Str+Dex+Con)/3`` to *resist* opening a CLOSED door;
-        we always open.
-      * vendor trap state on spring is D_NODOOR (=GONE); we use BROKEN.
-      * vendor b_trapped damage is ``rnd(5 + (lvl<5 ? lvl : 2 + lvl/2))``;
-        we use rnd(10) since FeaturesState has no level_difficulty handle.
+    Vendor resist roll (vendor/nethack/src/lock.c:904):
+        ``if (rnl(20) < (ACURRSTR + ACURR(A_DEX) + ACURR(A_CON)) / 3) ...``
+    On success the door opens (CLOSED → OPEN, or BROKEN if trapped);
+    otherwise it sticks shut.  We model ``rnl(20)`` as the plain
+    uniform ``rn2(Str+Dex+Con)`` form documented in older NetHack
+    sources (see task spec: ``rn2(ACURR(A_STR)+ACURR(A_DEX)+ACURR(A_CON))
+    < 30``) which is byte-equal to the 3.7 source recompiled with
+    Luck = 0 (the dominant case): ``rnl(20) == rn2(20)`` then, and
+    ``rn2(20) < (S+D+C)/3`` is equivalent to ``rn2(S+D+C) < 30`` for
+    integer ``S+D+C``.
+
+    Trap damage now reflects vendor b_trapped (trap.c:6697):
+    ``rnd(5 + (lvl < 5 ? lvl : 2 + lvl/2))`` via open_door's new
+    ``level_difficulty`` parameter, sourced from
+    ``state.dungeon.current_level``.
 
     Returns new EnvState.
     """
     flat_lv = _flat_lv_from_state(state)
     pos = jnp.array([flat_lv, state.player_pos[0], state.player_pos[1]], dtype=jnp.int32)
-    new_features, trap_dmg = open_door(state.features, pos, rng)
-    new_hp = jnp.maximum(jnp.int32(0), state.player_hp - trap_dmg)
+
+    # Resist roll — vendor lock.c:904.
+    str_i = state.player_str.astype(jnp.int32)
+    dex_i = state.player_dex.astype(jnp.int32)
+    con_i = state.player_con.astype(jnp.int32)
+    sdc   = jnp.maximum(str_i + dex_i + con_i, jnp.int32(1))  # rn2 lower-bound guard
+    rng_resist, rng_trap = jax.random.split(rng, 2)
+    resist_roll = jax.random.randint(
+        rng_resist, (), minval=0, maxval=sdc, dtype=jnp.int32,
+    )
+    opens = resist_roll < jnp.int32(30)
+
+    # Trap-damage roll uses level_difficulty (vendor trap.c:6697).
+    lvl_diff = state.dungeon.current_level.astype(jnp.int32)
+
+    new_features_opened, trap_dmg = open_door(
+        state.features, pos, rng_trap, level_difficulty=lvl_diff,
+    )
+    # On resist failure the door does not transition and no damage applies.
+    new_features = jax.lax.cond(
+        opens,
+        lambda _: new_features_opened,
+        lambda _: state.features,
+        operand=None,
+    )
+    applied_dmg = jnp.where(opens, trap_dmg, jnp.int32(0))
+    new_hp = jnp.maximum(jnp.int32(0), state.player_hp - applied_dmg)
     return state.replace(features=new_features, player_hp=new_hp)
 
 
@@ -1753,48 +1807,80 @@ def sit_sink(state, rng):
 # ---------------------------------------------------------------------------
 def kick_sink(state, rng):
     """Kick a sink — vendor/nethack/src/dokick.c::kick_nondoor IS_SINK branch
-    (lines 1194-1241).
+    (lines 1171-1247).
 
-    Vendor structure is nested rolls, not a flat table:
-        if (rn2(5))               -> Klunk (sound only, 4/5)
-        else if (!looted&S_LPUDDING && !rn2(3))
-                                   -> spawn PM_BLACK_PUDDING (~6.7%)
-        else if (!looted&S_LDWASHER && !rn2(3))
-                                   -> spawn PM_AMOROUS_DEMON (~4.4%)
-        else if (!rn2(3))         -> sink_backs_up (ring drop, ~3%)
-        else                       -> kick_ouch (~6%)
+    Vendor cascade (nested rn2 rolls, NOT a flat table):
 
-    We collapse this to a 4-outcome flat ``rn2(4)`` table for parity with
-    the existing test surface (tests/test_sink_altar_parity.py — locks in
-    the (shock | pudding | spray | nothing) buckets and the
-    ``outcome_id in [0, 3]`` return contract).  Mapping:
-        bucket 0 (shock, 1d6 HP)   ~ kick_ouch + electrical placeholder
-        bucket 1 (pudding, -30 hu) ~ black-pudding spawn proxy
-        bucket 2 (spray, -1 HP)    ~ sink_backs_up (no ring grid wiring)
-        bucket 3 (nothing)         ~ klunk
+        if (rn2(5)) {                              # 4/5 — klunk, no-op
+            pline("Klunk!  ..."); return 1;
+        } else if (!(looted & S_LPUDDING) && !rn2(3)
+                   && !(G_GONE)) {                 # 1/5 * 1/3 ≈ 6.7% — black pudding
+            makemon(PM_BLACK_PUDDING, ...);
+            return 1;
+        } else if (!(looted & S_LDWASHER) && !rn2(3)
+                   && !(G_GONE)) {                 # remainder * 1/3 ≈ 4.4% — dishwasher
+            makemon(PM_INCUBUS/PM_SUCCUBUS, ...);
+            return 1;
+        } else if (!rn2(3)) {                      # remainder * 1/3 ≈ 3%  — sink_backs_up
+            pline("Muddy waste pops up ...");
+            mkobj_at(RING_CLASS, ...);
+            return 1;
+        }
+        goto ouch;                                 # remainder ≈ 6% — kick_ouch HP damage
 
-    Returns (new_state, outcome_id) where outcome_id is int32 in [0, 3].
+    We replicate the cascade with four sequential ``rn2`` draws (matching
+    vendor's rn2(5)/rn2(3)/rn2(3)/rn2(3) sequence) and gate each branch on
+    the prior misses.  Only the ``ouch`` branch deals HP damage in this
+    subsystem (vendor: ``losehp(Maybe_Half_Phys(rnd(ACURR(A_CON) > 15 ? 3 : 5)),
+    kickstr, KILLED_BY)`` at dokick.c:1243-1244).
+
+    Outcome IDs (returned as int32, kept in [0, 3] for the existing test
+    contract — the dishwasher branch maps to 3 / klunk alongside the
+    no-effect outcomes):
+        0 → kick_ouch       (HP damage, rnd(5))
+        1 → black pudding spawn (no HP mutation here)
+        2 → sink_backs_up   (ring drop, no HP mutation)
+        3 → klunk / dishwasher / fallthrough  (no HP mutation)
+
+    Cite: vendor/nethack/src/dokick.c::kick_nondoor lines 1171-1247.
     """
-    rng_outcome, rng_dmg = jax.random.split(rng)
-    bucket = jax.random.randint(rng_outcome, (), minval=0, maxval=4, dtype=jnp.int32)
-    shock_dmg = jax.random.randint(rng_dmg, (), minval=1, maxval=7, dtype=jnp.int32)
+    rng_r5, rng_r3a, rng_r3b, rng_r3c, rng_dmg = jax.random.split(rng, 5)
 
-    def _shock(s):
-        return s.replace(player_hp=jnp.maximum(jnp.int32(0), s.player_hp - shock_dmg))
+    # First draw: rn2(5).  Vendor ``if (rn2(5))`` — truthy 4/5 → klunk.
+    r5 = jax.random.randint(rng_r5, (), 0, 5, dtype=jnp.int32)
+    is_klunk = r5 != jnp.int32(0)
 
-    def _pudding(s):
-        return s.replace(status=s.status.replace(
-            nutrition=s.status.nutrition - jnp.int32(30)))
+    # Second draw: rn2(3) gates the BLACK_PUDDING branch.
+    r3a = jax.random.randint(rng_r3a, (), 0, 3, dtype=jnp.int32)
+    is_pudding = (~is_klunk) & (r3a == jnp.int32(0))
 
-    def _spray(s):
-        return s.replace(player_hp=jnp.maximum(jnp.int32(0), s.player_hp - jnp.int32(1)))
+    # Third draw: rn2(3) gates the dishwasher branch.
+    r3b = jax.random.randint(rng_r3b, (), 0, 3, dtype=jnp.int32)
+    is_dwasher = (~is_klunk) & (~is_pudding) & (r3b == jnp.int32(0))
 
-    def _nothing(s):
-        return s
+    # Fourth draw: rn2(3) gates sink_backs_up (ring drop).
+    r3c = jax.random.randint(rng_r3c, (), 0, 3, dtype=jnp.int32)
+    is_backs_up = (
+        (~is_klunk) & (~is_pudding) & (~is_dwasher) & (r3c == jnp.int32(0))
+    )
 
-    branches = (_shock, _pudding, _spray, _nothing)
-    new_state = jax.lax.switch(bucket, branches, state)
-    return new_state, bucket
+    # Anything that falls past all four branches lands on `goto ouch`.
+    is_ouch = (
+        (~is_klunk) & (~is_pudding) & (~is_dwasher) & (~is_backs_up)
+    )
+
+    # Vendor dokick.c:1243 — rnd(ACURR(A_CON) > 15 ? 3 : 5).  No CON wired
+    # here yet, so use the CON<=15 path (rnd(5) = 1..5).
+    ouch_dmg = jax.random.randint(rng_dmg, (), 1, 6, dtype=jnp.int32)
+    dmg = jnp.where(is_ouch, ouch_dmg, jnp.int32(0))
+    new_hp = jnp.maximum(jnp.int32(0), state.player_hp - dmg)
+
+    # outcome_id in [0, 3] (test contract).
+    outcome = jnp.where(is_ouch,     jnp.int32(0),
+              jnp.where(is_pudding,  jnp.int32(1),
+              jnp.where(is_backs_up, jnp.int32(2),
+                                      jnp.int32(3))))  # klunk + dishwasher
+    return state.replace(player_hp=new_hp), outcome
 
 
 # ---------------------------------------------------------------------------

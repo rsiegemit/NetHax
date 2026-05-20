@@ -241,6 +241,7 @@ def erode_obj_slot(
     slot_idx,
     kind,
     force,
+    rng=None,
 ):
     """JIT-pure erosion of inventory_items[slot_idx].
 
@@ -252,6 +253,10 @@ def erode_obj_slot(
     force           : bool scalar — when True, bypass blessed-resist check
                       (vendor: ``ef_flags & EF_PAY`` style force; we treat ``force``
                       as overriding the ``otmp->blessed && !rnl(4)`` chance gate)
+    rng             : optional JAX PRNG key. When provided, the blessed-resist
+                      gate samples the vendor ``!rnl(4)`` (1/4 chance to resist)
+                      using this key; when omitted, falls back to the deterministic
+                      worst-case (blessed always blocks unless ``force`` is True).
 
     Returns
     -------
@@ -302,10 +307,15 @@ def erode_obj_slot(
                                 | (k == jnp.int32(ERODE_CORRODE)))
 
     # Blessed has 1/4 chance to resist (vendor trap.c:257 ``otmp->blessed && !rnl(4)``).
-    # Without an rnl(4) here, we use the deterministic worst case: when not
-    # forced, blessed always blocks (force=True overrides). Callers that want
-    # the stochastic gate can fold it into ``force`` themselves.
-    blessed_blocks = blessed & (~f)
+    # When an ``rng`` is provided, sample the vendor 1/4 gate; otherwise fall
+    # back to the deterministic worst case (blessed always blocks unless forced).
+    if rng is not None:
+        from Nethax.nethax.rng import rnl as _rnl
+        # !rnl(4) is true iff the roll equals 0 (luck=0 default).
+        blessed_resists = _rnl(rng, 4) == jnp.int32(0)
+    else:
+        blessed_resists = jnp.bool_(True)
+    blessed_blocks = blessed & (~f) & blessed_resists
 
     cur_erosion = jnp.where(primary, oeroded, oeroded2)
     saturated   = cur_erosion >= jnp.int32(MAX_ERODE)
@@ -339,14 +349,18 @@ def erode_obj_slot(
     return new_items, result
 
 
-def erode_obj(state, slot_idx, kind, force=False):
+def erode_obj(state, slot_idx, kind, force=False, rng=None):
     """High-level wrapper: erode ``state.inventory.items[slot_idx]`` by ``kind``.
 
     Cite: vendor/nethack/src/trap.c::erode_obj lines 171-354.
     Returns (new_state, result).  result is one of ER_NOTHING / ER_GREASED /
     ER_DAMAGED (ER_DESTROYED is not emitted here — caller handles destruction).
+
+    When ``rng`` is provided, the blessed-resist gate uses the vendor
+    ``otmp->blessed && !rnl(4)`` 1/4 roll (trap.c:257); otherwise the
+    deterministic worst case is used (blessed always blocks unless ``force``).
     """
-    new_items, result = erode_obj_slot(state.inventory.items, slot_idx, kind, force)
+    new_items, result = erode_obj_slot(state.inventory.items, slot_idx, kind, force, rng=rng)
     new_inv = state.inventory.replace(items=new_items)
     return state.replace(inventory=new_inv), result
 
