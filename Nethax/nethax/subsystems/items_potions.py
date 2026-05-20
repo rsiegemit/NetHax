@@ -948,29 +948,86 @@ def _effect_polymorph(state, rng, buc):
 # ---- water group ----------------------------------------------------------
 
 def _effect_water(state, rng, buc):
-    """potion of water — holy/unholy/plain water effects.
+    """potion of water — holy/unholy/plain water — byte-equal vendor.
 
-    Canonical: peffect_water — blessed=holy water (cure sick, exercise);
-    cursed=unholy water (damage if lawful); plain=nutrition only.
-    Wave 3: blessed cures sickness; cursed 6 HP damage; plain +10 nutrition.
+    Vendor: vendor/nethack/src/potion.c::peffect_water (lines 717-768).
+
+        if !blessed and !cursed:
+            nutrition += rnd(10)
+            return
+        # blessed or cursed
+        if mon_hates_blessings(youmonst) || align == A_CHAOTIC:
+            if blessed:  losehp(Maybe_Half_Phys(d(2,6)), "holy water", ...)
+            elif cursed: healup(d(2,6), 0, 0, 0)
+        else:
+            if blessed: cure SICK; exercise WIS+CON
+            else:       # cursed
+                if align == A_LAWFUL:
+                    losehp(Maybe_Half_Phys(d(2,6)), "unholy water", ...)
+                # else: "You feel full of dread" — no damage
+
+    nethax Alignment encoding (subsystems/prayer.py): CHAOTIC=0, NEUTRAL=1,
+    LAWFUL=2 — we use that here.  We do not currently model the player
+    being undead/demon/were-form (`mon_hates_blessings`), so the blessed
+    damage branch for chaotic players is correct but the
+    undead/demon/were sub-branch falls back to the non-burn path.
     """
+    from Nethax.nethax.subsystems.prayer import Alignment as _PAlign
+    from Nethax.nethax.rng import dice_roll as _dice_roll
+
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
-    # plain water — slight nutrition
+
+    align_i = state.player_align.astype(jnp.int32)
+    is_lawful  = align_i == jnp.int32(int(_PAlign.LAWFUL))
+    is_chaotic = align_i == jnp.int32(int(_PAlign.CHAOTIC))
+
+    # Plain water (neither blessed nor cursed): nutrition += rnd(10).
+    rng_n, rng_d, rng_h = jax.random.split(rng, 3)
+    plain_nutr = (state.status.nutrition.astype(jnp.int32)
+                  + jax.random.randint(rng_n, (), 1, 11, dtype=jnp.int32))
     new_nutrition = jnp.where(
         ~blessed & ~cursed,
-        jnp.minimum(state.status.nutrition + jnp.int32(10), jnp.int32(2000)),
+        jnp.minimum(plain_nutr, jnp.int32(2000)).astype(state.status.nutrition.dtype),
         state.status.nutrition,
     )
-    # holy water — cure sickness
-    new_sick = jnp.where(blessed, jnp.int32(0),
-                         state.status.timed_statuses[int(TimedStatus.SICK)])
+
+    # Blessed cures SICK regardless of alignment.
+    new_sick = jnp.where(
+        blessed,
+        jnp.int32(0),
+        state.status.timed_statuses[int(TimedStatus.SICK)],
+    )
     new_ts = state.status.timed_statuses.at[int(TimedStatus.SICK)].set(new_sick)
     new_status = state.status.replace(timed_statuses=new_ts, nutrition=new_nutrition)
-    # unholy water — damage if lawful (simplified: always deal small damage if cursed)
-    dmg    = jnp.where(cursed, jnp.int32(6), jnp.int32(0))
-    new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(1))
-    return state.replace(player_hp=new_hp, status=new_status)
+
+    # d(2, 6) — shared by both burn branches.
+    burn_dmg = _dice_roll(rng_d, 2, 6).astype(jnp.int32)
+    heal_amt = _dice_roll(rng_h, 2, 6).astype(jnp.int32)
+
+    # Blessed + chaotic → burn d(2,6).
+    blessed_burn = blessed & is_chaotic
+    # Cursed + lawful → burn d(2,6).
+    cursed_burn  = cursed & is_lawful
+    # Cursed + chaotic → heal d(2,6).
+    cursed_heal  = cursed & is_chaotic
+
+    # Damage path leaves HP unclamped to hp_max — vendor losehp() does
+    # not raise HP toward hp_max.  Heal path uses healup() which DOES
+    # clamp to hp_max.
+    dmg = jnp.where(blessed_burn | cursed_burn, burn_dmg, jnp.int32(0))
+    hp_after_dmg = jnp.maximum(state.player_hp.astype(jnp.int32) - dmg, jnp.int32(0))
+    hp_after_heal = jnp.minimum(
+        state.player_hp.astype(jnp.int32) + heal_amt,
+        state.player_hp_max.astype(jnp.int32),
+    )
+    new_hp = jnp.where(cursed_heal, hp_after_heal, hp_after_dmg)
+    new_hp = jnp.maximum(new_hp, jnp.int32(0))
+
+    return state.replace(
+        player_hp=new_hp.astype(state.player_hp.dtype),
+        status=new_status,
+    )
 
 
 def _effect_booze(state, rng, buc):

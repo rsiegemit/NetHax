@@ -146,6 +146,31 @@ def _build_dragon_breath_element_table() -> jnp.ndarray:
     return jnp.array(tbl, dtype=jnp.int8)
 
 
+def _build_dragon_breath_damn_table() -> jnp.ndarray:
+    """Return int8[_NUMMONS] mapping each dragon entry_idx → mattk->damn.
+
+    Per-dragon dice-count for breath damage roll.  Vendor passes
+    ``mattk->damn`` to dobuzz (mthrowu.c::breamm line 1123); zhitu then
+    uses ``d(nd, 6)`` for fire/cold/elec/poison/acid/magm.
+
+    Cite: vendor/nethack/include/monsters.h AT_BREA damn values:
+        gray=4 (magm), silver=4 (cold), red=6 (fire), white=4 (cold),
+        orange=4 (sleep), black=1 (disint), blue=4 (elec),
+        green=4 (poison), yellow=4 (acid).
+    """
+    tbl = [0] * _NUMMONS
+    tbl[_IDX_RED_DRAGON]    = 6
+    tbl[_IDX_BLUE_DRAGON]   = 4
+    tbl[_IDX_WHITE_DRAGON]  = 4
+    tbl[_IDX_BLACK_DRAGON]  = 1
+    tbl[_IDX_GREEN_DRAGON]  = 4
+    tbl[_IDX_YELLOW_DRAGON] = 4
+    tbl[_IDX_ORANGE_DRAGON] = 4
+    tbl[_IDX_GRAY_DRAGON]   = 4
+    tbl[_IDX_SILVER_DRAGON] = 4
+    return jnp.array(tbl, dtype=jnp.int8)
+
+
 def _build_perminvis_table() -> jnp.ndarray:
     """Return bool[_NUMMONS]; True for monsters with permanent natural invisibility.
 
@@ -160,6 +185,7 @@ def _build_perminvis_table() -> jnp.ndarray:
 
 _SPECIAL_ACTION_TYPE:      jnp.ndarray = _build_special_action_table()
 _DRAGON_BREATH_ELEMENT:    jnp.ndarray = _build_dragon_breath_element_table()
+_DRAGON_BREATH_DAMN:       jnp.ndarray = _build_dragon_breath_damn_table()
 _PERMINVIS_TABLE:           jnp.ndarray = _build_perminvis_table()
 
 # Resistance gate per breath element: index = _ELEM_* (0..8), value = Intrinsic
@@ -420,10 +446,16 @@ _BREATH_RANGE: int = 8  # vendor: breath has range up to 8 tiles (breamu ~line 5
 def _dragon_breath(state, slot: jnp.ndarray, rng: jax.Array):
     """Adult dragon breathes at player if within range.
 
-    Damage: 6d6 for most elements (vendor mhitu.c::breamu d6,6 base).
-    Resistance (player intrinsic) halves or blocks damage.
+    Damage: d(nd, 6) where nd = dragon's mattk->damn (vendor uses dobuzz
+    ➜ zhitu, which deals d(nd, 6) for fire/cold/elec/poison/acid/magm).
+    Reflection (player REFLECTING intrinsic): vendor's dobuzz bounces the
+    beam off a reflecting target — equivalent here to zero damage.
+    Resistance (player matching intrinsic) blocks damage.
+
     Vendor cite: mhitu.c::mattacku case AT_BREA ~873 — 'if (range2) breamu';
-                 breamu processes ray along Bresenham path to hero.
+                 mthrowu.c::breamm:1123 dobuzz call with mattk->damn;
+                 zap.c::zhitu:4416-4438 d(nd, 6) for fire/cold/elec/acid/magm;
+                 zap.c::dobuzz:4873 mon_reflects → beam reflected (no damage).
     """
     mai = state.monster_ai
     idx = slot.astype(jnp.int32)
@@ -434,10 +466,15 @@ def _dragon_breath(state, slot: jnp.ndarray, rng: jax.Array):
 
     safe_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, _NUMMONS - 1)
     elem = _DRAGON_BREATH_ELEMENT[safe_entry].astype(jnp.int32)
+    nd   = _DRAGON_BREATH_DAMN[safe_entry].astype(jnp.int32)
 
     def _apply(s):
-        rolls = jax.random.randint(rng, (6,), 1, 7)   # 6d6
-        raw_dmg = jnp.sum(rolls).astype(jnp.int32)
+        from Nethax.nethax.subsystems.status_effects import Intrinsic
+        # d(nd, 6): roll up to 6 dice of d6, masked by nd.  Matches
+        # zhitu's d(nd, 6) formula; nd is statically <=6 for all dragons.
+        rolls = jax.random.randint(rng, (6,), 1, 7)
+        mask  = jnp.arange(6) < nd
+        raw_dmg = jnp.sum(jnp.where(mask, rolls, jnp.int32(0))).astype(jnp.int32)
 
         # Resistance gate: if player has the matching intrinsic, damage = 0.
         # Clamp res_idx to valid range before indexing; -1 signals "no resist".
@@ -445,7 +482,13 @@ def _dragon_breath(state, slot: jnp.ndarray, rng: jax.Array):
         safe_res = jnp.clip(res_idx, 0, s.status.intrinsics.shape[0] - 1)
         raw_res  = s.status.intrinsics[safe_res]
         has_res  = (res_idx >= jnp.int32(0)) & raw_res
-        dmg = jnp.where(has_res, jnp.int32(0), raw_dmg)
+
+        # Reflection: vendor's dobuzz reverses the beam off a reflecting
+        # target so it never hits the original target.  Model as zero damage.
+        # Cite: vendor/nethack/src/zap.c::dobuzz lines 4872-4882.
+        reflecting = s.status.intrinsics[int(Intrinsic.REFLECTING)]
+
+        dmg = jnp.where(has_res | reflecting, jnp.int32(0), raw_dmg)
 
         new_hp = jnp.maximum(jnp.int32(0), s.player_hp - dmg)
         new_done = s.done | (new_hp <= jnp.int32(0))
@@ -466,11 +509,12 @@ def _dragon_breath(state, slot: jnp.ndarray, rng: jax.Array):
 
         # Element -> erode kind: FIRE/COLD -> ERODE_BURN (cite trap.c case BURN);
         # ACID -> ERODE_CORRODE.  Other elements: leave armor untouched.
+        # Reflection causes the beam to never reach armor either.
         is_fire   = elem == jnp.int32(_ELEM_FIRE)
         is_cold   = elem == jnp.int32(_ELEM_COLD)
         is_acid   = elem == jnp.int32(_ELEM_ACID)
-        do_burn   = (is_fire | is_cold) & has_body & (~has_res)
-        do_corrode = is_acid & has_body & (~has_res)
+        do_burn   = (is_fire | is_cold) & has_body & (~has_res) & (~reflecting)
+        do_corrode = is_acid & has_body & (~has_res) & (~reflecting)
 
         def _erode_burn(items_in):
             safe_b = jnp.clip(body_slot, 0, items_in.oeroded.shape[0] - 1)

@@ -196,32 +196,37 @@ def _passive_acid(state, rng):
 def _passive_fire(state, rng):
     """Red mold passive: rnd(4) fire damage, gated by fire resistance.
 
-    Cite: vendor/nethack/src/uhitm.c::passive() lines 5895-5905 (AD_FIRE).
-    AD_FIRE also burns worn body armor via passive_obj → erode_obj kind=BURN
-    (vendor/nethack/src/trap.c::erode_obj ERODE_BURN).
+    Cite: vendor/nethack/src/uhitm.c::passive() lines 5895-5905 (AD_FIRE
+    outer case ➜ passive_obj on the attacking weapon, NOT body armor) and
+    lines 6089-6101 (AD_FIRE inner case ➜ fire damage gated by Fire_resistance).
+    passive_obj AD_FIRE: vendor/nethack/src/uhitm.c:6157-6162 calls
+    erode_obj on the wielded weapon with a 1/6 chance (rn2(6)==0).
     """
     from Nethax.nethax.subsystems.status_effects import Intrinsic
     from Nethax.nethax.subsystems.items import erode_obj_slot, ERODE_BURN
-    from Nethax.nethax.subsystems.inventory import ArmorSlot
     from Nethax.nethax.rng import rnd
+    from Nethax.nethax.rng import rn2 as _rn2
 
+    rng_dmg, rng_erode = jax.random.split(rng)
     fire_res = (
         state.status.intrinsics[int(Intrinsic.RESIST_FIRE)]
         | (state.status.timed_intrinsics[int(Intrinsic.RESIST_FIRE)] > 0)
     )
-    dmg = jnp.where(fire_res, jnp.int32(0), rnd(rng, 4).astype(jnp.int32))
+    dmg = jnp.where(fire_res, jnp.int32(0), rnd(rng_dmg, 4).astype(jnp.int32))
     new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(0))
     new_done = state.done | (new_hp <= jnp.int32(0))
     state = state.replace(player_hp=new_hp, done=new_done)
 
-    # Burn worn body armor (unresisted).
-    body_slot = state.inventory.worn_armor[int(ArmorSlot.BODY)].astype(jnp.int32)
-    has_body  = body_slot >= jnp.int32(0)
-    should_burn = has_body & (~fire_res)
+    # Burn the wielded weapon via passive_obj AD_FIRE (rn2(6)==0 gate).
+    # Cite: vendor/nethack/src/uhitm.c::passive_obj AD_FIRE lines 6157-6162.
+    wielded = state.inventory.wielded.astype(jnp.int32)
+    has_weapon = wielded >= jnp.int32(0)
+    burn_chance = _rn2(rng_erode, 6) == jnp.int32(0)
+    should_burn = has_weapon & burn_chance
 
     def _do_burn(items_in):
-        safe_b = jnp.clip(body_slot, 0, items_in.oeroded.shape[0] - 1)
-        new_items, _ = erode_obj_slot(items_in, safe_b, ERODE_BURN, True)
+        safe_w = jnp.clip(wielded, 0, items_in.oeroded.shape[0] - 1)
+        new_items, _ = erode_obj_slot(items_in, safe_w, ERODE_BURN, True)
         return new_items
 
     new_items = jax.lax.cond(
