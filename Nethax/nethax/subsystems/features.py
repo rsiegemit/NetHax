@@ -1739,67 +1739,21 @@ def drink_sink(state, rng):
 # Sit-on-sink effects (sit.c::dosit IS_SINK branch, rn2(6) table)
 # ---------------------------------------------------------------------------
 def sit_sink(state, rng):
-    """Sit on a sink.
+    """Sit on a sink — vendor/nethack/src/sit.c::dosit IS_SINK branch.
 
-    Vendor truth (sit.c::dosit IS_SINK branch, lines 526-529):
+    Vendor truth (sit.c:526-529):
 
-        You(sit_message, defsyms[S_sink].explanation);
-        Your("%s gets wet.", humanoid? "rump" : "underside");
+        } else if (IS_SINK(typ)) {
+            You(sit_message, defsyms[S_sink].explanation);
+            Your("%s gets wet.",
+                 humanoid(gy.youmonst.data) ? "rump" : "underside");
 
-    Vendor sit-on-sink is flavor-only — no game-state mutation, no rn2()
-    roll.  Our implementation invents a 6-bucket ``rn2(6)`` effect table
-    so that tests/test_sink_altar_parity.py can observe varied outcomes
-    (curse / nutrition / HP / identify).  This is a deliberate divergence
-    from byte-equal vendor; flagged here so future-wave cleanup can
-    revisit when test_sink_altar_parity is rewritten.
-
-        bucket 0 → slip:        −1 HP
-        bucket 1 → pudding:     −20 nutrition
-        bucket 2 → faucet:      −1 HP
-        bucket 3 → throw-up:    −50 nutrition
-        bucket 4 → curse worn:  buc → CURSED on first occupied slot
-        bucket 5 → identify:    identified[0] := True
+    Pure flavor: no rn2() roll, no state mutation.  Byte-equal vendor
+    parity means this is a no-op; *rng* is accepted for caller-API
+    stability but unused.
     """
-    bucket = jax.random.randint(rng, (), minval=0, maxval=6, dtype=jnp.int32)
-
-    def _slip(s):
-        return s.replace(player_hp=jnp.maximum(jnp.int32(0), s.player_hp - jnp.int32(1)))
-
-    def _pudding(s):
-        return s.replace(status=s.status.replace(
-            nutrition=s.status.nutrition - jnp.int32(20)))
-
-    def _faucet(s):
-        return s.replace(player_hp=jnp.maximum(jnp.int32(0), s.player_hp - jnp.int32(1)))
-
-    def _throw_up(s):
-        return s.replace(status=s.status.replace(
-            nutrition=s.status.nutrition - jnp.int32(50)))
-
-    def _curse_worn(s):
-        # Proxy for rndcurse(): curse the first non-empty inventory slot.
-        buc = s.inventory.items.buc_status
-        has_item = s.inventory.items.quantity > jnp.int16(0)
-        first = jnp.argmax(has_item).astype(jnp.int32)
-        new_buc = buc.at[first].set(jnp.int8(1))
-        return s.replace(inventory=s.inventory.replace(
-            items=s.inventory.items.replace(buc_status=new_buc)))
-
-    def _identify_rings(s):
-        # Identify first ring slot (identified flag → True).
-        ident = s.inventory.identified
-        new_ident = ident.at[0].set(True)
-        return s.replace(inventory=s.inventory.replace(identified=new_ident))
-
-    branches = (
-        _slip,           # 0
-        _pudding,        # 1
-        _faucet,         # 2
-        _throw_up,       # 3
-        _curse_worn,     # 4
-        _identify_rings, # 5
-    )
-    return jax.lax.switch(bucket, branches, state)
+    del rng
+    return state
 
 
 # ---------------------------------------------------------------------------

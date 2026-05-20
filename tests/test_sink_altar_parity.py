@@ -137,41 +137,24 @@ class TestKickSink:
 # ---------------------------------------------------------------------------
 
 class TestSitSink:
-    def test_sit_sink_random_outcome(self):
-        """Over 60 rngs, sit_sink produces varied outcomes (not all identical).
+    """Vendor sit-on-sink (sit.c:526-529) is pure flavor — no state mutation."""
 
-        Cite: vendor/nethack/src/sit.c::dosit IS_SINK branch.
-        """
-        state = _make_state()
-        hp_values = set()
-        nutrition_values = set()
-        for i in range(60):
-            rng_i = jax.random.PRNGKey(300 + i)
-            new_state = sit_sink(state, rng_i)
-            hp_values.add(int(new_state.player_hp))
-            nutrition_values.add(int(new_state.status.nutrition))
-        # Expect multiple distinct outcomes across 60 seeds
-        all_distinct = len(hp_values) + len(nutrition_values)
-        assert all_distinct >= 3, (
-            f"Expected varied outcomes; got hp_values={hp_values}, "
-            f"nutrition_values={nutrition_values}"
-        )
+    def test_sit_sink_is_noop(self):
+        """sit_sink does not mutate HP, nutrition, or inventory.
 
-    def test_sit_sink_curse_worn_item(self):
-        """sit_sink can curse the first worn item (buc → 1).
-
-        Cite: sit.c rndcurse() proxy in sit_sink._curse_worn.
+        Cite: vendor/nethack/src/sit.c:526-529 — only You()/Your() pline
+        calls; no rn2(), no state change.
         """
         state = _make_state()
         state = _with_item(state, slot=0, category=int(ItemCategory.WEAPON), buc=2)
-        any_cursed = False
-        for i in range(60):
-            rng_i = jax.random.PRNGKey(400 + i)
+        for i in range(20):
+            rng_i = jax.random.PRNGKey(300 + i)
             new_state = sit_sink(state, rng_i)
-            if int(new_state.inventory.items.buc_status[0]) == 1:
-                any_cursed = True
-                break
-        assert any_cursed, "Expected at least one curse outcome in 60 sit_sink trials"
+            assert int(new_state.player_hp) == int(state.player_hp)
+            assert int(new_state.status.nutrition) == int(state.status.nutrition)
+            assert int(new_state.inventory.items.buc_status[0]) == int(
+                state.inventory.items.buc_status[0]
+            )
 
     def test_sit_sink_jit_safe(self):
         """sit_sink must be jit-compilable."""
@@ -179,15 +162,6 @@ class TestSitSink:
         fn = jax.jit(sit_sink)
         out = fn(state, _RNG)
         assert out is not None
-
-    def test_sit_sink_no_negative_hp(self):
-        """HP must never go below 0 after sit_sink."""
-        state = _make_state()
-        state = state.replace(player_hp=jnp.int32(1))
-        for i in range(20):
-            rng_i = jax.random.PRNGKey(500 + i)
-            new_state = sit_sink(state, rng_i)
-            assert int(new_state.player_hp) >= 0
 
 
 # ---------------------------------------------------------------------------
