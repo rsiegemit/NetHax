@@ -1236,21 +1236,6 @@ def _monster_heal(state, m_slot, rng):
     return state.replace(monster_ai=mai.replace(hp=new_hp_arr))
 
 
-def _monster_extra_heal(state, m_slot, rng):
-    """Extra-healing potion on monster — restore d8+6 HP (vendor potion.c).
-
-    Heals d8 + 6 HP, capped at hp_max.  Cite: potion.c::potionhit.
-    """
-    rng_d8, _ = jax.random.split(rng)
-    mai = state.monster_ai
-    heal = jax.random.randint(rng_d8, (), 1, 9, dtype=jnp.int32) + jnp.int32(6)
-    cur_hp  = mai.hp[m_slot].astype(jnp.int32)
-    cur_max = mai.hp_max[m_slot].astype(jnp.int32)
-    new_hp  = jnp.minimum(cur_hp + heal, cur_max)
-    new_hp_arr = mai.hp.at[m_slot].set(new_hp)
-    return state.replace(monster_ai=mai.replace(hp=new_hp_arr))
-
-
 def _monster_full_heal(state, m_slot, rng):
     """Full-healing potion on monster — restore to hp_max + bump hp_max by 4.
 
@@ -1306,11 +1291,18 @@ def _monster_sickness(state, m_slot, rng):
 
 
 def _monster_extra_heal(state, m_slot, rng):
-    """Extra-healing potion shatters on monster — restore 25 HP."""
+    """Extra-healing potion shatters on monster — restore d8+6 HP.
+
+    Vendor potion.c::potionhit EXTRA_HEALING heals by d8+6 (matching the
+    hero's `healup(d(2,8)+6, ...)` minus the +1 hp_max bump that vendor
+    grants to the hero but not to monsters).
+    """
+    rng_d8, _ = jax.random.split(rng)
+    heal = jax.random.randint(rng_d8, (), 1, 9, dtype=jnp.int32) + jnp.int32(6)
     mai = state.monster_ai
     cur_hp  = mai.hp[m_slot].astype(jnp.int32)
     cur_max = mai.hp_max[m_slot].astype(jnp.int32)
-    new_hp  = jnp.minimum(cur_hp + jnp.int32(25), cur_max)
+    new_hp  = jnp.minimum(cur_hp + heal, cur_max)
     new_hp_arr = mai.hp.at[m_slot].set(new_hp)
     return state.replace(monster_ai=mai.replace(hp=new_hp_arr))
 
