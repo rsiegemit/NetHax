@@ -885,13 +885,14 @@ def cancel_bag_of_holding(state, container_idx: int, src_slot: int = -1):
                 jnp.where(is_boh, jnp.int32(0), inv.weight[s_idx])),
         )
 
-        # d(6,6) — sum of 6 dice each 1..6 → range [6, 36].  We approximate
-        # as 6 + rn2(31) for JIT simplicity (matches the dice-sum range and
-        # mirrors the displacer-beast convention in items_corpses.py:485).
+        # d(6,6) — sum of 6 d6 rolls (triangular distribution [6, 36]),
+        # byte-equal to vendor `zap.c::cancel_item` mbag-explodes damage.
+        # Cite: vendor/nethack/src/zap.c::cancel_item line 720.
         rng_dmg, new_rng = jax.random.split(new_state.rng)
-        dmg = jnp.int32(6) + jax.random.randint(
-            rng_dmg, (), 0, 31, dtype=jnp.int32
-        )
+        _d6_keys = jax.random.split(rng_dmg, 6)
+        dmg = jnp.sum(jnp.stack([
+            jax.random.randint(k, (), 1, 7, dtype=jnp.int32) for k in _d6_keys
+        ])).astype(jnp.int32)
         new_hp = jnp.where(
             is_boh,
             jnp.maximum(jnp.int32(0),
