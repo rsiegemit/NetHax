@@ -1004,20 +1004,30 @@ def _effect_booze(state, rng, buc):
 
 
 def _effect_fruit_juice(state, rng, buc):
-    """potion of fruit juice — minor nutrition; blessed grants temporary see-invis.
+    """potion of fruit juice — byte-equal to vendor peffect_see_invisible
+    POT_FRUIT_JUICE early-return branch.
 
-    Canonical: POT_FRUIT_JUICE → peffect_see_invisible (same handler).
-    Wave 3: +50 nutrition; blessed also adds 300-turn see-invisible.
+    vendor/nethack/src/potion.c:856-860:
+        if (otmp->otyp == POT_FRUIT_JUICE) {
+            u.uhunger += (otmp->odiluted ? 5 : 10) * (2 + bcsign(otmp));
+            newuhs(FALSE);
+            return;
+        }
+
+    Only nutrition gain — vendor does NOT grant see-invisible from fruit
+    juice (that's the POT_SEE_INVISIBLE branch). Without odiluted tracking,
+    use the standard 10 * (2 + bcsign) = 10/20/30 for cursed/uncursed/
+    blessed.
     """
-    blessed      = _is_blessed(buc)
+    cursed  = _is_cursed(buc)
+    blessed = _is_blessed(buc)
+    bcsign  = jnp.where(blessed, jnp.int32(1),
+              jnp.where(cursed,  jnp.int32(-1), jnp.int32(0)))
+    nut_gain = jnp.int32(10) * (jnp.int32(2) + bcsign)  # 10/20/30
     new_nutrition = jnp.minimum(
-        state.status.nutrition + jnp.int32(50), jnp.int32(2000)
+        state.status.nutrition + nut_gain, jnp.int32(2000)
     )
-    cur  = state.status.timed_intrinsics[Intrinsic.SEE_INVIS]
-    new_t = jnp.where(blessed, jnp.maximum(cur, jnp.int32(300)), cur)
-    new_timers = state.status.timed_intrinsics.at[Intrinsic.SEE_INVIS].set(new_t)
-    new_status  = state.status.replace(nutrition=new_nutrition,
-                                       timed_intrinsics=new_timers)
+    new_status = state.status.replace(nutrition=new_nutrition)
     return state.replace(status=new_status)
 
 
