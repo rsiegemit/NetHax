@@ -1138,6 +1138,11 @@ def _single_melee_strike(
     key_multi = jax.random.fold_in(key_dmg, jnp.uint32(0xA771))
     multi_keys = split_n(key_multi, _NATTK)
     extra_multi_total = jnp.int32(0)
+    # Static-shape masked dice-sum: roll _MAX_DICE d-sides dice per attack
+    # slot; only the first `slot_dice` rolls contribute.  Matches vendor
+    # `d(slot_dice, slot_sides)` byte-equal (triangular distribution).
+    # Cite: vendor/nethack/src/uhitm.c::hitum (polymorph multi-attack).
+    _MAX_DICE = 8  # vendor dice counts on poly form attacks rarely exceed 6.
     for i in range(1, _NATTK):  # slot 0 is primary; slots 1..5 are extras
         slot_type = poly_types[i]
         slot_dice = poly_ndice[i].astype(jnp.int32)
@@ -1147,14 +1152,15 @@ def _single_melee_strike(
             & (slot_dice > jnp.int32(0))
             & (slot_sides > jnp.int32(0))
         )
-        # Single uniform draw scaled by (sides * dice) approximates the sum
-        # of `dice` rolls of d`sides` — keeps compile cost flat.
-        max_val = jnp.maximum(slot_dice * slot_sides, jnp.int32(1))
-        roll = jax.random.randint(
-            multi_keys[i], (), minval=1, maxval=max_val + jnp.int32(1), dtype=jnp.int32,
-        )
+        # Roll _MAX_DICE dice on `slot_sides`; mask first `slot_dice`.
+        safe_sides = jnp.maximum(slot_sides, jnp.int32(1))
+        slot_rolls = jax.random.randint(
+            multi_keys[i], (_MAX_DICE,), 0, safe_sides, dtype=jnp.int32,
+        ) + jnp.int32(1)
+        active_mask = jnp.arange(_MAX_DICE, dtype=jnp.int32) < slot_dice
+        slot_sum = jnp.sum(jnp.where(active_mask, slot_rolls, jnp.int32(0))).astype(jnp.int32)
         extra_multi_total = extra_multi_total + jnp.where(
-            slot_active, roll, jnp.int32(0)
+            slot_active, slot_sum, jnp.int32(0)
         ).astype(jnp.int32)
     base_dmg = (base_dmg + jnp.where(is_poly, extra_multi_total, jnp.int32(0))).astype(jnp.int32)
 
@@ -1212,6 +1218,17 @@ def _single_melee_strike(
     new_state = jax.lax.cond(
         killed,
         lambda s: _xp_more_experienced(s, xp_award, jnp.int32(0)),
+        lambda s: s,
+        new_state,
+    )
+    # Wave 30d: more_experienced is byte-equal vendor exper.c:168-203 and
+    # only touches u.uexp / u.urexp.  Kill-counter and running-score side
+    # effects (vendor end.c::done records per-genus/per-class kill counts;
+    # u.urexp drives the score via topten.c:675) are bumped here via
+    # scoring.record_kill, gated on the same ``killed`` flag.
+    new_state = jax.lax.cond(
+        killed,
+        lambda s: s.replace(scoring=_scoring_record_kill(s.scoring, xp_award)),
         lambda s: s,
         new_state,
     )
