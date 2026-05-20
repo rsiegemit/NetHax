@@ -86,8 +86,12 @@ def try_engulf(state, attacker_slot: jnp.ndarray, rng: jax.Array):
     """
     already = state.swallow.swallowed
 
-    # Total timer: 25 + rnd(75) turns — vendor mhitu.c:1287 approximate range.
-    total = jnp.int32(25) + rnd(rng, 75)
+    # Approximation: vendor mhitu.c:1380-1395 computes uswldtim from the
+    # specific attack type (AD_DGST uses CON+AC+rn2(20); others use
+    # rnd(m_lev+5)).  We don't have AD_DGST vs other separation at this
+    # call site, so use a uniform [25, 100) — same shape as 3.6's
+    # rn1(25, 75) for non-AD_DGST.  Clamp to >= 2 mirrors line 1395.
+    total = jnp.maximum(jnp.int32(25) + rnd(rng, 75), jnp.int32(2))
 
     # Player's pos moves to the engulfer's pos (they are now inside).
     # vendor/nethack/src/mhitu.c:1301 — sets u.ux/u.uy to mtmp->mx/mtmp->my.
