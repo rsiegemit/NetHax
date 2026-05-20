@@ -66,7 +66,6 @@ from Nethax.nethax.subsystems.action_dispatch import (
     _SLOT_APPLY,
     _SLOT_ENGRAVE,
     _SLOT_NAME,
-    _SLOT_ENHANCE,
 )
 
 
@@ -274,7 +273,7 @@ def test_meta_l_maps_to_loot_handler():
 
 
 def test_meta_e_aliases_to_eat_handler():
-    """Meta-e (0xE5) → _SLOT_ENHANCE per vendor cmd.c:1716.
+    """Meta-e (0xE5) — vendor cmd.c:1716 M('e') → enhance_weapon_skill.
 
     Wave-14 remap: _SLOT_ENHANCE is vendor-correct; plain 'e' (0x65) still
     routes to _SLOT_EAT.  Citation: cmd.c:1716.

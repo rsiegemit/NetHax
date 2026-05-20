@@ -119,6 +119,12 @@ SOLID_TILES = jnp.array(
 )
 
 # Tiles that block line of sight (default opacity table).
+# vendor/nethack/src/vision.c:167-168, 760 — IS_DOOR with closed/locked/trapped
+# AND secret-door (SDOOR) and secret corridor (SCORR) are all opaque.
+# The internal TileType enum here does NOT carry SDOOR/SCORR; those live in
+# VendorTileType (rm.h-exact) below. Secret doors that aren't yet discovered
+# are represented at the internal-tile layer as WALL (vendor's display
+# behavior), so the existing WALL entry already blocks LOS for them.
 OPAQUE_TILES = jnp.array(
     [TileType.VOID, TileType.WALL, TileType.CLOSED_DOOR],
     dtype=jnp.int32,

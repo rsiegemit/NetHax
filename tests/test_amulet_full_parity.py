@@ -202,7 +202,7 @@ def test_unchanging_blocks_revert():
     )
 
     # Polymorph the player into some form so there is something to revert.
-    state = polymorph_player(state, _RNG, form_idx, controlled=False)
+    state = polymorph_player(state, _RNG, form_idx)
     assert bool(state.polymorph.is_polymorphed), "Player must be polymorphed"
 
     # Revert — should kill due to Unchanging.
@@ -253,7 +253,7 @@ def test_reflection_bounces_ray():
     state = WandState(
         mon_pos=mon_pos,
         mon_hp=mon_hp,
-        mon_hp_max=jnp.zeros(N, dtype=jnp.int32),
+        mon_hp_max=mon_hp,
         mon_type=jnp.zeros(N, dtype=jnp.int16),
         mon_alive=mon_alive,
         mon_asleep=jnp.zeros(N, dtype=jnp.bool_),
