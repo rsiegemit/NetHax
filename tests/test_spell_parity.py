@@ -22,7 +22,7 @@ import pytest
 
 from Nethax.nethax.state import EnvState
 from Nethax.nethax.subsystems.magic import (
-    MAX_SPELL_MEMORY,
+    KEEN,
     SPELL_DECAY_PER_TURN,
     SPELL_KEEN,
     SpellId,
@@ -61,7 +61,7 @@ def _base_state(
     )
 
 
-def _with_known_spell(state: EnvState, spell_id: int, memory: int = MAX_SPELL_MEMORY):
+def _with_known_spell(state: EnvState, spell_id: int, memory: int = KEEN):
     magic = state.magic
     new_known = magic.spell_known.at[spell_id].set(True)
     new_mem   = magic.spell_memory.at[spell_id].set(jnp.int32(memory))
@@ -184,19 +184,22 @@ class TestSpellPwCost:
 # ---------------------------------------------------------------------------
 
 class TestSpellMemoryDecay:
-    def test_spell_memory_decay_2_per_turn(self):
+    def test_spell_memory_decay_1_per_turn(self):
         """Vendor decrnknow decrements sp_know by 1 per turn (spell.h line 31).
 
-        The audit brief originally specified "2 per turn"; vendor source
-        contradicts this and decrements by 1.  We follow the vendor
-        canonical value (1/turn) and assert SPELL_DECAY_PER_TURN reflects it.
+        Vendor parity: ``spelleffects`` does NOT touch ``sp_know`` on cast
+        (vendor/nethack/src/spell.c::spelleffects).  Memory only decays via
+        the per-turn ``age_spells`` loop (vendor spell.c lines 669-682,
+        called from allmain.c::moveloop).  We therefore assert that cast
+        leaves ``spell_memory`` unchanged.
         """
         # Module-level constant matches vendor's decrnknow semantics.
         assert SPELL_DECAY_PER_TURN == 1, (
             "Vendor spell.h decrnknow decrements sp_know by 1 per turn."
         )
 
-        # cast_spell decrements by 1 (per-cast simplification); confirm.
+        # cast_spell must NOT decrement spell_memory (vendor spelleffects
+        # does not touch sp_know).
         state = _base_state(player_pw=50, player_pw_max=50,
                             player_int=18, player_xl=30, player_role=12)
         state = _with_known_spell(state, SpellId.HEALING, memory=10)
@@ -204,14 +207,22 @@ class TestSpellMemoryDecay:
         rng = jax.random.PRNGKey(42)
         new_state, _ = cast_spell(state, rng, SpellId.HEALING)
         new_mem = int(new_state.magic.spell_memory[SpellId.HEALING])
-        assert new_mem == 9, f"Spell memory should decrement by 1, got {new_mem}"
+        assert new_mem == 10, (
+            f"Spell memory must not change on cast (vendor parity); got {new_mem}"
+        )
 
     def test_spell_keen_constant_matches_vendor(self):
         """Vendor spell.c line 17: #define KEEN 20000."""
         assert SPELL_KEEN == 20000
+        assert KEEN == 20000
 
-    def test_spell_memory_floor_zero(self):
-        """Spell memory never goes negative (matches u.uen >= 0 invariant)."""
+    def test_spell_memory_zero_unchanged_by_cast(self):
+        """A cast against a spell at memory=0 leaves memory at 0.
+
+        Vendor: ``spelleffects`` does not touch ``sp_know``; an already-
+        forgotten spell (``spellknow(i) <= 0``) cannot be cast in vendor,
+        but even if dispatched, sp_know is not written.
+        """
         state = _base_state(player_pw=50, player_pw_max=50,
                             player_int=18, player_xl=30, player_role=12)
         state = _with_known_spell(state, SpellId.HEALING, memory=0)
@@ -219,7 +230,7 @@ class TestSpellMemoryDecay:
         rng = jax.random.PRNGKey(99)
         new_state, _ = cast_spell(state, rng, SpellId.HEALING)
         new_mem = int(new_state.magic.spell_memory[SpellId.HEALING])
-        assert new_mem == 0, "Spell memory must floor at 0"
+        assert new_mem == 0, "Spell memory floor must remain at 0"
 
 
 # ---------------------------------------------------------------------------

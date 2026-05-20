@@ -111,14 +111,20 @@ class SpellId(enum.IntEnum):
 
 N_SPELLS = len(SpellId)
 
-# vendor/nethack/src/spell.c: KEEN = 20000 — maximum freshly-learned memory
-MAX_SPELL_MEMORY = 10000
-
 # Vendor parity constant (spell.c line 17: `#define KEEN 20000`).  When a
-# spell is freshly learned via study_book(), sp_know is set to KEEN, and
-# age_spells() decrements sp_know by 1 every turn (spell.h line 31:
-# `#define decrnknow(spell) svs.spl_book[spell].sp_know--`).
-SPELL_KEEN = 20000
+# spell is freshly learned via study_book(), sp_know is set to KEEN + bonus
+# (vendor spell.c line 22: `#define incrnknow(spell, x)
+# (svs.spl_book[spell].sp_know = KEEN + (x))`).  age_spells() decrements
+# sp_know by 1 every turn (spell.h line 31: `#define decrnknow(spell)
+# svs.spl_book[spell].sp_know--`).
+KEEN = 20000
+
+# Back-compat alias — older call sites and tests still import the
+# legacy ``MAX_SPELL_MEMORY`` name.  Now aliased to vendor ``KEEN`` so the
+# fresh-memory ceiling matches vendor byte-equally.
+MAX_SPELL_MEMORY = KEEN
+
+SPELL_KEEN = KEEN
 SPELL_DECAY_PER_TURN = 1  # vendor: decrnknow() = sp_know-- (one per turn)
 
 # ---------------------------------------------------------------------------
@@ -1583,7 +1589,10 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
       3. Roll d100 failure chance (percent_success simplified formula)
       4. On success: dispatch to effect handler
       5. Decrement Pw by cost
-      6. Decrement spell_memory by 1 (Wave 3 simplified decay)
+
+    Spell memory is NOT decremented on cast — vendor ``spelleffects``
+    does not touch ``sp_know`` (vendor/nethack/src/spell.c::spelleffects).
+    Memory decays once per turn via ``age_spells`` (env._step_impl).
 
     Parameters
     ----------
@@ -1651,12 +1660,9 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
         new_nutrition = jnp.maximum(old_nutrition - nutrition_cost, jnp.int32(0))
         adapter["status"] = adapter["status"].replace(nutrition=new_nutrition)
 
-    # Decrement spell memory (Wave 3 simplified: -1 per cast, floor 0)
-    magic = adapter["magic"]
-    new_mem = magic.spell_memory.at[sid].set(
-        jnp.maximum(magic.spell_memory[sid] - jnp.int32(1), jnp.int32(0))
-    )
-    adapter["magic"] = magic.replace(spell_memory=new_mem)
+    # Vendor parity: ``spelleffects`` does NOT touch ``sp_know`` on cast.
+    # Spell memory decays once per turn via ``age_spells`` (env._step_impl)
+    # — see vendor/nethack/src/spell.c::age_spells lines 669-682.
 
     # Skill practice after cast (regardless of success/failure).
     # Cite: vendor/nethack/src/weapon.c:1424 (use_skill).

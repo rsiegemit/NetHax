@@ -16,7 +16,8 @@ Wave 8d implementation (vendor-probabilistic formula):
   higher read_ability; the +2 models the Wizard's studied comprehension
   advantage — see vendor study_book:587-596 wizard-only early check).
 
-  On success: spell_known[spell_id] = True, spell_memory = MAX_SPELL_MEMORY
+  On success: spell_known[spell_id] = True, spell_memory = KEEN + 1
+    (vendor incrnknow(i, 1); spell.c line 22 + lines 410/428)
   On failure: no change (side effects like confusion/paralysis are Wave 4+)
 
 BUC handling (vendor spell.c::study_book / cursed_book lines 590-650):
@@ -36,6 +37,7 @@ import jax.numpy as jnp
 
 from Nethax.nethax.rng import rnd, rn1
 from Nethax.nethax.subsystems.magic import (
+    KEEN,
     MagicState,
     MAX_SPELL_MEMORY,
     N_SPELLS,
@@ -137,7 +139,8 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
 
     On success:
         spell_known[spell_id]  = True
-        spell_memory[spell_id] = MAX_SPELL_MEMORY
+        spell_memory[spell_id] = KEEN + 1  (vendor incrnknow(i, 1);
+            spell.c line 22 + lines 410/428)
         assign inventory letter if not yet assigned
 
     On failure:
@@ -272,9 +275,12 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
         return state
 
     # --- update MagicState ---
+    # Vendor: study_book success calls ``incrnknow(i, 1)`` which sets
+    # ``sp_know = KEEN + 1`` (vendor/nethack/src/spell.c lines 410, 428;
+    # macro defined line 22).  Byte-equal: KEEN + 1 = 20001.
     magic = state.magic
     new_known = magic.spell_known.at[spell_id].set(True)
-    new_mem   = magic.spell_memory.at[spell_id].set(jnp.int32(MAX_SPELL_MEMORY))
+    new_mem   = magic.spell_memory.at[spell_id].set(jnp.int32(KEEN + 1))
     magic = magic.replace(spell_known=new_known, spell_memory=new_mem)
 
     # Assign letter if not yet bound
