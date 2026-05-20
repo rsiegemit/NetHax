@@ -361,12 +361,14 @@ def _h_can_of_grease(state, rng: jax.Array) -> object:
 #       apply.c::write_with_marker (~line 4320).
 # vendor (write.c::dowrite line 74): player picks the scroll type from a menu.
 # Headless mode: decode marker.user_name bytes as the requested scroll name and
-# parse via wish.parse_wish_string_dict (limited to SCROLL_CLASS items).
+# do a direct bare-name lookup in _SCROLL_NAME_MAP.
 # Empty/unparseable user_name -> default SCR_MAGIC_MAPPING (offset 14).
 # ---------------------------------------------------------------------------
 
 # Scroll type constants (vendor/nethack/include/objects.h sequential order).
 # _SCROLL_BASE_ID = 94; 22 non-blank scroll types (indices 0-21).
+# NOTE: _SCROLL_BASE_ID is the Nethax compact encoding base; the OBJECTS table
+# has scrolls starting at ~298.  Inventory type_ids use the compact form.
 _SCROLL_BASE_ID           = 94
 _SCR_BLANK_PAPER_ID       = _SCROLL_BASE_ID + 22  # index 22 = SCR_BLANK_PAPER
 _N_WRITABLE_SCROLLS       = 22                     # indices 0-21 are writable
@@ -376,24 +378,21 @@ _SCR_MAGIC_MAPPING_OFFSET = 14                     # ScrollEffect.MAGIC_MAPPING
 def _build_scroll_name_map() -> dict:
     """Build {bare_name: nethax_type_id} for the 22 writable scroll types.
 
-    The Nethax inventory type_id for scrolls is a compact encoding starting
-    at _SCROLL_BASE_ID (94), NOT the OBJECTS table index.  The OBJECTS table
-    has scrolls starting at ~298.  We map each ScrollEffect offset (0-21) to
-    its bare OBJECTS name and to the compact type_id _SCROLL_BASE_ID + offset.
+    Iterates the OBJECTS table by SCROLL_CLASS, assigning compact Nethax
+    type_id _SCROLL_BASE_ID+offset in encounter order (matching ScrollEffect).
 
     Cite: vendor/nethack/src/apply.c::write_with_marker (~line 4320).
     """
     from Nethax.nethax.constants.objects import OBJECTS, ObjectClass
-    result = {}
+    result: dict = {}
     scroll_offset = 0
-    for idx, obj in enumerate(OBJECTS):
+    for obj in OBJECTS:
         if obj.class_ != ObjectClass.SCROLL_CLASS:
             continue
         if obj.name is None:
             continue
         if scroll_offset >= _N_WRITABLE_SCROLLS:
             break
-        # Map bare name to compact Nethax type_id.
         result[obj.name.lower()] = _SCROLL_BASE_ID + scroll_offset
         scroll_offset += 1
     return result
@@ -406,9 +405,9 @@ def _scroll_type_id_from_user_name(user_name_bytes) -> int:
     """Parse user_name bytes to a writable scroll type_id (Python-side, not JIT).
 
     Cite: vendor/nethack/src/apply.c::write_with_marker (~line 4320).
-    Vendor presents a menu of scroll names; headless mode parses user_name via
-    direct lookup in _SCROLL_NAME_MAP (bare name -> compact Nethax type_id).
-    Empty / unparseable / non-scroll -> default SCR_MAGIC_MAPPING.
+    Strips "scroll of " / "scroll " / "of " prefixes then looks up the bare
+    name in _SCROLL_NAME_MAP (OBJECTS-based, compact Nethax type_ids).
+    Empty / unparseable -> default SCR_MAGIC_MAPPING.
     """
     _DEFAULT = _SCROLL_BASE_ID + _SCR_MAGIC_MAPPING_OFFSET
 
@@ -421,30 +420,24 @@ def _scroll_type_id_from_user_name(user_name_bytes) -> int:
     if not text:
         return _DEFAULT
 
-    # Strip "scroll of " / "scroll " / "of " prefixes to get bare name.
     bare = text.lower()
     for prefix in ("scroll of ", "scroll ", "of "):
         if bare.startswith(prefix):
             bare = bare[len(prefix):]
             break
 
-    tid = _SCROLL_NAME_MAP.get(bare)
-    if tid is None:
-        return _DEFAULT
-    return tid
+    return _SCROLL_NAME_MAP.get(bare, _DEFAULT)
 
 
 def _h_magic_marker_with_tid(state, rng: jax.Array, target_type_id: jnp.ndarray) -> object:
     """Inner magic-marker handler: convert blank scroll to target_type_id.
 
     Cite: vendor/nethack/src/apply.c::write_with_marker (~line 4320).
-    target_type_id must be a concrete jnp.int16 (resolved before JAX traces
-    this function, e.g. from dispatch_apply pre-computation).
+    target_type_id is a concrete jnp.int16 resolved before JAX traces this.
     """
     inv = state.inventory
     marker_slot = inv.wielded.astype(jnp.int32)
 
-    # Find first blank scroll in inventory.
     is_blank = (inv.items.type_id == jnp.int16(_SCR_BLANK_PAPER_ID)) & (
         inv.items.category == jnp.int8(int(ItemCategory.SCROLL))
     )
@@ -456,7 +449,6 @@ def _h_magic_marker_with_tid(state, rng: jax.Array, target_type_id: jnp.ndarray)
     )
     safe_blank = jnp.clip(blank_slot, 0, MAX_INVENTORY_SLOTS - 1)
 
-    # Convert blank -> target type only when marker is wielded and blank exists.
     can_write = has_blank & (marker_slot >= jnp.int32(0))
     new_type_id = jnp.where(
         can_write,
@@ -468,13 +460,9 @@ def _h_magic_marker_with_tid(state, rng: jax.Array, target_type_id: jnp.ndarray)
 
 
 def _h_magic_marker(state, rng: jax.Array) -> object:
-    """Fallback magic-marker handler used in _HANDLERS tuple.
-
-    dispatch_apply replaces this slot with a closure over the pre-computed
-    target_type_id before calling jax.lax.switch, so this path is only
-    reached when dispatch_apply is bypassed (e.g. direct switch calls in
-    tests).  Defaults to SCR_MAGIC_MAPPING in that case.
-    """
+    # Fallback used when _h_magic_marker is invoked directly (not via
+    # dispatch_apply which overrides this slot with a pre-computed closure).
+    # Defaults to SCR_MAGIC_MAPPING.
     default_tid = jnp.int16(_SCROLL_BASE_ID + _SCR_MAGIC_MAPPING_OFFSET)
     return _h_magic_marker_with_tid(state, rng, default_tid)
 
@@ -753,22 +741,17 @@ def _h_lock_pick(state, rng: jax.Array) -> object:
                      state.player_pos[0].astype(jnp.int32),
                      state.player_pos[1].astype(jnp.int32)])
 
-    # Pass rng and integer chance directly; picklock_door rolls rn2(100) < ch.
-    # We override its internal dex logic by pre-computing chance and passing
-    # player_dex such that 3*dex == chance (i.e. pass chance//3 for LOCK_PICK).
-    # Simpler: call with rng and let picklock_door use player_dex; but
-    # picklock_door uses int(player_dex) which traces fine as a Python int only
-    # when called outside lax.switch.  Instead we do the roll here and pass
-    # rng=None (always-succeed) or a patched rng path.
-    #
-    # Roll once; used for both door and chest path.
+    # Roll once; shared between door and chest attempt.
+    # Implementation: roll here, then call picklock_door with rng=None to apply
+    # the door state change only when our roll succeeds.
     # Cite: vendor/nethack/src/lock.c::pick_lock (line 636-644).
     rng, sub = jax.random.split(rng)
     roll = jax.random.randint(sub, shape=(), minval=0, maxval=100)
     success = roll < chance
 
     # --- Door path ---
-    # Pass rng=None so picklock_door always applies the change; we gate via success.
+    # Only attempt unlock when roll succeeds; pass rng=None so picklock_door
+    # always opens (we guard via success flag below).
     new_features, _door_changed = picklock_door(state.features, pos, rng=None)
     final_features = jax.lax.cond(
         success,
@@ -778,9 +761,9 @@ def _h_lock_pick(state, rng: jax.Array) -> object:
     )
 
     # --- Chest/container path ---
-    # Vendor lock.c::pick_lock: after door check, scan the tile's obj list for
-    # locked chests/large boxes and unlock on success.
-    # We pick the first locked container slot (is_locked[i] == True).
+    # Vendor lock.c::pick_lock: after the door check, scan the current tile's
+    # object list for locked chests and large boxes.
+    # We scan state.containers for the first locked slot and unlock it on success.
     # Cite: vendor/nethack/src/lock.c::pick_lock chest branch.
     cs = state.containers
     has_locked  = jnp.any(cs.is_locked)
@@ -850,9 +833,10 @@ def dispatch_apply(state, rng: jax.Array) -> object:
     The wielded slot is checked; if nothing is wielded, returns state unchanged.
     Dispatch uses ``jax.lax.switch`` for JIT-pure dispatch.
 
-    Magic-marker special case: user_name is read Python-side (before JAX tracing)
-    to resolve the target scroll type_id, then passed as a concrete constant into
-    the switch-dispatched handler via a closure.
+    Magic-marker: user_name is read Python-side before JAX traces the switch
+    body.  We pre-compute the target scroll type_id from the concrete
+    user_names array (available before tracing) and close it into a per-call
+    handler variant.
     Cite: vendor/nethack/src/apply.c::write_with_marker (~line 4320).
     """
     inv = state.inventory
@@ -863,27 +847,20 @@ def dispatch_apply(state, rng: jax.Array) -> object:
                     jnp.int16(0))
     handler_idx = _handler_for_type_id(tid)
 
-    # Pre-compute target scroll type_id from user_name before JAX traces the
-    # switch body.  safe_slot is a traced int32 but inv.user_names is concrete
-    # when dispatch_apply is called outside jit (typical for apply actions).
-    # When traced inside jit the result is still a static Python int because
-    # _scroll_type_id_from_user_name does not read traced arrays — it reads the
-    # *abstract* shape, which is always concrete at trace time.
-    # We default to SCR_MAGIC_MAPPING for any tracing context where user_names
-    # cannot be concretized.
+    # Pre-compute target scroll type_id from user_name before JAX traces.
+    # jax.device_get materialises the concrete value; falls back to default
+    # if the array is still abstract (e.g. inside a nested jit trace).
     try:
-        _marker_safe_slot = int(jax.device_get(safe_slot))
-        _marker_uname = inv.user_names[_marker_safe_slot]
-        _marker_target_tid = jnp.int16(
-            _scroll_type_id_from_user_name(jax.device_get(_marker_uname))
-        )
+        _slot_py   = int(jax.device_get(safe_slot))
+        _uname_raw = jax.device_get(inv.user_names[_slot_py])
+        _marker_tid = jnp.int16(_scroll_type_id_from_user_name(_uname_raw))
     except Exception:
-        _marker_target_tid = jnp.int16(_SCROLL_BASE_ID + _SCR_MAGIC_MAPPING_OFFSET)
+        _marker_tid = jnp.int16(_SCROLL_BASE_ID + _SCR_MAGIC_MAPPING_OFFSET)
 
-    def _h_magic_marker_bound(s, r):
-        return _h_magic_marker_with_tid(s, r, _marker_target_tid)
+    def _h_marker_bound(s, r):
+        return _h_magic_marker_with_tid(s, r, _marker_tid)
 
     handlers = list(_HANDLERS)
-    handlers[_H_MAGIC_MARKER] = _h_magic_marker_bound
+    handlers[_H_MAGIC_MARKER] = _h_marker_bound
 
     return jax.lax.switch(handler_idx, handlers, state, rng)

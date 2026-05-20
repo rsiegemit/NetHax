@@ -808,8 +808,7 @@ def _effect_restore_ability(state: dict, rng: jax.Array) -> dict:
 
     Vendor: vendor/nethack/src/potion.c::peffect_restore_ability — calls
     full_restore() which sets each stat to its undrained maximum (u.urace.attrmax).
-    We use state["player_amax"][i] as the per-stat ceiling. Only raises stats
-    below amax; never lowers a stat already above amax.
+    We use state["player_amax"][i] as the per-stat ceiling.
 
     Stat order in player_amax: str(0) int(1) wis(2) dex(3) con(4) cha(5).
     Cite: vendor/nethack/src/potion.c::peffect_restore_ability;
