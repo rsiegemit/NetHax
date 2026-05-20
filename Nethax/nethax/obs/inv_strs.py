@@ -9,11 +9,14 @@ String structure per slot::
     <letter> - <qty_word> <buc_word> <enchant> <name> <equip_status> <charges>
 
 Wave 3 simplifications (documented per feature):
-- article "a" always used for singular items (no a/an vowel check — simplified)
 - User-given names (oname/oextra) skipped entirely
 - Two-weapon "alternate weapon" status skipped
 - Charges shown as "(recharged:charges)" matching vendor objnam.c:1486
 - Slots 52-54 (NLE extras beyond a-zA-Z) always rendered empty
+
+The "a"/"an" article selection is now byte-equal to vendor objnam.c::an
+via the pre-computed _OBJECT_USE_AN / _APP_USE_AN tables (Wave 6); the
+old "no vowel check" simplification has been retired.
 
 Canonical sources:
   vendor/nethack/src/objnam.c  — doname / xname / an
