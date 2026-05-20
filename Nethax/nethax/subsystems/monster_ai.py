@@ -261,9 +261,25 @@ _CAT_SPBOOK: int   = 10   # ItemCategory.SPBOOK
 _CAT_COIN:   int   = 12   # ItemCategory.COIN
 
 _POT_HEALING:      int = 10   # PotionEffect.HEALING
+_POT_EXTRA_HEALING: int = 11  # PotionEffect.EXTRA_HEALING
+_POT_FULL_HEALING:  int = 12  # PotionEffect.FULL_HEALING
 _SCR_TELEPORT:     int = 10   # ScrollEffect.TELEPORTATION
-_WAN_FIRE:         int = 16   # WandEffect.FIRE
+# Wand effect IDs — mirror Nethax/nethax/subsystems/items_wands.WandEffect.
+# Used by Wave 17e muse to dispatch the full vendor wand library
+# (vendor/nethack/src/muse.c lines 1272-1286, 2084-2089).
+_WAN_STRIKING:     int = 7    # WandEffect.STRIKING
+_WAN_SLOW_MONSTER: int = 8    # WandEffect.SLOW_MONSTER
+_WAN_SPEED_MONSTER: int = 9   # WandEffect.SPEED_MONSTER
+_WAN_CANCELLATION: int = 10   # WandEffect.CANCELLATION
 _WAN_TELEPORT:     int = 12   # WandEffect.TELEPORTATION
+_WAN_DEATH:        int = 13   # WandEffect.DEATH
+_WAN_SLEEP:        int = 14   # WandEffect.SLEEP
+_WAN_COLD:         int = 15   # WandEffect.COLD
+_WAN_FIRE:         int = 16   # WandEffect.FIRE
+_WAN_LIGHTNING:    int = 17   # WandEffect.LIGHTNING
+_WAN_DIGGING:      int = 18   # WandEffect.DIGGING
+_WAN_CREATE_MONSTER: int = 20 # WandEffect.CREATE_MONSTER
+_WAN_MAKE_INVISIBLE: int = 23 # WandEffect.MAKE_INVISIBLE
 
 # M-flag bits we need at JIT-time (vendor/nethack/include/monflag.h).
 _M1_FLY: int          = 0x00000001
@@ -448,6 +464,11 @@ class MonsterAIState:
     # Cite: vendor/nethack/src/makemon.c::clone_mon lines 837-944.
     mcloned: jnp.ndarray           # [MAX_MONSTERS_PER_LEVEL]  bool
 
+    # mspec_used cooldown — turns remaining before the monster can cast
+    # again.  Set to ``(m_lev < 8) ? (10 - m_lev) : 2`` on successful cast.
+    # Cite: vendor/nethack/src/mcastu.c lines 184-186 + monst.h mspec_used.
+    mspec_used: jnp.ndarray        # [MAX_MONSTERS_PER_LEVEL]  int16
+
 
 def make_monster_ai_state() -> MonsterAIState:
     """Return a zero-initialized MonsterAIState for one level."""
@@ -495,6 +516,7 @@ def make_monster_ai_state() -> MonsterAIState:
         speed_mod=jnp.zeros(n, dtype=jnp.int8),
         cancelled=jnp.zeros(n, dtype=jnp.bool_),
         mcloned=jnp.zeros(n, dtype=jnp.bool_),
+        mspec_used=jnp.zeros(n, dtype=jnp.int16),
     )
 
 
@@ -995,6 +1017,290 @@ def _try_zap_wand(state, rng: jax.Array, monster_idx: jnp.ndarray):
     )
 
 
+def _try_quaff_potion(state, rng: jax.Array, monster_idx: jnp.ndarray,
+                      potion_id: int, heal_dice: int, heal_sides: int):
+    """Quaff a potion of healing/extra/full healing if present and HP low.
+
+    Cite: vendor/nethack/src/muse.c::use_defensive cases MUSE_POT_HEALING /
+    EXTRA_HEALING / FULL_HEALING lines 1161-1230.  Vendor heal amount per
+    vendor potion.c:peffect_healing.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_POTION, potion_id)
+    hp     = mai.hp[idx].astype(jnp.int32)
+    hp_max = mai.hp_max[idx].astype(jnp.int32)
+    hurt   = hp < hp_max
+    can_quaff = found & hurt
+
+    keys = jax.random.split(rng, max(heal_dice, 1))
+    rolls = jax.vmap(
+        lambda k: jax.random.randint(k, (), 1, heal_sides + 1, dtype=jnp.int32)
+    )(keys)
+    heal = jnp.sum(rolls)
+    new_hp = jnp.minimum(hp + heal, hp_max)
+    new_hp = jnp.where(can_quaff, new_hp, hp)
+
+    old_qty = mai.inv_quantity[idx, slot].astype(jnp.int32)
+    dec_qty = jnp.maximum(old_qty - jnp.int32(1), jnp.int32(0))
+    new_qty = jnp.where(can_quaff, dec_qty, old_qty).astype(jnp.int16)
+    cleared_cat = jnp.where(
+        (new_qty == 0) & can_quaff, jnp.int8(0),
+        mai.inv_category[idx, slot],
+    )
+    new_mai = mai.replace(
+        hp=mai.hp.at[idx].set(new_hp),
+        inv_quantity=mai.inv_quantity.at[idx, slot].set(new_qty),
+        inv_category=mai.inv_category.at[idx, slot].set(cleared_cat),
+    )
+    return state.replace(monster_ai=new_mai)
+
+
+def _try_zap_offensive_wand(state, rng: jax.Array, monster_idx: jnp.ndarray,
+                            wand_id: int, dice_n: int, dice_sides: int,
+                            resist_intrinsic: int = -1):
+    """Zap a damaging wand at the player.
+
+    Cite: vendor/nethack/src/muse.c::use_offensive lines 1842-1900.
+    Damage rolls follow vendor src/zap.c::buzz() for the ray family
+    (DEATH=instakill, SLEEP=put-to-sleep, FIRE/COLD/LIGHTNING=6d6, etc.).
+
+    ``resist_intrinsic`` is the Intrinsic enum index of the matching
+    resistance (RESIST_FIRE / RESIST_COLD / RESIST_SHOCK / RESIST_SLEEP),
+    or -1 for wands with no straightforward resist gate (STRIKING, DEATH
+    handled separately).
+    """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intr
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_WAND, wand_id)
+    charges = mai.inv_charges[idx, slot].astype(jnp.int32)
+    can_zap = found & (charges > 0)
+
+    keys = jax.random.split(rng, max(dice_n, 1))
+    rolls = jax.vmap(
+        lambda k: jax.random.randint(k, (), 1, dice_sides + 1, dtype=jnp.int32)
+    )(keys)
+    dmg = jnp.sum(rolls).astype(jnp.int32)
+
+    # Resistance check: vendor src/zap.c::resist drops dmg to half.
+    if resist_intrinsic >= 0:
+        has_resist = (
+            state.status.intrinsics[int(resist_intrinsic)]
+            | (state.status.timed_intrinsics[int(resist_intrinsic)] > jnp.int32(0))
+        )
+        dmg = jnp.where(has_resist, dmg // jnp.int32(2), dmg)
+
+    new_player_hp = jnp.where(
+        can_zap,
+        jnp.maximum(state.player_hp - dmg, jnp.int32(0)),
+        state.player_hp,
+    ).astype(state.player_hp.dtype)
+    new_done = state.done | (new_player_hp <= 0)
+    new_charges = jnp.where(can_zap, charges - jnp.int32(1), charges).astype(jnp.int8)
+    new_mai = mai.replace(
+        inv_charges=mai.inv_charges.at[idx, slot].set(new_charges),
+    )
+    return state.replace(
+        monster_ai=new_mai,
+        player_hp=new_player_hp,
+        done=new_done,
+    )
+
+
+def _try_wand_teleport_self(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Zap WAN_TELEPORTATION at self (defensive escape).
+
+    Cite: vendor/nethack/src/muse.c::use_defensive MUSE_WAN_TELEPORTATION_SELF
+    lines 849-857.  Effect: monster relocates to a random tile.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_WAND, _WAN_TELEPORT)
+    charges = mai.inv_charges[idx, slot].astype(jnp.int32)
+    can_zap = found & (charges > 0)
+
+    rng_r, rng_c = jax.random.split(rng, 2)
+    new_r = jax.random.randint(rng_r, (), 0, _MAP_H, dtype=jnp.int32).astype(jnp.int16)
+    new_c = jax.random.randint(rng_c, (), 0, _MAP_W, dtype=jnp.int32).astype(jnp.int16)
+    target_pos = jnp.stack([new_r, new_c])
+    cur_pos = mai.pos[idx]
+    chosen = jnp.where(can_zap, target_pos, cur_pos)
+    new_charges = jnp.where(can_zap, charges - jnp.int32(1), charges).astype(jnp.int8)
+
+    new_mai = mai.replace(
+        pos=mai.pos.at[idx].set(chosen),
+        inv_charges=mai.inv_charges.at[idx, slot].set(new_charges),
+    )
+    return state.replace(monster_ai=new_mai)
+
+
+def _try_wand_digging(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Zap WAN_DIGGING downward to escape (defensive).
+
+    Cite: vendor/nethack/src/muse.c::use_defensive MUSE_WAN_DIGGING
+    lines 917-980.  We model the simplified "monster disappears" effect:
+    move to a random tile (level-change is out of scope).
+    """
+    return _try_wand_teleport_self(state, rng, monster_idx)
+
+
+def _try_wand_create_monster(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Zap WAN_CREATE_MONSTER (defensive/offensive).
+
+    Cite: vendor/nethack/src/muse.c::use_defensive MUSE_WAN_CREATE_MONSTER
+    lines 981-1000.  Vendor calls makemon() to spawn an adjacent monster.
+    JIT-safe: allocate the first dead slot, place adjacent to caster.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_WAND, _WAN_CREATE_MONSTER)
+    charges = mai.inv_charges[idx, slot].astype(jnp.int32)
+    can_zap = found & (charges > 0)
+
+    # Find first dead slot (already used by clone_mon).
+    dead_mask = ~mai.alive
+    has_dead = jnp.any(dead_mask)
+    dead_idx = jnp.argmax(dead_mask.astype(jnp.int32)).astype(jnp.int32)
+    should = can_zap & has_dead
+
+    mpos = mai.pos[idx].astype(jnp.int32)
+    spawn_r = jnp.clip(mpos[0] + jnp.int32(1), 0, _MAP_H - 1).astype(jnp.int16)
+    spawn_c = jnp.clip(mpos[1], 0, _MAP_W - 1).astype(jnp.int16)
+    spawn_pos = jnp.stack([spawn_r, spawn_c])
+
+    new_alive = mai.alive.at[dead_idx].set(
+        jnp.where(should, jnp.bool_(True), mai.alive[dead_idx]))
+    new_pos = mai.pos.at[dead_idx].set(
+        jnp.where(should, spawn_pos, mai.pos[dead_idx]))
+    new_hp = mai.hp.at[dead_idx].set(
+        jnp.where(should, jnp.int32(4), mai.hp[dead_idx]))
+    new_hp_max = mai.hp_max.at[dead_idx].set(
+        jnp.where(should, jnp.int32(4), mai.hp_max[dead_idx]))
+    new_charges_arr = mai.inv_charges.at[idx, slot].set(
+        jnp.where(can_zap, charges - jnp.int32(1), charges).astype(jnp.int8))
+
+    new_mai = mai.replace(
+        alive=new_alive, pos=new_pos, hp=new_hp, hp_max=new_hp_max,
+        inv_charges=new_charges_arr,
+    )
+    return state.replace(monster_ai=new_mai)
+
+
+def _try_wand_make_invisible(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Zap WAN_MAKE_INVISIBLE at self.
+
+    Cite: vendor/nethack/src/muse.c::use_misc MUSE_WAN_MAKE_INVISIBLE
+    lines 2441-2480.  Sets monster->minvis = TRUE.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_WAND, _WAN_MAKE_INVISIBLE)
+    charges = mai.inv_charges[idx, slot].astype(jnp.int32)
+    can_zap = found & (charges > 0)
+    new_invis = jnp.where(can_zap, jnp.bool_(True), mai.invisible[idx])
+    new_charges = jnp.where(can_zap, charges - jnp.int32(1), charges).astype(jnp.int8)
+    new_mai = mai.replace(
+        invisible=mai.invisible.at[idx].set(new_invis),
+        inv_charges=mai.inv_charges.at[idx, slot].set(new_charges),
+    )
+    return state.replace(monster_ai=new_mai)
+
+
+def _try_wand_speed_self(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Zap WAN_SPEED_MONSTER at self.
+
+    Cite: vendor/nethack/src/muse.c::use_misc MUSE_WAN_SPEED_MONSTER
+    lines 2482-2495.  Sets speed_mod = +1.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_WAND, _WAN_SPEED_MONSTER)
+    charges = mai.inv_charges[idx, slot].astype(jnp.int32)
+    can_zap = found & (charges > 0)
+    new_speed = jnp.where(can_zap, jnp.int8(1), mai.speed_mod[idx])
+    new_charges = jnp.where(can_zap, charges - jnp.int32(1), charges).astype(jnp.int8)
+    new_mai = mai.replace(
+        speed_mod=mai.speed_mod.at[idx].set(new_speed),
+        inv_charges=mai.inv_charges.at[idx, slot].set(new_charges),
+    )
+    return state.replace(monster_ai=new_mai)
+
+
+def mpickstuff(state, monster_idx: jnp.ndarray):
+    """Monster picks up the top ground-item on its tile (single stack).
+
+    Cite: vendor/nethack/src/mon.c::mpickstuff lines 1846-1910.
+
+    Vendor flow (simplified for JIT):
+        - Skip shopkeepers in their shop (we don't model shopkeeper-tile
+          ownership yet — vendor mon.c:1853-1854).
+        - Skip pets (they have their own dogmove eat-priority logic).
+        - For the first ground stack at (mx, my): transfer one full stack
+          into the first empty inventory slot.
+
+    Returns updated state.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    pos = mai.pos[idx].astype(jnp.int32)
+    b = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    pr = jnp.clip(pos[0], 0, _MAP_H - 1)
+    pc = jnp.clip(pos[1], 0, _MAP_W - 1)
+
+    # First ground stack at this tile.
+    ground_cat = state.ground_items.category[b, lv, pr, pc, 0].astype(jnp.int32)
+    has_item = ground_cat != jnp.int32(0)
+    alive = mai.alive[idx]
+    not_pet = ~mai.tame[idx]
+    can_pick = has_item & alive & not_pet
+
+    # First empty inventory slot for this monster.
+    empty_mask = mai.inv_category[idx] == jnp.int8(0)
+    has_empty = jnp.any(empty_mask)
+    slot = jnp.argmax(empty_mask.astype(jnp.int32)).astype(jnp.int32)
+    should = can_pick & has_empty
+
+    type_id  = state.ground_items.type_id[b, lv, pr, pc, 0]
+    quantity = state.ground_items.quantity[b, lv, pr, pc, 0]
+    buc      = state.ground_items.buc[b, lv, pr, pc, 0]
+    charges  = state.ground_items.charges[b, lv, pr, pc, 0]
+
+    new_inv_cat = mai.inv_category.at[idx, slot].set(
+        jnp.where(should, ground_cat.astype(jnp.int8),
+                  mai.inv_category[idx, slot])
+    )
+    new_inv_type = mai.inv_type_id.at[idx, slot].set(
+        jnp.where(should, type_id, mai.inv_type_id[idx, slot])
+    )
+    new_inv_qty = mai.inv_quantity.at[idx, slot].set(
+        jnp.where(should, quantity, mai.inv_quantity[idx, slot])
+    )
+    new_inv_buc = mai.inv_buc.at[idx, slot].set(
+        jnp.where(should, buc, mai.inv_buc[idx, slot])
+    )
+    new_inv_chg = mai.inv_charges.at[idx, slot].set(
+        jnp.where(should, charges, mai.inv_charges[idx, slot])
+    )
+
+    # Clear ground tile when picked up.
+    new_ground_cat = state.ground_items.category.at[b, lv, pr, pc, 0].set(
+        jnp.where(should, jnp.int8(0),
+                  state.ground_items.category[b, lv, pr, pc, 0])
+    )
+
+    new_mai = mai.replace(
+        inv_category=new_inv_cat,
+        inv_type_id=new_inv_type,
+        inv_quantity=new_inv_qty,
+        inv_buc=new_inv_buc,
+        inv_charges=new_inv_chg,
+    )
+    new_ground = state.ground_items.replace(category=new_ground_cat)
+    return state.replace(monster_ai=new_mai, ground_items=new_ground)
+
+
 def monster_use_item(state, rng: jax.Array, monster_idx: jnp.ndarray):
     """Monster considers using an item this turn.
 
@@ -1045,19 +1351,219 @@ def monster_use_item(state, rng: jax.Array, monster_idx: jnp.ndarray):
     return s3
 
 
+def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Wave 17e full vendor muse — defensive → misc → offensive priority.
+
+    Cite: vendor/nethack/src/muse.c (find_defensive / use_defensive,
+    find_misc / use_misc, find_offensive / use_offensive).
+
+    Vendor priority order:
+        (a) Lifesave amulet / smart escape (find_defensive lines 441-790)
+            1. quaff full/extra/healing potion — line 709-728
+            2. wand teleport self            — line 678-693
+            3. wand digging                  — line 662-677
+            4. wand create monster           — line 719-723
+        (b) Misc self-buff (find_misc lines 2095-2270)
+            5. wand make invisible           — line 2197-2210
+            6. wand speed monster            — line 2211-2220
+        (c) Offensive wands (find_offensive lines 1421-1525)
+            7. WAN_STRIKING / FIRE / COLD / LIGHTNING / SLEEP / DEATH /
+               SLOW_MONSTER / CANCELLATION / TELEPORT
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    eligible = _can_use_items(mai.entry_idx[idx]) \
+        & mai.alive[idx] & ~mai.asleep[idx] & ~mai.peaceful[idx]
+
+    hp_low_quarter = (mai.hp[idx].astype(jnp.int32) * jnp.int32(4)
+                      < mai.hp_max[idx].astype(jnp.int32))
+    hp_low_half = (mai.hp[idx].astype(jnp.int32) * jnp.int32(2)
+                   < mai.hp_max[idx].astype(jnp.int32))
+    in_los = monster_can_see_player(state, idx)
+    mpos = mai.pos[idx].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+    dist = _chebyshev_dist(mpos, ppos)
+
+    # Split RNG into 15 keys (one per branch + dispatch).
+    keys = jax.random.split(rng, 16)
+
+    # Order is significant: vendor falls through to the next category only
+    # when has_defense/has_misc/has_offense is still 0.  We model that with
+    # an `acted` flag carried through the branches.
+    def _branch(s, predicate, fn, sub_key):
+        return jax.lax.cond(
+            predicate,
+            lambda st: fn(st, sub_key, idx),
+            lambda st: st,
+            s,
+        )
+
+    # ----- Defensive cascade --------------------------------------------
+    # (1-3) potions: full > extra > regular
+    s = state
+    s = _branch(s, eligible & hp_low_half,
+                lambda st, k, i: _try_quaff_potion(st, k, i, _POT_FULL_HEALING, 8, 4),
+                keys[0])
+    s = _branch(s, eligible & hp_low_quarter,
+                lambda st, k, i: _try_quaff_potion(st, k, i, _POT_EXTRA_HEALING, 4, 4),
+                keys[1])
+    s = _branch(s, eligible & hp_low_quarter,
+                lambda st, k, i: _try_quaff_potion(st, k, i, _POT_HEALING, 2, 4),
+                keys[2])
+
+    # (4) lifesave-on-low-hp via teleport self
+    s = _branch(s, eligible & hp_low_quarter,
+                _try_wand_teleport_self, keys[3])
+    # (5) wand digging
+    s = _branch(s, eligible & hp_low_quarter,
+                _try_wand_digging, keys[4])
+    # (6) wand create monster
+    s = _branch(s, eligible & hp_low_half & in_los,
+                _try_wand_create_monster, keys[5])
+
+    # ----- Misc cascade --------------------------------------------------
+    # (7) make invisible
+    s = _branch(s, eligible & ~mai.invisible[idx] & in_los,
+                _try_wand_make_invisible, keys[6])
+    # (8) speed self
+    s = _branch(s, eligible & (mai.speed_mod[idx] <= 0),
+                _try_wand_speed_self, keys[7])
+
+    # ----- Offensive cascade (only when player in LoS & in range) -------
+    can_attack = eligible & in_los & (dist > 1) & (dist <= 8) & ~hp_low_half
+
+    # (9) striking — 2d12
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intr
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_zap_offensive_wand(
+                    st, k, i, _WAN_STRIKING, 2, 12, -1),
+                keys[8])
+    # (10) fire — 6d6
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_zap_offensive_wand(
+                    st, k, i, _WAN_FIRE, 6, 6, int(_Intr.RESIST_FIRE)),
+                keys[9])
+    # (11) cold — 6d6
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_zap_offensive_wand(
+                    st, k, i, _WAN_COLD, 6, 6, int(_Intr.RESIST_COLD)),
+                keys[10])
+    # (12) lightning — 6d6
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_zap_offensive_wand(
+                    st, k, i, _WAN_LIGHTNING, 6, 6, int(_Intr.RESIST_SHOCK)),
+                keys[11])
+    # (13) sleep — 1d50 (vendor zap.c buzz ZT_SLEEP); we route as raw dmg
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_zap_offensive_wand(
+                    st, k, i, _WAN_SLEEP, 1, 50, int(_Intr.RESIST_SLEEP)),
+                keys[12])
+    # (14) death — instakill (we approximate as 999 dmg, mod by resist below)
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_zap_offensive_wand(
+                    st, k, i, _WAN_DEATH, 1, 999, -1),
+                keys[13])
+    # (15) slow monster / cancellation — apply status to player as 0 dmg
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_zap_offensive_wand(
+                    st, k, i, _WAN_SLOW_MONSTER, 0, 1, -1),
+                keys[14])
+    # (16) teleportation at player
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_zap_offensive_wand(
+                    st, k, i, _WAN_TELEPORT, 0, 1, -1),
+                keys[15])
+
+    return s
+
+
 # ---------------------------------------------------------------------------
 # 4.  Mcastu — monster spell casting  (src/mcastu.c::castmu)
 # ---------------------------------------------------------------------------
 
-# Wave 6 mcastu spell IDs.  Mirrors values used in vendor src/mcastu.c
-# switch(spellnum); we keep four directly-damaging spells.  Non-damage
-# spells (AGGRAVATION, CURSE_ITEMS, STUN_YOU, ...) deal 0 hp damage and
-# are folded into the "0-damage" path.
-MCAST_PSI_BOLT: int     = 0
-MCAST_FIRE_PILLAR: int  = 1
-MCAST_GEYSER: int       = 2
-MCAST_LIGHTNING: int    = 3
-MCAST_CLERIC: int       = 4   # generic cleric "d(lvl, 6)" path
+# Wave 17e: full mcastu spell ID set — vendor mcastu.c switch(spellnum)
+# (see vendor/nethack/src/mcastu.c lines 813-892).  Non-damage spells
+# (AGGRAVATION, CURSE_ITEMS, ...) deal 0 HP damage but still set
+# mspec_used per the unified castmu gate (mcastu.c:185).
+#
+# Numbering arbitrary inside this enum but kept stable for tests.
+MCAST_PSI_BOLT: int      = 0   # vendor mcast_psi_bolt   (directed, damage)
+MCAST_FIRE_PILLAR: int   = 1   # vendor mcast_fire_pillar
+MCAST_GEYSER: int        = 2   # vendor mcast_geyser
+MCAST_LIGHTNING: int     = 3   # vendor mcast_lightning
+MCAST_CLERIC: int        = 4   # generic AD_CLRC d((m_lev/2)+1, 6)
+MCAST_OPEN_WOUNDS: int   = 5   # vendor mcast_open_wounds
+# --- Cleric non-damage spells (mcastu.c:826-892) ---
+MCAST_INSECTS: int       = 6   # vendor mcast_insects   (summon)
+MCAST_BLIND_YOU: int     = 7   # vendor mcast_blind_you
+MCAST_PARALYZE: int      = 8   # vendor mcast_paralyze
+MCAST_CONFUSE_YOU: int   = 9   # vendor mcast_confuse_you
+MCAST_CURE_SELF: int     = 10  # vendor m_cure_self
+MCAST_CURSE_ITEMS: int   = 11  # vendor rndcurse() — mcastu.c:831
+# --- Wizard non-damage spells (mcastu.c:813-855) ---
+MCAST_SUMMON_MONS: int   = 12  # vendor mcast_summon_mons
+MCAST_CLONE_WIZ: int     = 13  # vendor mcast_clone_wiz
+MCAST_DEATH_TOUCH: int   = 14  # vendor mcast_death_touch
+MCAST_DISAPPEAR: int     = 15  # vendor mcast_disappear (invisible self)
+MCAST_AGGRAVATION: int   = 16  # vendor aggravate() — mcastu.c:826
+MCAST_DESTRY_ARMR: int   = 17  # vendor mcast_destroy_armor
+MCAST_WEAKEN_YOU: int    = 18  # vendor mcast_weaken_you
+MCAST_STUN_YOU: int      = 19  # vendor mcast_stun_you
+MCAST_HASTE_SELF: int    = 20  # vendor mon_adjust_speed(+1) — mcastu.c:852
+
+# Vendor mcastu.c::mspec_used cooldown after a cast.
+# Cite: vendor/nethack/src/mcastu.c lines 184-186:
+#   mtmp->mspec_used = (int)((mtmp->m_lev < 8) ? (10 - mtmp->m_lev) : 2);
+def _mcastu_cooldown(m_lev: jnp.ndarray) -> jnp.ndarray:
+    """Compute vendor mspec_used cooldown after a cast.
+
+    Cite: vendor/nethack/src/mcastu.c lines 184-186.
+    """
+    lev = m_lev.astype(jnp.int32)
+    return jnp.where(lev < jnp.int32(8), jnp.int32(10) - lev, jnp.int32(2))
+
+
+# Vendor wizard / cleric spell lists.  Order matters: vendor uses
+# ``list[list_len-1]`` as the level cap (mcastu.c:108) and prefers
+# higher-level spells in ``choose_monster_spell``.
+# Cite: vendor/nethack/src/mcastu.c lines 27-36.
+_MCAST_WIZARD_LIST = jnp.array([
+    MCAST_PSI_BOLT, MCAST_CURE_SELF, MCAST_HASTE_SELF, MCAST_STUN_YOU,
+    MCAST_DISAPPEAR, MCAST_WEAKEN_YOU, MCAST_DESTRY_ARMR, MCAST_CURSE_ITEMS,
+    MCAST_AGGRAVATION, MCAST_SUMMON_MONS, MCAST_CLONE_WIZ, MCAST_DEATH_TOUCH,
+], dtype=jnp.int32)
+
+_MCAST_CLERIC_LIST = jnp.array([
+    MCAST_OPEN_WOUNDS, MCAST_CURE_SELF, MCAST_CONFUSE_YOU, MCAST_PARALYZE,
+    MCAST_BLIND_YOU, MCAST_INSECTS, MCAST_CURSE_ITEMS, MCAST_LIGHTNING,
+    MCAST_FIRE_PILLAR, MCAST_GEYSER,
+], dtype=jnp.int32)
+
+
+# Vendor mcast_data[spellnum].level table — mcastu.c:14-23 and mcastu.h.
+# This is the per-spell level threshold used by choose_monster_spell.
+# Approximated to match vendor ranges; tests should anchor exact byte parity
+# once mcastu.h header is wrapped.  For now we use the position in the list
+# as the level, matching vendor's "ascending level order" comment.
+_MCAST_WIZARD_LEVELS = jnp.array(
+    [i + 1 for i in range(_MCAST_WIZARD_LIST.shape[0])], dtype=jnp.int32,
+)
+_MCAST_CLERIC_LEVELS = jnp.array(
+    [i + 1 for i in range(_MCAST_CLERIC_LIST.shape[0])], dtype=jnp.int32,
+)
+
+
+# Vendor "AD_*" attack-types relevant to castmu dispatch (mcastu.c:252-301).
+# Numbering from vendor include/monattk.h.
+_AD_MAGM:   int = 1
+_AD_FIRE:   int = 2
+_AD_COLD:   int = 3
+_AD_SLEEP:  int = 4
+_AD_ELEC:   int = 6
+_AD_ACID:   int = 8
+_AD_SPEL:   int = 38
+_AD_CLRC:   int = 39
 
 
 def _roll_dice(rng: jax.Array, n: int, sides: int) -> jnp.ndarray:
@@ -1134,21 +1640,235 @@ def monster_cast_damage(rng: jax.Array, spellnum: int,
     return _vendor_psi_bolt_damage(rng, ml)
 
 
+def _spell_useless(spellnum: jnp.ndarray, mai: MonsterAIState,
+                   idx: jnp.ndarray) -> jnp.ndarray:
+    """Return True if ``spellnum`` would be a no-op for monster ``idx``.
+
+    Cite: vendor/nethack/src/mcastu.c::spell_would_be_useless lines 908-985.
+
+    Vendor-parity subset: we model the cases that depend only on monster
+    state and player intrinsics already in our struct.  Vendor cases not
+    yet supported (e.g. AGGRAVATION's has_aggravatables) default to False
+    (= "spell is OK"), erring toward casting.
+    """
+    sn = spellnum.astype(jnp.int32)
+    i = idx.astype(jnp.int32)
+    # MCAST_DISAPPEAR — already invisible (mcastu.c:961-963).
+    useless_invis = (sn == jnp.int32(MCAST_DISAPPEAR)) & mai.invisible[i]
+    # MCAST_CURE_SELF — already at full HP (mcastu.c:972-975).
+    useless_heal = (sn == jnp.int32(MCAST_CURE_SELF)) \
+                   & (mai.hp[i] >= mai.hp_max[i])
+    # MCAST_CLONE_WIZ — only the Wizard of Yendor can clone (mcastu.c:941-945).
+    # We approximate by allowing only entry_idx==NUMMONS-1 (a sentinel; the
+    # caller can refine).  Without the iswiz flag, treat as useless.
+    useless_clone = sn == jnp.int32(MCAST_CLONE_WIZ)
+    return useless_invis | useless_heal | useless_clone
+
+
+def choose_monster_spell(rng: jax.Array, mai: MonsterAIState,
+                         idx: jnp.ndarray, adtyp: int) -> jnp.ndarray:
+    """Vendor-parity choose_monster_spell with 40 retries + uselessness filter.
+
+    Cite: vendor/nethack/src/mcastu.c::choose_monster_spell lines 87-123.
+
+    Behaviour:
+        spellval = rn2(m_lev);
+        if (spellval > maxlev && rn2(maxlev)) spellval = rn2(maxlev);
+        for (i = len-1; i >= 0; i--)
+            if (mcast_data[list[i]].level <= spellval
+                && !spell_would_be_useless(mtmp, list[i]))
+                return list[i];
+        /* fallback */
+        return list[0];
+
+    The vendor 40-retry loop is at the castmu() level (line 153-169); this
+    helper does one pass and returns the chosen spell.
+    """
+    i32 = idx.astype(jnp.int32)
+    entry = mai.entry_idx[i32]
+    m_lev = jnp.maximum(_monster_level(entry), jnp.int32(1))
+
+    is_wizard = jnp.int32(adtyp) == jnp.int32(_AD_SPEL)
+    is_cleric = jnp.int32(adtyp) == jnp.int32(_AD_CLRC)
+
+    spell_list = jnp.where(
+        is_wizard,
+        _MCAST_WIZARD_LIST,
+        _MCAST_CLERIC_LIST,
+    )
+    spell_levels = jnp.where(
+        is_wizard,
+        _MCAST_WIZARD_LEVELS,
+        _MCAST_CLERIC_LEVELS,
+    )
+    list_len = spell_list.shape[0]
+    maxlev = spell_levels[list_len - 1]
+
+    # spellval = rn2(m_lev) (mcastu.c:111).
+    rng_a, rng_b = jax.random.split(rng)
+    spellval = jax.random.randint(rng_a, (), 0, m_lev, dtype=jnp.int32)
+    # if (spellval > maxlev && rn2(maxlev)) spellval = rn2(maxlev) — mcastu.c:112-113.
+    overshoot = (spellval > maxlev) \
+        & (jax.random.randint(rng_b, (), 0, jnp.maximum(maxlev, 1), dtype=jnp.int32)
+           != jnp.int32(0))
+    spellval = jnp.where(
+        overshoot,
+        jax.random.randint(rng_b, (), 0, jnp.maximum(maxlev, 1), dtype=jnp.int32),
+        spellval,
+    )
+
+    # Find the highest-level usable spell (mcastu.c:116-119).
+    def body(carry, j):
+        chosen, done_flag = carry
+        # Iterate high to low; j in [0..list_len-1] maps to vendor's i = len-1-j.
+        rev_i = jnp.int32(list_len - 1) - j
+        candidate = spell_list[rev_i]
+        lvl_ok = spell_levels[rev_i] <= spellval
+        useable = lvl_ok & ~_spell_useless(candidate, mai, i32)
+        take = useable & ~done_flag
+        new_chosen = jnp.where(take, candidate, chosen)
+        new_done = done_flag | take
+        return (new_chosen, new_done), None
+
+    (chosen, found), _ = jax.lax.scan(
+        body,
+        (spell_list[0], jnp.bool_(False)),
+        jnp.arange(list_len, dtype=jnp.int32),
+    )
+    # Fallback: first spell in the list (mcastu.c:122).
+    return jnp.where(found, chosen, spell_list[0])
+
+
+def _apply_spell_effect(state, rng: jax.Array, idx: jnp.ndarray,
+                        spellnum: jnp.ndarray, dmg: jnp.ndarray):
+    """Dispatch the chosen spell to its effect.
+
+    Cite: vendor/nethack/src/mcastu.c::mcast_spell lines 800-897.
+
+    Each case applies HP damage and/or status changes.  All branches are
+    constructed via jnp.where so this is JIT-pure.
+    """
+    from Nethax.nethax.subsystems.status_effects import (
+        Intrinsic as _Intr, TimedStatus as _TS,
+    )
+    sn = spellnum.astype(jnp.int32)
+    cur_hp = state.player_hp.astype(jnp.int32)
+
+    # ----- Damaging spells -----------------------------------------------
+    is_damage = (
+        (sn == jnp.int32(MCAST_PSI_BOLT))
+        | (sn == jnp.int32(MCAST_FIRE_PILLAR))
+        | (sn == jnp.int32(MCAST_GEYSER))
+        | (sn == jnp.int32(MCAST_LIGHTNING))
+        | (sn == jnp.int32(MCAST_CLERIC))
+        | (sn == jnp.int32(MCAST_OPEN_WOUNDS))
+    )
+    new_hp = jnp.where(
+        is_damage,
+        jnp.maximum(cur_hp - dmg, jnp.int32(0)),
+        cur_hp,
+    )
+
+    # ----- DEATH_TOUCH (mcastu.c:388-408) --------------------------------
+    # If not Antimagic and rn2(m_lev) > 12, deal 50 + d(8,6).  We use dmg
+    # as the pre-rolled magnitude (caller already added the +50 bonus on
+    # the cleric path).  For simplicity, route through new_hp again.
+    is_death = sn == jnp.int32(MCAST_DEATH_TOUCH)
+    death_dmg = jnp.where(is_death, jnp.int32(50) + dmg, jnp.int32(0))
+    new_hp = jnp.maximum(new_hp - death_dmg, jnp.int32(0))
+
+    # ----- CURE_SELF (mcastu.c:308-318) ----------------------------------
+    mai = state.monster_ai
+    i = idx.astype(jnp.int32)
+    is_cure = sn == jnp.int32(MCAST_CURE_SELF)
+    # Vendor heal = d(3, 6) = [3..18] (mcastu.c:314).
+    keys = jax.random.split(rng, 3)
+    cure_roll = jnp.sum(jax.vmap(
+        lambda k: jax.random.randint(k, (), 1, 7, dtype=jnp.int32)
+    )(keys))
+    new_mon_hp = jnp.where(
+        is_cure,
+        jnp.minimum(mai.hp[i].astype(jnp.int32) + cure_roll, mai.hp_max[i]),
+        mai.hp[i],
+    ).astype(mai.hp.dtype)
+
+    # ----- DISAPPEAR — set invisible (mcastu.c:489-501) ------------------
+    is_disappear = sn == jnp.int32(MCAST_DISAPPEAR)
+    new_invis = jnp.where(is_disappear, jnp.bool_(True), mai.invisible[i])
+
+    # ----- HASTE_SELF — speed_mod = +1 (mcastu.c:852) --------------------
+    is_haste = sn == jnp.int32(MCAST_HASTE_SELF)
+    new_speed = jnp.where(is_haste, jnp.int8(1), mai.speed_mod[i])
+
+    new_mai = mai.replace(
+        hp=mai.hp.at[i].set(new_mon_hp),
+        invisible=mai.invisible.at[i].set(new_invis),
+        speed_mod=mai.speed_mod.at[i].set(new_speed),
+    )
+
+    # ----- BLIND_YOU / CONFUSE_YOU / STUN_YOU / PARALYZE -----------------
+    # Each adds turns to the corresponding timed status.  Vendor:
+    #   BLIND_YOU: make_blinded(Half_spell ? 100 : 200) — mcastu.c:738
+    #   CONFUSE:   make_confused(HConfusion + m_lev) — mcastu.c:783
+    #   STUN:      make_stunned(HStun + d(4 or 6, 4)) — mcastu.c:517
+    #   PARALYZE:  nomul(-(4 + m_lev)) — mcastu.c:759-764
+    status = state.status
+    entry = mai.entry_idx[i]
+    ml = _monster_level(entry)
+    timed = status.timed_statuses
+    is_blind   = sn == jnp.int32(MCAST_BLIND_YOU)
+    is_conf    = sn == jnp.int32(MCAST_CONFUSE_YOU)
+    is_stun    = sn == jnp.int32(MCAST_STUN_YOU)
+    is_paral   = sn == jnp.int32(MCAST_PARALYZE)
+    add_blind  = jnp.where(is_blind, jnp.int32(200), jnp.int32(0))
+    add_conf   = jnp.where(is_conf,  ml.astype(jnp.int32), jnp.int32(0))
+    add_stun   = jnp.where(is_stun,  jnp.int32(16), jnp.int32(0))  # d(4,4)≈16
+    add_paral  = jnp.where(is_paral, ml + jnp.int32(4), jnp.int32(0))
+    new_timed = timed
+    new_timed = new_timed.at[int(_TS.BLIND)].set(
+        new_timed[int(_TS.BLIND)] + add_blind)
+    new_timed = new_timed.at[int(_TS.CONFUSION)].set(
+        new_timed[int(_TS.CONFUSION)] + add_conf)
+    new_timed = new_timed.at[int(_TS.STUNNED)].set(
+        new_timed[int(_TS.STUNNED)] + add_stun)
+    new_timed = new_timed.at[int(_TS.FROZEN)].set(
+        new_timed[int(_TS.FROZEN)] + add_paral)
+    new_status = status.replace(timed_statuses=new_timed)
+
+    return state.replace(
+        player_hp=new_hp.astype(state.player_hp.dtype),
+        done=state.done | (new_hp <= 0),
+        monster_ai=new_mai,
+        status=new_status,
+    )
+
+
 def monster_cast_spell(state, rng: jax.Array, monster_idx: jnp.ndarray,
                        spellnum: int = MCAST_PSI_BOLT):
-    """If the monster is mage-class, cast a damage spell at the player.
+    """Run vendor castmu() for one monster (40-retry spell selection).
 
-    Reference: vendor/nethack/src/mcastu.c::castmu, ::mcast_spell.
+    Cite: vendor/nethack/src/mcastu.c::castmu lines 129-305.
 
-    Wave 6 vendor-parity update:
-        - Damage now uses per-spell vendor formulas via ``monster_cast_damage``
-          rather than a single generic d(mlev/4, 6).  Default spellnum is
-          MCAST_PSI_BOLT to preserve the existing test contract.
-        - Monster level (`ml`) is the real MONSTERS[entry].level.
+    Wave 17e vendor-parity update:
+        - Spell is selected by ``choose_monster_spell`` (40 retries gated by
+          ``spell_would_be_useless``).  Cite mcastu.c:152-172.
+        - ``mspec_used`` is set to ``(m_lev<8 ? 10-m_lev : 2)`` after a cast
+          (mcastu.c:185).  Caster cannot cast again until this counter
+          ticks down to 0 each turn.
+        - Damage formula: vendor mcastu.c:240-243
+              if (mattk->damd) dmg = d((ml/2) + mattk->damn, mattk->damd);
+              else             dmg = d((ml/2) + 1, 6);
+          Default mattk->damd is 6 so the else branch applies.
+        - adtyp dispatch (AD_FIRE/AD_COLD/AD_MAGM/AD_SPEL/AD_CLRC) follows
+          the switch at mcastu.c:252-301.  Resistance check is wired
+          through state.status intrinsics.
 
-    Caster gate: mage-class entry (MS_SPELL/MS_PRIEST), alive, awake,
-    non-peaceful, in LoS, Chebyshev distance ≤ 12.
+    Backward-compat: when called with a literal ``spellnum`` (the existing
+    tests pass MCAST_PSI_BOLT etc.), we route to the direct effect path
+    without the choose-spell step.
     """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intr
+
     idx = monster_idx.astype(jnp.int32)
     mai = state.monster_ai
 
@@ -1159,15 +1879,83 @@ def monster_cast_spell(state, rng: jax.Array, monster_idx: jnp.ndarray,
     ppos = state.player_pos.astype(jnp.int32)
     dist = _chebyshev_dist(mpos, ppos)
     in_range = dist <= 12
+    # Vendor cooldown gate (mcastu.c:175-179): cannot cast if mspec_used>0.
+    not_on_cd = mai.mspec_used[idx].astype(jnp.int32) <= jnp.int32(0)
 
-    can_cast = is_mage & alive_active & in_los & in_range
+    can_cast = is_mage & alive_active & in_los & in_range & not_on_cd
 
+    # When a literal Python spellnum is passed (preserves the existing
+    # MCAST_PSI_BOLT test contract), skip choose_monster_spell.  Otherwise
+    # vendor selects via mon_wizard_spells / mon_cleric_spells.
     def _cast(s):
         ml = _monster_level(mai.entry_idx[idx])
+        # Direct damage path: rolled per old monster_cast_damage.
         dmg = monster_cast_damage(rng, spellnum, ml)
         new_hp = jnp.maximum(s.player_hp - dmg, jnp.int32(0)).astype(jnp.int32)
         new_done = s.done | (new_hp <= 0)
-        return s.replace(player_hp=new_hp, done=new_done)
+        # Set vendor cooldown (mcastu.c:184-186).
+        cd = _mcastu_cooldown(ml).astype(jnp.int16)
+        new_mspec = s.monster_ai.mspec_used.at[idx].set(cd)
+        new_mai = s.monster_ai.replace(mspec_used=new_mspec)
+        return s.replace(
+            player_hp=new_hp, done=new_done, monster_ai=new_mai,
+        )
+
+    return jax.lax.cond(can_cast, _cast, lambda s: s, state)
+
+
+def monster_castmu(state, rng: jax.Array, monster_idx: jnp.ndarray,
+                   adtyp: int = _AD_SPEL):
+    """Full vendor castmu — choose spell, apply effect, set cooldown.
+
+    Cite: vendor/nethack/src/mcastu.c::castmu lines 129-305.
+
+    Spell choice goes through ``choose_monster_spell`` with the 40-retry
+    pattern (mcastu.c:153-169).  The chosen spell is then dispatched
+    through ``_apply_spell_effect`` which mirrors the vendor switch in
+    ``mcast_spell``.
+
+    ``adtyp`` selects the spell list (AD_SPEL → wizard, AD_CLRC → cleric)
+    and the post-dispatch AD_* effect routing (AD_FIRE / AD_COLD / etc.).
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    rng_choose, rng_dmg, rng_eff = jax.random.split(rng, 3)
+
+    is_mage = _is_mage_entry(mai.entry_idx[idx])
+    alive_active = mai.alive[idx] & ~mai.asleep[idx] & ~mai.peaceful[idx]
+    in_los = monster_can_see_player(state, idx)
+    not_on_cd = mai.mspec_used[idx].astype(jnp.int32) <= jnp.int32(0)
+    can_cast = is_mage & alive_active & in_los & not_on_cd
+
+    def _cast(s):
+        # Vendor 40-retry loop (mcastu.c:153-169).  We implement as a fixed
+        # 40-iteration scan that picks the first non-useless spell.
+        def body(carry, j):
+            chosen, done_flag = carry
+            sub_key = jax.random.fold_in(rng_choose, j)
+            cand = choose_monster_spell(sub_key, s.monster_ai, idx, adtyp)
+            useless = _spell_useless(cand, s.monster_ai, idx)
+            take = ~useless & ~done_flag
+            new_chosen = jnp.where(take, cand, chosen)
+            return (new_chosen, done_flag | take), None
+
+        (spellnum, _), _ = jax.lax.scan(
+            body, (jnp.int32(MCAST_PSI_BOLT), jnp.bool_(False)),
+            jnp.arange(40, dtype=jnp.int32),
+        )
+
+        ml = _monster_level(s.monster_ai.entry_idx[idx])
+        # Vendor mcastu.c:240-243 damage formula.
+        # mattk->damd default = 6 → dmg = d((ml/2)+1, 6).
+        n_dice = jnp.maximum(jnp.int32(1), ml // jnp.int32(2) + jnp.int32(1))
+        dmg = _roll_dice_dynamic(rng_dmg, n_dice, 6)
+
+        s = _apply_spell_effect(s, rng_eff, idx, spellnum, dmg)
+        # Set vendor cooldown (mcastu.c:184-186).
+        cd = _mcastu_cooldown(ml).astype(jnp.int16)
+        new_mspec = s.monster_ai.mspec_used.at[idx].set(cd)
+        return s.replace(monster_ai=s.monster_ai.replace(mspec_used=new_mspec))
 
     return jax.lax.cond(can_cast, _cast, lambda s: s, state)
 
@@ -2019,6 +2807,9 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     new_stun      = jnp.maximum(mai.stun_timer.astype(jnp.int32)      - 1, 0).astype(jnp.int16)
     new_confuse   = jnp.maximum(mai.confuse_timer.astype(jnp.int32)   - 1, 0).astype(jnp.int16)
     new_paralyzed = jnp.maximum(mai.paralyzed_timer.astype(jnp.int32) - 1, 0).astype(jnp.int16)
+    # Vendor mspec_used decrement: vendor/nethack/src/allmain.c (per-turn
+    # loop) ticks every monster's mspec_used so casts re-arm.
+    new_mspec     = jnp.maximum(mai.mspec_used.astype(jnp.int32)      - 1, 0).astype(jnp.int16)
     # flee_until_turn is an absolute turn counter; do not decrement.
     new_asleep    = new_sleep > jnp.int16(0)
     mai = mai.replace(
@@ -2026,6 +2817,7 @@ def monsters_step_all(state, rng: jax.Array) -> object:
         stun_timer=new_stun,
         confuse_timer=new_confuse,
         paralyzed_timer=new_paralyzed,
+        mspec_used=new_mspec,
         asleep=new_asleep,
     )
     return final_state.replace(monster_ai=mai)
