@@ -129,14 +129,14 @@ def _get_worms(state_or_worms) -> WormState:
     """Accept either an EnvState or WormState; return the WormState."""
     if isinstance(state_or_worms, WormState):
         return state_or_worms
-    return state_or_worms.worms  # EnvState attribute when wired in
+    return state_or_worms.worm_state  # EnvState attribute (state.py)
 
 
 def _replace_worms(state, new_worms: WormState):
-    """Write ``new_worms`` back into ``state.worms`` if state is an EnvState."""
+    """Write ``new_worms`` back into ``state.worm_state`` if state is an EnvState."""
     if isinstance(state, WormState):
         return new_worms
-    return state.replace(worms=new_worms)
+    return state.replace(worm_state=new_worms)
 
 
 # ---------------------------------------------------------------------------
@@ -520,3 +520,213 @@ def count_wsegs(state, slot: jnp.ndarray) -> jnp.ndarray:
     count = worms.seg_count[s].astype(jnp.int32)
     # Vendor excludes the dummy head segment, so subtract one.
     return jnp.maximum(count - jnp.int32(1), jnp.int32(0))
+
+
+# ---------------------------------------------------------------------------
+# worm_cross — diagonal pass-through-worm-body block
+# ---------------------------------------------------------------------------
+
+def worm_cross(state, x1: jnp.ndarray, y1: jnp.ndarray,
+               x2: jnp.ndarray, y2: jnp.ndarray) -> jnp.ndarray:
+    """Return True if a diagonal move from (x1,y1) to (x2,y2) would pass
+    between two *consecutive* segments of the same long worm.
+
+    Cite: vendor/nethack/src/worm.c::worm_cross lines 895-942.
+
+    Vendor flow (paraphrased):
+        if (distmin(x1,y1,x2,y2) != 1) return FALSE;     /* non-adjacent */
+        if (x1 == x2 || y1 == y2)      return FALSE;     /* not diagonal */
+        worm = m_at(x1, y2);
+        if (!worm || m_at(x2, y1) != worm) return FALSE; /* not same worm */
+        /* walk worm seg chain; if two consecutive segs occupy
+           (x1,y2) and (x2,y1) in either order → return TRUE  */
+
+    In the JAX port we don't have an m_at index, so we scan all worm slots
+    in-graph: for each worm, check whether *consecutive* segments occupy the
+    diagonal-cardinal pair (x1, y2) and (x2, y1).  If any worm has such a
+    pair, the diagonal move is blocked.
+    """
+    worms = _get_worms(state)
+    # Vendor only blocks for true diagonals.  (worm.c:917-919)
+    is_diag = (x1.astype(jnp.int32) != x2.astype(jnp.int32)) & (
+        y1.astype(jnp.int32) != y2.astype(jnp.int32)
+    )
+
+    a = jnp.stack([x1.astype(jnp.int16), y2.astype(jnp.int16)])  # (x1, y2)
+    b = jnp.stack([x2.astype(jnp.int16), y1.astype(jnp.int16)])  # (x2, y1)
+
+    pos = worms.seg_pos                                # [W, S, 2]
+    # Pair-wise consecutive segments along axis=1.
+    cur = pos[:, :-1, :]                               # [W, S-1, 2]
+    nxt = pos[:,  1:, :]                               # [W, S-1, 2]
+
+    idx_arr = jnp.arange(MAX_WSEGS_PER_WORM - 1, dtype=jnp.int32)
+    seg_valid = (
+        idx_arr[None, :] < (worms.seg_count[:, None].astype(jnp.int32) - jnp.int32(1))
+    )                                                  # [W, S-1]
+    in_use = worms.in_use[:, None]                     # [W, 1]
+
+    cur_is_a = jnp.all(cur == a[None, None, :], axis=2)
+    nxt_is_b = jnp.all(nxt == b[None, None, :], axis=2)
+    cur_is_b = jnp.all(cur == b[None, None, :], axis=2)
+    nxt_is_a = jnp.all(nxt == a[None, None, :], axis=2)
+
+    consecutive = ((cur_is_a & nxt_is_b) | (cur_is_b & nxt_is_a)) & seg_valid & in_use
+    return is_diag & jnp.any(consecutive)
+
+
+# ---------------------------------------------------------------------------
+# place_worm_tail_randomly — initial-placement BFS-style segment scatter
+# ---------------------------------------------------------------------------
+
+def place_worm_tail_randomly(state, slot: jnp.ndarray,
+                             x: jnp.ndarray, y: jnp.ndarray,
+                             rng: jax.Array):
+    """Place worm ``slot``'s tail segments randomly around (x, y).
+
+    Cite: vendor/nethack/src/worm.c::place_worm_tail_randomly lines 728-792.
+
+    Vendor walks the segment chain and for each tail seg picks a random
+    walkable adjacent tile via ``rnd_nextto_goodpos``; if no neighbour is
+    available the chain is truncated (``toss_wsegs``).
+
+    The JAX port is JIT-pure: for each segment slot 0..count-2 (tail end up
+    to but excluding the head) it picks a random direction from the 8
+    neighbours of the previous segment and writes it if walkable; otherwise
+    the segment is truncated (set to (-1, -1)) and a running ``truncated``
+    flag drops all later segs.
+    """
+    worms = _get_worms(state)
+    s = slot.astype(jnp.int32)
+
+    # Walkable mask = tiles that aren't solid.  We test against the *current*
+    # level's terrain (the worm always lives on one level).
+    terrain = state.terrain[
+        state.dungeon.current_branch,
+        state.dungeon.current_level - 1,
+    ]                                                # [H, W]
+    map_h, map_w = terrain.shape
+
+    from Nethax.nethax.constants.tiles import TileType as _TT
+    walkable = (
+        (terrain == jnp.int8(_TT.FLOOR))
+        | (terrain == jnp.int8(_TT.CORRIDOR))
+        | (terrain == jnp.int8(_TT.OPEN_DOOR))
+    )
+
+    # 8 neighbour offsets (vendor rnd_nextto_goodpos uses any of 8 dirs).
+    dirs = jnp.array(
+        [(-1, -1), (-1, 0), (-1, 1),
+         ( 0, -1),          ( 0, 1),
+         ( 1, -1), ( 1, 0), ( 1, 1)],
+        dtype=jnp.int32,
+    )                                                # [8, 2]
+
+    seg_pos = worms.seg_pos[s]                       # [S, 2]
+    count = worms.seg_count[s].astype(jnp.int32)
+    # Head segment is at index count-1; we keep it where it is and walk back
+    # toward index 0 (the tail end), choosing a random adjacent tile each
+    # step.  Vendor builds the chain head→tail; we mirror that.
+    head_pos = jnp.stack([x.astype(jnp.int16), y.astype(jnp.int16)])
+
+    def body(carry, key):
+        i, prev_pos, pos_arr, truncated = carry
+        # Pick a random direction.
+        d_idx = jax.random.randint(key, (), 0, 8, dtype=jnp.int32)
+        d = dirs[d_idx]
+        candidate_r = prev_pos[0].astype(jnp.int32) + d[0]
+        candidate_c = prev_pos[1].astype(jnp.int32) + d[1]
+        in_bounds = (
+            (candidate_r >= 0) & (candidate_r < map_h)
+            & (candidate_c >= 0) & (candidate_c < map_w)
+        )
+        is_walk = walkable[
+            jnp.clip(candidate_r, 0, map_h - 1),
+            jnp.clip(candidate_c, 0, map_w - 1),
+        ]
+        is_active = (i < count - jnp.int32(1)) & ~truncated
+        ok = is_active & in_bounds & is_walk
+        new_seg = jnp.where(
+            ok,
+            jnp.stack([candidate_r.astype(jnp.int16),
+                       candidate_c.astype(jnp.int16)]),
+            jnp.array([-1, -1], dtype=jnp.int16),
+        )
+        # Compute target index: tail end is 0, walking up to count-2.
+        # Vendor builds head→tail by walking back; we mirror by writing at
+        # (count - 2 - i).
+        tgt_idx = jnp.maximum(count - jnp.int32(2) - i, jnp.int32(0))
+        write = is_active
+        new_pos_arr = jax.lax.cond(
+            write,
+            lambda a: a.at[tgt_idx].set(new_seg),
+            lambda a: a,
+            pos_arr,
+        )
+        new_prev = jnp.where(ok, new_seg, prev_pos)
+        new_truncated = truncated | (is_active & ~ok)
+        return (i + jnp.int32(1), new_prev, new_pos_arr, new_truncated), None
+
+    keys = jax.random.split(rng, MAX_WSEGS_PER_WORM)
+    (_, _, new_seg_pos_slot, _), _ = jax.lax.scan(
+        body,
+        (jnp.int32(0), head_pos, seg_pos, jnp.bool_(False)),
+        keys,
+    )
+    # Re-write head position (slot count-1) to (x, y) — vendor leaves it
+    # there explicitly (worm.c:771-772).
+    head_idx_local = jnp.maximum(count - jnp.int32(1), jnp.int32(0))
+    new_seg_pos_slot = new_seg_pos_slot.at[head_idx_local].set(head_pos)
+
+    new_seg_pos = jax.lax.dynamic_update_slice(
+        worms.seg_pos,
+        new_seg_pos_slot[None, ...],
+        (s, jnp.int32(0), jnp.int32(0)),
+    )
+    new_worms = worms.replace(seg_pos=new_seg_pos)
+    return _replace_worms(state, new_worms)
+
+
+# ---------------------------------------------------------------------------
+# wormhitu — each adjacent worm segment hits the player
+# ---------------------------------------------------------------------------
+
+def wormhitu(state, slot: jnp.ndarray):
+    """Each non-head segment of worm ``slot`` that is adjacent to the player
+    attempts to hit; HP delta is routed via tail_hit_to_head to the head
+    monster.
+
+    Cite: vendor/nethack/src/worm.c::wormhitu lines 334-362.
+
+    Vendor flow:
+        for (seg = wtails[wnum]; seg != wheads[wnum]; seg = seg->nseg)
+            if (distu(seg->wx, seg->wy) < 3)         /* Chebyshev<=1 in tiles */
+                if (mattacku(worm)) return 1;
+
+    The JAX port counts adjacent body segments (excluding the head dummy at
+    index count-1) and returns ``(state, n_hits, head_mon_slot)``.  The
+    caller — combat layer — applies one mattacku-equivalent damage roll per
+    hit to the head monster slot.
+
+    distu(x, y) is sq-Euclidean distance in NetHack (vendor mondata.c).
+    "distu(seg) < 3" means within one tile in either axis (Chebyshev <= 1).
+    """
+    worms = _get_worms(state)
+    s = slot.astype(jnp.int32)
+
+    pos = worms.seg_pos[s]                              # [S, 2]
+    count = worms.seg_count[s].astype(jnp.int32)
+    head_idx_local = jnp.maximum(count - jnp.int32(1), jnp.int32(0))
+    idx_arr = jnp.arange(MAX_WSEGS_PER_WORM, dtype=jnp.int32)
+    seg_valid = (idx_arr < count) & (idx_arr != head_idx_local)
+
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    sr = pos[:, 0].astype(jnp.int32)
+    sc = pos[:, 1].astype(jnp.int32)
+    cheb = jnp.maximum(jnp.abs(sr - pr), jnp.abs(sc - pc))
+    in_range = cheb <= jnp.int32(1)
+
+    hits = jnp.sum((seg_valid & in_range).astype(jnp.int32))
+    head_mon = worms.head_idx[s].astype(jnp.int32)
+    return state, hits, head_mon

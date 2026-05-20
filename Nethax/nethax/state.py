@@ -44,6 +44,8 @@ from Nethax.nethax.subsystems.skills import SkillState
 from Nethax.nethax.subsystems.digging import DigState
 from Nethax.nethax.subsystems.swallow import SwallowState
 from Nethax.nethax.subsystems.lighting import LightingState
+from Nethax.nethax.subsystems.regions import RegionState, make_region_state
+from Nethax.nethax.subsystems.worm import WormState, make_worm_state
 
 from Nethax.nethax.dungeon.branches import (
     DungeonState,
@@ -109,6 +111,8 @@ class EnvState:
     dig: DigState
     swallow: SwallowState
     lighting: LightingState
+    region_state: RegionState
+    worm_state: WormState
 
     # ---- Player core (kept here for fast access; not part of any subsystem) ----
     player_pos: jax.Array       # int16[2]  (row, col)
@@ -267,6 +271,8 @@ class EnvState:
             dig=DigState.default(),
             swallow=SwallowState.default(),
             lighting=LightingState.default(),
+            region_state=make_region_state(),
+            worm_state=make_worm_state(),
             # player core
             player_pos=jnp.zeros((2,), dtype=jnp.int16),
             player_hp=jnp.int32(10),

@@ -693,4 +693,48 @@ def populate_level_with_monsters(
         )
 
     new_mai = jax.lax.fori_loop(0, n_monsters, _write_slot, mai)
-    return state.replace(monster_ai=new_mai)
+    state_after_mai = state.replace(monster_ai=new_mai)
+
+    # Long-worm setup.
+    # Cite: vendor/nethack/src/makemon.c lines 1405-1409:
+    #     if (mndx == PM_LONG_WORM && (mtmp->wormno = get_wormno()) != 0) {
+    #         initworm(mtmp, allowtail ? rn2(5) : 0);
+    #         if (count_wsegs(mtmp))
+    #             place_worm_tail_randomly(mtmp, x, y);
+    #     }
+    # PM_LONG_WORM is monster entry index 118 (constants/monster_entries/
+    # chunk2.py).  For each newly-spawned long-worm slot we allocate a worm
+    # slot, initialise its single head segment at the monster position, and
+    # scatter random tail segments around it.
+    from Nethax.nethax.subsystems.worm import (
+        init_worm as _init_worm,
+        place_worm_tail_randomly as _place_tail,
+        get_wormno as _get_wormno,
+    )
+    PM_LONG_WORM = jnp.int32(118)
+
+    def _worm_init_slot(i, carry):
+        st, key = carry
+        entry = type_ids[i].astype(jnp.int32)
+        is_long_worm = entry == PM_LONG_WORM
+        key, k_alloc, k_tail = jax.random.split(key, 3)
+        found, wslot = _get_wormno(st)
+        do_init = is_long_worm & found
+
+        def _do(st_in):
+            r_ = positions[i, 0]
+            c_ = positions[i, 1]
+            st1 = _init_worm(st_in, wslot, jnp.int32(i), r_, c_)
+            st2 = _place_tail(st1, wslot, r_, c_, k_tail)
+            return st2
+
+        st_new = jax.lax.cond(do_init, _do, lambda s: s, st)
+        return (st_new, key), None
+
+    rng_worm, _ = jax.random.split(rng)
+    (state_final, _), _ = jax.lax.scan(
+        lambda c, i: _worm_init_slot(i, c),
+        (state_after_mai, rng_worm),
+        jnp.arange(n_monsters, dtype=jnp.int32),
+    )
+    return state_final

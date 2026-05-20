@@ -660,6 +660,21 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         is_diagonal_move & cardA_solid & cardB_solid & ~passes_walls
     )
 
+    # vendor/nethack/src/worm.c::worm_cross lines 895-942 — diagonal pass
+    # between two consecutive segments of the same long worm is blocked.
+    # Skip when player Passes_walls (mirrors vendor `!Passes_walls` gating
+    # in hack.c::test_move which is the call-site of worm_cross).
+    from Nethax.nethax.subsystems.worm import worm_cross as _worm_cross
+    _wc_x1 = pos[0]
+    _wc_y1 = pos[1]
+    _wc_x2 = pos[0] + jnp.int32(dy)
+    _wc_y2 = pos[1] + jnp.int32(dx)
+    worm_cross_blocked = (
+        is_diagonal_move
+        & _worm_cross(state, _wc_x1, _wc_y1, _wc_x2, _wc_y2)
+        & ~passes_walls
+    )
+
     # vendor/nethack/src/hack.c:1140 — diagonal-into-doorway block; and
     # hack.c:1208 — diagonal-out-of-doorway block.  Approximation: when
     # diagonal and either source or target tile is a door (OPEN_DOOR or
@@ -683,6 +698,7 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     can_move = (
         in_bounds & ~is_solid & ~door_blocked
         & ~diagonal_corner_blocked & ~diagonal_door_blocked
+        & ~worm_cross_blocked
     )
 
     new_pos = jnp.where(can_move, target, pos).astype(jnp.int16)
