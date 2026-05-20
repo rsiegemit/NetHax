@@ -407,9 +407,12 @@ def partial_identify(
 ) -> IdentificationState:
     """Identify *cnt* randomly-chosen currently-unidentified object types.
 
-    Cite: vendor/nethack/src/o_init.c::peffect_object_detection — the
-    scroll/potion of object-detection path that identifies a random subset
-    of unknown item types rather than the full inventory.
+    Cite: vendor/nethack/src/invent.c::identify_pack (line 2711) →
+    menu_identify(id_limit) (line 2660): partial identification chooses a
+    bounded number of items to identify from the player's pack.  In the
+    vendor's menu-driven flow the player picks; in our headless model we
+    pick uniformly at random from currently-unidentified types, which is
+    byte-equivalent for tests that exercise the count-of-types invariant.
 
     Algorithm:
       1. Build a priority vector: uniform random noise for unidentified slots,
@@ -447,5 +450,61 @@ def full_identify(
 
 
 def check_known(state: IdentificationState, obj_type: int) -> jnp.ndarray:
-    """Return True if obj_type has been fully identified this game."""
+    """Return True if obj_type has been fully identified this game.
+
+    Mirrors vendor objnam.c::xname (line 208): ``nn = ocl->oc_name_known``;
+    the per-type flag drives whether an item renders as its true name or
+    its random appearance.
+    """
     return state.identified[obj_type]
+
+
+def learn_by_use(
+    state: IdentificationState,
+    obj_type: jnp.ndarray,
+) -> IdentificationState:
+    """Mark obj_type as fully identified — vendor `makeknown(otyp)` parity.
+
+    Vendor hack.h:1530 defines::
+
+        #define makeknown(x) discover_object((x), TRUE, TRUE, TRUE)
+
+    Callers (zap.c::learnwand, do_wear.c::learnring, read.c::learnscroll,
+    potion.c::peffects) invoke this whenever a use-effect reveals the item
+    type to the player.  Setting ``identified[obj_type] = True`` causes all
+    items of this type to render with their canonical name from then on
+    (objnam.c::xname line 208 ``nn = ocl->oc_name_known``).
+
+    Functionally identical to ``full_identify`` but accepts a JIT-traced
+    ``obj_type`` scalar for use inside ``lax.cond``/``lax.switch`` branches.
+
+    Parameters
+    ----------
+    state    : IdentificationState.
+    obj_type : int scalar (Python or traced) — index into the objects table.
+
+    Returns
+    -------
+    IdentificationState with ``identified[obj_type] = True``.
+    """
+    t = jnp.asarray(obj_type, dtype=jnp.int32)
+    t = jnp.clip(t, jnp.int32(0), jnp.int32(state.identified.shape[0] - 1))
+    new_identified = state.identified.at[t].set(jnp.bool_(True))
+    return state.replace(identified=new_identified)
+
+
+def is_type_known(
+    state: IdentificationState,
+    obj_type: jnp.ndarray,
+) -> jnp.ndarray:
+    """Return scalar bool: is obj_type's true name known to the player?
+
+    Mirrors vendor ``objects[otyp].oc_name_known`` read.  Safe for traced
+    obj_type (clips to valid range).  Renderers / inventory display should
+    use this together with the per-item ``identified`` flag — vendor xname
+    uses oc_name_known as the primary gate (objnam.c:208), with per-item
+    ``known``/``dknown`` modulating enchantment/BUC display only.
+    """
+    t = jnp.asarray(obj_type, dtype=jnp.int32)
+    t = jnp.clip(t, jnp.int32(0), jnp.int32(state.identified.shape[0] - 1))
+    return state.identified[t]

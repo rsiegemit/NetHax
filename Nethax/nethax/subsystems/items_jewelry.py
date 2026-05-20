@@ -238,18 +238,38 @@ def put_on_ring(state, rng: jax.Array, slot_idx: int, hand: int):
     enchantment = int(enc_raw[slot_idx])  if enc_raw.ndim  > 0 else int(enc_raw)
     buc_val     = int(buc_raw[slot_idx])  if buc_raw.ndim  > 0 else int(buc_raw)
 
+    # Strip the ring from wielded / off-hand / quiver slots before wearing.
+    # Cite: vendor/nethack/src/do_wear.c Ring_on lines 1247-1254 —
+    #   "make sure ring isn't wielded"; clears uwep / uswapwep / uquiver.
+    inv = state.inventory
+    cleared_wielded = jnp.where(
+        inv.wielded.astype(jnp.int32) == jnp.int32(slot_idx),
+        jnp.int8(-1), inv.wielded,
+    )
+    cleared_off_hand = jnp.where(
+        inv.off_hand.astype(jnp.int32) == jnp.int32(slot_idx),
+        jnp.int8(-1), inv.off_hand,
+    )
+    cleared_quiver = jnp.where(
+        inv.quiver.astype(jnp.int32) == jnp.int32(slot_idx),
+        jnp.int8(-1), inv.quiver,
+    )
+
     # Record the worn slot.
-    new_worn_rings = state.inventory.worn_rings.at[hand].set(jnp.int8(slot_idx))
+    new_worn_rings = inv.worn_rings.at[hand].set(jnp.int8(slot_idx))
     # Cursed ring becomes stuck on the finger.
     # Cite: vendor/nethack/src/do_wear.c Ring_off_or_gone cursed check.
     CURSED = 1
     is_cursed = buc_val == CURSED
-    new_worn_rings_welded = state.inventory.worn_rings_welded.at[hand].set(
+    new_worn_rings_welded = inv.worn_rings_welded.at[hand].set(
         jnp.bool_(is_cursed)
     )
-    new_inventory = state.inventory.replace(
+    new_inventory = inv.replace(
         worn_rings=new_worn_rings,
         worn_rings_welded=new_worn_rings_welded,
+        wielded=cleared_wielded,
+        off_hand=cleared_off_hand,
+        quiver=cleared_quiver,
     )
     state = state.replace(inventory=new_inventory)
 
@@ -436,13 +456,34 @@ def wear_amulet(state, rng: jax.Array, slot_idx: int):
     amulet_effect = int(type_raw[slot_idx]) if type_raw.ndim > 0 else int(type_raw)
     buc_val = int(buc_raw[slot_idx]) if buc_raw.ndim > 0 else int(buc_raw)
 
+    # Strip the amulet from wielded / off-hand / quiver before wearing.
+    # Cite: vendor/nethack/src/do_wear.c Amulet_on line 968 —
+    #   remove_worn_item(amul, FALSE) ensures the amulet isn't wielded,
+    #   alt-wielded, or quivered before setworn(amul, W_AMUL).
+    inv = state.inventory
+    cleared_wielded = jnp.where(
+        inv.wielded.astype(jnp.int32) == jnp.int32(slot_idx),
+        jnp.int8(-1), inv.wielded,
+    )
+    cleared_off_hand = jnp.where(
+        inv.off_hand.astype(jnp.int32) == jnp.int32(slot_idx),
+        jnp.int8(-1), inv.off_hand,
+    )
+    cleared_quiver = jnp.where(
+        inv.quiver.astype(jnp.int32) == jnp.int32(slot_idx),
+        jnp.int8(-1), inv.quiver,
+    )
+
     # Cursed amulet becomes stuck.
     # Cite: vendor/nethack/src/do_wear.c Amulet_off cursed check.
     CURSED = 1
     is_cursed = buc_val == CURSED
-    new_inventory = state.inventory.replace(
+    new_inventory = inv.replace(
         worn_amulet=jnp.int8(slot_idx),
         worn_amulet_welded=jnp.bool_(is_cursed),
+        wielded=cleared_wielded,
+        off_hand=cleared_off_hand,
+        quiver=cleared_quiver,
     )
     state = state.replace(inventory=new_inventory)
 
