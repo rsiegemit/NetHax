@@ -332,6 +332,7 @@ def test_identify_marks_first_item_identified():
         type_id=scroll_type_id,
         quantity=1,
         buc_status=_BUC_UNCURSED,
+        identified=True,  # wave17h: make_item now defaults identified=False
     )
     # Slot 1: an unidentified potion (make_item sets identified=True by default;
     # override by building manually)

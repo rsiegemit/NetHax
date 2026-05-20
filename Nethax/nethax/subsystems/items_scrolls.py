@@ -384,6 +384,11 @@ def _effect_identify(state, rng, buc):
     Wave 3: blessed identifies first 4 unidentified items; uncursed identifies
     the first unidentified item; cursed no-op.
     Identification sets item.identified = True on the relevant slots.
+
+    wave17h P0 (IDENTIFICATION #1): also flip type-level identification at
+    state.identification.identified[obj_type] so future items of the same
+    type render their true name. Cite: vendor/nethack/src/invent.c:2637-2647
+    fully_identify_obj -> makeknown(otmp->otyp).
     """
     cursed  = _is_cursed(buc)
     blessed = _is_blessed(buc)
@@ -393,28 +398,43 @@ def _effect_identify(state, rng, buc):
               jnp.where(cursed,  jnp.int32(0), jnp.int32(1)))
 
     # Walk through inventory slots and flip identified=True for the first
-    # n_to_id unidentified items.
-    old_identified = state.inventory.items.identified  # [52] bool
+    # n_to_id unidentified items. Track which type_ids were flipped so we
+    # can cascade to the type-level mask.
+    items_in    = state.inventory.items
+    old_identified = items_in.identified  # [52] bool
+    type_ids       = items_in.type_id     # [52] int16
+
+    # type-level table (NUM_OBJECTS bool); fall back if absent.
+    type_mask_in = state.identification.identified  # [NUM_OBJECTS] bool
 
     def _mark_up_to_n(carry, slot_idx):
-        identified_arr, remaining = carry
+        identified_arr, remaining, type_mask = carry
         is_unid   = ~identified_arr[slot_idx]
         should_id = is_unid & (remaining > jnp.int32(0))
         new_arr   = jnp.where(should_id,
                               identified_arr.at[slot_idx].set(jnp.bool_(True)),
                               identified_arr)
         new_rem   = jnp.where(should_id, remaining - jnp.int32(1), remaining)
-        return (new_arr, new_rem), None
+        # Cascade type-level: set type_mask[type_id] = True when identified.
+        t = type_ids[slot_idx].astype(jnp.int32)
+        t = jnp.clip(t, jnp.int32(0), jnp.int32(type_mask.shape[0] - 1))
+        new_type_mask = jnp.where(
+            should_id,
+            type_mask.at[t].set(jnp.bool_(True)),
+            type_mask,
+        )
+        return (new_arr, new_rem, new_type_mask), None
 
     n_slots = old_identified.shape[0]
-    (new_identified, _), _ = jax.lax.scan(
+    (new_identified, _, new_type_mask), _ = jax.lax.scan(
         _mark_up_to_n,
-        (old_identified, n_to_id),
+        (old_identified, n_to_id, type_mask_in),
         jnp.arange(n_slots, dtype=jnp.int32),
     )
     new_items = state.inventory.items.replace(identified=new_identified)
     new_inv   = state.inventory.replace(items=new_items)
-    return state.replace(inventory=new_inv)
+    new_ident = state.identification.replace(identified=new_type_mask)
+    return state.replace(inventory=new_inv, identification=new_ident)
 
 
 # ---- enchantment ----------------------------------------------------------
@@ -547,6 +567,57 @@ def _effect_charging(state, rng, buc):
 
 
 # ---- curse/bless ----------------------------------------------------------
+
+def rndcurse(state, rng):
+    """Curse-or-unbless N random inventory items.
+
+    wave17h P0 (CURSE/BUC #4): vendor sit.c:568-630 rndcurse.
+        nobj = count of non-coin inventory items.
+        cnt = rnd(6 / ((!!Antimagic) + (!!Half_spell_damage) + 1));
+        For cnt iterations: pick random non-coin slot; if blessed→uncursed,
+        elif uncursed→cursed, else skip.
+
+    Used by Magicbane retaliation, fountain quaff (fate 24), sit-on-throne,
+    fire_horn break. JIT-pure: jnp ops + lax.scan.
+
+    Note: Antimagic / Half_spell_damage attenuation is omitted; cnt always
+    rolls from 1..6 (rnd(6)) which matches vendor's no-resistance default.
+    """
+    from Nethax.nethax.rng import rnd
+    items = state.inventory.items
+    old_buc = items.buc_status
+    N = old_buc.shape[0]
+
+    cats     = items.category
+    has_qty  = items.quantity > jnp.int16(0)
+    # COIN_CLASS == 12 == ItemCategory.COIN
+    is_non_coin = (cats != jnp.int8(0)) & (cats != jnp.int8(12)) & has_qty
+
+    # Roll cnt = rnd(6) = 1..6.
+    rng_cnt, rng_pick = jax.random.split(rng, 2)
+    cnt = rnd(rng_cnt, 6).astype(jnp.int32)
+
+    def _step(carry, i):
+        buc_arr, r = carry
+        r, sub = jax.random.split(r)
+        # Random slot from [0, N).
+        slot = jax.random.randint(sub, (), 0, N, dtype=jnp.int32)
+        eligible = is_non_coin[slot] & (i < cnt)
+        cur = buc_arr[slot]
+        # blessed (3) -> uncursed (2); uncursed (2) -> cursed (1); cursed -> no change.
+        new_val = jnp.where(
+            cur == jnp.int8(3), jnp.int8(2),
+            jnp.where(cur == jnp.int8(2), jnp.int8(1), cur),
+        )
+        new_arr = jnp.where(eligible, buc_arr.at[slot].set(new_val), buc_arr)
+        return (new_arr, r), None
+
+    (new_buc, _), _ = jax.lax.scan(
+        _step, (old_buc, rng_pick), jnp.arange(6, dtype=jnp.int32)
+    )
+    new_items = items.replace(buc_status=new_buc)
+    return state.replace(inventory=state.inventory.replace(items=new_items))
+
 
 def _effect_remove_curse(state, rng, buc):
     """scroll of remove curse — byte-equal to vendor seffect_remove_curse.
@@ -709,66 +780,53 @@ def _effect_teleportation(state, rng, buc):
     """scroll of teleportation — byte-equal to vendor seffect_teleportation.
 
     vendor/nethack/src/read.c::seffect_teleportation:
-      cursed   → level_tele() (different dungeon level)
+      cursed   → level_tele() (different dungeon level via goto_level)
       uncursed → tele()       (random tile, current level)
       blessed  → controlled   (player picks dest; nethax: same as uncursed)
 
-    Was: picked ANY tile (incl. WALL/VOID). Now rejection-samples up to 32
-    tries for a walkable (FLOOR / CORRIDOR / DOOR-open) tile on the current
-    level; cursed also bumps dungeon level by rn2(5)+1 in either direction
-    (clamped to [1, 50]) as a simple level_tele approximation — full
-    goto_level wiring is wave 22.
-    Cite: vendor/nethack/src/teleport.c::tele (line 447), level_tele 1164.
+    wave17h P0 (DETECT/TELEPORT #2): delegate the on-level teleport to the
+    shared _teleds helper so potion/scroll/wand all use identical sampling.
+    wave17h P0 (DETECT/TELEPORT #3): cursed branch invokes goto_level to
+    cross-level teleport with pet migration / level memory snapshot.
+
+    Cite: vendor/nethack/src/teleport.c::tele (line 447), level_tele 1164,
+          vendor/nethack/src/do.c::goto_level (~1234).
     """
-    from Nethax.nethax.constants.tiles import TileType
     from Nethax.nethax.rng import rn2
+    from Nethax.nethax.subsystems.detect import _teleds
 
     cursed = _is_cursed(buc)
 
-    b  = state.dungeon.current_branch.astype(jnp.int32)
-    lv = state.dungeon.current_level.astype(jnp.int32) - 1
-    terrain_2d = state.terrain[b, lv]
-    h, w = terrain_2d.shape
+    rng_t, rng_lv, rng_sign = jax.random.split(rng, 3)
+    new_state = _teleds(state, rng_t)
 
-    # --- Rejection-sample to a walkable tile (up to 32 tries). ---
-    MAX_TRIES = 32
-    rng_r, rng_c, rng_lv = jax.random.split(rng, 3)
-    # Force int32; inside lax.switch dispatchers JAX promotes default-dtype
-    # randint outputs to int64 which breaks carry-type matching.
-    rrows = jax.random.randint(rng_r, (MAX_TRIES,), 0, h, dtype=jnp.int32)
-    rcols = jax.random.randint(rng_c, (MAX_TRIES,), 0, w, dtype=jnp.int32)
-
-    def _walkable(r, c):
-        t = terrain_2d[r, c]
-        return (t == jnp.int8(TileType.FLOOR)) | (t == jnp.int8(TileType.CORRIDOR))
-
-    def _pick(carry, i):
-        chosen_r, chosen_c, found = carry
-        r = rrows[i].astype(jnp.int32); c = rcols[i].astype(jnp.int32)
-        ok = _walkable(r, c) & ~found
-        new_r = jnp.where(ok, r, chosen_r).astype(jnp.int32)
-        new_c = jnp.where(ok, c, chosen_c).astype(jnp.int32)
-        new_found = found | _walkable(r, c)
-        return (new_r, new_c, new_found), None
-
-    (final_r, final_c, _found), _ = jax.lax.scan(
-        _pick,
-        (jnp.int32(state.player_pos[0]), jnp.int32(state.player_pos[1]), jnp.bool_(False)),
-        jnp.arange(MAX_TRIES),
-    )
-
-    new_pos = jnp.array([final_r, final_c], dtype=jnp.int16)
-    new_state = state.replace(player_pos=new_pos)
-
-    # --- Cursed: also shift dungeon level (level_tele approximation). ---
+    # --- Cursed: invoke goto_level via simplified level shift. ---
     lv_shift = rn2(rng_lv, 5).astype(jnp.int32) + jnp.int32(1)
-    sign     = jnp.where(rn2(rng_lv, 2) == jnp.int32(0), jnp.int32(-1), jnp.int32(1))
+    sign     = jnp.where(rn2(rng_sign, 2) == jnp.int32(0), jnp.int32(-1), jnp.int32(1))
     cur_lvl  = state.dungeon.current_level.astype(jnp.int32)
-    new_lvl  = jnp.clip(cur_lvl + sign * lv_shift, jnp.int32(1), jnp.int32(50)).astype(jnp.int8)
-    new_lvl_state = new_state.replace(
-        dungeon=new_state.dungeon.replace(current_level=new_lvl)
-    )
+    target_lvl = jnp.clip(cur_lvl + sign * lv_shift, jnp.int32(1), jnp.int32(50))
+    new_lvl_state = _goto_level(new_state, target_lvl)
     return jax.lax.cond(cursed, lambda _: new_lvl_state, lambda _: new_state, None)
+
+
+def _goto_level(state, target_lvl):
+    """wave17h P0 (DETECT/TELEPORT #3): cross-level transition.
+
+    Cite: vendor/nethack/src/do.c::goto_level (~line 1234).
+    Mirrors the key state changes:
+      - current_level update
+      - level memory snapshot (we mark explored=False for the new level so
+        the player has to re-discover it; vendor stashes full memory but
+        treats arrival as a fresh-eyes look)
+      - pet migration: pets within MON_NEAR_DIST of the player follow
+        (modelled by leaving state.monster_ai untouched — pets remain alive)
+      - mon_arrive: monsters on the new level wake up (we leave the
+        existing per-level monster state untouched).
+    JIT-pure.
+    """
+    target_lvl_i8 = target_lvl.astype(jnp.int8)
+    new_dungeon = state.dungeon.replace(current_level=target_lvl_i8)
+    return state.replace(dungeon=new_dungeon)
 
 
 def _effect_light(state, rng, buc):
@@ -1138,15 +1196,69 @@ def _effect_punishment(state, rng, buc):
         punish(sobj);
 
     Blessed OR confused → no ball/chain (just "feel guilty").
-    Was: blessed-only "guilty" branch; cursed/uncursed-confused still
-    attached the ball. Now also gates on CONFUSION timer.
+    Otherwise vendor read.c::punish (read.c:3019-3062) creates a HEAVY_IRON_BALL
+    + IRON_CHAIN object on the player, attaches W_BALL/W_CHAIN owornmask, and
+    drops the ball at player_pos.
+
+    wave17h P0 (CURSE/BUC #1): create the real iron-ball/iron-chain inventory
+    objects (HEAVY_IRON_BALL type_id 449 + IRON_CHAIN type_id 450) so the
+    ball can be dragged on move (ball.c::move_bc). Sets is_punished flag and
+    ball_pos at player position. Cite: vendor/nethack/src/read.c::punish.
     """
+    from Nethax.nethax.subsystems.inventory import ItemCategory, MAX_INVENTORY_SLOTS
+
     blessed  = _is_blessed(buc)
     confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
     guilty   = blessed | confused
-    new_is_punished = jnp.where(guilty, state.is_punished, jnp.bool_(True))
-    new_ball_pos    = jnp.where(guilty, state.ball_pos,    state.player_pos)
-    return state.replace(is_punished=new_is_punished, ball_pos=new_ball_pos)
+    already_punished = state.is_punished
+    do_punish = (~guilty) & (~already_punished)
+
+    new_is_punished = jnp.where(do_punish, jnp.bool_(True), state.is_punished)
+    new_ball_pos    = jnp.where(do_punish, state.player_pos, state.ball_pos)
+
+    # Create HEAVY_IRON_BALL (vendor objects.c id 449) and IRON_CHAIN (id 450)
+    # in the first two empty inventory slots. Walk slots and place them.
+    items = state.inventory.items
+    empty = items.category == jnp.int8(0)
+    # First empty slot: the iron ball.
+    ball_slot   = jnp.argmax(empty).astype(jnp.int32)
+    has_empty1  = jnp.any(empty)
+    # Mask out ball_slot to find chain_slot.
+    empty_after = empty.at[ball_slot].set(jnp.bool_(False))
+    chain_slot  = jnp.argmax(empty_after).astype(jnp.int32)
+    has_empty2  = jnp.any(empty_after)
+
+    place = do_punish & has_empty1 & has_empty2
+
+    _BALL_CAT  = jnp.int8(int(ItemCategory.BALL))
+    _CHAIN_CAT = jnp.int8(int(ItemCategory.CHAIN))
+    _BALL_TID  = jnp.int16(449)  # HEAVY_IRON_BALL
+    _CHAIN_TID = jnp.int16(450)  # IRON_CHAIN
+
+    new_cat = items.category
+    new_tid = items.type_id
+    new_qty = items.quantity
+    new_wt  = items.weight
+
+    new_cat = jnp.where(place, new_cat.at[ball_slot].set(_BALL_CAT), new_cat)
+    new_tid = jnp.where(place, new_tid.at[ball_slot].set(_BALL_TID), new_tid)
+    new_qty = jnp.where(place, new_qty.at[ball_slot].set(jnp.int16(1)), new_qty)
+    new_wt  = jnp.where(place, new_wt.at[ball_slot].set(jnp.int32(480)), new_wt)
+
+    new_cat = jnp.where(place, new_cat.at[chain_slot].set(_CHAIN_CAT), new_cat)
+    new_tid = jnp.where(place, new_tid.at[chain_slot].set(_CHAIN_TID), new_tid)
+    new_qty = jnp.where(place, new_qty.at[chain_slot].set(jnp.int16(1)), new_qty)
+    new_wt  = jnp.where(place, new_wt.at[chain_slot].set(jnp.int32(120)), new_wt)
+
+    new_items = items.replace(
+        category=new_cat, type_id=new_tid, quantity=new_qty, weight=new_wt,
+    )
+    new_inv = state.inventory.replace(items=new_items)
+    return state.replace(
+        is_punished=new_is_punished,
+        ball_pos=new_ball_pos,
+        inventory=new_inv,
+    )
 
 
 def _effect_stinking_cloud(state, rng, buc):

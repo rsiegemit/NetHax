@@ -8,10 +8,59 @@ Canonical sources:
   vendor/nethack/src/detect.c::monster_detect (lines ~798-962)
   vendor/nethack/src/detect.c::do_clairvoyance (lines ~1446-1560)
 """
+import jax
 import jax.numpy as jnp
 
 from Nethax.nethax.constants.tiles import TileType, VendorTileType
 from Nethax.nethax.subsystems.inventory import ItemCategory
+
+
+# ---------------------------------------------------------------------------
+# wave17h P0 (DETECT/TELEPORT #2): unified _teleds helper.
+# Cite: vendor/nethack/src/teleport.c::teleds (lines 358-433),
+#       vendor/nethack/src/teleport.c::tele   (line 447).
+#
+# The helper rejection-samples a walkable destination (FLOOR / CORRIDOR / DOOR
+# open) on the current level and writes player_pos. Used by potion/scroll/wand
+# teleport so the three subsystems do not diverge.
+# ---------------------------------------------------------------------------
+
+def _teleds(state, rng):
+    """Teleport the player to a uniformly-sampled walkable tile.
+
+    Cite: vendor/nethack/src/teleport.c::teleds + tele.
+    JIT-pure. Uses bounded rejection (32 tries) to avoid lax.while_loop.
+    """
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    terrain_2d = state.terrain[b, lv]
+    h, w = terrain_2d.shape
+
+    MAX_TRIES = 32
+    rng_r, rng_c = jax.random.split(rng, 2)
+    rrows = jax.random.randint(rng_r, (MAX_TRIES,), 0, h, dtype=jnp.int32)
+    rcols = jax.random.randint(rng_c, (MAX_TRIES,), 0, w, dtype=jnp.int32)
+
+    def _walkable(r, c):
+        t = terrain_2d[r, c]
+        return (t == jnp.int8(TileType.FLOOR)) | (t == jnp.int8(TileType.CORRIDOR))
+
+    def _pick(carry, i):
+        chosen_r, chosen_c, found = carry
+        r = rrows[i].astype(jnp.int32); c = rcols[i].astype(jnp.int32)
+        ok = _walkable(r, c) & ~found
+        new_r = jnp.where(ok, r, chosen_r).astype(jnp.int32)
+        new_c = jnp.where(ok, c, chosen_c).astype(jnp.int32)
+        new_found = found | _walkable(r, c)
+        return (new_r, new_c, new_found), None
+
+    (final_r, final_c, _), _ = jax.lax.scan(
+        _pick,
+        (jnp.int32(state.player_pos[0]), jnp.int32(state.player_pos[1]), jnp.bool_(False)),
+        jnp.arange(MAX_TRIES),
+    )
+    new_pos = jnp.array([final_r, final_c], dtype=jnp.int16)
+    return state.replace(player_pos=new_pos)
 
 
 # ---------------------------------------------------------------------------

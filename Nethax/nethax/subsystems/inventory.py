@@ -193,15 +193,21 @@ def make_item(
     corpse_entry_idx: int = -1,
     corpse_creation_turn: int = -1,
     tin_poisoned: bool = False,
+    identified: bool = False,
 ) -> Item:
-    """Construct a concrete Item with given fields (Python-side helper)."""
+    """Construct a concrete Item with given fields (Python-side helper).
+
+    wave17h P0 (IDENTIFICATION #3): default identified=False to match vendor
+    starting-item behavior (cite invent.c:2637-2647). Existing callers that
+    rely on starting inventory being identified can pass identified=True.
+    """
     return Item(
         category=jnp.int8(category),
         type_id=jnp.int16(type_id),
         buc_status=jnp.int8(buc_status),
         enchantment=jnp.int8(enchantment),
         charges=jnp.int8(0),
-        identified=jnp.bool_(True),
+        identified=jnp.bool_(identified),
         quantity=jnp.int16(quantity),
         weight=jnp.int32(weight),
         ac_bonus=jnp.int8(ac_bonus),
@@ -831,12 +837,34 @@ def wear_armor(state, slot_idx: int, armor_slot: ArmorSlot):
     )
     new_ac = compute_ac(state.inventory.items, new_worn_armor)
 
+    # wave17h P0 (IDENTIFICATION #2): use-ID on donning unknown armor.
+    # Cite: vendor/nethack/src/do_wear.c lines 121-460 — wearing identifies
+    # the type when its effect is observable (e.g. gauntlets of dex/str).
+    new_items_id = jnp.where(
+        can_wear,
+        state.inventory.items.identified.at[slot_i32].set(jnp.bool_(True)),
+        state.inventory.items.identified,
+    )
+    item_type_id = state.inventory.items.type_id[slot_i32].astype(jnp.int32)
+    type_mask    = state.identification.identified
+    t_clip       = jnp.clip(item_type_id, jnp.int32(0), jnp.int32(type_mask.shape[0] - 1))
+    new_type_mask = jnp.where(
+        can_wear,
+        type_mask.at[t_clip].set(jnp.bool_(True)),
+        type_mask,
+    )
+
     new_inv = state.inventory.replace(
         worn_armor=new_worn_armor,
         worn_armor_ac_bonus=new_worn_ac_bonus,
         worn_armor_welded=new_worn_armor_welded,
+        items=state.inventory.items.replace(identified=new_items_id),
     )
-    return state.replace(inventory=new_inv, player_ac=new_ac)
+    return state.replace(
+        inventory=new_inv,
+        player_ac=new_ac,
+        identification=state.identification.replace(identified=new_type_mask),
+    )
 
 
 def take_off_armor(state, armor_slot: ArmorSlot):

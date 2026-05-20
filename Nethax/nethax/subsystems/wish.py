@@ -730,6 +730,15 @@ def wishymatch(wish_bytes) -> dict:
     # wave17h P0 #2: gold-piece wish detection (objnam.c:4533-4546).
     if _try_gold_wish(text):
         gcnt = cnt
+        # vendor: "$5000" form — digits after the $ sign provide cnt.
+        if gcnt == 0 and text.startswith("$") and len(text) > 1 and text[1].isdigit():
+            j = 1
+            while j < len(text) and text[j].isdigit():
+                j += 1
+            try:
+                gcnt = int(text[1:j])
+            except ValueError:
+                gcnt = 0
         if gcnt > 5000:
             gcnt = 5000
         if gcnt < 1:

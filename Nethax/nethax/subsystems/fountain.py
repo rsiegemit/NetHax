@@ -5,6 +5,19 @@ Canonical source: vendor/nethack/src/fountain.c
   drinkfountain() fountain.c:243-390  — quaff from fountain
   dryup()         fountain.c:200-238  — fountain dries to FLOOR after N uses
 
+wave17h P0 (DETECT/TELEPORT #1): this module hosts the canonical
+dip_fountain / drink_fountain / dry_fountain entry points used by the
+test suite. ``subsystems.features`` also defines a parallel
+``dip_fountain`` + ``quaff_fountain`` pair (called from feature
+dispatch). The two are intentionally kept distinct because the
+features.py version is JIT-fused into the feature pipeline while the
+fountain.py version is the standalone parity-grade implementation with
+deterministic dryup. Callers in the env step path should prefer
+fountain.py; features.py callers are restricted to the
+within-feature-dispatch path. Future work: merge into a single
+implementation once the feature dispatch contract is widened to accept
+the deterministic dryup.
+
 Design: all three functions are JIT-pure (no Python control flow on traced
 values).  They operate on the full EnvState and return a new EnvState.
 

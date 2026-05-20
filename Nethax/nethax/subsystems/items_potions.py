@@ -1347,6 +1347,22 @@ def quaff_potion(state, rng, slot_idx):
         # Dispatch: operand is (state, rng, buc); each branch returns new state.
         new_state = jax.lax.switch(effect_id, _SWITCH_BRANCHES, (s, rng, buc))
 
+        # wave17h P0 (IDENTIFICATION #2): use-ID on drinking unknown potion.
+        # Cite: vendor/nethack/src/potion.c::peffects identifies the type
+        # in many branches (e.g. potion.c:632-2603). We mirror this by
+        # setting identified=True on the consumed slot AND flipping the
+        # type-level mask at state.identification.identified[type_id].
+        new_items_id   = new_state.inventory.items.identified.at[_sidx].set(jnp.bool_(True))
+        type_mask      = new_state.identification.identified
+        type_id_clipped = jnp.clip(type_id, jnp.int32(0), jnp.int32(type_mask.shape[0] - 1))
+        new_type_mask  = type_mask.at[type_id_clipped].set(jnp.bool_(True))
+        new_state = new_state.replace(
+            inventory=new_state.inventory.replace(
+                items=new_state.inventory.items.replace(identified=new_items_id),
+            ),
+            identification=new_state.identification.replace(identified=new_type_mask),
+        )
+
         # Decrement quantity; clear category when exhausted.
         old_qty  = new_state.inventory.items.quantity[_sidx]
         new_qty  = jnp.maximum(old_qty - jnp.int16(1), jnp.int16(0))
