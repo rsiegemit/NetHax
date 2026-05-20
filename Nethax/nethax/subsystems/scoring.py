@@ -19,16 +19,23 @@ Canonical sources:
                                  ESCAPED/ASCENDED branches (lines 1430-1452).
   vendor/nethack/include/hack.h — game_end_types enum (lines 482-499) defining
                                  DIED..ASCENDED death-cause integers.
-  vendor/nethack/src/insight.c — show_conduct() listing per-conduct bonuses;
-                                 Nethax simplifies counts to a single
-                                 kept/broken bit and applies a flat per-conduct
-                                 bonus (see _CONDUCT_BONUS table below).
+  vendor/nethack/src/insight.c — show_conduct() *displays* per-conduct
+                                 status via u.uconduct.<field> counters
+                                 (lines 2079-2236); it awards no score.
+                                 Vendor topten.c logs conducts to the
+                                 xlogfile (lines 415-451) without altering
+                                 the score.  The flat per-kept-conduct
+                                 bonus implemented here is a Nethax-only
+                                 RL-reward augmentation (see _CONDUCT_BONUS
+                                 table below); the vendor terms (XP, gold,
+                                 depth, ascension multiplier) remain
+                                 byte-equal end.c::really_done.
 
-Status: Wave 6 Phase A — final scoring formula and death-cause enum landed.
-The full conduct counter system (turn-weighted bonuses for FOODLESS, ATHEIST,
-etc.) is simplified to flat per-kept-conduct bonuses; this trades vendor
-exactness for a JIT-friendly fixed-shape computation that is still
-monotonically meaningful for RL reward signals.
+Status: Wave 6 Phase A — vendor final-score formula and death-cause enum
+landed.  Wave 29b: compute_conduct_bonus switched to vendor-byte-equal
+``counters == 0`` kept predicate (matches insight.c ``if (!u.uconduct.X)``
+test); module docstring corrected to state that vendor awards no conduct
+score bonus.
 """
 from enum import IntEnum
 
@@ -127,12 +134,21 @@ def is_real_death(cause: int) -> bool:
 # ---------------------------------------------------------------------------
 # Per-conduct bonus table.
 #
-# Vendor (insight.c::show_conduct) awards turn-weighted bonuses
-# (e.g. 100 * turns for FOODLESS).  Nethax collapses each conduct to a single
-# kept/broken bit, so we award a flat bonus per kept conduct.  Values mirror
-# the rough per-turn weight used by NetHack so that PACIFIST (200) is the
-# largest, FOODLESS/ATHEIST/WISHLESS/POLYSELFLESS (100) sit at the second
-# tier, etc.  This is the documented Wave 6 simplification.
+# Vendor parity note: vendor does NOT award any score bonus for conducts.
+# Cite: vendor/nethack/src/insight.c::show_conduct (lines 2079-2236) only
+# *displays* conducts via enl_msg / you_have_been / you_have_X; vendor
+# topten.c writes conducts to the xlogfile (lines 415-451, 587-...) but
+# never adjusts the score.  Vendor end.c::really_done (lines 1325-1352)
+# composes the final score from u.urexp, gold, deepest-level, and ascension
+# multiplier — no conduct term.
+#
+# Nethax adds a flat per-kept-conduct bonus as a Nethax-specific RL reward
+# signal.  The "kept" predicate matches vendor's display-time test
+# (insight.c:2126 ``if (!u.uconduct.food)`` etc.) byte-equal: a conduct is
+# kept iff its counter equals 0.  Relative weights below preserve the
+# established Nethax ordering: PACIFIST (200) > FOODLESS/ATHEIST/WISHLESS/
+# POLYSELFLESS (100) > VEGAN/WEAPONLESS/ILLITERATE/ARTIWISHLESS (50) >
+# VEGETARIAN/POLYPILELESS/GENOCIDELESS/ELBERETHLESS (25).
 # ---------------------------------------------------------------------------
 
 _CONDUCT_BONUS: dict = {
@@ -325,12 +341,18 @@ def _player_holds_amulet(state) -> jnp.ndarray:
 def compute_conduct_bonus(state) -> jnp.ndarray:
     """Sum the flat bonus for every still-kept conduct.
 
-    Mirrors vendor ``show_conduct`` (insight.c) which awards a per-conduct
-    bonus proportional to how long the conduct was kept; we apply a flat
-    bonus per kept conduct (see _CONDUCT_BONUS table comment).
+    The "kept" predicate uses ``ConductState.counters == 0`` to match
+    vendor's display-time test byte-equal: vendor checks
+    ``if (!u.uconduct.<field>)`` to decide whether a conduct was kept
+    (cite: insight.c lines 2126, 2129, 2131, 2134, 2138, 2144, 2147, 2155,
+    2167, 2175, 2183, 2219).  Vendor itself awards no score bonus for any
+    conduct — see _CONDUCT_BONUS header comment above — so this function
+    is a documented Nethax-only addition layered on top of the vendor
+    counters; it does not alter byte-equal final-score parity for the
+    vendor terms (XP / gold / depth / ascension).
     """
-    bonuses = _conduct_bonus_array()           # int32[N_CONDUCTS]
-    kept    = ~state.conduct.violations        # bool[N_CONDUCTS]
+    bonuses = _conduct_bonus_array()                       # int32[N_CONDUCTS]
+    kept    = state.conduct.counters == jnp.int32(0)       # bool[N_CONDUCTS]
     return jnp.int32(jnp.sum(jnp.where(kept, bonuses, jnp.int32(0))))
 
 
