@@ -111,7 +111,8 @@ def test_priest_attack_spell_expert():
 # test_enhance_advances_eligible_skill
 # Cite: vendor/nethack/src/weapon.c::enhance_weapon_skill line 1329.
 # Set advance[DAGGER]=20 with level=P_UNSKILLED(0), cap=P_EXPERT(3).
-# practice_needed_to_advance(0) = 0, so advance=20 >= 0 → eligible.
+# practice_needed_to_advance(0) = 20 (vendor's macro applied to 1-based
+# P_UNSKILLED=1 → 1*1*20 = 20), so advance=20 == threshold → eligible.
 # After _handle_enhance, level[DAGGER] should be P_BASIC(1).
 # ---------------------------------------------------------------------------
 def test_enhance_advances_eligible_skill():
@@ -136,7 +137,7 @@ def test_enhance_advances_eligible_skill():
 # test_enhance_no_op_when_no_eligible
 # Cite: vendor/nethack/src/weapon.c::enhance_weapon_skill line 1329.
 # All skills at P_UNSKILLED(0) with advance=0 and cap=P_UNSKILLED(0) (restricted).
-# practice_needed_to_advance(0) = 0 but level(0) >= cap(0) → not eligible.
+# practice_needed_to_advance(0) = 20 but level(0) >= cap(0) blocks → not eligible.
 # _handle_enhance must leave state unchanged.
 # ---------------------------------------------------------------------------
 def test_enhance_no_op_when_no_eligible():

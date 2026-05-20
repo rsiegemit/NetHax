@@ -42,11 +42,15 @@ def _fresh_state() -> EnvState:
 # vendor/nethack/include/skills.h:106 — level*level*20
 # ---------------------------------------------------------------------------
 def test_practice_needed_to_advance_formula():
-    assert int(practice_needed_to_advance(jnp.int8(0))) == 0   # P_UNSKILLED → P_BASIC
-    assert int(practice_needed_to_advance(jnp.int8(1))) == 20  # P_BASIC → P_SKILLED
-    assert int(practice_needed_to_advance(jnp.int8(2))) == 80  # P_SKILLED → P_EXPERT
-    assert int(practice_needed_to_advance(jnp.int8(3))) == 180 # P_EXPERT → P_MASTER
-    assert int(practice_needed_to_advance(jnp.int8(4))) == 320 # P_MASTER → P_GRAND_MASTER
+    # Vendor's macro is (L)*(L)*20 keyed off vendor's 1-based level
+    # (P_UNSKILLED=1 … P_GRAND_MASTER=6).  In our 0-based encoding we
+    # evaluate at (level+1)^2 * 20 so the output sequence matches vendor
+    # for every reachable Nethax level.
+    assert int(practice_needed_to_advance(jnp.int8(0))) == 20   # P_UNSKILLED → P_BASIC
+    assert int(practice_needed_to_advance(jnp.int8(1))) == 80   # P_BASIC → P_SKILLED
+    assert int(practice_needed_to_advance(jnp.int8(2))) == 180  # P_SKILLED → P_EXPERT
+    assert int(practice_needed_to_advance(jnp.int8(3))) == 320  # P_EXPERT → P_MASTER
+    assert int(practice_needed_to_advance(jnp.int8(4))) == 500  # P_MASTER → P_GRAND_MASTER
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +96,13 @@ def test_starting_valkyrie_skill_caps():
 def test_use_skill_increments_advance():
     state = _fresh_state()
     dagger_id = jnp.int32(int(SkillId.DAGGER))
+    # Vendor weapon.c:1428 gates use_skill on !P_RESTRICTED(skill); in our
+    # encoding "restricted" means max_level <= P_UNSKILLED.  Unlock DAGGER
+    # by raising its cap before practicing.
+    new_max = state.skills.max_level.at[int(SkillId.DAGGER)].set(
+        jnp.int8(int(SkillLevel.P_BASIC))
+    )
+    state = state.replace(skills=state.skills.replace(max_level=new_max))
     for _ in range(20):
         state = use_skill(state, dagger_id, 1)
     advance = int(state.skills.advance[int(SkillId.DAGGER)])
@@ -101,8 +112,9 @@ def test_use_skill_increments_advance():
 # ---------------------------------------------------------------------------
 # test_try_advance_at_threshold
 # advance=20, level=P_UNSKILLED(0), max=P_SKILLED(2) → level becomes P_BASIC(1)
-# practice_needed_to_advance(0) = 0, so any advance >= 0 suffices for UNSKILLED→BASIC.
-# Cite: vendor/nethack/src/weapon.c::skill_advance
+# practice_needed_to_advance(0) = 20 (vendor's macro applied to 1-based
+# P_UNSKILLED=1 → 1*1*20 = 20), so advance==20 exactly meets the threshold.
+# Cite: vendor/nethack/src/weapon.c::skill_advance + skills.h:106
 # ---------------------------------------------------------------------------
 def test_try_advance_at_threshold():
     state = _fresh_state()
@@ -160,6 +172,13 @@ def test_spell_cast_increments_skill():
     new_mem = state.magic.spell_memory.at[int(SpellId.MAGIC_MISSILE)].set(jnp.int32(100))
     new_known = state.magic.spell_known.at[int(SpellId.MAGIC_MISSILE)].set(jnp.bool_(True))
     state = state.replace(magic=state.magic.replace(spell_memory=new_mem, spell_known=new_known))
+
+    # Unlock ATTACK_SPELL skill (vendor weapon.c:1428 — use_skill skips
+    # restricted skills, i.e. max_level <= P_UNSKILLED in our encoding).
+    new_max = state.skills.max_level.at[int(SkillId.ATTACK_SPELL)].set(
+        jnp.int8(int(SkillLevel.P_EXPERT))
+    )
+    state = state.replace(skills=state.skills.replace(max_level=new_max))
 
     rng = jr.PRNGKey(0)
     new_state, _success = cast_spell(state, rng, SpellId.MAGIC_MISSILE)

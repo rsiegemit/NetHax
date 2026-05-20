@@ -192,12 +192,15 @@ def test_martial_arts_thresholds_match_default():
     """
     from Nethax.nethax.subsystems.skills import practice_needed_to_advance, SkillLevel
 
+    # Vendor evaluates the macro on its own 1-based level (P_UNSKILLED=1 …
+    # P_GRAND_MASTER=6).  Our 0-based encoding passes (level+1) into the
+    # macro so the resulting threshold sequence is byte-equal to vendor.
     expected = {
-        SkillLevel.P_UNSKILLED:    0,    # 0*0*20
-        SkillLevel.P_BASIC:       20,    # 1*1*20
-        SkillLevel.P_SKILLED:     80,    # 2*2*20
-        SkillLevel.P_EXPERT:     180,    # 3*3*20
-        SkillLevel.P_MASTER:     320,    # 4*4*20
+        SkillLevel.P_UNSKILLED:   20,    # vendor 1*1*20
+        SkillLevel.P_BASIC:       80,    # vendor 2*2*20
+        SkillLevel.P_SKILLED:    180,    # vendor 3*3*20
+        SkillLevel.P_EXPERT:     320,    # vendor 4*4*20
+        SkillLevel.P_MASTER:     500,    # vendor 5*5*20
     }
 
     for level, exp_val in expected.items():

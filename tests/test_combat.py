@@ -246,7 +246,12 @@ def test_bump_attack_no_monster_is_noop_for_hp():
 # ---------------------------------------------------------------------------
 
 def test_practice_skill_advances_at_threshold():
-    """Basic→Skilled threshold is 1*1*20 = 20 practices."""
+    """Basic→Skilled threshold is vendor (2)*(2)*20 = 80 practices.
+
+    Vendor's practice_needed_to_advance macro is keyed on its 1-based skill
+    level: P_BASIC=2 → 2*2*20 = 80.  In our 0-based encoding the equivalent
+    table entry is (BASIC+1)^2 * 20 = 80.  Cite: include/skills.h:106.
+    """
     state = _fresh_state()
     # Push tier up to BASIC manually.
     state = state.replace(
@@ -255,8 +260,8 @@ def test_practice_skill_advances_at_threshold():
         )
     )
     weapon_type = jnp.int32(0)
-    # 20 practices at BASIC (1*1*20 = 20) → advance to SKILLED.
-    for _ in range(20):
+    # 80 practices at BASIC (vendor 2*2*20 = 80) → advance to SKILLED.
+    for _ in range(80):
         state = practice_skill(state, weapon_type)
     assert int(state.combat.weapon_skill[0]) == SKILL_BASIC + 1
     assert int(state.combat.weapon_practice[0]) == 0

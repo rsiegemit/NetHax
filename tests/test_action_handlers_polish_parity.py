@@ -167,11 +167,12 @@ def _state_with_skill(skill_id: SkillId, level: int, advance: int, cap: int) -> 
 
 
 def test_handle_enhance_advances_eligible():
-    """DAGGER at UNSKILLED(0) with advance=20 >= threshold(0)=0; E should advance to BASIC(1).
+    """DAGGER at UNSKILLED(0) with advance=20 == threshold(0)=20; should advance to BASIC(1).
 
     Cite: vendor/nethack/src/weapon.c::enhance_weapon_skill line 1329.
-    Threshold formula: practice_needed_to_advance(0) = 0*0*20 = 0
-    (vendor/nethack/include/skills.h:106).
+    Threshold formula: vendor practice_needed_to_advance(P_UNSKILLED=1) = 1*1*20 = 20
+    (vendor/nethack/include/skills.h:106); in our 0-based encoding the
+    macro evaluated at level=0 returns (0+1)*(0+1)*20 = 20.
     """
     state = _state_with_skill(
         SkillId.DAGGER,
