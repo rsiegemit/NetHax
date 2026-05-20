@@ -106,13 +106,27 @@ def make_empty_level_memory() -> LevelMemoryState:
 
 
 def snapshot_monsters_and_features(state, branch: int, level: int):
-    """Snapshot per-level subsystems (monsters, features, ground items).
+    """Snapshot per-level subsystems (monsters, features, ground items, engravings).
 
-    Vendor parity rationale: vendor/nethack/src/save.c::savelev() writes
-    the entire ``svm.mvitals`` / ``svr.rooms`` / ``svl.level.objects``
-    block to the per-level file.  ``loadlev()`` restores it on re-visit.
-    Our model exposes the same surface through this helper, which the
-    stair handlers call before changing ``dungeon.current_level``.
+    Vendor parity rationale: vendor/nethack/src/save.c::savelev_core
+    (lines 451-567) writes the per-level slice — monsters
+    (``savemonchn`` line 542), traps (``savetrapchn`` line 544), ground
+    objects (``saveobjchn`` lines 545-547), engravings
+    (``save_engravings`` line 548) and room/door features
+    (``save_rooms`` line 534) — to the per-level file.
+    ``vendor/nethack/src/restore.c::getlev`` (lines 1046-1305) restores
+    the same block on re-visit.  This helper mirrors that surface, called
+    by the stair handlers before changing ``dungeon.current_level``.
+
+    Wave 30g: ``engrave`` added to the snapshot dict so dust/burn/HE
+    engravings persist across stair traversal (EngraveState is
+    single-level — see vendor/nethack/src/save.c::save_engravings).
+    ``traps``, ``features`` and ``ground_items`` are already 4-D
+    [N_BRANCHES, MAX_LEVELS, ...] in our model so they survive level
+    swap implicitly; we still snapshot the full pytree slot for
+    completeness and so a hypothetical future single-level reshape is
+    drop-in.  Monster wakefulness (``asleep`` / ``sleep_timer``) is
+    preserved as part of the full ``MonsterAIState`` pytree.
 
     JIT-pure: returns the same state pytree but tags a host-side dict on
     state via ``state._level_snapshots`` (Python attribute only, kept
@@ -140,11 +154,17 @@ def snapshot_monsters_and_features(state, branch: int, level: int):
             # flax @struct.dataclass is frozen; bail out silently.
             return state
     try:
-        cache[(int(branch), int(level))] = {
+        entry = {
             "monster_ai":   state.monster_ai,
             "features":     state.features,
             "ground_items": state.ground_items,
         }
+        # engrave is single-level (MAP_H x MAP_W) — must snapshot for parity
+        # with vendor save.c::save_engravings (line 548).
+        engrave = getattr(state, "engrave", None)
+        if engrave is not None:
+            entry["engrave"] = engrave
+        cache[(int(branch), int(level))] = entry
     except Exception:
         pass
     return state
@@ -156,14 +176,18 @@ def restore_monsters_and_features(state, branch: int, level: int):
     Pair with ``snapshot_monsters_and_features``.  When no snapshot
     exists the state is returned unchanged (first visit path).
 
+    Wave 30g: also restores ``engrave`` when present in the snapshot
+    (vendor/nethack/src/restore.c::rest_engravings, line 1174).
+
     Args:
         state:   EnvState pytree (after dungeon.current_level swap).
         branch:  Branch index (int).
         level:   1-based level number within branch.
 
     Returns:
-        Updated EnvState with monster_ai / features / ground_items
-        restored from the cache, or the original state on cache miss.
+        Updated EnvState with monster_ai / features / ground_items /
+        engrave restored from the cache, or the original state on cache
+        miss.
     """
     cache = getattr(state, "_level_snapshots", None)
     if not cache:
@@ -171,11 +195,14 @@ def restore_monsters_and_features(state, branch: int, level: int):
     snap = cache.get((int(branch), int(level)))
     if snap is None:
         return state
-    return state.replace(
-        monster_ai=snap["monster_ai"],
-        features=snap["features"],
-        ground_items=snap["ground_items"],
-    )
+    replace_kwargs = {
+        "monster_ai":   snap["monster_ai"],
+        "features":     snap["features"],
+        "ground_items": snap["ground_items"],
+    }
+    if "engrave" in snap and hasattr(state, "engrave"):
+        replace_kwargs["engrave"] = snap["engrave"]
+    return state.replace(**replace_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -587,16 +614,33 @@ def traverse_portal(
 # ---------------------------------------------------------------------------
 # TODO blocks
 # ---------------------------------------------------------------------------
-# Wave 4:
+# Wave 30g audit (vendor save.c::savelev / restore.c::loadlev parity):
+#   - snapshot_monsters_and_features now covers monster_ai (incl. asleep
+#     / sleep_timer for wakefulness persistence per vendor savemonchn,
+#     save.c:542), features (doors / stairs / altars / sinks per
+#     save_rooms, save.c:534), ground_items (saveobjchn, save.c:545-547)
+#     and engrave (save_engravings, save.c:548).  traps and features
+#     are already 4-D per-level arrays so they persist implicitly across
+#     stair traversal (TrapState / FeaturesState in
+#     subsystems/{traps,features}.py).
+#   - HOLE / TRAPDOOR drop: vendor do.c::goto_level calls savelev()
+#     unconditionally on the level being left (do.c:1650), so hole-drop
+#     levels stay VISITED (save.c:494).  The corresponding caller in
+#     action_dispatch.py::_action_move HOLE/TRAPDOOR branch (line ~776)
+#     should call snapshot_monsters_and_features before bumping
+#     dungeon.current_level — outside this file's scope (audited Wave 30g).
+#
+# Wave 4 (still open):
 #   - enter_level: dispatch to generate_special_level() for ORACLE,
 #     MINETOWN, etc. instead of the procedural room generator.
-#   - Add cached_items / cached_monsters fields once ItemState /
-#     MonsterState array shapes are finalised in state.py.
 #   - Handle Sokoban anti-cheat: reset boulders if puzzle was cheated.
-#   - Handle item migration: items thrown/kicked between levels via holes.
+#   - Handle item migration: items thrown/kicked between levels via holes
+#     (vendor mon.c::mdrop_special_objs; migrating_objs chain).
 #
-# Wave 5:
-#   - Minetown: persist shopkeeper state across visits.
+# Wave 5 (still open):
+#   - Minetown: persist shopkeeper state across visits (svm.shk fields
+#     beyond the MonsterAIState slot — bills, residency).
 #
-# Wave 6:
-#   - Endgame levels are never revisited; skip write-back for performance.
+# Wave 6 (still open):
+#   - Endgame levels are never revisited; skip write-back for performance
+#     (vendor do.c::goto_level cant_go_back branch, lines 1640-1664).
