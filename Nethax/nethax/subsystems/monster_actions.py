@@ -33,6 +33,10 @@ _ACT_SEDU:    int = 3   # AD_SEDU ability drain + Pw drain (mhitu.c::doseduce ~2
 _ACT_LICH:    int = 4   # spell cast: force_bolt/paralyze/fireball (mhitu.c ~412)
 _ACT_BREATH:  int = 5   # AT_BREA dragon breath (mhitu.c::mattacku ~873)
 _ACT_KRAKEN:  int = 6   # AT_HUGS+AD_WRAP grab → drown (mhitu.c ~1053)
+_ACT_SPIT:    int = 7   # AT_SPIT ranged venom/acid (mthrowu.c::spitmu :1268,
+                        #   spitmm :1016 — acid/blinding venom projectile)
+_ACT_GAZE:    int = 8   # AT_GAZE ranged stare effect (mhitu.c::gazemu :1668 —
+                        #   AD_FIRE/AD_CONF/AD_STON/AD_STUN/AD_BLND)
 
 # ---------------------------------------------------------------------------
 # Monster index constants (from vendor/nethack/include/monsters.h; mirrors
@@ -120,6 +124,26 @@ def _build_special_action_table() -> jnp.ndarray:
     tbl[_IDX_SILVER_DRAGON] = _ACT_BREATH
     # Kraken: AT_HUGS AD_WRAP grab+drown, mhitu.c ~1053
     tbl[_IDX_KRAKEN] = _ACT_KRAKEN
+
+    # AT_SPIT / AT_GAZE — populate from MONSTERS attack lists.
+    # Lower-priority than the bespoke actions above, so the established
+    # dragons/lich/etc. routes win when both apply (no current overlap).
+    # Vendor cite: mhitu.c::mattacku case AT_SPIT line 878-882 and
+    #              case AT_GAZE line 832-837.
+    from Nethax.nethax.constants.monsters import MONSTERS, AttackType
+    at_spit = int(AttackType.AT_SPIT)
+    at_gaze = int(AttackType.AT_GAZE)
+    for i, m in enumerate(MONSTERS):
+        if tbl[i] != _ACT_NONE:
+            continue
+        for atk in m.attacks:
+            aatyp = int(atk[0])
+            if aatyp == at_spit:
+                tbl[i] = _ACT_SPIT
+                break
+            if aatyp == at_gaze:
+                tbl[i] = _ACT_GAZE
+                break
     return jnp.array(tbl, dtype=jnp.int8)
 
 
@@ -187,6 +211,81 @@ _SPECIAL_ACTION_TYPE:      jnp.ndarray = _build_special_action_table()
 _DRAGON_BREATH_ELEMENT:    jnp.ndarray = _build_dragon_breath_element_table()
 _DRAGON_BREATH_DAMN:       jnp.ndarray = _build_dragon_breath_damn_table()
 _PERMINVIS_TABLE:           jnp.ndarray = _build_perminvis_table()
+
+
+def _build_spit_attack_tables() -> tuple:
+    """Return (damn[N], sides[N], adtyp[N]) for each monster's first AT_SPIT
+    attack.  All zeros for non-spitters.
+
+    Cite: vendor/nethack/src/mthrowu.c::spitmm:1016 — AD_ACID/AD_BLND/AD_DRST
+    venoms; damage is rolled from the venom object on hit (m_throw → hitmu).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, AttackType
+    at_spit = int(AttackType.AT_SPIT)
+    damn = [0] * _NUMMONS
+    sides = [0] * _NUMMONS
+    adtyp = [0] * _NUMMONS
+    for i, m in enumerate(MONSTERS):
+        for atk in m.attacks:
+            if int(atk[0]) == at_spit:
+                adtyp[i] = int(atk[1])
+                damn[i]  = int(atk[2])
+                sides[i] = int(atk[3])
+                break
+    return (
+        jnp.array(damn,  dtype=jnp.int8),
+        jnp.array(sides, dtype=jnp.int8),
+        jnp.array(adtyp, dtype=jnp.int8),
+    )
+
+
+_SPIT_DAMN, _SPIT_SIDES, _SPIT_ADTYP = _build_spit_attack_tables()
+
+
+def _build_gaze_attack_tables() -> tuple:
+    """Return (damn[N], sides[N], adtyp[N]) for each monster's first AT_GAZE
+    attack.  All zeros for non-gazers.
+
+    Cite: vendor/nethack/src/mhitu.c::gazemu:1668 — AD_STON (Medusa, killed),
+        AD_FIRE (fire ant), AD_CONF (forest centaur), AD_STUN (umber hulk),
+        AD_BLND (floating eye via passive — but kept here for completeness).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, AttackType
+    at_gaze = int(AttackType.AT_GAZE)
+    damn = [0] * _NUMMONS
+    sides = [0] * _NUMMONS
+    adtyp = [0] * _NUMMONS
+    for i, m in enumerate(MONSTERS):
+        for atk in m.attacks:
+            if int(atk[0]) == at_gaze:
+                adtyp[i] = int(atk[1])
+                damn[i]  = int(atk[2])
+                sides[i] = int(atk[3])
+                break
+    return (
+        jnp.array(damn,  dtype=jnp.int8),
+        jnp.array(sides, dtype=jnp.int8),
+        jnp.array(adtyp, dtype=jnp.int8),
+    )
+
+
+_GAZE_DAMN, _GAZE_SIDES, _GAZE_ADTYP = _build_gaze_attack_tables()
+
+# AD_* values used in spit/gaze dispatch (mirror DamageType in
+# Nethax/nethax/constants/monsters.py:117-165).
+_AD_PHYS: int =  0
+_AD_FIRE: int =  2
+_AD_DRST: int =  7   # poison (drains strength)
+_AD_ACID: int =  8
+_AD_BLND: int = 11
+_AD_STUN: int = 12
+_AD_CONF: int = 25
+_AD_STON: int = 18
+
+# Range cap for spit/gaze: BOLT_LIM = 13 per vendor monst.c, but mthrowu uses
+# m_lined_up (uses BOLT_LIM-1 effective).  Use the same range as breath.
+_SPIT_RANGE: int = 8
+_GAZE_RANGE: int = 8
 
 # Resistance gate per breath element: index = _ELEM_* (0..8), value = Intrinsic
 # index (or -1 = no resistance for that element).
@@ -573,7 +672,181 @@ def _kraken_grab(state, slot: jnp.ndarray, rng: jax.Array):
 
 
 # ---------------------------------------------------------------------------
-# 7. Stalker invisibility rendering helper
+# 7. Monster ranged spit  (vendor/nethack/src/mthrowu.c::spitmu :1268,
+#    spitmm :1016 — AD_ACID/AD_BLND/AD_DRST venom projectile)
+# ---------------------------------------------------------------------------
+
+def _spit_attack(state, slot: jnp.ndarray, rng: jax.Array):
+    """Monster spits venom at the player if lined up within range.
+
+    Damage roll: d(damn, sides) per the monster's AT_SPIT attack row.
+    Resistance gates per AD type:
+        AD_ACID → RESIST_ACID    (zhitu acid path, zap.c)
+        AD_DRST → RESIST_POISON  (poison strength drain — d(damn,sides) HP
+                                  reduced; full RESIST_POISON blocks)
+        AD_BLND → BLIND timer set to a fixed window when not RESIST_BLND
+                  (vendor mksobj BLINDING_VENOM → does_blind path,
+                  potion.c::peffects PR_BLINDED branch ~ 25-49 turns)
+
+    Vendor cite: mthrowu.c::spitmm:1016-1077 — venom mksobj + m_throw.
+    Range check uses _SPIT_RANGE; line-of-sight gate via Chebyshev distance.
+    """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic, TimedStatus
+    mai = state.monster_ai
+    idx = slot.astype(jnp.int32)
+    mpos = mai.pos[idx].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+    dist = _cheby(mpos, ppos)
+    in_range = (dist >= jnp.int32(2)) & (dist <= jnp.int32(_SPIT_RANGE))
+
+    safe_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, _NUMMONS - 1)
+    damn  = _SPIT_DAMN[safe_entry].astype(jnp.int32)
+    sides = _SPIT_SIDES[safe_entry].astype(jnp.int32)
+    adtyp = _SPIT_ADTYP[safe_entry].astype(jnp.int32)
+
+    def _apply(s):
+        # d(damn, sides): roll up to 6 dice (damn <= 6 in vendor for spitters).
+        rng_roll, rng_blind = jax.random.split(rng)
+        rolls = jax.random.randint(rng_roll, (6,), 1, 7)
+        mask  = jnp.arange(6) < damn
+        capped = jnp.minimum(rolls, jnp.maximum(sides, jnp.int32(1)))
+        raw_dmg = jnp.sum(jnp.where(mask, capped, jnp.int32(0))).astype(jnp.int32)
+
+        is_acid = adtyp == jnp.int32(_AD_ACID)
+        is_drst = adtyp == jnp.int32(_AD_DRST)
+        is_blnd = adtyp == jnp.int32(_AD_BLND)
+
+        # Resistance gates per vendor zhitu / venom branches.
+        res_acid = s.status.intrinsics[int(Intrinsic.RESIST_ACID)]
+        res_pois = s.status.intrinsics[int(Intrinsic.RESIST_POISON)]
+        # AD_BLND venom — vendor's BLINDING_VENOM clears via BLND_RES (an
+        # equipment/intrinsic property tested in potion.c).  Use no-intrinsic
+        # gating here; eyewear gating is handled in armor_effects.
+        gated_dmg = jnp.where(
+            (is_acid & res_acid) | (is_drst & res_pois),
+            jnp.int32(0),
+            raw_dmg,
+        )
+
+        new_hp = jnp.maximum(jnp.int32(0), s.player_hp - gated_dmg)
+        s = s.replace(player_hp=new_hp, done=s.done | (new_hp <= jnp.int32(0)))
+
+        # AD_BLND: apply BLIND timer (rnd(25)+25 per vendor potion.c
+        # PR_BLINDED on blinding venom hit ~lines 1280-1320 in spitmm path).
+        blind_dur = jax.random.randint(rng_blind, (), 25, 50)
+        timed = s.status.timed_statuses
+        cur_blind = timed[int(TimedStatus.BLIND)]
+        new_blind = jnp.where(
+            is_blnd,
+            jnp.maximum(cur_blind, blind_dur.astype(cur_blind.dtype)),
+            cur_blind,
+        )
+        new_timed = timed.at[int(TimedStatus.BLIND)].set(new_blind)
+        new_status = s.status.replace(timed_statuses=new_timed)
+        return s.replace(status=new_status)
+
+    return jax.lax.cond(in_range, _apply, lambda s: s, state)
+
+
+# ---------------------------------------------------------------------------
+# 8. Monster ranged gaze  (vendor/nethack/src/mhitu.c::gazemu :1666-1900 —
+#    AD_FIRE/AD_CONF/AD_STON/AD_STUN/AD_BLND gaze effects)
+# ---------------------------------------------------------------------------
+
+def _gaze_attack(state, slot: jnp.ndarray, rng: jax.Array):
+    """Monster gazes at the player within line-of-sight range.
+
+    Per AD type (vendor cite: mhitu.c::gazemu 1666-1900):
+        AD_FIRE → d(damn, sides) fire damage; gated by RESIST_FIRE
+                  (gazemu:1830 — fire ant; ureflects RES if Reflecting).
+        AD_CONF → CONFUSION timer extended (gazemu:1769 forest centaur).
+        AD_STUN → STUNNED timer extended (gazemu umber-hulk path).
+        AD_BLND → BLIND timer extended (gazemu floating-eye gaze if any).
+        AD_STON → begin petrification (gazemu Medusa:1751); gated by
+                  RESIST_STONE.
+    Range check uses _GAZE_RANGE; the player must "see" the monster, modeled
+    as Chebyshev distance gate (no explicit LoS field).
+    """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic, TimedStatus
+    mai = state.monster_ai
+    idx = slot.astype(jnp.int32)
+    mpos = mai.pos[idx].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+    dist = _cheby(mpos, ppos)
+    in_range = dist <= jnp.int32(_GAZE_RANGE)
+
+    safe_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, _NUMMONS - 1)
+    damn  = _GAZE_DAMN[safe_entry].astype(jnp.int32)
+    sides = _GAZE_SIDES[safe_entry].astype(jnp.int32)
+    adtyp = _GAZE_ADTYP[safe_entry].astype(jnp.int32)
+
+    def _apply(s):
+        rng_dmg, rng_conf, rng_stun, rng_blnd = jax.random.split(rng, 4)
+        # d(damn, sides) damage roll for AD_FIRE.
+        rolls = jax.random.randint(rng_dmg, (6,), 1, 7)
+        mask = jnp.arange(6) < damn
+        capped = jnp.minimum(rolls, jnp.maximum(sides, jnp.int32(1)))
+        raw_dmg = jnp.sum(jnp.where(mask, capped, jnp.int32(0))).astype(jnp.int32)
+
+        is_fire = adtyp == jnp.int32(_AD_FIRE)
+        is_conf = adtyp == jnp.int32(_AD_CONF)
+        is_stun = adtyp == jnp.int32(_AD_STUN)
+        is_blnd = adtyp == jnp.int32(_AD_BLND)
+        is_ston = adtyp == jnp.int32(_AD_STON)
+
+        res_fire = s.status.intrinsics[int(Intrinsic.RESIST_FIRE)]
+        res_ston = s.status.intrinsics[int(Intrinsic.RESIST_STONE)]
+        reflecting = s.status.intrinsics[int(Intrinsic.REFLECTING)]
+
+        # Fire damage applied unless RESIST_FIRE / Reflecting.
+        fire_dmg = jnp.where(is_fire & (~res_fire) & (~reflecting),
+                             raw_dmg, jnp.int32(0))
+        new_hp = jnp.maximum(jnp.int32(0), s.player_hp - fire_dmg)
+        s = s.replace(player_hp=new_hp, done=s.done | (new_hp <= jnp.int32(0)))
+
+        # CONFUSION (vendor: forest centaur gaze, gazemu:1769) —
+        # extend timer by rn1(7, 16) per status_effects.cause_confusion.
+        timed = s.status.timed_statuses
+        conf_dur = (jax.random.randint(rng_conf, (), 0, 7) + jnp.int32(16))
+        cur_conf = timed[int(TimedStatus.CONFUSION)]
+        new_conf = jnp.where(is_conf,
+                             cur_conf + conf_dur.astype(cur_conf.dtype),
+                             cur_conf)
+
+        # STUNNED — extend by rn1(5, 3).
+        stun_dur = (jax.random.randint(rng_stun, (), 0, 5) + jnp.int32(3))
+        cur_stun = timed[int(TimedStatus.STUNNED)]
+        new_stun = jnp.where(is_stun,
+                             cur_stun + stun_dur.astype(cur_stun.dtype),
+                             cur_stun)
+
+        # BLIND — extend timer (rn1(25, 25) approximation).
+        blnd_dur = (jax.random.randint(rng_blnd, (), 0, 25) + jnp.int32(25))
+        cur_blnd = timed[int(TimedStatus.BLIND)]
+        new_blnd = jnp.where(is_blnd,
+                             cur_blnd + blnd_dur.astype(cur_blnd.dtype),
+                             cur_blnd)
+
+        # STONED — Medusa gaze begins petrification.  Vendor sets STONED=5
+        # (timeout.c::nh_timeout STONED fixed window).  Gated by RESIST_STONE.
+        cur_ston = timed[int(TimedStatus.STONED)]
+        new_ston = jnp.where(is_ston & (~res_ston) & (~reflecting),
+                             jnp.maximum(cur_ston, jnp.int32(5)),
+                             cur_ston)
+
+        new_timed = (timed
+                     .at[int(TimedStatus.CONFUSION)].set(new_conf)
+                     .at[int(TimedStatus.STUNNED)].set(new_stun)
+                     .at[int(TimedStatus.BLIND)].set(new_blnd)
+                     .at[int(TimedStatus.STONED)].set(new_ston))
+        new_status = s.status.replace(timed_statuses=new_timed)
+        return s.replace(status=new_status)
+
+    return jax.lax.cond(in_range, _apply, lambda s: s, state)
+
+
+# ---------------------------------------------------------------------------
+# 9. Stalker invisibility rendering helper
 #    (vendor/nethack/src/makemon.c:1317, display.h::mon_visible macro ~88)
 # ---------------------------------------------------------------------------
 
@@ -604,7 +877,7 @@ def monster_special_action(state, slot: jnp.ndarray, rng: jax.Array):
     safe_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, _NUMMONS - 1)
     act = _SPECIAL_ACTION_TYPE[safe_entry].astype(jnp.int32)
 
-    rng_a, rng_b, rng_c, rng_d, rng_e, rng_f = jax.random.split(rng, 6)
+    rng_a, rng_b, rng_c, rng_d, rng_e, rng_f, rng_g, rng_h = jax.random.split(rng, 8)
 
     # Each branch is a closure over its dedicated RNG key; only the matching
     # branch executes (lax.switch is JIT-pure with static num_branches).
@@ -616,6 +889,8 @@ def monster_special_action(state, slot: jnp.ndarray, rng: jax.Array):
         lambda s: _lich_cast(s, slot, rng_d),                   # 4: LICH
         lambda s: _dragon_breath(s, slot, rng_e),               # 5: BREATH
         lambda s: _kraken_grab(s, slot, rng_f),                 # 6: KRAKEN
+        lambda s: _spit_attack(s, slot, rng_g),                 # 7: SPIT
+        lambda s: _gaze_attack(s, slot, rng_h),                 # 8: GAZE
     ]
 
     return jax.lax.switch(act, branches, state)
