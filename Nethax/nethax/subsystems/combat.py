@@ -1526,14 +1526,20 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
         return s, halved
 
     def _b_dren(args):
-        # AD_DREN — drain XL (losexp).  Mirrors prayer._apply_drain_level:
-        # XL -= 1 (floor 1); HP_max shaved; HP clamped.  No raw HP damage on
-        # top (vendor: drain attacks deal HP via dmg roll separately, but the
-        # canonical model is XL loss as the primary effect).
+        # AD_DREN — drain XL.  Vendor: uhitm.c::mhitm_ad_drli calls
+        # losexp(...) which shaves XL by 1 and HP_max by uhpinc[ulevel] and
+        # Pw_max by ueninc[ulevel] (exper.c:206-291).  Drain resistance is
+        # checked here so the secondary HP roll (base) still applies even if
+        # the level-drain itself is resisted.
+        from Nethax.nethax.subsystems.experience import losexp as _losexp
+        from Nethax.nethax.subsystems.status_effects import Intrinsic as _DRIntr
         s, base = args
-        new_xl = jnp.maximum(s.player_xl.astype(jnp.int32) - jnp.int32(1), jnp.int32(1)).astype(jnp.int32)
-        new_hp_max = jnp.maximum(s.player_hp_max.astype(jnp.int32) - jnp.int32(5), jnp.int32(5)).astype(jnp.int32)
-        s2 = s.replace(player_xl=new_xl, player_hp_max=new_hp_max)
+        # resists_drli: DRAIN_RES intrinsic.  Vendor exper.c:215.
+        drli_res = (
+            s.status.intrinsics[int(_DRIntr.RESIST_DRAIN)]
+            | (s.status.timed_intrinsics[int(_DRIntr.RESIST_DRAIN)] > jnp.int32(0))
+        )
+        s2 = jax.lax.cond(drli_res, lambda st: st, _losexp, s)
         return s2, base
 
     # Apply switch.  When hit=False we still run the switch (purity), but the
