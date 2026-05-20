@@ -172,21 +172,23 @@ def _passive_acid(state, rng):
     new_done = state.done | (new_hp <= jnp.int32(0))
     state = state.replace(player_hp=new_hp, done=new_done)
 
-    # Corrode wielded weapon (vendor passive_obj AD_ACID: erode_obj ERODE_CORRODE).
+    # Corrode wielded weapon (vendor passive_obj AD_ACID → erode_obj ERODE_CORRODE).
+    # Cite: vendor/nethack/src/uhitm.c::passive() line 5906 (AD_ACID) →
+    #       vendor/nethack/src/trap.c::erode_obj kind=ERODE_CORRODE.
+    from Nethax.nethax.subsystems.items import erode_obj_slot, ERODE_CORRODE
+
     wielded = state.inventory.wielded.astype(jnp.int32)
     has_weapon = wielded >= jnp.int32(0)
-    safe_w = jnp.clip(wielded, 0, state.inventory.items.oeroded.shape[0] - 1)
-    cur_eroded = state.inventory.items.oeroded[safe_w].astype(jnp.int32)
-    proof = state.inventory.items.oerodeproof[safe_w]
-    new_eroded = jnp.where(
-        has_weapon & (~acid_res) & (~proof) & (cur_eroded < jnp.int32(3)),
-        cur_eroded + jnp.int32(1),
-        cur_eroded,
-    ).astype(jnp.int8)
-    new_oeroded = state.inventory.items.oeroded.at[safe_w].set(
-        jnp.where(has_weapon, new_eroded, state.inventory.items.oeroded[safe_w])
+    should_corrode = has_weapon & (~acid_res)
+
+    def _do_corrode(items_in):
+        safe_w = jnp.clip(wielded, 0, items_in.oeroded.shape[0] - 1)
+        new_items, _ = erode_obj_slot(items_in, safe_w, ERODE_CORRODE, True)
+        return new_items
+
+    new_items = jax.lax.cond(
+        should_corrode, _do_corrode, lambda x: x, state.inventory.items
     )
-    new_items = state.inventory.items.replace(oeroded=new_oeroded)
     new_inv = state.inventory.replace(items=new_items)
     return state.replace(inventory=new_inv)
 
@@ -195,8 +197,12 @@ def _passive_fire(state, rng):
     """Red mold passive: rnd(4) fire damage, gated by fire resistance.
 
     Cite: vendor/nethack/src/uhitm.c::passive() lines 5895-5905 (AD_FIRE).
+    AD_FIRE also burns worn body armor via passive_obj → erode_obj kind=BURN
+    (vendor/nethack/src/trap.c::erode_obj ERODE_BURN).
     """
     from Nethax.nethax.subsystems.status_effects import Intrinsic
+    from Nethax.nethax.subsystems.items import erode_obj_slot, ERODE_BURN
+    from Nethax.nethax.subsystems.inventory import ArmorSlot
     from Nethax.nethax.rng import rnd
 
     fire_res = (
@@ -206,7 +212,23 @@ def _passive_fire(state, rng):
     dmg = jnp.where(fire_res, jnp.int32(0), rnd(rng, 4).astype(jnp.int32))
     new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(0))
     new_done = state.done | (new_hp <= jnp.int32(0))
-    return state.replace(player_hp=new_hp, done=new_done)
+    state = state.replace(player_hp=new_hp, done=new_done)
+
+    # Burn worn body armor (unresisted).
+    body_slot = state.inventory.worn_armor[int(ArmorSlot.BODY)].astype(jnp.int32)
+    has_body  = body_slot >= jnp.int32(0)
+    should_burn = has_body & (~fire_res)
+
+    def _do_burn(items_in):
+        safe_b = jnp.clip(body_slot, 0, items_in.oeroded.shape[0] - 1)
+        new_items, _ = erode_obj_slot(items_in, safe_b, ERODE_BURN, True)
+        return new_items
+
+    new_items = jax.lax.cond(
+        should_burn, _do_burn, lambda x: x, state.inventory.items
+    )
+    new_inv = state.inventory.replace(items=new_items)
+    return state.replace(inventory=new_inv)
 
 
 def _passive_cold_sleep(state, rng):
@@ -312,23 +334,23 @@ def _passive_disenchant(state, rng):
 def _passive_rust(state, rng):
     """Rust monster passive: increments oeroded on wielded metal weapon/armor.
 
-    Cite: vendor/nethack/src/uhitm.c::passive() lines 5958-5967 (AD_RUST).
-    passive_obj → erode_obj ERODE_RUST: rust-proof items are immune.
+    Cite: vendor/nethack/src/uhitm.c::passive() lines 5958-5967 (AD_RUST) →
+    vendor/nethack/src/trap.c::erode_obj kind=ERODE_RUST: rust-proof items
+    are immune via the central erode_obj path.
     """
+    from Nethax.nethax.subsystems.items import erode_obj_slot, ERODE_RUST
+
     wielded = state.inventory.wielded.astype(jnp.int32)
     has_weapon = wielded >= jnp.int32(0)
-    safe_w = jnp.clip(wielded, 0, state.inventory.items.oeroded.shape[0] - 1)
-    cur_eroded = state.inventory.items.oeroded[safe_w].astype(jnp.int32)
-    proof = state.inventory.items.oerodeproof[safe_w]
-    new_eroded = jnp.where(
-        has_weapon & (~proof) & (cur_eroded < jnp.int32(3)),
-        cur_eroded + jnp.int32(1),
-        cur_eroded,
-    ).astype(jnp.int8)
-    new_oeroded = state.inventory.items.oeroded.at[safe_w].set(
-        jnp.where(has_weapon, new_eroded, state.inventory.items.oeroded[safe_w])
+
+    def _do_rust(items_in):
+        safe_w = jnp.clip(wielded, 0, items_in.oeroded.shape[0] - 1)
+        new_items, _ = erode_obj_slot(items_in, safe_w, ERODE_RUST, True)
+        return new_items
+
+    new_items = jax.lax.cond(
+        has_weapon, _do_rust, lambda x: x, state.inventory.items
     )
-    new_items = state.inventory.items.replace(oeroded=new_oeroded)
     new_inv = state.inventory.replace(items=new_items)
     return state.replace(inventory=new_inv)
 

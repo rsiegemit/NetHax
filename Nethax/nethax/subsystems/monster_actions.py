@@ -449,7 +449,43 @@ def _dragon_breath(state, slot: jnp.ndarray, rng: jax.Array):
 
         new_hp = jnp.maximum(jnp.int32(0), s.player_hp - dmg)
         new_done = s.done | (new_hp <= jnp.int32(0))
-        return s.replace(player_hp=new_hp, done=new_done)
+        s = s.replace(player_hp=new_hp, done=new_done)
+
+        # Armor erosion: fire/cold/acid breath erodes worn body armor through
+        # the central erode_obj path.  Vendor cite:
+        #   vendor/nethack/src/zap.c::destroy_item / ::erode_armor  — invoked
+        #   from mhitu.c::breamu when breath element is fire/cold/acid.  We
+        #   route through items.erode_obj_slot here.
+        from Nethax.nethax.subsystems.items import (
+            erode_obj_slot, ERODE_BURN, ERODE_CORRODE,
+        )
+        from Nethax.nethax.subsystems.inventory import ArmorSlot
+
+        body_slot = s.inventory.worn_armor[int(ArmorSlot.BODY)].astype(jnp.int32)
+        has_body  = body_slot >= jnp.int32(0)
+
+        # Element -> erode kind: FIRE/COLD -> ERODE_BURN (cite trap.c case BURN);
+        # ACID -> ERODE_CORRODE.  Other elements: leave armor untouched.
+        is_fire   = elem == jnp.int32(_ELEM_FIRE)
+        is_cold   = elem == jnp.int32(_ELEM_COLD)
+        is_acid   = elem == jnp.int32(_ELEM_ACID)
+        do_burn   = (is_fire | is_cold) & has_body & (~has_res)
+        do_corrode = is_acid & has_body & (~has_res)
+
+        def _erode_burn(items_in):
+            safe_b = jnp.clip(body_slot, 0, items_in.oeroded.shape[0] - 1)
+            new_items, _ = erode_obj_slot(items_in, safe_b, ERODE_BURN, True)
+            return new_items
+
+        def _erode_corrode(items_in):
+            safe_b = jnp.clip(body_slot, 0, items_in.oeroded.shape[0] - 1)
+            new_items, _ = erode_obj_slot(items_in, safe_b, ERODE_CORRODE, True)
+            return new_items
+
+        items_after = jax.lax.cond(do_burn, _erode_burn, lambda x: x, s.inventory.items)
+        items_after = jax.lax.cond(do_corrode, _erode_corrode, lambda x: x, items_after)
+        new_inv = s.inventory.replace(items=items_after)
+        return s.replace(inventory=new_inv)
 
     return jax.lax.cond(in_range, _apply, lambda s: s, state)
 

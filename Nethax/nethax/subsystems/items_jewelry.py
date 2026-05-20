@@ -185,6 +185,19 @@ def _ring_apply_stat(state, ring_effect: int, enchantment: int):
         return state.replace(
             player_cha=jnp.int8(state.player_cha + enchantment)
         )
+    if eff == RingEffect.INCREASE_ACCURACY:
+        return state.replace(
+            player_uhitinc=jnp.int8(state.player_uhitinc + enchantment)
+        )
+    if eff == RingEffect.INCREASE_DAMAGE:
+        return state.replace(
+            player_udaminc=jnp.int8(state.player_udaminc + enchantment)
+        )
+    if eff == RingEffect.PROTECTION:
+        # Ring of protection lowers AC by enchantment (lower AC = better in NetHack).
+        return state.replace(
+            player_ac=jnp.int32(state.player_ac - enchantment)
+        )
     return state
 
 
@@ -246,14 +259,21 @@ def put_on_ring(state, rng: jax.Array, slot_idx: int, hand: int):
         state = state.replace(status=add_intrinsic(state.status, intrinsic_id))
 
     # Stat-adjusting rings.
+    # Cite: vendor/nethack/src/do_wear.c Ring_on lines 1316-1342 — adjust_attrib,
+    # u.uhitinc/u.udaminc bumps, and find_ac() for RIN_PROTECTION.
     if ring_effect in (
         RingEffect.GAIN_STRENGTH,
         RingEffect.GAIN_CONSTITUTION,
         RingEffect.ADORNMENT,
+        RingEffect.INCREASE_ACCURACY,
+        RingEffect.INCREASE_DAMAGE,
+        RingEffect.PROTECTION,
     ):
         state = _ring_apply_stat(state, ring_effect, enchantment)
 
     # Ring of hunger — flag the tick driver to increase drain rate.
+    # Cite: vendor/nethack/src/do_wear.c Ring_on line 1265 (RIN_HUNGER fall-through);
+    #       extrinsic HUNGER is consumed in timeout.c::hunger to speed nutrition drain.
     if ring_effect == RingEffect.HUNGER:
         state = state.replace(
             status=add_timed(state.status, TimedStatus.HUNGER_RING, 999)
@@ -305,10 +325,15 @@ def take_off_ring(state, hand: int):
         )
 
     # Revoke stat adjustments.
+    # Cite: vendor/nethack/src/do_wear.c Ring_off_or_gone lines 1415-1437 —
+    # adjust_attrib(-spe), uhitinc/udaminc -=spe, and find_ac() for RIN_PROTECTION.
     if ring_effect in (
         RingEffect.GAIN_STRENGTH,
         RingEffect.GAIN_CONSTITUTION,
         RingEffect.ADORNMENT,
+        RingEffect.INCREASE_ACCURACY,
+        RingEffect.INCREASE_DAMAGE,
+        RingEffect.PROTECTION,
     ):
         state = _ring_revoke_stat(state, ring_effect, enchantment)
 
@@ -330,6 +355,10 @@ def ring_tick(state, rng: jax.Array):
     Called once per game turn after action dispatch.
     - HUNGER ring: drain 1 nutrition per turn when worn.
     - TELEPORTATION ring: 1/85 chance to set a timed teleport (vendor timeout.c).
+    - POLYMORPH ring: 1/100 chance per turn to trigger polyself.
+      Cite: vendor/nethack/src/allmain.c:325 — ``if (Polymorph && !rn2(100))``.
+      Effect is queued via TimedStatus.POLY_SELF style flag (we set a
+      timed_intrinsics[POLYMORPH] tick that polymorph subsystem can observe).
 
     Cite: vendor/nethack/src/timeout.c — ring_effects() called from do_regain_pw.
     JIT-safe.
@@ -349,6 +378,8 @@ def ring_tick(state, rng: jax.Array):
                   (ring1_type == jnp.int32(RingEffect.HUNGER))
     tele_worn   = (ring0_type == jnp.int32(RingEffect.TELEPORTATION)) | \
                   (ring1_type == jnp.int32(RingEffect.TELEPORTATION))
+    poly_worn   = (ring0_type == jnp.int32(RingEffect.POLYMORPH)) | \
+                  (ring1_type == jnp.int32(RingEffect.POLYMORPH))
 
     # HUNGER: drain 1 nutrition per turn.
     old_nut = state.status.nutrition
@@ -363,6 +394,18 @@ def ring_tick(state, rng: jax.Array):
     old_tele = new_status.timed_intrinsics[tele_idx]
     new_tele_val = jnp.where(tele_fires, old_tele + jnp.int32(1), old_tele)
     new_timed_intr = new_status.timed_intrinsics.at[tele_idx].set(new_tele_val)
+    new_status = new_status.replace(timed_intrinsics=new_timed_intr)
+
+    # POLYMORPH: 1/100 chance to bump timed_intrinsics[POLYMORPH] so the
+    # polymorph subsystem fires polyself on its next tick.
+    # Cite: vendor/nethack/src/allmain.c:325 — ``if (Polymorph && !rn2(100))``.
+    rng_poly = jax.random.fold_in(rng, jnp.int32(0x9017))
+    poly_roll = jax.random.randint(rng_poly, (), 0, 100, dtype=jnp.int32)
+    poly_fires = poly_worn & (poly_roll == jnp.int32(0))
+    poly_idx = jnp.int32(int(Intrinsic.POLYMORPH))
+    old_poly = new_status.timed_intrinsics[poly_idx]
+    new_poly_val = jnp.where(poly_fires, old_poly + jnp.int32(1), old_poly)
+    new_timed_intr = new_status.timed_intrinsics.at[poly_idx].set(new_poly_val)
     new_status = new_status.replace(timed_intrinsics=new_timed_intr)
 
     return state.replace(status=new_status)
