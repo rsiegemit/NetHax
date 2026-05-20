@@ -81,6 +81,7 @@ _KICKING_BOOTS          = ObjType.KICKING_BOOTS
 _JUMPING_BOOTS          = ObjType.JUMPING_BOOTS
 _WATER_WALKING_BOOTS    = ObjType.WATER_WALKING_BOOTS
 _ELVEN_BOOTS            = ObjType.ELVEN_BOOTS
+_SPEED_BOOTS            = ObjType.SPEED_BOOTS
 
 # Alignment sentinels (prayer.py Alignment enum)
 _ALIGN_CHAOTIC = 0
@@ -171,6 +172,8 @@ def apply_armor_effects(state) -> object:
         int(Intrinsic.JUMPING),
         int(Intrinsic.LEVITATION),
         int(Intrinsic.WWALKING),
+        int(Intrinsic.FAST),
+        int(Intrinsic.CLAIRVOYANT),
     ]
     for bit in armor_bits:
         intr = intr.at[bit].set(jnp.bool_(False))
@@ -240,6 +243,13 @@ def apply_armor_effects(state) -> object:
     # Combine stealth sources
     intr = intr.at[int(Intrinsic.STEALTH)].set(has_stealth_cloak | has_stealth_boots)
 
+    # SPEED_BOOTS → FAST
+    # cite: do_wear.c line 219-226 (SPEED_BOOTS) — oc_oprop = FAST is
+    #       conferred via setworn: u.uprops[FAST].extrinsic |= W_ARMF.
+    #       See objects.h line 707-708 (BOOTS("speed boots", ... FAST ...)).
+    has_fast = _is_wearing(boot_tid, _SPEED_BOOTS)
+    intr = intr.at[int(Intrinsic.FAST)].set(has_fast)
+
     # ------------------------------------------------------------------
     # 6. FUMBLING (timed status) from gauntlets or boots
     # cite: do_wear.c line 584 (GAUNTLETS_OF_FUMBLING), line 231 (FUMBLE_BOOTS)
@@ -284,27 +294,29 @@ def apply_armor_effects(state) -> object:
     bonus = bonus.at[_STAT_INT].add(dunce_penalty)
     bonus = bonus.at[_STAT_WIS].add(dunce_penalty)
 
-    # ORCISH_HELM → -1 Int, -1 Wis (non-orc penalty)
-    # cite: do_wear.c line 445 (ORCISH_HELM listed with no special case but
-    #       worn.c setworn grants the oc_oprop penalty for non-orc races).
-    #       We apply it unconditionally here (race check is a Wave-N+ concern).
-    orc_helm_penalty = jnp.where(
-        _is_wearing(helm_tid, _ORCISH_HELM),
-        jnp.int8(-1),
-        jnp.int8(0),
-    )
-    bonus = bonus.at[_STAT_INT].add(orc_helm_penalty)
-    bonus = bonus.at[_STAT_WIS].add(orc_helm_penalty)
+    # ORCISH_HELM → no stat penalty
+    # cite: objects.h line 448-450 — ORCISH_HELM oc_oprop = 0.
+    # cite: do_wear.c Helmet_on/off — ORCISH_HELM has no special case (no
+    #       call to adj_abon or ABON manipulation).  Vendor applies no
+    #       intrinsic or stat effect for wearing ORCISH_HELM.
 
     # CORNUTHAUM → +1 Cha for wizard, -1 Cha otherwise
     # cite: do_wear.c line 454-460: ABON(A_CHA) += (Role_if(PM_WIZARD) ? 1 : -1)
     is_wizard = state.player_role == jnp.int8(_ROLE_WIZARD)
+    has_cornu = _is_wearing(helm_tid, _CORNUTHAUM)
     cornu_bonus = jnp.where(
-        _is_wearing(helm_tid, _CORNUTHAUM),
+        has_cornu,
         jnp.where(is_wizard, jnp.int8(1), jnp.int8(-1)),
         jnp.int8(0),
     )
     bonus = bonus.at[_STAT_CHA].add(cornu_bonus)
+
+    # CORNUTHAUM → CLAIRVOYANT for wizards (blocked for non-wizards).
+    # cite: objects.h line 457-461 — CORNUTHAUM oc_oprop = CLAIRVOYANT.
+    # cite: worn.c line 38-44 w_blocks: CORNUTHAUM blocks CLAIRVOYANT when
+    #       worn by a non-wizard.  Net effect: wizards have CLAIRVOYANT,
+    #       non-wizards do not (the extrinsic is set but also blocked).
+    intr = intr.at[int(Intrinsic.CLAIRVOYANT)].set(has_cornu & is_wizard)
 
     # GAUNTLETS_OF_DEXTERITY → +spe Dex
     # cite: do_wear.c line 592-593: adj_abon(uarmg, uarmg->spe)
@@ -315,14 +327,14 @@ def apply_armor_effects(state) -> object:
     )
     bonus = bonus.at[_STAT_DEX].add(dex_bonus)
 
-    # GAUNTLETS_OF_POWER → +spe Str
-    # cite: do_wear.c line 588-590: makeknown; attrib.c adj_abon adds to STR.
-    str_bonus = jnp.where(
-        _is_wearing(glove_tid, _GAUNTLETS_OF_POWER),
-        glove_ench.astype(jnp.int8),
-        jnp.int8(0),
-    )
-    bonus = bonus.at[_STAT_STR].add(str_bonus.astype(jnp.int8))
+    # GAUNTLETS_OF_POWER → effective STR = 125 (STR19(25))
+    # cite: do_wear.c line 588-591 (Gloves_on: no adj_abon for GoP).
+    # cite: attrib.c::acurr lines 1213-1215 — when uarmg == GAUNTLETS_OF_POWER,
+    #       result is forced to STR19(25) = 125 regardless of base/abon.
+    # The vendor does NOT add `spe` to STR ABON for GoP (see adj_abon at
+    # do_wear.c:3319-3336 which only handles DEX/INT/WIS).  The STR=125 cap
+    # is enforced in acurr (not here) — armor_stat_bonus stays 0 for STR
+    # when GoP is worn; downstream acurr-equivalent applies the cap.
 
     # ------------------------------------------------------------------
     # 8. Alignment swap — HELM_OF_OPPOSITE_ALIGNMENT

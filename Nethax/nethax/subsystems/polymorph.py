@@ -477,6 +477,35 @@ def _build_form_golemhp() -> jnp.ndarray:
 _FORM_GOLEM_HP: jnp.ndarray = _build_form_golemhp()
 
 
+def _build_form_can_ride() -> jnp.ndarray:
+    """bool[N_MONSTERS]: True iff a hero polymorphed into this form can ride.
+
+    Vendor cite: vendor/nethack/src/steed.c:169-174 can_ride()
+        humanoid(youmonst.data) && !verysmall(youmonst.data)
+        && !bigmonst(youmonst.data)
+    where (mondata.h:11-12,65)
+        verysmall(p) := msize < MZ_SMALL
+        bigmonst(p)  := msize >= MZ_LARGE
+        humanoid(p)  := (mflags1 & M1_HUMANOID) != 0
+    The mtame and Underwater/is_swimmer clauses depend on the steed, not
+    the rider form, so they're checked elsewhere; here we capture only
+    the new-form gate consulted from polyself.c:963.
+    """
+    from Nethax.nethax.constants.monsters import (
+        MONSTERS, MZ_SMALL, MZ_LARGE, M1_HUMANOID,
+    )
+    out = []
+    for m in MONSTERS:
+        humanoid_f = bool(int(m.flags1) & M1_HUMANOID)
+        verysmall  = m.size < MZ_SMALL
+        bigmon     = m.size >= MZ_LARGE
+        out.append(humanoid_f and (not verysmall) and (not bigmon))
+    return jnp.array(out, dtype=jnp.bool_)
+
+
+_FORM_CAN_RIDE: jnp.ndarray = _build_form_can_ride()
+
+
 # ---------------------------------------------------------------------------
 # Vendor PROPSET adoption table (polyself.c:88-109)
 #
@@ -1129,22 +1158,34 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool = 
                             jnp.minimum(cur_str, new_max_str))
     state = state.replace(player_str=updated_str.astype(state.player_str.dtype))
 
-    # --- 4b. Mount-on-poly: if riding and form cannot ride, force dismount.
-    # polyself.c:1412 — when can_ride() fails after poly, dismount_steed().
-    # We always dismount on poly for safety.  Apply 1d6 fall damage.
+    # --- 4b. Mount-on-poly: if riding and new form cannot ride, force dismount.
+    # Vendor cite: polyself.c:955-965 — if (u.usteed) { ... if (!can_ride(...))
+    #   dismount_steed(DISMOUNT_POLY); }
+    # can_ride() (steed.c:169-174) tests the *new* rider form: humanoid &&
+    # !verysmall && !bigmonst.  We capture that via _FORM_CAN_RIDE[form_idx].
+    # Vendor's DISMOUNT_POLY path (steed.c::dismount_steed) drops the hero in
+    # place (no movement) and applies fall damage via Levitating gate.
+    # Cite: steed.c::dismount_steed DISMOUNT_POLY branch — 1d6 fall damage
+    # unless Levitating (status_effects.Intrinsic.LEVITATION).
     rng, sub_fall = jax.random.split(rng)
     fall_roll = jax.random.randint(sub_fall, (), 1, 7).astype(jnp.int32)
     was_riding = state.player_steed_mid != jnp.uint32(0)
+    new_form_can_ride = _FORM_CAN_RIDE[form_i16.astype(jnp.int32)]
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intr
+    levitating = state.status.intrinsics[int(_Intr.LEVITATION)]
+    do_dismount = was_riding & (~new_form_can_ride)
 
     def _dismount(s):
-        new_hp = jnp.maximum(s.player_hp - fall_roll, jnp.int32(0))
+        # Vendor: fall damage skipped if Levitating (steed.c::dismount_steed).
+        applied = jnp.where(levitating, jnp.int32(0), fall_roll)
+        new_hp = jnp.maximum(s.player_hp - applied, jnp.int32(0))
         return s.replace(
             player_steed_mid=jnp.uint32(0),
             player_hp=new_hp,
             done=s.done | (new_hp <= jnp.int32(0)),
         )
 
-    state = jax.lax.cond(was_riding, _dismount, lambda s: s, state)
+    state = jax.lax.cond(do_dismount, _dismount, lambda s: s, state)
 
     # --- 5. Drop incompatible armor per-slot (polyself.c:1156 break_armor).
     state = _drop_worn_armor_per_slot(state, form_i16)
@@ -1174,10 +1215,16 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool = 
                          lambda s: s,
                          state)
 
-    # --- 7. Conduct: POLYSELFLESS violated.
-    from Nethax.nethax.subsystems.conduct import Conduct
-    new_vio = state.conduct.violations.at[int(Conduct.POLYSELFLESS)].set(True)
-    state = state.replace(conduct=state.conduct.replace(violations=new_vio))
+    # --- 7. Conduct: POLYSELFLESS violated — bump counter + set bit.
+    # Vendor: u.uconduct.polyselfs++ (polyself.c::polyself); counter consumed
+    # by insight.c::show_conduct line ~2178 ("changed form %ld time%s").
+    from Nethax.nethax.subsystems.conduct import Conduct, increment_counter
+    state = increment_counter(state, int(Conduct.POLYSELFLESS))
+
+    # Emit "You turn into ..." message.
+    # Cite: vendor/nethack/src/polyself.c::polymon — pline("You turn into ...").
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    state = state.replace(messages=_msg_emit(state.messages, int(_MsgId.YOU_TURN_INTO)))
 
     return state
 
@@ -1260,7 +1307,14 @@ def revert_polymorph(state, rng: jax.Array | None = None):
                 reverted,
             )
 
-        return jax.lax.cond(has_unchanging, _unchanging_death, _normal_revert, s)
+        reverted = jax.lax.cond(has_unchanging, _unchanging_death, _normal_revert, s)
+        # Emit "You return to your old form." — only when actually reverting.
+        # Cite: vendor/nethack/src/polyself.c::rehumanize (line ~1367)
+        # pline("You return to %s form!", ...).
+        from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+        return reverted.replace(
+            messages=_msg_emit(reverted.messages, int(_MsgId.YOU_RETURN_TO_HUMAN)),
+        )
 
     return jax.lax.cond(poly.is_polymorphed, _do_revert, lambda s: s, state)
 

@@ -1567,7 +1567,13 @@ def read_scroll(state, rng, slot_idx):
             quantity=new_quantity, category=new_category
         )
         new_inv = new_state.inventory.replace(items=new_items)
-        return new_state.replace(inventory=new_inv)
+        # Emit "You read the scroll." message.
+        # Cite: vendor/nethack/src/read.c::doread — pline("You read ...").
+        from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+        return new_state.replace(
+            inventory=new_inv,
+            messages=_msg_emit(new_state.messages, int(_MsgId.YOU_READ_SCROLL)),
+        )
 
     return jax.lax.cond(can_read, _do_read, lambda s: s, state)
 

@@ -1221,13 +1221,48 @@ def _monster_sleep(state, m_slot, rng):
 
 
 def _monster_heal(state, m_slot, rng):
-    """Healing potion shatters on monster — restore 10 HP (capped at hp_max)."""
+    """Healing potion shatters on monster — restore d8 HP (capped at hp_max).
+
+    Vendor: vendor/nethack/src/potion.c::potionhit (~line 2120) — healing
+    potion thrown at monster heals it by d8 HP and removes BLIND/STUNNED.
+    """
+    rng_d8, _ = jax.random.split(rng)
     mai = state.monster_ai
+    heal = jax.random.randint(rng_d8, (), 1, 9, dtype=jnp.int32)  # d8 = 1..8
     cur_hp  = mai.hp[m_slot].astype(jnp.int32)
     cur_max = mai.hp_max[m_slot].astype(jnp.int32)
-    new_hp  = jnp.minimum(cur_hp + jnp.int32(10), cur_max)
+    new_hp  = jnp.minimum(cur_hp + heal, cur_max)
     new_hp_arr = mai.hp.at[m_slot].set(new_hp)
     return state.replace(monster_ai=mai.replace(hp=new_hp_arr))
+
+
+def _monster_extra_heal(state, m_slot, rng):
+    """Extra-healing potion on monster — restore d8+6 HP (vendor potion.c).
+
+    Heals d8 + 6 HP, capped at hp_max.  Cite: potion.c::potionhit.
+    """
+    rng_d8, _ = jax.random.split(rng)
+    mai = state.monster_ai
+    heal = jax.random.randint(rng_d8, (), 1, 9, dtype=jnp.int32) + jnp.int32(6)
+    cur_hp  = mai.hp[m_slot].astype(jnp.int32)
+    cur_max = mai.hp_max[m_slot].astype(jnp.int32)
+    new_hp  = jnp.minimum(cur_hp + heal, cur_max)
+    new_hp_arr = mai.hp.at[m_slot].set(new_hp)
+    return state.replace(monster_ai=mai.replace(hp=new_hp_arr))
+
+
+def _monster_full_heal(state, m_slot, rng):
+    """Full-healing potion on monster — restore to hp_max + bump hp_max by 4.
+
+    Vendor: potion.c::potionhit FULL_HEALING — heals to max, also bumps
+    mhpmax by 4 (matching the +nxtra=4 uncursed-thrown case for hero).
+    """
+    mai = state.monster_ai
+    cur_max = mai.hp_max[m_slot].astype(jnp.int32)
+    new_max = cur_max + jnp.int32(4)
+    new_max_arr = mai.hp_max.at[m_slot].set(new_max)
+    new_hp_arr  = mai.hp.at[m_slot].set(new_max)
+    return state.replace(monster_ai=mai.replace(hp=new_hp_arr, hp_max=new_max_arr))
 
 
 def _monster_acid_dmg(state, m_slot, rng):
@@ -1313,7 +1348,7 @@ _MONSTER_EFFECT_TABLE = (
     _monster_default_dmg,    # 15  OBJECT_DETECTION  → splash
     _monster_default_dmg,    # 16  GAIN_ENERGY       → splash
     _monster_sleep,          # 17  SLEEPING
-    _monster_heal,           # 18  FULL_HEALING      → same as heal (simplified)
+    _monster_full_heal,      # 18  FULL_HEALING (heal to max + 4 hp_max)
     _monster_default_dmg,    # 19  POLYMORPH         → splash
     _monster_default_dmg,    # 20  BOOZE             → splash
     _monster_sickness,       # 21  SICKNESS
@@ -1444,7 +1479,13 @@ def quaff_potion(state, rng, slot_idx):
             quantity=new_quantity, category=new_category
         )
         new_inv = new_state.inventory.replace(items=new_items)
-        return new_state.replace(inventory=new_inv)
+        # Emit "You quaff the potion." message.
+        # Cite: vendor/nethack/src/potion.c::dodrink — pline("You drink ...").
+        from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+        return new_state.replace(
+            inventory=new_inv,
+            messages=_msg_emit(new_state.messages, int(_MsgId.YOU_QUAFF_POTION)),
+        )
 
     return jax.lax.cond(glib_drop, _drop_glib, _do_quaff, state)
 

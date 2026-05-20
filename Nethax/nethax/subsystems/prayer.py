@@ -1672,14 +1672,22 @@ def handle_pray(state, rng: jax.Array):
 
     1. Run pray() pipeline.
     2. Mark ATHEIST conduct as violated (vendor/nethack/src/insight.c ~2134).
+    3. Emit "You begin praying ..." message.
     """
     new_state = pray(state, rng)
 
-    # Conduct: ATHEIST is violated on any prayer attempt.
-    atheist_idx = int(Conduct.ATHEIST)
-    new_violations = new_state.conduct.violations.at[atheist_idx].set(True)
-    new_conduct = new_state.conduct.replace(violations=new_violations)
-    return new_state.replace(conduct=new_conduct)
+    # Conduct: ATHEIST is violated on any prayer attempt — bump counter and
+    # set derived bit.  Vendor: u.uconduct.gnostic++ (pray.c invocation path;
+    # counter consumed by insight.c::show_conduct line ~2134).
+    from Nethax.nethax.subsystems.conduct import increment_counter
+    new_state = increment_counter(new_state, int(Conduct.ATHEIST))
+
+    # Emit "You begin praying to your god."
+    # Cite: vendor/nethack/src/pray.c::dopray — pline("You begin praying...").
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    return new_state.replace(
+        messages=_msg_emit(new_state.messages, int(_MsgId.YOU_PRAY)),
+    )
 
 
 # ---------------------------------------------------------------------------

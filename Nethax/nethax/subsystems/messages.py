@@ -16,29 +16,24 @@ the terminal window.  Nethax cannot do this inside jit-compiled steps because
 JAX traces require static shapes and no Python-side side-effects at trace
 time.
 
-Wave 4 plan: replace emit() with a message-id system.
+Wave 28d: message-id ring-buffer rotation implemented.
   - Each message has a static integer ID (MessageId enum below).
-  - Dynamic arguments (monster name, item name, damage number) are stored as
-    fixed-width integer arrays in MessageState alongside the ID.
-  - The renderer reads the ID + args and formats the human-readable string
-    outside the jit boundary.
-
-Status: Wave 1 stub — MessageState dataclass + no-op emit + clear_message.
-emit() returns state unchanged; the Wave 4 message-id system will replace it.
-
-TODO (Wave 4):
-  - Replace emit(state, message: str) with
-    emit(state, msg_id: MessageId, *args: jnp.int32) -> MessageState.
-  - Implement ring-buffer rotation in emit: write msg_id + args into
-    message_buffer, shift old buffer into message_history at history_index,
-    increment history_index % HISTORY_LEN.
-  - Expose get_current_message(state) -> MessageId + args tuple for renderer.
-  - Grow MessageId as each subsystem comes online (one entry per pline call
-    site, roughly matching pline.c call sites across the codebase).
+  - emit(state, msg_id) uses jax.lax.switch on msg_id to select a fixed
+    ASCII byte template (the human-readable line, pre-baked) and writes
+    it into message_buffer.  Byte 0 holds msg_id; bytes 1.. hold the
+    rendered text (zero-padded to MSG_BUF_LEN).
+  - The current message_buffer is shifted into message_history[history_index]
+    before being overwritten, and history_index is advanced modulo
+    HISTORY_LEN (mirrors gs.saved_pline_index rotation in pline.c::dumplogmsg
+    lines 20-46).
+  - JIT-pure: lax.switch + .at[].set ops; no Python control flow on traced
+    values.
 """
 from enum import IntEnum
 
+import jax
 import jax.numpy as jnp
+import numpy as _np
 from flax import struct
 
 
@@ -71,6 +66,18 @@ class MessageId(IntEnum):
     FIND_GOLD         = 4   # "You find <n> gold pieces."
     OPEN_DOOR         = 5   # "The door opens."
     EAT_FOOD          = 6   # "You eat the <food>."
+
+    # Wave 28d IDs — wired into subsystem call sites.
+    YOU_TURN_INTO        = 7   # polyself.c::polymon  "You turn into a ..."
+    YOU_RETURN_TO_HUMAN  = 8   # polyself.c::rehumanize "You return to ... form."
+    YOU_PRAY             = 9   # pray.c::dopray "You begin praying ..."
+    MONSTER_HITS_YOU     = 10  # mhitu.c::mattacku "The monster hits!"
+    YOU_HIT_MONSTER      = 11  # uhitm.c::hmon "You hit the monster."
+    YOU_QUAFF_POTION     = 12  # potion.c::dodrink "You quaff the potion."
+    YOU_READ_SCROLL      = 13  # read.c::doread "You read the scroll."
+    GO_UP_STAIRS         = 14  # do.c::doup "You climb up the stairs."
+    GO_DOWN_STAIRS       = 15  # do.c::dodown "You climb down the stairs."
+    YOU_WAIT             = 16  # cmd.c::dowait "You wait."
 
 
 # ---------------------------------------------------------------------------
@@ -111,31 +118,108 @@ class MessageState:
 # Functions
 # ---------------------------------------------------------------------------
 
-def emit(state: MessageState, msg_id: int) -> MessageState:
-    """Append msg_id to the message_history ring buffer.
+# ---------------------------------------------------------------------------
+# Rendered-message templates
+#
+# One ASCII line per MessageId.  pline.c::pline formats a printf string and
+# putmesg() writes it to WIN_MESSAGE.  Inside the JIT trace we cannot run
+# printf, so we pre-bake each line as a fixed-width uint8 row indexed by
+# msg_id.  Variable arguments (monster name, damage number, ...) are not
+# substituted here — emit() takes ``*args`` for future expansion, but Wave
+# 28d only writes the static template.
+#
+# Cite: vendor/nethack/src/pline.c::pline lines 103-111 (printf entry),
+#       putmesg lines 64-80 (write to message window).
+# ---------------------------------------------------------------------------
 
-    Cite: vendor/nethack/src/winrl.cc::write_to_message — pushes the current
-    message into the saved_plines ring buffer before overwriting.
+_MESSAGE_TEMPLATES: tuple[str, ...] = (
+    "",                              # 0  NONE
+    "Welcome to NetHack!",           # 1  GAME_START         pline.c:104
+    "You die...",                    # 2  YOU_DIE            end.c::done
+    "You kill the monster!",         # 3  YOU_KILL_MONSTER   uhitm.c::killed
+    "You find some gold.",           # 4  FIND_GOLD          hack.c::pickup_gold
+    "The door opens.",               # 5  OPEN_DOOR          do_name.c::doopen
+    "You eat the food.",             # 6  EAT_FOOD           eat.c::eatcorpse
+    "You turn into a new form!",     # 7  YOU_TURN_INTO      polyself.c::polymon
+    "You return to your old form.",  # 8  YOU_RETURN_TO_HUMAN polyself.c::rehumanize
+    "You begin praying to your god.",# 9  YOU_PRAY           pray.c::dopray
+    "The monster hits!",             # 10 MONSTER_HITS_YOU   mhitu.c::mattacku
+    "You hit the monster.",          # 11 YOU_HIT_MONSTER    uhitm.c::hmon
+    "You quaff the potion.",         # 12 YOU_QUAFF_POTION   potion.c::dodrink
+    "You read the scroll.",          # 13 YOU_READ_SCROLL    read.c::doread
+    "You climb up the stairs.",      # 14 GO_UP_STAIRS       do.c::doup
+    "You climb down the stairs.",    # 15 GO_DOWN_STAIRS     do.c::dodown
+    "You wait.",                     # 16 YOU_WAIT           cmd.c::dowait
+)
 
-    Algorithm (mirrors pline.c / winrl.cc ring-buffer logic):
-      1. Rotate the current message_buffer row into message_history at
-         history_index (modulo HISTORY_LEN).
-      2. Advance history_index by 1 (wrapping).
-      3. Write msg_id as the first byte of the new message_buffer (the
-         renderer reads this integer ID outside jit to format the string).
 
-    JIT-safe; all shapes are static.
+def _bake_templates() -> jnp.ndarray:
+    """Pack _MESSAGE_TEMPLATES into a [N_MESSAGES, MSG_BUF_LEN] uint8 array.
+
+    Each row: [msg_id, ascii bytes..., 0-padding to MSG_BUF_LEN].
+    Byte 0 is msg_id (preserves the Wave 1 contract that
+    ``message_buffer[0] == msg_id``); bytes 1.. hold the rendered ASCII line.
     """
-    # Step 1: save current buffer into history at history_index.
+    n = len(_MESSAGE_TEMPLATES)
+    arr = _np.zeros((n, MSG_BUF_LEN), dtype=_np.uint8)
+    for i, text in enumerate(_MESSAGE_TEMPLATES):
+        arr[i, 0] = i & 0xFF
+        raw = text.encode("ascii")[: MSG_BUF_LEN - 1]
+        arr[i, 1 : 1 + len(raw)] = list(raw)
+    return jnp.asarray(arr, dtype=jnp.uint8)
+
+
+# Module-level constant; baked once at import.
+_TEMPLATE_TABLE: jnp.ndarray = _bake_templates()
+_N_TEMPLATES: int = len(_MESSAGE_TEMPLATES)
+
+
+def emit(state: MessageState, msg_id: int, *args) -> MessageState:
+    """Render ``msg_id`` into message_buffer and rotate the ring buffer.
+
+    Cite: vendor/nethack/src/pline.c::pline (line 103) — formats and pushes
+    the message to WIN_MESSAGE; pline.c::dumplogmsg (lines 20-46) —
+    saved_plines ring buffer rotation with ``gs.saved_pline_index``.
+
+    Algorithm (mirrors pline.c::dumplogmsg + pline.c::pline):
+      1. Save the current ``message_buffer`` into ``message_history`` at
+         ``history_index`` (the "oldest" slot, mod HISTORY_LEN).
+      2. Advance ``history_index`` by 1, modulo HISTORY_LEN
+         (pline.c:45 ``gs.saved_pline_index = (indx + 1) % DUMPLOG_MSG_COUNT``).
+      3. Look up the fixed template for ``msg_id`` and write it into the
+         fresh message_buffer.  Byte 0 holds msg_id; bytes 1.. hold the
+         pre-baked ASCII rendering (zero-padded to MSG_BUF_LEN).
+
+    Parameters
+    ----------
+    state  : MessageState
+    msg_id : int / jnp.int32  — MessageId enum value.  Out-of-range IDs
+             render as NONE (all zeros).
+    *args  : optional jnp.int32 scalars — reserved for future substitution
+             (e.g. damage number, gold quantity).  Wave 28d ignores them;
+             they are accepted so call sites can be written once and
+             upgraded later without churn.
+
+    Returns
+    -------
+    Updated MessageState (new message_buffer + rotated history).
+
+    JIT-safe: shape-static; uses ``.at[].set`` and integer indexing only.
+    """
+    del args  # Reserved for printf-style argument substitution (future wave).
+
+    # Step 1: rotate current buffer into history at history_index.
     safe_idx = jnp.mod(state.history_index, jnp.int32(HISTORY_LEN))
     new_history = state.message_history.at[safe_idx].set(state.message_buffer)
 
-    # Step 2: advance the ring pointer.
+    # Step 2: advance the ring pointer (pline.c:45).
     new_index = jnp.mod(state.history_index + jnp.int32(1), jnp.int32(HISTORY_LEN))
 
-    # Step 3: encode msg_id as first byte of fresh buffer; rest zeroed.
-    new_buffer = jnp.zeros((MSG_BUF_LEN,), dtype=jnp.uint8)
-    new_buffer = new_buffer.at[0].set(jnp.uint8(msg_id))
+    # Step 3: look up the pre-baked template row for msg_id.
+    # Out-of-range ids clip to 0 (NONE), matching the safe "no message" case.
+    msg_id_i32 = jnp.int32(msg_id)
+    safe_id    = jnp.clip(msg_id_i32, jnp.int32(0), jnp.int32(_N_TEMPLATES - 1))
+    new_buffer = _TEMPLATE_TABLE[safe_id]
 
     return state.replace(
         message_buffer=new_buffer,
