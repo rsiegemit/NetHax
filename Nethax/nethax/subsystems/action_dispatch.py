@@ -458,6 +458,16 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
     )
     monster_idx = jnp.argmax(monster_match).astype(jnp.int32)
     monster_present = jnp.any(monster_match)
+    # Vendor hack.c:1925-1995 (domove_bump_mon / domove_attackmon_at) —
+    # peaceful and pet monsters are NOT auto-attacked on bump; vendor prompts
+    # for confirmation (y/n) and defaults to no. Nethax has no interactive
+    # prompt, so treat peaceful/tame bump as "do nothing" — the player neither
+    # moves nor attacks (player_in_trap-style noop).
+    target_peaceful = mai.peaceful[monster_idx]
+    target_tame     = mai.tame[monster_idx] > jnp.int8(0)
+    is_friendly_bump = monster_present & (target_peaceful | target_tame)
+    # Only attack if monster is present AND not friendly.
+    monster_present = monster_present & ~is_friendly_bump
 
     def _attack_branch(s):
         # Capture pre-attack alive flag at the matched slot so we can grant
@@ -502,10 +512,16 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
     # _attack_branch must return the same pytree shape as _move_branch
     # (below).  We construct that by computing the full movement state and
     # selecting via lax.cond at the very end.
+    # Friendly-bump path: do nothing (no move, no attack).
     return jax.lax.cond(
-        monster_present,
-        _attack_branch,
-        lambda s: _move_branch(s, eff_dy, eff_dx, rng, target, in_bounds, terrain_2d, map_h, map_w),
+        is_friendly_bump,
+        lambda s: s,                                              # friendly bump → no-op
+        lambda s: jax.lax.cond(
+            monster_present,
+            _attack_branch,
+            lambda s2: _move_branch(s2, eff_dy, eff_dx, rng, target, in_bounds, terrain_2d, map_h, map_w),
+            s,
+        ),
         state,
     )
 
