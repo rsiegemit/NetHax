@@ -74,14 +74,17 @@ def _run_step(state, player_hp, player_hp_max, player_pw, player_pw_max, xl, rol
 # ---------------------------------------------------------------------------
 
 class TestComputeHungerState:
-    # Wave 6 #73: updated to vendor-correct thresholds per
-    # vendor/nethack/src/eat.c::newuhs lines 3369-3372.
-    #   nutrition > 1000 → SATIATED
-    #   nutrition >  150 → NOT_HUNGRY
-    #   nutrition >   50 → HUNGRY
-    #   nutrition >    0 → WEAK
-    #   nutrition > -800 → FAINTING
-    #   nutrition ≤ -800 → STARVED
+    # Wave 33c: vendor-correct thresholds per
+    # vendor/nethack/src/eat.c::newuhs lines 3369-3372 + line 3437.
+    #   nutrition > 1000          → SATIATED
+    #   nutrition >  150          → NOT_HUNGRY
+    #   nutrition >   50          → HUNGRY
+    #   nutrition >    0          → WEAK
+    #   nutrition >= -(100+10*CON) → FAINTING
+    #   nutrition <  -(100+10*CON) → STARVED      (CON-dependent, eat.c:3437)
+    #
+    # compute_hunger_state defaults con=11 (vendor neutral baseline) so the
+    # STARVED floor here is -(100 + 10*11) = -210.
     def test_satiated(self):
         assert int(compute_hunger_state(jnp.int32(1001))) == HungerState.SATIATED
         assert int(compute_hunger_state(jnp.int32(1500))) == HungerState.SATIATED
@@ -107,13 +110,16 @@ class TestComputeHungerState:
         assert int(compute_hunger_state(jnp.int32(1)))   == HungerState.WEAK
 
     def test_fainting(self):
-        # Wave 6 #73: FAINTING covers everything in (-800, 0].
+        # Wave 33c: FAINTING covers [-(100+10*CON), 0] (CON=11 default → -210).
+        # eat.c:3437 — STARVED triggers only when u.uhunger < -(100 + 10*CON).
         assert int(compute_hunger_state(jnp.int32(0)))    == HungerState.FAINTING
         assert int(compute_hunger_state(jnp.int32(-100))) == HungerState.FAINTING
-        assert int(compute_hunger_state(jnp.int32(-799))) == HungerState.FAINTING
+        assert int(compute_hunger_state(jnp.int32(-210))) == HungerState.FAINTING
 
     def test_starved(self):
-        # Wave 6 #73: STARVED death-cliff at -800 (HUNGER_STARVED constant).
+        # Wave 33c: STARVED death-cliff at -(100 + 10*CON); default CON=11 → -210.
+        # Anything < -210 (i.e. -211 or below) → STARVED at default CON.
+        assert int(compute_hunger_state(jnp.int32(-211)))  == HungerState.STARVED
         assert int(compute_hunger_state(jnp.int32(-800)))  == HungerState.STARVED
         assert int(compute_hunger_state(jnp.int32(-1000))) == HungerState.STARVED
 
