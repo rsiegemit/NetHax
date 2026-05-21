@@ -563,6 +563,13 @@ def _dragon_breath(state, slot: jnp.ndarray, rng: jax.Array):
     beam off a reflecting target — equivalent here to zero damage.
     Resistance (player matching intrinsic) blocks damage.
 
+    Range gate: vendor uses Euclidean² distance (``mdistu(mtmp)``, defined
+    in hack.h:1531-1532 as ``dist2(x,y,u.ux,u.uy)`` = ``dx*dx+dy*dy``;
+    see hacklib.c:672-678).  Breath fires when ``range2`` (mhitu.c:453,
+    ``range2 = !monnear(...)`` = ``dist2 >= 3`` per mon.c:2476-2483) is
+    true and the target is within ``BOLT_LIM * BOLT_LIM`` (hack.h:49
+    ``BOLT_LIM 8``).
+
     Vendor cite: mhitu.c::mattacku case AT_BREA ~873 — 'if (range2) breamu';
                  mthrowu.c::breamm:1123 dobuzz call with mattk->damn;
                  zap.c::zhitu:4416-4438 d(nd, 6) for fire/cold/elec/acid/magm;
@@ -572,8 +579,14 @@ def _dragon_breath(state, slot: jnp.ndarray, rng: jax.Array):
     idx = slot.astype(jnp.int32)
     mpos = mai.pos[idx].astype(jnp.int32)
     ppos = state.player_pos.astype(jnp.int32)
-    dist = _cheby(mpos, ppos)
-    in_range = (dist >= jnp.int32(2)) & (dist <= jnp.int32(_BREATH_RANGE))
+    # Euclidean² distance per vendor mdistu/dist2 (hack.h:1531, hacklib.c:672).
+    dx = mpos[0].astype(jnp.int32) - ppos[0].astype(jnp.int32)
+    dy = mpos[1].astype(jnp.int32) - ppos[1].astype(jnp.int32)
+    dist2 = dx * dx + dy * dy
+    # range2: !monnear ⇔ dist2 >= 3 (mon.c:2476-2483).
+    # Upper bound: BOLT_LIM*BOLT_LIM = 64 (hack.h:49 BOLT_LIM=8).
+    _BOLT_LIM_SQ = jnp.int32(_BREATH_RANGE * _BREATH_RANGE)
+    in_range = (dist2 >= jnp.int32(3)) & (dist2 <= _BOLT_LIM_SQ)
 
     safe_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, _NUMMONS - 1)
     elem = _DRAGON_BREATH_ELEMENT[safe_entry].astype(jnp.int32)
