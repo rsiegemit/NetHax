@@ -639,7 +639,19 @@ def _effect_identify(state: dict, rng: jax.Array) -> dict:
     new_identified = items.identified.at[target_slot].set(
         jnp.where(any_match, jnp.bool_(True), items.identified[target_slot])
     )
-    new_items = items.replace(identified=new_identified)
+    # Scroll-of-identify reveals erodeproof / charge state too.
+    # Cite: vendor obj.h line 114 (rknown) + objnam.c:1183.
+    new_dknown = items.dknown.at[target_slot].set(
+        jnp.where(any_match, jnp.bool_(True), items.dknown[target_slot])
+    )
+    new_rknown = items.rknown.at[target_slot].set(
+        jnp.where(any_match, jnp.bool_(True), items.rknown[target_slot])
+    )
+    new_items = items.replace(
+        identified=new_identified,
+        dknown=new_dknown,
+        rknown=new_rknown,
+    )
     new_inv = inv.replace(items=new_items)
     return {**state, "inventory": new_inv}
 

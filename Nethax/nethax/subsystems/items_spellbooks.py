@@ -66,6 +66,89 @@ _BUC_BLESSED  = 3
 _BLESSED_STUDY_BONUS = 2
 
 
+# ---------------------------------------------------------------------------
+# Study-time formula
+# Cite: vendor/nethack/src/spell.c::study_book lines 537-559.
+# Vendor switches on objects[booktype].oc_level:
+#     level 1-2: delay = -oc_delay
+#     level 3-4: delay = -(oc_level - 1) * oc_delay
+#     level 5-6: delay = -oc_level * oc_delay
+#     level 7:   delay = -8 * oc_delay
+# The negative sign in svc.context.spbook.delay simply marks it as a study
+# interruption; magnitude is the turn count.  Per-spell oc_delay values are
+# the SPELL() macro's `delay` field (vendor objects.h line 1277:
+# SPELL(name, desc, sub, prob, delay, level, mgc, dir, color, sn)).
+# ---------------------------------------------------------------------------
+
+# oc_delay per spell, indexed by SpellId (objects.h SPELL() entries).
+# Source: vendor/nethack/include/objects.h lines 1293-1396.
+_SPELL_OC_DELAYS: tuple = (
+    6,  # DIG
+    2,  # MAGIC_MISSILE
+    4,  # FIREBALL
+    7,  # CONE_OF_COLD
+    1,  # SLEEP
+    10, # FINGER_OF_DEATH
+    1,  # LIGHT
+    1,  # DETECT_MONSTERS
+    5,  # HEALING
+    1,  # KNOCK
+    2,  # FORCE_BOLT
+    2,  # CONFUSE_MONSTER
+    2,  # CURE_BLINDNESS
+    2,  # DRAIN_LIFE
+    2,  # SLOW_MONSTER
+    3,  # WIZARD_LOCK
+    3,  # CREATE_MONSTER
+    3,  # DETECT_FOOD
+    3,  # CAUSE_FEAR
+    3,  # CLAIRVOYANCE
+    3,  # CURE_SICKNESS
+    6,  # CHARM_MONSTER
+    4,  # HASTE_SELF
+    3,  # DETECT_UNSEEN
+    4,  # LEVITATION
+    5,  # EXTRA_HEALING
+    5,  # RESTORE_ABILITY
+    5,  # INVISIBILITY
+    4,  # DETECT_TREASURE
+    5,  # REMOVE_CURSE
+    5,  # MAGIC_MAPPING
+    3,  # IDENTIFY
+    8,  # TURN_UNDEAD
+    7,  # POLYMORPH
+    6,  # TELEPORT_AWAY
+    7,  # CREATE_FAMILIAR
+    8,  # CANCELLATION
+    1,  # PROTECTION
+    3,  # JUMPING
+    3,  # STONE_TO_FLESH
+    2,  # CHAIN_LIGHTNING
+    1,  # FLAME_SPHERE
+    1,  # FREEZE_SPHERE
+)
+
+
+def study_book_delay(book_level: int, oc_delay: int) -> int:
+    """Return the number of turns required to study a spellbook.
+
+    Mirrors the vendor switch in spell.c::study_book (lines 537-559):
+        level 1-2: delay = oc_delay
+        level 3-4: delay = (level - 1) * oc_delay
+        level 5-6: delay = level * oc_delay
+        level 7:   delay = 8 * oc_delay
+
+    Cite: vendor/nethack/src/spell.c::study_book lines 537-559.
+    """
+    if book_level <= 2:
+        return oc_delay
+    if book_level <= 4:
+        return (book_level - 1) * oc_delay
+    if book_level <= 6:
+        return book_level * oc_delay
+    return 8 * oc_delay
+
+
 def _assign_letter(magic: MagicState, spell_id: int) -> MagicState:
     """Assign the first unused a-z / A-Z letter to this spell.
 
@@ -287,7 +370,13 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
     if int(magic.spell_letter[spell_id]) == -1:
         magic = _assign_letter(magic, spell_id)
 
-    return state.replace(magic=magic)
+    # Advance timestep by study delay (vendor spell.c::study_book switch
+    # at lines 537-559).  Cite via study_book_delay above.
+    oc_delay = int(_SPELL_OC_DELAYS[spell_id]) if 0 <= spell_id < len(_SPELL_OC_DELAYS) else 1
+    delay_turns = study_book_delay(book_level, oc_delay)
+    new_timestep = (state.timestep.astype(jnp.int32) + jnp.int32(delay_turns))
+
+    return state.replace(magic=magic, timestep=new_timestep)
 
 
 def handle_read_spellbook(state, rng: jax.Array, slot_idx: int):
