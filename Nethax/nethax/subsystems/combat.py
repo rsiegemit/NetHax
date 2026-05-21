@@ -1799,10 +1799,24 @@ def thrown_attack(
     # vendor/nethack/src/uhitm.c:709-710 -- strict ``tmp > dieroll``.
     hit_landed = (tmp > roll) & valid_throw & target_alive
 
-    # --- Damage: weight-based heuristic + enchant ---
-    base = jnp.maximum(weight // jnp.int32(30), jnp.int32(1))
-    spread = rnd(key_dmg, 4).astype(jnp.int32)  # +1..4 variability
-    raw_dmg = base + spread + enchant
+    # --- Damage: byte-equal vendor dmgval per-weapon dice (weapon.c:215-302).
+    # ``weapon_damage_dice`` returns the small/large dice (oc_wsdam / oc_wldam
+    # from include/objects.h) plus the per-otyp switch-statement bonus dice
+    # from weapon.c:228-295 (TRIDENT +1, BATTLE_AXE +2d4 vs large, ...).
+    # For items without a damage entry (oc_wsdam == 0) the roll is 0, leaving
+    # only the spe (enchant) bonus — matching vendor dmgval behaviour for
+    # projectiles that lack a weapon-class dice spec.
+    safe_tgt_for_size = jnp.clip(target_idx, 0, mai.is_large.shape[0] - 1)
+    target_large = mai.is_large[safe_tgt_for_size]
+    dn1, ds1, dn2, ds2 = _wdd(type_id, target_large)
+    key_dmg_a, key_dmg_b = split_n(key_dmg, 2)
+    raw1 = jnp.where(ds1 > 0, _roll_dice_sum(key_dmg_a, dn1, ds1),
+                     jnp.int32(0))
+    raw2 = jnp.where(ds2 > 0, _roll_dice_sum(key_dmg_b, dn2, ds2),
+                     jnp.int32(0))
+    base_dmg = raw1 + raw2
+    # vendor/nethack/src/weapon.c:298-302: tmp += spe; if tmp < 0, tmp = 0.
+    raw_dmg = jnp.maximum(base_dmg + enchant, jnp.int32(0))
 
     # --- Gap 5: silver damage vs hates_silver (dothrow.c:1343) ---
     # if (obj->material == SILVER && hates_silver(mtmp->data)) dmg += d(20)
