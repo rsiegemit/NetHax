@@ -454,9 +454,24 @@ def apply_corpse_postfx(
 
     # Giant: +1 STR  cite: eat.c::corpse_intrinsic:1345 ``is_giant(ptr)`` → gainstr
     # is_giant checks M2_GIANT flag (mondata.h).
+    #
+    # Vendor 50% gate when STR is the ONLY candidate
+    # cite: vendor/nethack/src/eat.c::corpse_intrinsic lines 1368-1370 —
+    #     /* if strength is the only candidate, give it 50% chance */
+    #     if (conveys_STR && count == 1 && !rn2(2))
+    #         prop = 0;
+    # Vendor's `count` is (1 if conveys_STR) + n_intrinsic_table_candidates.
+    # `count == 1` therefore means STR is the only candidate, i.e. our
+    # n_candidates (the table-only count) is zero.  Per audit-E: apply +STR
+    # when (n_candidates > 0) OR (rn2(2) == 0); equivalently, suppress STR
+    # only when n_candidates == 0 AND rn2(2) != 0.
     is_giant_corp = is_corpse & _MONSTER_IS_GIANT[safe_idx]
+    rng, rng_str_gate = jax.random.split(rng)
+    str_50_roll = jax.random.randint(rng_str_gate, (), 0, 2, dtype=jnp.int32)
+    str_only = n_candidates == jnp.int32(0)
+    apply_str = is_giant_corp & ((~str_only) | (str_50_roll == jnp.int32(0)))
     new_str = jnp.where(
-        is_giant_corp,
+        apply_str,
         jnp.minimum(state.player_str + jnp.int16(1), jnp.int16(125)),
         state.player_str,
     )

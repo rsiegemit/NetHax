@@ -155,10 +155,10 @@ _AMULET_TO_INTRINSIC: dict[int, int] = {
 
 # Amulet effects that start a timed status on wear (effect_id → TimedStatus).
 # STRANGULATION triggers at 6 turns (do_wear.c: Strangled = 6L).
-# RESTFUL_SLEEP randomises 2–100 turns; we default to 50 (midpoint).
+# RESTFUL_SLEEP randomises 2–100 turns via rnd(98)+2 in wear_amulet
+# (see do_wear.c:1048 case AMULET_OF_RESTFUL_SLEEP).
 _AMULET_TO_TIMED: dict[int, tuple[int, int]] = {
     AmuletEffect.STRANGULATION: (TimedStatus.STRANGLED, 6),
-    AmuletEffect.RESTFUL_SLEEP: (TimedStatus.SLEEPY,    50),
 }
 
 
@@ -566,6 +566,28 @@ def wear_amulet(state, rng: jax.Array, slot_idx: int):
     if timed_entry is not None:
         timed_id, turns = timed_entry
         state = state.replace(status=add_timed(state.status, timed_id, turns))
+
+    # RESTFUL_SLEEP: vendor uses rnd(98)+2 (uniform [2,100]) and only updates
+    # HSleepy timer when newnap < oldnap OR oldnap == 0; FROMOUTSIDE source
+    # bits in HSleepy are preserved (HSleepy = (HSleepy & ~TIMEOUT) | newnap).
+    # cite: vendor/nethack/src/do_wear.c::Amulet_on lines 1047-1054:
+    #     case AMULET_OF_RESTFUL_SLEEP: {
+    #         long newnap = (long) rnd(98) + 2L, oldnap = (HSleepy & TIMEOUT);
+    #         if (newnap < oldnap || oldnap == 0L)
+    #             HSleepy = (HSleepy & ~TIMEOUT) | newnap;
+    #         break;
+    #     }
+    # Our JAX state stores only the TIMEOUT portion in
+    # status.timed_statuses[SLEEPY]; there is no FROMOUTSIDE bit on this slot
+    # in the current representation, so preservation is a no-op.
+    if amulet_effect == int(AmuletEffect.RESTFUL_SLEEP):
+        newnap = jax.random.randint(rng, (), 2, 101, dtype=jnp.int32)  # rnd(98)+2 → [2,100]
+        sleepy_idx = int(TimedStatus.SLEEPY)
+        old_timeout = state.status.timed_statuses[sleepy_idx]
+        do_update = (newnap < old_timeout) | (old_timeout == jnp.int32(0))
+        new_timeout = jnp.where(do_update, newnap, old_timeout)
+        new_ts = state.status.timed_statuses.at[sleepy_idx].set(new_timeout)
+        state = state.replace(status=state.status.replace(timed_statuses=new_ts))
 
     return state
 
