@@ -317,6 +317,29 @@ def detect_unseen(state, rng):
 #    accordingly (rows -5/+6, cols -9/+10).
 # ---------------------------------------------------------------------------
 
+def trap_detect(state, rng):
+    """One-shot reveal of every trap on the current level.
+
+    Cite: vendor/nethack/src/detect.c::trap_detect (lines 1011-1088) and
+          vendor/nethack/src/detect.c::display_trap_map.
+    Vendor walks gf.ftrap (line 1025), buried/inventory/door traps and
+    calls display_trap_map which marks each trap's seenv on the level.
+    There is NO timer — the reveal is immediate and persistent.
+
+    Implementation: sets state.traps.revealed[flat_lv, :, :] = True so
+    that every trap location on the current level is permanently visible.
+    """
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    max_lv = jnp.int32(state.terrain.shape[1])
+    flat_lv = b * max_lv + lv
+
+    old_revealed = state.traps.revealed
+    full_row = jnp.ones_like(old_revealed[flat_lv])
+    new_revealed = old_revealed.at[flat_lv].set(full_row)
+    return state.replace(traps=state.traps.replace(revealed=new_revealed))
+
+
 def clairvoyance(state, rng):
     """Reveal the do_vicinity_map rectangle centred on the player.
 
