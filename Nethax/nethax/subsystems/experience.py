@@ -544,7 +544,7 @@ def losexp(state):
     resync_target = newuexp(new_ulev) - jnp.int64(1)
     new_uexp = jnp.where(cur_uexp > jnp.int64(0), resync_target, cur_uexp)
 
-    return state.replace(
+    state = state.replace(
         player_xl=new_ulev,
         player_hp_max=new_hp_max.astype(state.player_hp_max.dtype),
         player_hp=new_hp.astype(state.player_hp.dtype),
@@ -552,6 +552,10 @@ def losexp(state):
         player_pw=new_pw.astype(state.player_pw.dtype),
         player_xp=new_uexp.astype(state.player_xp.dtype),
     )
+
+    # Vendor exper.c:280 calls adjabil(oldlevel, u.ulevel) after the level
+    # drop to revoke any role/race intrinsics tied to the lost XL.
+    return adjabil(state, ulev, jnp.int32(new_ulev))
 
 
 # ---------------------------------------------------------------------------
@@ -612,7 +616,7 @@ def pluslvl(state, rng, incr: bool = True):
         # vendor: u.uexp = newuexp(u.ulevel)  (still the OLD ulevel)
         new_uexp = jnp.where(can_level, newuexp(ulev), cur_uexp)
 
-    return state.replace(
+    state = state.replace(
         player_xl=new_ulev.astype(state.player_xl.dtype),
         player_hp_max=new_hp_max.astype(state.player_hp_max.dtype),
         player_hp=new_hp.astype(state.player_hp.dtype),
@@ -620,6 +624,10 @@ def pluslvl(state, rng, incr: bool = True):
         player_pw=new_pw.astype(state.player_pw.dtype),
         player_xp=new_uexp.astype(state.player_xp.dtype),
     )
+
+    # Vendor exper.c:359 calls adjabil(oldlevel, u.ulevel) after the level
+    # change to fold in any role/race intrinsics gained at the new XL.
+    return adjabil(state, ulev, new_ulev)
 
 
 # ---------------------------------------------------------------------------
@@ -651,25 +659,177 @@ def newexplevel(state, rng):
 # ---------------------------------------------------------------------------
 # adjabil(oldlevel, newlevel) — vendor attrib.c:1005-1074
 # ---------------------------------------------------------------------------
+#
+# Vendor ``static const struct innate {schar ulevel; long *ability; ...}``
+# tables at attrib.c:23-105 list, per role and race, the (ulevel, prop_id)
+# pairs at which an intrinsic is gained.  We mirror those tables here as
+# flat int8 arrays of shape [N, MAX_INNATE, 2] (ulevel, intrinsic_id).
+# Each table is null-terminated at ulevel==0 (vendor sentinel ``{0,0,0,0}``).
+#
+# HXxx → Intrinsic mapping (Nethax status_effects.Intrinsic):
+#   HSearching         → SEARCHING (34)
+#   HStealth           → STEALTH (42)
+#   HFast              → FAST (64)
+#   HPoison_resistance → RESIST_POISON (6)
+#   HWarning           → WARNING (31)
+#   HSleep_resistance  → RESIST_SLEEP (3)
+#   HSee_invisible     → SEE_INVIS (29)
+#   HFire_resistance   → RESIST_FIRE (1)
+#   HCold_resistance   → RESIST_COLD (2)
+#   HShock_resistance  → RESIST_SHOCK (5)
+#   HTeleport_control  → TELEPORT_CONTROL (47)
+#   HInfravision       → INFRAVISION (36)
+# ---------------------------------------------------------------------------
+
+_ROLE_INNATE = {
+    # ARCHEOLOGIST (attrib.c:27-30)
+    0:  [(1, 34), (5, 42), (10, 64)],
+    # BARBARIAN (attrib.c:32-35)
+    1:  [(1, 6), (7, 64), (15, 42)],
+    # CAVEMAN (attrib.c:37-39)
+    2:  [(7, 64), (15, 31)],
+    # HEALER (attrib.c:41-43)
+    3:  [(1, 6), (15, 31)],
+    # KNIGHT (attrib.c:45)
+    4:  [(7, 64)],
+    # MONK (attrib.c:47-58)
+    5:  [(1, 64), (1, 3), (1, 29), (3, 6), (5, 42), (7, 31),
+         (9, 34), (11, 1), (13, 2), (15, 5), (17, 47)],
+    # PRIEST (attrib.c:60-62)
+    6:  [(15, 31), (20, 1)],
+    # RANGER (attrib.c:64-67)
+    7:  [(1, 34), (7, 42), (15, 29)],
+    # ROGUE (attrib.c:69-71)
+    8:  [(1, 42), (10, 34)],
+    # SAMURAI (attrib.c:73-75)
+    9:  [(1, 64), (15, 42)],
+    # TOURIST (attrib.c:77-79)
+    10: [(10, 34), (20, 6)],
+    # VALKYRIE (attrib.c:81-84)
+    11: [(1, 2), (3, 42), (7, 64)],
+    # WIZARD (attrib.c:86-88)
+    12: [(15, 31), (17, 47)],
+}
+
+_RACE_INNATE = {
+    # HUMAN (attrib.c:105 — hum_abil[] is empty)
+    0: [],
+    # ELF (attrib.c:94-96)
+    1: [(1, 36), (4, 3)],
+    # DWARF (attrib.c:91-92)
+    2: [(1, 36)],
+    # GNOME (attrib.c:98-99)
+    3: [(1, 36)],
+    # ORC (attrib.c:101-103)
+    4: [(1, 36), (1, 6)],
+}
+
+
+def _build_innate_table(table_dict, n_keys, max_rows):
+    arr = _np.zeros((n_keys, max_rows, 2), dtype=_np.int8)
+    for k, rows in table_dict.items():
+        for i, (ulev, prop) in enumerate(rows):
+            arr[k, i, 0] = int(ulev)
+            arr[k, i, 1] = int(prop)
+    return jnp.array(arr, dtype=jnp.int8)
+
+
+# MAX_INNATE = 11 (Monk has 11 rows, the maximum across all *_abil tables).
+_MAX_INNATE_ROLE = 11
+_MAX_INNATE_RACE = 2
+_INNATE_ROLE = _build_innate_table(_ROLE_INNATE, 13, _MAX_INNATE_ROLE)
+_INNATE_RACE = _build_innate_table(_RACE_INNATE, 5,  _MAX_INNATE_RACE)
+
+
+def _apply_innate_walk(intr, intr_src, oldlev, newlev, table, role_or_race,
+                       mask_bit):
+    """Walk a single innate table; gain/lose intrinsics by FROMxxx mask.
+
+    Mirrors attrib.c:1028-1066::
+
+        if (oldlevel < abil->ulevel && newlevel >= abil->ulevel)
+            *abil->ability |= mask;
+        else if (oldlevel >= abil->ulevel && newlevel < abil->ulevel)
+            *abil->ability &= ~mask;
+    """
+    safe_key = jnp.clip(role_or_race.astype(jnp.int32), 0,
+                        table.shape[0] - 1)
+    rows = table[safe_key]              # [MAX_INNATE, 2]
+    ulev_col = rows[:, 0].astype(jnp.int32)
+    prop_col = rows[:, 1].astype(jnp.int32)
+    valid = ulev_col > jnp.int32(0)     # sentinel guard
+
+    gain = valid & (oldlev < ulev_col) & (newlev >= ulev_col)
+    lose = valid & (oldlev >= ulev_col) & (newlev <  ulev_col)
+
+    n_intr = intr.shape[0]
+    # ``~mask_bit & 0xFF`` would overflow int8 (e.g. 0xFB = 251);
+    # construct the inverse via uint8 -> int8 reinterpretation.
+    inv_mask = jnp.asarray(_np.int8(_np.uint8(~mask_bit & 0xFF)))
+
+    def _step(carry, i):
+        intr_, src_ = carry
+        prop_i = jnp.clip(prop_col[i], 0, n_intr - 1)
+        cur_src = src_[prop_i]
+        new_src_gain = (cur_src | jnp.int8(mask_bit))
+        new_src_lose = (cur_src & inv_mask)
+        new_src = jnp.where(
+            gain[i], new_src_gain,
+            jnp.where(lose[i], new_src_lose, cur_src),
+        )
+        src_2 = src_.at[prop_i].set(new_src.astype(src_.dtype))
+
+        any_src = new_src != jnp.int8(0)
+        cur_bool = intr_[prop_i]
+        new_bool = jnp.where(
+            gain[i], jnp.bool_(True),
+            jnp.where(lose[i], any_src, cur_bool),
+        )
+        intr_2 = intr_.at[prop_i].set(new_bool)
+        return (intr_2, src_2), None
+
+    (intr, intr_src), _ = jax.lax.scan(
+        _step, (intr, intr_src), jnp.arange(table.shape[1], dtype=jnp.int32),
+    )
+    return intr, intr_src
+
 
 def adjabil(state, oldlevel, newlevel):
     """Recompute intrinsics on experience-level change.
 
-    Vendor ``attrib.c::adjabil`` (lines 1005-1074) walks the per-role and
-    per-race ``innate`` intrinsic tables and toggles ability bits in
-    ``u.uprops[]`` (gain on level-up, lose on level-loss).  It also calls
-    ``add_weapon_skill`` / ``lose_weapon_skill`` to grant or revoke weapon
-    practice slots.
+    Byte-equal port of vendor ``attrib.c::adjabil`` (lines 1005-1074),
+    intrinsic-walk portion only (lines 1028-1066).  The weapon-skill
+    practice-slot delta at lines 1068-1073 is deferred to the skills
+    subsystem and intentionally not modelled here.
 
-    Nethax does not yet model the per-property intrinsic timer array nor the
-    weapon-skill practice-slot pool, so this function is a no-op stub.  When
-    those subsystems land, this stub should walk ROLES[role].intrinsics /
-    RACES[race].intrinsics and flip the ``FROMEXPER`` / ``FROMRACE`` bits in
-    the appropriate property timer.  See vendor/nethack/src/attrib.c:1028-1066
-    for the intrinsic walk and lines 1068-1073 for the weapon-skill delta.
+    Per-role table is walked with mask = FROMEXPER, per-race table with
+    mask = FROMRACE (vendor attrib.c:1009-1036).  Source bits are stored
+    on ``state.status.intrinsic_source[N_INTRINSICS]`` (mirrors the low
+    byte of vendor ``upp->intrinsic``), and the boolean in
+    ``state.status.intrinsics`` is set whenever any source bit is on.
     """
-    # No-op: state passes through unchanged.  Signature mirrors vendor for
-    # call-site parity with pluslvl(oldlevel, newlevel) and losexp(oldlevel,
-    # newlevel) when those eventually wire intrinsics through this hook.
-    del oldlevel, newlevel
-    return state
+    oldlev = (oldlevel.astype(jnp.int32) if hasattr(oldlevel, "astype")
+              else jnp.int32(oldlevel))
+    newlev = (newlevel.astype(jnp.int32) if hasattr(newlevel, "astype")
+              else jnp.int32(newlevel))
+
+    # Local import to avoid a circular load (status_effects imports nothing
+    # from this module).
+    from Nethax.nethax.subsystems.status_effects import FROMEXPER, FROMRACE
+
+    intr = state.status.intrinsics
+    src  = state.status.intrinsic_source
+
+    # Per-role walk (mask = FROMEXPER).  Vendor attrib.c:1011.
+    intr, src = _apply_innate_walk(
+        intr, src, oldlev, newlev, _INNATE_ROLE,
+        state.player_role, FROMEXPER,
+    )
+    # Per-race walk (mask = FROMRACE).  Vendor attrib.c:1013-1026.
+    intr, src = _apply_innate_walk(
+        intr, src, oldlev, newlev, _INNATE_RACE,
+        state.player_race, FROMRACE,
+    )
+
+    new_status = state.status.replace(intrinsics=intr, intrinsic_source=src)
+    return state.replace(status=new_status)
