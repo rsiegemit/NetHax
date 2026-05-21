@@ -163,15 +163,24 @@ _MESSAGE_TEMPLATES: tuple[str, ...] = (
     "",                              # 0  NONE
     "Welcome to NetHack!",           # 1  GAME_START         pline.c:104
     "You die...",                    # 2  YOU_DIE            end.c::done
-    "You kill the monster!",         # 3  YOU_KILL_MONSTER   uhitm.c::killed
-    "You find some gold.",           # 4  FIND_GOLD          hack.c::pickup_gold
+    # YOU_KILL_MONSTER: 32-byte monster-name slot starts at offset 13
+    # (after "You kill the ").  Trailing '!' is appended by emit() after
+    # the trimmed name.  Cite: vendor uhitm.c::killed line ~1015 —
+    # "You kill the %s%s!" formatted with mon_nam().
+    "You kill the " + (" " * 32) + "!",  # 3 YOU_KILL_MONSTER uhitm.c::killed
+    # FIND_GOLD: 10-byte right-aligned numeric slot at offset 9.
+    # Cite: vendor hack.c::pickup_gold line ~150 — "%ld gold piece%s".
+    "You find " + (" " * 10) + " gold pieces.",  # 4 FIND_GOLD hack.c
     "The door opens.",               # 5  OPEN_DOOR          do_name.c::doopen
     "You eat the food.",             # 6  EAT_FOOD           eat.c::eatcorpse
     "You turn into a new form!",     # 7  YOU_TURN_INTO      polyself.c::polymon
     "You return to your old form.",  # 8  YOU_RETURN_TO_HUMAN polyself.c::rehumanize
     "You begin praying to your god.",# 9  YOU_PRAY           pray.c::dopray
     "The monster hits!",             # 10 MONSTER_HITS_YOU   mhitu.c::mattacku
-    "You hit the monster.",          # 11 YOU_HIT_MONSTER    uhitm.c::hmon
+    # YOU_HIT_MONSTER: 32-byte monster-name slot starts at offset 12
+    # (after "You hit the ").  '.' is appended after the trimmed name.
+    # Cite: vendor uhitm.c::hmon line ~1180 — "You hit %s." with mon_nam().
+    "You hit the " + (" " * 32) + ".",  # 11 YOU_HIT_MONSTER uhitm.c::hmon
     "You quaff the potion.",         # 12 YOU_QUAFF_POTION   potion.c::dodrink
     "You read the scroll.",          # 13 YOU_READ_SCROLL    read.c::doread
     "You climb up the stairs.",      # 14 GO_UP_STAIRS       do.c::doup
@@ -221,8 +230,162 @@ _TEMPLATE_TABLE: jnp.ndarray = _bake_templates()
 _N_TEMPLATES: int = len(_MESSAGE_TEMPLATES)
 
 
+# ---------------------------------------------------------------------------
+# Argument-slot metadata (printf-style substitution into pre-baked templates).
+#
+# Mirrors vendor pline.c::pline(fmt, ...) which accepts a printf-style format
+# string and writes the formatted result via vsprintf into a BUFSZ buffer
+# (pline.c lines 103-130).  In our JIT-compatible model we can't run printf
+# at trace time, so each MessageId reserves a fixed-width byte slot inside
+# its template and emit() writes the argument value(s) into that slot.
+#
+# Kinds:
+#   _ARG_KIND_NONE    = 0 -> no substitution (template is static)
+#   _ARG_KIND_NUMERIC = 1 -> right-aligned decimal ASCII into the slot
+#   _ARG_KIND_MONSTER = 2 -> monster-name bytes from MONSTERS[entry_idx].name
+# ---------------------------------------------------------------------------
+
+_ARG_KIND_NONE:    int = 0
+_ARG_KIND_NUMERIC: int = 1
+_ARG_KIND_MONSTER: int = 2
+
+# Slot width for the monster-name placeholder (chosen to fit the longest
+# vendor monster name comfortably; truncates if longer).
+_MONSTER_NAME_SLOT_WIDTH: int = 32
+
+# Numeric slot width — fits up to 10 ASCII digits (covers a 32-bit int).
+_NUMERIC_SLOT_WIDTH: int = 10
+
+
+def _bake_arg_metadata():
+    """Build [N_MESSAGES] arrays describing each MessageId's arg slot.
+
+    Returns three int32 vectors:
+      - kind   : _ARG_KIND_*
+      - offset : byte position (into the buffer row) where the arg writes
+      - width  : slot width in bytes
+
+    The offset is computed against the template buffer layout, which is:
+        buffer[0]        = msg_id
+        buffer[1..1+len] = template ASCII
+    so an offset of "1 + python_index_in_template" yields the buffer offset.
+    """
+    n = _N_TEMPLATES
+    kind   = _np.zeros((n,), dtype=_np.int32)
+    offset = _np.zeros((n,), dtype=_np.int32)
+    width  = _np.zeros((n,), dtype=_np.int32)
+
+    # YOU_KILL_MONSTER (id=3): "You kill the <name>!" — name starts at template
+    # column 13 ("You kill the " = 13 chars), then 32-byte slot.  Buffer
+    # offset = 1 (msg_id) + 13 = 14.
+    kind[3]   = _ARG_KIND_MONSTER
+    offset[3] = 1 + len("You kill the ")
+    width[3]  = _MONSTER_NAME_SLOT_WIDTH
+
+    # FIND_GOLD (id=4): "You find <N> gold pieces." — N at column 9.
+    kind[4]   = _ARG_KIND_NUMERIC
+    offset[4] = 1 + len("You find ")
+    width[4]  = _NUMERIC_SLOT_WIDTH
+
+    # YOU_HIT_MONSTER (id=11): "You hit the <name>." — name at column 12.
+    kind[11]   = _ARG_KIND_MONSTER
+    offset[11] = 1 + len("You hit the ")
+    width[11]  = _MONSTER_NAME_SLOT_WIDTH
+
+    return (
+        jnp.asarray(kind,   dtype=jnp.int32),
+        jnp.asarray(offset, dtype=jnp.int32),
+        jnp.asarray(width,  dtype=jnp.int32),
+    )
+
+
+_ARG_KIND, _ARG_OFFSET, _ARG_WIDTH = _bake_arg_metadata()
+
+
+def _bake_monster_name_table() -> jnp.ndarray:
+    """Build [N_MONSTERS, _MONSTER_NAME_SLOT_WIDTH] uint8 table of names.
+
+    Indexed by entry_idx (matches MONSTERS tuple ordering).  Each row holds
+    the monster name as ASCII bytes, right-padded with spaces (' ' = 0x20)
+    so that the resulting line aligns naturally in the message buffer.
+    Out-of-range indices are looked up via clip-to-bounds in emit().
+
+    Cite: vendor monst.c MON() entries — monster_entry.mname strings.
+    """
+    # Local import to avoid a cycle at module-import time; constants/monsters
+    # itself does not depend on messages.
+    from Nethax.nethax.constants.monsters import MONSTERS
+
+    n = len(MONSTERS)
+    arr = _np.full((n, _MONSTER_NAME_SLOT_WIDTH), ord(" "), dtype=_np.uint8)
+    for i, m in enumerate(MONSTERS):
+        raw = m.name.encode("ascii")[: _MONSTER_NAME_SLOT_WIDTH]
+        arr[i, : len(raw)] = list(raw)
+    return jnp.asarray(arr, dtype=jnp.uint8)
+
+
+_MONSTER_NAME_TABLE: jnp.ndarray = _bake_monster_name_table()
+_N_MONSTERS: int = int(_MONSTER_NAME_TABLE.shape[0])
+
+
+def _digits10(value: jnp.ndarray) -> jnp.ndarray:
+    """Render ``value`` (int32 scalar) as 10 right-aligned ASCII digits.
+
+    Returned shape: (_NUMERIC_SLOT_WIDTH,) uint8.  Leading positions are
+    filled with ASCII space (0x20) until the most-significant non-zero
+    digit.  Negative values are rendered as ``|v|`` with a leading '-'
+    sign before the first digit (clamped: very large negatives still fit
+    inside 10 chars).  Mirrors vendor pline.c "%ld" formatting for the
+    gold-pickup line ("%ld gold piece%s").
+    """
+    v_signed = jnp.int32(value)
+    is_neg   = v_signed < jnp.int32(0)
+    v_abs    = jnp.where(is_neg, -v_signed, v_signed).astype(jnp.int32)
+    space    = jnp.uint8(0x20)  # ' '
+    zero     = jnp.uint8(ord("0"))
+    minus    = jnp.uint8(ord("-"))
+
+    digits = jnp.full((_NUMERIC_SLOT_WIDTH,), space, dtype=jnp.uint8)
+    # Build digits from right (column 9) to left (column 0).
+    def _step(i, carry):
+        digits_in, val_in = carry
+        # Position from the right: column index = (W-1) - i.
+        col = jnp.int32(_NUMERIC_SLOT_WIDTH - 1) - jnp.int32(i)
+        d = jnp.mod(val_in, jnp.int32(10)).astype(jnp.uint8)
+        # If val_in==0 AND we've already written at least one digit (i>=1)
+        # then we leave a space; otherwise write the digit.  At i==0 we
+        # always write at least the ones digit (so value 0 renders "0").
+        already_done = (val_in == jnp.int32(0)) & (jnp.int32(i) > jnp.int32(0))
+        ch = jnp.where(already_done, space, zero + d)
+        digits_out = digits_in.at[col].set(ch)
+        val_out    = jnp.floor_divide(val_in, jnp.int32(10))
+        return digits_out, val_out
+
+    digits, _ = jax.lax.fori_loop(0, _NUMERIC_SLOT_WIDTH, _step, (digits, v_abs))
+    # If negative, place '-' just before the leading digit.  We find the
+    # leading digit by scanning left-to-right for the first non-space.
+    def _find_leading(i, acc):
+        found, pos = acc
+        is_digit = (digits[i] != space) & (digits[i] != minus)
+        pos = jnp.where(~found & is_digit, jnp.int32(i), pos)
+        return (found | is_digit, pos)
+
+    _, lead = jax.lax.fori_loop(
+        0, _NUMERIC_SLOT_WIDTH, _find_leading,
+        (jnp.bool_(False), jnp.int32(_NUMERIC_SLOT_WIDTH - 1)),
+    )
+    # Position to place '-' = max(lead-1, 0).
+    minus_pos = jnp.maximum(lead - jnp.int32(1), jnp.int32(0))
+    digits = jnp.where(
+        is_neg,
+        digits.at[minus_pos].set(minus),
+        digits,
+    )
+    return digits
+
+
 def emit(state: MessageState, msg_id: int, *args) -> MessageState:
-    """Render ``msg_id`` into message_buffer and rotate the ring buffer.
+    """Render ``msg_id`` (with optional printf-style args) into the buffer.
 
     Cite: vendor/nethack/src/pline.c::pline (line 103) — formats and pushes
     the message to WIN_MESSAGE; pline.c::dumplogmsg (lines 20-46) —
@@ -236,16 +399,23 @@ def emit(state: MessageState, msg_id: int, *args) -> MessageState:
       3. Look up the fixed template for ``msg_id`` and write it into the
          fresh message_buffer.  Byte 0 holds msg_id; bytes 1.. hold the
          pre-baked ASCII rendering (zero-padded to MSG_BUF_LEN).
+      4. If the MessageId has an argument slot (see _ARG_KIND), substitute
+         the first ``arg`` into the reserved byte range — this mirrors
+         vendor pline.c's printf vsprintf step.
 
     Parameters
     ----------
     state  : MessageState
     msg_id : int / jnp.int32  — MessageId enum value.  Out-of-range IDs
              render as NONE (all zeros).
-    *args  : optional jnp.int32 scalars — reserved for future substitution
-             (e.g. damage number, gold quantity).  Wave 28d ignores them;
-             they are accepted so call sites can be written once and
-             upgraded later without churn.
+    *args  : optional jnp.int32 scalars — printf-style arguments to be
+             substituted into the template.  Currently three messages
+             have arg slots wired:
+                YOU_KILL_MONSTER (3)  -> arg0 = monster entry_idx
+                FIND_GOLD        (4)  -> arg0 = decimal gold quantity
+                YOU_HIT_MONSTER  (11) -> arg0 = monster entry_idx
+             Additional args are ignored; templates without slots ignore
+             ``args`` entirely.
 
     Returns
     -------
@@ -253,8 +423,6 @@ def emit(state: MessageState, msg_id: int, *args) -> MessageState:
 
     JIT-safe: shape-static; uses ``.at[].set`` and integer indexing only.
     """
-    del args  # Reserved for printf-style argument substitution (future wave).
-
     # Step 1: rotate current buffer into history at history_index.
     safe_idx = jnp.mod(state.history_index, jnp.int32(HISTORY_LEN))
     new_history = state.message_history.at[safe_idx].set(state.message_buffer)
@@ -267,6 +435,54 @@ def emit(state: MessageState, msg_id: int, *args) -> MessageState:
     msg_id_i32 = jnp.int32(msg_id)
     safe_id    = jnp.clip(msg_id_i32, jnp.int32(0), jnp.int32(_N_TEMPLATES - 1))
     new_buffer = _TEMPLATE_TABLE[safe_id]
+
+    # Step 4: substitute the first arg into the reserved slot (if any).
+    # Mirrors vendor pline.c's vsprintf into the BUFSZ buffer.
+    if len(args) >= 1:
+        kind   = _ARG_KIND[safe_id]
+        offset = _ARG_OFFSET[safe_id]
+        width  = _ARG_WIDTH[safe_id]
+        arg0   = jnp.int32(args[0])
+
+        # Build the substitution bytes for both kinds; pick via lax.cond.
+        # NUMERIC: 10-byte right-aligned ASCII via _digits10.
+        # MONSTER: lookup MONSTERS[arg0].name from baked table.
+        numeric_bytes = _digits10(arg0)
+        safe_mon_idx  = jnp.clip(
+            arg0, jnp.int32(0), jnp.int32(_N_MONSTERS - 1)
+        )
+        monster_bytes = _MONSTER_NAME_TABLE[safe_mon_idx]
+
+        # Generic byte-range writer: writes `src[:width]` into
+        # new_buffer[offset:offset+width].  Implemented via fori_loop so
+        # the trace stays shape-static.
+        def _write_slot(buf, src, off, w):
+            def _wstep(i, b):
+                col_in  = jnp.int32(i)
+                col_out = jnp.int32(off) + col_in
+                # Bounds-guard: keep col_out within MSG_BUF_LEN.
+                col_out = jnp.clip(col_out, jnp.int32(0),
+                                   jnp.int32(MSG_BUF_LEN - 1))
+                active  = col_in < jnp.int32(w)
+                ch = jnp.where(active, src[col_in], b[col_out])
+                return b.at[col_out].set(ch)
+
+            max_w = max(_NUMERIC_SLOT_WIDTH, _MONSTER_NAME_SLOT_WIDTH)
+            return jax.lax.fori_loop(0, max_w, _wstep, buf)
+
+        # Apply substitution conditional on kind.  NONE -> no-op.
+        new_buffer = jax.lax.cond(
+            kind == jnp.int32(_ARG_KIND_NUMERIC),
+            lambda b: _write_slot(b, numeric_bytes, offset, width),
+            lambda b: b,
+            new_buffer,
+        )
+        new_buffer = jax.lax.cond(
+            kind == jnp.int32(_ARG_KIND_MONSTER),
+            lambda b: _write_slot(b, monster_bytes, offset, width),
+            lambda b: b,
+            new_buffer,
+        )
 
     return state.replace(
         message_buffer=new_buffer,

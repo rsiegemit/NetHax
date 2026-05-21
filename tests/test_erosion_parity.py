@@ -5,10 +5,13 @@ prefix words in inventory strings, matching vendor/nethack/src/objnam.c::
 add_erosion_words() lines 1142-1191.
 
 Type-id reference (Nethax/nethax/constants/objects.py):
-  37  = long sword  (WEAPON, IRON  -> rustprone)
-  35  = broadsword  (WEAPON, IRON  -> rustprone)
-  34  = silver saber (WEAPON, SILVER -> corrodeable-only)
-  113 = leather armor (ARMOR, LEATHER -> flammable)
+  37  = long sword         (WEAPON, IRON    -> rustprone)
+  35  = broadsword         (WEAPON, IRON    -> rustprone)
+  34  = silver saber       (WEAPON, SILVER  -> NO erosion class; vendor
+                            is_corrodeable=COPPER||IRON only — see
+                            include/objclass.h:200-207, Wave 28f).
+  102 = bronze plate mail  (ARMOR,  COPPER  -> corrodeable-only)
+  113 = leather armor      (ARMOR,  LEATHER -> flammable)
 """
 
 import os
@@ -41,7 +44,8 @@ _ARMOR_CAT  = int(ObjectClass.ARMOR_CLASS)
 # Vendor type-ids (see module docstring)
 _IRON_WEAPON_TYPE   = 37   # long sword (IRON)
 _LEATHER_ARMOR_TYPE = 113  # leather armor (LEATHER)
-_SILVER_WEAPON_TYPE = 34   # silver saber (SILVER, corrodeable-only)
+_SILVER_WEAPON_TYPE = 34   # silver saber (SILVER — NOT corrodeable per Wave 28f)
+_COPPER_ARMOR_TYPE  = 102  # bronze plate mail (COPPER, corrodeable-only)
 
 
 def _decode(row: jnp.ndarray) -> str:
@@ -83,6 +87,7 @@ def _make_inv_state(items: Item) -> InventoryState:
         alternate_weapon_slot=jnp.int8(-1),
         worn_armor=jnp.full((N_ARMOR_SLOTS,), -1, dtype=jnp.int8),
         worn_armor_ac_bonus=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.int8),
+        armor_stat_bonus=jnp.zeros((6,), dtype=jnp.int8),
         worn_amulet=jnp.int8(-1),
         worn_rings=jnp.full((2,), -1, dtype=jnp.int8),
         quiver=jnp.int8(-1),
@@ -224,24 +229,47 @@ class TestBurntLeatherArmor:
 
 
 class TestCorrodeableSilver:
-    """SILVER weapon: oeroded2 -> corroded series; oeroded unused.
+    """SILVER is NOT corrodeable per vendor (Wave 28f narrowing).
 
-    Canonical: vendor/nethack/src/objnam.c lines 1169-1178 (is_corrodeable).
+    Vendor macro: is_corrodeable(otmp) := oc_material == COPPER || IRON
+    (vendor/nethack/include/objclass.h lines 200-207).  Therefore a SILVER
+    weapon with oeroded2 or oerodeproof set must NOT produce any
+    corroded/corrodeproof prefix.
     """
 
-    def test_corroded_silver(self):
-        """oeroded2=1 on silver weapon -> 'corroded '."""
-        s = _render_slot0(_WEAPON_CAT, _SILVER_WEAPON_TYPE, oeroded2=1)
+    def test_silver_not_corroded(self):
+        """oeroded2 on silver weapon -> no corrosion prefix (vendor: silver
+        is not corrodeable)."""
+        for lvl in (1, 2, 3):
+            s = _render_slot0(_WEAPON_CAT, _SILVER_WEAPON_TYPE, oeroded2=lvl)
+            assert "corroded" not in s, f"unexpected corrosion at lvl={lvl} in {s!r}"
+
+    def test_silver_no_corrodeproof(self):
+        """oerodeproof on silver weapon -> no 'corrodeproof' prefix."""
+        s = _render_slot0(_WEAPON_CAT, _SILVER_WEAPON_TYPE, oerodeproof=True)
+        assert "corrodeproof" not in s, f"unexpected 'corrodeproof' in {s!r}"
+
+
+class TestCorrodeableCopper:
+    """COPPER armor: oeroded2 -> corroded series; oeroded unused.
+
+    Canonical: vendor/nethack/src/objnam.c lines 1169-1178 (is_corrodeable),
+    narrowed to COPPER|IRON in include/objclass.h:200-207 (Wave 28f).
+    """
+
+    def test_corroded_copper(self):
+        """oeroded2=1 on copper armor -> 'corroded '."""
+        s = _render_slot0(_ARMOR_CAT, _COPPER_ARMOR_TYPE, oeroded2=1)
         assert "corroded " in s, f"expected 'corroded ' in {s!r}"
 
-    def test_very_corroded_silver(self):
+    def test_very_corroded_copper(self):
         """oeroded2=2 -> 'very corroded '."""
-        s = _render_slot0(_WEAPON_CAT, _SILVER_WEAPON_TYPE, oeroded2=2)
+        s = _render_slot0(_ARMOR_CAT, _COPPER_ARMOR_TYPE, oeroded2=2)
         assert "very corroded " in s, f"expected 'very corroded ' in {s!r}"
 
-    def test_corrodeproof_silver(self):
-        """oerodeproof=True on silver weapon -> 'corrodeproof '."""
-        s = _render_slot0(_WEAPON_CAT, _SILVER_WEAPON_TYPE, oerodeproof=True)
+    def test_corrodeproof_copper(self):
+        """oerodeproof=True on copper armor -> 'corrodeproof '."""
+        s = _render_slot0(_ARMOR_CAT, _COPPER_ARMOR_TYPE, oerodeproof=True)
         assert "corrodeproof " in s, f"expected 'corrodeproof ' in {s!r}"
 
 
