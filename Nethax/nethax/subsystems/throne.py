@@ -40,13 +40,15 @@ def _random_stat_idx(rng) -> jnp.int32:
 
 
 def _drain_abilities(state, rng):
-    """Drain -1 from a random stat.
+    """Drain rn1(4,3) (= 3..6) from a random stat.
 
-    Cite: sit.c line 70 — adjattrib(rn2(A_MAX), -rn1(4,3), FALSE).
-    Simplified to -1 for JIT-purity (no per-stat clamping table yet).
+    Cite: vendor/nethack/src/sit.c:70 — adjattrib(rn2(A_MAX), -rn1(4,3), FALSE).
+    rn1(4,3) = 3 + rn2(4) ∈ [3, 6].
     """
-    rng_stat, _ = jax.random.split(rng)
+    from Nethax.nethax.rng import rn1
+    rng_stat, rng_drain = jax.random.split(rng)
     idx = _random_stat_idx(rng_stat)
+    drain = rn1(rng_drain, 4, 3).astype(jnp.int32)
     stats = jnp.stack([
         state.player_str.astype(jnp.int32),
         state.player_dex.astype(jnp.int32),
@@ -55,7 +57,7 @@ def _drain_abilities(state, rng):
         state.player_wis.astype(jnp.int32),
         state.player_cha.astype(jnp.int32),
     ])
-    new_stats = stats.at[idx].add(-1)
+    new_stats = stats.at[idx].add(-drain)
     return state.replace(
         player_str=new_stats[0].astype(jnp.int16),
         player_dex=new_stats[1].astype(jnp.int8),
