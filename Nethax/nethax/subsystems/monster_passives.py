@@ -157,29 +157,37 @@ def _passive_acid(state, rng):
     """Green mold passive: rnd(4) acid + weapon corrosion, gated by acid resistance.
 
     Cite: vendor/nethack/src/uhitm.c::passive() lines 5906-5933.
-    On contact: rn2(2) → 50% chance splash; acid corrosion on wielded weapon.
-    We simplify: always deal damage (if not resisted), always corrode weapon.
+    Vendor semantics:
+      - splash damage fires only if rn2(2) (50% chance) — line 5907.
+      - body armor corrosion fires only if !rn2(30) (1/30 chance) — line 5920.
     """
     from Nethax.nethax.subsystems.status_effects import Intrinsic
     from Nethax.nethax.rng import rnd
+    from Nethax.nethax.rng import rn2 as _rn2
+
+    rng_splash, rng_dmg, rng_corrode = jax.random.split(rng, 3)
 
     acid_res = (
         state.status.intrinsics[int(Intrinsic.RESIST_ACID)]
         | (state.status.timed_intrinsics[int(Intrinsic.RESIST_ACID)] > 0)
     )
-    dmg = jnp.where(acid_res, jnp.int32(0), rnd(rng, 4).astype(jnp.int32))
+    # rn2(2) gate — 50% chance to splash. Cite: uhitm.c:5907.
+    splash = _rn2(rng_splash, 2) != jnp.int32(0)
+    raw_dmg = rnd(rng_dmg, 4).astype(jnp.int32)
+    dmg = jnp.where(splash & ~acid_res, raw_dmg, jnp.int32(0))
     new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(0))
     new_done = state.done | (new_hp <= jnp.int32(0))
     state = state.replace(player_hp=new_hp, done=new_done)
 
     # Corrode wielded weapon (vendor passive_obj AD_ACID → erode_obj ERODE_CORRODE).
-    # Cite: vendor/nethack/src/uhitm.c::passive() line 5906 (AD_ACID) →
-    #       vendor/nethack/src/trap.c::erode_obj kind=ERODE_CORRODE.
+    # Cite: vendor/nethack/src/uhitm.c::passive() line 5920 — !rn2(30) gate.
     from Nethax.nethax.subsystems.items import erode_obj_slot, ERODE_CORRODE
 
     wielded = state.inventory.wielded.astype(jnp.int32)
     has_weapon = wielded >= jnp.int32(0)
-    should_corrode = has_weapon & (~acid_res)
+    # 1/30 chance: !rn2(30) is true when rn2(30) == 0.
+    corrode_roll = _rn2(rng_corrode, 30) == jnp.int32(0)
+    should_corrode = splash & has_weapon & (~acid_res) & corrode_roll
 
     def _do_corrode(items_in):
         safe_w = jnp.clip(wielded, 0, items_in.oeroded.shape[0] - 1)
