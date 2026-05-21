@@ -43,22 +43,27 @@ def _build() -> tuple:
     ldam1_n[0]     = 1
     ldam1_sides[0] = 1
 
-    # Extra dice from vendor/nethack/src/weapon.c switch statements:
+    # Extra dice from vendor/nethack/src/weapon.c switch statements
+    # (NLE vendor mirror at vendor/nle/src/weapon.c lines 220-289 matches;
+    # NLE has no SILVER_MACE so it is omitted from the small +1 group).
     #
     # Small target (weapon.c:266-295):
-    #   +1   -> TRIDENT(16), SPETUM(44), MACE(56), WAR_HAMMER(58), FLAIL(63)
+    #   +1   -> IRON_CHAIN(450), CROSSBOW_BOLT(6), MACE(56), WAR_HAMMER(58),
+    #           FLAIL(63), SPETUM(44), TRIDENT(16)
     #   +1d4 -> BATTLE_AXE(28), BARDICHE(48), BILL_GUISARME(53), GUISARME(52),
     #           LUCERN_HAMMER(54), MORNING_STAR(57), RANSEUR(43), BROADSWORD(35),
     #           ELVEN_BROADSWORD(36), RUNESWORD(41), VOULGE(49)
+    #   +1d6 -> ACID_VENOM(452)
     #
     # Large target (weapon.c:228-261):
-    #   +1   -> MORNING_STAR(57), PARTISAN(42), RUNESWORD(41), ELVEN_BROADSWORD(36), BROADSWORD(35)
+    #   +1   -> IRON_CHAIN(450), CROSSBOW_BOLT(6), MORNING_STAR(57),
+    #           PARTISAN(42), RUNESWORD(41), ELVEN_BROADSWORD(36), BROADSWORD(35)
     #   +1d4 -> FLAIL(63), RANSEUR(43), VOULGE(49)
-    #   +1d6 -> HALBERD(47), SPETUM(44)
+    #   +1d6 -> ACID_VENOM(452), HALBERD(47), SPETUM(44)
     #   +2d4 -> BATTLE_AXE(28), BARDICHE(48), TRIDENT(16)
     #   +2d6 -> TWO_HANDED_SWORD(38), TSURUGI(40), DWARVISH_MATTOCK(50)
 
-    for idx in (16, 44, 56, 58, 63):       # small +1 (1d1)
+    for idx in (6, 16, 44, 56, 58, 63, 450):   # small +1 (1d1)
         sdam2_n[idx]     = 1
         sdam2_sides[idx] = 1
 
@@ -66,7 +71,10 @@ def _build() -> tuple:
         sdam2_n[idx]     = 1
         sdam2_sides[idx] = 4
 
-    for idx in (35, 36, 41, 42, 57):       # large +1 (1d1)
+    sdam2_n[452]     = 1                       # small +1d6 (ACID_VENOM)
+    sdam2_sides[452] = 6
+
+    for idx in (6, 35, 36, 41, 42, 57, 450):   # large +1 (1d1)
         ldam2_n[idx]     = 1
         ldam2_sides[idx] = 1
 
@@ -74,7 +82,7 @@ def _build() -> tuple:
         ldam2_n[idx]     = 1
         ldam2_sides[idx] = 4
 
-    for idx in (44, 47):                   # large +1d6
+    for idx in (44, 47, 452):              # large +1d6 (incl. ACID_VENOM)
         ldam2_n[idx]     = 1
         ldam2_sides[idx] = 6
 
