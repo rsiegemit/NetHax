@@ -82,10 +82,18 @@ def _state_with_food(type_id: int, corpse_entry_idx: int = -1) -> EnvState:
 # ---------------------------------------------------------------------------
 
 def test_ascension_score_formula():
-    """Vendor formula: xp + xp + gold + 100*(deepest-20) when ascended.
+    """Vendor formula: ascension doubles (xp + gold_adj + travel + deep_b),
+    plus the 5000 alignment bonus (wave35, end.c:1325-1352 ASCENDED branch).
 
-    Input:  XP=10000, gold=5000, deepest=25, ascended=True
-    Expected: 10000 + 10000 + 5000 + 100*5 = 25500
+    Input:  XP=10000, gold=5000, deepest=25, ascended=True.
+    gold_adj    = 5000 - 5000//10 = 4500            (end.c:1337 death tax)
+    travel_b    = 50 * (25 - 1) = 1200              (end.c:1338-1339)
+    deep_b      = 1000 * min(10, 25-20) = 5000      (end.c:1340)
+    base        = 10000 + 4500 + 1200 + 5000 = 20700
+    asc_b       = 20700                             (ascension doubles base)
+    alignment_b = 5000                              (wave35; ASCENDED + aligned)
+    conduct_b   = 900                               (counters==0 → all kept)
+    total       = 20700 + 20700 + 5000 + 900 = 47300
     Cite: vendor/nethack/src/end.c::really_done lines 1325-1352.
     """
     state = _violate_all_conducts(_fresh_state())
@@ -99,11 +107,16 @@ def test_ascension_score_formula():
         ),
         player_gold=jnp.int32(5000),
     )
-    assert int(compute_final_score(state)) == 25500
+    assert int(compute_final_score(state)) == 47300
 
 
 def test_ascension_score_no_deep_bonus_below_20():
-    """deepest <= 20 contributes 0 to the deep bonus even when ascended."""
+    """deepest <= 20 contributes 0 to the deep bonus even when ascended.
+
+    XP=1000, gold=0, deepest=15, ascended=True.
+    gold_adj=0, travel_b=50*14=700, deep_b=0.
+    base=1700, asc_b=1700, alignment_b=5000, conduct_b=900 → total=9300.
+    """
     state = _violate_all_conducts(_fresh_state())
     state = state.replace(
         scoring=add_experience(
@@ -115,8 +128,7 @@ def test_ascension_score_no_deep_bonus_below_20():
         ),
         player_gold=jnp.int32(0),
     )
-    # xp doubled only, no deep bonus
-    assert int(compute_final_score(state)) == 2000
+    assert int(compute_final_score(state)) == 9300
 
 
 # ---------------------------------------------------------------------------

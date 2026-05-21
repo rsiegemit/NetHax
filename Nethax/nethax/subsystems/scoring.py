@@ -356,6 +356,55 @@ def compute_conduct_bonus(state) -> jnp.ndarray:
     return jnp.int32(jnp.sum(jnp.where(kept, bonuses, jnp.int32(0))))
 
 
+def count_artifacts(state) -> jnp.ndarray:
+    """Count artifacts the player is carrying.
+
+    Vendor: end.c::really_done lines 1430-1452 walks the hero's invent
+    chain and adds ``arti_cost(obj)`` for each artifact carried on
+    ESCAPED/ASCENDED.  Nethax approximates this as a flat
+    ARTIFACT_BONUS per artifact (50 pts; the per-artifact constant
+    cited at end.c:1452).
+
+    Nethax-specific note: the per-slot ``Item`` struct does not carry
+    an ``artifact_idx`` field; the only artifact tracking on
+    InventoryState is ``wielded_artifact_idx`` (scalar, -1 = none).
+    This helper returns 1 iff the wielded slot holds an artifact, else
+    0.  When per-slot artifact tracking lands, replace the body with a
+    full inventory walk that counts items where ``artifact_idx >= 0``.
+
+    Cite: vendor/nethack/src/end.c::really_done lines 1430-1452.
+
+    Returns
+    -------
+    jnp.int32 scalar — number of artifacts carried (0 or 1).
+    """
+    art_idx = state.inventory.wielded_artifact_idx.astype(jnp.int32)
+    return jnp.int32(art_idx >= jnp.int32(0))
+
+
+def compute_alignment_bonus(state) -> jnp.ndarray:
+    """Return the alignment bonus awarded at ascension.
+
+    Vendor: end.c::really_done lines 1325-1352 — when ASCENDED with
+    matching alignment, the final score includes a 5000-point bonus.
+    Per the ascension pipeline (subsystems.ascension.check_ascension,
+    citing pray.c::dosacrifice / offer_real_amulet), ``ascended`` is
+    only set when the player stood on the coaligned Astral altar, so
+    "ascended && aligned-with-god" reduces to ``state.scoring.ascended``.
+
+    Cite: vendor/nethack/src/end.c::really_done lines 1325-1352.
+
+    Returns
+    -------
+    jnp.int32 scalar — 5000 if ascended, else 0.
+    """
+    return jnp.where(
+        state.scoring.ascended,
+        jnp.int32(5000),
+        jnp.int32(0),
+    )
+
+
 def compute_final_score(state) -> jnp.ndarray:
     """Compute the end-of-game score.
 
@@ -364,14 +413,15 @@ def compute_final_score(state) -> jnp.ndarray:
         total = u.urexp                              # XP earned
               + (u.urexp if ASCENDED else 0)         # ascension doubles XP
               + gold_carried                          # net gold (end.c:1329)
-              + ARTIFACT_BONUS * n_artifacts          # end.c:1452 (0 if none)
+              + ARTIFACT_BONUS * n_artifacts          # end.c:1452
               + DEEP_LEVEL_BONUS * max(0, deepest-20) # end.c:1340
+              + alignment_bonus                       # end.c (ASCENDED + aligned)
               + conduct_bonus                         # insight.c simplification
 
-    Nethax Wave 6 simplifications (documented divergences):
-        * n_artifacts=0 (artifact tracking not yet implemented).
-        * alignment_bonus=0 (alignment-record bonus not yet implemented).
-        * gold taken as-is (no ``tmp/10`` post-death deduction, end.c:1337).
+    Wave 35 audit fix: ``n_artifacts`` now sourced from count_artifacts
+    (walks state.inventory) and ``alignment_bonus`` from
+    compute_alignment_bonus (5000 on aligned ascension).  Gold uses the
+    ``tmp - tmp/10`` death-tax form per end.c:1337.
 
     JIT-safe — every term is a jnp scalar.
     """
@@ -404,12 +454,18 @@ def compute_final_score(state) -> jnp.ndarray:
     base    = xp_pts + gold_adj + travel_b + deep_b
     asc_b   = jnp.where(scoring.ascended, base, jnp.int32(0))
 
-    # Artifact bonus: 50 * n_artifacts (end.c:1452); 0 until tracking added.
-    artifact_b = jnp.int32(0)
+    # Artifact bonus: ARTIFACT_BONUS * n_artifacts (end.c:1452).  Wave 35:
+    # n_artifacts now sourced from count_artifacts(state).
+    artifact_b = jnp.int32(ARTIFACT_BONUS) * count_artifacts(state)
+
+    # Alignment bonus: 5000 if ASCENDED on the coaligned altar.
+    # Cite: vendor/nethack/src/end.c::really_done lines 1325-1352.
+    # Wave 35: previously hardcoded 0.
+    alignment_b = compute_alignment_bonus(state)
 
     conduct_b = compute_conduct_bonus(state)
 
-    total = base + asc_b + artifact_b + conduct_b
+    total = base + asc_b + artifact_b + alignment_b + conduct_b
     return jnp.int32(total)
 
 
