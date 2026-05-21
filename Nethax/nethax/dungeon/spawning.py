@@ -32,6 +32,8 @@ from Nethax.nethax.constants.monsters import (
     NUMMONS,
     G_NOGEN,
     G_UNIQ,
+    G_SGROUP,
+    G_LGROUP,
     AttackType,
     DamageType,
     MZ_LARGE,
@@ -40,6 +42,7 @@ from Nethax.nethax.constants.monsters import (
     M2_MAGIC,
     M2_NASTY,
     M2_GREEDY,
+    M2_STRONG,
     MS_SOLDIER,
     MS_PRIEST,
     MS_SPELL,
@@ -59,38 +62,151 @@ from Nethax.nethax.subsystems.monster_ai import (
 # Module-level constants built at import time from the Python MONSTERS tuple
 # ---------------------------------------------------------------------------
 
-def _compute_monstr_full(entry) -> int:
-    """Full vendor monstr[] formula per makemon.c::monstr_init.
+def _mstrength_ranged_attk(entry) -> bool:
+    """Mirror of vendor mondata.c::mstrength_ranged_attk (lines 500-512).
 
-    monstr = level
-           + speed_bonus       (move_speed // 8, capped at 5)
-           + attk_count        (number of attacks with dice_n > 0)
-           + breath_bonus      (+5 if any attack is AT_BREA)
-           + petrify_bonus     (+10 if any attack is AD_STON)
+    Returns True if any attack type is AT_WEAP or higher (AT_WEAP=254,
+    AT_MAGC=255), OR is one of {AT_BREA, AT_SPIT, AT_GAZE}.
+
+    Vendor (mondata.c:504-509):
+        atk_mask = (1 << AT_BREA) | (1 << AT_SPIT) | (1 << AT_GAZE)
+        for i in NATTK:
+            j = mattk[i].aatyp
+            if j >= AT_WEAP or (j < 32 && (atk_mask & (1 << j)) != 0):
+                return TRUE
+    """
+    for atk in (entry.attacks or ()):
+        j = int(atk[0])
+        if j >= int(AttackType.AT_WEAP):
+            return True
+        if j < 32 and j in (
+            int(AttackType.AT_BREA),
+            int(AttackType.AT_SPIT),
+            int(AttackType.AT_GAZE),
+        ):
+            return True
+    return False
+
+
+def _compute_monstr_full(entry) -> int:
+    """Byte-equal vendor mstrength formula.
 
     Canonical source: vendor/nethack/src/mondata.c::mstrength
-    (Wave 6 Phase B uses the simplified spec formula above; mstrength's
-    full ranged/special-damage tweaks are deferred.)
+    (lines 428-498, with helper mstrength_ranged_attk at lines 500-512).
+
+    Steps (vendor):
+      tmp = ptr->mlevel; if (tmp > 49) tmp = 2 * (tmp - 6) / 4;
+      n  = !!(geno & G_SGROUP) + (!!(geno & G_LGROUP) << 1)
+      n += mstrength_ranged_attk(ptr)
+      n += (ac < 4) + (ac < 0)
+      n += (mmove >= 18)
+      for each attack:
+          n += (aatyp > 0)
+          n += (aatyp == AT_MAGC)
+          n += (aatyp == AT_WEAP && (mflags2 & M2_STRONG))
+          if (aatyp == AT_EXPL):
+              n += 3 if adtyp in (AD_COLD, AD_FIRE) else 5 if adtyp == AD_ELEC else 0
+      for each attack:
+          if adtyp in (AD_DRLI, AD_STON, AD_DRST, AD_DRDX, AD_DRCO, AD_WERE): n += 2
+          elif name != "grid bug": n += (adtyp != AD_PHYS)
+          n += (damd * damn > 23)
+      if name == "leprechaun":  n -= 2
+      if name in ("killer bee", "soldier ant"):  n += 2
+      if n == 0:        tmp -= 1
+      elif n < 6:       tmp += (n // 3 + 1)
+      else:             tmp += (n // 2)
+      return max(tmp, 0)
     """
-    level = entry.level
-    speed_bonus = min(entry.move_speed // 8, 5)
+    tmp = int(entry.level)
+    if tmp > 49:
+        tmp = 2 * (tmp - 6) // 4
+
+    geno = int(entry.generation_mask)
+    n = 1 if (geno & G_SGROUP) else 0
+    n += (1 if (geno & G_LGROUP) else 0) << 1
+
+    # Ranged attack bonus (mondata.c:440-441).
+    if _mstrength_ranged_attk(entry):
+        n += 1
+
+    # AC threshold bumps (mondata.c:444-445).
+    ac = int(entry.ac)
+    if ac < 4:
+        n += 1
+    if ac < 0:
+        n += 1
+
+    # Speed bump (mondata.c:448).
+    if int(entry.move_speed) >= 18:
+        n += 1
+
+    mflags2 = int(entry.flags2) & 0xFFFFFFFF
+    name = entry.name
+
+    AT_MAGC = int(AttackType.AT_MAGC)
+    AT_WEAP = int(AttackType.AT_WEAP)
+    AT_EXPL = int(AttackType.AT_EXPL)
+    AD_COLD = int(DamageType.AD_COLD)
+    AD_FIRE = int(DamageType.AD_FIRE)
+    AD_ELEC = int(DamageType.AD_ELEC)
+    AD_DRLI = int(DamageType.AD_DRLI)
+    AD_STON = int(DamageType.AD_STON)
+    AD_DRST = int(DamageType.AD_DRST)
+    AD_DRDX = int(DamageType.AD_DRDX)
+    AD_DRCO = int(DamageType.AD_DRCO)
+    AD_WERE = int(DamageType.AD_WERE)
+    AD_PHYS = int(DamageType.AD_PHYS)
+    M2_STRONG_MASK = int(M2_STRONG) & 0xFFFFFFFF
+
     attacks = entry.attacks or ()
-    attk_count = 0
-    has_breath = False
-    has_petrify = False
+
+    # First attack loop (mondata.c:451-464).
     for atk in attacks:
-        atyp = atk[0]
-        dtyp = atk[1]
-        dice_n = atk[2]
-        if dice_n > 0:
-            attk_count += 1
-        if int(atyp) == int(AttackType.AT_BREA):
-            has_breath = True
-        if int(dtyp) == int(DamageType.AD_STON):
-            has_petrify = True
-    breath_bonus = 5 if has_breath else 0
-    petrify_bonus = 10 if has_petrify else 0
-    return int(level + speed_bonus + attk_count + breath_bonus + petrify_bonus)
+        aatyp = int(atk[0])
+        adtyp = int(atk[1])
+        if aatyp > 0:
+            n += 1
+        if aatyp == AT_MAGC:
+            n += 1
+        if aatyp == AT_WEAP and (mflags2 & M2_STRONG_MASK):
+            n += 1
+        if aatyp == AT_EXPL:
+            if adtyp == AD_COLD or adtyp == AD_FIRE:
+                n += 3
+            elif adtyp == AD_ELEC:
+                n += 5
+
+    # Second attack loop — special damage (mondata.c:467-475).
+    for atk in attacks:
+        adtyp = int(atk[1])
+        damn = int(atk[2])
+        damd = int(atk[3])
+        if adtyp in (AD_DRLI, AD_STON, AD_DRST, AD_DRDX, AD_DRCO, AD_WERE):
+            n += 2
+        elif name != "grid bug":
+            # Vendor uses strcmp() != 0 ⇒ adds (adtyp != AD_PHYS) for every
+            # non-grid-bug.  Note: matches vendor even though it shadows the
+            # AD_PHYS=0 default in NO_ATTK slots.
+            n += 1 if (adtyp != AD_PHYS) else 0
+        # damd * damn > 23 bump applies to every monster including grid bug.
+        if (damd * damn) > 23:
+            n += 1
+
+    # Name-keyed bumps (mondata.c:479-486).
+    if name == "leprechaun":
+        n -= 2
+    if name in ("killer bee", "soldier ant"):
+        n += 2
+
+    # Final scaling (mondata.c:488-494).
+    if n == 0:
+        tmp -= 1
+    elif n < 6:
+        tmp += (n // 3 + 1)
+    else:
+        tmp += (n // 2)
+
+    return tmp if tmp >= 0 else 0
 
 
 def _compute_difficulties() -> jnp.ndarray:
