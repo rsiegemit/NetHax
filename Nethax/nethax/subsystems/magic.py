@@ -719,17 +719,77 @@ def _effect_slow_monster(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_protection(state: dict, rng: jax.Array) -> dict:
-    """PROTECTION: grant timed PROTECTION intrinsic.
+    """PROTECTION: vendor cast_protection formula.
 
-    Vendor: spell.c::cast_protection line 1169-1172 — sets
-    ``u.uspmtime = P_EXPERT ? 20 : 10`` per stack of ``u.uspellprot``.
-    Wave 6 simplified: grant 10-turn PROTECTION intrinsic on each cast.
-    Cite: vendor/nethack/src/spell.c::cast_protection.
+    Cite: vendor/nethack/src/spell.c::cast_protection lines 1103-1177.
+
+        int l = u.ulevel, loglev = 0,
+            gain, natac = u.uac + u.uspellprot;
+        while (l) { loglev++; l /= 2; }            /* loglev = log2(ulevel)+1 */
+        natac = (10 - natac) / 10;                 /* scale + invert */
+        gain  = loglev - (int) u.uspellprot / (4 - min(3, natac));
+        if (gain > 0) {
+            u.uspellprot += gain;
+            u.uspmtime = (P_SKILL(spell_skilltype(SPE_PROTECTION)) == P_EXPERT)
+                            ? 20 : 10;
+        }
+
+    Encoding: PROTECTION timer in ``timed_intrinsics`` stores
+    ``u.uspellprot * u.uspmtime``.  We recover ``u.uspellprot`` by
+    dividing the current timer by the *current* call's ``u.uspmtime``
+    (lossy if the skill tier changed between casts; matches vendor when
+    constant).  ``u.uac`` mirrors vendor's natural AC; in Nethax
+    ``state.player_ac`` is not adjusted by ``uspellprot`` (no find_ac
+    subtraction), so it already equals vendor's ``u.uac + u.uspellprot``.
     """
     from Nethax.nethax.subsystems.status_effects import Intrinsic
-    current = state["status"].timed_intrinsics[Intrinsic.PROTECTION]
-    new_val = jnp.maximum(current, jnp.int32(10))
-    new_timers = state["status"].timed_intrinsics.at[Intrinsic.PROTECTION].set(new_val)
+    from Nethax.nethax.subsystems.skills import SkillId, SkillLevel
+
+    # uspmtime = 20 if cleric-spell skill is EXPERT, else 10.
+    # SPE_PROTECTION is P_CLERIC_SPELL per objects.h line 1400-1402.
+    # Cite: spell.c:1169 — spell_skilltype(SPE_PROTECTION) == P_EXPERT.
+    skill_id = jnp.int32(SkillId.CLERIC_SPELL)
+    skill_level = state["skills"].level[skill_id].astype(jnp.int32)
+    is_expert = skill_level >= jnp.int32(SkillLevel.P_EXPERT)
+    uspmtime = jnp.where(is_expert, jnp.int32(20), jnp.int32(10))
+
+    # Recover u.uspellprot from current timer.
+    current_timer = state["status"].timed_intrinsics[Intrinsic.PROTECTION].astype(jnp.int32)
+    uspellprot = current_timer // jnp.maximum(uspmtime, jnp.int32(1))
+
+    # loglev = log2(ulevel) + 1, computed by vendor's bit-loop:
+    #   l = u.ulevel; while (l) { loglev++; l /= 2; }
+    # Use lax.while_loop for JIT purity.
+    ulevel = jnp.maximum(state["player_xl"].astype(jnp.int32), jnp.int32(0))
+
+    def _loglev_body(carry):
+        l, lv = carry
+        return (l // jnp.int32(2), lv + jnp.int32(1))
+
+    def _loglev_cond(carry):
+        l, _lv = carry
+        return l > jnp.int32(0)
+
+    _, loglev = lax.while_loop(_loglev_cond, _loglev_body,
+                                (ulevel, jnp.int32(0)))
+
+    # natac = u.uac + u.uspellprot, then (10 - natac) / 10.
+    # state.player_ac mirrors vendor's "natural AC" (uspellprot not
+    # factored in via find_ac in Nethax), so use it directly as
+    # (u.uac + u.uspellprot) — see docstring.
+    uac_raw = state["player_ac"].astype(jnp.int32)
+    natac_pos = (jnp.int32(10) - uac_raw) // jnp.int32(10)  # vendor C int div
+    natac_clamped = jnp.minimum(jnp.int32(3), natac_pos)
+    denom = jnp.maximum(jnp.int32(4) - natac_clamped, jnp.int32(1))
+    gain = loglev - uspellprot // denom
+
+    # If gain > 0: bump u.uspellprot, then write timer = uspellprot * uspmtime.
+    apply_gain = gain > jnp.int32(0)
+    new_uspellprot = jnp.where(apply_gain, uspellprot + gain, uspellprot)
+    new_timer = jnp.where(apply_gain,
+                          new_uspellprot * uspmtime,
+                          current_timer)
+    new_timers = state["status"].timed_intrinsics.at[Intrinsic.PROTECTION].set(new_timer)
     new_status = state["status"].replace(timed_intrinsics=new_timers)
     return {**state, "status": new_status}
 
