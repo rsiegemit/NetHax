@@ -353,8 +353,13 @@ def test_jit_build_nle_observation():
     assert obs["blstats"].shape == (27,)
 
 
+@pytest.mark.timeout(300)
 def test_jit_env_step():
-    """env.step must be jit-compilable end-to-end."""
+    """env.step must be jit-compilable end-to-end.
+
+    Wave34e: cold compile of the full env.step graph is ~200s on CPU;
+    timeout bumped to 300s so the test isn't killed by the 120s default.
+    """
     from Nethax.nethax.env import NethaxEnv
 
     env = NethaxEnv()

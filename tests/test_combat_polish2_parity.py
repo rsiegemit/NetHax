@@ -71,30 +71,34 @@ def _state_with_weapon(type_id: int):
 
 
 def _melee_damage_samples(state, n=_N_TRIALS, seed=7):
-    rng = jax.random.PRNGKey(seed)
-    damages = []
-    for _ in range(n):
-        rng, sub = jax.random.split(rng)
-        _s, dmg, _hit = melee_attack(state, sub, jnp.int32(0))
-        damages.append(int(dmg))
-    return damages
+    """Run melee_attack n times; collect damage values.
+
+    JIT-compiled + vmapped: a single compile of `melee_attack` is reused
+    across all n trials.  Eager calls retrace the giant combat graph each
+    invocation and exceed the 120s pytest timeout for n=600.  Mirrors the
+    wave 33d pattern in tests/test_combat_polish_parity.py.
+    """
+    keys = jax.random.split(jax.random.PRNGKey(seed), n)
+    idx = jnp.int32(0)
+    vsample = jax.jit(jax.vmap(lambda k: melee_attack(state, k, idx)[1]))
+    damages = vsample(keys)
+    return [int(d) for d in damages]
 
 
 def _melee_hit_rate(state, n=_N_TRIALS, seed=17):
-    rng = jax.random.PRNGKey(seed)
-    hits = 0
-    for _ in range(n):
-        rng, sub = jax.random.split(rng)
-        _s, _dmg, hit = melee_attack(state, sub, jnp.int32(0))
-        hits += int(hit)
-    return hits / n
+    """Hit rate over n trials — vmapped to avoid per-trial JIT retrace."""
+    keys = jax.random.split(jax.random.PRNGKey(seed), n)
+    idx = jnp.int32(0)
+    vsample = jax.jit(jax.vmap(lambda k: melee_attack(state, k, idx)[2]))
+    hits = vsample(keys)
+    return float(jnp.sum(hits.astype(jnp.int32))) / n
 
 
 # ---------------------------------------------------------------------------
 # 1. Two-handed STR scaling — vendor/nethack/src/uhitm.c:1467-1468
 # ---------------------------------------------------------------------------
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 def test_two_handed_str_scaling():
     """TWO_HANDED_SWORD with max STR should average more damage than LONG_SWORD.
 
@@ -124,7 +128,7 @@ def test_two_handed_str_scaling():
 # 2. Sleeping target uses sleep_timer — vendor/nethack/src/uhitm.c:387
 # ---------------------------------------------------------------------------
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 def test_sleeping_target_uses_sleep_timer():
     """sleep_timer=10 should give +2 to-hit vs sleep_timer=0.
 
@@ -169,7 +173,7 @@ def test_sleeping_target_uses_sleep_timer():
 # 3. Paralyzed target — vendor/nethack/src/uhitm.c:393-394
 # ---------------------------------------------------------------------------
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 def test_paralyzed_target_immobile_bonus():
     """paralyzed_timer=5 should give +4 to-hit (immobile category).
 
@@ -206,7 +210,7 @@ def test_paralyzed_target_immobile_bonus():
 # 4. Status timers tick down — vendor timeout.c::run_timers pattern
 # ---------------------------------------------------------------------------
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 def test_status_timers_tick_down():
     """After one monsters_step_all tick, sleep_timer should decrease by 1.
 

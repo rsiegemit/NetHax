@@ -139,6 +139,7 @@ def test_monster_kills_player():
     )
 
 
+@pytest.mark.timeout(300)
 def test_armor_reduces_damage():
     """Same monster attacks player with and without armor; compare HP loss.
 
@@ -152,6 +153,11 @@ def test_armor_reduces_damage():
     difference in hit-rate.  With monster_hp=100, mlev≈25 makes
     ``tmp = 10+10+25 = 45 > rnd(20)`` always true regardless of armor.
     Many trials are aggregated so a single seed's run doesn't dominate.
+
+    Wave34e perf fix: JIT-compile env.step once outside the trial loop.
+    Without JIT, every call retraces the full step graph and 512 retraces
+    blow past the 120s pytest timeout.  One compile + many fast calls
+    finishes in well under 5 min.
     """
     import jax
     import jax.numpy as jnp
@@ -162,20 +168,26 @@ def test_armor_reduces_damage():
     n_turns = 8
     bare_total = 0
     armor_total = 0
+    # Build env once and JIT-compile step — bare/armored states share the
+    # same pytree structure so a single jit caches across both branches.
+    env_b, _, _ = _make_env_with_monster(
+        monster_hp=4, monster_dice_n=1, monster_dice_sides=6, player_hp=200
+    )
+    jstep = jax.jit(env_b.step)
+    action = jnp.int32(ord("."))
     for seed in range(n_trials):
         # Bare
-        env_b, state_b, _ = _make_env_with_monster(
+        _, state_b, _ = _make_env_with_monster(
             monster_hp=4, monster_dice_n=1, monster_dice_sides=6, player_hp=200
         )
         rng_b = jax.random.PRNGKey(seed)
-        action = jnp.int32(ord("."))
         for _ in range(n_turns):
             rng_b, step_rng = jax.random.split(rng_b)
-            state_b, _, _, _, _ = env_b.step(state_b, action, step_rng)
+            state_b, _, _, _, _ = jstep(state_b, action, step_rng)
         bare_total += 200 - int(state_b.player_hp)
 
         # Armored: AC bonus +5 in slot 0 — large enough to dominate noise.
-        env_a, state_a, _ = _make_env_with_monster(
+        _, state_a, _ = _make_env_with_monster(
             monster_hp=4, monster_dice_n=1, monster_dice_sides=6, player_hp=200
         )
         inv = state_a.inventory
@@ -184,7 +196,7 @@ def test_armor_reduces_damage():
         rng_a = jax.random.PRNGKey(seed)
         for _ in range(n_turns):
             rng_a, step_rng = jax.random.split(rng_a)
-            state_a, _, _, _, _ = env_a.step(state_a, action, step_rng)
+            state_a, _, _, _, _ = jstep(state_a, action, step_rng)
         armor_total += 200 - int(state_a.player_hp)
 
     assert armor_total < bare_total, (

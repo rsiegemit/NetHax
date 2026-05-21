@@ -64,10 +64,14 @@ def test_conduct_step_noop():
     assert _trees_equal(step(state, _RNG), state)
 
 
+@pytest.mark.timeout(300)
 def test_status_effects_step_noop():
     """Wave 3: step() now takes full EnvState (hunger / regen ticks need player_hp etc).
     No-op semantics: input action contributes nothing; status state unchanged when
     player has not taken damage and is well-fed.
+
+    Wave34e: bump timeout — first call to env.step is an eager retrace
+    of the full graph (~200s) since this test doesn't jit-compile.
     """
     import jax
     from Nethax.nethax import NethaxEnv

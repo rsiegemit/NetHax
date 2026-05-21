@@ -72,8 +72,13 @@ def test_full_step_lifecycle():
         )
 
 
+@pytest.mark.timeout(300)
 def test_jit_full_step():
-    """jax.jit(env.step) runs without retracing across 5 steps."""
+    """jax.jit(env.step) runs without retracing across 5 steps.
+
+    Wave34e: cold compile of the full env.step graph is ~200s on CPU;
+    timeout bumped to 300s so the test isn't killed by the 120s default.
+    """
     import jax
     import jax.numpy as jnp
     from Nethax.nethax.env import NethaxEnv

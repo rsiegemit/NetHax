@@ -10,6 +10,7 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 
 def _env_with_adjacent_monster(
@@ -125,9 +126,13 @@ def test_monster_attacks_waiting_player():
     )
 
 
+@pytest.mark.timeout(300)
 def test_monster_ai_step_jit_compatible():
     """jax.jit(env.step) should compile cleanly with monster_ai.step in the
-    pipeline and produce a state on the first call."""
+    pipeline and produce a state on the first call.
+
+    Wave34e: cold compile of env.step is ~200s on CPU; bump timeout to 300s.
+    """
     from Nethax.nethax.env import NethaxEnv
 
     rng = jax.random.PRNGKey(0)

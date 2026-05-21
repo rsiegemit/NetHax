@@ -43,6 +43,7 @@ def _measure(fn, *args):
     return time.perf_counter() - t0
 
 
+@pytest.mark.timeout(360)
 def test_step_impl_jit_compile_within_5min():
     """``jax.jit(_step_impl)`` cold-compile must finish within 300 s on CPU."""
     state = _build_state()
@@ -54,6 +55,7 @@ def test_step_impl_jit_compile_within_5min():
     )
 
 
+@pytest.mark.timeout(360)
 def test_step_impl_vmap_compile_within_5min():
     """``jax.jit(jax.vmap(_step_impl))`` cold-compile must finish within 300 s."""
     state = _build_state()
@@ -71,6 +73,7 @@ def test_step_impl_vmap_compile_within_5min():
     )
 
 
+@pytest.mark.timeout(360)
 def test_step_impl_scan_compile_within_5min():
     """``jit(scan(_step_impl, length=16))`` cold-compile must finish within 300 s.
 
