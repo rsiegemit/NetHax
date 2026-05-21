@@ -75,12 +75,17 @@ def _make_inv_state(items: Item) -> InventoryState:
         alternate_weapon_slot=jnp.int8(-1),
         worn_armor=jnp.full((N_ARMOR_SLOTS,), -1, dtype=jnp.int8),
         worn_armor_ac_bonus=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.int8),
+        armor_stat_bonus=jnp.zeros((6,), dtype=jnp.int8),
         worn_amulet=jnp.int8(-1),
         worn_rings=jnp.full((2,), -1, dtype=jnp.int8),
         quiver=jnp.int8(-1),
         total_weight=jnp.int32(0),
         user_names=jnp.zeros((MAX_INVENTORY_SLOTS, USER_NAME_LEN), dtype=jnp.int8),
         wielded_artifact_idx=jnp.int8(-1),
+        welded=jnp.bool_(False),
+        worn_armor_welded=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.bool_),
+        worn_amulet_welded=jnp.bool_(False),
+        worn_rings_welded=jnp.zeros((2,), dtype=jnp.bool_),
     )
 
 
