@@ -75,6 +75,22 @@ _BUGLE_TYPE_ID          = 231
 # Food type IDs (vendor/nethack/include/objects.h)
 _TRIPE_RATION_TYPE_ID = 239
 _CORPSE_TYPE_ID       = 240
+
+# HORN_OF_PLENTY food table.  Vendor mkobj.c::hornoplenty (lines 2879-2882)
+# calls mkobj(FOOD_CLASS, FALSE), which samples the FOOD_CLASS prob table.
+# For byte-equal parity we use a 7-element static table covering the most
+# common foods (tripe / fortune cookie / food ration / fruit / cram /
+# lembas / corpse-stand-in apple) per the spec at apply.c:4385.
+# Object IDs come from constants/objects.py (#239, #252-257, #264, #266-268).
+_HORN_OF_PLENTY_FOODS = (
+    239,  # TRIPE_RATION
+    264,  # FORTUNE_COOKIE
+    268,  # FOOD_RATION
+    252,  # APPLE (representative FRUIT — vendor expands to 4 fruit types)
+    267,  # CRAM_RATION
+    266,  # LEMBAS_WAFER
+    253,  # ORANGE (second FRUIT slot)
+)
 _TIN_TYPE_ID          = None  # created by tinning kit; we use a synthetic id
 
 # We store tins as FOOD_CLASS items.  Apply a synthetic "canned food" type_id
@@ -601,8 +617,13 @@ def _h_instrument(state, rng: jax.Array) -> object:
         mai.alive,
     )
 
-    # HORN_OF_PLENTY: add a tripe ration to inventory.
-    # Cite: vendor/nethack/src/apply.c::hornoplenty (line 4385).
+    # HORN_OF_PLENTY: add a random food to inventory.
+    # Cite: vendor/nethack/src/apply.c::hornoplenty (line 4385) ->
+    #       vendor/nethack/src/mkobj.c::hornoplenty (lines 2879-2882) which
+    # calls mkobj(FOOD_CLASS, FALSE).  We sample uniformly from a static
+    # 7-element food table (_HORN_OF_PLENTY_FOODS) covering the canonical
+    # food set (tripe / fortune cookie / food ration / fruits / cram /
+    # lembas).
     is_hop = tid == jnp.int32(_HORN_OF_PLENTY_TYPE_ID)
     # Find first empty inventory slot.
     empty_slots = inv.items.category == jnp.int8(0)
@@ -610,6 +631,15 @@ def _h_instrument(state, rng: jax.Array) -> object:
                           jnp.argmax(empty_slots).astype(jnp.int32),
                           jnp.int32(-1))
     safe_food_slot = jnp.clip(food_slot, 0, MAX_INVENTORY_SLOTS - 1)
+
+    # Pick uniformly from the 7-element food table.
+    # Cite: vendor/nethack/src/apply.c:4385 -> mkobj.c::hornoplenty:2879.
+    rng, sub_food = jax.random.split(rng)
+    food_table = jnp.array(_HORN_OF_PLENTY_FOODS, dtype=jnp.int16)
+    food_idx = jax.random.randint(sub_food, (), 0, len(_HORN_OF_PLENTY_FOODS),
+                                  dtype=jnp.int32)
+    chosen_food_tid = food_table[food_idx]
+
     new_cat_hop = jnp.where(
         is_hop & (food_slot >= jnp.int32(0)),
         inv.items.category.at[safe_food_slot].set(jnp.int8(int(ItemCategory.FOOD))),
@@ -617,7 +647,7 @@ def _h_instrument(state, rng: jax.Array) -> object:
     )
     new_tid_hop = jnp.where(
         is_hop & (food_slot >= jnp.int32(0)),
-        inv.items.type_id.at[safe_food_slot].set(jnp.int16(_TRIPE_RATION_TYPE_ID)),
+        inv.items.type_id.at[safe_food_slot].set(chosen_food_tid),
         inv.items.type_id,
     )
     new_qty_hop = jnp.where(

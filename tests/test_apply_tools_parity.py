@@ -224,14 +224,16 @@ def test_horn_of_plenty_food():
 
     new_state = dispatch_apply(state, _RNG)
 
-    # Should have a FOOD item with type_id == TRIPE_RATION in slot 1.
+    # Should have a FOOD item drawn from the horn-of-plenty food table.
+    # Cite: apply.c:4385 -> mkobj.c::hornoplenty:2879 (mkobj(FOOD_CLASS)).
+    from Nethax.nethax.subsystems.apply_tools import _HORN_OF_PLENTY_FOODS
     inv_after = new_state.inventory
     food_slots = (inv_after.items.category == jnp.int8(int(ItemCategory.FOOD)))
     assert bool(jnp.any(food_slots)), "Horn of plenty should add food to inventory"
     food_idx = int(jnp.argmax(food_slots))
-    assert int(inv_after.items.type_id[food_idx]) == _TRIPE_RATION_TYPE_ID, (
-        f"Expected tripe ration type_id {_TRIPE_RATION_TYPE_ID}; "
-        f"got {int(inv_after.items.type_id[food_idx])}"
+    chosen_tid = int(inv_after.items.type_id[food_idx])
+    assert chosen_tid in _HORN_OF_PLENTY_FOODS, (
+        f"Expected food from horn table {_HORN_OF_PLENTY_FOODS}; got {chosen_tid}"
     )
 
 
