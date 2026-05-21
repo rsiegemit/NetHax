@@ -65,14 +65,17 @@ def _base_state(role: Role = Role.VALKYRIE):
 
 
 def _melee_damage_samples(state, n=_N_TRIALS, seed=7):
-    """Run melee_attack n times; collect damage values (0 on miss)."""
-    rng = jax.random.PRNGKey(seed)
-    damages = []
-    for _ in range(n):
-        rng, sub = jax.random.split(rng)
-        _s, dmg, _hit = melee_attack(state, sub, jnp.int32(0))
-        damages.append(int(dmg))
-    return damages
+    """Run melee_attack n times; collect damage values (0 on miss).
+
+    JIT-compiled + vmapped: a single compile of `melee_attack` is reused
+    across all n trials.  Eager calls retrace the giant combat graph each
+    invocation and exceed the 120s pytest timeout for n=600.
+    """
+    keys = jax.random.split(jax.random.PRNGKey(seed), n)
+    idx = jnp.int32(0)
+    vsample = jax.jit(jax.vmap(lambda k: melee_attack(state, k, idx)[1]))
+    damages = vsample(keys)
+    return [int(d) for d in damages]
 
 
 def _melee_hit_rate(state, n=_N_TRIALS, seed=17):
