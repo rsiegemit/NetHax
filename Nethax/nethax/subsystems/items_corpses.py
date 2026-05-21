@@ -556,6 +556,44 @@ def apply_corpse_postfx(
 _CORPSE_AGE_THRESHOLD: int = 50
 
 
+def compute_rotted(
+    rng: jax.Array,
+    moves: jnp.ndarray,
+    creation_turn: jnp.ndarray,
+    blessed: jnp.ndarray = jnp.bool_(False),
+    cursed: jnp.ndarray = jnp.bool_(False),
+) -> jnp.ndarray:
+    """Compute the vendor rotted level for a corpse.
+
+    Byte-equal to vendor/nethack/src/eat.c::eatcorpse line 1887::
+
+        rotted = (svm.moves - age) / (10L + rn2(20));
+        if (otmp->cursed)   rotted += 2L;
+        else if (otmp->blessed) rotted -= 2L;
+
+    The divisor is uniform in [10, 29] (10 + rn2(20)), so each rot stage
+    spans 10..29 turns.  Vendor treats ``rotted > 5`` as tainted.
+
+    Parameters
+    ----------
+    rng           : JAX PRNG key (single rn2(20) draw).
+    moves         : current game turn (svm.moves), int32 scalar.
+    creation_turn : corpse age (svm.moves-age = turns since creation), int32.
+    blessed       : corpse blessed status (bool scalar).
+    cursed        : corpse cursed status (bool scalar).
+
+    Returns
+    -------
+    jnp.int32 — rotted level (can be negative for blessed fresh corpses).
+    """
+    divisor = jnp.int32(10) + jax.random.randint(rng, (), 0, 20, dtype=jnp.int32)
+    age = jnp.maximum(moves - creation_turn, jnp.int32(0))
+    rotted = age // divisor
+    rotted = jnp.where(cursed, rotted + jnp.int32(2), rotted)
+    rotted = jnp.where(blessed & ~cursed, rotted - jnp.int32(2), rotted)
+    return rotted.astype(jnp.int32)
+
+
 def apply_old_corpse_effects(state, rng: jax.Array, is_old: jnp.ndarray):
     """Apply VOMITING + SICK when eating a tainted/old corpse.
 
