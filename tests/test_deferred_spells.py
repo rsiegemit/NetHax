@@ -210,25 +210,25 @@ def test_detect_monsters_sets_flag_until_100_turns_later():
 
 
 def test_detect_food_sets_flag():
-    """DETECT_FOOD: identification.detect_food_until_turn = timestep + 100.
+    """DETECT_FOOD: identification.detect_food_until_turn = timestep + 50.
 
-    Cite: vendor/nethack/src/detect.c::food_detect.
+    Cite: vendor/nethack/src/detect.c::food_detect (50-turn window).
     """
     state = _base_state()
     state = state.replace(timestep=jnp.int32(10))
     new_state = _run_effect(SpellId.DETECT_FOOD, state, seed=8)
-    assert int(new_state.identification.detect_food_until_turn) == 110
+    assert int(new_state.identification.detect_food_until_turn) == 60
 
 
 def test_detect_treasure_sets_flag():
-    """DETECT_TREASURE: identification.detect_treasure_until_turn = timestep + 100.
+    """DETECT_TREASURE: identification.detect_treasure_until_turn = timestep + 50.
 
     Cite: vendor/nethack/src/detect.c::trap_detect (treasure branch).
     """
     state = _base_state()
     state = state.replace(timestep=jnp.int32(0))
     new_state = _run_effect(SpellId.DETECT_TREASURE, state, seed=9)
-    assert int(new_state.identification.detect_treasure_until_turn) == 100
+    assert int(new_state.identification.detect_treasure_until_turn) == 50
 
 
 def test_clairvoyance_reveals_vendor_rectangle():

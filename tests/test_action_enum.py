@@ -8,9 +8,13 @@ def test_action_count_121():
 
 
 def test_useful_action_count():
-    """Canonical NLE USEFUL = 121 - 20 NON_RL_ACTIONS = 101."""
+    """Canonical NLE USEFUL subset = 86.
+
+    Matches vendor/nle/nle/nethack/actions.py:247-251 construction:
+    121 ACTIONS - 20 _NON_RL_ACTIONS - 16 TextCharacters + 1 SPACE = 86.
+    """
     from Nethax.nethax.constants.actions import USEFUL_ACTIONS
-    assert len(USEFUL_ACTIONS) == 101
+    assert len(USEFUL_ACTIONS) == 86
 
 
 def test_action_tuple_canonical_length():
