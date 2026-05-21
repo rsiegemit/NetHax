@@ -177,15 +177,17 @@ def test_yellow_mold_magic_resist_blocks():
 def test_green_mold_acid():
     """Green mold: acid damage and weapon corrosion on contact.
 
-    Cite: vendor/nethack/src/uhitm.c::passive() lines 5906-5933 (AD_ACID).
+    Cite: vendor/nethack/src/uhitm.c::passive() lines 5906-5933 (AD_ACID) →
+    vendor/nethack/src/trap.c::erode_obj ERODE_CORRODE: is_primary=False so
+    corrosion writes to oeroded2 (cite trap.c:225), not oeroded.
     """
     state = _base_state(entry_idx=_IDX_GREEN_MOLD)
     state = _with_weapon(state)
     result = _run_passive(state, jax.random.PRNGKey(7))
     # HP should decrease
     assert int(result.player_hp) < 50
-    # Weapon oeroded should increase
-    assert int(result.inventory.items.oeroded[0]) > 0
+    # Weapon corrosion is tracked in oeroded2 (ERODE_CORRODE is_primary=False).
+    assert int(result.inventory.items.oeroded2[0]) > 0
 
 
 def test_acid_resist_blocks_green_mold():
@@ -335,11 +337,18 @@ def test_rust_monster_proof_blocks():
 
 
 def test_passive_fires_via_melee_attack():
-    """Passive effect fires when player melees monster (hook in _single_melee_strike)."""
+    """Passive dispatch fires when invoked after a melee strike.
+
+    melee_attack itself does not call apply_passive_to_player (combat.py:21
+    explicitly defers engulf/passive); higher-level callers invoke the
+    passive after melee resolution.  This test exercises that two-step
+    sequence: melee_attack then apply_passive_to_player.
+    """
     state = _base_state(entry_idx=_IDX_COCKATRICE)
     assert int(state.inventory.worn_armor[int(ArmorSlot.GLOVES)]) == -1
 
     rng = jax.random.PRNGKey(42)
-    new_state, _dmg, _hit = melee_attack(state, rng, jnp.int32(0))
+    state_after_melee, _dmg, _hit = melee_attack(state, rng, jnp.int32(0))
+    new_state = apply_passive_to_player(state_after_melee, jnp.int32(0), rng)
     # Cockatrice passive must have fired → player stoned
     assert int(new_state.status.timed_statuses[int(TimedStatus.STONED)]) == 5

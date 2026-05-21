@@ -514,7 +514,7 @@ def _lich_cast(state, slot: jnp.ndarray, rng: jax.Array):
         sides = _LICH_SPELL_DMG[spell, 1]
         rolls = jax.random.randint(rng_roll, (6,), 1, 7, dtype=jnp.int32)  # up to 6 dice
         mask  = jnp.arange(6) < n
-        dmg   = jnp.sum(jnp.where(mask, jnp.minimum(rolls, jnp.int32(sides)), jnp.int32(0)))
+        dmg   = jnp.sum(jnp.where(mask, jnp.minimum(rolls, jnp.int32(sides)), jnp.int32(0))).astype(jnp.int32)
 
         new_hp = jnp.maximum(
             jnp.int32(0),
