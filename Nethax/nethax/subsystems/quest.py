@@ -387,16 +387,104 @@ _QSTAGE_GOT_OBJ  = jnp.int8(2)
 _QSTAGE_COMPLETE = jnp.int8(4)
 
 
-def on_enter_quest_level(state) -> object:
-    """Set met_leader=True and advance stage to BEGUN_QUEST (1).
+# ---------------------------------------------------------------------------
+# Leader spawn helpers (P2 — vendor sp_lev / quest.c::chat_with_leader parity)
+# ---------------------------------------------------------------------------
+# Vendor places the quest leader through the quest-level template files
+# (vendor/nethack/dat/{role}-strt.des) at the SLDR mapping symbol.  Here we
+# spawn the leader at a deterministic fixed tile near the level center and
+# route chat/hostility through the existing peaceful flag.  See
+# vendor/nethack/src/quest.c::chat_with_leader (lines 282-370) for the
+# alignment-purity / pissed_off rules that gate peacefulness.
+# ---------------------------------------------------------------------------
 
-    Called when the player enters the Quest branch leader level and has not
-    yet met the leader.  Mirrors quest.c::chat_with_leader lines ~321-324
-    (Qstat(met_leader) = TRUE) and qstplay.c expulsion / on_leader_level
-    logic that gates further progress on the entry level.
+_LEADER_SPAWN_ROW = jnp.int16(10)
+_LEADER_SPAWN_COL = jnp.int16(40)
 
-    JIT-pure: all ops are jnp.where / jnp.maximum on scalars.
+
+def _spawn_quest_leader(state) -> object:
+    """Place the role's quest leader on the current level and record leader_pos.
+
+    Vendor parity:
+      * leader monster id from Role.lead0 (vendor/nethack/src/role.c roles[];
+        mapped per-role in _LEADER_IDX_BY_ROLE).
+      * peacefulness mirrors chat_with_leader's purity check
+        (quest.c:323-358): peaceful iff player and leader alignment signs
+        match.  Otherwise hostile until cured.
+      * leader_pos recorded so check_quest_complete adjacency works.
     """
+    from Nethax.nethax.constants.monsters import MONSTERS
+
+    role_i = jnp.clip(
+        state.player_role.astype(jnp.int32), 0, _LEADER_IDX_BY_ROLE.shape[0] - 1
+    )
+    leader_entry = _LEADER_IDX_BY_ROLE[role_i].astype(jnp.int32)
+
+    levels_arr = jnp.array([int(m.level) for m in MONSTERS], dtype=jnp.int32)
+    sizes_arr = jnp.array([int(m.size) for m in MONSTERS], dtype=jnp.int32)
+    align_arr = jnp.array(
+        [int(getattr(m, "alignment", 0)) for m in MONSTERS], dtype=jnp.int32
+    )
+    from Nethax.nethax.dungeon.spawning import _ATK_DICE_N, _ATK_DICE_S, _BASE_AC
+
+    lvl = jnp.take(levels_arr, leader_entry)
+    ac = jnp.take(_BASE_AC, leader_entry)
+    is_large = jnp.take(sizes_arr, leader_entry) >= jnp.int32(4)  # MZ_LARGE
+    atk_n = jnp.take(_ATK_DICE_N, leader_entry)
+    atk_s = jnp.take(_ATK_DICE_S, leader_entry)
+    leader_align = jnp.take(align_arr, leader_entry)
+
+    pal = state.player_align.astype(jnp.int32)
+    same_sign = jnp.logical_or(
+        jnp.logical_and(pal > 0, leader_align > 0),
+        jnp.logical_or(
+            jnp.logical_and(pal < 0, leader_align < 0),
+            jnp.logical_and(pal == 0, leader_align == 0),
+        ),
+    )
+
+    # Mean hp = d(mlevel, 8) ≈ 4*lvl; quest level construction is one-shot.
+    hp = jnp.maximum(lvl * jnp.int32(4), jnp.int32(1))
+
+    mai = state.monster_ai
+    free_slot = jnp.argmin(mai.alive.astype(jnp.int32)).astype(jnp.int32)
+    has_free = ~mai.alive[free_slot]
+
+    leader_pos = jnp.stack([_LEADER_SPAWN_ROW, _LEADER_SPAWN_COL])
+
+    def _do_spawn(m):
+        return m.replace(
+            pos=m.pos.at[free_slot].set(leader_pos),
+            hp=m.hp.at[free_slot].set(hp),
+            hp_max=m.hp_max.at[free_slot].set(hp),
+            alive=m.alive.at[free_slot].set(jnp.bool_(True)),
+            ac=m.ac.at[free_slot].set(ac),
+            is_large=m.is_large.at[free_slot].set(is_large),
+            attack_dice_n=m.attack_dice_n.at[free_slot].set(atk_n),
+            attack_dice_sides=m.attack_dice_sides.at[free_slot].set(atk_s),
+            mstrategy=m.mstrategy.at[free_slot].set(jnp.int8(0)),
+            entry_idx=m.entry_idx.at[free_slot].set(leader_entry.astype(jnp.int16)),
+            peaceful=m.peaceful.at[free_slot].set(same_sign),
+            movement_points=m.movement_points.at[free_slot].set(jnp.int16(12)),
+        )
+
+    new_mai = jax.lax.cond(has_free, _do_spawn, lambda m: m, mai)
+    new_quest = state.quest.replace(leader_pos=leader_pos)
+    return state.replace(monster_ai=new_mai, quest=new_quest)
+
+
+def on_enter_quest_level(state) -> object:
+    """Set met_leader=True, spawn quest leader, advance stage to BEGUN_QUEST.
+
+    P2 vendor parity:
+      * Spawn the role's quest leader at a fixed position on first entry.
+        Mirrors vendor sp_lev SLDR placement in dat/{role}-strt.des plus
+        the chat_with_leader purity gate (quest.c:282-370).
+      * leader_pos populated for check_quest_complete adjacency.
+
+    JIT-pure.
+    """
+    state = _spawn_quest_leader(state)
     new_stage = jnp.maximum(state.quest.stage, _QSTAGE_BEGUN)
     new_quest = state.quest.replace(
         met_leader=jnp.bool_(True),
