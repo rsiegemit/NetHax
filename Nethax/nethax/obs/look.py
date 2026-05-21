@@ -28,7 +28,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from Nethax.nethax.constants.monsters import MONSTERS
+from Nethax.nethax.constants.monsters import MONSTERS, G_UNIQ
 from Nethax.nethax.constants.objects import OBJECTS
 
 
@@ -200,18 +200,38 @@ def _random_monster_name() -> str:
 
 
 def _monster_at(state, r: int, c: int) -> Optional[str]:
+    info = _monster_info_at(state, r, c)
+    if info is None:
+        return None
+    return info[0]
+
+
+def _monster_info_at(state, r: int, c: int):
+    """Return (name, tame, is_uniq) tuple for the monster at (r,c), or None.
+
+    ``tame`` and ``is_uniq`` drive vendor article selection:
+      - tame   -> "your <name>"  (do_name.c:1121, ARTICLE_YOUR)
+      - G_UNIQ -> "The <Name>"   (do_name.c:1005, ARTICLE_THE + capitalised)
+    """
     mons = state.monster_ai
     pos = np.asarray(mons.pos)
     alive = np.asarray(mons.alive).astype(bool)
     entry = np.asarray(mons.entry_idx).astype(np.int32)
+    tame_arr = None
+    if hasattr(mons, "tame"):
+        tame_arr = np.asarray(mons.tame).astype(bool)
     for i in range(pos.shape[0]):
         if alive[i] and int(pos[i, 0]) == r and int(pos[i, 1]) == c:
+            tame = bool(tame_arr[i]) if tame_arr is not None else False
             # Vendor do_name.c:1199 — hallucinating: random monster name.
             if _is_hallucinating(state):
-                return _random_monster_name()
+                return (_random_monster_name(), tame, False)
             idx = int(entry[i])
             if 0 <= idx < len(MONSTERS) and MONSTERS[idx] is not None:
-                return MONSTERS[idx].name or "creature"
+                m = MONSTERS[idx]
+                name = m.name or "creature"
+                is_uniq = bool(m.generation_mask & G_UNIQ)
+                return (name, tame, is_uniq)
     return None
 
 
@@ -328,9 +348,23 @@ def build_look_text(state, target_row: int, target_col: int) -> str:
     if _player_at(state, target_row, target_col):
         return "yourself"
 
-    mon = _monster_at(state, target_row, target_col)
-    if mon is not None:
-        return _the(mon)
+    mon_info = _monster_info_at(state, target_row, target_col)
+    if mon_info is not None:
+        name, tame, is_uniq = mon_info
+        if tame:
+            # Vendor do_name.c:1121 — pet article is ARTICLE_YOUR.
+            mon_text = "your " + name
+        elif is_uniq:
+            # Vendor do_name.c:1005 — G_UNIQ promotes ARTICLE_A to ARTICLE_THE
+            # with the canonical "The " (capital T) and a capitalised name.
+            cap_name = name[:1].upper() + name[1:] if name else name
+            mon_text = "The " + cap_name
+        else:
+            mon_text = _the(name)
+        engrave_lines = _engrave_descriptor(state, target_row, target_col)
+        if engrave_lines:
+            return "\n".join([mon_text] + engrave_lines)
+        return mon_text
 
     objs = _objects_at(state, target_row, target_col)
     if objs:

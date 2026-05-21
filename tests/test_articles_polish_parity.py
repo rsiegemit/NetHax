@@ -98,6 +98,7 @@ def _make_inv_state(items: Item) -> InventoryState:
         worn_armor_welded=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.bool_),
         worn_amulet_welded=jnp.bool_(False),
         worn_rings_welded=jnp.zeros((2,), dtype=jnp.bool_),
+        armor_stat_bonus=jnp.zeros((6,), dtype=jnp.int8),
     )
 
 
@@ -179,16 +180,7 @@ class TestSSuffix:
 # Gap 2 — Pet "your" article (do_name.c:1121)
 # ---------------------------------------------------------------------------
 
-_XFAIL_PET = pytest.mark.xfail(
-    reason="Pet 'your' article (do_name.c:1121) not yet wired into "
-           "build_look_text; tame status is ignored. Real regression "
-           "tracked for future wave.",
-    strict=False,
-)
-
-
 class TestPetYourInLook:
-    @_XFAIL_PET
     def test_tame_monster_yields_your(self):
         # Find any monster that exists in the table
         idx = next(
@@ -202,7 +194,6 @@ class TestPetYourInLook:
             f"tame monster should give 'your ...', got: {text!r}"
         )
 
-    @_XFAIL_PET
     def test_tame_monster_no_the(self):
         idx = next(
             i for i, m in enumerate(MONSTERS)
@@ -232,19 +223,11 @@ class TestPetYourInLook:
 # Gap 3 — G_UNIQ "The" capital (do_name.c:1005)
 # ---------------------------------------------------------------------------
 
-_XFAIL_UNIQ = pytest.mark.xfail(
-    reason="G_UNIQ 'The ' capitalization (do_name.c:1005) not yet wired "
-           "into build_look_text. Real regression tracked for future wave.",
-    strict=False,
-)
-
-
 class TestUniqueMonsterTheCapital:
     @pytest.fixture
     def wizard_idx(self):
         return _find_monster_idx("Wizard of Yendor")
 
-    @_XFAIL_UNIQ
     def test_unique_wizard_gives_The(self, wizard_idx):
         state = _FakeLookState(monster_idx=wizard_idx, row=5, col=5,
                                tame=False, player_pos=(0, 0))
@@ -262,7 +245,6 @@ class TestUniqueMonsterTheCapital:
             f"expected 'Wizard' in look text, got: {text!r}"
         )
 
-    @_XFAIL_UNIQ
     def test_medusa_unique(self):
         try:
             idx = _find_monster_idx("Medusa")
@@ -278,15 +260,7 @@ class TestUniqueMonsterTheCapital:
 # Gap 4 — "pair of boots/gloves/lenses" (objnam.c:724-726)
 # ---------------------------------------------------------------------------
 
-_XFAIL_PAIR = pytest.mark.xfail(
-    reason="'pair of' prefix (objnam.c:724-726) not yet rendered by "
-           "build_inv_strs for boots/gloves/lenses. Real regression.",
-    strict=False,
-)
-
-
 class TestPairOfBoots:
-    @_XFAIL_PAIR
     def test_pair_of_boots_singular(self):
         # low boots = type_id 140, ARMOR_CLASS
         type_id_val = _find_type_id("low boots")
@@ -294,7 +268,6 @@ class TestPairOfBoots:
                              quantity=1, identified=True)
         assert "pair of" in s, f"expected 'pair of' in: {s!r}"
 
-    @_XFAIL_PAIR
     def test_pair_of_boots_article(self):
         type_id_val = _find_type_id("low boots")
         s = _render_slot_str(type_id_val, int(ObjectClass.ARMOR_CLASS),
@@ -311,7 +284,6 @@ class TestPairOfBoots:
 
 
 class TestPairOfGloves:
-    @_XFAIL_PAIR
     def test_pair_of_gloves_singular(self):
         type_id_val = _find_type_id("leather gloves")
         s = _render_slot_str(type_id_val, int(ObjectClass.ARMOR_CLASS),
@@ -325,15 +297,7 @@ class TestPairOfGloves:
         assert "leather gloves" in s, f"expected 'leather gloves' in: {s!r}"
 
 
-_XFAIL_PAIRS = pytest.mark.xfail(
-    reason="'pairs of' plural prefix (objnam.c:724-726) not yet implemented "
-           "in build_inv_strs pluralisation path. Real regression.",
-    strict=False,
-)
-
-
 class TestPairsPlural:
-    @_XFAIL_PAIRS
     def test_pairs_of_boots_plural(self):
         type_id_val = _find_type_id("low boots")
         s = _render_slot_str(type_id_val, int(ObjectClass.ARMOR_CLASS),
@@ -351,22 +315,13 @@ class TestPairsPlural:
 # Gap 5 — "set of dragon scales" (objnam.c:722)
 # ---------------------------------------------------------------------------
 
-_XFAIL_SET = pytest.mark.xfail(
-    reason="'set of' dragon-scales prefix (objnam.c:722) not yet rendered "
-           "by build_inv_strs. Real regression tracked for future wave.",
-    strict=False,
-)
-
-
 class TestSetOfDragonScales:
-    @_XFAIL_SET
     def test_set_of_scales_singular(self):
         type_id_val = _find_type_id("gray dragon scales")
         s = _render_slot_str(type_id_val, int(ObjectClass.ARMOR_CLASS),
                              quantity=1, identified=True)
         assert "set of" in s, f"expected 'set of' in: {s!r}"
 
-    @_XFAIL_SET
     def test_set_of_scales_article(self):
         type_id_val = _find_type_id("gray dragon scales")
         s = _render_slot_str(type_id_val, int(ObjectClass.ARMOR_CLASS),

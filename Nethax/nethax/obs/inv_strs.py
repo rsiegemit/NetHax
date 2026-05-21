@@ -330,6 +330,63 @@ _CLASS_PREFIX_BYTES: jnp.ndarray = jnp.array(
 # For identified items with class prefix: show "potion of healing" etc.
 # For identified items without prefix (weapons, armor): just the name.
 
+# ---------------------------------------------------------------------------
+# "pair of " / "set of " noun-cluster prefix tables.
+# Vendor citations:
+#   objnam.c:724-726  — ARMOR_CLASS, is_boots/is_gloves -> "pair of "
+#   objnam.c:721-723  — ARMOR_CLASS, GRAY..YELLOW DRAGON_SCALES -> "set of "
+#   objnam.c:694-695  — TOOL_CLASS, LENSES -> "pair of "
+#   obj.h:427         — #define pair_of(o) ((o)->otyp == LENSES
+#                       || is_gloves(o) || is_boots(o))
+# ARM_GLOVES = 3, ARM_BOOTS = 4 (objclass.h lines 41-42).
+# When quantity > 1, vendor renders "pairs of " (objnam.c:2879).
+# ---------------------------------------------------------------------------
+
+_LENSES_TYPE_ID = _find_type_id("lenses", ObjectClass.TOOL_CLASS)
+
+def _is_pair_of(obj, otyp: int) -> bool:
+    if obj is None or obj.name is None:
+        return False
+    if obj.class_ == ObjectClass.ARMOR_CLASS:
+        return obj.oc_armor_class in (3, 4)  # ARM_GLOVES, ARM_BOOTS
+    if obj.class_ == ObjectClass.TOOL_CLASS and otyp == _LENSES_TYPE_ID:
+        return True
+    return False
+
+
+def _is_set_of(obj) -> bool:
+    """True for gray..yellow dragon scales (NOT scale mail).
+
+    Vendor: objnam.c:721 — range GRAY_DRAGON_SCALES..YELLOW_DRAGON_SCALES.
+    Match by name: '<color> dragon scales' (with trailing 's', not "scale mail").
+    """
+    if obj is None or obj.name is None:
+        return False
+    if obj.class_ != ObjectClass.ARMOR_CLASS:
+        return False
+    return obj.name.endswith(" dragon scales")
+
+
+_PAIR_OF: jnp.ndarray = jnp.array(
+    [_is_pair_of(obj, i) for i, obj in enumerate(OBJECTS)],
+    dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS]
+
+_SET_OF: jnp.ndarray = jnp.array(
+    [_is_set_of(obj) for obj in OBJECTS],
+    dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS]
+
+_PAIR_OF_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("pair of ", 9), dtype=jnp.uint8,
+)  # uint8[9]
+_PAIRS_OF_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("pairs of ", 10), dtype=jnp.uint8,
+)  # uint8[10]
+_SET_OF_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("set of ", 8), dtype=jnp.uint8,
+)  # uint8[8]
+
 # Digit table for integer rendering  (0..9 -> b'0'..b'9')
 _DIGITS: jnp.ndarray = jnp.arange(10, dtype=jnp.uint8) + jnp.uint8(ord('0'))
 
@@ -1209,8 +1266,37 @@ def _write_true_name(buf, cursor, safe_type, obj_class, quantity,
         return b, c
 
     # --- Normal path: class prefix + canonical name ---
+    # Vendor objnam.c:721-726 + 694-695 — "pair of "/"pairs of "/"set of "
+    # prefix for boots/gloves/lenses/dragon scales.  Looked up via per-otyp
+    # _PAIR_OF / _SET_OF tables.  Set-of dragon scales always uses the
+    # singular noun (vendor sprintf"set of %s",actualn; no plural path).
+    is_pair = _PAIR_OF[safe_type]
+    is_set  = _SET_OF[safe_type]
+
     def write_normal(bc):
         b, c = bc
+        # Step 1: "pair of "/"pairs of "/"set of " noun-cluster prefix
+        # (precedes any class-of prefix, and applies even when plural).
+        def write_pair(_bc):
+            return lax.cond(
+                is_plural,
+                lambda x: _write_fixed(x[0], x[1], _PAIRS_OF_BYTES, 10),
+                lambda x: _write_fixed(x[0], x[1], _PAIR_OF_BYTES, 9),
+                _bc,
+            )
+
+        def write_set(_bc):
+            return _write_fixed(_bc[0], _bc[1], _SET_OF_BYTES, 8)
+
+        b, c = lax.cond(
+            is_pair,
+            write_pair,
+            lambda _bc: lax.cond(is_set, write_set, lambda x: x, _bc),
+            (b, c),
+        )
+
+        # Step 2: class-of prefix ("ring of ", "potion of ", ...).  Only when
+        # singular (vendor: makeplural pluralizes the head noun, not the prefix).
         pfx_src = _CLASS_PREFIX_BYTES[cls_safe]
         b, c = lax.cond(
             is_plural,
@@ -1218,9 +1304,13 @@ def _write_true_name(buf, cursor, safe_type, obj_class, quantity,
             lambda _bc: _write_fixed(_bc[0], _bc[1], pfx_src, _MAX_PREFIX_LEN),
             (b, c),
         )
+
+        # Step 3: canonical name (singular or pluralised).  For set-of dragon
+        # scales the singular row is used unconditionally (vendor objnam.c:722
+        # writes actualn directly).
         sing_row = _OBJECT_NAMES_BYTES_PADDED[safe_type]
         plur_row = _NAME_PLURAL_BYTES[safe_type]
-        name_src = jnp.where(is_plural, plur_row, sing_row)
+        name_src = jnp.where(is_plural & ~is_set, plur_row, sing_row)
         b, c = _write_fixed(b, c, name_src, _MAX_PLURAL_NAME_LEN)
         return b, c
 
