@@ -714,15 +714,24 @@ def _spit_attack(state, slot: jnp.ndarray, rng: jax.Array):
                   potion.c::peffects PR_BLINDED branch ~ 25-49 turns)
 
     Vendor cite: mthrowu.c::spitmm:1016-1077 — venom mksobj + m_throw.
-    Range check uses _SPIT_RANGE; line-of-sight gate via Chebyshev distance.
+    Range gate uses Euclidean² (vendor mdistu, hack.h:1531-1532;
+    hacklib.c:672-678) with BOLT_LIM=8 (hack.h:49) → BOLT_LIM*BOLT_LIM=64.
+    See mhitu.c:1795 for the same Euclidean² <= BOLT_LIM*BOLT_LIM idiom on
+    the AD_BLND gaze sibling path.
     """
     from Nethax.nethax.subsystems.status_effects import Intrinsic, TimedStatus
     mai = state.monster_ai
     idx = slot.astype(jnp.int32)
     mpos = mai.pos[idx].astype(jnp.int32)
     ppos = state.player_pos.astype(jnp.int32)
-    dist = _cheby(mpos, ppos)
-    in_range = (dist >= jnp.int32(2)) & (dist <= jnp.int32(_SPIT_RANGE))
+    # Euclidean² per vendor mdistu (hack.h:1531-1532, hacklib.c:672-678).
+    dx = mpos[0].astype(jnp.int32) - ppos[0].astype(jnp.int32)
+    dy = mpos[1].astype(jnp.int32) - ppos[1].astype(jnp.int32)
+    dist2 = dx * dx + dy * dy
+    # range2: !monnear ⇔ dist2 >= 3 (mon.c:2476-2483).
+    # Upper bound: BOLT_LIM*BOLT_LIM = 64 (mhitu.c:1795 uses this idiom).
+    _BOLT_LIM_SQ = jnp.int32(_SPIT_RANGE * _SPIT_RANGE)
+    in_range = (dist2 >= jnp.int32(3)) & (dist2 <= _BOLT_LIM_SQ)
 
     safe_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, _NUMMONS - 1)
     damn  = _SPIT_DAMN[safe_entry].astype(jnp.int32)
