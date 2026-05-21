@@ -22,6 +22,7 @@ from Nethax.nethax.obs.nle_obs import build_nle_observation
 from Nethax.nethax.subsystems.action_dispatch import dispatch_action
 from Nethax.nethax.subsystems.monster_ai import step as _monster_ai_step
 from Nethax.nethax.subsystems.status_effects import step as _status_step
+from Nethax.nethax.subsystems.status_effects import tick_hallu_expiry as _tick_hallu_expiry
 from Nethax.nethax.subsystems.ascension import maybe_ascend
 from Nethax.nethax.subsystems.polymorph import step as _polymorph_step
 from Nethax.nethax.subsystems.shop import shop_step as _shop_step
@@ -244,6 +245,10 @@ def _step_impl(state, action, rng):
 
         # 4. Status-effect tick — allmain.c line 273 (nh_timeout),
         #    inclusive of regen_hp (line 294) and regen_pw (line 305).
+        #    Pre-tick: emit HALLUCINATION expiry message (vendor timeout.c
+        #    HALLU case lines 778-783 — make_hallucinated(0L, TRUE, 0L) →
+        #    "Everything looks SO boring now.").
+        ns = _tick_hallu_expiry(ns)
         new_status, new_hp, new_pw, new_done = _status_step(
             ns.status,
             rng_status,

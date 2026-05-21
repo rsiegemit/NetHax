@@ -79,6 +79,33 @@ class MessageId(IntEnum):
     GO_DOWN_STAIRS       = 15  # do.c::dodown "You climb down the stairs."
     YOU_WAIT             = 16  # cmd.c::dowait "You wait."
 
+    # Wave 30b — per-prop expiry messages from nh_timeout.
+    HALLU_BORING         = 17  # potion.c:381 / timeout.c:778-783
+                               # "Everything looks SO boring now."
+                               # Fired when HHallucination timer ticks 1 → 0
+                               # via nh_timeout HALLU case.
+
+    # Wave 32i IDs — swallow message variants + throne/altar flavor.
+    SWALLOW_DIGESTS      = 18  # mhitu.c:1336 "swallows you whole" (digests)
+    SWALLOW_ENFOLDS      = 19  # mhitu.c:1337 "folds itself around you"
+    SWALLOW_ENGULFS      = 20  # mhitu.c:1338 "engulfs you" (default)
+    THRONE_ATTR_LOSS     = 21  # sit.c throne effect 1
+    THRONE_ATTR_GAIN     = 22  # sit.c throne effect 2
+    THRONE_SHOCK         = 23  # sit.c throne effect 3
+    THRONE_FULL_HEAL     = 24  # sit.c throne effect 4
+    THRONE_TAKE_GOLD     = 25  # sit.c throne effect 5
+    THRONE_WISH          = 26  # sit.c throne effect 6
+    THRONE_COURT         = 27  # sit.c throne effect 7
+    THRONE_GENOCIDE      = 28  # sit.c throne effect 8
+    THRONE_CURSE_ITEMS   = 29  # sit.c throne effect 9
+    THRONE_MAP_CONFUSE   = 30  # sit.c throne effect 10
+    THRONE_TELEPORT      = 31  # sit.c throne effect 11
+    THRONE_IDENTIFY      = 32  # sit.c throne effect 12
+    THRONE_CONFUSE       = 33  # sit.c throne effect 13
+    ALTAR_WRATH          = 34  # pray.c::altar_wrath same-aligned penalty
+    ALTAR_LUCK_LOSS      = 35  # pray.c::altar_wrath different-aligned penalty
+    SPELL_FIZZLES        = 36  # spell.c:1373 "You fail to cast the spell correctly."
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -150,6 +177,26 @@ _MESSAGE_TEMPLATES: tuple[str, ...] = (
     "You climb up the stairs.",      # 14 GO_UP_STAIRS       do.c::doup
     "You climb down the stairs.",    # 15 GO_DOWN_STAIRS     do.c::dodown
     "You wait.",                     # 16 YOU_WAIT           cmd.c::dowait
+    "Everything looks SO boring now.", # 17 HALLU_BORING     potion.c:381
+    "The monster swallows you whole!", # 18 SWALLOW_DIGESTS  mhitu.c:1336
+    "The monster folds itself around you!", # 19 SWALLOW_ENFOLDS  mhitu.c:1337
+    "The monster engulfs you!",        # 20 SWALLOW_ENGULFS  mhitu.c:1338
+    "You feel weaker.",                # 21 THRONE_ATTR_LOSS sit.c effect 1
+    "You feel a surge of power.",      # 22 THRONE_ATTR_GAIN sit.c effect 2
+    "A shock runs through your body!", # 23 THRONE_SHOCK     sit.c effect 3
+    "You feel much better!",           # 24 THRONE_FULL_HEAL sit.c effect 4
+    "Your gold disappears!",           # 25 THRONE_TAKE_GOLD sit.c effect 5
+    "A wish is granted!",              # 26 THRONE_WISH      sit.c effect 6
+    "The court is summoned!",          # 27 THRONE_COURT     sit.c effect 7
+    "A feeling of great wisdom comes over you.", # 28 THRONE_GENOCIDE sit.c effect 8
+    "You feel a malignant aura surround you.", # 29 THRONE_CURSE_ITEMS sit.c effect 9
+    "Your mind is filled with images!", # 30 THRONE_MAP_CONFUSE sit.c effect 10
+    "You are teleported!",             # 31 THRONE_TELEPORT  sit.c effect 11
+    "Your possessions are identified.", # 32 THRONE_IDENTIFY  sit.c effect 12
+    "Your vision becomes unsteady.",   # 33 THRONE_CONFUSE   sit.c effect 13
+    "You feel that you have transgressed.", # 34 ALTAR_WRATH  pray.c::altar_wrath
+    "You feel your luck waver.",       # 35 ALTAR_LUCK_LOSS  pray.c::altar_wrath
+    "You fail to cast the spell correctly.", # 36 SPELL_FIZZLES spell.c:1373
 )
 
 

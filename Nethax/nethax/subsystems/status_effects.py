@@ -1312,6 +1312,32 @@ def tick_slimed_lethal(env_state):
     return env_state.replace(player_hp=new_hp, done=new_done, scoring=new_scoring)
 
 
+def tick_hallu_expiry(env_state):
+    """Emit "Everything looks SO boring now." on HALLUCINATION timeout.
+
+    Pre-decrement convention: timer == 1 this turn means the timer will tick
+    to 0 and the hallucination ends.  Emits the vendor message via the
+    EnvState's MessageState ring buffer.
+
+    Cite: vendor/nethack/src/timeout.c::nh_timeout HALLU case lines 778-783
+          (set_itimeout(&HHallucination, 1L); make_hallucinated(0L, TRUE, 0L));
+          vendor/nethack/src/potion.c::make_hallucinated lines 369-411
+          (the !xtime branch picks "Everything %s SO boring now.").
+    """
+    from Nethax.nethax.subsystems.messages import emit, MessageId
+
+    timer = env_state.status.timed_statuses[TimedStatus.HALLUCINATION]
+    expiring = timer == jnp.int32(1)
+    new_messages = emit(env_state.messages, jnp.int32(int(MessageId.HALLU_BORING)))
+    # Only rotate the ring buffer when the message actually fires.
+    final_messages = jax.tree.map(
+        lambda new, old: jnp.where(expiring, new, old),
+        new_messages,
+        env_state.messages,
+    )
+    return env_state.replace(messages=final_messages)
+
+
 def tick_strangled_lethal(env_state):
     """Fire STRANGLED death when timer == 1 on the given EnvState.
 
