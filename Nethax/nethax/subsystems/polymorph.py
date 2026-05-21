@@ -995,8 +995,13 @@ def newman(state, rng: jax.Array):
     ts = ts.at[int(TimedStatus.STONED)].set(jnp.int32(0))
     new_status = state.status.replace(timed_statuses=ts)
 
-    # polyself.c:336 — newman also restores nutrition to NORMAL (1000).
-    new_status = new_status.replace(nutrition=jnp.int32(1000))
+    # vendor/nethack/src/polyself.c:414 — u.uhunger = rn1(500, 500);
+    # rn1(x, y) := rn2(x) + y, so nutrition resets to [500, 999] inclusive.
+    rng, sub_h = jax.random.split(rng)
+    new_status = new_status.replace(
+        nutrition=jnp.int32(500)
+        + jax.random.randint(sub_h, (), 0, 500, dtype=jnp.int32)
+    )
 
     return state.replace(
         player_xl=new_xl,
