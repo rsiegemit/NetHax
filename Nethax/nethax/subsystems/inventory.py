@@ -160,6 +160,17 @@ class Item:
     # Poisoned-tin flag: tin is poisoned even when sealed.
     # cite: vendor/nethack/src/eat.c::consume_tin line 1537 tin->otrapped check
     tin_poisoned: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
+    # dknown: description known (item seen "up close").  Set TRUE on first
+    # pickup/sight via observe_object (vendor o_init.c::observe_object lines
+    # 441-451 — sets obj->dknown=1 and discovers the object type).  Vendor
+    # objnam.c::xname uses dknown to gate "potion" vs "ruby potion" rendering.
+    # cite: vendor/nethack/include/obj.h lines 109-112.
+    dknown: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
+    # rknown: rustproofing status known.  Set TRUE when an identify path
+    # reveals erodeproof / poison / charge state.  Vendor objnam.c:1183
+    # ("rknown && oerodeproof") gates rustproof/fireproof display on this.
+    # cite: vendor/nethack/include/obj.h line 114.
+    rknown: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
 
 
 def make_empty_item() -> Item:
@@ -175,6 +186,8 @@ def make_empty_item() -> Item:
         recharged=jnp.int8(0),
         corpse_creation_turn=jnp.int32(-1),
         tin_poisoned=jnp.bool_(False),
+        dknown=jnp.bool_(False),
+        rknown=jnp.bool_(False),
     )
 
 
@@ -223,6 +236,8 @@ def make_item(
         recharged=jnp.int8(0),
         corpse_creation_turn=jnp.int32(corpse_creation_turn),
         tin_poisoned=jnp.bool_(tin_poisoned),
+        dknown=jnp.bool_(False),
+        rknown=jnp.bool_(False),
     )
 
 
@@ -266,6 +281,8 @@ def _stack_items(items: list) -> Item:
         tin_poisoned=jnp.array(
             [bool(it.tin_poisoned) for it in items], dtype=jnp.bool_
         ),
+        dknown=jnp.array([bool(it.dknown) for it in items], dtype=jnp.bool_),
+        rknown=jnp.array([bool(it.rknown) for it in items], dtype=jnp.bool_),
     )
 
 
@@ -294,6 +311,8 @@ def _empty_items_array() -> Item:
         recharged=jnp.zeros((n,), dtype=jnp.int8),
         corpse_creation_turn=jnp.full((n,), -1, dtype=jnp.int32),
         tin_poisoned=jnp.zeros((n,), dtype=jnp.bool_),
+        dknown=jnp.zeros((n,), dtype=jnp.bool_),
+        rknown=jnp.zeros((n,), dtype=jnp.bool_),
     )
 
 
@@ -322,6 +341,8 @@ def _empty_ground_items_array(n_branches: int, max_levels: int, map_h: int, map_
         recharged=jnp.zeros(shape, dtype=jnp.int8),
         corpse_creation_turn=jnp.full(shape, -1, dtype=jnp.int32),
         tin_poisoned=jnp.zeros(shape, dtype=jnp.bool_),
+        dknown=jnp.zeros(shape, dtype=jnp.bool_),
+        rknown=jnp.zeros(shape, dtype=jnp.bool_),
     )
 
 
@@ -622,6 +643,13 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
         is_two_handed = new_items.is_two_handed.at[safe_slot].set(
             jnp.where(write_slot, ground_items.is_two_handed[branch, level, row, col, 0], new_items.is_two_handed[safe_slot])
         ),
+        # dknown: vendor pickup.c::pickup_object line 1818 calls
+        # observe_object(obj) when !Blind, which sets obj->dknown=1
+        # (o_init.c::observe_object lines 441-451).  We mirror that
+        # here unconditionally — the item is "seen up close" on pickup.
+        dknown = new_items.dknown.at[safe_slot].set(
+            jnp.where(write_slot, jnp.bool_(True), new_items.dknown[safe_slot])
+        ),
     )
 
     # Clear ground tile (set category to 0)
@@ -851,6 +879,14 @@ def wear_armor(state, slot_idx: int, armor_slot: ArmorSlot):
         state.inventory.items.identified.at[slot_i32].set(jnp.bool_(True)),
         state.inventory.items.identified,
     )
+    # rknown: wearing reveals erodeproof / poison-coating / charge state
+    # (vendor objnam.c:1183 — rknown gates rustproof display).  When the
+    # armor identifies on donning, rknown is also revealed.
+    new_items_rknown = jnp.where(
+        can_wear,
+        state.inventory.items.rknown.at[slot_i32].set(jnp.bool_(True)),
+        state.inventory.items.rknown,
+    )
     item_type_id = state.inventory.items.type_id[slot_i32].astype(jnp.int32)
     type_mask    = state.identification.identified
     t_clip       = jnp.clip(item_type_id, jnp.int32(0), jnp.int32(type_mask.shape[0] - 1))
@@ -864,7 +900,10 @@ def wear_armor(state, slot_idx: int, armor_slot: ArmorSlot):
         worn_armor=new_worn_armor,
         worn_armor_ac_bonus=new_worn_ac_bonus,
         worn_armor_welded=new_worn_armor_welded,
-        items=state.inventory.items.replace(identified=new_items_id),
+        items=state.inventory.items.replace(
+            identified=new_items_id,
+            rknown=new_items_rknown,
+        ),
     )
     new_state = state.replace(
         inventory=new_inv,

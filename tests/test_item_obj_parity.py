@@ -31,6 +31,8 @@ REQUIRED_VENDOR_FIELDS = (
     "bknown",
     "lamplit",
     "olocked",
+    "dknown",
+    "rknown",
 )
 
 # Deliberately omitted (cosmetic / save-only / UI scratchpad / pointer state).
@@ -41,7 +43,8 @@ DELIBERATELY_OMITTED = (
     "named_how", "ghostly", "how_lost", "pickup_prev",# save / history
     "unpaid", "no_charge",                             # shop bookkeeping
     "recharged", "in_use", "bypass",                   # transient flags
-    "dknown", "rknown", "cknown", "lknown", "tknown",  # secondary id flags
+    "cknown", "lknown", "tknown",                      # secondary id flags
+    # NB: dknown/rknown are now first-class Item fields (see REQUIRED_VENDOR_FIELDS).
     "globby", "obroken", "otrapped", "nomerge",        # rare-state flags
     "timed",                                           # timer queue link
 )
@@ -64,6 +67,8 @@ def test_item_default_values_match_vendor_init():
     assert bool(item.bknown) is False
     assert bool(item.lamplit) is False
     assert bool(item.olocked) is False
+    assert bool(item.dknown) is False
+    assert bool(item.rknown) is False
 
 
 def test_item_erosion_tier_range():
@@ -96,6 +101,14 @@ def test_item_field_count_full():
         "lamplit", "olocked",
         # post-erosion-merge: corpse identity tracking field
         "corpse_entry_idx",
+        # Wand recharge counter (vendor obj.h line 102 Bitfield(recharged,3)).
+        "recharged",
+        # Corpse age + poisoned-tin tracking (vendor eat.c::eatcorpse 1885,
+        # consume_tin 1537).
+        "corpse_creation_turn", "tin_poisoned",
+        # Per-item description-known / rustproofing-known (vendor obj.h
+        # lines 109-114).
+        "dknown", "rknown",
     }
     assert fields == expected, (
         f"Item field-set drift:\n"

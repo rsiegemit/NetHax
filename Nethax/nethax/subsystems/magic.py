@@ -1695,7 +1695,12 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
     )
     rng, sub = jax.random.split(rng)
     roll = jax.random.randint(sub, (), 0, 100)
-    failed = bool(roll >= success_pct)
+    # Vendor spell.c:1372 — ``if (confused || (rnd(100) > chance))`` — being
+    # confused forces a cast failure regardless of skill roll.  Mirrors the
+    # confused-cast behavior parallel to the movement randomization gate.
+    from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS_cast
+    confused = bool(int(state.status.timed_statuses[int(_TS_cast.CONFUSION)]) > 0)
+    failed = confused or bool(roll >= success_pct)
 
     # Build adapter so effect handlers can read/write via dict syntax
     adapter = _StateAdapter(state)
@@ -1735,6 +1740,13 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
     # Vendor parity: ``spelleffects`` does NOT touch ``sp_know`` on cast.
     # Spell memory decays once per turn via ``age_spells`` (env._step_impl)
     # — see vendor/nethack/src/spell.c::age_spells lines 669-682.
+
+    # Emit SPELL_FIZZLES on failure (vendor spell.c:1373 "You fail to cast
+    # the spell correctly.").  Pre-build so the message rides on the same
+    # state we return.
+    if failed:
+        from Nethax.nethax.subsystems.messages import emit as _msg_emit_f, MessageId as _MsgId_f
+        adapter["messages"] = _msg_emit_f(adapter["messages"], int(_MsgId_f.SPELL_FIZZLES))
 
     # Skill practice after cast (regardless of success/failure).
     # Cite: vendor/nethack/src/weapon.c:1424 (use_skill).

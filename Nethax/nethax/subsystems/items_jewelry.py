@@ -346,12 +346,22 @@ def put_on_ring(state, rng: jax.Array, slot_idx: int, hand: int):
         )
         new_type_mask = type_mask.at[safe_otyp].set(jnp.bool_(True))
         # Also flip the per-item identified flag (vendor learnring also
-        # sets obj->dknown, which is the per-item analogue).
+        # sets obj->dknown, which is the per-item analogue).  Per vendor
+        # obj.h line 114 + objnam.c:1183, learning the ring's effect also
+        # reveals erodeproof / charge state — set rknown=True alongside.
         items_id = state.inventory.items.identified
         new_items_id = items_id.at[slot_idx].set(jnp.bool_(True))
+        items_dknown = state.inventory.items.dknown
+        new_items_dknown = items_dknown.at[slot_idx].set(jnp.bool_(True))
+        items_rknown = state.inventory.items.rknown
+        new_items_rknown = items_rknown.at[slot_idx].set(jnp.bool_(True))
         state = state.replace(
             inventory=state.inventory.replace(
-                items=state.inventory.items.replace(identified=new_items_id),
+                items=state.inventory.items.replace(
+                    identified=new_items_id,
+                    dknown=new_items_dknown,
+                    rknown=new_items_rknown,
+                ),
             ),
             identification=state.identification.replace(
                 identified=new_type_mask
