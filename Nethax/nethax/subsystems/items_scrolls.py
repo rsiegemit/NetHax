@@ -1090,11 +1090,20 @@ def _effect_amnesia(state, rng, buc):
             identification=new_state.identification.replace(identified=new_ident)
         )
 
-    # --- Spells: forget all known spells when cursed ---
+    # --- Spells: forget a vendor-distributed subset when not blessed.
+    # Vendor read.c:1836 — forget(!sblessed ? ALL_SPELLS : 0).  forget()
+    # then dispatches to losespells() which draws nzap from rn2(n+1)
+    # (and the confusion / luck modifiers).  We call losespells for both
+    # uncursed and cursed amnesia (blessed skips the call entirely).
     if hasattr(new_state, "magic") and hasattr(new_state.magic, "spell_memory"):
-        cur_mem = new_state.magic.spell_memory
-        new_mem = jnp.where(cursed, jnp.zeros_like(cur_mem), cur_mem)
-        new_state = new_state.replace(magic=new_state.magic.replace(spell_memory=new_mem))
+        from Nethax.nethax.subsystems.magic import losespells
+        rng, rng_lose = jax.random.split(rng)
+        lose_state = losespells(new_state, rng_lose)
+        new_state = jax.tree.map(
+            lambda a, b: jnp.where(blessed, a, b),
+            new_state,
+            lose_state,
+        )
 
     return new_state
 

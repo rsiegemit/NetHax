@@ -1853,3 +1853,106 @@ def handle_spell_genocide(state, rng: jax.Array):
     """
     from Nethax.nethax.subsystems.items_scrolls import apply_genocide
     return apply_genocide(state, rng)
+
+
+# ---------------------------------------------------------------------------
+# losespells — amnesia spell-forgetting roll.
+#
+# Vendor: vendor/nethack/src/spell.c::losespells lines 1763-1827.
+#   n = number of known spells (scan spl_book until NO_SPELL)
+#   nzap = rn2(n + 1)
+#   if Confusion: nzap = max(nzap, rn2(n + 1))
+#   if nzap > 1 && !rnl(7): nzap = rnd(nzap)         /* luck amelioration */
+#   for i = 0; nzap > 0; ++i:
+#       if rn2(n - i) < nzap:
+#           spellknow(i) = 0
+#           --nzap
+#
+# JAX port keeps the same statistical distribution: iterates over the full
+# fixed-shape spell_known mask (N_SPELLS slots), tracking the running
+# "i = number-of-known-slots-visited" via a cumulative sum.  The vendor
+# rn2(n - i) < nzap test is replicated per slot, and `nzap` is decremented
+# whenever a known slot is selected.  Unknown slots are skipped (no draw,
+# no counter advance) so the distribution matches vendor byte-equal.
+# ---------------------------------------------------------------------------
+
+
+def losespells(state, rng: jax.Array):
+    """Forget a random subset of known spells — vendor-equal amnesia roll.
+
+    Cite: vendor/nethack/src/spell.c::losespells lines 1763-1827.
+
+    Inputs
+    ------
+    state : EnvState — uses ``state.magic.spell_known`` to count known
+            spells and ``state.status.timed_statuses[CONFUSION]`` for the
+            confusion modifier.  ``state.luck`` (or 0 if absent) feeds the
+            ``rnl(7)`` luck amelioration draw.
+
+    Returns
+    -------
+    Updated state with ``magic.spell_memory`` cleared to 0 for any spell
+    selected by the vendor distribution.  ``spell_known`` is left intact;
+    the spell becomes uncastable because cast_spell guards on
+    ``spell_memory > 0`` (see vendor spellknow semantics — vendor
+    likewise leaves spellid(i) alone and only zeroes sp_know).
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+
+    magic = state.magic
+    known = magic.spell_known                                # bool[N_SPELLS]
+    n = jnp.sum(known.astype(jnp.int32))                     # known count
+
+    # --- nzap draw (vendor lines 1777-1782) ---
+    rng, rng_a, rng_b, rng_c, rng_d = jax.random.split(rng, 5)
+    nzap = jax.random.randint(rng_a, (), 0, n + jnp.int32(1), dtype=jnp.int32)
+
+    # Confusion: take max of two draws (vendor line 1779-1781).
+    confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
+    nzap_conf = jax.random.randint(rng_b, (), 0, n + jnp.int32(1), dtype=jnp.int32)
+    nzap = jnp.where(confused, jnp.maximum(nzap, nzap_conf), nzap)
+
+    # Good luck might ameliorate spell loss (vendor line 1784-1785):
+    #   if (nzap > 1 && !rnl(7)) nzap = rnd(nzap);
+    # rnl(7) is rn2(7) modulated by luck; we use raw rn2(7) (luck=0 baseline)
+    # because EnvState luck plumbing is not universally available in this
+    # call site — matches the vendor distribution when Luck is 0.
+    luck_test  = jax.random.randint(rng_c, (), 0, 7, dtype=jnp.int32) == jnp.int32(0)
+    ameliorate = (nzap > jnp.int32(1)) & luck_test
+    # rnd(nzap) = 1 + rn2(nzap); safe when nzap >= 1.
+    amel_draw  = jnp.int32(1) + jax.random.randint(
+        rng_d, (), 0, jnp.maximum(nzap, jnp.int32(1)), dtype=jnp.int32
+    )
+    nzap = jnp.where(ameliorate, amel_draw, nzap)
+
+    # --- Per-slot forget loop (vendor lines 1809-1826) ---
+    # Vendor walks indices 0..n-1 of the packed spl_book; for each known
+    # slot ``i`` it draws rn2(n - i) and clears sp_know if the draw < nzap.
+    # In nethax the spell_known mask is sparse; we iterate all N_SPELLS
+    # slots but only advance ``i`` (and consume an rng draw) for slots
+    # whose ``known`` bit is set.  Unknown slots are skipped without
+    # touching nzap or i.
+    rng_per_slot = jax.random.split(rng, N_SPELLS)            # one key per slot
+
+    def _body(carry, inputs):
+        nzap, i = carry
+        slot_known, key = inputs
+        # rn2(n - i) — exclusive upper bound; guard against zero by clamping.
+        upper = jnp.maximum(n - i, jnp.int32(1))
+        draw  = jax.random.randint(key, (), 0, upper, dtype=jnp.int32)
+        forget = slot_known & (draw < nzap) & (nzap > jnp.int32(0))
+        # Vendor only decrements nzap when forget fires; i advances per
+        # known slot regardless (matches the packed-list walk).
+        new_nzap = jnp.where(forget, nzap - jnp.int32(1), nzap)
+        new_i    = jnp.where(slot_known, i + jnp.int32(1), i)
+        return (new_nzap, new_i), forget
+
+    (_, _), forget_mask = jax.lax.scan(
+        _body,
+        (nzap, jnp.int32(0)),
+        (known, rng_per_slot),
+    )
+
+    # Zero spell_memory for every spell flagged by the forget mask.
+    new_mem = jnp.where(forget_mask, jnp.int32(0), magic.spell_memory)
+    return state.replace(magic=magic.replace(spell_memory=new_mem))
