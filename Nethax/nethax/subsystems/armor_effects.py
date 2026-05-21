@@ -53,9 +53,33 @@ _ORCISH_HELM            = ObjType.ORCISH_HELM
 _HELM_OF_BRILLIANCE     = ObjType.HELM_OF_BRILLIANCE
 _HELM_OF_OPPOSITE_ALIGN = ObjType.HELM_OF_OPPOSITE_ALIGNMENT
 _HELM_OF_TELEPATHY      = ObjType.HELM_OF_TELEPATHY
+_HELM_OF_CAUTION        = ObjType.HELM_OF_CAUTION
 _DUNCE_CAP              = ObjType.DUNCE_CAP
 _CORNUTHAUM             = ObjType.CORNUTHAUM
 _TINFOIL_HAT            = ObjType.TINFOIL_HAT
+
+# Dragon scale mails and scales (BODY slot).
+# cite: vendor/nethack/include/objects.h:497-553 (DRGN_ARMR).
+_GRAY_DSM    = ObjType.GRAY_DRAGON_SCALE_MAIL
+_GOLD_DSM    = ObjType.GOLD_DRAGON_SCALE_MAIL
+_SILVER_DSM  = ObjType.SILVER_DRAGON_SCALE_MAIL
+_RED_DSM     = ObjType.RED_DRAGON_SCALE_MAIL
+_WHITE_DSM   = ObjType.WHITE_DRAGON_SCALE_MAIL
+_ORANGE_DSM  = ObjType.ORANGE_DRAGON_SCALE_MAIL
+_BLACK_DSM   = ObjType.BLACK_DRAGON_SCALE_MAIL
+_BLUE_DSM    = ObjType.BLUE_DRAGON_SCALE_MAIL
+_GREEN_DSM   = ObjType.GREEN_DRAGON_SCALE_MAIL
+_YELLOW_DSM  = ObjType.YELLOW_DRAGON_SCALE_MAIL
+_GRAY_DS     = ObjType.GRAY_DRAGON_SCALES
+_GOLD_DS     = ObjType.GOLD_DRAGON_SCALES
+_SILVER_DS   = ObjType.SILVER_DRAGON_SCALES
+_RED_DS      = ObjType.RED_DRAGON_SCALES
+_WHITE_DS    = ObjType.WHITE_DRAGON_SCALES
+_ORANGE_DS   = ObjType.ORANGE_DRAGON_SCALES
+_BLACK_DS    = ObjType.BLACK_DRAGON_SCALES
+_BLUE_DS     = ObjType.BLUE_DRAGON_SCALES
+_GREEN_DS    = ObjType.GREEN_DRAGON_SCALES
+_YELLOW_DS   = ObjType.YELLOW_DRAGON_SCALES
 
 # Cloaks
 _CLOAK_OF_PROTECTION    = ObjType.CLOAK_OF_PROTECTION
@@ -132,6 +156,53 @@ def _is_wearing(type_id: jnp.ndarray, target: int) -> jnp.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Effective-stat accessors (vendor attrib.c::acurr)
+# ---------------------------------------------------------------------------
+
+# STR19(25) — vendor attrib.h::STR19 macro yields 100+y for 19<=y<=25, so
+# STR19(25) = 125.  Returned by acurr(A_STR) whenever GoP is worn (vendor
+# attrib.c:1213-1215).
+_STR19_25 = 125
+
+
+def compute_effective_str(state) -> jnp.ndarray:
+    """Effective Strength accounting for armor and Gauntlets of Power.
+
+    Mirrors the STR branch of vendor ``attrib.c::acurr`` lines 1207-1220::
+
+        tmp = u.abon.a[A_STR] + u.atemp.a[A_STR] + u.acurr.a[A_STR];
+        if (tmp >= STR19(25) || (uarmg && uarmg->otyp == GAUNTLETS_OF_POWER))
+            result = STR19(25);   /* 125 */
+        else
+            result = max(tmp, 3);
+
+    Nethax stores base STR directly in ``state.player_str`` (already on the
+    0..125 scale, equivalent to vendor's combined ``abon + atemp + acurr``),
+    and any additive armor-sourced delta in
+    ``inventory.armor_stat_bonus[_STAT_STR]``.  When GoP is in the GLOVES
+    slot the effective value is forced to 125 regardless of the additive
+    bonus, matching vendor.
+
+    JIT-pure scalar; safe to call from any traced context.
+    """
+    from Nethax.nethax.subsystems.inventory import ArmorSlot
+    glove_tid = _type_id_at_slot(state, int(ArmorSlot.GLOVES))
+    wearing_gop = _is_wearing(glove_tid, _GAUNTLETS_OF_POWER)
+
+    base = state.player_str.astype(jnp.int32)
+    bonus = state.inventory.armor_stat_bonus[_STAT_STR].astype(jnp.int32)
+    additive = jnp.maximum(base + bonus, jnp.int32(3))
+    # vendor acurr also clamps when tmp >= STR19(25); since additive >=125
+    # is functionally identical to GoP we fold both paths.
+    capped = jnp.where(
+        wearing_gop | (additive >= jnp.int32(_STR19_25)),
+        jnp.int32(_STR19_25),
+        additive,
+    )
+    return capped
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -154,6 +225,7 @@ def apply_armor_effects(state) -> object:
     glove_tid  = _type_id_at_slot(state, int(ArmorSlot.GLOVES))
     glove_ench = _enchant_at_slot(state, int(ArmorSlot.GLOVES))
     boot_tid   = _type_id_at_slot(state, int(ArmorSlot.BOOTS))
+    body_tid   = _type_id_at_slot(state, int(ArmorSlot.BODY))
 
     # ------------------------------------------------------------------
     # 2. Start from the current intrinsics array (permanent + timed).
@@ -174,6 +246,18 @@ def apply_armor_effects(state) -> object:
         int(Intrinsic.WWALKING),
         int(Intrinsic.FAST),
         int(Intrinsic.CLAIRVOYANT),
+        # HELM_OF_CAUTION (helm) + dragon scale mail / scales (body).
+        # cite: vendor/nethack/include/objects.h:479-481 (WARNING),
+        #       :497-553 DRGN_ARMR (resist + REFLECTING + ANTIMAGIC powers).
+        int(Intrinsic.WARNING),
+        int(Intrinsic.REFLECTING),
+        int(Intrinsic.RESIST_FIRE),
+        int(Intrinsic.RESIST_COLD),
+        int(Intrinsic.RESIST_SLEEP),
+        int(Intrinsic.RESIST_DISINT),
+        int(Intrinsic.RESIST_SHOCK),
+        int(Intrinsic.RESIST_POISON),
+        int(Intrinsic.RESIST_ACID),
     ]
     for bit in armor_bits:
         intr = intr.at[bit].set(jnp.bool_(False))
@@ -189,6 +273,38 @@ def apply_armor_effects(state) -> object:
     has_telep = _is_wearing(helm_tid, _HELM_OF_TELEPATHY) | _is_wearing(helm_tid, _TINFOIL_HAT)
     intr = intr.at[int(Intrinsic.TELEPATHY)].set(has_telep)
 
+    # HELM_OF_CAUTION -> WARNING
+    # cite: vendor/nethack/include/objects.h:479-481 — oc_oprop = WARNING.
+    has_warning = _is_wearing(helm_tid, _HELM_OF_CAUTION)
+    intr = intr.at[int(Intrinsic.WARNING)].set(has_warning)
+
+    # ------------------------------------------------------------------
+    # 3b. BODY armor effects — dragon scale mail / dragon scales.
+    # cite: vendor/nethack/include/objects.h:497-553 (DRGN_ARMR).
+    # Pairs (DSM, scales) share intrinsic; GOLD has no intrinsic (light only).
+    # ------------------------------------------------------------------
+    has_gray   = _is_wearing(body_tid, _GRAY_DSM)   | _is_wearing(body_tid, _GRAY_DS)
+    has_silver = _is_wearing(body_tid, _SILVER_DSM) | _is_wearing(body_tid, _SILVER_DS)
+    has_red    = _is_wearing(body_tid, _RED_DSM)    | _is_wearing(body_tid, _RED_DS)
+    has_white  = _is_wearing(body_tid, _WHITE_DSM)  | _is_wearing(body_tid, _WHITE_DS)
+    has_orange = _is_wearing(body_tid, _ORANGE_DSM) | _is_wearing(body_tid, _ORANGE_DS)
+    has_black  = _is_wearing(body_tid, _BLACK_DSM)  | _is_wearing(body_tid, _BLACK_DS)
+    has_blue   = _is_wearing(body_tid, _BLUE_DSM)   | _is_wearing(body_tid, _BLUE_DS)
+    has_green  = _is_wearing(body_tid, _GREEN_DSM)  | _is_wearing(body_tid, _GREEN_DS)
+    has_yellow = _is_wearing(body_tid, _YELLOW_DSM) | _is_wearing(body_tid, _YELLOW_DS)
+    # GRAY -> ANTIMAGIC.  OR with cloak MR below.
+    intr = intr.at[int(Intrinsic.MAGIC_RESIST)].set(
+        intr[int(Intrinsic.MAGIC_RESIST)] | has_gray
+    )
+    intr = intr.at[int(Intrinsic.REFLECTING)].set(has_silver)
+    intr = intr.at[int(Intrinsic.RESIST_FIRE)].set(has_red)
+    intr = intr.at[int(Intrinsic.RESIST_COLD)].set(has_white)
+    intr = intr.at[int(Intrinsic.RESIST_SLEEP)].set(has_orange)
+    intr = intr.at[int(Intrinsic.RESIST_DISINT)].set(has_black)
+    intr = intr.at[int(Intrinsic.RESIST_SHOCK)].set(has_blue)
+    intr = intr.at[int(Intrinsic.RESIST_POISON)].set(has_green)
+    intr = intr.at[int(Intrinsic.RESIST_ACID)].set(has_yellow)
+
     # ------------------------------------------------------------------
     # 4. CLOAK effects
     # cite: do_wear.c Cloak_on (~line 325)
@@ -196,8 +312,11 @@ def apply_armor_effects(state) -> object:
 
     # CLOAK_OF_MAGIC_RESISTANCE → MAGIC_RESIST
     # cite: do_wear.c line 334 (oc_oprop = ANTIMAGIC for this cloak)
+    # OR with any MAGIC_RESIST already granted (e.g. GRAY dragon scale mail).
     has_mr = _is_wearing(cloak_tid, _CLOAK_OF_MAGIC_RES)
-    intr = intr.at[int(Intrinsic.MAGIC_RESIST)].set(has_mr)
+    intr = intr.at[int(Intrinsic.MAGIC_RESIST)].set(
+        intr[int(Intrinsic.MAGIC_RESIST)] | has_mr
+    )
 
     # CLOAK_OF_INVISIBILITY → INVIS (unless mummy wrapping blocks it)
     # cite: do_wear.c line 355

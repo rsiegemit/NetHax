@@ -170,6 +170,34 @@ class ObjType:
     LOW_BOOTS                 = 115
     WATER_WALKING_BOOTS       = 116
 
+    # Helm of caution (vendor/nethack/include/objects.h:479-481 — oc_oprop=WARNING)
+    HELM_OF_CAUTION           = 117
+
+    # Dragon scale mails (vendor/nethack/include/objects.h:502-526)
+    # Order mirrors vendor DRGN_ARMR block; powers from oc_oprop column.
+    GRAY_DRAGON_SCALE_MAIL    = 118   # ANTIMAGIC
+    GOLD_DRAGON_SCALE_MAIL    = 119   # (light source — no intrinsic)
+    SILVER_DRAGON_SCALE_MAIL  = 120   # REFLECTING
+    RED_DRAGON_SCALE_MAIL     = 121   # FIRE_RES
+    WHITE_DRAGON_SCALE_MAIL   = 122   # COLD_RES
+    ORANGE_DRAGON_SCALE_MAIL  = 123   # SLEEP_RES
+    BLACK_DRAGON_SCALE_MAIL   = 124   # DISINT_RES
+    BLUE_DRAGON_SCALE_MAIL    = 125   # SHOCK_RES
+    GREEN_DRAGON_SCALE_MAIL   = 126   # POISON_RES
+    YELLOW_DRAGON_SCALE_MAIL  = 127   # ACID_RES
+
+    # Dragon scales (vendor/nethack/include/objects.h:530-553) — same powers
+    GRAY_DRAGON_SCALES        = 128   # ANTIMAGIC
+    GOLD_DRAGON_SCALES        = 129
+    SILVER_DRAGON_SCALES      = 130   # REFLECTING
+    RED_DRAGON_SCALES         = 131   # FIRE_RES
+    WHITE_DRAGON_SCALES       = 132   # COLD_RES
+    ORANGE_DRAGON_SCALES      = 133   # SLEEP_RES
+    BLACK_DRAGON_SCALES       = 134   # DISINT_RES
+    BLUE_DRAGON_SCALES        = 135   # SHOCK_RES
+    GREEN_DRAGON_SCALES       = 136   # POISON_RES
+    YELLOW_DRAGON_SCALES      = 137   # ACID_RES
+
     # Potions (POTION_CLASS = 8)
     POT_WATER         = 200
     POT_BOOZE         = 201
@@ -253,6 +281,30 @@ _ARMOR_AC = {
     ObjType.ORCISH_HELM: 1,
     ObjType.FEDORA: 0,
     ObjType.ELVEN_LEATHER_HELM: 1,
+    # HELM_OF_CAUTION — objects.h:479-481 a_ac=9 → 10-9=1
+    ObjType.HELM_OF_CAUTION: 1,
+    # Dragon scale mails / scales — objects.h:497-553 DRGN_ARMR macro
+    # a_ac=1 → 10-1=9.  All dragon armor entries share AC 9.
+    ObjType.GRAY_DRAGON_SCALE_MAIL: 9,
+    ObjType.GOLD_DRAGON_SCALE_MAIL: 9,
+    ObjType.SILVER_DRAGON_SCALE_MAIL: 9,
+    ObjType.RED_DRAGON_SCALE_MAIL: 9,
+    ObjType.WHITE_DRAGON_SCALE_MAIL: 9,
+    ObjType.ORANGE_DRAGON_SCALE_MAIL: 9,
+    ObjType.BLACK_DRAGON_SCALE_MAIL: 9,
+    ObjType.BLUE_DRAGON_SCALE_MAIL: 9,
+    ObjType.GREEN_DRAGON_SCALE_MAIL: 9,
+    ObjType.YELLOW_DRAGON_SCALE_MAIL: 9,
+    ObjType.GRAY_DRAGON_SCALES: 9,
+    ObjType.GOLD_DRAGON_SCALES: 9,
+    ObjType.SILVER_DRAGON_SCALES: 9,
+    ObjType.RED_DRAGON_SCALES: 9,
+    ObjType.WHITE_DRAGON_SCALES: 9,
+    ObjType.ORANGE_DRAGON_SCALES: 9,
+    ObjType.BLACK_DRAGON_SCALES: 9,
+    ObjType.BLUE_DRAGON_SCALES: 9,
+    ObjType.GREEN_DRAGON_SCALES: 9,
+    ObjType.YELLOW_DRAGON_SCALES: 9,
     # Gloves
     ObjType.LEATHER_GLOVES: 1,
     # Boots
