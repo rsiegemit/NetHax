@@ -86,13 +86,20 @@ def _fresh() -> EnvState:
 def _set_violations(state: EnvState, kept_conducts: list) -> EnvState:
     """Return state with only the conducts in ``kept_conducts`` preserved.
 
-    Every other conduct is marked violated.
+    Every other conduct is marked violated.  Sets both ``violations`` (legacy
+    bool mask) and ``counters`` (vendor u.uconduct.<field> long counter) so
+    the two fields stay in sync — matches ``violate()`` / ``increment_counter()``
+    semantics in conduct.py.  Wave 29b-2 switched
+    ``compute_conduct_bonus`` to use ``counters == 0`` as the kept predicate
+    (insight.c byte-equal), so fixtures must bump counters too.
     """
     kept = set(int(c) for c in kept_conducts)
-    arr = [i not in kept for i in range(N_CONDUCTS)]
+    violated = [i not in kept for i in range(N_CONDUCTS)]
+    counters = [1 if v else 0 for v in violated]
     return state.replace(
         conduct=state.conduct.replace(
-            violations=jnp.array(arr, dtype=jnp.bool_),
+            violations=jnp.array(violated, dtype=jnp.bool_),
+            counters=jnp.array(counters, dtype=jnp.int32),
         ),
     )
 
