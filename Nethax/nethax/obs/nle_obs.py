@@ -1422,10 +1422,12 @@ def build_blstats(env_state) -> jnp.ndarray:
     # Strength: NLE stores the clamped display value [3..25] at BL_STR25
     # and the raw internal value [3..125] at BL_STR125.
     # NetHack botl.c: display shows str//5 when str > 25 (i.e. exceptional str).
-    result = result.at[BL_STR25].set(
-        jnp.int64(jnp.minimum(env_state.player_str, jnp.int16(25)))
-    )
-    result = result.at[BL_STR125].set(jnp.int64(env_state.player_str))
+    # Effective STR honors the Gauntlets-of-Power cap (acurr branch at
+    # vendor/nethack/src/attrib.c:1213-1215 forces 125 when uarmg==GoP).
+    from Nethax.nethax.subsystems.armor_effects import compute_effective_str
+    eff_str = compute_effective_str(env_state)
+    result = result.at[BL_STR25].set(jnp.int64(jnp.minimum(eff_str, jnp.int32(25))))
+    result = result.at[BL_STR125].set(jnp.int64(eff_str))
 
     result = result.at[BL_DEX].set(jnp.int64(env_state.player_dex))
     result = result.at[BL_CON].set(jnp.int64(env_state.player_con))

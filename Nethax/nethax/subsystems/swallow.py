@@ -37,6 +37,39 @@ _IS_ENGULFER: jnp.ndarray = _build_is_engulfer_table()
 
 
 # ---------------------------------------------------------------------------
+# Swallow-message variant table — chooses between SWALLOW_DIGESTS,
+# SWALLOW_ENFOLDS, and SWALLOW_ENGULFS based on the engulfer's AT_ENGL attack
+# damage type.  Mirrors mhitu.c:1335-1338:
+#   digests(mtmp->data) ? "swallows you whole"      (AT_ENGL + AD_DGST)
+#   enfolds(mtmp->data) ? "folds itself around you" (AT_ENGL + AD_WRAP)
+#   else                  "engulfs you"             (any other AT_ENGL)
+# Encoded as: 0 = ENGULFS (default), 1 = DIGESTS, 2 = ENFOLDS.
+# ---------------------------------------------------------------------------
+def _build_swallow_variant_table() -> jnp.ndarray:
+    from Nethax.nethax.constants.monsters import MONSTERS, AttackType, DamageType
+    at_engl = int(AttackType.AT_ENGL)
+    ad_dgst = int(DamageType.AD_DGST)
+    # AD_WRAP: mhitu/monattk uses AD_WRAP for enfolding (trapper/lurker).
+    ad_wrap = getattr(DamageType, "AD_WRAP", None)
+    ad_wrap_v = int(ad_wrap) if ad_wrap is not None else -1
+    variants = []
+    for m in MONSTERS:
+        v = 0  # default ENGULFS
+        for atk in m.attacks:
+            if atk[0] == at_engl:
+                if atk[1] == ad_dgst:
+                    v = 1
+                elif ad_wrap_v >= 0 and atk[1] == ad_wrap_v:
+                    v = 2
+                break
+        variants.append(v)
+    return jnp.array(variants, dtype=jnp.int8)
+
+
+_SWALLOW_VARIANT: jnp.ndarray = _build_swallow_variant_table()
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 @struct.dataclass
@@ -148,19 +181,36 @@ def try_engulf(
 
     # Player's pos moves to the engulfer's pos (they are now inside).
     # vendor/nethack/src/mhitu.c:1301 — sets u.ux/u.uy to mtmp->mx/mtmp->my.
-    engulfer_pos = state.monster_ai.pos[attacker_slot.astype(jnp.int32)]
+    slot_i32 = attacker_slot.astype(jnp.int32)
+    engulfer_pos = state.monster_ai.pos[slot_i32]
 
     new_swallow = state.swallow.replace(
         swallowed=jnp.bool_(True),
-        engulfer_slot=attacker_slot.astype(jnp.int32),
+        engulfer_slot=slot_i32,
         digest_timer=jnp.int32(10),
         total_timer=total,
     )
     new_pos = engulfer_pos.astype(jnp.int16)
 
+    # Choose swallow-message variant by engulfer's AT_ENGL damage type.
+    # Cite: vendor/nethack/src/mhitu.c:1335-1338 (digests/enfolds/engulfs).
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    entry_idx = state.monster_ai.entry_idx[slot_i32].astype(jnp.int32)
+    safe_entry = jnp.clip(entry_idx, jnp.int32(0), jnp.int32(_SWALLOW_VARIANT.shape[0] - 1))
+    variant = _SWALLOW_VARIANT[safe_entry].astype(jnp.int32)
+    msg_id_engulfs = jnp.int32(int(_MsgId.SWALLOW_ENGULFS))
+    msg_id_digests = jnp.int32(int(_MsgId.SWALLOW_DIGESTS))
+    msg_id_enfolds = jnp.int32(int(_MsgId.SWALLOW_ENFOLDS))
+    chosen_id = jnp.where(
+        variant == jnp.int32(1), msg_id_digests,
+        jnp.where(variant == jnp.int32(2), msg_id_enfolds, msg_id_engulfs),
+    )
+    new_messages = _msg_emit(state.messages, chosen_id)
+
     swallowed_state = state.replace(
         swallow=new_swallow,
         player_pos=new_pos,
+        messages=new_messages,
     )
 
     # No-op if already swallowed; apply engulf otherwise.

@@ -1053,10 +1053,29 @@ def sit_on_altar(state, rng):
     ).astype(jnp.int8)
 
     new_prayer = state.prayer.replace(alignment_record=new_record)
+
+    # Vendor sit.c/pray.c::altar_wrath emits a flavor pline message for the
+    # branch that triggered.  Mirror with MessageId emits gated on the two
+    # outcome gates above.
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit_a, MessageId as _MsgId_a
+    msgs_after_wrath = jax.lax.cond(
+        do_wrath_same,
+        lambda m: _msg_emit_a(m, int(_MsgId_a.ALTAR_WRATH)),
+        lambda m: m,
+        state.messages,
+    )
+    msgs_after_luck = jax.lax.cond(
+        luck_active,
+        lambda m: _msg_emit_a(m, int(_MsgId_a.ALTAR_LUCK_LOSS)),
+        lambda m: m,
+        msgs_after_wrath,
+    )
+
     new_state = state.replace(
         player_wis=new_wis,
         player_luck=new_luck,
         prayer=new_prayer,
+        messages=msgs_after_luck,
     )
 
     # Retain BUC-reveal side-effect (Wave 4 altar_buc_sense semantics).
@@ -1556,6 +1575,30 @@ def sit_on_throne(state, rng):
         _confuse,
     )
     new_state = jax.lax.switch(effect, branches, state)
+
+    # Emit per-effect flavor message — mirrors vendor/nethack/src/sit.c
+    # throne_sit_effect pline lines (one per case 1..13).
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit_t, MessageId as _MsgId_t
+    _THRONE_MSG_IDS = jnp.array([
+        int(_MsgId_t.THRONE_ATTR_LOSS),
+        int(_MsgId_t.THRONE_ATTR_GAIN),
+        int(_MsgId_t.THRONE_SHOCK),
+        int(_MsgId_t.THRONE_FULL_HEAL),
+        int(_MsgId_t.THRONE_TAKE_GOLD),
+        int(_MsgId_t.THRONE_WISH),
+        int(_MsgId_t.THRONE_COURT),
+        int(_MsgId_t.THRONE_GENOCIDE),
+        int(_MsgId_t.THRONE_CURSE_ITEMS),
+        int(_MsgId_t.THRONE_MAP_CONFUSE),
+        int(_MsgId_t.THRONE_TELEPORT),
+        int(_MsgId_t.THRONE_IDENTIFY),
+        int(_MsgId_t.THRONE_CONFUSE),
+    ], dtype=jnp.int32)
+    safe_effect = jnp.clip(effect, jnp.int32(0), jnp.int32(_THRONE_MSG_IDS.shape[0] - 1))
+    throne_msg_id = _THRONE_MSG_IDS[safe_effect]
+    new_state = new_state.replace(
+        messages=_msg_emit_t(new_state.messages, throne_msg_id),
+    )
 
     # Post-step: 1-in-3 chance throne disappears.
     destroy_roll = jax.random.randint(rng_post, (), 0, 3, dtype=jnp.int32)
