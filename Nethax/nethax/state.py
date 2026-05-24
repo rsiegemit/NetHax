@@ -32,6 +32,7 @@ from Nethax.nethax.subsystems.identification import IdentificationState
 from Nethax.nethax.subsystems.traps import TrapState
 from Nethax.nethax.subsystems.features import FeaturesState
 from Nethax.nethax.subsystems.prayer import PrayerState
+from Nethax.nethax.subsystems.priest import PriestState
 from Nethax.nethax.subsystems.conduct import ConductState
 from Nethax.nethax.subsystems.shop import ShopState
 from Nethax.nethax.subsystems.quest import QuestState
@@ -97,6 +98,7 @@ class EnvState:
     traps: TrapState
     features: FeaturesState
     prayer: PrayerState
+    priest: PriestState
     conduct: ConductState
     shop: ShopState
     quest: QuestState
@@ -264,6 +266,7 @@ class EnvState:
             traps=TrapState.default(num_levels=b * l, map_h=h, map_w=w),
             features=FeaturesState.default(num_levels=b * l, map_h=h, map_w=w),
             prayer=PrayerState.default(),
+            priest=PriestState.default(),
             conduct=ConductState.default(),
             shop=ShopState.default(),
             quest=QuestState.default(),

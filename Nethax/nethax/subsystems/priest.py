@@ -69,6 +69,51 @@ from flax import struct
 
 
 # ---------------------------------------------------------------------------
+# PriestState — top-level per-game priest bookkeeping.
+#
+# Wave 41g report noted that ``priest_talk`` stashed cheapskate_count locally
+# and dropped it on return; vendor priest.c::priest_talk reads/writes
+# ``EPRI(priest)->cheapskate`` across multiple #chat calls.  Hoist the field
+# here so it survives between calls and matches vendor parity.
+#
+# Field map vs vendor ``struct epri`` (include/epri.h):
+#   cheapskate_count <- EPRI(priest)->cheapskate (priest.c lines 612-680)
+#   pri_alignment    <- EPRI(priest)->shralign   (priest.c::priestini line 248)
+#   pri_intone_time  <- EPRI(priest)->intone_time (priest.c::intemple)
+#   pri_enter_time   <- EPRI(priest)->enter_time  (priest.c::intemple)
+# ---------------------------------------------------------------------------
+
+@struct.dataclass
+class PriestState:
+    """Persistent per-game priest record.
+
+    Mirrors the subset of vendor ``struct epri`` (include/epri.h) needed
+    for the donation cascade and temple-entry hints.  Defaults match a
+    fresh game (no priest interactions yet).
+    """
+    # priest.c lines 612-680: ``EPRI(priest)->cheapskate`` — times the caller
+    # refused to donate; increases ``suggested`` next call by +40 per bump.
+    cheapskate_count: jnp.ndarray   # int32 scalar
+    # priest.c::priestini line 248: ``EPRI(priest)->shralign = ...``
+    # Last-known altar alignment of the priest in the current temple.
+    pri_alignment:    jnp.ndarray   # int8 scalar
+    # priest.c::intemple uses long ``intone_time`` to throttle re-speaks of
+    # the temple-entry blessing line.
+    pri_intone_time:  jnp.ndarray   # int32 scalar
+    # priest.c::intemple uses ``enter_time`` to throttle the entry hint.
+    pri_enter_time:   jnp.ndarray   # int32 scalar
+
+    @classmethod
+    def default(cls) -> "PriestState":
+        return cls(
+            cheapskate_count=jnp.int32(0),
+            pri_alignment=jnp.int8(0),
+            pri_intone_time=jnp.int32(0),
+            pri_enter_time=jnp.int32(0),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Priest record is encoded into FeaturesState:
 #   features.altar_shrine[level, y, x]  — True at the priest's shrine tile
 #   features.has_temple [level]         — True iff a priest was placed here
@@ -196,9 +241,10 @@ def priest_talk(state, rng: jax.Array):
     """
     # --- 1. Compute "suggested" ----------------------------------------
     rng_offer, _ = jax.random.split(rng, 2)
-    # cheapskate_count is a vendor epri field we don't yet carry on EnvState.
-    # For parity tests we treat it as zero (fresh interaction).
-    cheapskate = jnp.int32(0)
+    # vendor priest.c lines 612-638: ``suggested = ... * rn1(101, 150 +
+    # cheapskate*40)``.  Read EPRI(priest)->cheapskate from PriestState
+    # (hoisted to EnvState in this wave so the count persists across calls).
+    cheapskate = state.priest.cheapskate_count.astype(jnp.int32)
     # ulevelpeak — we use player_xl (current XL); vendor uses u.ulevelpeak,
     # the player's highest XL achieved, but we don't carry that field.
     ulevelpeak = jnp.maximum(state.player_xl.astype(jnp.int32), jnp.int32(1))
@@ -316,13 +362,18 @@ def priest_talk(state, rng: jax.Array):
     # --- 6. Deduct gold and write back --------------------------------
     new_gold = jnp.where(has_gold, gold - offer, gold).astype(jnp.int32)
 
-    # cheapskate_count is a vendor epri field we don't yet carry on
-    # EnvState; donation tests verify gold / record / clairvoyant only.
-    _ = new_cheap
+    # vendor priest.c lines 612-680: ``EPRI(priest)->cheapskate`` persists
+    # across calls; write back through PriestState.  No-op when has_gold is
+    # False (the function is an early-return no-op in vendor too).
+    new_cheap_final = jnp.where(has_gold, new_cheap, cheapskate).astype(jnp.int32)
 
     new_prayer = state.prayer.replace(alignment_record=final_record_i16)
+    new_priest = state.priest.replace(cheapskate_count=new_cheap_final)
     return state.replace(
         prayer=new_prayer,
+        priest=new_priest,
         status=new_status,
         player_gold=new_gold,
     )
+
+
