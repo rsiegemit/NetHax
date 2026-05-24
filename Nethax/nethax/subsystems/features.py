@@ -1374,8 +1374,15 @@ def dip_fountain(state, rng, slot_idx):
     """
     rng_fate, rng_excal, rng_dry = jax.random.split(rng, 3)
 
-    LONG_SWORD_TYPE_ID = 34   # ObjType.LONG_SWORD
+    # vendor/nethack/src/fountain.c:404 — obj->otyp == LONG_SWORD.
+    # Long sword type_id matches Nethax/nethax/constants/objects.py line 924
+    # (index 37 in OBJECTS).  Previous value 34 was incorrect.
+    LONG_SWORD_TYPE_ID = 37   # ObjType.LONG_SWORD (objects.py line 924)
     LAWFUL = 2                # Alignment.LAWFUL
+
+    # vendor/nethack/src/role.c — PM_KNIGHT role id.
+    from Nethax.nethax.constants.roles import Role as _Role
+    KNIGHT = int(_Role.KNIGHT)
 
     inv = state.inventory.items
     n = inv.category.shape[0]
@@ -1384,13 +1391,27 @@ def dip_fountain(state, rng, slot_idx):
     item_type   = inv.type_id[slot]
     item_buc    = inv.buc_status[slot]
     item_ench   = inv.enchantment[slot]
+    item_qty    = inv.quantity[slot]
     item_filled = inv.category[slot] != jnp.int8(0)
 
+    # vendor/nethack/src/fountain.c:404-408 — Excalibur preconditions:
+    #   obj->otyp == LONG_SWORD && u.ulevel >= 5
+    #   && !rn2(Role_if(PM_KNIGHT) ? 6 : 30)
+    #   && obj->quan == 1L && !obj->oartifact
+    #   && (alignment check at line 411 — non-Lawful denied; we gate on
+    #      Lawful here so the grant path matches vendor's success branch).
     is_long_sword  = (item_type == jnp.int16(LONG_SWORD_TYPE_ID)) & item_filled
     is_lawful      = state.player_align == jnp.int8(LAWFUL)
     is_high_xl     = state.player_xl >= jnp.int32(5)
-    excal_eligible = is_long_sword & is_lawful & is_high_xl
-    excal_roll = jax.random.randint(rng_excal, (), 0, 6, dtype=jnp.int32) == jnp.int32(0)
+    is_single      = item_qty == jnp.int16(1)              # obj->quan == 1L
+    is_knight      = state.player_role == jnp.int8(KNIGHT)
+    excal_eligible = is_long_sword & is_lawful & is_high_xl & is_single
+    # vendor fountain.c:405 — !rn2(Role_if(PM_KNIGHT) ? 6 : 30).
+    # Knight: 1/6; any other (lawful) class: 1/30.
+    excal_denom = jnp.where(is_knight, jnp.int32(6), jnp.int32(30))
+    excal_roll  = jax.random.randint(
+        rng_excal, (), 0, excal_denom, dtype=jnp.int32
+    ) == jnp.int32(0)
     grants_excalibur = excal_eligible & excal_roll
 
     fate = jax.random.randint(rng_fate, (), 1, 31, dtype=jnp.int32)
@@ -1419,7 +1440,11 @@ def dip_fountain(state, rng, slot_idx):
         return s.replace(inventory=s.inventory.replace(items=new_items))
 
     def _water_demon(s):
-        return s.replace(player_hp=jnp.maximum(jnp.int32(0), s.player_hp - jnp.int32(3)))
+        # vendor/nethack/src/fountain.c:63-89 dowaterdemon() — spawns
+        # PM_WATER_DEMON adjacent.  Modelled here as a fixed HP loss proxy;
+        # 4 HP matches the sibling fountain.py::dip_fountain _demon branch
+        # (fountain.py line 267) and aligns with the cross-subsystem audit.
+        return s.replace(player_hp=jnp.maximum(jnp.int32(0), s.player_hp - jnp.int32(4)))
 
     def _water_nymph(s):
         return s

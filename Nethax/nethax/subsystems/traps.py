@@ -170,7 +170,11 @@ def trigger_trap(
     new_state = state.replace(revealed=new_revealed)
 
     # Split rng into per-roll keys.
-    k0, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10 = jax.random.split(rng, 11)
+    # vendor/nethack/src/trap.c::dotrap — each trap consumer must get its
+    # own random draw; PIT (line 1950: rnd(6)), SPIKED_PIT (line 1925: rnd(10))
+    # and HOLE/TRAPDOOR (rnd(6)) are independent rolls in vendor, so allocate
+    # distinct keys (k9, k10, k11) here rather than reusing one key.
+    k0, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10, k11 = jax.random.split(rng, 12)
 
     # Compute result for every trap type (all branches execute; jnp.select picks).
     # damage per type — vendor citations in comments.
@@ -184,10 +188,14 @@ def trigger_trap(
     # vendor trap.c:4238 — d(2,4) inside dofiretrap (was incorrectly d2).
     dmg_fire         = _d(k7, 4) + _d(k8, 4)              # d(2,4)=2..8
     # vendor trap.c:1950 — rnd(6) fall damage (was incorrectly 0).
+    # Use k9 for PIT (independent draw per vendor dotrap PIT branch).
     dmg_pit          = _d(k9, 6)
     # vendor trap.c:1925 — rnd(10) = 1..10 (was incorrectly d4).
-    dmg_spiked_pit   = _d(k9, 10)                         # rnd(10)
-    dmg_hole         = _d(k9, 6)                          # d6 (stub for HOLE/TRAPDOOR)
+    # Use k10 (distinct from k9) so SPIKED_PIT damage is independent of PIT —
+    # vendor draws a separate rnd() inside dotrap's SPIKED_PIT branch.
+    dmg_spiked_pit   = _d(k10, 10)                        # rnd(10)
+    # Use k11 for HOLE/TRAPDOOR (vendor: rnd(6) inside its own branch).
+    dmg_hole         = _d(k11, 6)                         # d6 (stub for HOLE/TRAPDOOR)
     dmg_anti_magic   = jnp.int32(0)
 
     # side_effects per type

@@ -244,18 +244,21 @@ def dip_fountain(state, rng: jax.Array, slot_idx: int) -> object:
 
     def _apply_dip_outcome(s, out):
         """Apply one of the 11 dip outcomes (no Excalibur path)."""
-        # --- CURSE_ITEM (fountain.c:459 case 16) ---
+        # --- CURSE_ITEM (vendor/nethack/src/fountain.c:459-462 case 16) ---
+        # Project BUC encoding: CURSED=1, UNCURSED=2, BLESSED=3 (matches
+        # items_scrolls._BUC_CURSED / _BUC_UNCURSED / _BUC_BLESSED).
         def _curse(st):
             buc = st.inventory.items.buc_status
-            new_buc = buc.at[slot_idx].set(jnp.int8(2))  # 2 = CURSED
+            new_buc = buc.at[slot_idx].set(jnp.int8(1))  # 1 = CURSED
             return st.replace(inventory=st.inventory.replace(
                 items=st.inventory.items.replace(buc_status=new_buc)
             ))
 
-        # --- UNCURSE_ITEM (fountain.c:467-474 cases 17-20) ---
+        # --- UNCURSE_ITEM (vendor/nethack/src/fountain.c:467-474 cases 17-20;
+        # vendor mkobj.c:1822 uncurse() clears cursed flag → UNCURSED state) ---
         def _uncurse(st):
             buc = st.inventory.items.buc_status
-            new_buc = buc.at[slot_idx].set(jnp.int8(1))  # 1 = UNCURSED
+            new_buc = buc.at[slot_idx].set(jnp.int8(2))  # 2 = UNCURSED
             return st.replace(inventory=st.inventory.replace(
                 items=st.inventory.items.replace(buc_status=new_buc)
             ))
@@ -310,10 +313,14 @@ def dip_fountain(state, rng: jax.Array, slot_idx: int) -> object:
 
     # Apply Excalibur or normal dip outcome.
     def _grant_excalibur(s):
-        """Lady of the Lake path (fountain.c:425-447)."""
+        """Lady of the Lake path (vendor/nethack/src/fountain.c:425-447).
+
+        Vendor fountain.c:434 calls bless(obj) which sets blessed=1.
+        Project BUC encoding: BLESSED=3.
+        """
         inv = s.inventory.items
         new_type = inv.type_id.at[slot_idx].set(jnp.int16(_EXCALIBUR_TYPE_ID))
-        new_buc  = inv.buc_status.at[slot_idx].set(jnp.int8(0))  # 0 = BLESSED
+        new_buc  = inv.buc_status.at[slot_idx].set(jnp.int8(3))  # 3 = BLESSED
         new_inv  = inv.replace(type_id=new_type, buc_status=new_buc)
         s = s.replace(inventory=s.inventory.replace(items=new_inv))
         # Fountain dries immediately (fountain.c:442).
@@ -381,12 +388,14 @@ def drink_fountain(state, rng: jax.Array) -> object:
         return s.replace(player_hp=new_hp)
 
     def _curse_items(s):
-        # fountain.c:315-332 fate 24: curse random inventory items.
-        # Simplified: curse first non-empty slot.
+        # vendor/nethack/src/fountain.c:315-332 fate 24: curse random
+        # inventory items.  Simplified: curse first non-empty slot.
+        # Project BUC encoding: CURSED=1 (was 2 — inverted; matches
+        # items_scrolls._BUC_CURSED).
         inv = s.inventory.items
         has_item = inv.category > jnp.int8(0)
         slot = jnp.argmax(has_item).astype(jnp.int32)
-        new_buc = inv.buc_status.at[slot].set(jnp.int8(2))
+        new_buc = inv.buc_status.at[slot].set(jnp.int8(1))  # 1 = CURSED
         return s.replace(inventory=s.inventory.replace(
             items=inv.replace(buc_status=new_buc)
         ))
