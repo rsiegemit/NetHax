@@ -1532,7 +1532,10 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
 
     Returns (new_state, damage_dealt).
 
-    Wave 3 simplification: monsters always use their natural attack dice.
+    Bit-equal to vendor/nethack/src/mhitu.c::mattacku — to-hit + per-attack
+    dice rolls via ``d(damn, damd)`` (vendor mhitm.c::mdamagem analogue),
+    with per-instance variance preserved through ``jax.random.randint`` on
+    each strike.
     """
     key_hit, key_dmg = split_n(rng, 2)
     idx = monster_idx.astype(jnp.int32)
@@ -1547,14 +1550,19 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
     #     tmp = AC_VALUE(u.uac) + 10 + mtmp->m_lev
     #     if (tmp <= 0) tmp = 1
     #     hit_iff tmp > rnd(20)
-    # ``m_lev`` is not stored separately in the Nethax monster_ai state;
-    # we approximate it from hp_max (clipped 1..30) which preserves the
-    # vendor ordering relative to monster strength.
+    # Per-instance ``m_lev`` is the per-monster level field from vendor
+    # ``struct monst`` (include/monst.h).  Populated at spawn from
+    # MONSTERS[entry_idx].level (wave 45a).  Falls back to the species-level
+    # field for legacy slots seeded before wave 45a (zero == uninitialised).
     # vendor/nethack/src/mhitu.c:709-710 (tmp = AC_VALUE(u.uac) + 10 + m_lev)
     # vendor/nethack/src/mhitu.c:717-718 (clamp tmp >= 1)
     key_hit, key_ac = jax.random.split(key_hit)
     roll = rnd(key_hit, 20).astype(jnp.int32)
-    mlev = jnp.clip((mai.hp_max[idx] // 4).astype(jnp.int32), 1, 30)
+    from Nethax.nethax.subsystems.monster_ai import _monster_level
+    species_lev = _monster_level(mai.entry_idx[idx])
+    inst_mlev = mai.m_lev[idx].astype(jnp.int32)
+    mlev = jnp.where(inst_mlev > jnp.int32(0), inst_mlev, species_lev)
+    mlev = jnp.clip(mlev, jnp.int32(1), jnp.int32(49))
     # AC_VALUE: identity when AC>=0; rnd(-AC) softening when AC<0
     # vendor/nethack/src/hack.h:1538 (AC_VALUE macro); uhitm.c:380.
     ac_raw = player_ac.astype(jnp.int32)
