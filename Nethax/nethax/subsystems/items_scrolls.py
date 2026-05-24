@@ -300,13 +300,17 @@ def _kill_all_of_symbol(state, chosen_class):
 
 
 def _apply_genocide(state, rng, buc=None):
-    """Random-class genocide for the scroll-read flow (Wave 5 simplification).
+    """Genocide for the scroll-read flow.
 
-    The player picks a class letter in vendor; we sample a class uniformly
-    from ``_GENOCIDE_CLASS_POOL`` until a higher-layer UI supplies the pick.
+    JAX-required divergence: vendor scroll-of-genocide prompts the player for
+    a class letter via getlin() in read.c::do_genocide.  Our headless env has
+    no interactive prompt, so the scroll-read flow samples a class uniformly
+    from ``_GENOCIDE_CLASS_POOL`` (the same pool vendor would offer at the
+    prompt).  ``apply_genocide(class_letter=...)`` is exposed for callers
+    that have a pre-bound class pick (e.g. AI policy, scripted tests).
 
     Self-genocide (vendor read.c:2826-3015, Your_Own_Race macro read.c:9):
-        When the scroll is cursed AND the random class pick collides with the
+        When the scroll is cursed AND the chosen class collides with the
         player's race symbol, the player dies (player_hp = -1).
         Race → symbol map:
             HUMAN(0)/ELF(1) → S_HUMAN(53)
@@ -798,19 +802,48 @@ def _effect_teleportation(state, rng, buc):
     Cite: vendor/nethack/src/teleport.c::tele (line 447), level_tele 1164,
           vendor/nethack/src/do.c::goto_level (~1234).
     """
-    from Nethax.nethax.rng import rn2
+    from Nethax.nethax.rng import rn2, rnd
     from Nethax.nethax.subsystems.detect import _teleds
 
     cursed = _is_cursed(buc)
 
-    rng_t, rng_lv, rng_sign = jax.random.split(rng, 3)
+    rng_t, rng_lv = jax.random.split(rng, 2)
     new_state = _teleds(state, rng_t)
 
-    # --- Cursed: invoke goto_level via simplified level shift. ---
-    lv_shift = rn2(rng_lv, 5).astype(jnp.int32) + jnp.int32(1)
-    sign     = jnp.where(rn2(rng_sign, 2) == jnp.int32(0), jnp.int32(-1), jnp.int32(1))
-    cur_lvl  = state.dungeon.current_level.astype(jnp.int32)
-    target_lvl = jnp.clip(cur_lvl + sign * lv_shift, jnp.int32(1), jnp.int32(50))
+    # --- Cursed: invoke level_tele() → random_teleport_level() → goto_level.
+    # Vendor port: random_teleport_level() (teleport.c:2191-2258).
+    #   if (!rn2(5)) return cur_depth;                       (line 2196)
+    #   nlev = rn2(cur_depth + 3 - min_depth) + min_depth;   (line 2239)
+    #     min_depth = 1 in main dungeon.
+    #   if (nlev >= cur_depth) nlev++;                       (line 2240)
+    #   if (nlev > max_depth) {
+    #       nlev = max_depth;
+    #       if (Is_botlevel(&u.uz)) nlev -= rnd(3);          (lines 2243-2247)
+    #   }
+    # min_depth-floor clamping (lines 2249-2255) is a no-op when min_depth=1
+    # and cur_depth>=1 because the "if (nlev==cur_depth) nlev+=rnd(3)" branch
+    # cannot fire (we just incremented past cur_depth above).
+    rng_stay, rng_pick, rng_bot = jax.random.split(rng_lv, 3)
+    cur_lvl   = state.dungeon.current_level.astype(jnp.int32)
+    cur_b     = jnp.clip(state.dungeon.current_branch.astype(jnp.int32),
+                         0, state.dungeon.branch_levels.shape[0] - 1)
+    max_depth = state.dungeon.branch_levels[cur_b].astype(jnp.int32)
+    max_depth = jnp.maximum(max_depth, jnp.int32(1))
+
+    stay_put  = rn2(rng_stay, 5).astype(jnp.int32) == jnp.int32(0)
+    # nlev = rn2(cur_depth + 3 - 1) + 1   ; range [1, cur_depth+2]
+    span      = jnp.maximum(cur_lvl + jnp.int32(2), jnp.int32(1))
+    pick      = rn2(rng_pick, span).astype(jnp.int32) + jnp.int32(1)
+    pick      = jnp.where(pick >= cur_lvl, pick + jnp.int32(1), pick)
+    # Cap at max_depth; if already on bottom level, step up by rnd(3).
+    is_bot    = cur_lvl >= max_depth
+    bot_step  = rnd(rng_bot, 3).astype(jnp.int32)
+    pick      = jnp.where(pick > max_depth,
+                          jnp.where(is_bot, max_depth - bot_step, max_depth),
+                          pick)
+    pick      = jnp.maximum(pick, jnp.int32(1))
+    target_lvl = jnp.where(stay_put, cur_lvl, pick)
+
     new_lvl_state = _goto_level(new_state, target_lvl)
     return jax.lax.cond(cursed, lambda _: new_lvl_state, lambda _: new_state, None)
 
@@ -1046,9 +1079,10 @@ def _effect_genocide(state, rng, buc):
     class (or species); every live monster on the level matching the chosen
     class has its alive flag cleared.
 
-    Wave 5 simplification: pick a class uniformly at random from the
-    candidate list ``_GENOCIDE_CLASSES`` and kill every monster whose
-    MONSTERS[entry_idx].symbol matches that class.
+    JAX-required divergence: vendor prompts for a class letter via getlin();
+    the headless scroll-read path samples uniformly from
+    ``_GENOCIDE_CLASS_POOL`` (same pool the prompt would offer).  Callers
+    with a pre-bound pick should invoke ``apply_genocide(class_letter=...)``.
 
     Self-genocide (vendor read.c:2826-3015, Your_Own_Race read.c:9):
         Cursed scrolls that pick the player's own race symbol kill the

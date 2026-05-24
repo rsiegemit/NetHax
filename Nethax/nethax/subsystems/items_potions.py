@@ -262,8 +262,9 @@ def _effect_full_healing(state, rng, buc):
     # We can't easily detect ``u.ulevelmax > u.ulevel`` without tracking lost
     # XL — but pluslvl is idempotent and capped at MAXULEV, so applying it
     # unconditionally on blessed is harmless when the player is already at
-    # max.  Vendor's pluslvl with incr=FALSE means "restore without bumping
-    # ulevelmax" — we approximate by calling pluslvl which bumps both.
+    # max.  Vendor's pluslvl(FALSE) means "restore without bumping ulevelmax";
+    # our pluslvl(incr=False) ports that semantic exactly (experience.py:610-
+    # 617: uexp resync uses newuexp(old_ulev) rather than newuexp(old_ulev+1)).
     from Nethax.nethax.subsystems.experience import pluslvl as _pluslvl
     mid_state = state.replace(
         player_hp=new_hp,
