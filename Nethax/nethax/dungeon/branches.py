@@ -230,9 +230,49 @@ _DUNGEON_NUM_LEVELS_VENDOR_SPEC: dict = {
 # to Gehennom), Ludios (acouple in Main).
 _BRANCH_ENTRY_VENDOR_SPEC: dict = {
     int(Branch.GNOMISH_MINES): (2, 3),    # dungeon.def line 19, acouple in Main
-    # int(Branch.SOKOBAN):     (1, 0),   # dungeon.def line 24, rcouple oracle +1 up
     # int(Branch.QUEST):       (6, 2),   # dungeon.def line 26, rcouple oracle +6 portal
     # int(Branch.VLAD):        (9, 5),   # dungeon.def line 55, acouple in Gehennom
+}
+
+
+# Chain-anchor specs for CHAINBRANCH entries (vendor/nle/util/dgn_comp.y
+# "rcouple" rule).  Each entry maps a branch to ``(anchor_branch,
+# anchor_level_spec, offset_spec)``:
+#
+#   anchor_level_spec  : (base, rand) for the named LEVEL (e.g. oracle)
+#                        sampled within anchor_branch via rn1.
+#   offset_spec        : (base, rand) added to anchor's sampled depth to
+#                        yield the branch entry depth in anchor_branch.
+#
+# Vendor cite: vendor/nle/src/dungeon.c::level_range lines 358-363
+# (``if (chain >= 0) base += levtmp->dlevel.dlevel``) and dungeon.c::
+# parent_dlevel (lines 384-408).
+#
+# Wired in Commit 4: SOKOBAN — Oracle (@(5,5) in Main) + (1, 0) up.
+_BRANCH_CHAIN_VENDOR_SPEC: dict = {
+    int(Branch.SOKOBAN): (
+        int(Branch.MAIN),  # anchor branch (where oracle level lives)
+        (5, 5),            # Oracle @ (5, 5) — dungeon.def line 22
+        (1, 0),            # rcouple offset above oracle — dungeon.def line 24
+    ),
+    # int(Branch.QUEST): (int(Branch.MAIN), (5, 5), (6, 2)),  # oracle + (6, 2)
+    # int(Branch.VLAD):  (int(Branch.GEHENNOM), (1, 0), (9, 5)),  # see Commit 6
+}
+
+
+# Per-branch connection-type overrides from vendor dungeon.def.  When a
+# branch's vendor connection differs from the static BRANCH_TABLE entry
+# we override it here so callers using sample_branch_table see the
+# vendor-correct type.
+#
+# Vendor: vendor/nle/util/dgn_comp.y::correct_branch_type +
+# vendor/nle/include/dungeon.h lines 91-96 (BR_STAIR / BR_NO_END1 /
+# BR_NO_END2 / BR_PORTAL).
+_BRANCH_CONNECTION_VENDOR_SPEC: dict = {
+    # Sokoban: ``CHAINBRANCH ... up`` with no explicit branch_type defaults
+    # to TBR_STAIR (dgn_comp.y line 322), so correct_branch_type returns
+    # BR_STAIR — NOT BR_PORTAL as the legacy static table had.
+    int(Branch.SOKOBAN): BranchConnectionType.STAIR,
 }
 
 
@@ -285,18 +325,18 @@ def sample_branch_table(rng) -> Tuple[BranchInfo, ...]:
     Returns:
         Tuple of ``BranchInfo`` records, ordered by Branch enum.
     """
-    # Split one key per branch, then split each branch-key into two sub-keys
-    # (one for num_levels, one for first_level) so that landing a new branch
-    # in a later commit doesn't reshuffle the samples drawn by branches that
-    # are already wired.  We always split to keep the rng schedule
-    # deterministic even when an individual branch falls back to the static
-    # value.
+    # Split one key per branch, then split each branch-key into three sub-keys
+    # (one for num_levels, one for first_level acouple, one for chain
+    # rcouple) so that landing a new branch in a later commit doesn't
+    # reshuffle the samples drawn by branches that are already wired.  We
+    # always split to keep the rng schedule deterministic even when an
+    # individual branch falls back to the static value.
     branch_keys = jax.random.split(rng, N_BRANCHES)
 
     out = []
     for b in range(N_BRANCHES):
         static = BRANCH_TABLE[b]
-        k_nl, k_fl = jax.random.split(branch_keys[b], 2)
+        k_nl, k_fl, k_chain = jax.random.split(branch_keys[b], 3)
 
         # num_levels: sample from DUNGEON spec when present.
         nl_spec = _DUNGEON_NUM_LEVELS_VENDOR_SPEC.get(b)
@@ -306,22 +346,37 @@ def sample_branch_table(rng) -> Tuple[BranchInfo, ...]:
         else:
             num_levels_sampled = static.num_levels
 
-        # first_level: sample from BRANCH-entry spec when present.  Only
-        # acouple (absolute-in-Main) entries are landed here; CHAINBRANCH
-        # entries that resolve relative to a special level (oracle, valley)
-        # are computed by the cross-branch chain logic.
+        # first_level: prefer CHAINBRANCH chain spec when present; else
+        # fall back to absolute BRANCH spec; else fall back to static.
+        chain_spec = _BRANCH_CHAIN_VENDOR_SPEC.get(b)
         fl_spec = _BRANCH_ENTRY_VENDOR_SPEC.get(b)
-        if fl_spec is not None:
+        if chain_spec is not None:
+            _anchor_branch, anchor_lvl_spec, offset_spec = chain_spec
+            anchor_base, anchor_rand = anchor_lvl_spec
+            off_base, off_rand = offset_spec
+            k_anchor, k_off = jax.random.split(k_chain, 2)
+            anchor_lvl = _vendor_rn1(k_anchor, anchor_rand, anchor_base)
+            off_lvl    = _vendor_rn1(k_off,    off_rand,    off_base)
+            first_level_sampled = (anchor_lvl.astype(jnp.int16)
+                                   + off_lvl.astype(jnp.int16)).astype(jnp.int8)
+        elif fl_spec is not None:
             fl_base, fl_rand = fl_spec
             first_level_sampled = _vendor_rn1(k_fl, fl_rand, fl_base)
         else:
             first_level_sampled = static.first_level
 
+        # connection_type: vendor override when listed, else static.
+        conn_override = _BRANCH_CONNECTION_VENDOR_SPEC.get(b)
+        if conn_override is not None:
+            connection_type = jnp.int8(conn_override)
+        else:
+            connection_type = static.connection_type
+
         out.append(BranchInfo(
             branch_id=static.branch_id,
             first_level=first_level_sampled,
             num_levels=num_levels_sampled,
-            connection_type=static.connection_type,
+            connection_type=connection_type,
         ))
     return tuple(out)
 
