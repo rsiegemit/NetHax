@@ -58,7 +58,23 @@ class ItemCategory(IntEnum):
 # ---------------------------------------------------------------------------
 
 # NetHack uses letters a-z A-Z — exactly 52 slots.
+# Cite: vendor/nethack/include/hack.h line 584 (invlet_basic = 52).
 MAX_INVENTORY_SLOTS = 52  # a-zA-Z
+
+# Weight-cap constants for encumbrance refusal.
+# Cite: vendor/nethack/include/weight.h lines 12-25
+#       WT_WEIGHTCAP_STRCON = 25, WT_WEIGHTCAP_SPARE = 50, MAX_CARR_CAP = 1000.
+# vendor hack.c::weight_cap (lines 4295-4346) formula:
+#   carrcap = 25*(STR + CON) + 50, capped at MAX_CARR_CAP = 1000.
+WT_WEIGHTCAP_STRCON: int = 25
+WT_WEIGHTCAP_SPARE:  int = 50
+MAX_CARR_CAP:        int = 1000
+
+# Loadstone otyp — special-cased by lift_object (pickup.c:1721) so it
+# can always be picked up even when the 52-slot or weight cap would
+# otherwise refuse the lift.
+# Cite: vendor/nethack/include/objects.h LOADSTONE; constants/objects.py:9045
+_LOADSTONE_TYPE_ID: int = 443
 
 # User-given name length per slot (Wave 6).  Mirrors NetHack's ONAME_MAX in
 # vendor/nethack/include/obj.h (capped at 16 chars + null for inv display).
@@ -574,6 +590,64 @@ def compute_ac(items: Item, worn_armor: jnp.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Weight cap helper (Audit L #12)
+# ---------------------------------------------------------------------------
+
+def weight_cap(state) -> jnp.ndarray:
+    """Compute the player's carrying capacity in aum units.
+
+    Mirrors vendor/nethack/src/hack.c::weight_cap lines 4295-4346:
+        carrcap = WT_WEIGHTCAP_STRCON * (STR + CON) + WT_WEIGHTCAP_SPARE
+        carrcap = min(carrcap, MAX_CARR_CAP)
+        carrcap = max(carrcap, 1)  -- never return 0
+    Levitation / Upolyd / Wounded_legs adjustments are not modeled here
+    (parity gap documented in inventory.py).
+
+    JIT-pure: arithmetic only.
+    """
+    strv = state.player_str.astype(jnp.int32)
+    conv = state.player_con.astype(jnp.int32)
+    cap  = jnp.int32(WT_WEIGHTCAP_STRCON) * (strv + conv) + jnp.int32(WT_WEIGHTCAP_SPARE)
+    cap  = jnp.minimum(cap, jnp.int32(MAX_CARR_CAP))
+    cap  = jnp.maximum(cap, jnp.int32(1))
+    return cap
+
+
+def _find_merge_slot(items: Item, in_cat, in_tid, in_buc, in_ench, in_oerodeproof) -> tuple:
+    """Find an inventory slot that is mergeable with the incoming item.
+
+    Mirrors vendor/nethack/src/invent.c::mergable (lines 4379-4460):
+    same otyp, same cursed/blessed, same spe (enchantment), same
+    oerodeproof.  We collapse to (category, type_id, buc, ench,
+    oerodeproof) — the subset relevant for byte-equal pickup merging
+    of common consumables (potions, scrolls, arrows, gems).
+
+    Returns (found, slot) where slot is the chosen inventory index.
+    """
+    def _scan(carry, idx):
+        found, slot = carry
+        occupied = items.category[idx] != jnp.int8(0)
+        match = (
+            occupied
+            & (items.category[idx]   == in_cat)
+            & (items.type_id[idx]    == in_tid)
+            & (items.buc_status[idx] == in_buc)
+            & (items.enchantment[idx] == in_ench)
+            & (items.oerodeproof[idx] == in_oerodeproof)
+        )
+        slot  = jnp.where(~found & match, idx, slot)
+        found = found | match
+        return (found, slot), None
+
+    (found, slot), _ = lax.scan(
+        _scan,
+        (jnp.bool_(False), jnp.int32(0)),
+        jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32),
+    )
+    return found, slot
+
+
+# ---------------------------------------------------------------------------
 # Core inventory operations
 # ---------------------------------------------------------------------------
 
@@ -581,11 +655,26 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
     """Pick up the top item from the ground tile at player_pos.
 
     Reads item at ground_items[branch, level, row, col, 0] (top of stack).
-    Finds the first empty inventory slot (lowest index where category == 0).
-    Copies item into that slot; clears ground tile; updates total_weight.
+    Stack-merging (Audit L #12):
+      - Pre-scan inventory for a slot with matching (category, type_id,
+        buc, enchantment, oerodeproof) — if found, add quantity instead
+        of consuming a new slot.
+      - Otherwise, use the lowest-index empty slot.
+    Encumbrance refusal:
+      - Compute new_weight = total_weight + item.weight*qty.  If
+        new_weight > weight_cap (25*(STR+CON)+50, capped at 1000) AND the
+        item is not a loadstone, refuse the pickup (state unchanged).
+        Cite: vendor/nethack/src/pickup.c::lift_object lines 1705-1789.
+    52-slot test:
+      - inv_cnt >= invlet_basic AND no merge slot → refuse.  This is
+        enforced implicitly by ``found`` since a full inventory yields
+        no empty slot and no merge slot.  Loadstone (otyp 443) bypasses
+        the 52-slot test (pickup.c:1721-1734).
 
     Canonical: vendor/nethack/src/pickup.c::pickup,
-               vendor/nethack/src/invent.c::addinv
+               vendor/nethack/src/invent.c::addinv,
+               vendor/nethack/src/invent.c::merged 814-905,
+               vendor/nethack/src/pickup.c::lift_object 1705-1789.
 
     Parameters
     ----------
@@ -603,6 +692,13 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
 
     # Ground item at top of stack (index 0)
     ground_cat  = ground_items.category[branch, level, row, col, 0]
+    ground_tid  = ground_items.type_id[branch, level, row, col, 0]
+    ground_buc  = ground_items.buc_status[branch, level, row, col, 0]
+    ground_ench = ground_items.enchantment[branch, level, row, col, 0]
+    ground_eprf = ground_items.oerodeproof[branch, level, row, col, 0]
+    ground_wt   = ground_items.weight[branch, level, row, col, 0].astype(jnp.int32)
+    ground_qty  = ground_items.quantity[branch, level, row, col, 0].astype(jnp.int32)
+
     has_item    = ground_cat != 0
     # Vendor pickup.c::pickup — gold is handled via add_to_money(quan), never
     # consumes an inventory letter. Detect COIN_CLASS here so we route the
@@ -610,11 +706,18 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
     is_gold = has_item & (ground_cat == jnp.int8(ItemCategory.COIN))
     gold_qty = jnp.where(
         is_gold,
-        ground_items.quantity[branch, level, row, col, 0].astype(jnp.int32),
+        ground_qty,
         jnp.int32(0),
     )
+    is_loadstone = has_item & (ground_tid == jnp.int16(_LOADSTONE_TYPE_ID))
 
-    # Find first empty inventory slot via lax.scan
+    # Merge-target scan (vendor invent.c::merged + mergable).
+    merge_found, merge_slot = _find_merge_slot(
+        state.inventory.items,
+        ground_cat, ground_tid, ground_buc, ground_ench, ground_eprf,
+    )
+
+    # First-empty-slot scan
     def _find_slot(carry, idx):
         found, slot = carry
         is_empty = state.inventory.items.category[idx] == 0
@@ -622,54 +725,80 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
         found = found | is_empty
         return (found, slot), None
 
-    (found, free_slot), _ = lax.scan(
+    (empty_found, empty_slot), _ = lax.scan(
         _find_slot,
         (jnp.bool_(False), jnp.int32(0)),
         jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32),
     )
-    # Non-gold items still need a slot; gold pickup ignores the slot check.
-    can_pickup = (has_item & found & ~is_gold) | is_gold
 
-    # Helpers to read one scalar field from a ground tile position
-    def _g(field, default):
-        val = field[branch, level, row, col, 0]
-        return jnp.where(can_pickup, val, default)
+    # Chosen target slot: merge slot wins; otherwise first empty.
+    target_slot = jnp.where(merge_found, merge_slot, empty_slot)
+    # Encumbrance: refuse if new total weight exceeds cap.
+    # vendor pickup.c::lift_object 1756-1789; loadstone bypasses (1718-1734).
+    # Note: ground_wt is the stack-total weight (objects[otyp].oc_weight*quan)
+    # already, matching vendor obj->owt convention.
+    cap = weight_cap(state)
+    cur_wt = state.inventory.total_weight.astype(jnp.int32)
+    new_total_wt_if_lifted = cur_wt + jnp.where(is_gold, jnp.int32(0), ground_wt)
+    over_cap = new_total_wt_if_lifted > cap
+    weight_ok = (~over_cap) | is_loadstone | is_gold
+
+    # Slot availability: merge or empty; gold bypasses.  Loadstone bypasses
+    # the empty-slot test only if no slot is free AND merge fails — vendor
+    # pickup.c:1723 carrying(LOADSTONE) || merge_choice grants the lift.
+    slot_ok = merge_found | empty_found | is_gold | is_loadstone
+
+    can_pickup = has_item & slot_ok & weight_ok
 
     # Write ground item into the chosen inventory slot (skip for gold).
-    safe_slot = jnp.clip(free_slot, 0, MAX_INVENTORY_SLOTS - 1)
+    safe_slot = jnp.clip(target_slot, 0, MAX_INVENTORY_SLOTS - 1)
     new_items = state.inventory.items
     write_slot = can_pickup & ~is_gold
+    # Merge writes only update quantity + weight (vendor merged() lines 836-842).
+    merge_write = write_slot & merge_found
+    # Non-merge writes copy the full item record into target_slot.
+    fresh_write = write_slot & ~merge_found
+
+    # Quantity: merge → existing_qty + ground_qty; fresh → ground_qty.
+    existing_qty = new_items.quantity[safe_slot].astype(jnp.int32)
+    merged_qty   = existing_qty + ground_qty
+    new_qty_val  = jnp.where(merge_write, merged_qty.astype(jnp.int16),
+                   jnp.where(fresh_write, ground_qty.astype(jnp.int16),
+                             new_items.quantity[safe_slot]))
+    # Weight: merge → existing_wt + ground_wt (ground_wt is the stack-total
+    # already, matching vendor obj->owt convention from weight()).
+    existing_wt  = new_items.weight[safe_slot].astype(jnp.int32)
+    merged_wt    = existing_wt + ground_wt
+    new_wt_val   = jnp.where(merge_write, merged_wt,
+                   jnp.where(fresh_write, ground_wt,
+                             new_items.weight[safe_slot]))
 
     new_items = new_items.replace(
         category   = new_items.category.at[safe_slot].set(
-            jnp.where(write_slot, ground_items.category[branch, level, row, col, 0], new_items.category[safe_slot])
+            jnp.where(fresh_write, ground_cat, new_items.category[safe_slot])
         ),
         type_id    = new_items.type_id.at[safe_slot].set(
-            jnp.where(write_slot, ground_items.type_id[branch, level, row, col, 0], new_items.type_id[safe_slot])
+            jnp.where(fresh_write, ground_tid, new_items.type_id[safe_slot])
         ),
         buc_status = new_items.buc_status.at[safe_slot].set(
-            jnp.where(write_slot, ground_items.buc_status[branch, level, row, col, 0], new_items.buc_status[safe_slot])
+            jnp.where(fresh_write, ground_buc, new_items.buc_status[safe_slot])
         ),
         enchantment = new_items.enchantment.at[safe_slot].set(
-            jnp.where(write_slot, ground_items.enchantment[branch, level, row, col, 0], new_items.enchantment[safe_slot])
+            jnp.where(fresh_write, ground_ench, new_items.enchantment[safe_slot])
         ),
         charges    = new_items.charges.at[safe_slot].set(
-            jnp.where(write_slot, ground_items.charges[branch, level, row, col, 0], new_items.charges[safe_slot])
+            jnp.where(fresh_write, ground_items.charges[branch, level, row, col, 0], new_items.charges[safe_slot])
         ),
         identified = new_items.identified.at[safe_slot].set(
-            jnp.where(write_slot, ground_items.identified[branch, level, row, col, 0], new_items.identified[safe_slot])
+            jnp.where(fresh_write, ground_items.identified[branch, level, row, col, 0], new_items.identified[safe_slot])
         ),
-        quantity   = new_items.quantity.at[safe_slot].set(
-            jnp.where(write_slot, ground_items.quantity[branch, level, row, col, 0], new_items.quantity[safe_slot])
-        ),
-        weight     = new_items.weight.at[safe_slot].set(
-            jnp.where(write_slot, ground_items.weight[branch, level, row, col, 0], new_items.weight[safe_slot])
-        ),
+        quantity   = new_items.quantity.at[safe_slot].set(new_qty_val),
+        weight     = new_items.weight.at[safe_slot].set(new_wt_val),
         ac_bonus   = new_items.ac_bonus.at[safe_slot].set(
-            jnp.where(write_slot, ground_items.ac_bonus[branch, level, row, col, 0], new_items.ac_bonus[safe_slot])
+            jnp.where(fresh_write, ground_items.ac_bonus[branch, level, row, col, 0], new_items.ac_bonus[safe_slot])
         ),
         is_two_handed = new_items.is_two_handed.at[safe_slot].set(
-            jnp.where(write_slot, ground_items.is_two_handed[branch, level, row, col, 0], new_items.is_two_handed[safe_slot])
+            jnp.where(fresh_write, ground_items.is_two_handed[branch, level, row, col, 0], new_items.is_two_handed[safe_slot])
         ),
         # dknown: vendor pickup.c::pickup_object line 1818 calls
         # observe_object(obj) when !Blind, which sets obj->dknown=1

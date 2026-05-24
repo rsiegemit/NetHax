@@ -338,3 +338,138 @@ def test_wear_multiple_armor_pieces():
     assert int(new_state.player_ac) == expected_ac, (
         f"Expected AC {expected_ac}; got {int(new_state.player_ac)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Audit L #12: pickup stack-merging + encumbrance + loadstone bypass
+# ---------------------------------------------------------------------------
+
+def test_pickup_merges_with_matching_stack():
+    """Picking up a matching potion should add to an existing stack."""
+    import jax
+    from Nethax.nethax.subsystems.inventory import (
+        pickup, make_item, ItemCategory, _items_from_list,
+        _empty_ground_items_array,
+    )
+    from Nethax.nethax.dungeon.branches import N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W
+
+    state = _make_state()
+    rng   = jax.random.PRNGKey(10)
+
+    existing = make_item(category=ItemCategory.POTION, type_id=205, quantity=2, weight=40)
+    inv = state.inventory.replace(items=_items_from_list([existing]))
+    # Recompute total_weight cache so the encumbrance check passes correctly.
+    from Nethax.nethax.subsystems.inventory import total_weight as _tw
+    inv = inv.replace(total_weight=_tw(inv.items))
+    state = state.replace(inventory=inv)
+
+    incoming = make_item(category=ItemCategory.POTION, type_id=205, quantity=3, weight=60)
+    row = int(state.player_pos[0])
+    col = int(state.player_pos[1])
+    ground = _make_ground_items(N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W)
+    ground = _place_item_on_ground(ground, incoming, 0, 0, row, col)
+
+    new_state, _ = pickup(state, rng, ground, 0, 0)
+
+    # Stack merged into slot 0; slot 1 still empty.
+    assert int(new_state.inventory.items.quantity[0]) == 5, (
+        f"Expected merged qty 5; got {int(new_state.inventory.items.quantity[0])}"
+    )
+    assert int(new_state.inventory.items.weight[0]) == 100, (
+        f"Expected merged weight 100; got {int(new_state.inventory.items.weight[0])}"
+    )
+    assert int(new_state.inventory.items.category[1]) == 0, (
+        "Slot 1 should remain empty after merge"
+    )
+
+
+def test_pickup_no_merge_when_buc_differs():
+    """Items with different BUC must NOT merge — uses a fresh slot."""
+    import jax
+    from Nethax.nethax.subsystems.inventory import (
+        pickup, make_item, ItemCategory, _items_from_list,
+    )
+    from Nethax.nethax.dungeon.branches import N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W
+
+    state = _make_state()
+    rng   = jax.random.PRNGKey(11)
+
+    blessed = make_item(category=ItemCategory.POTION, type_id=205, quantity=2,
+                        weight=40, buc_status=3)
+    state = state.replace(inventory=state.inventory.replace(
+        items=_items_from_list([blessed])))
+
+    cursed = make_item(category=ItemCategory.POTION, type_id=205, quantity=1,
+                       weight=20, buc_status=1)
+    row = int(state.player_pos[0]); col = int(state.player_pos[1])
+    ground = _make_ground_items(N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W)
+    ground = _place_item_on_ground(ground, cursed, 0, 0, row, col)
+
+    new_state, _ = pickup(state, rng, ground, 0, 0)
+
+    # Blessed stack intact at slot 0; cursed stack drops to slot 1.
+    assert int(new_state.inventory.items.quantity[0]) == 2
+    assert int(new_state.inventory.items.buc_status[0]) == 3
+    assert int(new_state.inventory.items.category[1]) == int(ItemCategory.POTION)
+    assert int(new_state.inventory.items.buc_status[1]) == 1
+
+
+def test_pickup_refuses_over_weight_cap():
+    """Pickup must refuse when item's weight pushes player past weight_cap."""
+    import jax, jax.numpy as jnp
+    from Nethax.nethax.subsystems.inventory import (
+        pickup, make_item, ItemCategory,
+    )
+    from Nethax.nethax.dungeon.branches import N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W
+
+    state = _make_state()
+    # Force STR + CON = 2 → cap = 25*2 + 50 = 100.
+    state = state.replace(
+        player_str=jnp.int16(1),
+        player_con=jnp.int8(1),
+    )
+    rng = jax.random.PRNGKey(12)
+
+    heavy = make_item(category=ItemCategory.WEAPON, type_id=34, quantity=1,
+                      weight=200)
+    row = int(state.player_pos[0]); col = int(state.player_pos[1])
+    ground = _make_ground_items(N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W)
+    ground = _place_item_on_ground(ground, heavy, 0, 0, row, col)
+
+    new_state, new_ground = pickup(state, rng, ground, 0, 0)
+
+    # Pickup refused: inventory slot 0 still empty, ground item intact.
+    assert int(new_state.inventory.items.category[0]) == 0, (
+        "Inventory should remain empty when over cap"
+    )
+    assert int(new_ground.category[0, 0, row, col, 0]) == int(ItemCategory.WEAPON), (
+        "Ground item must remain when pickup refused"
+    )
+
+
+def test_pickup_loadstone_bypasses_weight_cap():
+    """Loadstone can always be lifted, even when over the weight cap."""
+    import jax, jax.numpy as jnp
+    from Nethax.nethax.subsystems.inventory import (
+        pickup, make_item, ItemCategory, _LOADSTONE_TYPE_ID,
+    )
+    from Nethax.nethax.dungeon.branches import N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W
+
+    state = _make_state()
+    state = state.replace(
+        player_str=jnp.int16(1),
+        player_con=jnp.int8(1),
+    )
+    rng = jax.random.PRNGKey(13)
+
+    stone = make_item(category=ItemCategory.GEM, type_id=_LOADSTONE_TYPE_ID,
+                      quantity=1, weight=500)
+    row = int(state.player_pos[0]); col = int(state.player_pos[1])
+    ground = _make_ground_items(N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W)
+    ground = _place_item_on_ground(ground, stone, 0, 0, row, col)
+
+    new_state, _ = pickup(state, rng, ground, 0, 0)
+
+    assert int(new_state.inventory.items.type_id[0]) == _LOADSTONE_TYPE_ID, (
+        "Loadstone must be picked up even when over weight cap"
+    )
