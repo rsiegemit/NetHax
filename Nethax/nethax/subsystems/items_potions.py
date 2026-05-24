@@ -221,10 +221,14 @@ def _effect_full_healing(state, rng, buc):
             pluslvl(FALSE);  // restore one lost XL
         }
         make_hallucinated(0, TRUE, 0);
+        /* potion.c:1160-1161 */
+        if (Wounded_legs && (otmp->blessed || (!otmp->cursed && !u.usteed)))
+            heal_legs(0);
 
     nhp=400 is large enough to saturate at max+nxtra (effective full restore).
     nxtra = 4+4*bcsign = 8 blessed / 4 uncursed / 0 cursed (HP_max bump).
-    curesick=!cursed, cureblind=TRUE.
+    curesick=!cursed, cureblind=TRUE. heal_legs on blessed (always) or
+    uncursed-not-riding.
     """
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
@@ -242,6 +246,17 @@ def _effect_full_healing(state, rng, buc):
     new_vom  = jnp.where(cursed, cur_vom,  jnp.int32(0))
     new_ts = new_ts.at[int(TimedStatus.SICK)].set(new_sick)
     new_ts = new_ts.at[int(TimedStatus.VOMITING)].set(new_vom)
+    # heal_legs (vendor potion.c:1160-1161): clear WOUNDED_LEGS timer when
+    # (blessed) OR (uncursed AND not riding). Vendor heal_legs() in do.c:2449
+    # resets HWounded_legs to 0.
+    is_riding = state.player_steed_mid > jnp.uint32(0)
+    heal_legs_cond = jnp.logical_or(
+        blessed,
+        jnp.logical_and(jnp.logical_not(cursed), jnp.logical_not(is_riding)),
+    )
+    cur_legs = new_ts[int(TimedStatus.WOUNDED_LEGS)]
+    new_legs = jnp.where(heal_legs_cond, jnp.int32(0), cur_legs)
+    new_ts = new_ts.at[int(TimedStatus.WOUNDED_LEGS)].set(new_legs)
     new_status = new_status.replace(timed_statuses=new_ts)
     # Blessed: restore one lost XL via experience.pluslvl (vendor potion.c:1149).
     # We can't easily detect ``u.ulevelmax > u.ulevel`` without tracking lost
@@ -267,17 +282,33 @@ def _effect_full_healing(state, rng, buc):
 # ---- energy ---------------------------------------------------------------
 
 def _effect_gain_energy(state, rng, buc):
-    """potion of gain energy — restore/increase Pw.
+    """potion of gain energy — byte-equal to vendor peffect_gain_energy.
 
-    Canonical: peffect_gain_energy — u.uen += 3*num; u.uenmax += num.
-    Wave 3: +10 Pw current and max (blessed +15, cursed -5 floored at 0).
+    vendor/nethack/src/potion.c:1243-1257:
+        num = d(otmp->blessed ? 3 : !otmp->cursed ? 2 : 1, 6);
+        if (otmp->cursed) num = -num;
+        u.uenmax += num;       (clamped to >=0)
+        u.uen += 3 * num;      (clamped to [0, uenmax])
+
+    Dice (n, 6):
+        blessed  → 3d6  (+3..+18 uenmax, +9..+54 uen)
+        uncursed → 2d6  (+2..+12 uenmax, +6..+36 uen)
+        cursed   → 1d6 negated (-1..-6 uenmax, -3..-18 uen)
     """
     blessed = _is_blessed(buc)
     cursed  = _is_cursed(buc)
-    delta   = jnp.where(blessed, jnp.int32(15),
-              jnp.where(cursed,  jnp.int32(-5), jnp.int32(10)))
-    new_pw_max = jnp.maximum(state.player_pw_max + delta, jnp.int32(0))
-    new_pw     = jnp.minimum(state.player_pw + delta * 3,
+    # n = 3 blessed / 2 uncursed / 1 cursed.
+    n_dice  = jnp.where(blessed, jnp.int32(3),
+              jnp.where(cursed,  jnp.int32(1), jnp.int32(2)))
+    # Static-shape masked roll: roll MAX_N d6 then sum first n_dice via mask.
+    MAX_N = 3
+    rolls = jax.random.randint(rng, (MAX_N,), 1, 7, dtype=jnp.int32)  # d6
+    mask  = jnp.arange(MAX_N, dtype=jnp.int32) < n_dice
+    num   = jnp.sum(jnp.where(mask, rolls, jnp.int32(0))).astype(jnp.int32)
+    # Cursed: negate num (vendor potion.c:1252-1253).
+    num   = jnp.where(cursed, -num, num)
+    new_pw_max = jnp.maximum(state.player_pw_max + num, jnp.int32(0))
+    new_pw     = jnp.minimum(state.player_pw + jnp.int32(3) * num,
                              new_pw_max)
     new_pw     = jnp.maximum(new_pw, jnp.int32(0))
     return state.replace(player_pw=new_pw, player_pw_max=new_pw_max)
@@ -921,15 +952,25 @@ def _effect_oil(state, rng, buc):
     new_items = state.inventory.items.replace(greased=new_greased)
 
     # Open-flame check: vendor peffect_oil — if any inventory item is lit
-    # (lamp/candle/candelabrum), the potion vapor ignites for 2d4 fire damage.
-    # Fire_resistance halves damage.
-    # Was: "greased-before-update" proxy (wrong — that's the OIL flag, not lit).
+    # (lamp/candle/candelabrum), the potion vapor ignites for fire damage.
+    # vendor/nethack/src/potion.c:1276-1280:
+    #     vulnerable = !Fire_resistance || Cold_resistance;
+    #     losehp(d(vulnerable ? 4 : 2, 4),
+    #            "quaffing a burning potion of oil", KILLED_BY);
+    # Dice count varies (4 vs 2) but sides are always 4; no halving — vendor
+    # passes raw d() result to losehp (which has no resistance-halving for oil).
     any_lit = jnp.any(state.inventory.items.lamplit)
-    rng, sub_a, sub_b = jax.random.split(rng, 3)
-    fire_dmg = (jax.random.randint(sub_a, (), 1, 5, dtype=jnp.int32) +
-                jax.random.randint(sub_b, (), 1, 5, dtype=jnp.int32))  # 2d4
     has_fire_res = state.status.intrinsics[int(Intrinsic.RESIST_FIRE)]
-    fire_dmg = jnp.where(has_fire_res, (fire_dmg + jnp.int32(1)) // jnp.int32(2), fire_dmg)
+    has_cold_res = state.status.intrinsics[int(Intrinsic.RESIST_COLD)]
+    # vulnerable = !Fire_resistance || Cold_resistance
+    vulnerable = jnp.logical_or(jnp.logical_not(has_fire_res), has_cold_res)
+    n_dice = jnp.where(vulnerable, jnp.int32(4), jnp.int32(2))
+    # Static-shape masked roll: 4 d4, sum first n_dice.
+    MAX_N = 4
+    rng, sub = jax.random.split(rng)
+    rolls = jax.random.randint(sub, (MAX_N,), 1, 5, dtype=jnp.int32)  # d4
+    mask  = jnp.arange(MAX_N, dtype=jnp.int32) < n_dice
+    fire_dmg = jnp.sum(jnp.where(mask, rolls, jnp.int32(0))).astype(jnp.int32)
     new_hp = jnp.where(any_lit,
                        jnp.maximum(state.player_hp - fire_dmg, jnp.int32(0)),
                        state.player_hp)
