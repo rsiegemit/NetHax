@@ -60,6 +60,122 @@ _ELBERETH_BYTES = tuple(b"Elbereth") + (0,) * (ENGRAVE_TEXT_LEN - 8)
 
 
 # ---------------------------------------------------------------------------
+# Rubouts substitution table (D16)
+# Cite: vendor/nethack/src/engrave.c lines 65-116 (rubouts[]) and
+#       lines 118-183 (wipeout_text).
+#
+# wipeout_text picks a random position in the string and either:
+#   - if char is space: skip (no change)
+#   - if char in "?.,'`-|_": maps to space
+#   - else with prob 3/4: looks up the rubouts entry; if found, picks one of
+#     the listed substitutes at random; if not found, sets to '?'
+#   - else (prob 1/4 when use_rubout==0): sets to '?'
+# After ``cnt`` iterations, trailing spaces are trimmed.
+#
+# We model this as two static [256]-shape lookup arrays:
+#   _RUBOUTS_LUT[c, k]   = ASCII byte of the k-th substitute for char c
+#                          (only first _RUBOUTS_COUNT[c] entries are valid).
+#   _RUBOUTS_COUNT[c]    = number of substitutes for c (0 → fall through to '?').
+# Plus a punctuation mask _IS_PUNCT_RUBOUT[c] for the
+# "?.,'`-|_" → space rule.
+# ---------------------------------------------------------------------------
+
+# Max substitutes per char: 'E' → "|FL[_" has 5 entries (longest row).
+_RUBOUTS_MAX_K: int = 5
+
+# Pairs taken directly from vendor engrave.c lines 69-116.
+_RUBOUTS_PAIRS: tuple = (
+    ('A', '^'),    ('B', 'Pb['),  ('C', '('),    ('D', '|)['),
+    ('E', '|FL[_'),('F', '|-'),   ('G', 'C('),   ('H', '|-'),
+    ('I', '|'),    ('K', '|<'),   ('L', '|_'),   ('M', '|'),
+    ('N', '|\\'),  ('O', 'C('),   ('P', 'F'),    ('Q', 'C('),
+    ('R', 'PF'),   ('T', '|'),    ('U', 'J'),    ('V', '/\\'),
+    ('W', 'V/\\'), ('Z', '/'),    ('b', '|'),    ('d', 'c|'),
+    ('e', 'c'),    ('g', 'c'),    ('h', 'n'),    ('j', 'i'),
+    ('k', '|'),    ('l', '|'),    ('m', 'nr'),   ('n', 'r'),
+    ('o', 'c'),    ('q', 'c'),    ('w', 'v'),    ('y', 'v'),
+    (':', '.'),    (';', ',:'),   (',', '.'),    ('=', '-'),
+    ('+', '-|'),   ('*', '+'),    ('@', '0'),    ('0', 'C('),
+    ('1', '|'),    ('6', 'o'),    ('7', '/'),    ('8', '3o'),
+)
+
+
+def _build_rubouts_arrays():
+    """Build the static rubouts LUT + count arrays from vendor pairs.
+
+    Returns
+    -------
+    (lut, count) : ([256, _RUBOUTS_MAX_K] int8, [256] int8)
+    """
+    import numpy as np
+    lut = np.zeros((256, _RUBOUTS_MAX_K), dtype=np.int8)
+    cnt = np.zeros((256,), dtype=np.int8)
+    for src, subs in _RUBOUTS_PAIRS:
+        sc = ord(src)
+        for k, ch in enumerate(subs):
+            assert k < _RUBOUTS_MAX_K, f"too many substitutes for {src!r}"
+            lut[sc, k] = ord(ch)
+        cnt[sc] = len(subs)
+    return jnp.asarray(lut, dtype=jnp.int8), jnp.asarray(cnt, dtype=jnp.int8)
+
+
+_RUBOUTS_LUT, _RUBOUTS_COUNT = _build_rubouts_arrays()
+
+# Small punctuation that wipeout_text maps directly to space (engrave.c:149):
+#   strchr("?.,'`-|_", *s)
+def _build_punct_mask():
+    import numpy as np
+    mask = np.zeros((256,), dtype=bool)
+    for c in "?.,'`-|_":
+        mask[ord(c)] = True
+    return jnp.asarray(mask, dtype=jnp.bool_)
+
+
+_IS_PUNCT_RUBOUT = _build_punct_mask()
+
+# Vendor wipe_engr_at uses ``cnt = rnd(5)`` (1..5) for player-step rubouts
+# (hack.c::maybe_smudge_engr line 3026).  We cap the loop at this constant
+# so the scan is JIT-friendly.
+_WIPEOUT_MAX_CNT: int = 5
+
+
+# ---------------------------------------------------------------------------
+# Tool/wand dispatch otyps (D17)
+# Cite: vendor/nethack/src/engrave.c::doengrave_sfx_item lines 819-849 and
+#       doengrave_sfx_item_WAN lines 583-737.
+# Vendor otyps are the indices in vendor/nethack/include/objects.h, which
+# match the ``constants/objects.py:OBJECTS`` tuple position (see e.g.
+# subsystems/containers.py:880 _WAN_CANCELLATION_TYPE_ID = 395).
+# ---------------------------------------------------------------------------
+_OTYP_MAGIC_MARKER:      int = 217   # objects.py:4524
+_OTYP_WAN_CANCELLATION:  int = 395   # objects.py:8084 (containers.py:880)
+_OTYP_WAN_DIGGING:       int = 400   # objects.py:8184
+_OTYP_WAN_FIRE:          int = 402   # objects.py:8224
+_OTYP_WAN_COLD:          int = 403   # objects.py:8244
+_OTYP_WAN_LIGHTNING:     int = 406   # objects.py:8304
+
+
+def _build_is_blade_lut():
+    """Build a [NUM_OBJECTS]-sized bool LUT marking is_blade(otyp).
+
+    Vendor obj.h line 213-216: is_blade(otmp) is
+        oclass == WEAPON_CLASS && P_DAGGER <= oc_skill <= P_SABER
+    (P_DAGGER=1 .. P_SABER=9).  Cite vendor/nethack/include/skills.h:24-32.
+    """
+    import numpy as np
+    from Nethax.nethax.constants.objects import OBJECTS, ObjectClass
+    n = len(OBJECTS)
+    blade = np.zeros((n,), dtype=bool)
+    for i, e in enumerate(OBJECTS):
+        if e.class_ == ObjectClass.WEAPON_CLASS and 1 <= e.oc_skill <= 9:
+            blade[i] = True
+    return jnp.asarray(blade, dtype=jnp.bool_)
+
+
+_IS_BLADE_OTYP = _build_is_blade_lut()
+
+
+# ---------------------------------------------------------------------------
 # State struct
 # ---------------------------------------------------------------------------
 
@@ -143,30 +259,95 @@ def _is_vampire_form(state) -> jnp.ndarray:
     return poly.is_polymorphed & is_undead & is_vampire_sym
 
 
+def _wielded_otyp(state) -> jnp.ndarray:
+    """Return the wielded weapon/tool/wand's otyp (or -1 when bare-handed).
+
+    Mirrors subsystems/combat.py::_wielded_type_id (line 840-845): looks up
+    ``state.inventory.items.type_id[wielded_slot]`` with clamping for the
+    -1 (bare hands) sentinel.
+    """
+    wielded = state.inventory.wielded.astype(jnp.int32)
+    safe = jnp.clip(wielded, 0, state.inventory.items.type_id.shape[0] - 1)
+    type_id = state.inventory.items.type_id[safe].astype(jnp.int32)
+    return jnp.where(wielded >= 0, type_id, jnp.int32(-1))
+
+
+def _engr_type_for_otyp(otyp: jnp.ndarray, kind_default: jnp.ndarray) -> jnp.ndarray:
+    """Dispatch wielded ``otyp`` → engr_type per vendor doengrave_sfx_item.
+
+    Vendor cites:
+      - WEAPON_CLASS + is_blade → de->type = ENGRAVE  (engrave.c:819-833)
+      - WAN_FIRE       → de->type = BURN              (engrave.c:707-717)
+      - WAN_LIGHTNING  → de->type = BURN              (engrave.c:718-734)
+      - WAN_DIGGING    → de->type = ENGRAVE           (engrave.c:684-705)
+      - MAGIC_MARKER   → de->type = MARK              (engrave.c:843-849)
+      - All other wands (incl. WAN_COLD, WAN_CANCELLATION) and the
+        bare-finger / tool / amulet / ... paths leave de->type at its
+        init value, which is ENGR_BLOOD for vampire/demon form and
+        ENGR_DUST otherwise (engrave.c:558, 573-574).
+
+    Notes / approximations:
+      - We do NOT implement vendor's ``is_art(ART_FIRE_BRAND)`` → BURN
+        branch (engrave.c:820-821).  Artifact identity for inventory
+        weapons is not currently surfaced as a per-otyp field; the
+        regular fire-brand long-sword otyp still falls through to the
+        blade-→ENGRAVE rule, which differs only in the engr_type
+        (ENGRAVE vs BURN).  Document for future tightening.
+      - Non-blade weapons (oc_skill outside P_DAGGER..P_SABER) keep
+        de->type = DUST per vendor (the welded/dull pline branches at
+        engrave.c:825-829 also leave type unchanged).
+
+    Parameters
+    ----------
+    otyp         : int32 scalar — wielded otyp, or -1 for bare hands.
+    kind_default : int8 scalar  — ENGR_DUST or ENGR_BLOOD (vampire form).
+    """
+    blade_lut_len = _IS_BLADE_OTYP.shape[0]
+    safe_otyp = jnp.clip(otyp, 0, blade_lut_len - 1)
+    is_blade = (otyp >= 0) & _IS_BLADE_OTYP[safe_otyp]
+
+    is_marker     = otyp == jnp.int32(_OTYP_MAGIC_MARKER)
+    is_wan_fire   = otyp == jnp.int32(_OTYP_WAN_FIRE)
+    is_wan_lit    = otyp == jnp.int32(_OTYP_WAN_LIGHTNING)
+    is_wan_dig    = otyp == jnp.int32(_OTYP_WAN_DIGGING)
+
+    # Priority order mirrors the vendor switch fall-through: WAN cases set
+    # explicit types; weapon-blade sets ENGRAVE; everything else keeps
+    # the default (DUST or BLOOD).
+    out = kind_default
+    out = jnp.where(is_blade,   jnp.int8(ENGR_ENGRAVE), out)
+    out = jnp.where(is_wan_dig, jnp.int8(ENGR_ENGRAVE), out)
+    out = jnp.where(is_wan_fire,jnp.int8(ENGR_BURN),    out)
+    out = jnp.where(is_wan_lit, jnp.int8(ENGR_BURN),    out)
+    out = jnp.where(is_marker,  jnp.int8(ENGR_MARK),    out)
+    return out
+
+
 def handle_engrave(state, rng):
     """Player engraves at the current position.
 
-    Wave 5 simplification: always engrave 'Elbereth' in dust regardless of
-    inventory (writing finger).  Mirrors the most-common ELBERETHLESS-
-    violating action in vendor (engrave.c::doengrave's finger path).
+    Vendor reference: engrave.c::doengrave + doengrave_sfx_item +
+    doengrave_sfx_item_WAN (lines 543-737, 740-892).  Vendor dispatches
+    on the wielded stylus (de->otmp->oclass / ->otyp) to choose the
+    engraving kind.  Nethax mirrors that dispatch via
+    ``_engr_type_for_otyp`` (D17), while always inscribing the literal
+    text 'Elbereth' (Wave 5 simplification — vendor prompts for text;
+    only Elbereth has gameplay effects via the ELBERETHLESS conduct).
 
-    When the player is polymorphed into a vampire form, the engraving kind
-    is ENGR_BLOOD instead of ENGR_DUST (engrave.c::doengrave line 573).
+    Default kind is ENGR_DUST; ENGR_BLOOD when polymorphed into a
+    vampire form (engrave.c:573 is_demon / is_vampire branch); then the
+    wielded otyp may upgrade to ENGRAVE/BURN/MARK.
 
     Effects:
       - state.engrave.has_engraving[row, col]  = True
-      - state.engrave.engraving_kind[row, col] = ENGR_BLOOD (vampire) or ENGR_DUST
+      - state.engrave.engraving_kind[row, col] = dispatched engr_type
       - state.engrave.text[row, col, :]        = 'Elbereth'
       - state.conduct.violations[ELBERETHLESS] = True
 
     Parameters
     ----------
     state : EnvState
-    rng   : jax.random.PRNGKey (unused for the dust-Elbereth case).
-
-    Returns
-    -------
-    Updated EnvState.
+    rng   : jax.random.PRNGKey (unused for the simplified inscription).
     """
     from Nethax.nethax.subsystems.conduct import Conduct, mark_violated
 
@@ -175,8 +356,14 @@ def handle_engrave(state, rng):
 
     bytes_vec = _elbereth_bytes_array()
 
-    # Vampire polymorph → blood writing (engrave.c:573).
-    kind = jnp.where(_is_vampire_form(state), jnp.int8(ENGR_BLOOD), jnp.int8(ENGR_DUST))
+    # Vampire polymorph → blood writing (engrave.c:573-574).
+    kind_default = jnp.where(
+        _is_vampire_form(state), jnp.int8(ENGR_BLOOD), jnp.int8(ENGR_DUST)
+    )
+
+    # Tool/wand dispatch (engrave.c:819-849, 583-737).
+    otyp = _wielded_otyp(state)
+    kind = _engr_type_for_otyp(otyp, kind_default)
 
     eng = state.engrave
     new_text  = eng.text.at[row, col, :].set(bytes_vec)
@@ -235,26 +422,146 @@ def engrave_text_at(eng: EngraveState, row, col) -> jnp.ndarray:
     return eng.text[r, c, :]
 
 
+def _wipeout_text_jax(
+    text: jnp.ndarray,
+    rng: jax.Array,
+    cnt: jnp.ndarray,
+) -> jnp.ndarray:
+    """JAX port of vendor wipeout_text (engrave.c lines 118-183).
+
+    Picks ``cnt`` random positions in ``text`` (each independently re-rolled)
+    and either:
+      - leaves a space unchanged,
+      - maps "?.,'`-|_" → space (engrave.c:149),
+      - with prob 1/4 sets to '?' (engrave.c:154-155 use_rubout==0),
+      - with prob 3/4 looks up the rubouts table; if found, picks one of
+        the substitutes uniformly at random; otherwise sets to '?'
+        (engrave.c:156-176).
+    Then trims trailing spaces (replaces them with NUL terminators, which
+    Nethax represents as 0 bytes); ``has_engraving`` is cleared by the
+    caller when the resulting text is fully blank.
+
+    The loop runs a fixed ``_WIPEOUT_MAX_CNT`` iterations and masks
+    iterations past ``cnt`` to keep the kernel JIT-shape-static.  Each
+    iteration consumes one Threefry split off ``rng`` (no key reuse).
+
+    Parameters
+    ----------
+    text : int8[ENGRAVE_TEXT_LEN] — current engraving bytes (0-terminated).
+    rng  : jax.random.PRNGKey
+    cnt  : int32 scalar — number of degrade-steps (1..5 from vendor caller).
+    """
+    cnt_i = jnp.asarray(cnt, dtype=jnp.int32)
+    keys = jax.random.split(rng, _WIPEOUT_MAX_CNT)
+
+    def step_one(text_carry: jnp.ndarray, scan_inputs):
+        key, idx = scan_inputs
+        active = idx < cnt_i
+
+        k_pos, k_use_rubout, k_sub = jax.random.split(key, 3)
+
+        # Current length = # nonzero leading bytes.  Vendor uses strlen,
+        # i.e. position of first NUL; trailing zeros (post-trim) match.
+        nz = text_carry != jnp.int8(0)
+        # equivalent to strlen since vendor maintains NUL-terminated
+        # buffers (no internal zero bytes).
+        lth = jnp.sum(nz.astype(jnp.int32))
+
+        # Pick position; clamp to 1 to avoid degenerate randint(0,0).
+        lth_safe = jnp.maximum(lth, jnp.int32(1))
+        pos = jax.random.randint(k_pos, (), 0, lth_safe, dtype=jnp.int32)
+
+        # use_rubout in [0,4).
+        use_rubout = jax.random.randint(
+            k_use_rubout, (), 0, 4, dtype=jnp.int32
+        )
+
+        # Read current character (as uint8 index into rubouts LUT).
+        ch = text_carry[pos].astype(jnp.int32) & jnp.int32(0xFF)
+        is_space = ch == jnp.int32(ord(' '))
+        is_punct = _IS_PUNCT_RUBOUT[ch]
+
+        # rubouts lookup
+        rcnt = _RUBOUTS_COUNT[ch].astype(jnp.int32)
+        rcnt_safe = jnp.maximum(rcnt, jnp.int32(1))
+        sub_idx = jax.random.randint(k_sub, (), 0, rcnt_safe, dtype=jnp.int32)
+        sub_byte = _RUBOUTS_LUT[ch, sub_idx]
+        has_rubout = rcnt > jnp.int32(0)
+
+        # Compose the new character per vendor switch:
+        #   space          → ch (no change)
+        #   punct          → ' '
+        #   use_rubout==0  → '?'
+        #   has_rubout     → sub_byte
+        #   else           → '?'
+        question = jnp.int8(ord('?'))
+        space_b  = jnp.int8(ord(' '))
+        new_char = jnp.where(
+            is_space,
+            jnp.asarray(ch, dtype=jnp.int8),
+            jnp.where(
+                is_punct,
+                space_b,
+                jnp.where(
+                    use_rubout == jnp.int32(0),
+                    question,
+                    jnp.where(has_rubout, sub_byte, question),
+                ),
+            ),
+        )
+
+        # Apply only when this iteration is active AND length > 0.
+        do_write = active & (lth > jnp.int32(0))
+        new_text = jnp.where(
+            do_write,
+            text_carry.at[pos].set(new_char),
+            text_carry,
+        )
+        return new_text, None
+
+    text_out, _ = jax.lax.scan(
+        step_one,
+        text,
+        (keys, jnp.arange(_WIPEOUT_MAX_CNT, dtype=jnp.int32)),
+    )
+
+    # Vendor trailing-space trim (engrave.c:181-182):
+    #   while (lth && engr[lth-1] == ' ') engr[--lth] = '\0';
+    # Compute a "trailing-blank" mask: position i is trailing-blank iff
+    # every position j>=i is space-or-NUL.  Implemented via reverse cummin.
+    is_blank = (text_out == jnp.int8(ord(' '))) | (text_out == jnp.int8(0))
+    rev_blank = jnp.flip(is_blank.astype(jnp.int32), axis=0)
+    rev_cummin = jnp.minimum.accumulate(rev_blank)
+    trailing_blank = jnp.flip(rev_cummin, axis=0).astype(jnp.bool_)
+    text_trimmed = jnp.where(trailing_blank, jnp.int8(0), text_out)
+    return text_trimmed
+
+
 def _wipe_engr_tile(eng: EngraveState, row, col, rng: jax.Array) -> EngraveState:
     """Erode the engraving at (row, col) per vendor wear rules.
 
     Mirrors vendor/nethack/src/engrave.c::wipe_engr_at (lines 270-289):
 
-      - DUST and ENGR_BLOOD wear quickly (vendor uses the full rubouts
-        substitution table; we keep the existing 50% bernoulli + 2-byte
-        trim as an approximation — full character substitution via the
-        ``rubouts`` table is deferred).
+      - DUST and ENGR_BLOOD wear via ``wipeout_text(engr_txt, cnt, 0)``
+        with no per-step gate; vendor callers pass ``cnt=rnd(5)`` on
+        player movement (hack.c::maybe_smudge_engr line 3026).  We
+        mirror the ``rnd(5)`` cnt and invoke the rubouts kernel
+        ``_wipeout_text_jax`` (D16) so individual characters are
+        substituted via the vendor table rather than blindly trimmed.
       - ENGRAVE, MARK, and HEADSTONE wear via ``rn2(1 + 50/(cnt+1)) == 0``;
         with ``cnt=1`` (single wipe-attempt per step) that's
-        ``rn2(26) == 0`` ≈ 1/26 per step.  cite engrave.c:280-285.
+        ``rn2(26) == 0`` ≈ 1/26 per step (engrave.c:280-285).  When
+        the roll succeeds we also pass through the rubouts kernel
+        with cnt=1.
       - BURN only erodes when ``is_ice(x,y) || (magical && !rn2(2))``.
         Plain movement doesn't visit those branches, so BURN never wears
         via this path (matches the practical effect).
-      - When all bytes become zero, clear ``has_engraving``.
+      - When the inscription becomes entirely blank/NUL, clear
+        ``has_engraving``.
 
-    Previously: only DUST eroded; ENGRAVE/MARK/BURN/BLOOD were treated
-    as fully permanent, which let bloodwriting and athame-engraved
-    Elbereth last forever instead of degrading slowly.
+    Previously: only DUST eroded; the dust/blood branch trimmed 2 trailing
+    bytes with prob 1/2 instead of running the rubouts substitution.
+    Slow-class branches now also go through the rubouts kernel.
     """
     r = jnp.asarray(row, dtype=jnp.int32)
     c = jnp.asarray(col, dtype=jnp.int32)
@@ -271,34 +578,38 @@ def _wipe_engr_tile(eng: EngraveState, row, col, rng: jax.Array) -> EngraveState
         | (kind == ENGR_HEADSTONE)
     )
 
-    rng_fast, rng_slow = jax.random.split(rng)
-    fast_roll = jax.random.bernoulli(rng_fast, p=0.5)
-    # cnt=1 single wipe attempt: rn2(1 + 50/(1+1)) == rn2(26).
+    rng_cnt, rng_fast, rng_slow_gate, rng_slow = jax.random.split(rng, 4)
+    # Fast-class cnt = rnd(5) → uniform 1..5 (engrave.c caller hack.c:3026).
+    fast_cnt = jax.random.randint(
+        rng_cnt, (), 1, _WIPEOUT_MAX_CNT + 1, dtype=jnp.int32
+    )
+    # cnt=1 single wipe attempt for slow class: rn2(1 + 50/(1+1)) == rn2(26).
     slow_roll = jax.random.randint(
-        rng_slow, (), 0, 26, dtype=jnp.int32
+        rng_slow_gate, (), 0, 26, dtype=jnp.int32
     ) == jnp.int32(0)
-
-    should_erode = (is_dust_class & fast_roll) | (is_slow_class & slow_roll)
 
     text = eng.text[r, c, :]  # int8[ENGRAVE_TEXT_LEN]
 
-    # Count non-zero bytes to find current text length.
-    nonzero_mask = text != 0                     # bool[ENGRAVE_TEXT_LEN]
-    text_len = jnp.sum(nonzero_mask.astype(jnp.int32))
+    # Fast-wear (dust/blood): always run rubouts with cnt=rnd(5).
+    fast_text = _wipeout_text_jax(text, rng_fast, fast_cnt)
+    # Slow-wear (engrave/mark/headstone): gated, then cnt=1 rubouts.
+    slow_text_raw = _wipeout_text_jax(text, rng_slow, jnp.int32(1))
+    slow_text = jnp.where(slow_roll, slow_text_raw, text)
 
-    # New length after removing 2 chars (clamped to 0).
-    new_len = jnp.maximum(text_len - 2, 0)
+    new_text = jnp.where(
+        is_dust_class,
+        fast_text,
+        jnp.where(is_slow_class, slow_text, text),
+    )
 
-    # Build eroded text: keep first new_len bytes, zero the rest.
-    indices = jnp.arange(ENGRAVE_TEXT_LEN, dtype=jnp.int32)
-    eroded_text = jnp.where(indices < new_len, text, jnp.int8(0))
-
-    # Apply only when should_erode.
-    new_text = jnp.where(should_erode, eroded_text, text)
-    still_has = (new_len > 0) | ~should_erode
+    # When all bytes are zero/space after vendor's trailing-space trim,
+    # the engraving is gone (engrave.c:286-287 del_engr).
+    still_has = jnp.any(new_text != jnp.int8(0))
 
     new_texts = eng.text.at[r, c, :].set(new_text)
-    new_has   = eng.has_engraving.at[r, c].set(eng.has_engraving[r, c] & still_has)
+    new_has   = eng.has_engraving.at[r, c].set(
+        eng.has_engraving[r, c] & still_has
+    )
 
     return eng.replace(text=new_texts, has_engraving=new_has)
 
