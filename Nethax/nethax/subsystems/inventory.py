@@ -829,16 +829,42 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
 def drop(state, rng, ground_items: Item, branch: int, level: int, slot_idx: int) -> tuple:
     """Drop the item in inventory slot ``slot_idx`` onto the ground at player_pos.
 
-    Finds the first empty position in the ground stack at player_pos,
-    copies item from inventory, zeros inventory slot, updates total_weight.
+    Drop preconditions (Audit L #13) — mirrors vendor do.c::drop 714-780
+    and do.c::canletgo 665-711:
+      - Cursed loadstone cannot be dropped (canletgo 685-699).
+      - Welded uwep cannot be dropped (canletgo 672-684): if slot_idx is
+        the wielded slot AND ``inventory.welded`` is True, refuse.
+      - Levitation: if status.intrinsics[LEVITATION] is set, refuse
+        (do.c:758-772 ``can_reach_floor`` returns False under Levitation,
+        which in vendor calls ``hitfloor``; we approximate by refusing
+        the drop to leave the slot intact).
+      - Altar tile: call ``features.drop_at_altar`` which mutates the
+        item's BUC per vendor pray.c::doaltar (called from dropx 786-796).
+        The item is still placed on the ground stack as normal.
+      - Ring-on-sink: vendor do.c:753-756 routes RING on SINK tile to
+        ``dosinkring`` (silent removal + identification side-effects).
+        DEFERRED — TileType has no SINK entry in the internal enum
+        (constants/tiles.py:18-50); routing is documented but not
+        functional until the SINK tile is modeled.
 
-    Canonical: vendor/nethack/src/invent.c::dotypeobj drop path,
-               vendor/nethack/src/do.c::drop
+    Ground-stack merging (Audit L #13 closing): when the drop target tile
+    already holds a matching item (same category/type_id/BUC/enchantment),
+    merge into the existing stack rather than consuming a new ground slot.
+    Cite: vendor/nethack/src/invent.c::merged (ground side of the same
+    mergable() predicate).
+
+    Canonical: vendor/nethack/src/do.c::drop 714-780,
+               vendor/nethack/src/do.c::canletgo 665-711,
+               vendor/nethack/src/do.c::dropx 786-796.
 
     Returns
     -------
     (new_state, new_ground_items)
     """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intrinsic
+    from Nethax.nethax.constants.tiles import TileType as _TileType
+    from Nethax.nethax.subsystems.features import drop_at_altar as _drop_at_altar
+
     row = state.player_pos[0].astype(jnp.int32)
     col = state.player_pos[1].astype(jnp.int32)
     slot_idx = jnp.int32(slot_idx)
@@ -846,40 +872,113 @@ def drop(state, rng, ground_items: Item, branch: int, level: int, slot_idx: int)
     has_item = state.inventory.items.category[slot_idx] != 0
 
     # Cursed loadstone cannot be dropped.
-    # Cite: vendor/nethack/src/pickup.c (items.c::doloadstone) — a cursed
-    # loadstone weighs too much to lift; drop is silently blocked.
-    # type_id 443 = loadstone (constants/objects.py line 9045).
-    LOADSTONE_TYPE_ID = jnp.int16(443)
+    # Cite: vendor/nethack/src/do.c::canletgo line 685-699 — cursed loadstone
+    # refuses with "For some reason, you cannot drop the stone!".
+    LOADSTONE_TYPE_ID = jnp.int16(_LOADSTONE_TYPE_ID)
     CURSED = jnp.int8(1)
     is_cursed_loadstone = (
         (state.inventory.items.type_id[slot_idx] == LOADSTONE_TYPE_ID)
         & (state.inventory.items.buc_status[slot_idx] == CURSED)
     )
-    has_item = has_item & ~is_cursed_loadstone
 
-    # Find first empty ground stack position
-    def _find_ground_slot(carry, stack_idx):
-        found, gslot = carry
-        is_empty = ground_items.category[branch, level, row, col, stack_idx] == 0
-        gslot = jnp.where(~found & is_empty, stack_idx, gslot)
-        found = found | is_empty
-        return (found, gslot), None
+    # Welded uwep: if slot is the wielded weapon and the welded flag is on,
+    # refuse the drop.  Cite: vendor/nethack/src/do.c::canletgo 672-684 and
+    # do.c::drop 722-728.
+    is_wielded_slot = (
+        slot_idx == state.inventory.wielded.astype(jnp.int32)
+    ) & (state.inventory.wielded.astype(jnp.int32) >= jnp.int32(0))
+    welded_block = is_wielded_slot & state.inventory.welded
 
-    (ground_found, ground_slot), _ = lax.scan(
-        _find_ground_slot,
-        (jnp.bool_(False), jnp.int32(0)),
+    # Levitation block: vendor do.c:758 — under Levitation, drop calls
+    # hitfloor() and the item leaves inventory but never lands on the
+    # current tile.  We refuse the drop to keep state predictable
+    # (parity gap documented above).
+    levitating = state.status.intrinsics[int(_Intrinsic.LEVITATION)]
+
+    has_item = has_item & ~is_cursed_loadstone & ~welded_block & ~levitating
+
+    # Item identity for ground-stack merge match.
+    in_cat  = state.inventory.items.category[slot_idx]
+    in_tid  = state.inventory.items.type_id[slot_idx]
+    in_buc  = state.inventory.items.buc_status[slot_idx]
+    in_ench = state.inventory.items.enchantment[slot_idx]
+    in_eprf = state.inventory.items.oerodeproof[slot_idx]
+    in_qty  = state.inventory.items.quantity[slot_idx].astype(jnp.int32)
+    in_wt   = state.inventory.items.weight[slot_idx].astype(jnp.int32)
+
+    # Scan ground stack for (a) first empty slot, (b) first mergeable slot.
+    def _scan(carry, stack_idx):
+        empty_found, empty_pos, merge_found, merge_pos = carry
+        cat_here = ground_items.category[branch, level, row, col, stack_idx]
+        is_empty = cat_here == jnp.int8(0)
+        is_match = (
+            (~is_empty)
+            & (cat_here == in_cat)
+            & (ground_items.type_id[branch, level, row, col, stack_idx]    == in_tid)
+            & (ground_items.buc_status[branch, level, row, col, stack_idx] == in_buc)
+            & (ground_items.enchantment[branch, level, row, col, stack_idx] == in_ench)
+            & (ground_items.oerodeproof[branch, level, row, col, stack_idx] == in_eprf)
+        )
+        empty_pos = jnp.where(~empty_found & is_empty, stack_idx, empty_pos)
+        empty_found = empty_found | is_empty
+        merge_pos = jnp.where(~merge_found & is_match, stack_idx, merge_pos)
+        merge_found = merge_found | is_match
+        return (empty_found, empty_pos, merge_found, merge_pos), None
+
+    (g_empty_found, g_empty_pos, g_merge_found, g_merge_pos), _ = lax.scan(
+        _scan,
+        (jnp.bool_(False), jnp.int32(0), jnp.bool_(False), jnp.int32(0)),
         jnp.arange(MAX_GROUND_STACK, dtype=jnp.int32),
     )
-    can_drop = has_item & ground_found
-    safe_gs = jnp.clip(ground_slot, 0, MAX_GROUND_STACK - 1)
 
-    # Copy item fields to ground
+    # Target ground slot: merge first, else empty.
+    g_target = jnp.where(g_merge_found, g_merge_pos, g_empty_pos)
+    g_slot_ok = g_merge_found | g_empty_found
+    can_drop = has_item & g_slot_ok
+    safe_gs  = jnp.clip(g_target, 0, MAX_GROUND_STACK - 1)
+
+    # Altar BUC mutation (vendor do.c::dropx 786-796 -> doaltarobj).
+    # ``drop_at_altar`` mutates inventory.items.buc_status BEFORE the item
+    # leaves inventory; we read the (possibly updated) BUC back into the
+    # ground stack below.  Only fires on ALTAR tile and when can_drop.
+    here_tile = state.terrain[branch, level, row, col].astype(jnp.int32)
+    on_altar = (here_tile == jnp.int32(int(_TileType.ALTAR))) & can_drop
+    state_altared = jax.lax.cond(
+        on_altar,
+        lambda s: _drop_at_altar(s, slot_idx),
+        lambda s: s,
+        state,
+    )
+    inv = state_altared.inventory.items
+
+    # For merge writes: only quantity + weight need update; identity already matches.
+    merge_write = can_drop & g_merge_found
+    fresh_write = can_drop & ~g_merge_found
+
+    # Helper: write inventory field into ground stack at safe_gs.
     def _set_ground(field_ground, field_inv):
         return field_ground.at[branch, level, row, col, safe_gs].set(
-            jnp.where(can_drop, field_inv[slot_idx], field_ground[branch, level, row, col, safe_gs])
+            jnp.where(fresh_write, field_inv[slot_idx],
+                      field_ground[branch, level, row, col, safe_gs])
         )
 
-    inv = state.inventory.items
+    # Quantity/weight: merge adds, fresh copies.
+    g_existing_qty = ground_items.quantity[branch, level, row, col, safe_gs].astype(jnp.int32)
+    g_existing_wt  = ground_items.weight[branch, level, row, col, safe_gs].astype(jnp.int32)
+    merged_qty = (g_existing_qty + in_qty).astype(jnp.int16)
+    merged_wt  = (g_existing_wt + in_wt).astype(jnp.int32)
+
+    new_qty_at_pos = jnp.where(
+        merge_write, merged_qty,
+        jnp.where(fresh_write, inv.quantity[slot_idx],
+                  ground_items.quantity[branch, level, row, col, safe_gs])
+    )
+    new_wt_at_pos = jnp.where(
+        merge_write, merged_wt,
+        jnp.where(fresh_write, inv.weight[slot_idx],
+                  ground_items.weight[branch, level, row, col, safe_gs])
+    )
+
     new_ground = ground_items.replace(
         category    = _set_ground(ground_items.category,    inv.category),
         type_id     = _set_ground(ground_items.type_id,     inv.type_id),
@@ -887,14 +986,13 @@ def drop(state, rng, ground_items: Item, branch: int, level: int, slot_idx: int)
         enchantment = _set_ground(ground_items.enchantment, inv.enchantment),
         charges     = _set_ground(ground_items.charges,     inv.charges),
         identified  = _set_ground(ground_items.identified,  inv.identified),
-        quantity    = _set_ground(ground_items.quantity,    inv.quantity),
-        weight      = _set_ground(ground_items.weight,      inv.weight),
+        quantity    = ground_items.quantity.at[branch, level, row, col, safe_gs].set(new_qty_at_pos),
+        weight      = ground_items.weight.at[branch, level, row, col, safe_gs].set(new_wt_at_pos),
         ac_bonus    = _set_ground(ground_items.ac_bonus,    inv.ac_bonus),
         is_two_handed = _set_ground(ground_items.is_two_handed, inv.is_two_handed),
     )
 
-    # Zero the inventory slot
-    zero = make_empty_item()
+    # Zero the inventory slot (item leaves inventory regardless of merge/fresh).
     new_items = inv.replace(
         category   = inv.category.at[slot_idx].set(jnp.where(can_drop, jnp.int8(0), inv.category[slot_idx])),
         type_id    = inv.type_id.at[slot_idx].set(jnp.where(can_drop, jnp.int16(0), inv.type_id[slot_idx])),
@@ -908,11 +1006,11 @@ def drop(state, rng, ground_items: Item, branch: int, level: int, slot_idx: int)
         is_two_handed = inv.is_two_handed.at[slot_idx].set(jnp.where(can_drop, jnp.bool_(False), inv.is_two_handed[slot_idx])),
     )
 
-    new_inv = state.inventory.replace(
+    new_inv = state_altared.inventory.replace(
         items=new_items,
         total_weight=total_weight(new_items),
     )
-    new_state = state.replace(inventory=new_inv)
+    new_state = state_altared.replace(inventory=new_inv)
     return new_state, new_ground
 
 

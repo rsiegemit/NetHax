@@ -473,3 +473,110 @@ def test_pickup_loadstone_bypasses_weight_cap():
     assert int(new_state.inventory.items.type_id[0]) == _LOADSTONE_TYPE_ID, (
         "Loadstone must be picked up even when over weight cap"
     )
+
+
+# ---------------------------------------------------------------------------
+# Audit L #13: drop preconditions (welded uwep, levitation, altar, ground merge)
+# ---------------------------------------------------------------------------
+
+def test_drop_blocked_when_welded():
+    """Cannot drop a wielded weapon when inventory.welded is True."""
+    import jax, jax.numpy as jnp
+    from Nethax.nethax.subsystems.inventory import (
+        drop, make_item, ItemCategory, _items_from_list,
+    )
+    from Nethax.nethax.dungeon.branches import N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W
+
+    state = _make_state()
+    rng   = jax.random.PRNGKey(20)
+
+    sword = make_item(category=ItemCategory.WEAPON, type_id=34, quantity=1,
+                      weight=40, buc_status=1)
+    inv = state.inventory.replace(
+        items=_items_from_list([sword]),
+        wielded=jnp.int8(0),
+        welded=jnp.bool_(True),
+    )
+    state = state.replace(inventory=inv)
+    ground = _make_ground_items(N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W)
+
+    new_state, new_ground = drop(state, rng, ground, 0, 0, 0)
+
+    # Drop refused: slot intact, ground empty.
+    row = int(state.player_pos[0]); col = int(state.player_pos[1])
+    assert int(new_state.inventory.items.category[0]) == int(ItemCategory.WEAPON), (
+        "Welded weapon must stay in inventory"
+    )
+    assert int(new_ground.category[0, 0, row, col, 0]) == 0, (
+        "Welded weapon must not appear on ground"
+    )
+
+
+def test_drop_blocked_when_levitating():
+    """Cannot drop items while Levitating (drop refused)."""
+    import jax, jax.numpy as jnp
+    from Nethax.nethax.subsystems.inventory import (
+        drop, make_item, ItemCategory, _items_from_list,
+    )
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    from Nethax.nethax.dungeon.branches import N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W
+
+    state = _make_state()
+    rng   = jax.random.PRNGKey(21)
+
+    sword = make_item(category=ItemCategory.WEAPON, type_id=34, quantity=1, weight=40)
+    state = state.replace(
+        inventory=state.inventory.replace(items=_items_from_list([sword])),
+        status=state.status.replace(
+            intrinsics=state.status.intrinsics.at[int(Intrinsic.LEVITATION)].set(jnp.bool_(True)),
+        ),
+    )
+    ground = _make_ground_items(N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W)
+
+    new_state, new_ground = drop(state, rng, ground, 0, 0, 0)
+    row = int(state.player_pos[0]); col = int(state.player_pos[1])
+    assert int(new_state.inventory.items.category[0]) == int(ItemCategory.WEAPON), (
+        "Levitating drop must leave the slot intact"
+    )
+    assert int(new_ground.category[0, 0, row, col, 0]) == 0, (
+        "Levitating drop must not place item on ground"
+    )
+
+
+def test_drop_merges_with_existing_ground_stack():
+    """Dropping a matching item onto an existing ground stack merges quantities."""
+    import jax
+    from Nethax.nethax.subsystems.inventory import (
+        drop, make_item, ItemCategory, _items_from_list,
+    )
+    from Nethax.nethax.dungeon.branches import N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W
+
+    state = _make_state()
+    rng   = jax.random.PRNGKey(22)
+
+    # Put 3x arrow on the ground at slot 0 of the stack.
+    ground_arrow = make_item(category=ItemCategory.WEAPON, type_id=60,
+                             quantity=3, weight=30)
+    row = int(state.player_pos[0]); col = int(state.player_pos[1])
+    ground = _make_ground_items(N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W)
+    ground = _place_item_on_ground(ground, ground_arrow, 0, 0, row, col)
+
+    # Carry 2x of the same arrow stack in inventory slot 0.
+    inv_arrow = make_item(category=ItemCategory.WEAPON, type_id=60,
+                          quantity=2, weight=20)
+    state = state.replace(
+        inventory=state.inventory.replace(items=_items_from_list([inv_arrow])),
+    )
+
+    new_state, new_ground = drop(state, rng, ground, 0, 0, 0)
+
+    # Ground stack[0] now has 5 arrows; stack[1] still empty.
+    assert int(new_ground.quantity[0, 0, row, col, 0]) == 5, (
+        f"Expected merged ground qty 5; got {int(new_ground.quantity[0, 0, row, col, 0])}"
+    )
+    assert int(new_ground.weight[0, 0, row, col, 0]) == 50
+    assert int(new_ground.category[0, 0, row, col, 1]) == 0, (
+        "Ground stack[1] should remain empty when merge occurred"
+    )
+    # Inventory slot cleared.
+    assert int(new_state.inventory.items.category[0]) == 0
