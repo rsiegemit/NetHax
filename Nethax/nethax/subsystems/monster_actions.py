@@ -881,8 +881,18 @@ def _gaze_attack(state, slot: jnp.ndarray, rng: jax.Array):
                              cur_stun + stun_dur.astype(cur_stun.dtype),
                              cur_stun)
 
-        # BLIND — extend timer (rn1(25, 25) approximation).
-        blnd_dur = (jax.random.randint(rng_blnd, (), 0, 25) + jnp.int32(25))
+        # BLIND — extend timer by ``d(damn, damd)`` from the monster's
+        # AD_BLND attack table.  Cite: vendor/nethack/src/mhitu.c:1804
+        # ``int blnd = d((int) mattk->damn, (int) mattk->damd);``
+        # The per-attack dice are already rolled into ``raw_dmg`` above
+        # (single rng_dmg consumer covering whichever adtyp branch fires).
+        # Previously this used ``rn1(25, 25)`` = 25..49, which produced
+        # blind durations 10x+ longer than vendor for the dominant
+        # blinding monsters (yellow light: vendor d(1,2) = 1..2; raven:
+        # d(1,2); flash: d(1,2); etc.).  rng_blnd is left unconsumed
+        # here for byte-stream stability but is no longer used.
+        del rng_blnd  # no longer consumed
+        blnd_dur = raw_dmg
         cur_blnd = timed[int(TimedStatus.BLIND)]
         new_blnd = jnp.where(is_blnd,
                              cur_blnd + blnd_dur.astype(cur_blnd.dtype),
