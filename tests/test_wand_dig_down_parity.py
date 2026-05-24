@@ -97,15 +97,55 @@ def test_mt_routes_to_tip_down_slot():
     assert int(_ACTION_TO_HANDLER_IDX[mt]) == _SLOT_TIP_DOWN
 
 
-def test_mt_dispatch_creates_hole_at_player_pos():
-    """dispatch_action(M-T) creates a HOLE at the player tile of the current level."""
+def test_mt_dispatch_empties_carried_container_to_floor():
+    """dispatch_action(M-T) empties a carried container onto the floor.
+
+    Wave 43c rebalance: prior expectation was ``terrain[5,5] == HOLE`` after
+    M-T, which pinned a Nethax-only divergence wiring #tip to the WAN_DIGGING
+    down-dig path.  Vendor ``#tip`` (vendor/nethack/src/pickup.c::dotip 3562)
+    calls ``tipcontainer`` which empties the chosen container's contents onto
+    the floor at the hero's spot.
+
+    Old expectation → new expectation:
+      terrain[player] == HOLE  →  ground[player] holds the apple AND
+                                   container slot is empty.
+    """
+    from Nethax.nethax.subsystems.containers import (
+        install_container, put_in_container, ContainerType, BUCStatus,
+    )
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+
     state = EnvState.default(rng=_RNG)
     state = state.replace(player_pos=jnp.array([5, 5], dtype=jnp.int16))
     b  = int(state.dungeon.current_branch)
     lv = int(state.dungeon.current_level) - 1
-    # Ensure player tile starts as FLOOR.
-    new_terrain = state.terrain.at[b, lv, 5, 5].set(jnp.int8(TileType.FLOOR))
-    state = state.replace(terrain=new_terrain)
+
+    # Install a carried BoH at container slot 0 (parent_slot=2 → inv slot 2).
+    state = install_container(
+        state, 0, ContainerType.BAG_OF_HOLDING,
+        parent_slot=2, buc=int(BUCStatus.UNCURSED),
+    )
+
+    # Place an apple in inventory slot 0 and stash it into the BoH.
+    inv = state.inventory.items
+    new_inv = inv.replace(
+        category   = inv.category.at[0].set(jnp.int8(ItemCategory.FOOD)),
+        type_id    = inv.type_id.at[0].set(jnp.int16(123)),
+        quantity   = inv.quantity.at[0].set(jnp.int16(1)),
+        weight     = inv.weight.at[0].set(jnp.int32(5)),
+        identified = inv.identified.at[0].set(jnp.bool_(True)),
+    )
+    state = state.replace(inventory=state.inventory.replace(items=new_inv))
+    state = put_in_container(state, 0, 0)
+
+    # Sanity: container has the apple before tip.
+    assert int(state.containers.items_category[0, 0]) == int(ItemCategory.FOOD)
+    assert int(state.ground_items.category[b, lv, 5, 5, 0]) == 0
 
     out = dispatch_action(state, jnp.int32(_M_byte("T")), _RNG)
-    assert int(out.terrain[b, lv, 5, 5]) == int(TileType.HOLE)
+
+    # Container slot 0 is now empty …
+    assert int(out.containers.items_category[0, 0]) == 0
+    # … and the apple is on the ground at the player's tile.
+    assert int(out.ground_items.category[b, lv, 5, 5, 0]) == int(ItemCategory.FOOD)
+    assert int(out.ground_items.type_id[b, lv, 5, 5, 0]) == 123

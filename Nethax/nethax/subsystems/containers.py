@@ -639,19 +639,24 @@ def take_from_container(state, container_idx, item_pos):
 # #tip — empty container contents onto the floor
 # ---------------------------------------------------------------------------
 
-def tip_container(state, container_idx: int):
+def tip_container(state, container_idx):
     """Empty ``container_idx`` onto the floor at the player's tile.
 
     Canonical: vendor/nethack/src/pickup.c::tipcontainer lines 3687-3760
     (and the vendor ``#tip`` command at pickup.c::dotip line 3562).  The
     vendor loop walks ``box->cobj`` and calls ``obj_extract_self`` +
-    ``place_object`` for each item; here we copy each container slot to
-    the first available ground-stack position at ``state.player_pos`` and
-    zero the container slot afterwards.
+    ``place_object`` for each item.
 
-    JIT-pure: a single ``lax.fori_loop`` over ``MAX_ITEMS_PER_CONTAINER``
-    slots so there is no Python control flow on traced values; per
-    iteration we re-scan the ground stack to find the first empty slot.
+    Implementation
+    --------------
+    Vectorized & assignment-based.  We compute a per-container-slot
+    destination ground-slot up-front (cumulative count of occupied
+    container slots before slot i, summed onto the starting empty count
+    of the ground stack).  Container slot i with occupied item moves to
+    ground slot ``base_empty + prior_occupied_count``; any overflow past
+    ``MAX_GROUND_STACK`` is dropped (matches the existing no-room
+    behavior in this port — vendor would call ``replace_object`` which
+    falls back to the same tile, but our ground array has a fixed depth).
 
     Cite: vendor/nethack/src/pickup.c::dotip line 3562;
           vendor/nethack/src/pickup.c::tipcontainer lines 3687-3760.
@@ -659,15 +664,12 @@ def tip_container(state, container_idx: int):
     Parameters
     ----------
     state         : EnvState
-    container_idx : int — container slot (0..N_CONTAINERS-1)
+    container_idx : int or jnp.int32 — container slot (0..N_CONTAINERS-1)
 
     Returns
     -------
-    new_state with the container emptied and its contents copied onto the
-    ground stack at the player's tile.  Items beyond the ground stack's
-    capacity are dropped on the floor in vendor (replace_object loop); here
-    they are silently lost when ground stack is full, matching the existing
-    no-room behavior elsewhere in the port.
+    new_state with the container emptied and its contents copied onto
+    the ground stack at the player's tile.
     """
     from Nethax.nethax.subsystems.inventory import MAX_GROUND_STACK
 
@@ -677,87 +679,75 @@ def tip_container(state, container_idx: int):
     pr    = state.player_pos[0].astype(jnp.int32)
     pc    = state.player_pos[1].astype(jnp.int32)
 
-    has_container = state.containers.container_type[c_idx] != jnp.int8(
-        ContainerType.NONE
-    )
+    cs     = state.containers
+    ground = state.ground_items
 
-    def _scan_ground_for_empty(g):
-        """Return (found, slot_idx) for first empty ground stack slot."""
-        cats = g.category[b, lv, pr, pc]  # int8[MAX_GROUND_STACK]
+    has_container = cs.container_type[c_idx] != jnp.int8(ContainerType.NONE)
 
-        def _body(carry, idx):
-            found, pos = carry
-            is_empty = cats[idx] == jnp.int8(0)
-            pos      = jnp.where(~found & is_empty, idx, pos)
-            found    = found | is_empty
-            return (found, pos), None
+    # Container occupancy mask (per-slot bool).
+    cat_row  = cs.items_category[c_idx]            # int8[M]
+    occupied = cat_row != jnp.int8(0)              # bool[M]
 
-        (found, pos), _ = lax.scan(
-            _body,
-            (jnp.bool_(False), jnp.int32(0)),
-            jnp.arange(MAX_GROUND_STACK, dtype=jnp.int32),
-        )
-        return found, pos
+    # Ground stack occupancy → starting fill count (== first empty slot).
+    g_cats = ground.category[b, lv, pr, pc]        # int8[MAX_GROUND_STACK]
+    g_occ  = g_cats != jnp.int8(0)                 # bool[MAX_GROUND_STACK]
+    g_base = jnp.sum(g_occ.astype(jnp.int32))      # number of occupied ground slots
 
-    def _tip_one(item_pos, st):
-        cs   = st.containers
-        item_occupied = cs.items_category[c_idx, item_pos] != jnp.int8(0)
+    # Per-container-slot destination ground index (only meaningful when occupied):
+    # base_empty + (#occupied in container slots [0..i)).
+    prior = jnp.cumsum(occupied.astype(jnp.int32)) - occupied.astype(jnp.int32)
+    dest  = g_base + prior                         # int32[M]
+    fits  = dest < jnp.int32(MAX_GROUND_STACK)
+    do_copy_per_slot = has_container & occupied & fits  # bool[M]
+    safe_dest = jnp.clip(dest, 0, MAX_GROUND_STACK - 1).astype(jnp.int32)
 
-        ground = st.ground_items
-        # Re-scan the *current* ground (it may have grown via prior iterations).
-        found_empty, g_pos = _scan_ground_for_empty(ground)
+    # Write each container slot to its destination ground slot if do_copy[i].
+    # We loop in Python over MAX_ITEMS_PER_CONTAINER (fixed at trace time so
+    # the IR is flat).
+    new_ground = ground
+    new_cs     = cs
+    for i in range(MAX_ITEMS_PER_CONTAINER):
+        do_copy = do_copy_per_slot[i]
+        g_slot  = safe_dest[i]
 
-        do_copy = has_container & item_occupied & found_empty
-        safe_g  = jnp.clip(g_pos, 0, MAX_GROUND_STACK - 1)
-
-        # Copy container slot → ground stack slot.
+        # Ground write helper.
         def _gset(field_g, field_c, dtype):
-            old = field_g[b, lv, pr, pc, safe_g]
+            old = field_g[b, lv, pr, pc, g_slot]
             new_val = jnp.where(
                 do_copy,
-                field_c[c_idx, item_pos].astype(dtype),
+                field_c[c_idx, i].astype(dtype),
                 old,
             )
-            return field_g.at[b, lv, pr, pc, safe_g].set(new_val)
+            return field_g.at[b, lv, pr, pc, g_slot].set(new_val)
 
-        new_ground = ground.replace(
-            category    = _gset(ground.category,    cs.items_category,   jnp.int8),
-            type_id     = _gset(ground.type_id,     cs.items_type_id,    jnp.int16),
-            buc_status  = _gset(ground.buc_status,  cs.items_buc,        jnp.int8),
-            enchantment = _gset(ground.enchantment, cs.items_enchant,    jnp.int8),
-            charges     = _gset(ground.charges,     cs.items_charges,    jnp.int8),
-            identified  = _gset(ground.identified,  cs.items_identified, jnp.bool_),
-            quantity    = _gset(ground.quantity,    cs.items_quantity,   jnp.int16),
-            weight      = _gset(ground.weight,      cs.items_weight,     jnp.int32),
+        new_ground = new_ground.replace(
+            category    = _gset(new_ground.category,    cs.items_category,   jnp.int8),
+            type_id     = _gset(new_ground.type_id,     cs.items_type_id,    jnp.int16),
+            buc_status  = _gset(new_ground.buc_status,  cs.items_buc,        jnp.int8),
+            enchantment = _gset(new_ground.enchantment, cs.items_enchant,    jnp.int8),
+            charges     = _gset(new_ground.charges,     cs.items_charges,    jnp.int8),
+            identified  = _gset(new_ground.identified,  cs.items_identified, jnp.bool_),
+            quantity    = _gset(new_ground.quantity,    cs.items_quantity,   jnp.int16),
+            weight      = _gset(new_ground.weight,      cs.items_weight,     jnp.int32),
         )
 
-        # Zero out the container slot if we copied (or item is empty no-op).
+        # Container zero helper.
         def _czero(field_c, zero_val):
-            old = field_c[c_idx, item_pos]
-            return field_c.at[c_idx, item_pos].set(
-                jnp.where(do_copy, zero_val, old)
-            )
+            old = field_c[c_idx, i]
+            return field_c.at[c_idx, i].set(jnp.where(do_copy, zero_val, old))
 
-        new_cs = cs.replace(
-            items_category   = _czero(cs.items_category,   jnp.int8(0)),
-            items_type_id    = _czero(cs.items_type_id,    jnp.int16(0)),
-            items_buc        = _czero(cs.items_buc,        jnp.int8(0)),
-            items_enchant    = _czero(cs.items_enchant,    jnp.int8(0)),
-            items_charges    = _czero(cs.items_charges,    jnp.int8(0)),
-            items_identified = _czero(cs.items_identified, jnp.bool_(False)),
-            items_quantity   = _czero(cs.items_quantity,   jnp.int16(0)),
-            items_weight     = _czero(cs.items_weight,     jnp.int16(0)),
+        new_cs = new_cs.replace(
+            items_category   = _czero(new_cs.items_category,   jnp.int8(0)),
+            items_type_id    = _czero(new_cs.items_type_id,    jnp.int16(0)),
+            items_buc        = _czero(new_cs.items_buc,        jnp.int8(0)),
+            items_enchant    = _czero(new_cs.items_enchant,    jnp.int8(0)),
+            items_charges    = _czero(new_cs.items_charges,    jnp.int8(0)),
+            items_identified = _czero(new_cs.items_identified, jnp.bool_(False)),
+            items_quantity   = _czero(new_cs.items_quantity,   jnp.int16(0)),
+            items_weight     = _czero(new_cs.items_weight,     jnp.int16(0)),
         )
 
-        return st.replace(containers=new_cs, ground_items=new_ground)
-
-    new_state = lax.fori_loop(
-        0,
-        MAX_ITEMS_PER_CONTAINER,
-        lambda i, s: _tip_one(jnp.int32(i), s),
-        state,
-    )
-    return new_state
+    return state.replace(containers=new_cs, ground_items=new_ground)
 
 
 # ---------------------------------------------------------------------------

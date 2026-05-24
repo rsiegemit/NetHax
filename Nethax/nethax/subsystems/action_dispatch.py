@@ -116,6 +116,7 @@ from Nethax.nethax.subsystems.containers import (
     handle_loot as _containers_handle_loot,
     handle_apply_container as _containers_handle_apply,
     cancel_bag_of_holding as _containers_cancel_boh,
+    tip_container as _containers_tip_container,
     ContainerType as _ContainerType,
 )
 from Nethax.nethax.subsystems.status_effects import (
@@ -2047,50 +2048,38 @@ def _handle_dip(state, rng):
 
 
 def _handle_tip_down(state, rng):
-    """#tip / M-T — wired to WAN_DIGGING down-dig path.
+    """#tip / M-T — empty a carried container onto the floor.
 
-    Per the wave16d brief, M-T is routed to invoke the down-dig branch added
-    to _effect_digging (direction == 8 sentinel → create HOLE at player_pos).
-    Cite: vendor/nethack/src/dig.c::zap_dig line 1548;
-          vendor/nethack/src/dig.c::digactualhole line 640.
+    Audit L #11: vendor ``#tip`` (pickup.c::dotip line 3562) calls
+    ``tipcontainer(cobj)`` which empties the chosen container's contents
+    onto the floor at the hero's spot.  Earlier wave16d wired this
+    handler to the WAN_DIGGING down-dig path (creating a HOLE at
+    player_pos via ``_effect_digging`` direction=8), which is a vendor
+    divergence: down-dig is a wand effect, not the #tip command.
 
-    Projects EnvState → WandState, calls _effect_digging with direction=8,
-    then writes the new terrain back.
+    Behavior here: pick the first carried container (``parent_slot >= 0``)
+    and call ``tip_container`` on it.  When no container is carried, the
+    state is returned unchanged (vendor would prompt the player; the
+    headless port silently no-ops).
+
+    Cite: vendor/nethack/src/pickup.c::dotip line 3562;
+          vendor/nethack/src/pickup.c::tipcontainer lines 3687-3760.
     """
-    from Nethax.nethax.subsystems.items_wands import _effect_digging
-    from Nethax.nethax.subsystems.status_effects import Intrinsic as _ZapIntrinsic
+    cs = state.containers
+    # First carried container = lowest-index slot with parent_slot >= 0 and
+    # container_type != NONE.
+    has_container = cs.container_type != jnp.int8(_ContainerType.NONE)
+    is_carried    = cs.parent_slot >= jnp.int8(0)
+    usable        = has_container & is_carried
+    first_idx     = jnp.argmax(usable).astype(jnp.int32)
+    any_usable    = jnp.any(usable)
 
-    b  = state.dungeon.current_branch.astype(jnp.int32)
-    lv = state.dungeon.current_level.astype(jnp.int32) - 1
-    terrain_2d  = state.terrain[b, lv]
-    explored_2d = state.explored[b, lv]
-
-    mai = state.monster_ai
-    wand_state = WandState(
-        mon_pos       = mai.pos,
-        mon_hp        = mai.hp,
-        mon_hp_max    = mai.hp_max,
-        mon_type      = mai.entry_idx,
-        mon_alive     = mai.alive,
-        mon_asleep    = mai.asleep,
-        mon_undead    = mai.undead,
-        mon_invisible = mai.invisible,
-        mon_resists   = mai.resists,
-        mon_speed_mod = mai.speed_mod,
-        mon_cancelled = mai.cancelled,
-        terrain       = terrain_2d,
-        explored      = explored_2d,
-        inventory     = state.inventory,
-        player_pos    = state.player_pos,
-        dungeon_level = state.dungeon.current_level.astype(jnp.int8),
-        probed_hp     = jnp.int32(0),
-        probed_idx    = jnp.int32(-1),
-        player_reflecting = state.status.intrinsics[int(_ZapIntrinsic.REFLECTING)],
+    return jax.lax.cond(
+        any_usable,
+        lambda s: _containers_tip_container(s, first_idx),
+        lambda s: s,
+        state,
     )
-
-    new_wand, _ = _effect_digging(wand_state, rng, direction=jnp.int32(8))
-    new_terrain = state.terrain.at[b, lv].set(new_wand.terrain)
-    return state.replace(terrain=new_terrain)
 
 
 # ---------------------------------------------------------------------------
