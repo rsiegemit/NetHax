@@ -453,8 +453,19 @@ def compute_final_score(state) -> jnp.ndarray:
     #   tmp += 50 * (deepest - 1)                 (travel bonus)
     #   if deepest > 20:
     #       tmp += 1000 * min(10, deepest - 20)   (deep bonus, capped at 10)
+    # Audit G #3 fix: vendor end.c:1336 ``if (how < PANICKED) tmp -= tmp/10``
+    # gates the 10% death tax on non-ascended deaths only.  ASCENDED == 15
+    # and PANICKED == 11, so ascension skips the tax.  We approximate
+    # ``how < PANICKED`` as ``!scoring.ascended`` because the only non-death
+    # how-codes here are TRICKED/QUIT/ESCAPED/ASCENDED; among those only
+    # ASCENDED is tracked in ScoringState today (and Nethax never sets
+    # scoring.ascended for the others).
     gold_capped = jnp.maximum(gold, jnp.int32(0))
-    gold_adj    = gold_capped - (gold_capped // jnp.int32(10))  # 10% death tax
+    gold_adj    = jnp.where(
+        scoring.ascended,
+        gold_capped,
+        gold_capped - (gold_capped // jnp.int32(10)),
+    )
     travel_b    = jnp.int32(50) * jnp.maximum(deepest - jnp.int32(1), jnp.int32(0))
     deep_excess = jnp.maximum(deepest - jnp.int32(20), jnp.int32(0))
     deep_b      = jnp.int32(1000) * jnp.minimum(deep_excess, jnp.int32(10))

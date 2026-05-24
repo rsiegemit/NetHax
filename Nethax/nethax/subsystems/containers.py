@@ -725,45 +725,59 @@ def use_bag_of_tricks(state, rng):
 # ---------------------------------------------------------------------------
 
 def cursed_bag_consume(state, rng, container_idx: int):
-    """1-in-10 chance a cursed bag of holding destroys a random contained item.
+    """Cursed bag of holding: per-item 1/13 chance to destroy each item.
 
-    Canonical: vendor/nethack/src/pickup.c::use_container — cursed BoH
-    has a per-operation chance of eating a contained item.
+    Vendor: pickup.c::is_boh_item_gone lines 2509-2513:
+
+        if (Is_mbag(container) && container->cursed && !rn2(13))
+            return TRUE;  /* destroy this item */
+
+    The check fires **per item** on every open/use of a cursed BoH (or
+    BoT — they share ``Is_mbag``), not a single coin flip on the bag.
+    Audit L #3 flagged the previous "single 10% roll picks one victim"
+    implementation as a Nethax-only approximation.
+
+    For ``MAX_ITEMS_PER_CONTAINER`` slots we split the rng once into
+    one key per slot, roll ``rn2(13) == 0`` independently for each, and
+    zero out the slots that drew 0 AND were occupied.
+
+    Cite: vendor/nethack/src/pickup.c::is_boh_item_gone lines 2509-2513;
+    vendor/nethack/include/obj.h:339 ``Is_mbag`` (BoH OR BoT).
     """
     cs    = state.containers
     c_idx = jnp.int32(container_idx)
 
-    is_cursed_boh = (
-        (cs.container_type[c_idx] == jnp.int8(ContainerType.BAG_OF_HOLDING))
-        & (cs.container_buc[c_idx] == jnp.int8(BUCStatus.CURSED))
+    # Audit L #6: gate covers BoH OR BoT per Is_mbag(container).
+    ctype = cs.container_type[c_idx]
+    is_mbag = (
+        (ctype == jnp.int8(ContainerType.BAG_OF_HOLDING))
+        | (ctype == jnp.int8(ContainerType.BAG_OF_TRICKS))
     )
+    is_cursed = cs.container_buc[c_idx] == jnp.int8(BUCStatus.CURSED)
+    eat_active = is_mbag & is_cursed
 
-    rng_roll, rng_pick, rng_new = jax.random.split(rng, 3)
-    eat_roll  = jax.random.uniform(rng_roll, shape=())
-    should_eat = is_cursed_boh & (eat_roll < jnp.float32(0.1))
+    # Per-slot independent rn2(13) == 0 rolls.  Split the rng once into
+    # MAX_ITEMS_PER_CONTAINER + 1 keys (last one carried out as rng_new).
+    n_slots = cs.items_category.shape[1]
+    keys = jax.random.split(rng, n_slots + 1)
+    rng_new = keys[0]
+    per_slot_keys = keys[1:]
+    # rn2(13) == 0 per slot.
+    rolls = jax.vmap(lambda k: jax.random.randint(k, (), 0, 13))(per_slot_keys)
+    gone_roll = rolls == jnp.int32(0)
 
-    occupied  = cs.items_category[c_idx] != jnp.int8(0)
-    n_occupied = jnp.sum(occupied.astype(jnp.int32))
-    has_items  = n_occupied > jnp.int32(0)
-
-    rand_pick  = jax.random.randint(
-        rng_pick, shape=(), minval=0,
-        maxval=jnp.maximum(n_occupied, jnp.int32(1)),
-    )
-    cum_occ    = jnp.cumsum(occupied.astype(jnp.int32))
-    victim_pos = jnp.argmax(cum_occ > rand_pick).astype(jnp.int32)
-
-    do_eat = should_eat & has_items
+    occupied = cs.items_category[c_idx] != jnp.int8(0)
+    do_eat = eat_active & gone_roll & occupied  # bool[N_SLOTS]
 
     new_cs = cs.replace(
-        items_category = cs.items_category.at[c_idx, victim_pos].set(
-            jnp.where(do_eat, jnp.int8(0), cs.items_category[c_idx, victim_pos])
+        items_category = cs.items_category.at[c_idx].set(
+            jnp.where(do_eat, jnp.int8(0),  cs.items_category[c_idx])
         ),
-        items_quantity = cs.items_quantity.at[c_idx, victim_pos].set(
-            jnp.where(do_eat, jnp.int16(0), cs.items_quantity[c_idx, victim_pos])
+        items_quantity = cs.items_quantity.at[c_idx].set(
+            jnp.where(do_eat, jnp.int16(0), cs.items_quantity[c_idx])
         ),
-        items_weight   = cs.items_weight.at[c_idx, victim_pos].set(
-            jnp.where(do_eat, jnp.int16(0), cs.items_weight[c_idx, victim_pos])
+        items_weight   = cs.items_weight.at[c_idx].set(
+            jnp.where(do_eat, jnp.int16(0), cs.items_weight[c_idx])
         ),
     )
     return state.replace(containers=new_cs, rng=rng_new)
@@ -819,39 +833,53 @@ _WAN_CANCELLATION_TYPE_ID:         int = 395   # vendor objects.h:8084-8086
 
 
 def cancel_bag_of_holding(state, container_idx: int, src_slot: int = -1):
-    """Wand of cancellation hits a bag of holding: implode it.
+    """Insertion-trigger implosion for a bag of holding (or bag of tricks).
 
-    Two trigger paths share this implementation:
+    Audit L #5: vendor ``zap.c::cancel_item`` (lines 1239-1362) has NO
+    BAG_OF_HOLDING / BAG_OF_TRICKS case — an external wand zap at a BoH
+    just runs the trailing ``unbless`` + ``uncurse`` at lines 1359-1360
+    and returns.  The "destroy contents + demote bag" behavior was a
+    Nethax-only divergence; ``action_dispatch.py`` no longer invokes
+    this function on external zap.
 
-    1. ``src_slot == -1`` (default): an *external* wand of cancellation is
-       zapped at the bag-of-holding (zap.c::cancel_item, line 1239+, dispatch
-       at line 2315/3167).  All contents are destroyed and the bag is demoted
-       to a SACK.
-    2. ``src_slot >= 0``: a triggering item is being *inserted* into the bag
-       (pickup.c::in_container, line 2658).  Vendor ``mbag_explodes`` returns
-       True for WAN_CANCELLATION or a nested Is_mbag (BAG_OF_HOLDING /
-       BAG_OF_TRICKS, gated by spe>0).  In that case vendor also:
-         * destroys the triggering item (pickup.c:2669 ``obfree``);
-         * deals ``d(6,6)`` HP damage (pickup.c:2692 ``losehp``);
-         * destroys the bag itself.  We model "destroy the bag" by demoting
-           BAG_OF_HOLDING → NONE (slot emptied) so the player can no longer
-           use it.
+    The contents-destruction path is reserved for the *insertion*
+    trigger (vendor pickup.c::in_container line 2658 → mbag_explodes
+    2488-2507): inserting WAN_CANCELLATION (any spe) or a nested
+    Is_mbag (BoH / BoT with spe > 0) detonates the bag, destroys all
+    contents, ``obfree`` 's the triggering item (pickup.c:2685-2690),
+    and deals ``d(6,6)`` HP damage (pickup.c:2692).
 
-    Cite: vendor/nethack/src/pickup.c::mbag_explodes (2488-2507) and the
-    in_container branch (2658-2693); vendor/nethack/src/zap.c::cancel_item
-    (1239+) for the external-zap path.
+    Two call modes survive for back-compat with existing wiring:
+
+    1. ``src_slot >= 0``: the insertion path described above.  We model
+       "obfree the bag" by demoting its container_type to NONE so the
+       slot becomes unusable (we don't free the underlying pytree
+       array shape).
+    2. ``src_slot == -1`` (legacy): no-op — external wand-zap path is
+       not implemented because vendor has none.  Returns ``state``
+       unchanged.  The buc-clearing portion (unbless+uncurse) is a
+       documented follow-up since it requires a container-BUC flag
+       flip not yet wired through.
+
+    Cite: vendor/nethack/src/pickup.c::mbag_explodes (2488-2507);
+          vendor/nethack/src/pickup.c::in_container 2658-2693;
+          vendor/nethack/src/zap.c::cancel_item 1239-1362 (NO BoH branch).
 
     Parameters
     ----------
     state         : EnvState
     container_idx : int — index into state.containers (0..N_CONTAINERS-1)
     src_slot      : int — inventory slot of the inserted trigger item, or -1
-                          for the external wand-zap path.
+                          for the (now-no-op) external wand-zap path.
 
     Returns
     -------
     new_state
     """
+    # Audit L #5: external zap path is a no-op in vendor.  Short-circuit
+    # before any destruction logic runs.
+    if int(src_slot) < 0:
+        return state
     cs    = state.containers
     c_idx = jnp.int32(container_idx)
 
@@ -936,7 +964,8 @@ def maybe_explode_on_insert(state, container_idx: int, src_slot: int):
     ``container_idx`` triggers the mbag_explodes implosion, and apply it.
 
     Trigger conditions (vendor pickup.c:2488-2507 ``mbag_explodes``):
-      * container is a BAG_OF_HOLDING (Is_mbag);
+      * container is a "magic bag" — ``Is_mbag`` covers BOTH BAG_OF_HOLDING
+        AND BAG_OF_TRICKS (vendor obj.h:339).  Audit L #6 fix.
       * AND the inserted item is WAN_CANCELLATION (any spe), OR a nested
         BAG_OF_HOLDING / BAG_OF_TRICKS with spe > 0.
 
@@ -957,7 +986,12 @@ def maybe_explode_on_insert(state, container_idx: int, src_slot: int):
     c_idx = jnp.int32(container_idx)
     s_idx = jnp.int32(src_slot)
 
-    is_boh = cs.container_type[c_idx] == jnp.int8(ContainerType.BAG_OF_HOLDING)
+    # Audit L #6: ``Is_mbag(container)`` is BoH OR BoT, not just BoH.
+    ctype = cs.container_type[c_idx]
+    is_mbag = (
+        (ctype == jnp.int8(ContainerType.BAG_OF_HOLDING))
+        | (ctype == jnp.int8(ContainerType.BAG_OF_TRICKS))
+    )
 
     src_tid     = inv.type_id[s_idx]
     src_charges = inv.charges[s_idx]
@@ -968,7 +1002,7 @@ def maybe_explode_on_insert(state, container_idx: int, src_slot: int):
         | (src_tid == jnp.int16(_BAG_OF_TRICKS_CONTAINER_TYPE_ID))
     ) & (src_charges > jnp.int8(0))
 
-    should_explode = is_boh & (is_wan_cancel | is_nested_mbag)
+    should_explode = is_mbag & (is_wan_cancel | is_nested_mbag)
 
     return jax.lax.cond(
         should_explode,

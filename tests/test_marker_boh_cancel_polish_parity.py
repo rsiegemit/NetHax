@@ -135,11 +135,20 @@ def test_marker_default_when_empty():
 # 3. cancel_bag_of_holding: empties contents and demotes type to SACK
 # ---------------------------------------------------------------------------
 
-def test_cancel_bag_of_holding_empties_and_demotes():
-    """cancel_bag_of_holding zeros all items_quantity and sets type to SACK.
+def test_cancel_bag_of_holding_on_insertion_destroys():
+    """Inserting WAN_CANCELLATION (or a nested BoH/BoT) into a BoH detonates.
 
-    Cite: vendor/nethack/src/zap.c::cancel_item (line 720) — BoH implodes,
-    destroying everything inside; bag becomes a plain sack.
+    Audit L #5 fix: vendor ``zap.c::cancel_item`` (lines 1239-1362) has
+    NO BAG_OF_HOLDING case — zapping the bag externally just runs the
+    trailing ``unbless`` / ``uncurse`` at lines 1359-1360 and returns.
+    Contents are NOT destroyed and the bag is NOT demoted on external zap.
+
+    The contents-destruction path is reserved for the *insertion*
+    trigger: vendor ``pickup.c::in_container`` at line 2658 calls
+    ``mbag_explodes()`` (lines 2488-2507) which returns true for
+    WAN_CANCELLATION (any spe) or a nested Is_mbag (BoH/BoT, gated
+    spe>0).  This test exercises the insertion path via the
+    ``src_slot >= 0`` arm of ``cancel_bag_of_holding``.
     """
     from Nethax.nethax.subsystems.containers import (
         cancel_bag_of_holding, install_container, ContainerType, BUCStatus,
@@ -162,19 +171,25 @@ def test_cancel_bag_of_holding_empties_and_demotes():
         )
     state = state.replace(containers=cs)
 
-    # Verify items are present before cancel.
+    # Verify items are present before insertion-detonation.
     assert int(jnp.sum(state.containers.items_quantity[0])) == 15
 
-    result = cancel_bag_of_holding(state, 0)
+    # Insertion-path: pass src_slot >= 0.  The implementation models
+    # vendor's obfree (pickup.c:2685-2690) by setting the bag's
+    # container_type to NONE so it can no longer be used.
+    result = cancel_bag_of_holding(state, 0, src_slot=0)
 
-    # All quantities zeroed.
+    # All contained quantities zeroed.
     total_qty = int(jnp.sum(result.containers.items_quantity[0]))
-    assert total_qty == 0, f"Expected 0 total quantity after cancel, got {total_qty}"
+    assert total_qty == 0, f"Expected 0 total quantity after detonate, got {total_qty}"
 
-    # Container demoted from BAG_OF_HOLDING to SACK.
+    # Bag is destroyed (set to NONE), per vendor obfree on the insertion
+    # path.  Note: the EXTERNAL zap-at-bag path is intentionally a no-op
+    # in vendor — see Audit L #5 in the function docstring.
     new_ctype = int(result.containers.container_type[0])
-    assert new_ctype == int(ContainerType.SACK), (
-        f"Expected SACK ({int(ContainerType.SACK)}), got {new_ctype}"
+    assert new_ctype == int(ContainerType.NONE), (
+        f"Expected NONE ({int(ContainerType.NONE)}) on insertion-detonate, "
+        f"got {new_ctype}"
     )
 
 

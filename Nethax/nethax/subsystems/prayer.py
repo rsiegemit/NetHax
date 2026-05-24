@@ -387,30 +387,53 @@ def in_trouble(state) -> jnp.ndarray:
     ringR_otyp = jnp.where(
         ringR_idx >= jnp.int32(0), items.type_id[ringR_idx], jnp.int32(-1)
     )
+    # Audit G #5 fix: vendor pray.c:232-241 only inspects the buc field of
+    # an item that is actually equipped — ``Cursed_obj(uarmf, ...)`` and
+    # ``stuck_ring(...)`` return false when the slot is empty without
+    # reading a buc value.  The previous ``jnp.int8(0)`` fallback when
+    # ``index < 0`` zero-extended uninitialised buc data; in particular it
+    # could *unset* a cursed status read elsewhere if downstream code
+    # consumed boots_cursed/ringL_cursed/ringR_cursed without the otyp
+    # guard.  Switch to a direct boolean: True iff the slot is occupied
+    # AND that item is cursed.
+    _CURSED = jnp.int8(1)
     boots_cursed = jnp.where(
-        boots_idx >= jnp.int32(0), items.buc_status[boots_idx], jnp.int8(0)
+        boots_idx >= jnp.int32(0),
+        items.buc_status[boots_idx] == _CURSED,
+        jnp.bool_(False),
     )
     ringL_cursed = jnp.where(
-        ringL_idx >= jnp.int32(0), items.buc_status[ringL_idx], jnp.int8(0)
+        ringL_idx >= jnp.int32(0),
+        items.buc_status[ringL_idx] == _CURSED,
+        jnp.bool_(False),
     )
     ringR_cursed = jnp.where(
-        ringR_idx >= jnp.int32(0), items.buc_status[ringR_idx], jnp.int8(0)
+        ringR_idx >= jnp.int32(0),
+        items.buc_status[ringR_idx] == _CURSED,
+        jnp.bool_(False),
     )
     is_cursed_levit = (
-        ((boots_otyp == jnp.int32(_LEVIT_BOOTS_OTYP))
-         & (boots_cursed == jnp.int8(1)))
-        | ((ringL_otyp == jnp.int32(_LEVIT_RING_OTYP))
-           & (ringL_cursed == jnp.int8(1)))
-        | ((ringR_otyp == jnp.int32(_LEVIT_RING_OTYP))
-           & (ringR_cursed == jnp.int8(1)))
+        ((boots_otyp == jnp.int32(_LEVIT_BOOTS_OTYP)) & boots_cursed)
+        | ((ringL_otyp == jnp.int32(_LEVIT_RING_OTYP)) & ringL_cursed)
+        | ((ringR_otyp == jnp.int32(_LEVIT_RING_OTYP)) & ringR_cursed)
     )
     # pray.c:232-241  unuseable hands (welded weapon / nohands form).
     is_unuse_hands = timed[int(TimedStatus.GLIB)] > jnp.int32(0)
-    # pray.c:242-243  cursed blindfold — Blindfolded && ublindf->cursed.
-    # Wave 27a byte-equal: only the worn blindfold matters.  We approximate
-    # "Blindfolded" as BLIND status > 0 AND a cursed blindfold (otyp 208) is
-    # present in inventory.  The vendor exact check requires ublindf pointer
-    # which is not exposed; this is the closest JIT-safe approximation.
+    # pray.c:242-243  cursed blindfold — ``Blindfolded && ublindf->cursed``.
+    # Vendor reads the specific worn-blindfold pointer (``ublindf``); a
+    # cursed blindfold in inventory that is *not* worn does not trigger
+    # TROUBLE_CURSED_BLINDFOLD.  Audit G #6: InventoryState exposes no
+    # ``worn_blindfold`` slot today (the ArmorSlot enum in
+    # subsystems/inventory.py only covers BODY/SHIELD/HELM/GLOVES/BOOTS/
+    # CLOAK/SHIRT), so a byte-equal vendor check requires per-state
+    # tracking we do not yet model.  We deliberately keep the
+    # "BLIND timed AND any cursed blindfold (otyp 208) in inventory"
+    # approximation — it preserves the AND-of-two-conditions structure of
+    # the vendor predicate (a blinded hero with a cursed blindfold at
+    # hand) and remains the closest JIT-safe analogue until a worn-
+    # blindfold slot lands.  Divergence: the vendor check is false when
+    # the cursed blindfold is carried but unworn; we report True in that
+    # case.  Cite: vendor/nethack/src/pray.c:242-243.
     _BLINDFOLD_OTYP = 208
     is_blindfold = items.type_id == jnp.int32(_BLINDFOLD_OTYP)
     is_cursed_item = items.buc_status == jnp.int8(1)

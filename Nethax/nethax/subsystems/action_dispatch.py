@@ -1371,22 +1371,21 @@ def _handle_zap(state, rng):
     )
     is_cancellation = zapped_type_id == _WAN_CANCELLATION
 
-    def _maybe_cancel_boh(s, c_idx: int):
-        """Cancel BoH at container index c_idx if cancellation wand was zapped."""
-        has_boh = s.containers.container_type[c_idx] == jnp.int8(
-            int(_ContainerType.BAG_OF_HOLDING)
-        )
-        return jax.lax.cond(
-            is_cancellation & has_boh,
-            lambda st: _containers_cancel_boh(st, c_idx),
-            lambda st: st,
-            s,
-        )
-
-    from Nethax.nethax.subsystems.containers import N_CONTAINERS as _N_CONTAINERS
+    # Audit L #5: vendor ``zap.c::cancel_item`` (lines 1239-1362) has NO
+    # BAG_OF_HOLDING case — zapping a BoH with cancellation only triggers
+    # the trailing ``unbless(obj); uncurse(obj);`` (lines 1359-1360).
+    # Contents are NOT destroyed and the bag is NOT demoted to a SACK on
+    # external zap.  The contents-destruction path is reserved for the
+    # *insertion* trigger (pickup.c::mbag_explodes), still wired via
+    # ``maybe_explode_on_insert`` in put_in_container.
+    #
+    # Previously this loop iterated every container index and called
+    # ``_containers_cancel_boh(...)`` on each BoH whenever any wand was
+    # zapped — destroying contents and demoting the bag.  That was a
+    # Nethax-only divergence; removed here.  The buc-clearing portion
+    # (unbless + uncurse) is left as a documented follow-up since it
+    # requires a container BUC flag flip not yet wired through.
     final_state = mid_state
-    for _ci in range(_N_CONTAINERS):
-        final_state = _maybe_cancel_boh(final_state, _ci)
 
     # Use-identification: zapping a wand identifies its type, vendor
     # zap.c:123-147 learnwand(otmp) → makeknown(obj->otyp).

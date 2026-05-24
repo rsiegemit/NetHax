@@ -4,7 +4,8 @@ For each sample game outcome below we hand-compute the expected final score
 component-by-component and assert ``compute_final_score`` returns that exact
 value.  This locks the Nethax formula to the vendor breakdown (end.c:1325-1352):
 
-    gold_adj = gold - gold/10                # 10% death tax
+    gold_adj = gold - gold/10                # 10% death tax (how < PANICKED only)
+    gold_adj = gold                          # ASCENDED skips the tax (end.c:1336)
     travel_b = 50 * (deepest - 1)
     deep_b   = 1000 * min(10, max(0, deepest - 20))
     base     = urexp + gold_adj + travel_b + deep_b
@@ -251,18 +252,20 @@ def test_score_got_amulet_39150():
 # amulet+ascend, only PACIFIST conduct kept.
 #
 # Vendor end.c:1325-1352 breakdown (with full doubling on ascension):
-#   gold_adj = 5000 - 500       = 4500
+#   gold_adj = 5000             (Audit G #3: ASCENDED skips death tax,
+#                                end.c:1336 ``if (how < PANICKED) tmp -= tmp/10``)
 #   travel_b = 50 * 52          = 2600
 #   deep_b   = 1000 * min(10,33)= 10000
-#   base     = 60000+4500+2600+10000 = 77100
-#   asc_b    = base             = 77100   (ascension doubles)
+#   base     = 60000+5000+2600+10000 = 77600
+#   asc_b    = base             = 77600   (ascension doubles)
 #   conduct_b= 200              (PACIFIST)
-#   final    = 77100 + 77100 + 200 = 154400
+#   final    = 77600 + 77600 + 200 = 155400
 # ---------------------------------------------------------------------------
 
-def test_score_ascended_pacifist_154400():
-    """Endgame ascension with pacifist preserved → 154400 under vendor doubling.
+def test_score_ascended_pacifist_155400():
+    """Endgame ascension with pacifist preserved → 155400 under vendor doubling.
 
+    # vendor/nethack/src/end.c:1336      — ASCENDED skips ``tmp -= tmp/10`` tax.
     # vendor/nethack/src/end.c:1344-1351 — ascended multiplies base.
     # vendor/nethack/src/insight.c PACIFIST has the 200-point conduct bonus.
     """
@@ -271,14 +274,14 @@ def test_score_ascended_pacifist_154400():
         amulet=True, ascended=True,
         kept_conducts=[Conduct.PACIFIST],
     )
-    gold_adj = 5000 - 5000 // 10  # 4500
+    gold_adj = 5000                      # ASCENDED → no death tax
     travel_b = DLEVEL_BONUS * (53 - 1)  # 2600
     deep_b   = 1000 * min(10, 53 - 20)  # 10000
-    base     = 60000 + gold_adj + travel_b + deep_b  # 77100
+    base     = 60000 + gold_adj + travel_b + deep_b  # 77600
     asc_b    = base                                  # full ascension double
     expected = base + asc_b + _CONDUCT_BONUS[Conduct.PACIFIST]
-    assert expected == 154400
-    assert int(compute_final_score(state)) == 154400
+    assert expected == 155400
+    assert int(compute_final_score(state)) == 155400
 
 
 # ---------------------------------------------------------------------------
@@ -286,18 +289,19 @@ def test_score_ascended_pacifist_154400():
 # amulet+ascend, only ATHEIST conduct kept.
 #
 # Vendor end.c:1325-1352 breakdown:
-#   gold_adj = 8000 - 800       = 7200
+#   gold_adj = 8000             (Audit G #3: ASCENDED skips death tax, end.c:1336)
 #   travel_b = 50 * 52          = 2600
 #   deep_b   = 1000 * min(10,33)= 10000
-#   base     = 90000+7200+2600+10000 = 109800
-#   asc_b    = base             = 109800
+#   base     = 90000+8000+2600+10000 = 110600
+#   asc_b    = base             = 110600
 #   conduct_b= 100              (ATHEIST)
-#   final    = 109800 + 109800 + 100 = 219700
+#   final    = 110600 + 110600 + 100 = 221300
 # ---------------------------------------------------------------------------
 
-def test_score_ascended_atheist_219700():
-    """Endgame ascension with atheist preserved → 219700 under vendor doubling.
+def test_score_ascended_atheist_221300():
+    """Endgame ascension with atheist preserved → 221300 under vendor doubling.
 
+    # vendor/nethack/src/end.c:1336      — ASCENDED skips ``tmp -= tmp/10`` tax.
     # vendor/nethack/src/end.c:1344-1351 (ascended doubles base).
     """
     state = _scenario(
@@ -305,14 +309,14 @@ def test_score_ascended_atheist_219700():
         amulet=True, ascended=True,
         kept_conducts=[Conduct.ATHEIST],
     )
-    gold_adj = 8000 - 8000 // 10  # 7200
-    travel_b = DLEVEL_BONUS * (53 - 1)  # 2600
-    deep_b   = 1000 * min(10, 53 - 20)  # 10000
-    base     = 90000 + gold_adj + travel_b + deep_b  # 109800
+    gold_adj = 8000                       # ASCENDED → no death tax
+    travel_b = DLEVEL_BONUS * (53 - 1)   # 2600
+    deep_b   = 1000 * min(10, 53 - 20)   # 10000
+    base     = 90000 + gold_adj + travel_b + deep_b  # 110600
     asc_b    = base
     expected = base + asc_b + _CONDUCT_BONUS[Conduct.ATHEIST]
-    assert expected == 219700
-    assert int(compute_final_score(state)) == 219700
+    assert expected == 221300
+    assert int(compute_final_score(state)) == 221300
 
 
 # ---------------------------------------------------------------------------
