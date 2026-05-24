@@ -3506,70 +3506,113 @@ def clone_mon(state, mon_idx: jnp.ndarray, rng: jax.Array) -> object:
 
 def mattackm(state, attacker_idx: jnp.ndarray, defender_idx: jnp.ndarray,
              rng: jax.Array) -> object:
-    """Monster-vs-monster melee attack.
+    """Monster-vs-monster melee attack — vendor NATTK loop.
 
-    Reads the attacker's primary (n_dice, sides) from
-    ``_MONSTER_PRIMARY_ATTACK_TABLE`` and the defender's effective AC from
-    ``MonsterAIState.ac``.  Rolls to-hit using a vendor-style accumulator
-    (``tmp = AC_VALUE(def_ac) + 10 + attacker_level``, hit iff ``tmp > rnd(20)``)
-    then rolls damage (1d{sides} per die).
+    Wave 40b Item #7: iterate over all NATTK=6 attack slots from the
+    attacker's data->mattk[].  For each slot with aatyp != AT_NONE:
+      * compute ``tmp = ac_value(def_ac) + 10 + a_lev`` (find_mac + m_lev)
+      * apply ``+4`` if defender is confused or helpless (sleep/paralysis)
+      * apply ``+1`` if attacker is elf and defender is orc
+      * roll ``dieroll = rnd(20 + i)`` per attack index i (mhitm.c:441)
+      * hit iff ``tmp > dieroll``; roll damage ``ndN dM``
+      * stop early if defender dies
 
     Gates: both slots alive, attacker != defender.
 
-    Cite: vendor/nethack/src/mhitm.c::mattackm (lines 1024-1100).
+    Cite: vendor/nethack/src/mhitm.c::mattackm lines 293-592; permonst.h
+    NATTK = 6 (line 48).
     """
     a = attacker_idx.astype(jnp.int32)
     d = defender_idx.astype(jnp.int32)
     mai = state.monster_ai
 
-    key_hit, key_dmg = jax.random.split(rng)
-
     same_slot = (a == d)
     both_alive = mai.alive[a] & mai.alive[d]
-    can_strike = both_alive & ~same_slot
+    can_strike_base = both_alive & ~same_slot
 
-    # Attacker primary attack — clipped to table bounds.
     a_entry = jnp.clip(
         mai.entry_idx[a].astype(jnp.int32),
-        0, _MONSTER_PRIMARY_ATTACK_N.shape[0] - 1,
+        0, _MONSTER_ATTACK_AATYP_TABLE.shape[0] - 1,
     )
-    n_dice_raw = _MONSTER_PRIMARY_ATTACK_N[a_entry].astype(jnp.int32)
-    sides_raw  = _MONSTER_PRIMARY_ATTACK_S[a_entry].astype(jnp.int32)
-    n_dice = jnp.clip(n_dice_raw, 1, 8)
-    sides  = jnp.clip(sides_raw, 1, 12)
-
-    # Attacker level: derived from MONSTERS[entry].level (precomputed table).
+    d_entry = jnp.clip(
+        mai.entry_idx[d].astype(jnp.int32),
+        0, _MONSTER_ATTACK_AATYP_TABLE.shape[0] - 1,
+    )
     a_lev = jnp.clip(_MONSTER_LEVEL_TABLE[a_entry].astype(jnp.int32), 1, 30)
 
-    # Defender AC: per-slot ``ac`` field.  Negative AC uses vendor AC_VALUE
-    # softening (rnd(-ac)) per vendor/nethack/src/hack.h:1538.
+    defender_confused = mai.confuse_timer[d] > jnp.int16(0)
+    defender_helpless = (
+        mai.asleep[d] | (mai.paralyzed_timer[d] > jnp.int16(0))
+    )
+    bonus_confused = jnp.where(defender_confused | defender_helpless,
+                                jnp.int32(4), jnp.int32(0))
+
+    _M2_ORC: int = 0x00000004
+    _M2_ELF: int = 0x00000008
+    a_flags2 = _MONSTER_FLAGS2_TABLE[a_entry]
+    d_flags2 = _MONSTER_FLAGS2_TABLE[d_entry]
+    is_elf = (a_flags2 & jnp.int32(_M2_ELF)) != 0
+    is_orc = (d_flags2 & jnp.int32(_M2_ORC)) != 0
+    bonus_elf_orc = jnp.where(is_elf & is_orc, jnp.int32(1), jnp.int32(0))
+
     def_ac_raw = mai.ac[d].astype(jnp.int32)
-    key_hit, key_ac = jax.random.split(key_hit)
+    rng, key_ac = jax.random.split(rng)
     ac_neg_roll = jax.random.randint(
         key_ac, (), 1, jnp.maximum(-def_ac_raw + 1, 2), dtype=jnp.int32
     )
     ac_value = jnp.where(def_ac_raw >= 0, def_ac_raw, -ac_neg_roll)
-    tmp = jnp.maximum(ac_value + jnp.int32(10) + a_lev, jnp.int32(1))
+    base_tmp = jnp.maximum(
+        ac_value + jnp.int32(10) + a_lev + bonus_confused + bonus_elf_orc,
+        jnp.int32(1),
+    )
 
-    roll = jax.random.randint(key_hit, (), 1, 21, dtype=jnp.int32)
-    hit = (tmp > roll) & can_strike
+    AT_NONE = jnp.int8(0)
+    aatyp_row = _MONSTER_ATTACK_AATYP_TABLE[a_entry]
+    n_row     = _MONSTER_ATTACK_N_TABLE[a_entry]
+    s_row     = _MONSTER_ATTACK_S_TABLE[a_entry]
 
-    # Roll damage — bounded scan over 8 dice (mirrors monster_attack_player).
-    def _roll_one(carry, key):
-        sub = jax.random.randint(key, (), 1, sides + 1, dtype=jnp.int32)
-        return carry, sub
+    nattk_keys = jax.random.split(rng, _NATTK)
 
-    keys_d = jax.random.split(key_dmg, 8)
-    _, rolls = jax.lax.scan(_roll_one, jnp.int32(0), keys_d)
-    take = jnp.arange(8, dtype=jnp.int32) < n_dice
-    raw_dmg = jnp.sum(jnp.where(take, rolls, jnp.int32(0))).astype(jnp.int32)
-    dmg = jnp.where(hit, raw_dmg, jnp.int32(0))
+    def _attack_step(carry, idx):
+        cur_def_hp, cur_def_alive, struck = carry
+        key_i = nattk_keys[idx]
+        aatyp_i = aatyp_row[idx]
+        n_raw   = n_row[idx].astype(jnp.int32)
+        s_raw   = s_row[idx].astype(jnp.int32)
+        n_dice  = jnp.clip(n_raw, 1, 8)
+        sides   = jnp.clip(s_raw, 1, 12)
 
-    new_def_hp = jnp.maximum(mai.hp[d] - dmg, jnp.int32(0)).astype(jnp.int32)
-    new_alive_d = mai.alive[d] & (new_def_hp > jnp.int32(0))
+        slot_active = (aatyp_i != AT_NONE) & (n_raw > 0)
+        can_attack = can_strike_base & slot_active & cur_def_alive
 
-    new_hp_arr    = mai.hp.at[d].set(new_def_hp)
-    new_alive_arr = mai.alive.at[d].set(new_alive_d)
+        key_hit, key_dmg = jax.random.split(key_i)
+        roll = jax.random.randint(
+            key_hit, (), 1, jnp.int32(21) + idx, dtype=jnp.int32,
+        )
+        hit = (base_tmp > roll) & can_attack
+
+        keys_d = jax.random.split(key_dmg, 8)
+
+        def _roll_one(c, k):
+            sub = jax.random.randint(k, (), 1, sides + 1, dtype=jnp.int32)
+            return c, sub
+
+        _, rolls = jax.lax.scan(_roll_one, jnp.int32(0), keys_d)
+        take = jnp.arange(8, dtype=jnp.int32) < n_dice
+        raw_dmg = jnp.sum(jnp.where(take, rolls, jnp.int32(0))).astype(jnp.int32)
+        dmg = jnp.where(hit, raw_dmg, jnp.int32(0))
+
+        new_def_hp = jnp.maximum(cur_def_hp - dmg, jnp.int32(0))
+        new_def_alive = cur_def_alive & (new_def_hp > jnp.int32(0))
+        return (new_def_hp, new_def_alive, struck | hit), None
+
+    init = (mai.hp[d].astype(jnp.int32), mai.alive[d], jnp.bool_(False))
+    (final_def_hp, final_def_alive, _struck), _ = jax.lax.scan(
+        _attack_step, init, jnp.arange(_NATTK, dtype=jnp.int32),
+    )
+
+    new_hp_arr    = mai.hp.at[d].set(final_def_hp.astype(mai.hp.dtype))
+    new_alive_arr = mai.alive.at[d].set(final_def_alive)
 
     new_mai = mai.replace(hp=new_hp_arr, alive=new_alive_arr)
     return state.replace(monster_ai=new_mai)
