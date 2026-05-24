@@ -710,34 +710,131 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
         return s.replace(player_pw=(uen + ep).astype(s.player_pw.dtype))
 
     # ---- 7: CREATE_AMMO (Longbow of Diana) artifact.c:1933-1960 -----------
+    # Vendor invoke_create_ammo:
+    #   otmp = mksobj(ARROW, TRUE, FALSE);
+    #   otmp->blessed = obj->blessed; otmp->cursed = obj->cursed;
+    #   if (obj->blessed) {
+    #       if (otmp->spe < 0) otmp->spe = 0;
+    #       otmp->quan += rnd(10);
+    #   } else if (obj->cursed) {
+    #       if (otmp->spe > 0) otmp->spe = 0;
+    #   } else { otmp->quan += rnd(5); }
+    #   otmp = hold_another_object(...)   /* inv if room, else floor */
+    # Note vendor mksobj default quan for ARROW is 1, then +rnd(10)/+rnd(5)
+    # add to it, so blessed = 2..11, uncursed = 2..6, cursed = 1.
+    # Audit K: route the otmp through inventory first; if no empty slot
+    # exists, fall through to the ground stack at player_pos (hold_another_
+    # object inventory-full path).
+    # Cite: vendor/nethack/src/artifact.c:1933-1960 (invoke_create_ammo);
+    #       vendor/nethack/src/invent.c::hold_another_object.
     def _h_create_ammo(s):
-        from Nethax.nethax.subsystems.inventory import ItemCategory
+        from Nethax.nethax.subsystems.inventory import (
+            ItemCategory, MAX_GROUND_STACK,
+        )
         items = s.inventory.items
         empty_mask = items.category == jnp.int8(int(ItemCategory.NONE))
+        has_empty = jnp.any(empty_mask)
         slot = jnp.argmax(empty_mask.astype(jnp.int32))
-        bcsign = items.buc_status[wielded_slot].astype(jnp.int32)
-        k_q = jax.random.split(k_handler, 2)[0]
-        q_b = jax.random.randint(k_q, (), 1, 11, dtype=jnp.int32)
-        q_n = jax.random.randint(k_q, (), 1, 6, dtype=jnp.int32)
-        quan = jnp.where(bcsign > jnp.int32(0), q_b,
-                jnp.where(bcsign < jnp.int32(0), jnp.int32(1), q_n))
+        # buc_status enum (1=cursed, 2=uncursed, 3=blessed) — convert.
+        buc = items.buc_status[wielded_slot].astype(jnp.int32)
+        k_q, k_unused = jax.random.split(k_handler, 2)
+        # Vendor uses rnd(10) for blessed and rnd(5) for uncursed, then
+        # quan += that (starting from 1).  So blessed = 1 + rnd(10) = 2..11,
+        # uncursed = 1 + rnd(5) = 2..6.
+        q_b = jnp.int32(1) + jax.random.randint(k_q, (), 1, 11, dtype=jnp.int32)
+        q_n = jnp.int32(1) + jax.random.randint(k_q, (), 1, 6,  dtype=jnp.int32)
+        quan = jnp.where(buc == jnp.int32(3), q_b,
+                jnp.where(buc == jnp.int32(1), jnp.int32(1), q_n))
         ARROW_TYPE_ID = 60
-        new_cat = items.category.at[slot].set(jnp.int8(int(ItemCategory.WEAPON)))
-        new_typ = items.type_id.at[slot].set(jnp.int16(ARROW_TYPE_ID))
-        new_qty = items.quantity.at[slot].set(quan.astype(items.quantity.dtype))
-        new_buc = items.buc_status.at[slot].set(bcsign.astype(items.buc_status.dtype))
-        new_items = items.replace(category=new_cat, type_id=new_typ,
-                                   quantity=new_qty, buc_status=new_buc)
-        return s.replace(inventory=s.inventory.replace(items=new_items))
+
+        # --- Inventory path (has empty slot) -------------------------------
+        new_cat_inv = items.category.at[slot].set(jnp.int8(int(ItemCategory.WEAPON)))
+        new_typ_inv = items.type_id.at[slot].set(jnp.int16(ARROW_TYPE_ID))
+        new_qty_inv = items.quantity.at[slot].set(quan.astype(items.quantity.dtype))
+        new_buc_inv = items.buc_status.at[slot].set(buc.astype(items.buc_status.dtype))
+        inv_items = items.replace(category=new_cat_inv, type_id=new_typ_inv,
+                                  quantity=new_qty_inv, buc_status=new_buc_inv)
+
+        # --- Ground path (no inventory room: drop on player tile) ----------
+        # Append to ground_items at the player position.  Find the first
+        # empty stack slot (category == NONE); if the whole stack is full
+        # the arrow is silently dropped (vendor: hold_another_object falls
+        # through to nothing in pathological cases).
+        b = s.dungeon.current_branch.astype(jnp.int32)
+        lv = s.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+        pr = s.player_pos[0].astype(jnp.int32)
+        pc = s.player_pos[1].astype(jnp.int32)
+        gi = s.ground_items
+        # gi.category shape: [n_branches, max_levels, map_h, map_w, MAX_GROUND_STACK]
+        stack_cats = gi.category[b, lv, pr, pc, :]
+        stack_empty = stack_cats == jnp.int8(int(ItemCategory.NONE))
+        gslot = jnp.argmax(stack_empty.astype(jnp.int32))
+        gi_new_cat = gi.category.at[b, lv, pr, pc, gslot].set(
+            jnp.int8(int(ItemCategory.WEAPON)))
+        gi_new_typ = gi.type_id.at[b, lv, pr, pc, gslot].set(
+            jnp.int16(ARROW_TYPE_ID))
+        gi_new_qty = gi.quantity.at[b, lv, pr, pc, gslot].set(
+            quan.astype(gi.quantity.dtype))
+        gi_new_buc = gi.buc_status.at[b, lv, pr, pc, gslot].set(
+            buc.astype(gi.buc_status.dtype))
+        ground_gi = gi.replace(
+            category=gi_new_cat, type_id=gi_new_typ,
+            quantity=gi_new_qty, buc_status=gi_new_buc,
+        )
+
+        # Branch on has_empty.
+        final_items = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(has_empty, new, old),
+            inv_items, items,
+        )
+        final_gi = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(has_empty, old, new),
+            ground_gi, gi,
+        )
+        return s.replace(
+            inventory=s.inventory.replace(items=final_items),
+            ground_items=final_gi,
+        )
 
     # ---- 8: UNTRAP (Master Key) artifact.c:1837-1845 ----------------------
-    # Partial stub: clear player_in_trap.  Full directional untrap menu
-    # requires interactive input.
+    # Vendor calls untrap(TRUE, 0, 0, NULL) which (a) clears u.utrap when the
+    # hero is stuck in a trap and (b) disarms the trap on the hero's tile
+    # (clearing levl[u.ux][u.uy].t_at via deltrap()).  We mirror both halves:
+    # clear player_in_trap AND zero state.traps.trap_type at the player tile.
+    # Cite: vendor/nethack/src/artifact.c:1837-1845;
+    #       vendor/nethack/src/trap.c::untrap & deltrap.
     def _h_untrap(s):
-        return s.replace(player_in_trap=jnp.bool_(False))
+        # Flat level idx for the current dungeon position.
+        max_lv = jnp.int32(s.terrain.shape[1])
+        b = s.dungeon.current_branch.astype(jnp.int32)
+        lv = s.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+        flat_lv = b * max_lv + lv
+        pr = s.player_pos[0].astype(jnp.int32)
+        pc = s.player_pos[1].astype(jnp.int32)
+        # Clear trap_type at player tile (deltrap equivalent).
+        new_tt = s.traps.trap_type.at[flat_lv, pr, pc].set(jnp.int8(0))
+        # Mark trap as revealed (otherwise stale).
+        new_rv = s.traps.revealed.at[flat_lv, pr, pc].set(jnp.bool_(False))
+        new_traps = s.traps.replace(trap_type=new_tt, revealed=new_rv)
+        return s.replace(
+            player_in_trap=jnp.bool_(False),
+            traps=new_traps,
+        )
 
     # ---- 9: CHARGE_OBJ (Yendorian Express) artifact.c:1847-1864 -----------
-    # Recharge target wand if any; no "refill player_pw" path in vendor.
+    # Vendor:
+    #   b_effect = obj->blessed && role_match
+    #   recharge(otmp, b_effect ? 1 : obj->cursed ? -1 : 0)
+    # recharge() (read.c:729) for WAND_CLASS:
+    #   lim = (otyp == WAN_WISHING) ? 1 : oc_dir != NODIR ? 8 : 15
+    #   blessed:  spe = max(spe, rn1(5, lim+1-5)) else spe++
+    #   uncursed: spe = max(spe, rnd(rn1(5, lim+1-5))) else spe++
+    #   cursed:   stripspe(obj)  (sets spe to 0)
+    # We approximate at the +1/-1/0 increment level (no rn1 draw) but cap
+    # spe at lim=15 and clamp at 0 minimum.  buc_status encoding is
+    # 1=cursed, 2=uncursed, 3=blessed (not signed) — convert explicitly.
+    # Cite: vendor/nethack/src/artifact.c:1847-1864;
+    #       vendor/nethack/src/read.c::recharge lines 729-799.
     def _h_charge_obj(s):
         from Nethax.nethax.subsystems.inventory import ItemCategory
         items = s.inventory.items
@@ -745,17 +842,31 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
                     & (items.quantity > jnp.int16(0))
         any_wand = jnp.any(wand_mask)
         target = jnp.argmax(wand_mask.astype(jnp.int32))
-        bcsign = items.buc_status[wielded_slot].astype(jnp.int32)
-        delta = jnp.where(bcsign > jnp.int32(0), jnp.int32(1),
-                  jnp.where(bcsign < jnp.int32(0), jnp.int32(-1), jnp.int32(0)))
+        # Convert artifact BUC enum (1=cursed, 2=uncursed, 3=blessed) to
+        # signed delta as vendor's recharge() expects.
+        buc = items.buc_status[wielded_slot].astype(jnp.int32)
+        delta = jnp.where(buc == jnp.int32(3), jnp.int32(1),
+                  jnp.where(buc == jnp.int32(1), jnp.int32(-1), jnp.int32(0)))
         cur_ch = items.charges[target].astype(jnp.int32)
-        new_ch = jnp.where(any_wand,
-                  jnp.maximum(cur_ch + delta, jnp.int32(0)),
-                  cur_ch).astype(items.charges.dtype)
+        # Cursed: stripspe (vendor recharge:771) sets spe to 0.
+        # Blessed/uncursed: increment spe.  Cap at 15 (default wand lim).
+        WAND_MAX_CHARGES = jnp.int32(15)
+        new_ch = jnp.where(
+            delta == jnp.int32(-1),
+            jnp.int32(0),
+            jnp.minimum(cur_ch + delta, WAND_MAX_CHARGES),
+        )
+        new_ch = jnp.maximum(new_ch, jnp.int32(0))
+        new_ch = jnp.where(any_wand, new_ch, cur_ch).astype(items.charges.dtype)
+        # Bump recharged counter (vendor line 767).
+        new_recharged = jnp.where(
+            any_wand,
+            items.recharged[target] + jnp.int8(1),
+            items.recharged[target],
+        ).astype(items.recharged.dtype)
         new_items = items.replace(
             charges=items.charges.at[target].set(new_ch),
-            recharged=items.recharged.at[target].set(
-                (items.recharged[target] + jnp.int8(1)).astype(items.recharged.dtype)),
+            recharged=items.recharged.at[target].set(new_recharged),
         )
         return s.replace(inventory=s.inventory.replace(items=new_items))
 
