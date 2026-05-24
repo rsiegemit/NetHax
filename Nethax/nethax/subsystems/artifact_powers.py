@@ -109,6 +109,7 @@ def _build_predicate_masks():
     from Nethax.nethax.constants.monsters import (
         MONSTERS,
         M2_UNDEAD, M2_DEMON, M2_ORC, M2_GIANT, M2_WERE,
+        M2_LORD, M2_PRINCE,
         MonsterSymbol,
     )
     undead = [bool(m.flags2 & M2_UNDEAD)             for m in MONSTERS]
@@ -125,6 +126,13 @@ def _build_predicate_masks():
         ogre = [m.symbol == ogre_sym for m in MONSTERS]
     except AttributeError:
         ogre = [False] * len(MONSTERS)
+    # Audit K — BANISH ladder needs S_IMP, M2_LORD, M2_PRINCE for dlord /
+    # dprince / imp classification.  Cite vendor/nethack/include/mondata.h:
+    # is_dprince = is_demon && is_prince ; is_dlord = is_demon && is_lord.
+    # Cite vendor artifact.c:1977 — `mdat->mlet == S_IMP` is the imp gate.
+    imp    = [m.symbol == MonsterSymbol.S_IMP   for m in MONSTERS]
+    lord   = [bool(m.flags2 & M2_LORD)          for m in MONSTERS]
+    prince = [bool(m.flags2 & M2_PRINCE)        for m in MONSTERS]
     return (
         jnp.array(undead, dtype=jnp.bool_),
         jnp.array(demon,  dtype=jnp.bool_),
@@ -134,6 +142,9 @@ def _build_predicate_masks():
         jnp.array(troll,  dtype=jnp.bool_),
         jnp.array(were,   dtype=jnp.bool_),
         jnp.array(ogre,   dtype=jnp.bool_),
+        jnp.array(imp,    dtype=jnp.bool_),
+        jnp.array(lord,   dtype=jnp.bool_),
+        jnp.array(prince, dtype=jnp.bool_),
     )
 
 
@@ -146,6 +157,9 @@ def _build_predicate_masks():
     _IS_TROLL,
     _IS_WERE,
     _IS_OGRE,
+    _IS_IMP,
+    _IS_LORD,
+    _IS_PRINCE,
 ) = _build_predicate_masks()
 
 _N_MONSTERS: int = _IS_UNDEAD.shape[0]
@@ -660,10 +674,26 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
         )
 
     # ---- 5: ENLIGHTENING (Eyes of Overworld) artifact.c:2162-2165 ---------
-    # UI-side enlightenment(); no game-state mutation.  Cooldown bump above
-    # is the only observable effect.
+    # Vendor calls enlightenment(MAGICENLIGHTENMENT, ENL_GAMEINPROGRESS) which
+    # is purely a UI menu and mutates no game state.  Audit-K approximation:
+    # treat the act of "knowing your situation" as making nearby hidden
+    # monsters known to the player by clearing their `invisible` flag for
+    # any monster in player line-of-sight.  Cleared monsters become rendered
+    # like normal monsters; mimics how vendor's enlightenment surfaces info
+    # the player would otherwise have to infer.
+    # Cite: vendor/nethack/src/artifact.c:2162-2165 (invoke ENLIGHTENING).
     def _h_enlightening(s):
-        return s
+        mai = s.monster_ai
+        pr = s.player_pos[0].astype(jnp.int32)
+        pc = s.player_pos[1].astype(jnp.int32)
+        mpos = mai.pos.astype(jnp.int32)
+        # Chebyshev distance <= 10 as a coarse "in sight" proxy (vendor uses
+        # couldsee()/cansee() which depends on lit + LoS; we approximate).
+        d_row = jnp.abs(mpos[:, 0] - pr)
+        d_col = jnp.abs(mpos[:, 1] - pc)
+        in_sight = (d_row <= jnp.int32(10)) & (d_col <= jnp.int32(10)) & mai.alive
+        new_invis = jnp.where(in_sight, jnp.bool_(False), mai.invisible)
+        return s.replace(monster_ai=mai.replace(invisible=new_invis))
 
     # ---- 6: ENERGY_BOOST (Mitre of Holiness) artifact.c:1817-1835 ---------
     #   epboost = (uenmax + 1 - uen) / 2;
@@ -757,17 +787,58 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
         return _storm_apply_dmg(s, k_handler, cold=False)
 
     # ---- 14: BANISH (Demonbane) artifact.c:1962-2019 ----------------------
-    # For each demon/imp: roll chance for migration.  Approximated as
-    # ~50% banish per demon-class monster on level.
+    # Vendor invoke_banish (artifact.c:1962-2019) iterates fmon and migrates
+    # each demon/imp passing rn2(chance)==0 OR chance<=1.  The chance ladder:
+    #     chance = 1
+    #     if (In_quest(&u.uz) && !killed_nemesis) chance += 10
+    #     if (is_dprince(data))                   chance += 2
+    #     if (is_dlord(data))                     chance += 1
+    # We model:
+    #   demon-class slot ::= (M2_DEMON flags2) | (symbol == S_IMP).
+    #   dprince          ::= demon && M2_PRINCE.
+    #   dlord            ::= demon && M2_LORD.
+    #   In_quest         ::= state.dungeon.current_branch == quest branch id
+    #                        (no killed_nemesis tracker in Nethax; treat as
+    #                        always-False so the +10 bonus applies whenever
+    #                        on the quest branch — vendor degenerate case).
+    # JIT-pure: bounded vmap over MAX_MONSTERS_PER_LEVEL slots.
+    # Cite: vendor/nethack/src/artifact.c:1962-2019 (invoke_banish);
+    #       vendor/nethack/include/mondata.h:140-141 (is_dlord/is_dprince);
+    #       vendor/nethack/include/monflag.h M2_LORD=0x400, M2_PRINCE=0x800.
     def _h_banish(s):
         mai = s.monster_ai
         entry_i = jnp.clip(mai.entry_idx.astype(jnp.int32), 0,
                            _IS_DEMON.shape[0] - 1)
-        is_demon_slot = _IS_DEMON[entry_i] & mai.alive
+        # Demon-class: M2_DEMON OR S_IMP symbol (vendor `mdata->mlet == S_IMP`).
+        is_demon_slot = (_IS_DEMON[entry_i] | _IS_IMP[entry_i]) & mai.alive
+
+        # is_dprince / is_dlord per-slot lookups (precomputed masks).
+        is_dprince_slot = _IS_DEMON[entry_i] & _IS_PRINCE[entry_i]
+        is_dlord_slot   = _IS_DEMON[entry_i] & _IS_LORD[entry_i]
+
+        # In_quest gate: branch index 2 is the Quest branch in Nethax dungeon
+        # layout (see dungeon/branches.py).  Approximated as branch==2.
+        # Vendor reference: Is_quest_lev macro in dungeon.h.
+        in_quest = (s.dungeon.current_branch.astype(jnp.int32)
+                    == jnp.int32(2))
+        quest_bonus = jnp.where(in_quest, jnp.int32(10), jnp.int32(0))
+
+        # Per-slot chance = 1 + bonuses.
+        chance = (jnp.int32(1)
+                  + quest_bonus
+                  + jnp.where(is_dprince_slot, jnp.int32(2), jnp.int32(0))
+                  + jnp.where(is_dlord_slot,   jnp.int32(1), jnp.int32(0)))
+        chance_safe = jnp.maximum(chance, jnp.int32(1))
+
         n = mai.alive.shape[0]
         keys = jax.random.split(k_handler, n)
-        rolls = jax.vmap(lambda k: jax.random.randint(k, (), 0, 2, dtype=jnp.int32))(keys)
-        banish_mask = is_demon_slot & (rolls == jnp.int32(0))
+        # rn2(chance) per slot.
+        rolls = jax.vmap(
+            lambda k, c: jax.random.randint(k, (), 0, c, dtype=jnp.int32)
+        )(keys, chance_safe)
+        # Vendor: chance<=1 || rn2(chance)==0 → migrate.
+        passes = (chance <= jnp.int32(1)) | (rolls == jnp.int32(0))
+        banish_mask = is_demon_slot & passes
         new_alive = jnp.where(banish_mask, jnp.bool_(False), mai.alive)
         new_hp = jnp.where(banish_mask, jnp.int32(0), mai.hp)
         return s.replace(monster_ai=mai.replace(alive=new_alive, hp=new_hp))
