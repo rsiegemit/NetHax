@@ -50,6 +50,7 @@ from Nethax.nethax.dungeon.endgame import (
 )
 from Nethax.nethax.subsystems.scoring import (
     Achievement,
+    mark_ascended,
     record_achievement,
 )
 from Nethax.nethax.subsystems.items_jewelry import AmuletEffect
@@ -167,8 +168,14 @@ def ascend(state):
     # Mark game over.
     new_done = jnp.bool_(True)
 
-    # Record the achievement; no flat bonus (see docstring).
+    # Record the achievement and flag scoring.ascended so compute_final_score
+    # fires ``asc_b = base`` (end.c:1344-1351 XP-doubling on ASCENDED).
+    # Without mark_ascended, the doubling never triggers and the only
+    # ASCENDED reward is the achievement bit — that was the latent half of
+    # the Audit G #4 fix (the flat +50000 was removed but ascended was
+    # never set).
     new_scoring = record_achievement(state.scoring, int(Achievement.ASCENDED))
+    new_scoring = mark_ascended(new_scoring)
 
     return state.replace(done=new_done, scoring=new_scoring)
 

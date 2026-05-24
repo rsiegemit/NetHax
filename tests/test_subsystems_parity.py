@@ -79,7 +79,7 @@ from Nethax.nethax.subsystems.ascension import (
     ascend,
     ASTRAL_LEVEL,
 )
-from Nethax.nethax.subsystems.scoring import Achievement
+from Nethax.nethax.subsystems.scoring import Achievement, compute_final_score
 from Nethax.nethax.subsystems.items_jewelry import AmuletEffect
 
 
@@ -128,28 +128,36 @@ def _env_shop_state(player_pos=(6, 6), player_gold=100, shopkeeper_pos=(5, 5)):
 
 def test_A1_accrue_bill_inside_shop_marks_unpaid_and_bumps_bill():
     """vendor shk.c:3489-3550 addtobill: in-shop pickup → bill += cost,
-    obj->unpaid = TRUE (add_one_tobill, shk.c:3548)."""
+    obj->unpaid = TRUE (add_one_tobill, shk.c:3548).
+
+    Wave 15 expanded the starting inventory into slots 0-7; use slot 10
+    (post-starting-inv empty) so DEFAULT_ITEM_PRICE fallback fires instead
+    of the priced real item.
+    """
     s = _env_shop_state(player_pos=(6, 7))  # inside room rows 5-7 cols 5-10
-    s1 = accrue_bill(s, slot_idx=2)
+    s1 = accrue_bill(s, slot_idx=10)
     assert int(s1.shop.bill) == DEFAULT_ITEM_PRICE
-    assert bool(s1.shop.items_owned_by_shop[2]) is True
+    assert bool(s1.shop.items_owned_by_shop[10]) is True
 
 
 def test_A1b_accrue_bill_outside_shop_is_noop():
     """vendor shk.c:3501 billable() returns FALSE outside *u.ushops →
     addtobill returns immediately without touching the bill."""
     s = _env_shop_state(player_pos=(20, 20))
-    s1 = accrue_bill(s, slot_idx=2)
+    s1 = accrue_bill(s, slot_idx=10)
     assert int(s1.shop.bill) == 0
     assert not bool(jnp.any(s1.shop.items_owned_by_shop))
 
 
 def test_A2_pay_at_exit_with_enough_gold_clears_bill():
     """vendor shk.c:2220-2299 dopayobj: PAY_BUY path deducts gold via
-    pay() (shk.c:2288) and setpaid() clears bill_p (shk.c:400)."""
+    pay() (shk.c:2288) and setpaid() clears bill_p (shk.c:400).
+
+    Slots 10/11 chosen post Wave 15 starting-inv expansion (see A1).
+    """
     s = _env_shop_state(player_pos=(6, 6), player_gold=200)
-    s = accrue_bill(s, slot_idx=0)
-    s = accrue_bill(s, slot_idx=1)
+    s = accrue_bill(s, slot_idx=10)
+    s = accrue_bill(s, slot_idx=11)
     expected_bill = 2 * DEFAULT_ITEM_PRICE
     assert int(s.shop.bill) == expected_bill
     # Cross the door.
@@ -163,10 +171,13 @@ def test_A2_pay_at_exit_with_enough_gold_clears_bill():
 
 def test_A2b_pay_at_exit_broke_angers_shopkeeper():
     """vendor shk.c:2283-2284 insufficient_funds → PAY_CANT → caller's
-    make_angry_shk (shk.c:1469-1489) flips ANGRY + hot_pursuit."""
+    make_angry_shk (shk.c:1469-1489) flips ANGRY + hot_pursuit.
+
+    Slots 10/11 chosen post Wave 15 starting-inv expansion (see A1).
+    """
     s = _env_shop_state(player_pos=(6, 6), player_gold=5)
-    s = accrue_bill(s, slot_idx=0)
-    s = accrue_bill(s, slot_idx=1)
+    s = accrue_bill(s, slot_idx=10)
+    s = accrue_bill(s, slot_idx=11)
     # bill = 20, gold = 5 → broke.
     s = s.replace(player_pos=jnp.array([8, 5], dtype=jnp.int16))
     s2 = pay_at_exit(s)
@@ -175,8 +186,8 @@ def test_A2b_pay_at_exit_broke_angers_shopkeeper():
     # gold unchanged, ownership flags persist (matches vendor: walking out
     # with items still on bill keeps them ->unpaid).
     assert int(s2.player_gold) == 5
-    assert bool(s2.shop.items_owned_by_shop[0])
-    assert bool(s2.shop.items_owned_by_shop[1])
+    assert bool(s2.shop.items_owned_by_shop[10])
+    assert bool(s2.shop.items_owned_by_shop[11])
 
 
 def test_A3_shopkeeper_attack_hot_pursuit_melee_damage():
@@ -450,17 +461,33 @@ def test_D2_ascend_sets_done_and_records_achievement_and_bonus():
     """vendor end.c done() with how=ASCENDED:
       - program_state.gameover = 1   (end.c:1147)  → state.done = True
       - achievement_record(ACH_ASCENDED) → scoring.achievements set
-      - topten scoring adds bonus on top (Wave 6 flat 50000)."""
+      - compute_final_score adds asc_b doubling (end.c:1344-1351)
+
+    Audit G #4 (Wave 35) removed the legacy flat +50000 bump from
+    ``ascend()`` because vendor has no analogue — the only ASCENDED
+    reward in end.c:1325-1352 is the XP-doubling realised via
+    ``asc_b = base if ascended`` inside ``compute_final_score``.  This
+    test now verifies that route: ``scoring.ascended`` is flagged and
+    ``compute_final_score`` reflects the bonus.
+    """
     s = _make_ascend_state(
         branch=int(Branch.ENDGAME), level=ASTRAL_LEVEL,
         pos=ASTRAL_ALTAR_LAWFUL, align=ASTRAL_ALIGN_LAWFUL,
         with_amulet=True,
     )
-    score_before = int(s.scoring.score)
     s2 = ascend(s)
     assert bool(s2.done) is True
     assert bool(s2.scoring.achievements[int(Achievement.ASCENDED)]) is True
-    assert int(s2.scoring.score) >= score_before + 50000
+    assert bool(s2.scoring.ascended) is True, (
+        "ascend() should mark scoring.ascended so compute_final_score "
+        "fires the asc_b XP-doubling bonus per end.c:1344-1351"
+    )
+    # compute_final_score should award a positive total on ascension
+    # (alignment_bonus 5000 + travel_b + …) — at minimum > 0.
+    final = int(compute_final_score(s2))
+    assert final > 0, (
+        f"compute_final_score on ascended state should be > 0; got {final}"
+    )
 
 
 def test_D3_wave6_simplification_no_offer_needed():
