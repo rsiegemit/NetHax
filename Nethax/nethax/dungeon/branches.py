@@ -43,7 +43,13 @@ MAP_W: int = 80   # canonical NLE / NetHack map width  (cols)
 # Branch / dungeon-count constants
 # ---------------------------------------------------------------------------
 
-N_BRANCHES: int = 7
+N_BRANCHES: int = 7  # number of branches with full state-array slots
+# Audit-N #7 Commit 7: Branch.LUDIOS = 7 is defined below for vendor-cite
+# completeness (dungeon.def line 27).  It is intentionally NOT counted in
+# N_BRANCHES yet — bumping that constant would resize every per-branch
+# state array in state.py / level_memory.py, which is outside the scope
+# of this wave.  Callers that want Ludios entry/spec metadata can read
+# the constants directly; the state arrays do not yet have a slot for it.
 MAX_LEVELS_PER_BRANCH: int = 32  # MAXLEVEL from vendor/nethack/include/global.h
 
 
@@ -65,6 +71,11 @@ class Branch(IntEnum):
     VLAD          = 4
     GEHENNOM      = 5
     ENDGAME       = 6
+    # vendor/nle/dat/dungeon.def line 27:
+    #   BRANCH: "Fort Ludios" @ (18, 4) portal
+    # See _DUNGEON_NUM_LEVELS_VENDOR_SPEC / _BRANCH_ENTRY_VENDOR_SPEC for
+    # the (mean, dev) specs.  Not represented in BRANCH_TABLE (length 7).
+    LUDIOS        = 7
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +227,7 @@ _DUNGEON_NUM_LEVELS_VENDOR_SPEC: dict = {
     int(Branch.SOKOBAN):       (4, 0),    # dungeon.def line 94 (rand=0 ⇒ fixed)
     int(Branch.VLAD):          (3, 0),    # dungeon.def line 116 (rand=0 ⇒ fixed)
     int(Branch.ENDGAME):       (6, 0),    # dungeon.def line 134 (rand=0 ⇒ fixed)
+    int(Branch.LUDIOS):        (1, 0),    # dungeon.def line 106 (rand=0 ⇒ fixed)
 }
 
 
@@ -230,6 +242,7 @@ _DUNGEON_NUM_LEVELS_VENDOR_SPEC: dict = {
 _BRANCH_ENTRY_VENDOR_SPEC: dict = {
     int(Branch.GNOMISH_MINES): (2, 3),    # dungeon.def line 19, acouple in Main
     int(Branch.VLAD):          (9, 5),    # dungeon.def line 55, acouple in Gehennom
+    int(Branch.LUDIOS):        (18, 4),   # dungeon.def line 27, acouple in Main (portal)
 }
 
 
@@ -246,6 +259,7 @@ _BRANCH_PARENT_DUNGEON: dict = {
     int(Branch.QUEST):         int(Branch.MAIN),       # CHAINBRANCH off oracle (Main)
     int(Branch.VLAD):          int(Branch.GEHENNOM),   # dungeon.def line 51/55
     int(Branch.ENDGAME):       int(Branch.MAIN),       # BRANCH at Main bottom + 1
+    int(Branch.LUDIOS):        int(Branch.MAIN),       # dungeon.def line 27
 }
 
 
@@ -291,7 +305,51 @@ _BRANCH_CONNECTION_VENDOR_SPEC: dict = {
     # to TBR_STAIR (dgn_comp.y line 322), so correct_branch_type returns
     # BR_STAIR — NOT BR_PORTAL as the legacy static table had.
     int(Branch.SOKOBAN): BranchConnectionType.STAIR,
+    # Ludios: ``BRANCH @ (18, 4) portal`` → BR_PORTAL.
+    int(Branch.LUDIOS):  BranchConnectionType.PORTAL,
 }
+
+
+# Vendor BranchInfo for Fort Ludios, exposed as a standalone constant
+# because Ludios is not yet allocated a slot in BRANCH_TABLE (N_BRANCHES
+# stays at 7 to preserve state-array shapes — see N_BRANCHES note above).
+# Use this for code paths that need Ludios metadata without bumping
+# per-branch array sizes.
+#
+# first_level / num_levels are computed once at module load using the
+# canonical mid-point of each (base, rand) range — for the Ludios entry
+# this is the *acouple* base in Main, since Ludios is a single-level
+# dungeon with rand=0 and an acouple entry @(18, 4).  When a sampled
+# value is required, use ``sample_ludios_branch_info(rng)`` below.
+LUDIOS_BRANCH_INFO_STATIC: BranchInfo = BranchInfo(
+    branch_id=jnp.int8(Branch.LUDIOS),
+    first_level=jnp.int8(18),   # mid-point of [18, 21]; sampled at runtime
+    num_levels=jnp.int8(1),     # dungeon.def line 106: (1, 0) ⇒ fixed
+    connection_type=jnp.int8(BranchConnectionType.PORTAL),
+)
+
+
+def sample_ludios_branch_info(rng) -> BranchInfo:
+    """Sample Fort Ludios's BranchInfo via the vendor (mean, dev) spec.
+
+    Vendor: ``BRANCH: "Fort Ludios" @ (18, 4) portal`` (dungeon.def line 27)
+    and ``DUNGEON: "Fort Ludios" "K" (1, 0)`` (dungeon.def line 106).
+
+    Args:
+        rng: jax.random.PRNGKey scalar.
+
+    Returns:
+        BranchInfo with first_level ∈ [18, 21], num_levels = 1,
+        connection_type = BR_PORTAL.
+    """
+    k_fl, _k_nl = jax.random.split(rng, 2)
+    first_level = _vendor_rn1(k_fl, 4, 18)  # acouple in Main
+    return BranchInfo(
+        branch_id=jnp.int8(Branch.LUDIOS),
+        first_level=first_level,
+        num_levels=jnp.int8(1),
+        connection_type=jnp.int8(BranchConnectionType.PORTAL),
+    )
 
 
 def _vendor_rn1(rng, rand: int, base: int) -> jnp.ndarray:
