@@ -583,3 +583,38 @@ def test_thrown_sleep_potion_adjacent_breathe():
         f"Player should breathe SLEEPING potion when shatter adjacent; "
         f"sleep_timer={sleep_timer}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Audit J D24 — expensive camera breakage releases a demon.
+# vendor/nethack/src/dothrow.c::breakobj EXPENSIVE_CAMERA line 2522 +
+# vendor/nethack/src/dothrow.c::release_camera_demon lines 2457-2470.
+# ---------------------------------------------------------------------------
+
+def test_thrown_camera_can_release_demon():
+    """Throwing a camera that shatters has rn2(3)==0 chance of spawning a monster."""
+    from Nethax.nethax.subsystems.combat import thrown_attack
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+    from Nethax.nethax.subsystems.throwing import _OTYP_EXPENSIVE_CAMERA
+
+    base = _base_state()
+    mai = base.monster_ai
+    mai = mai.replace(alive=jnp.zeros(mai.alive.shape, dtype=bool))
+    base = base.replace(monster_ai=mai)
+
+    spawn_count = 0
+    n_trials = 30
+    for seed in range(n_trials):
+        rng = jax.random.PRNGKey(seed * 41 + 13)
+        s = _place_item(base, 0, ItemCategory.TOOL,
+                        type_id=_OTYP_EXPENSIVE_CAMERA, weight=12, qty=1)
+        result = thrown_attack(s, rng, jnp.int32(0),
+                               jnp.array([0, 1], dtype=jnp.int32))
+        if bool(result.monster_ai.alive[0]):
+            spawn_count += 1
+
+    # Vendor: ~1/3 of camera breakages spawn a demon.  Camera always breaks
+    # (per breaktest switch), so we expect ~10/30 spawns.
+    assert spawn_count >= 4, (
+        f"Camera breakage should release demon sometimes (~1/3); got {spawn_count}/{n_trials}"
+    )

@@ -2154,8 +2154,50 @@ def thrown_attack(
         jnp.int32(0),
     ).astype(jnp.int32)
 
+    # --- D24: camera breakage releases a demon (dothrow.c::breakobj
+    # EXPENSIVE_CAMERA line 2522 → release_camera_demon @ 2457-2470).
+    # vendor: rn2(3) == 0 success rate; spawns IMP (rn2(3)) or HOMUNCULUS.
+    # We approximate as a generic monster spawn (entry_idx=1 placeholder
+    # pattern, mirrors magic.py spawn) in a free monster slot adjacent to
+    # the drop tile.  rn2(3) gate fires only when does_break.
+    is_camera = item_otyp_i == jnp.int32(_OTYP_EXPENSIVE_CAMERA)
+    camera_broke = does_break & is_camera
+    cam_roll = _rn2(key_brk_msg, 3)
+    cam_spawn = camera_broke & (cam_roll == jnp.int32(0))
+
+    # Find a free monster slot.
+    free_mask = ~new_mai.alive
+    any_free = jnp.any(free_mask)
+    spawn_slot = jnp.argmax(free_mask.astype(jnp.int32)).astype(jnp.int32)
+    do_spawn = cam_spawn & any_free
+
+    # Spawn at the drop tile.
+    spawn_pos = jnp.stack([
+        drop_row.astype(jnp.int16),
+        drop_col.astype(jnp.int16),
+    ])
+    # entry_idx 1 → small monster placeholder; vendor uses
+    # PM_HOMUNCULUS / PM_IMP but Nethax JIT-side spawn uses a generic.
+    new_alive2 = new_mai.alive.at[spawn_slot].set(
+        jnp.where(do_spawn, jnp.bool_(True), new_mai.alive[spawn_slot]))
+    new_hp_max2 = new_mai.hp_max.at[spawn_slot].set(
+        jnp.where(do_spawn, jnp.int32(8), new_mai.hp_max[spawn_slot]))
+    new_hp2 = new_mai.hp.at[spawn_slot].set(
+        jnp.where(do_spawn, jnp.int32(8), new_mai.hp[spawn_slot]))
+    new_pos2 = new_mai.pos.at[spawn_slot].set(
+        jnp.where(do_spawn, spawn_pos, new_mai.pos[spawn_slot]))
+    new_entry2 = new_mai.entry_idx.at[spawn_slot].set(
+        jnp.where(do_spawn, jnp.int16(1), new_mai.entry_idx[spawn_slot]))
+    final_mai = new_mai.replace(
+        alive=new_alive2,
+        hp=new_hp2,
+        hp_max=new_hp_max2,
+        pos=new_pos2,
+        entry_idx=new_entry2,
+    )
+
     return state_after_hit.replace(
-        monster_ai=new_mai,
+        monster_ai=final_mai,
         inventory=new_inv,
         ground_items=new_ground,
         player_luck=luck_after_egg,

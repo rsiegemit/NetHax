@@ -304,3 +304,122 @@ def test_noop_for_unknown_tool():
 
     # State should be structurally identical (no crash, no mutation).
     assert int(new_state.player_hp) == int(state.player_hp)
+
+
+# ---------------------------------------------------------------------------
+# Audit J D23 — cursed crystal ball failure cascade.
+# vendor/nethack/src/detect.c::use_crystal_ball lines 1206-1295.
+# ---------------------------------------------------------------------------
+
+def test_crystal_ball_cursed_can_explode():
+    """A cursed crystal ball with low Int can explode (case 5), dealing HP loss.
+
+    vendor detect.c:1247-1256: case 5 useup(obj) + losehp(rnd(30)).
+    With BUC=cursed and low Int (3), failure fires every turn.  We run many
+    seeds; expect explosions in a sizeable minority (~1/5 = 20%).
+    """
+    state = _floor_state(player_pos=(10, 10))
+    state = state.replace(
+        player_int=jnp.int8(3),
+        player_hp=jnp.int32(80),
+        player_hp_max=jnp.int32(80),
+    )
+    state = _wield_item(
+        state,
+        type_id=_CRYSTAL_BALL_TYPE_ID,
+        category=int(ItemCategory.TOOL),
+        buc_status=jnp.int8(1),       # cursed
+        quantity=jnp.int16(1),
+        charges=jnp.int8(3),
+        identified=jnp.bool_(True),
+    )
+
+    blew_up = 0
+    hp_losses = 0
+    n = 40
+    for seed in range(n):
+        rng = jax.random.PRNGKey(seed * 13 + 5)
+        new_state = dispatch_apply(state, rng)
+        # Useup zeros quantity & category.
+        if int(new_state.inventory.items.quantity[0]) == 0:
+            blew_up += 1
+        if int(new_state.player_hp) < 80:
+            hp_losses += 1
+
+    assert blew_up >= 4, (
+        f"Cursed crystal ball should explode sometimes (case 5/{n}); blew_up={blew_up}"
+    )
+    # HP loss covers ALL failure branches (impair confusion etc. don't drop HP),
+    # so hp_losses >= blew_up; explosion is the only HP-loss path.
+    assert hp_losses >= blew_up, (
+        f"HP loss count ({hp_losses}) should track explosion count ({blew_up})"
+    )
+
+
+def test_crystal_ball_cursed_can_confuse():
+    """A cursed crystal ball failure can confuse the player (case 2).
+
+    vendor detect.c:1228-1230: case 2 → make_confused(impair).
+    """
+    state = _floor_state(player_pos=(10, 10))
+    state = state.replace(
+        player_int=jnp.int8(3),
+        player_hp=jnp.int32(80),
+        player_hp_max=jnp.int32(80),
+    )
+    state = _wield_item(
+        state,
+        type_id=_CRYSTAL_BALL_TYPE_ID,
+        category=int(ItemCategory.TOOL),
+        buc_status=jnp.int8(1),       # cursed → always fail
+        quantity=jnp.int16(1),
+        charges=jnp.int8(3),
+    )
+
+    confused_count = 0
+    for seed in range(30):
+        rng = jax.random.PRNGKey(seed * 19 + 11)
+        new_state = dispatch_apply(state, rng)
+        if int(new_state.status.timed_statuses[int(TimedStatus.CONFUSION)]) > 0:
+            confused_count += 1
+
+    assert confused_count > 0, (
+        f"Cursed crystal ball should confuse player on some seeds; confused={confused_count}/30"
+    )
+
+
+def test_crystal_ball_charges_decrement_on_failure():
+    """On a non-explode failure, vendor calls consume_obj_charge(obj, TRUE).
+
+    vendor detect.c:1257-1258 — charges decrement by 1 (except case 5 which
+    used up the item entirely).
+    """
+    state = _floor_state(player_pos=(10, 10))
+    state = state.replace(
+        player_int=jnp.int8(3),
+        player_hp=jnp.int32(80),
+        player_hp_max=jnp.int32(80),
+    )
+    state = _wield_item(
+        state,
+        type_id=_CRYSTAL_BALL_TYPE_ID,
+        category=int(ItemCategory.TOOL),
+        buc_status=jnp.int8(1),
+        quantity=jnp.int16(1),
+        charges=jnp.int8(5),
+    )
+
+    # Pick a seed that DOES NOT explode.  Use a high-Int blessed ball so
+    # nbranch=4 (no case-5 branch); but it should also fail.  Easier: cursed
+    # with explicit branch.  Search a seed.
+    found = False
+    for seed in range(50):
+        rng = jax.random.PRNGKey(seed)
+        new_state = dispatch_apply(state, rng)
+        if int(new_state.inventory.items.quantity[0]) != 0:
+            # Did not use up; check charges decremented.
+            new_charges = int(new_state.inventory.items.charges[0])
+            if new_charges == 4:
+                found = True
+                break
+    assert found, "Some cursed apply should decrement charges by 1 without useup"

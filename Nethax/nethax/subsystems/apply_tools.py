@@ -813,24 +813,128 @@ def _h_lock_pick(state, rng: jax.Array) -> object:
 
 
 # ---------------------------------------------------------------------------
-# Handler 15: crystal ball — identify wielded item (mark identified=True).
-# Cite: vendor/nethack/src/detect.c::use_crystal_ball (line 1206).
-# vendor: chance of seeing dungeon/items based on Int; we model a fixed 50%
-#   chance of identifying the wielded item's type.
+# Handler 15: crystal ball — vendor-byte-equal use_crystal_ball.
+# Cite: vendor/nethack/src/detect.c::use_crystal_ball lines 1206-1295.
+#
+# vendor algorithm:
+#   oops = is_quest_artifact ? 8 : blessed ? 16 : 20
+#   if (charged && (cursed || rnd(oops) > ACURR(A_INT))) {
+#       impair = rnd(100 - 3 * ACURR(A_INT))
+#       switch (rnd(obj->oartifact || blessed ? 4 : 5)) {
+#         case 1: too much to comprehend
+#         case 2: confuse(rnd(100 - 3*Int))
+#         case 3: blind(rnd(100 - 3*Int))
+#         case 4: hallucinate(rnd(100 - 3*Int))
+#         case 5: useup(obj) + losehp(rnd(30), "exploding crystal ball")
+#       }
+#       consume_obj_charge(obj, TRUE)  // unless useup happened
+#       return
+#   }
+#   // success branch: id wielded item (Nethax simplification)
+#
+# Audit J D23 implements the failure cascade.  Charge counter is decremented
+# via Item.charges - 1 (clamped >= 0).  Useup zeroes the item out entirely.
 # ---------------------------------------------------------------------------
 def _h_crystal_ball(state, rng: jax.Array) -> object:
-    rng, sub = jax.random.split(rng)
-    success = jax.random.randint(sub, shape=(), minval=0, maxval=2) == 0
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+
     inv = state.inventory
     slot = inv.wielded.astype(jnp.int32)
     safe_slot = jnp.clip(slot, 0, MAX_INVENTORY_SLOTS - 1)
+    has_wield = slot >= jnp.int32(0)
+
+    buc      = inv.items.buc_status[safe_slot].astype(jnp.int32)
+    arti_idx = inv.items.artifact_idx[safe_slot].astype(jnp.int32)
+    charges  = inv.items.charges[safe_slot].astype(jnp.int32)
+
+    # Vendor BUC: 1=cursed, 2=uncursed, 3=blessed.
+    is_cursed   = buc == jnp.int32(1)
+    is_blessed  = buc == jnp.int32(3)
+    is_arti     = arti_idx >= jnp.int32(0)
+    charged     = charges > jnp.int32(0)
+
+    int_score = state.player_int.astype(jnp.int32)
+
+    # oops base — vendor line 1218.
+    oops = jnp.where(is_arti, jnp.int32(8),
+            jnp.where(is_blessed, jnp.int32(16), jnp.int32(20)))
+
+    # Roll for failure trigger.
+    rng, k_oops, k_branch, k_impair, k_hp = jax.random.split(rng, 5)
+    oops_roll = jax.random.randint(k_oops, (), 1,
+                                   jnp.maximum(oops + jnp.int32(1), jnp.int32(2)),
+                                   dtype=jnp.int32)
+    fail = has_wield & charged & (is_cursed | (oops_roll > int_score))
+
+    # Branch picker: 1..4 for arti/blessed, 1..5 otherwise.
+    nbranch = jnp.where(is_arti | is_blessed, jnp.int32(4), jnp.int32(5))
+    branch_roll = jax.random.randint(k_branch, (), 1, nbranch + jnp.int32(1),
+                                     dtype=jnp.int32)
+
+    # impair = rnd(100 - 3*Int)  (clamped to >= 1).
+    impair_max = jnp.maximum(jnp.int32(100) - jnp.int32(3) * int_score,
+                             jnp.int32(1))
+    impair = jax.random.randint(k_impair, (), 1, impair_max + jnp.int32(1),
+                                dtype=jnp.int32)
+
+    ts = state.status.timed_statuses
+    # case 1 — message-only ("too much to comprehend"); deferred.
+    # case 2 — confuse.
+    do_conf  = fail & (branch_roll == jnp.int32(2))
+    # case 3 — blind.
+    do_blind = fail & (branch_roll == jnp.int32(3))
+    # case 4 — hallucinate.
+    do_hallu = fail & (branch_roll == jnp.int32(4))
+    # case 5 — explode (only for non-arti/non-blessed nbranch == 5).
+    do_boom  = fail & (branch_roll == jnp.int32(5))
+
+    ts = jnp.where(do_conf,
+                   ts.at[int(TimedStatus.CONFUSION)].add(impair), ts)
+    ts = jnp.where(do_blind,
+                   ts.at[int(TimedStatus.BLIND)].add(impair), ts)
+    ts = jnp.where(do_hallu,
+                   ts.at[int(TimedStatus.HALLUCINATION)].add(impair), ts)
+
+    # Case 5 explosion — useup(obj) + losehp(rnd(30)).
+    hp_loss = jax.random.randint(k_hp, (), 1, 31, dtype=jnp.int32)
+    explode_hp_loss = jnp.where(do_boom, hp_loss, jnp.int32(0))
+    new_player_hp = jnp.maximum(
+        state.player_hp.astype(jnp.int32) - explode_hp_loss, jnp.int32(0)
+    ).astype(jnp.int32)
+
+    # On case 5: zero out the inventory slot (useup).  Otherwise:
+    # consume_obj_charge(obj, TRUE) decrements charges by 1 (clamped >= 0).
+    cur_qty = inv.items.quantity[safe_slot]
+    cur_cat = inv.items.category[safe_slot]
+    cur_ch  = inv.items.charges[safe_slot]
+    new_qty = jnp.where(do_boom & has_wield, jnp.int16(0), cur_qty)
+    new_cat = jnp.where(do_boom & has_wield, jnp.int8(0),  cur_cat)
+    # Charge decrement only if fail and not explode (vendor skips
+    # consume_obj_charge after useup).
+    decr_charge = fail & has_wield & ~do_boom
+    new_ch_val = jnp.maximum(cur_ch.astype(jnp.int32) - jnp.int32(1),
+                             jnp.int32(0)).astype(cur_ch.dtype)
+    new_ch = jnp.where(decr_charge, new_ch_val, cur_ch)
+
+    # Success branch (no fail): preserve existing identify-wielded behavior.
+    success = has_wield & ~fail
     new_identified = jnp.where(
-        success & (slot >= jnp.int32(0)),
+        success,
         inv.items.identified.at[safe_slot].set(jnp.bool_(True)),
         inv.items.identified,
     )
-    new_items = inv.items.replace(identified=new_identified)
-    return state.replace(inventory=inv.replace(items=new_items))
+
+    new_items = inv.items.replace(
+        identified=new_identified,
+        quantity=inv.items.quantity.at[safe_slot].set(new_qty),
+        category=inv.items.category.at[safe_slot].set(new_cat),
+        charges=inv.items.charges.at[safe_slot].set(new_ch),
+    )
+    return state.replace(
+        inventory=inv.replace(items=new_items),
+        status=state.status.replace(timed_statuses=ts),
+        player_hp=new_player_hp,
+    )
 
 
 # ---------------------------------------------------------------------------
