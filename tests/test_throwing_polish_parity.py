@@ -443,3 +443,143 @@ def test_artifact_resists_breakage():
     assert survived >= int(n_trials * 0.75), (
         f"Artifact mirror should survive most throws; survived={survived}/{n_trials}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Audit J D25 — mirror breakage applies -2 luck penalty.
+# vendor/nethack/src/dothrow.c::breakobj MIRROR lines 2494-2497.
+# ---------------------------------------------------------------------------
+
+def test_mirror_throw_loses_luck():
+    """Throwing a mirror that shatters drops player_luck by 2."""
+    from Nethax.nethax.subsystems.combat import thrown_attack
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+    from Nethax.nethax.subsystems.throwing import _OTYP_MIRROR
+
+    base = _base_state()
+    mai = base.monster_ai
+    mai = mai.replace(alive=jnp.zeros(mai.alive.shape, dtype=bool))
+    base = base.replace(monster_ai=mai, player_luck=jnp.int8(0))
+
+    losses = 0
+    for seed in range(20):
+        rng = jax.random.PRNGKey(seed * 97 + 3)
+        s = _place_item(base, 0, ItemCategory.TOOL,
+                        type_id=_OTYP_MIRROR, weight=10, qty=1)
+        result = thrown_attack(s, rng, jnp.int32(0),
+                               jnp.array([0, 1], dtype=jnp.int32))
+        if int(result.player_luck) <= -2:
+            losses += 1
+
+    # Mirror almost always breaks; expect -2 luck in vast majority of trials.
+    assert losses >= 15, (
+        f"Mirror throw should apply -2 luck on (most) trials; got {losses}/20"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Audit J D28 — egg breakage applies luck penalty (fertile own-eggs).
+# vendor/nethack/src/dothrow.c::breakobj EGG lines 2525-2531.
+# ---------------------------------------------------------------------------
+
+def test_egg_throw_fertile_luck_penalty():
+    """Throwing a fertile egg (spe > 0, corpsenm set) drops luck by quantity (capped 5)."""
+    from Nethax.nethax.subsystems.combat import thrown_attack
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+    from Nethax.nethax.subsystems.throwing import _OTYP_EGG
+
+    base = _base_state()
+    mai = base.monster_ai
+    mai = mai.replace(alive=jnp.zeros(mai.alive.shape, dtype=bool))
+    base = base.replace(monster_ai=mai, player_luck=jnp.int8(0))
+
+    rng = jax.random.PRNGKey(2025)
+    s = _place_item(base, 0, ItemCategory.FOOD,
+                    type_id=_OTYP_EGG, weight=1, qty=1, enchant=1)
+    items = s.inventory.items
+    items = items.replace(
+        corpse_entry_idx=items.corpse_entry_idx.at[0].set(jnp.int16(5))
+    )
+    s = s.replace(inventory=s.inventory.replace(items=items))
+
+    result = thrown_attack(s, rng, jnp.int32(0),
+                           jnp.array([0, 1], dtype=jnp.int32))
+
+    # vendor: change_luck(-min(quan, 5)) → -1 for qty=1.
+    assert int(result.player_luck) == -1, (
+        f"Fertile egg throw should subtract -1 luck (qty=1); got {int(result.player_luck)}"
+    )
+
+
+def test_egg_throw_pyrolisk_explosion():
+    """Throwing a pyrolisk egg damages the player if adjacent to landing tile."""
+    from Nethax.nethax.subsystems.combat import thrown_attack
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+    from Nethax.nethax.subsystems.throwing import _OTYP_EGG, _PM_PYROLISK
+
+    base = _base_state()
+    mai = base.monster_ai
+    mai = mai.replace(alive=jnp.zeros(mai.alive.shape, dtype=bool))
+    base = base.replace(
+        monster_ai=mai,
+        player_hp=jnp.int32(50),
+        player_str=jnp.int16(3),  # min STR so range = 1 (lands adjacent)
+    )
+
+    s = _place_item(base, 0, ItemCategory.FOOD,
+                    type_id=_OTYP_EGG, weight=1, qty=1)
+    items = s.inventory.items
+    items = items.replace(
+        corpse_entry_idx=items.corpse_entry_idx.at[0].set(jnp.int16(_PM_PYROLISK))
+    )
+    s = s.replace(inventory=s.inventory.replace(items=items))
+
+    hp_losses = 0
+    for seed in range(10):
+        rng = jax.random.PRNGKey(seed * 31 + 11)
+        result = thrown_attack(s, rng, jnp.int32(0),
+                               jnp.array([0, 1], dtype=jnp.int32))
+        if int(result.player_hp) < 50:
+            hp_losses += 1
+
+    assert hp_losses >= 8, (
+        f"Pyrolisk egg should damage player on adjacent throws; hp_losses={hp_losses}/10"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Audit J D22 — potion shatter side effect: player breathes vapors when adjacent.
+# vendor/nethack/src/dothrow.c::breakobj POT_WATER lines 2498-2521 +
+# vendor/nethack/src/potion.c::potionbreathe.
+# ---------------------------------------------------------------------------
+
+def test_thrown_sleep_potion_adjacent_breathe():
+    """When a thrown sleeping potion shatters adjacent to player, player gets SLEEP timer."""
+    from Nethax.nethax.subsystems.combat import thrown_attack
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+    from Nethax.nethax.subsystems.items_potions import (
+        _POTION_BASE_ID, PotionEffect,
+    )
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+
+    base = _base_state()
+    base = _place_monster(base, 0, row=10, col=11, hp=20, ac=10)
+    base = base.replace(
+        player_str=jnp.int16(118),
+        player_dex=jnp.int8(18),
+        player_xl=jnp.int32(10),
+    )
+
+    sleep_tid = _POTION_BASE_ID + int(PotionEffect.SLEEPING)
+    s = _place_item(base, 0, ItemCategory.POTION,
+                    type_id=sleep_tid, weight=10, qty=1)
+
+    rng = jax.random.PRNGKey(2026)
+    result = thrown_attack(s, rng, jnp.int32(0),
+                           jnp.array([0, 1], dtype=jnp.int32))
+
+    sleep_timer = int(result.status.timed_statuses[int(TimedStatus.SLEEP)])
+    assert sleep_timer > 0, (
+        f"Player should breathe SLEEPING potion when shatter adjacent; "
+        f"sleep_timer={sleep_timer}"
+    )

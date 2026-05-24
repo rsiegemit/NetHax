@@ -1879,13 +1879,83 @@ def thrown_attack(
     # inside apply_potion_to_monster selects the per-effect branch.
     is_potion = items.category[slot] == jnp.int8(int(ItemCategory.POTION))
     potion_type_id = items.type_id[slot].astype(jnp.int32)
-    key_pot, _ = split_n(rng, 2)
+    key_pot, key_breathe = split_n(rng, 2)
+
+    # --- D22: player potion-breathe side effect (dothrow.c::breakobj
+    # POT_WATER branch lines 2498-2521).
+    # Vendor: if next2u(x,y) && (!breathless || haseyes), call potionbreathe.
+    # We model the most-impactful breathe effects as small status-timer bumps
+    # on the player; this is a vendor-faithful approximation of
+    # potionbreathe() (potion.c:1932-2107) for CONFUSION, BOOZE, SLEEPING,
+    # BLINDNESS, HALLUCINATION.  Half_gas / breathless / wet-towel guards
+    # are not modeled (Nethax lacks those player flags); the player is
+    # assumed eye-bearing and breathing.
+    # Cite: vendor/nethack/src/potion.c::potionbreathe lines 1932-2107.
+    target_pos_r = mai.pos[target_idx, 0].astype(jnp.int32)
+    target_pos_c = mai.pos[target_idx, 1].astype(jnp.int32)
+    impact_r = jnp.where(found_hit, target_pos_r, end_row)
+    impact_c = jnp.where(found_hit, target_pos_c, end_col)
+    cheby = jnp.maximum(
+        jnp.abs(impact_r - start_row),
+        jnp.abs(impact_c - start_col),
+    )
+    player_adjacent = cheby <= jnp.int32(1)
+
+    from Nethax.nethax.subsystems.items_potions import (
+        _POTION_BASE_ID as _POT_BASE,
+        N_POTIONS as _N_POT,
+    )
+    breathe_effect = jnp.clip(
+        potion_type_id - jnp.int32(_POT_BASE), 0, _N_POT - 1
+    )
+
+    def _apply_breathe(s):
+        # Per-effect player timer bumps.  Bumps are small (vendor rnd(5)
+        # via itimeout_incr); we use a fixed +5 add as a JIT-stable
+        # approximation.  Effects mapped:
+        #   CONFUSION (2) / BOOZE (20) → CONFUSION timer
+        #   SLEEPING  (17)             → SLEEP timer
+        #   BLINDNESS (16)             → BLIND timer
+        #   HALLU     (7)              → HALLUCINATION timer
+        # All others are no-ops (matches vendor's empty switch arms).
+        from Nethax.nethax.subsystems.status_effects import TimedStatus
+        ts = s.status.timed_statuses
+
+        is_conf = (breathe_effect == jnp.int32(2)) | (breathe_effect == jnp.int32(20))
+        is_sleep = breathe_effect == jnp.int32(17)
+        is_blind = breathe_effect == jnp.int32(16)
+        is_hallu = breathe_effect == jnp.int32(7)
+
+        bump = jnp.int32(5)
+        ts = jnp.where(
+            is_conf,
+            ts.at[int(TimedStatus.CONFUSION)].add(bump),
+            ts,
+        )
+        ts = jnp.where(
+            is_sleep,
+            ts.at[int(TimedStatus.SLEEP)].add(bump),
+            ts,
+        )
+        ts = jnp.where(
+            is_blind,
+            ts.at[int(TimedStatus.BLIND)].add(bump),
+            ts,
+        )
+        ts = jnp.where(
+            is_hallu,
+            ts.at[int(TimedStatus.HALLUCINATION)].add(bump),
+            ts,
+        )
+        return s.replace(status=s.status.replace(timed_statuses=ts))
 
     def _shatter(s):
         # Commit new_mai (weight-based HP update cleared for potions) then
         # overlay the potion effect onto the target monster.
         s2 = s.replace(monster_ai=new_mai)
-        return apply_potion_to_monster(s2, key_pot, potion_type_id, target_idx)
+        s3 = apply_potion_to_monster(s2, key_pot, potion_type_id, target_idx)
+        # D22: player-side breathe when adjacent to shatter point.
+        return jax.lax.cond(player_adjacent, _apply_breathe, lambda x: x, s3)
 
     def _no_shatter(s):
         return s.replace(monster_ai=new_mai)
@@ -1972,6 +2042,11 @@ def thrown_attack(
     can_drop = should_drop & gfound
     safe_gs = jnp.clip(gslot, 0, n_stack - 1)
 
+    # --- D25 / D28 prep: extract item info for breakobj side effects.
+    item_corpsenm = items.corpse_entry_idx[slot].astype(jnp.int32)
+    item_qty_pre = items.quantity[slot].astype(jnp.int32)
+    item_spe = items.enchantment[slot].astype(jnp.int32)  # vendor obj->spe
+
     # --- D21 + D26: vendor-byte-equal breaktest (dothrow.c:2582-2609) ---
     # Replaces the legacy 50/50 GLASS|POTTERY break.  vendor_breaktest()
     # mirrors breaktest() exactly: GLASS+!artifact+!gem deterministic, plus
@@ -2030,7 +2105,62 @@ def thrown_attack(
     )
 
     new_inv = state.inventory.replace(items=new_items)
-    return state.replace(monster_ai=new_mai, inventory=new_inv, ground_items=new_ground)
+
+    # --- D25: mirror breakage → -2 luck (dothrow.c::breakobj MIRROR 2494-2497).
+    is_mirror = item_otyp_i == jnp.int32(_OTYP_MIRROR)
+    mirror_broke = does_break & is_mirror
+    luck_after_mirror = jnp.where(
+        mirror_broke,
+        jnp.clip(state.player_luck.astype(jnp.int32) - jnp.int32(2),
+                 jnp.int32(-13), jnp.int32(13)),
+        state.player_luck.astype(jnp.int32),
+    ).astype(jnp.int8)
+
+    # --- D28: egg breakage side effects (dothrow.c::breakobj EGG 2525-2531).
+    # vendor:
+    #   if (hero_caused && obj->spe && ismnum(obj->corpsenm))
+    #       change_luck(-min(obj->quan, 5));
+    #   if (obj->corpsenm == PM_PYROLISK) explosion = TRUE;
+    # ``obj->spe`` is 1 for fertile (laid by hero) eggs and triggers the
+    # luck penalty (you destroyed your own future pet).  ``corpsenm`` maps
+    # to the MONSTERS table index, mirrored as Item.corpse_entry_idx.
+    is_egg = item_otyp_i == jnp.int32(_OTYP_EGG)
+    egg_broke = does_break & is_egg
+    is_fertile = item_spe > jnp.int32(0)
+    has_corpsenm = item_corpsenm >= jnp.int32(0)
+    egg_luck_active = egg_broke & is_fertile & has_corpsenm
+    egg_penalty = jnp.minimum(item_qty_pre, jnp.int32(5))
+    luck_after_egg = jnp.where(
+        egg_luck_active,
+        jnp.clip(luck_after_mirror.astype(jnp.int32) - egg_penalty,
+                 jnp.int32(-13), jnp.int32(13)).astype(jnp.int8),
+        luck_after_mirror,
+    )
+
+    # Pyrolisk egg → flame burst at landing tile.  Vendor explode() radius-1
+    # fire damage; we model as 1d6+1 fire damage on the player if within
+    # chebyshev 1 of the drop tile.
+    is_pyrolisk = item_corpsenm == jnp.int32(_PM_PYROLISK)
+    pyrolisk_explode = egg_broke & is_pyrolisk
+    cheby_to_drop = jnp.maximum(
+        jnp.abs(drop_row - start_row),
+        jnp.abs(drop_col - start_col),
+    )
+    player_in_blast = pyrolisk_explode & (cheby_to_drop <= jnp.int32(1))
+    fire_dmg = _rn2(key_brk_side, 6) + jnp.int32(1)
+    fire_dmg_to_player = jnp.where(player_in_blast, fire_dmg, jnp.int32(0))
+    new_player_hp = jnp.maximum(
+        state.player_hp.astype(jnp.int32) - fire_dmg_to_player,
+        jnp.int32(0),
+    ).astype(jnp.int32)
+
+    return state_after_hit.replace(
+        monster_ai=new_mai,
+        inventory=new_inv,
+        ground_items=new_ground,
+        player_luck=luck_after_egg,
+        player_hp=new_player_hp,
+    )
 
 
 
