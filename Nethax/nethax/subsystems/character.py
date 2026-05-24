@@ -696,7 +696,7 @@ STARTING_STATS: dict = {
 #   hp_base: Init HP at level 1
 #   hp_per_level: Lower (added each level gain)
 #   pw_base: starting energy
-#   pw_per_level: energy gained per level (approximation)
+#   pw_per_level: energy gained per level (vendor role.c en_advance.lofactor)
 # ---------------------------------------------------------------------------
 
 STARTING_HP_PW: dict = {
