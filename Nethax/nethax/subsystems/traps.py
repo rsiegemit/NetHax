@@ -1165,9 +1165,19 @@ def _trap_magic(state, rng):
     def b_nothing(s, r):  # fate 10 - sometimes nothing happens
         return s
 
-    def b_invis(s, r):    # fate 11 - toggle intrinsic invisibility
-        return _set_timed_status(s, int(TimedStatus.INVIS_TMP),
-                                 jnp.int32(50))  # vendor: persistent; cap 50
+    def b_invis(s, r):    # fate 11 — toggle intrinsic invisibility
+        # Vendor trap.c:4377: ``HInvis = HInvis ? 0L : HInvis | FROMOUTSIDE;``
+        # The fate toggles the permanent intrinsic flag, not a timed bump.
+        # Audit M #20.  Previously this set TimedStatus.INVIS_TMP=50, which
+        # was a temporary timer.  Now flip the persistent
+        # ``Intrinsic.INVIS`` boolean (vendor FROMOUTSIDE-equivalent).
+        # Cite: vendor/nethack/src/trap.c:4377 (b_invis branch).
+        from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intr
+        ints = s.status.intrinsics
+        idx = int(_Intr.INVIS)
+        cur = ints[idx]
+        new_ints = ints.at[idx].set(~cur)
+        return s.replace(status=s.status.replace(intrinsics=new_ints))
 
     def b_fire(s, r):     # fate 12 - flash of fire = dofiretrap d(2,4)
         k0, k1 = jax.random.split(r, 2)
@@ -1180,13 +1190,55 @@ def _trap_magic(state, rng):
     def b_smell(s, r):    return s  # fate 17
     def b_tired(s, r):    return s  # fate 18
 
-    def b_tame(s, r):     # fate 19 - tame nearby + Cha+1 (gold proxy)
-        bonus = jax.random.randint(r, (), 1, 100).astype(jnp.int32)
-        return s.replace(player_gold=s.player_gold + bonus)
+    def b_tame(s, r):     # fate 19 — Cha+1 + tame nearby monsters
+        # vendor trap.c:4422-4430:
+        #   if (!Confusion) adjattrib(A_CHA, 1, A_BEYOND_BREATH);
+        #   for ... 3x3 around hero: if mtmp && rn2(2): tamedog(mtmp)
+        # We bump CHA by 1 (capped at 25 per ATTRMAX) and tame each
+        # adjacent (Chebyshev=1) alive hostile monster on a 50% roll.
+        # Audit M item #21.
+        # Cite: vendor/nethack/src/trap.c:4422-4430 (b_tame branch).
+        cha_new = jnp.minimum(s.player_cha.astype(jnp.int32) + jnp.int32(1),
+                              jnp.int32(25)).astype(s.player_cha.dtype)
+        s1 = s.replace(player_cha=cha_new)
 
-    def b_uncurse(s, r):  # fate 20 - uncurse stuff (small heal proxy)
-        new_hp = jnp.minimum(s.player_hp + _d(r, 4), s.player_hp_max)
-        return s.replace(player_hp=new_hp)
+        # Tame nearby (3x3 around player_pos).
+        mai = s1.monster_ai
+        pr = s1.player_pos[0].astype(jnp.int32)
+        pc = s1.player_pos[1].astype(jnp.int32)
+        all_pos = mai.pos.astype(jnp.int32)
+        d_row = jnp.abs(all_pos[:, 0] - pr)
+        d_col = jnp.abs(all_pos[:, 1] - pc)
+        adj = jnp.maximum(d_row, d_col) <= jnp.int32(1)
+
+        # Eligible: alive, hostile (not already tame), within 3x3.
+        eligible = mai.alive & ~mai.tame & adj
+
+        # Per-monster 50/50 roll via vmap on split keys.
+        n = mai.alive.shape[0]
+        k_tame_keys = jax.random.split(r, n)
+        tame_rolls = jax.vmap(lambda k: jax.random.randint(k, (), 0, 2))(k_tame_keys)
+        do_tame = eligible & (tame_rolls == jnp.int32(0))
+
+        new_tame      = jnp.where(do_tame, jnp.bool_(True),  mai.tame)
+        new_peaceful  = jnp.where(do_tame, jnp.bool_(True),  mai.peaceful)
+        new_mai = mai.replace(tame=new_tame, peaceful=new_peaceful)
+        return s1.replace(monster_ai=new_mai)
+
+    def b_uncurse(s, r):  # fate 20 — uncurse all worn/wielded items
+        # vendor trap.c:4433-4445: ``(void) seffects(SPE_REMOVE_CURSE, ...)``
+        # which uncurses every worn/wielded inventory slot.  Audit M #22.
+        # Vendor BUC encoding: 1=cursed, 2=uncursed, 3=blessed.  We flip
+        # every cursed item to uncursed; blessed/uncursed are left alone.
+        # Cite: vendor/nethack/src/trap.c:4433-4445;
+        #       vendor/nethack/src/read.c::seffect_remove_curse 1489+.
+        items = s.inventory.items
+        cur_buc = items.buc_status
+        was_cursed = cur_buc == jnp.int8(1)
+        new_buc = jnp.where(was_cursed, jnp.int8(2), cur_buc)
+        new_items = items.replace(buc_status=new_buc)
+        new_inv = s.inventory.replace(items=new_items)
+        return s.replace(inventory=new_inv)
 
     # fate 5 (idx 4): confusion rn1(5,15)=5..19 turns.
     # Citation: vendor/nethack/src/trap.c::domagictrap fate=5 → make_confused().
