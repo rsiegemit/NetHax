@@ -846,15 +846,52 @@ def _apply_inflict_weakness(state):
 # ---------------------------------------------------------------------------
 
 def _apply_intrinsic_gift(state, rng: jax.Array):
-    """INTRINSIC_GIVING: grant a random resistance intrinsic.
+    """Case-5 ladder: TELEPAT -> FAST -> STEALTH -> PROTECTION.
 
-    Mirrors pray.c pleased case 5 (pray.c:1310-1338) — telepathy/speed/
-    stealth/protection ladder.  Vendor cascades through TELEPAT → FAST →
-    STEALTH → PROTECTION.  For Wave 6 we expose a simpler RNG-driven pick
-    over the resistance group so the test surface is non-trivial.
+    Vendor: pray.c::pleased case 5 (lines 1310-1338).  This is a
+    *deterministic ordered cascade* — the first absent intrinsic is
+    granted.  Resistance gifts (FIRE/COLD/SLEEP/SHOCK/POISON) are case 7/8
+    (gcrownu); they are NOT case-5 gifts and now live in
+    :func:`_apply_gcrownu_resistance`.
     """
     from Nethax.nethax.subsystems.status_effects import Intrinsic
-    # Candidate intrinsics: resistances (1..10) and telepathy (30) / fast (64).
+    del rng  # ordered cascade is RNG-free per vendor
+    intr = state.status.intrinsics
+
+    has_telepat = intr[int(Intrinsic.TELEPATHY)]
+    has_fast    = intr[int(Intrinsic.FAST)]
+    has_stealth = intr[int(Intrinsic.STEALTH)]
+
+    grant_telepat    = ~has_telepat
+    grant_fast       = (~grant_telepat) & (~has_fast)
+    grant_stealth    = (~grant_telepat) & (~grant_fast) & (~has_stealth)
+    grant_protection = (~grant_telepat) & (~grant_fast) & (~grant_stealth)
+
+    intr = intr.at[int(Intrinsic.TELEPATHY)].set(
+        intr[int(Intrinsic.TELEPATHY)] | grant_telepat
+    )
+    intr = intr.at[int(Intrinsic.FAST)].set(
+        intr[int(Intrinsic.FAST)] | grant_fast
+    )
+    intr = intr.at[int(Intrinsic.STEALTH)].set(
+        intr[int(Intrinsic.STEALTH)] | grant_stealth
+    )
+    intr = intr.at[int(Intrinsic.PROTECTION)].set(
+        intr[int(Intrinsic.PROTECTION)] | grant_protection
+    )
+    return state.replace(status=state.status.replace(intrinsics=intr))
+
+
+def _apply_gcrownu_resistance(state, rng: jax.Array):
+    """gcrownu resistance gift (pray.c case 7/8).
+
+    Vendor: pray.c::gcrownu — when the player ascends to PIOUS the deity
+    crowns them and confers a *random* resistance (FIRE/COLD/SLEEP/SHOCK/
+    POISON).  DEFER: full gcrownu (artifact grant, Hand of Elbereth, etc.)
+    is a follow-up wave; this helper covers only the resistance portion
+    and is not yet wired into the pleased-cascade.
+    """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
     candidates = jnp.array(
         [
             int(Intrinsic.RESIST_FIRE),
@@ -862,13 +899,10 @@ def _apply_intrinsic_gift(state, rng: jax.Array):
             int(Intrinsic.RESIST_SLEEP),
             int(Intrinsic.RESIST_SHOCK),
             int(Intrinsic.RESIST_POISON),
-            int(Intrinsic.TELEPATHY),
-            int(Intrinsic.FAST),
-            int(Intrinsic.STEALTH),
         ],
         dtype=jnp.int32,
     )
-    idx = jax.random.randint(rng, (), minval=0, maxval=candidates.shape[0], dtype=jnp.int32)
+    idx = jax.random.randint(rng, (), 0, candidates.shape[0], dtype=jnp.int32)
     intrinsic_id = candidates[idx]
     new_intr = state.status.intrinsics.at[intrinsic_id].set(True)
     return state.replace(status=state.status.replace(intrinsics=new_intr))
@@ -964,65 +998,91 @@ def _apply_zap_form_change(state):
 # ---------------------------------------------------------------------------
 
 def god_zaps_you(state, rng: jax.Array):
-    """Simplified port of pray.c::god_zaps_you (lightning + item destruction).
+    """Two-phase divine-wrath (vendor pray.c::god_zaps_you, lines 610-691).
 
-    Per the Wave-4 spec:
-      - 50 % lightning bolt for d6 damage
-      - 50 % destroy a random worn item
-      - alignment_record -= 5
+    Vendor sequence (not the 50/50 coin we had):
 
-    Returns: new EnvState (deterministic given rng).
+      Phase 1 (lines 612-644): "Suddenly, a bolt of lightning strikes you!"
+        - if Reflecting: harmless (shieldeff)
+        - elif Shock_resistance: harmless ("seems not to affect")
+        - else: fry_by_god(resp_god, FALSE) → kill (HP -> 0)
+
+      Phase 2 (lines 646-690): "wide-angle disintegration beam"
+        - disintegrate worn armor in order: uarms (shield) -> uarmc (cloak)
+          -> uarm (body, only if !uarmc) -> uarmu (shirt, only if !uarm && !uarmc)
+        - if !Disint_resistance: fry_by_god(resp_god, TRUE) → kill
+        - alignment_record always drops by 5 (record-keeping consequence)
+
+    The 50/50 coin between lightning vs "destroy random inventory" is
+    *not* in vendor and has been removed.
     """
-    rng_branch, rng_dmg, rng_slot = jax.random.split(rng, 3)
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    from Nethax.nethax.subsystems.inventory import ArmorSlot
+    del rng  # outcome is fully deterministic in two-phase vendor
 
-    # Decide branch via uniform U[0,1).
-    coin = jax.random.uniform(rng_branch, ())
-    is_lightning = coin < jnp.float32(0.5)
+    intr = state.status.intrinsics
+    has_shock_resist  = intr[int(Intrinsic.RESIST_SHOCK)]
+    has_disint_resist = intr[int(Intrinsic.RESIST_DISINT)]
+    # Vendor "Reflecting" can come from an amulet/cloak; our parity slice
+    # doesn't carry the reflect bit on intrinsics — treat as False.
+    reflecting = jnp.bool_(False)
 
-    # Lightning branch: d6 damage.
-    dmg = jax.random.randint(rng_dmg, (), minval=1, maxval=7, dtype=jnp.int32)
-    new_hp_lightning = jnp.maximum(jnp.int32(0), state.player_hp - dmg)
+    # --- Phase 1: lightning ---
+    survived_lightning = reflecting | has_shock_resist
+    hp_after_lightning = jnp.where(
+        survived_lightning, state.player_hp, jnp.int32(0)
+    ).astype(jnp.int32)
 
-    # Item-destruction branch: drop quantity to 0 on a random occupied slot.
-    items = state.inventory.items
-    occupied = items.category != jnp.int8(0)
-    n_slots = items.category.shape[0]
-    # Pick a random slot index in [0, n_slots).
-    rand_slot = jax.random.randint(
-        rng_slot, (), minval=0, maxval=n_slots, dtype=jnp.int32
+    # --- Phase 2: disintegration beam ---
+    # Disintegrate worn armor in vendor order; track which slot to zap.
+    worn = state.inventory.worn_armor              # int8[N_ARMOR_SLOTS]
+    shield_idx = int(ArmorSlot.SHIELD)
+    cloak_idx  = int(ArmorSlot.CLOAK)
+    body_idx   = int(ArmorSlot.BODY)
+    shirt_idx  = int(ArmorSlot.SHIRT)
+
+    has_shield = worn[shield_idx] >= jnp.int8(0)
+    has_cloak  = worn[cloak_idx]  >= jnp.int8(0)
+    has_body   = worn[body_idx]   >= jnp.int8(0)
+    has_shirt  = worn[shirt_idx]  >= jnp.int8(0)
+
+    # Vendor cascade (lines 661-671):
+    #   if uarms                     → disintegrate uarms
+    #   if uarmc                     → disintegrate uarmc
+    #   if uarm  && !uarmc           → disintegrate uarm
+    #   if uarmu && !uarm && !uarmc  → disintegrate uarmu
+    disint_shield = has_shield
+    disint_cloak  = has_cloak
+    disint_body   = has_body & (~has_cloak)
+    disint_shirt  = has_shirt & (~has_body) & (~has_cloak)
+
+    new_worn = worn
+    new_worn = new_worn.at[shield_idx].set(
+        jnp.where(disint_shield, jnp.int8(-1), new_worn[shield_idx])
     )
-    # If chosen slot empty, fall through to first occupied (argmax).
-    fallback = jnp.argmax(occupied).astype(jnp.int32)
-    target_slot = jnp.where(
-        occupied[rand_slot],
-        rand_slot,
-        fallback,
+    new_worn = new_worn.at[cloak_idx].set(
+        jnp.where(disint_cloak, jnp.int8(-1), new_worn[cloak_idx])
     )
-    can_destroy = jnp.any(occupied)
-    new_qty = jnp.where(
-        (~is_lightning) & can_destroy,
-        jnp.int16(0),
-        items.quantity[target_slot],
+    new_worn = new_worn.at[body_idx].set(
+        jnp.where(disint_body, jnp.int8(-1), new_worn[body_idx])
     )
-    new_cat = jnp.where(
-        (~is_lightning) & can_destroy,
-        jnp.int8(0),
-        items.category[target_slot],
+    new_worn = new_worn.at[shirt_idx].set(
+        jnp.where(disint_shirt, jnp.int8(-1), new_worn[shirt_idx])
     )
-    new_quantity = items.quantity.at[target_slot].set(new_qty)
-    new_category = items.category.at[target_slot].set(new_cat)
-    new_items = items.replace(quantity=new_quantity, category=new_category)
-    new_inv = state.inventory.replace(items=new_items)
+    new_inventory = state.inventory.replace(worn_armor=new_worn)
 
-    new_hp = jnp.where(is_lightning, new_hp_lightning, state.player_hp).astype(jnp.int32)
+    # Phase 2 kill: if !Disint_resistance → fry_by_god (HP -> 0).
+    hp_after_disint = jnp.where(
+        has_disint_resist, hp_after_lightning, jnp.int32(0)
+    ).astype(jnp.int32)
 
-    # alignment_record -= 5.
+    # Alignment record always drops -5 (continuity with prior tests).
     new_record = (state.prayer.alignment_record - jnp.int16(5)).astype(jnp.int16)
     new_prayer = state.prayer.replace(alignment_record=new_record)
 
     return state.replace(
-        player_hp=new_hp,
-        inventory=new_inv,
+        player_hp=hp_after_disint,
+        inventory=new_inventory,
         prayer=new_prayer,
     )
 

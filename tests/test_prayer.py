@@ -158,8 +158,20 @@ def test_alignment_record_changes_with_outcome():
     assert int(new_state.prayer.alignment_record) == 8
 
 
-def test_god_zaps_does_d6_damage_range():
-    """god_zaps_you(state) — on lightning branches, hp loss must be in [0, 6]."""
+def test_god_zaps_kills_unresisted_hero():
+    """god_zaps_you(state) — two-phase vendor parity (pray.c:610-691).
+
+    Wave-N rebalance: the previous 50/50 d6 / random-inventory-destruction
+    coin was a simplified Wave-4 stand-in; vendor pray.c::god_zaps_you is
+    a sequential two-phase event:
+
+      Phase 1 (lightning):  fry to crisp unless Shock_resistance / Reflecting.
+      Phase 2 (disintegration beam):  disintegrate worn armor; fry unless
+                                       Disint_resistance.
+
+    On a fresh hero with no resistances both phases reduce HP to 0, which
+    is the vendor outcome — *not* a d6 nibble.
+    """
     import jax
     import jax.numpy as jnp
     from Nethax.nethax.subsystems.prayer import god_zaps_you
@@ -169,18 +181,31 @@ def test_god_zaps_does_d6_damage_range():
         player_hp_max=jnp.int32(50),
         player_hp=jnp.int32(50),
     )
-    # Sample over several seeds to cover lightning branch (50 % chance).
-    saw_lightning = False
-    for seed in range(20):
-        rng = jax.random.PRNGKey(seed)
-        new_state = god_zaps_you(state, rng)
-        loss = int(state.player_hp) - int(new_state.player_hp)
-        # Each call: loss is either 0 (item branch) or in [1,6] (lightning).
-        assert 0 <= loss <= 6, f"seed {seed}: HP loss out of [0,6]: {loss}"
-        if loss > 0:
-            saw_lightning = True
-    # Over 20 seeds, expect at least one lightning bolt.
-    assert saw_lightning, "Never saw lightning branch — RNG sample too small?"
+    rng = jax.random.PRNGKey(0)
+    new_state = god_zaps_you(state, rng)
+    # Unresisted hero is killed (HP → 0); alignment record drops by 5.
+    assert int(new_state.player_hp) == 0
+    assert int(new_state.prayer.alignment_record) == int(state.prayer.alignment_record) - 5
+
+
+def test_god_zaps_spares_disint_resist():
+    """Hero with Disintegration resistance survives both phases."""
+    import jax
+    import jax.numpy as jnp
+    from Nethax.nethax.subsystems.prayer import god_zaps_you
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+
+    _env, state, _rng = _fresh_env_state()
+    state = state.replace(
+        player_hp_max=jnp.int32(50),
+        player_hp=jnp.int32(50),
+    )
+    intr = state.status.intrinsics
+    intr = intr.at[int(Intrinsic.RESIST_SHOCK)].set(True)
+    intr = intr.at[int(Intrinsic.RESIST_DISINT)].set(True)
+    state = state.replace(status=state.status.replace(intrinsics=intr))
+    new_state = god_zaps_you(state, jax.random.PRNGKey(0))
+    assert int(new_state.player_hp) == 50, "Resistant hero must survive"
 
 
 def test_sacrifice_aligned_corpse_increases_record():
