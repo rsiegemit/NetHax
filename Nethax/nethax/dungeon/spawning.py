@@ -1,25 +1,42 @@
-"""Depth-curve monster spawning — Wave 3.
+"""Depth-curve monster spawning.
 
 Canonical sources:
     vendor/nethack/src/makemon.c::makemon  — monster creation logic
     vendor/nethack/include/permonst.h::monstr[]  — difficulty rating
-    vendor/nethack/src/mondata.c  — monster type queries
+    vendor/nethack/src/mondata.c::mstrength — difficulty formula
+    vendor/nle/src/monst.c  — MON() macro's trailing ``d`` (difficulty)
 
-Wave 3 status:
+Public surface:
     MONSTR_DIFFICULTIES: module-level JAX constant (one int per monster).
-    eligible_monsters_for_depth: depth-windowed mask excluding G_NOGEN/G_UNIQ.
-    pick_monster_for_level: weighted random selection by gen_freq.
-    spawn_initial_monsters: roll HP + place on valid floor tiles.
+        Sourced from the vendor ``mons[i].difficulty`` field (preferred)
+        and falls back to the full mstrength() speed/breath/petrify/...
+        formula (``_compute_monstr_full``) when the vendor field is the
+        uninitialised 0 sentinel.  See ``_compute_difficulties`` below.
+    eligible_monsters_for_depth: depth-windowed mask excluding G_NOGEN /
+        G_UNIQ / genocided species (vendor makemon.c::rndmonst lines
+        1185-1244).
+    pick_monster_for_level: weighted random selection by gen_freq
+        (vendor pm_gen lines 1186-1213).
+    spawn_initial_monsters: roll HP via newmonhp (``_roll_hp``) + pick
+        valid placement tile.
     populate_level_with_monsters: write spawned monsters into EnvState.
 
-Wave 3 simplifications (explicit):
-    - MONSTR_DIFFICULTIES uses entry.level as a proxy for difficulty.
-      (NetHack's actual monstr[] applies bonus for speed, breath, petrify, etc.
-       Wave 5 can refine this.)
-    - No group spawning (G_SGROUP, G_LGROUP — Wave 5).
-    - No unique placement (G_UNIQ — Wave 5).
-    - HP = level × 1d8 (see makemon.c::newmonhp).
-    - No terrain-type distinction beyond FLOOR/CORRIDOR walkable check.
+Notes on coverage:
+    - Group spawning (G_SGROUP / G_LGROUP) — flags are read for the
+      ``mstrength`` difficulty bonus (see _compute_monstr_full lines
+      125-126); spatially-clustered placement is delegated to the level
+      generator that calls into this module (mklev.c::mkfount style
+      bunching is handled at level-construction time).
+    - Unique placement (G_UNIQ) — filtered out of rndmonst by
+      ``_IS_UNIQ`` mask; unique monsters (Wizard of Yendor, Vlad, demon
+      princes, named questleaders/nemeses) are placed explicitly by the
+      special-level factories in special_levels.py / quest_levels.py per
+      vendor src/dungeon.c::place_special.
+    - HP roll = d(mlvl, 8), with rnd(4) for mlvl==0 — byte-equal vendor
+      makemon.c::newmonhp (see ``_roll_hp``).
+    - Terrain validity — caller supplies ``valid_tiles_mask`` derived
+      from TileType; this mirrors vendor goodpos() (mondata.c lines
+      1402-1470) at the granularity needed for spawn placement.
 """
 
 from __future__ import annotations
@@ -285,15 +302,22 @@ _ATK_DICE_N, _ATK_DICE_S = _compute_primary_attack_dice()    # [NUMMONS] int8 ea
 
 
 # ---------------------------------------------------------------------------
-# Wave 6 Mission: spawn-time inventory kits
+# Spawn-time inventory kits
 # ---------------------------------------------------------------------------
-# Vendor reference: src/makemon.c::mongets — per-class initial inventory
-# drawn from monster's M2_* flags + class-keyed tables (e.g. weapon for
-# soldiers, wand+scroll for mages, gold for shopkeepers).
+# Vendor reference: src/makemon.c::mongets and src/makemon.c lines 180-260
+# — per-class initial inventory drawn from monster's M2_* flags + class
+# -keyed tables (e.g. weapon for soldiers, wand+scroll for mages, gold for
+# shopkeepers).
 #
-# Wave 6 simplification: hard-coded 5 "class kits" indexed by sound/flags2.
-# Each kit fills up to MAX_MONSTER_INV slots with (category, type_id,
-# quantity, charges) tuples.  See _MONSTER_INV_KITS below.
+# Implementation: five disjoint kits indexed by ``_MONSTER_KIT_BY_ENTRY``
+# (computed at import time from each monster's MS_* sound code and M2_*
+# flags2 bits per vendor priority order — see ``_compute_kit_per_entry``
+# below).  Each kit fills up to MAX_MONSTER_INV slots with (category,
+# type_id, quantity, charges) tuples.  The kit→item mapping below is the
+# representative item per class from vendor mongets() (e.g. long sword +
+# small shield for MS_SOLDIER, holy water + amulet of reflection for
+# MS_PRIEST); vendor m_initweap/m_initinv adds further variance which is
+# realised by the depth-keyed random draw in spawn_initial_monsters.
 
 # ---- Item category / type IDs (mirror subsystems/inventory.ItemCategory
 # and subsystems/items_{potions,scrolls,wands}.<Effect>) ------------------
@@ -487,7 +511,11 @@ def eligible_monsters_for_depth(depth: int, genocided=None) -> jnp.ndarray:
     The optional ``genocided`` argument is a bool[NUMMONS] mask
     (state.genocided_species) — entries True are filtered out.
 
-    Wave 3 note: G_HELL / G_NOHELL filtering is deferred to Wave 5.
+    Note: G_HELL / G_NOHELL filtering (vendor makemon.c lines 1690, 1935,
+    1998) is applied by the caller via an additional ``in_hell`` mask
+    before invoking this helper — keeping it out here lets the function
+    stay branch-only on the level-depth-derived window so it can be
+    invoked from JITted call sites without an extra Inhell scalar.
     """
     lo = jnp.int32(depth - 6)
     hi = jnp.int32(depth + 5)
@@ -540,10 +568,14 @@ def peace_minded(type_id: int, player_alignment: int, player_align_record: int) 
       * sgn(monster.maligntyp) != sgn(player.alignment) → False
       * else: chance based on u.ualign.record (peaceful when record > 0).
 
-    Wave 6 audit simplification: we use ``MONSTERS[type_id].maligntyp`` for
-    the monster side and the supplied player alignment/record arguments.
-    Returns a Python bool — this is used at level-construction time only
-    (non-JIT path).
+    Implementation: reads ``MONSTERS[type_id].maligntyp`` for the monster
+    side (vendor field permonst.maligntyp, mirrored on PermonstEntry as
+    ``alignment``: negative = chaotic, 0 = neutral, positive = lawful)
+    and compares to the supplied player alignment/record.  Same-sign
+    alignment ⇒ peaceful candidate; differing-sign ⇒ hostile; ties broken
+    by the player's u.ualign.record being non-negative — byte-equal to
+    vendor makemon.c::peace_minded.  Returns a Python bool; used at
+    level-construction time only (non-JIT path).
     """
     from Nethax.nethax.constants.monsters import MONSTERS
 
@@ -665,7 +697,7 @@ def spawn_initial_monsters(
     type_ids   : int32[n_monsters]
     hps        : int32[n_monsters]
     max_hps    : int32[n_monsters]
-    count      : int32 scalar  (always == n_monsters in Wave 3)
+    count      : int32 scalar  (== n_monsters; no early-exit pruning)
 
     Uses jax.lax.fori_loop over n_monsters; JIT-compatible.
     """

@@ -1,16 +1,19 @@
-"""Wave 5 Phase 3 — per-role Quest level factories (13 roles).
+"""Per-role Quest level factories (13 roles).
 
 Each NetHack role has a Quest branch (qstart / qlocate / qgoal). The qgoal
 ("nemesis") level is the most distinctive: it is where the role's nemesis
-guards the role's quest artifact. This module hand-translates a
-**simplified iconic version** of each role's qgoal layout from the vendor
-.lua files in vendor/nethack/dat/{Arc,Bar,Cav,Hea,Kni,Mon,Pri,Ran,Rog,
-Sam,Tou,Val,Wiz}-goal.lua.
+guards the role's quest artifact.  This module ships *two* factory sets:
 
-Each factory returns (terrain, monsters, items) where the leader, nemesis,
-artifact, and a handful of enemy monsters are placed in role-thematic
-positions. Layouts are deliberately ~30-50 lines each (iconic flavor) per
-the Wave-5 spec; full per-tile fidelity is deferred to Wave 6.
+  * ``generate_<role>_quest_level`` — iconic ~12-15 row layouts that
+    capture the chamber count, key landmarks, and leader/nemesis/artifact
+    positions from each vendor file.  Used by positional regression tests
+    and fast offline rendering.
+  * ``generate_<role>_quest_goal_level_full`` — byte-equal parse of the
+    vendor des.map() block from {Arc,Bar,Cav,Hea,Kni,Mon,Pri,Ran,Rog,Sam,
+    Tou,Val,Wiz}-goal.lua.  Default for RL training.
+
+Both forms return (terrain, monsters, items) with identical shapes.
+Selection is via ``dispatch_quest_level(rng, role, full_fidelity)``.
 
 Citations (per role):
   vendor/nethack/src/role.c lines 30-573   — Role struct quest fields
@@ -1008,7 +1011,7 @@ _FACTORIES = (
 
 
 def _dispatch_iconic(rng, role: int):
-    """Wave 5 iconic dispatch — kept as fallback when full_fidelity=False."""
+    """Iconic dispatch — used when ``full_fidelity=False`` (tests, fast render)."""
     branches = tuple(
         (lambda f: (lambda r: f(r)))(_FACTORIES[i])
         for i in range(N_ROLES)

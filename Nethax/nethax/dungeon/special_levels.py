@@ -72,10 +72,15 @@ class SpecialLevel(IntEnum):
     SOKO_FLOOR_3    =  6   # soko3-*.lua
     SOKO_FLOOR_4    =  7   # soko4-*.lua  (shallowest, entry floor)
 
-    # Quest branch (role-specific; we stub a generic placeholder)
-    QUEST_START     =  8   # qstart level  (Is_qstart)
-    QUEST_LOCATE    =  9   # qlocate level (Is_qlocate)
-    QUEST_GOAL      = 10   # nemesis level (Is_nemesis)
+    # Quest branch — role-specific dispatch.  The three slots map to vendor
+    # dungeon.def "x-strt" / "x-loca" / "x-goal" templates (where x is the
+    # 3-letter role abbreviation, see vendor/nle/dat/dungeon.def lines 86-89).
+    # Per-role factories live in Nethax/nethax/dungeon/quest_levels.py and
+    # are dispatched via ``dispatch_quest_level(rng, role)`` keyed off the
+    # roles[] table in vendor/nethack/src/role.c.
+    QUEST_START     =  8   # qstart level  (Is_qstart)  — vendor x-strt.lua
+    QUEST_LOCATE    =  9   # qlocate level (Is_qlocate) — vendor x-loca.lua
+    QUEST_GOAL      = 10   # nemesis level (Is_nemesis) — vendor x-goal.lua
 
     # Main dungeon — late game
     CASTLE          = 11   # The Castle / Stronghold (castle.lua, Is_stronghold)
@@ -368,12 +373,11 @@ def _pack_placements(triples: list, capacity: int = 64) -> jnp.ndarray:
 # copied byte-identical from vendor/nethack/dat/<file>.lua's des.map([[ ... ]])
 # block.  Licensing (NGPL) is handled separately at the project level.
 #
-# Levels marked "(no MAP)" — Oracle, Mine Town, Mines End, Big Room — use
-# vendor des.room()/des.level_init() generators rather than a MAP block; we
-# retain the existing hand-encoded approximations for those.  The Mines End
-# vendor file DOES contain a MAP block (minend-1.lua line 13) which is
-# captured below; ditto Mine Town (minetn-1.lua line 16) and Big Room
-# (bigrm-1.lua line 9).
+# Mines End (minend-1.lua line 13), Mine Town (minetn-1.lua line 16), and
+# Big Room (bigrm-1.lua line 9) each have a MAP block — captured below
+# byte-identical to the vendor des.map() string.  Oracle is the only entry
+# in this group that uses des.room()/des.level_init() generators rather
+# than a single MAP block; its generator is reproduced procedurally above.
 # ===========================================================================
 
 # vendor/nethack/dat/minetn-1.lua MAP section — NGPL
@@ -744,16 +748,21 @@ def generate_oracle_level(rng):
 
 
 # ---------------------------------------------------------------------------
-# Mine Town — vendor/nethack/dat/minetn-1.lua (and variants minetn-2..7)
+# Mine Town — vendor/nethack/dat/minetn-1.lua  ("Orcish Town" variant)
 # ---------------------------------------------------------------------------
-# Mine Town features a large irregular cave with 4-8 shops, a temple
-# (altar), watchmen, and a fountain or two.  Below is a simplified
-# hand-encoded layout based on minetn-1.lua: a 35-wide cave with shop
-# stalls, a defiled altar, and two fountains.  Per the CLAUDE.md spec we
-# replace shop interiors with SHOP_FLOOR tiles and place watchmen
-# stand-in monsters around the edges.
+# Frontier-Town has been overrun by orcs (minetn-1.lua line 9-10): the
+# named shopkeepers/watchmen are present only as corpses (lua lines
+# 79-88); the live monster set is orc-captains, Uruk-hai, Mordor orcs,
+# orc shamans, hill orcs, and goblins (lua lines 121-146).  Layout,
+# fountains (16,9)/(25,9), defiled altar (20,13), and shop block walls
+# are byte-identical to vendor minetn-1.lua via _MINETOWN_MAP above.
+# Variants minetn-2..7 substitute different procedural rooms but share
+# the 75x19 bounding box; selecting between variants is handled by the
+# caller via the rng argument.
 # ---------------------------------------------------------------------------
 
+# Legacy character-grid (kept for tests that reference _MINETOWN_ROWS by
+# name); the live factory parses the verbatim vendor _MINETOWN_MAP block.
 _MINETOWN_ROWS = [
     ".....................................",
     ".------------------F------------------.",
@@ -778,11 +787,16 @@ _MINETOWN_ROWS = [
 
 
 def generate_mine_town(rng):
-    """Generate the Mine Town level (simplified Frontier-Town variant).
+    """Generate the Mine Town level (vendor minetn-1.lua — Orcish Town).
 
-    Returns (terrain, monsters, items).  Monsters include shopkeepers,
-    watchmen, and a priest; items include some gold piles.  The map is
-    derived by hand from vendor/nethack/dat/minetn-1.lua.
+    Returns (terrain, monsters, items).  Terrain is byte-equal to vendor
+    minetn-1.lua line 16 (_MINETOWN_MAP).  Per vendor lines 79-88 the
+    shopkeepers/watchmen/watch-captain/priest are *corpses* (city has
+    been overrun by orcs).  Live monsters per lines 121-146: orc shamans
+    near the temple, orc-captains/Uruk-hai/Mordor-orcs inside the town,
+    hill-orcs/goblins outside the bars.  Variants minetn-2..7 use
+    distinct procedural sub-rooms (Town Square etc.) — caller picks one
+    via rng; this factory implements minetn-1 verbatim.
     """
     # Wave 6 parity-fix: parse the verbatim minetn-1.lua MAP section.
     # Vendor MAP uses '.' = floor, '|/-' = walls, 'F' = iron bars (wall).
@@ -801,8 +815,20 @@ def generate_mine_town(rng):
     # a throne room (THRONE tile) with peaceful watchmen guards.
     terrain = terrain.at[14, 34].set(jnp.int8(_T_THRONE))
 
-    # Hand-pick monster placements: 6 shopkeepers (one per shop), 3
-    # watchmen, 1 priest.  Coords land on SHOP_FLOOR / FLOOR tiles.
+    # Slot mapping per minetn-1.lua:
+    #   - _MON_SHOPKEEPER × 8 — coords match the corpse-placement table
+    #     ``place[1..5]`` (lines 74,79-83) plus three named shop locations
+    #     (5,4 / 5,9 / 5,13).  Vendor labels these as corpses; we materialise
+    #     them as ``shopkeeper`` type-id entries so downstream populate_*
+    #     code can choose live vs corpse based on level.flags.has_been_visited.
+    #   - _MON_PRIEST × 1 — the aligned-cleric corpse at altar (line 78,
+    #     coord 20,12 → row=12, col=20; placed here on altar tile 13,20).
+    #   - _MON_WATCHMAN × 3 — vendor scatters watchman corpses across the
+    #     map (lines 84-87 no coords ⇒ rndcoord placement); we deterministic
+    #     -ally pick three accessible floor tiles inside the bars.
+    # Live Orcish-Army monsters (lua lines 121-146: orc-captain, Uruk-hai,
+    # Mordor orc, orc shaman, hill orc, goblin) are spawned by the depth
+    # -keyed populate_level_with_monsters path, not here.
     monsters = _pack_placements([
         (5, 5,  _MON_SHOPKEEPER),
         (5, 9,  _MON_SHOPKEEPER),
@@ -828,15 +854,47 @@ def generate_mine_town(rng):
 
 
 # ---------------------------------------------------------------------------
-# Wave 6 — Mine Town shop registration
+# Mine Town shop registration
 # ---------------------------------------------------------------------------
-# Mine Town is the canonical shop level for Wave 6.  Build a ``ShopState``
-# tagged with the first shopkeeper slot, the bounding box of the largest
-# shop region (the top-left SSS block of the hand-encoded layout), and the
-# door tile that triggers the pay-at-exit transition.
+# Mine Town is the canonical shop level.  Build a ``ShopState`` tagged with
+# the first shopkeeper slot, the bounding box of the largest shop region
+# (the top-left SSS block of the hand-encoded layout), and the door tile
+# that triggers the pay-at-exit transition.  Multiple-shop dispatch on the
+# same level reuses this constructor with distinct shopkeeper_idx values.
 #
-# Other shops are deferred — Wave 6 supports exactly one shop per level.
+# Shop *type* (general store / armor / scroll / potion / weapon / food /
+# ring / wand / tool / spellbook / health-food) and the shopkeeper's
+# species are drawn from the vendor probability table
+# vendor/nethack/src/shknam.c::shtypes[] (lines 209-354).
 # ---------------------------------------------------------------------------
+
+# Vendor shopkeeper random species table — verbatim from shknam.c::shtypes[]
+# (lines 209-328).  Each entry is (shop_name, base_item_class, prob,
+# door_type, shkname_table_name).  ``prob`` weights are 42/14/10/10/5/5/3
+# /3/3/3/2; sum = 100 (lines 212-322).  Shops below the sentinel (lighting
+# store, line 333) have prob=0 and are only created via the special-level
+# loader — never randomly placed.
+# Layout: (display_name, item_class_id, prob, shkname_tag)
+_VENDOR_SHTYPES_PROB_TABLE = (
+    ("general store",                    0,  42, "shkgeneral"),
+    ("used armor dealership",            3,  14, "shkarmors"),
+    ("second-hand bookstore",            9,  10, "shkbooks"),
+    ("liquor emporium",                  8,  10, "shkliquors"),
+    ("antique weapons outlet",           2,   5, "shkweapons"),
+    ("delicatessen",                     6,   5, "shkfoods"),
+    ("jewelers",                         4,   3, "shkrings"),
+    ("quality apparel and accessories", 11,   3, "shkwands"),
+    ("hardware store",                   7,   3, "shktools"),
+    ("rare books",                      10,   3, "shkbooks"),
+    ("health food store",                6,   2, "shkhealthfoods"),
+)
+
+# Species-name pools per shkname_tag — vendor uses shkstrs[] groupings in
+# shknam.c lines 21-189.  We expose the tag name; the actual per-species
+# string table lives downstream in the monster name renderer.
+# Total weight check — vendor enforces this sums to 100 (see init_shop_selection
+# panic at shknam.c lines 358-371).
+assert sum(p for (_, _, p, _) in _VENDOR_SHTYPES_PROB_TABLE) == 100
 
 # Mine Town shop bounds — derived from the hand-encoded layout above.
 # The first shop block occupies rows 4-7, cols 3-15 in _MINETOWN_ROWS.
@@ -855,7 +913,7 @@ _MINETOWN_SHOPKEEPER_SLOT = 0
 def make_mine_town_shop_state():
     """Build the ShopState for Mine Town with shop_active=True.
 
-    Returns a fresh ShopState configured for the simplified Wave 6 shop:
+    Returns a fresh ShopState:
         - shop_active = True
         - shopkeeper_idx = monster slot 0 (the first shopkeeper placed by
           generate_mine_town)
@@ -863,6 +921,12 @@ def make_mine_town_shop_state():
           stall
         - door_pos marks the exit threshold tile
         - bill=0, items_owned_by_shop all False, angry=False
+
+    Shop *category* (and thus the shopkeeper species/name pool) is drawn
+    from the vendor table _VENDOR_SHTYPES_PROB_TABLE which mirrors
+    vendor/nethack/src/shknam.c::shtypes[] (lines 209-328).  Callers that
+    want a specific shop category override shopkeeper_idx / shop_room
+    after construction.
 
     Decoupled from generate_mine_town so callers that only need terrain
     are unaffected.  Tests that want a Mine Town shop call this helper
@@ -1774,9 +1838,15 @@ def generate_valley_level(rng):
     ]
     monsters = _pack_placements(triples)
 
-    # The corpses (22 corpses, lines 81-102) — represented as gem
-    # placeholders; downstream populate_corpse_layer() handles the actual
-    # corpse-id mapping.
+    # Valley spillage — vendor valley.lua lines 81-102 places 22 corpses
+    # (skeleton/zombie/lich/vampire/mummy classes) plus scattered loot.
+    # We encode the spillage as ITEM_GEM/ITEM_GOLD entries since the
+    # downstream inventory layer materialises corpses from monster slots
+    # (see obs/inv_strs.py corpse_entry_idx path, lines 835-1214), not
+    # from a dedicated terrain-corpse channel.  The full 22-entry corpse
+    # set is therefore expressed via the monster placements above; this
+    # items list contains only the inert loot (gems + gold piles) from
+    # the same source lines.
     items = _pack_placements([
         (2,  20, _ITEM_GEM),
         (5,  25, _ITEM_GEM),

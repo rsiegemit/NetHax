@@ -1954,14 +1954,17 @@ def stormbringer_drli_hit(state, mon_slot, rng) -> tuple:
     # 1d8 drain roll (vendor monhp_per_lvl ~weapon.c:75).
     k_drain, k_heal = jax.random.split(rng, 2)
     drain_roll = jax.random.randint(k_drain, (), 1, 9, dtype=jnp.int32)
-    m_lev = mai.entry_idx[idx].astype(jnp.int32)  # use entry as level proxy
-    m_lev = jnp.maximum(m_lev, jnp.int32(0))
-    # Vendor uses mdef->m_lev (per-monster level).  We approximate from the
-    # monster's MONSTERS[].level table.
+    # Consume the per-monster m_lev field (added in Wave 45a) so drain
+    # damage scales with the actual instance level rather than the
+    # species default.  Falls back to MONSTERS[].level via the
+    # _MONSTER_XP_TABLE when m_lev hasn't been populated yet (spawn
+    # sites that pre-date Wave 45a).
     from Nethax.nethax.subsystems.combat import _MONSTER_XP_TABLE as _LVL
     safe_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0,
                           _LVL.shape[0] - 1)
-    actual_lvl = _LVL[safe_entry].astype(jnp.int32)
+    species_lvl = _LVL[safe_entry].astype(jnp.int32)
+    inst_lvl = mai.m_lev[idx].astype(jnp.int32)
+    actual_lvl = jnp.where(inst_lvl > jnp.int32(0), inst_lvl, species_lvl)
     mhpmax = jnp.maximum(mai.hp_max[idx].astype(jnp.int32), jnp.int32(1))
 
     # Adjust drain if would drop mhpmax below m_lev (vendor lines 1658-1659).
