@@ -233,14 +233,13 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
         state.ground_items, b, lv, safe_br, safe_bc
     )
 
-    # Closed door blocks (vendor hack.c:485-488 + diagonal-door rule 434).
+    # Closed door blocks (vendor hack.c:485-488).
     beyond_is_closed_door = beyond_tile == jnp.int32(_TILE_CLOSED_DOOR)
-    # Vendor hack.c:434 — diagonal through doorway forbidden unless
-    # doorless_door (we treat OPEN_DOOR as doorless-equivalent).  Diagonal
-    # through a CLOSED door is always blocked.
-    beyond_is_open_door = beyond_tile == jnp.int32(_TILE_OPEN_DOOR)
-    diag_through_door = is_diagonal & beyond_is_open_door  # #58 (treated as block)
-    diag_through_closed = is_diagonal & beyond_is_closed_door
+    # Vendor hack.c:434 — diagonal through a doorway with a leaf is
+    # forbidden; ``doorless_door`` (i.e. OPEN_DOOR with no leaf) is allowed.
+    # We treat OPEN_DOOR as ``doorless_door`` and so a diagonal push through
+    # OPEN_DOOR is permitted; a CLOSED_DOOR blocks unconditionally.
+    diag_through_closed = is_diagonal & beyond_is_closed_door  # #58
 
     # Live monster on beyond tile blocks.
     mai = state.monster_ai
@@ -261,8 +260,7 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
         | beyond_is_solid
         | beyond_has_boulder
         | beyond_is_closed_door     # #57 closed door blocks
-        | diag_through_door         # #58 diagonal through open door
-        | diag_through_closed
+        | diag_through_closed       # #58 diagonal through closed door
         | beyond_has_monster
         | sokoban_diag_block        # #50
     )

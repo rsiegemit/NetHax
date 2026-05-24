@@ -1,9 +1,10 @@
-"""Parity tests for AMAX restore, cursed-book wielded-drop, and lock-pick chest.
+"""Parity tests for AMAX restore, cursed-book explode, and lock-pick chest.
 
 Covers:
   1. test_amax_restored         — restore ability raises drained stat to player_amax
   2. test_amax_doesnt_restore_above — stat already at/above amax is unchanged
-  3. test_cursed_book_drops_wielded — explode branch (b=1..4) sets wielded=-1
+  3. test_cursed_book_explode_destroys_book_and_damages_hp
+        — vendor branch 6 (rn2(lev)==6) destroys the book + 2*rnd(10)+5 hp loss
   4. test_lock_pick_opens_chest     — success roll unlocks is_locked container slot
 """
 import os
@@ -67,59 +68,68 @@ def test_amax_doesnt_restore_above():
 
 
 # ---------------------------------------------------------------------------
-# 3. test_cursed_book_drops_wielded
-#    Force explode branch (b in 1..4) via a seeded RNG that yields b=1.
-#    After reading: inventory.wielded should be -1.
+# 3. test_cursed_book_explode_destroys_book_and_damages_hp
+#    Vendor branch 6 (rn2(lev)==6) destroys the book and deals 2*rnd(10)+5
+#    damage; Antimagic (unmodelled) would gate the damage to 0.
+#
+# REBALANCE: this slot previously tested ``wielded == -1`` after an "explode
+# branch" hit.  That behaviour was invented — vendor cursed_book does not
+# drop the wielded weapon (vendor/nethack/src/spell.c::cursed_book line 169
+# only calls ``losehp()`` and returns TRUE so the caller useup()s the book;
+# there is no setuwep(NULL) call).  Test rewritten to assert vendor truth:
+# the book is destroyed and hp drops by 7..25.
+#
+# Cite: vendor/nethack/src/spell.c::cursed_book lines 169-179.
 # ---------------------------------------------------------------------------
 
-def test_cursed_book_drops_wielded():
-    from Nethax.nethax.subsystems.magic import SpellId, N_SPELLS
+def test_cursed_book_explode_destroys_book_and_damages_hp():
+    from Nethax.nethax.subsystems.magic import SpellId, _SPELL_LEVELS
     from Nethax.nethax.subsystems.inventory import make_item
+    from Nethax.nethax.rng import rn2 as nethax_rn2
 
+    # CANCELLATION = level 7 so rn2(lev)==6 (vendor explode branch) is hit.
+    spell_id = int(SpellId.CANCELLATION)
+    assert int(_SPELL_LEVELS[spell_id]) == 7
+
+    initial_hp = 60
     s = _base_state()
+    s = s.replace(player_hp=jnp.int32(initial_hp),
+                  player_hp_max=jnp.int32(initial_hp))
 
-    # Place a cursed spellbook (SpellId.FORCE_BOLT = 10) in slot 0.
+    # Patch slot 0 to be the cursed level-7 spellbook.
     new_items = s.inventory.items
-    book = make_item(
-        category=ItemCategory.SPBOOK,
-        type_id=int(SpellId.FORCE_BOLT),
-        quantity=1,
-        weight=50,
-        buc_status=_BUC_CURSED,
-    )
-    # Patch each field of the items struct at slot 0.
     new_cat = new_items.category.at[0].set(jnp.int8(int(ItemCategory.SPBOOK)))
-    new_tid = new_items.type_id.at[0].set(jnp.int16(int(SpellId.FORCE_BOLT)))
+    new_tid = new_items.type_id.at[0].set(jnp.int16(spell_id))
     new_buc = new_items.buc_status.at[0].set(jnp.int8(_BUC_CURSED))
     new_qty = new_items.quantity.at[0].set(jnp.int16(1))
     patched_items = new_items.replace(
         category=new_cat, type_id=new_tid, buc_status=new_buc, quantity=new_qty
     )
-    # Wield slot 1 (a placeholder weapon so wielded >= 0).
-    wep = make_item(category=ItemCategory.WEAPON, type_id=17, quantity=1, weight=10)
-    new_cat2 = patched_items.category.at[1].set(jnp.int8(int(ItemCategory.WEAPON)))
-    new_tid2 = patched_items.type_id.at[1].set(jnp.int16(17))
-    new_qty2 = patched_items.quantity.at[1].set(jnp.int16(1))
-    patched_items2 = patched_items.replace(category=new_cat2, type_id=new_tid2, quantity=new_qty2)
-    inv = s.inventory.replace(items=patched_items2, wielded=jnp.int8(1))
-    s = s.replace(inventory=inv)
+    s = s.replace(inventory=s.inventory.replace(items=patched_items))
 
-    # Seed-scan: find an RNG that triggers the explode branch (b in [1,4]).
-    # The first rnd(20) call in cursed_book uses sub_b from jax.random.split(rng, 7)[1].
-    # We iterate seeds until we land in branch 0 (b in 1..4).
+    # Seed-scan for the explode branch (rn2(7) == 6).  Mirrors the RNG
+    # split inside :func:`_cursed_book_backfire` (9-way split → branch
+    # selector is the first sub-key).
     explode_state = None
-    for seed in range(200):
+    for seed in range(1000):
         rng = jax.random.PRNGKey(seed)
-        s2 = read_spellbook(s, rng, slot_idx=0)
-        if int(s2.inventory.wielded) == -1:
-            explode_state = s2
+        subs = jax.random.split(rng, 9)
+        if int(nethax_rn2(subs[0], 7)) == 6:
+            explode_state = read_spellbook(s, rng, slot_idx=0)
             break
 
     assert explode_state is not None, (
-        "Could not find a seed that triggers the explode branch in 200 tries"
+        "No seed found where rn2(7)==6 (vendor explode branch) in 1000 tries"
     )
-    assert int(explode_state.inventory.wielded) == -1, (
-        f"Expected wielded=-1 after cursed book explode, got {int(explode_state.inventory.wielded)}"
+    # Vendor: book is useup'd (quantity → 0).
+    qty_after = int(explode_state.inventory.items.quantity[0])
+    assert qty_after == 0, (
+        f"Vendor explode destroys the book; expected quantity 0, got {qty_after}"
+    )
+    # Vendor damage range: dmg = 2*rnd(10)+5 → [7, 25].
+    hp_loss = initial_hp - int(explode_state.player_hp)
+    assert 7 <= hp_loss <= 25, (
+        f"Vendor explode hp loss {hp_loss} should be in [7, 25] (2*rnd(10)+5)"
     )
 
 
