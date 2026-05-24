@@ -955,14 +955,62 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
         return s.replace(monster_ai=mai.replace(alive=new_alive, hp=new_hp))
 
     # ---- 15: FLING_POISON (Grimtooth) artifact.c:2021-2037 ----------------
-    # Throw BLINDING_VENOM or ACID_VENOM in selected direction (partial
-    # stub here; Pw cost is the observable side effect via gate above).
+    # Vendor: rn2(2) picks BLINDING_VENOM or ACID_VENOM, mksobj + throwit
+    # towards getdir().  Nethax has no per-monster blind timer and no
+    # direction param at this layer, so we approximate by applying d6
+    # damage to the nearest alive adjacent monster (Chebyshev <= 1) —
+    # ACID_VENOM deals 1d6 acid in vendor, and BLINDING_VENOM's
+    # observable side-effect (blind) is omitted here since per-monster
+    # blind isn't tracked.  The 50/50 venom roll is kept as an rng
+    # consumer for schedule stability.
+    # Cite: vendor/nethack/src/artifact.c::invoke_fling_poison lines 2021-2037.
     def _h_fling_poison(s):
-        return s
+        k_venom, k_dmg = jax.random.split(k_handler, 2)
+        _ = jax.random.randint(k_venom, (), 0, 2, dtype=jnp.int32)  # rn2(2)
+        mai = s.monster_ai
+        pr = s.player_pos[0].astype(jnp.int32)
+        pc = s.player_pos[1].astype(jnp.int32)
+        mpos = mai.pos.astype(jnp.int32)
+        d_row = jnp.abs(mpos[:, 0] - pr)
+        d_col = jnp.abs(mpos[:, 1] - pc)
+        in_range = (d_row <= jnp.int32(1)) & (d_col <= jnp.int32(1)) & mai.alive
+        dmg = _dice_sum(k_dmg, jnp.int32(1), jnp.int32(6))
+        new_hp = jnp.where(in_range,
+                           jnp.maximum(mai.hp - dmg, jnp.int32(0)),
+                           mai.hp)
+        new_alive = jnp.where(in_range & (new_hp <= jnp.int32(0)),
+                              jnp.bool_(False), mai.alive)
+        return s.replace(monster_ai=mai.replace(hp=new_hp, alive=new_alive))
 
     # ---- 16: BLINDING_RAY (Sunsword) artifact.c:2053-2086 -----------------
+    # Vendor: do_blinding_ray (apply.c:60-76) → bhit + flash_hits_mon
+    # blinds an adjacent monster for ``damg + rnd(damg)`` turns where
+    # ``damg = blessed?15 : !cursed?10 : 5``.  Nethax has no per-monster
+    # blind timer; we approximate by dealing ``damg + rnd(damg)`` HP
+    # damage to the nearest adjacent alive monster (the observable
+    # side-effect of having the monster's actions degraded).  We assume
+    # uncursed (damg=10) since the wielded-slot artifact is the most
+    # common state.
+    # Cite: vendor/nethack/src/artifact.c::invoke_blinding_ray lines 2053-2086;
+    #       vendor/nethack/src/apply.c::do_blinding_ray lines 60-76;
+    #       vendor/nethack/src/zap.c::flash_hits_mon line 2925.
     def _h_blinding_ray(s):
-        return s
+        mai = s.monster_ai
+        pr = s.player_pos[0].astype(jnp.int32)
+        pc = s.player_pos[1].astype(jnp.int32)
+        mpos = mai.pos.astype(jnp.int32)
+        d_row = jnp.abs(mpos[:, 0] - pr)
+        d_col = jnp.abs(mpos[:, 1] - pc)
+        in_range = (d_row <= jnp.int32(1)) & (d_col <= jnp.int32(1)) & mai.alive
+        damg = jnp.int32(10)  # uncursed default per artifact.c:2070
+        rnd_damg = jax.random.randint(k_handler, (), 1, 11, dtype=jnp.int32)
+        total = damg + rnd_damg
+        new_hp = jnp.where(in_range,
+                           jnp.maximum(mai.hp - total, jnp.int32(0)),
+                           mai.hp)
+        new_alive = jnp.where(in_range & (new_hp <= jnp.int32(0)),
+                              jnp.bool_(False), mai.alive)
+        return s.replace(monster_ai=mai.replace(hp=new_hp, alive=new_alive))
 
     handlers = [
         _h_noop,           #  0  NOOP
