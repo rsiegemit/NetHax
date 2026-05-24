@@ -832,7 +832,11 @@ def _trap_trapdoor(state, rng):
 
 
 def _trap_telep(state, rng):
-    """TELEP_TRAP — teleport to a random FLOOR tile on the current level.
+    """TELEP_TRAP — teleport to a random FLOOR / CORRIDOR tile on the level.
+
+    Audit-M #32: vendor's tele_trap selects any open square (floor OR
+    corridor) — see vendor/nethack/src/teleport.c::tele_trap which calls
+    teleok() / placebc() to find an "open" passable tile.
 
     vendor/nethack/src/trap.c::TELEP_TRAP — tele() picks an open square.
     """
@@ -840,16 +844,20 @@ def _trap_telep(state, rng):
     b = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
     terrain_2d = state.terrain[b, lv]
-    floor_mask = (terrain_2d == jnp.int8(int(TileType.FLOOR))).reshape(-1)
+    # Audit-M #32 — also allow CORRIDOR per vendor teleok() valid-tile mask.
+    open_mask = (
+        (terrain_2d == jnp.int8(int(TileType.FLOOR)))
+        | (terrain_2d == jnp.int8(int(TileType.CORRIDOR)))
+    ).reshape(-1)
     k0, _ = jax.random.split(rng, 2)
-    uni = jax.random.uniform(k0, shape=floor_mask.shape, dtype=jnp.float32)
-    scores = jnp.where(floor_mask, uni, jnp.float32(-1.0))
+    uni = jax.random.uniform(k0, shape=open_mask.shape, dtype=jnp.float32)
+    scores = jnp.where(open_mask, uni, jnp.float32(-1.0))
     flat_idx = jnp.argmax(scores).astype(jnp.int32)
     row = (flat_idx // terrain_2d.shape[1]).astype(jnp.int16)
     col = (flat_idx %  terrain_2d.shape[1]).astype(jnp.int16)
-    any_floor = jnp.any(floor_mask)
-    new_row = jnp.where(any_floor, row, state.player_pos[0])
-    new_col = jnp.where(any_floor, col, state.player_pos[1])
+    any_open = jnp.any(open_mask)
+    new_row = jnp.where(any_open, row, state.player_pos[0])
+    new_col = jnp.where(any_open, col, state.player_pos[1])
     return state.replace(
         player_pos=jnp.stack([new_row, new_col]).astype(jnp.int16)
     )

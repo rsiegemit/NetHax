@@ -155,19 +155,38 @@ def test_pit_d6_damage_and_held():
 
 
 def test_spiked_pit_d10_damage():
-    """SPIKED_PIT: rnd(10) = 1..10 spike damage (vendor trap.c:1925)."""
+    """SPIKED_PIT: rnd(10) spike + (1/6) rnd(8) poison HP (vendor trap.c:1925,
+    1938-1945).
+
+    Audit-M #3: vendor poisoned("spikes", A_STR, ..., 8, FALSE) adds up to
+    rnd(8) HP damage on top of the rnd(10) spike damage when the 1/6 poison
+    roll fires; range therefore [1, 18] overall.  We separate poison vs
+    non-poison by detecting STR drain (vendor A_STR drain on poison).
+    """
     base = _make_state()
+    base = base.replace(player_str=jnp.int16(18))
     base = _place(base, TrapType.SPIKED_PIT)
-    losses = []
-    for seed in range(128):
+    non_poison = []
+    poison    = []
+    for seed in range(256):
         rng = jax.random.PRNGKey(seed)
         out = trigger_trap_envstate(base, rng, 5, 5)
-        losses.append(_hp_loss(base, out))
-    assert all(1 <= l <= 10 for l in losses), (
-        f"SPIKED_PIT HP loss out of [1,10]: {sorted(set(losses))}"
+        loss = _hp_loss(base, out)
+        # Audit-M #3 — vendor poisoned("spikes", A_STR, ...) drains STR.
+        was_poisoned = int(out.player_str) < int(base.player_str)
+        if was_poisoned:
+            poison.append(loss)
+        else:
+            non_poison.append(loss)
+    assert all(1 <= l <= 10 for l in non_poison), (
+        f"SPIKED_PIT non-poison HP loss out of [1,10]: {sorted(set(non_poison))}"
     )
-    assert min(losses) == 1 and max(losses) == 10, (
-        f"Expected SPIKED_PIT to span 1..10, got min={min(losses)} max={max(losses)}"
+    assert all(2 <= l <= 18 for l in poison), (
+        f"SPIKED_PIT poison HP loss out of [2,18]: {sorted(set(poison))}"
+    )
+    assert min(non_poison) == 1 and max(non_poison) == 10, (
+        f"Expected SPIKED_PIT non-poison to span 1..10, got "
+        f"min={min(non_poison)} max={max(non_poison)}"
     )
 
 
@@ -199,24 +218,30 @@ def test_fire_trap_burns_scrolls_in_inv():
     )
 
 
-def test_anti_magic_drains_pw_2_to_12():
-    """ANTI_MAGIC: d(2,6) = 2..12 Pw drain (vendor trap.c:2386).
+def test_anti_magic_drains_pw_total_2_to_12():
+    """ANTI_MAGIC: d(2,6) = 2..12 TOTAL drain (vendor trap.c:2386).
 
-    Note: prompt sheet said "d(2,8)" but vendor source is explicit:
-    ``drain = d(2, 6);  /* 2d6 => 2..12 */`` — vendor wins.
+    Audit-M #35: vendor splits the drain between uenmax (player_pw_max) and
+    current uen (player_pw) when uenmax > drain.  Specifically
+    ``halfd = rnd(drain/2)`` is removed from uenmax and ``drain - halfd``
+    from current.  We therefore check the SUM of the two losses against the
+    original 2..12 range.
     """
     base = _make_state()
     base = _place(base, TrapType.ANTI_MAGIC)
-    drains = []
+    totals = []
     for seed in range(128):
         rng = jax.random.PRNGKey(seed)
         out = trigger_trap_envstate(base, rng, 5, 5)
-        drains.append(_pw_loss(base, out))
-    assert all(2 <= d <= 12 for d in drains), (
-        f"ANTI_MAGIC drain out of [2,12]: {sorted(set(drains))}"
+        pw_loss     = _pw_loss(base, out)
+        pwmax_loss  = int(base.player_pw_max) - int(out.player_pw_max)
+        totals.append(pw_loss + pwmax_loss)
+    assert all(2 <= t <= 12 for t in totals), (
+        f"ANTI_MAGIC total drain out of [2,12]: {sorted(set(totals))}"
     )
-    assert min(drains) == 2 and max(drains) == 12, (
-        f"Expected ANTI_MAGIC to span 2..12, got min={min(drains)} max={max(drains)}"
+    assert min(totals) == 2 and max(totals) == 12, (
+        f"Expected ANTI_MAGIC to span 2..12 total, got "
+        f"min={min(totals)} max={max(totals)}"
     )
 
 
