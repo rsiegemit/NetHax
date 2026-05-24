@@ -1821,6 +1821,78 @@ def _handle_jump(state, rng):
     return state.replace(player_pos=new_pos)
 
 
+def _handle_monster_ability(state, rng):
+    """#monster — vendor/nethack/src/monst.c::domonability line 87.
+
+    Use the polyform-specific monster ability.  Vendor dispatches based
+    on `youmonst.data->mlet` and `mflags2`:
+      - Dragons (S_DRAGON): breath weapon (8d6 AoE in a 3-tile radius)
+      - Vampires: shapechange to mist (intangible)
+      - Mind flayers: psychic blast (mass damage)
+      - Were-: change form
+      - Gnomes / dwarves with pickaxe: dig down
+
+    Wave-46 minimum: dragon breath only.  If player is polymorphed into
+    a S_DRAGON-symbol form, deal d(8, 6) damage to all alive monsters
+    in Chebyshev≤3 around the player.  Otherwise no-op.
+
+    Cite: vendor/nethack/src/monst.c::domonability line 87.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS as _MM, MonsterSymbol
+    poly = state.polymorph
+    form = poly.current_form_idx.astype(jnp.int32)
+    n_mons = len(_MM)
+    safe_form = jnp.clip(form, 0, n_mons - 1)
+
+    is_dragon_arr = jnp.array(
+        [int(m.symbol == int(MonsterSymbol.S_DRAGON)) for m in _MM],
+        dtype=jnp.bool_,
+    )
+    is_dragon = poly.is_polymorphed & is_dragon_arr[safe_form]
+
+    mai = state.monster_ai
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    mpos = mai.pos.astype(jnp.int32)
+    d_row = jnp.abs(mpos[:, 0] - pr)
+    d_col = jnp.abs(mpos[:, 1] - pc)
+    in_range = (d_row <= jnp.int32(3)) & (d_col <= jnp.int32(3)) & mai.alive
+
+    # Breath damage: d(8, 6) = sum of 8d6 = 8..48.
+    keys = jax.random.split(rng, 8)
+    dmg = sum(
+        jax.random.randint(keys[i], (), 1, 7, dtype=jnp.int32) for i in range(8)
+    )
+    targets = is_dragon & in_range
+    new_hp = jnp.where(targets,
+                       jnp.maximum(mai.hp - dmg, jnp.int32(0)),
+                       mai.hp)
+    new_alive = jnp.where(targets & (new_hp <= jnp.int32(0)),
+                          jnp.bool_(False), mai.alive)
+    return state.replace(monster_ai=mai.replace(hp=new_hp, alive=new_alive))
+
+
+def _handle_ui_noop(state, rng):
+    """UI-only commands (#version, #vanquished, #genocided, #explore, #?).
+
+    Vendor displays informational text and does not mutate game state:
+      - #version (cmd.c::doversion):    print version string.
+      - #vanquished (cmd.c::dovanquished): list slain monsters.
+      - #genocided (cmd.c::dogenocided): list genocided species.
+      - #explore (cmd.c::enter_explore_mode): toggles wizard flag (no
+        observable state in Nethax — there is no explore_mode field).
+      - #? (cmd.c::doextlist): print extended command help.
+
+    All return ECMD_OK with no state change.  This handler exists to
+    explicitly cover the dispatch slot rather than collapse to a
+    sentinel NOOP, so each meta-byte route has a vendor-cited entry.
+
+    Cite: vendor/nethack/src/cmd.c::doversion / dovanquished /
+          dogenocided / enter_explore_mode / doextlist.
+    """
+    return state
+
+
 def _handle_chat(state, rng):
     """#chat — vendor/nethack/src/pray.c::dochat line 88.
 
@@ -2489,6 +2561,8 @@ _HANDLERS = (
     _handle_force,      # 55  vendor/nethack/src/lock.c::doforce (M-f → break lock)
     _handle_chat,       # 56  vendor/nethack/src/pray.c::dochat (M-c → priest heal)
     _handle_turn_undead,# 57  vendor/nethack/src/pray.c::doturn (M-t → smite undead)
+    _handle_monster_ability,# 58  vendor/nethack/src/monst.c::domonability (M-m)
+    _handle_ui_noop,    # 59  vendor cmd.c info-only commands (M-g/v/V/X/?)
 )
 
 # Slot indices for each named handler.
@@ -2569,6 +2643,10 @@ _SLOT_FORCE      = 55
 _SLOT_CHAT       = 56
 # #turn (M-t) — vendor/nethack/src/pray.c::doturn.
 _SLOT_TURN       = 57
+# #monster ability (M-m) — vendor/nethack/src/monst.c::domonability.
+_SLOT_MONSTER_ABILITY = 58
+# UI-only commands (#version, #vanquished, #genocided, #explore, #?).
+_SLOT_UI_NOOP    = 59
 
 # ---------------------------------------------------------------------------
 # 256-entry lookup table: action ASCII value → handler slot index
@@ -2747,11 +2825,11 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     table[_M_byte("d")] = _SLOT_DIP    # cmd.c::dodip — potion.c::dodip line 2267
     table[_M_byte("e")] = _SLOT_ENHANCE  # cmd.c:1716 — M('e') → enhance_weapon_skill
     table[_M_byte("f")] = _SLOT_FORCE  # lock.c::doforce (break locked container)
-    table[_M_byte("g")] = _SLOT_NOOP   # cmd.c::dogenocided
+    table[_M_byte("g")] = _SLOT_UI_NOOP # cmd.c::dogenocided (UI list)
     table[_M_byte("i")] = _SLOT_INVOKE  # cmd.c::doinvoke → artifact.c::arti_invoke
     table[_M_byte("j")] = _SLOT_JUMP   # apply.c::dojump
     table[_M_byte("l")] = _SLOT_LOOT   # cmd.c::doloot (already set via Command.LOOT)
-    table[_M_byte("m")] = _SLOT_NOOP   # cmd.c::domonability
+    table[_M_byte("m")] = _SLOT_MONSTER_ABILITY  # monst.c::domonability
     table[_M_byte("n")] = _SLOT_NAME   # cmd.c::docallcmd (name alias)
     table[_M_byte("o")] = _SLOT_OFFER  # cmd.c::dosacrifice → pray.c::offer_real_amulet
     table[_M_byte("p")] = _SLOT_PRAY   # cmd.c::dopray (already set)
@@ -2762,11 +2840,11 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     table[_M_byte("t")] = _SLOT_TURN   # pray.c::doturn (smite undead)
     table[_M_byte("T")] = _SLOT_TIP_DOWN  # cmd.c::dotip → WAN_DIGGING down-dig (dig.c:1548)
     table[_M_byte("u")] = _SLOT_UNTRAP # untrap.c::dountrap (disarm adjacent)
-    table[_M_byte("v")] = _SLOT_NOOP   # cmd.c::doextversion
-    table[_M_byte("V")] = _SLOT_NOOP   # cmd.c::dovanquished
+    table[_M_byte("v")] = _SLOT_UI_NOOP # cmd.c::doextversion (UI text)
+    table[_M_byte("V")] = _SLOT_UI_NOOP # cmd.c::dovanquished (UI list)
     table[_M_byte("w")] = _SLOT_WIPE   # apply.c::dowipe (clear face → BLIND=0)
-    table[_M_byte("X")] = _SLOT_NOOP   # cmd.c::enter_explore_mode
-    table[_M_byte("?")] = _SLOT_NOOP   # cmd.c::doextlist
+    table[_M_byte("X")] = _SLOT_UI_NOOP # cmd.c::enter_explore_mode (no flag)
+    table[_M_byte("?")] = _SLOT_UI_NOOP # cmd.c::doextlist (UI help)
 
     # ---- Ctrl-prefixed commands (C(x) == 0x1F & ord(x)) ----
     # Ctrl-d (KICK) and Ctrl-p (PREVMSG) already handled via Command.* enum.
@@ -2875,6 +2953,8 @@ _COMPACT_WIPE       = 40
 _COMPACT_FORCE      = 41
 _COMPACT_CHAT       = 42
 _COMPACT_TURN       = 43
+_COMPACT_MONSTER_ABILITY = 44
+_COMPACT_UI_NOOP    = 45
 
 
 def _build_compact_handlers():
@@ -2924,6 +3004,8 @@ def _build_compact_handlers():
         _wrap_no_dir(_handle_force),     # 41  COMPACT_FORCE — lock.c::doforce
         _wrap_no_dir(_handle_chat),      # 42  COMPACT_CHAT — pray.c::dochat
         _wrap_no_dir(_handle_turn_undead),# 43  COMPACT_TURN — pray.c::doturn
+        _wrap_no_dir(_handle_monster_ability),# 44  COMPACT_MONSTER_ABILITY
+        _wrap_no_dir(_handle_ui_noop),   # 45  COMPACT_UI_NOOP — UI-only cmds
     )
 
 
@@ -2932,7 +3014,7 @@ _COMPACT_HANDLERS: tuple = _build_compact_handlers()
 
 def _build_slot_to_compact() -> jnp.ndarray:
     """Map legacy handler slot (0..54) → compact slot (0..40)."""
-    table = [0] * 58
+    table = [0] * 60
     # Movement slots 1..8 → COMPACT_MOVE.
     for s in (_SLOT_MOVE_N, _SLOT_MOVE_E, _SLOT_MOVE_S, _SLOT_MOVE_W,
               _SLOT_MOVE_NE, _SLOT_MOVE_SE, _SLOT_MOVE_SW, _SLOT_MOVE_NW):
@@ -2983,6 +3065,8 @@ def _build_slot_to_compact() -> jnp.ndarray:
     table[_SLOT_FORCE]      = _COMPACT_FORCE     # lock.c::doforce
     table[_SLOT_CHAT]       = _COMPACT_CHAT      # pray.c::dochat
     table[_SLOT_TURN]       = _COMPACT_TURN      # pray.c::doturn
+    table[_SLOT_MONSTER_ABILITY] = _COMPACT_MONSTER_ABILITY  # monst.c::domonability
+    table[_SLOT_UI_NOOP]    = _COMPACT_UI_NOOP   # cmd.c info-only commands
     return jnp.array(table, dtype=jnp.int32)
 
 
@@ -2992,7 +3076,7 @@ def _build_slot_to_dir_idx() -> jnp.ndarray:
     Non-movement slots map to 0 (the direction is unused for those branches).
     The order matches ``_DIR_TABLE``: N=0, E=1, S=2, W=3, NE=4, SE=5, SW=6, NW=7.
     """
-    table = [0] * 58
+    table = [0] * 60
     # Move slots.
     table[_SLOT_MOVE_N]  = 0
     table[_SLOT_MOVE_E]  = 1
