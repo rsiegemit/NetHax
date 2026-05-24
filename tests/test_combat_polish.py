@@ -93,8 +93,15 @@ def test_worn_armor_total_ac_from_multiple_slots():
 # 2. Two-weapon combat
 # ---------------------------------------------------------------------------
 
+@pytest.mark.timeout(900)
 def test_two_weapon_toggle_via_command():
-    """env.step(Command.TWOWEAPON) flips state.combat.two_weapon."""
+    """env.step(Command.TWOWEAPON) flips state.combat.two_weapon.
+
+    Wave 42-era cold env.step JIT compile is ~200-300s post-Round-3
+    additions (priest subsystem + monster_ai NATTK loop + cursed_book
+    7-branch).  Bumped from conftest 120s default, matching the existing
+    @timeout(900) marker on sibling tests in this file.
+    """
     from Nethax.nethax.env import NethaxEnv
     from Nethax.nethax.constants.actions import Command
 
