@@ -212,10 +212,10 @@ _DUNGEON_NUM_LEVELS_VENDOR_SPEC: dict = {
     int(Branch.MAIN):          (25, 5),   # dungeon.def line 17
     int(Branch.GEHENNOM):      (20, 5),   # dungeon.def line 51
     int(Branch.GNOMISH_MINES): (8, 2),    # dungeon.def line 71
+    int(Branch.QUEST):         (5, 2),    # dungeon.def line 86
+    int(Branch.SOKOBAN):       (4, 0),    # dungeon.def line 94 (rand=0 ⇒ fixed)
     int(Branch.ENDGAME):       (6, 0),    # dungeon.def line 134 (rand=0 ⇒ fixed)
     # Subsequent commits will populate:
-    # int(Branch.QUEST):       (5, 2),   # dungeon.def line 86
-    # int(Branch.SOKOBAN):     (4, 0),   # dungeon.def line 94
     # int(Branch.VLAD):        (3, 0),   # dungeon.def line 116
 }
 
@@ -255,7 +255,11 @@ _BRANCH_CHAIN_VENDOR_SPEC: dict = {
         (5, 5),            # Oracle @ (5, 5) — dungeon.def line 22
         (1, 0),            # rcouple offset above oracle — dungeon.def line 24
     ),
-    # int(Branch.QUEST): (int(Branch.MAIN), (5, 5), (6, 2)),  # oracle + (6, 2)
+    int(Branch.QUEST): (
+        int(Branch.MAIN),  # anchor branch (Main, where oracle level lives)
+        (5, 5),            # Oracle @ (5, 5) — dungeon.def line 22
+        (6, 2),            # rcouple offset = oracle + (6, 2) — dungeon.def line 26
+    ),
     # int(Branch.VLAD):  (int(Branch.GEHENNOM), (1, 0), (9, 5)),  # see Commit 6
 }
 
