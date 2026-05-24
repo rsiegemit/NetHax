@@ -807,6 +807,18 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
         dknown = new_items.dknown.at[safe_slot].set(
             jnp.where(write_slot, jnp.bool_(True), new_items.dknown[safe_slot])
         ),
+        # Preserve obj->oartifact across drop-and-pickup so the artifact's
+        # cspfx extrinsics keep firing once carried.  Cite:
+        # vendor/nethack/include/obj.h obj->oartifact.
+        # Audit K wire-up follow-up: previously this field defaulted to -1
+        # on every pickup, losing artifact identity.
+        artifact_idx = new_items.artifact_idx.at[safe_slot].set(
+            jnp.where(
+                fresh_write,
+                ground_items.artifact_idx[branch, level, row, col, 0],
+                new_items.artifact_idx[safe_slot],
+            )
+        ),
     )
 
     # Clear ground tile (set category to 0)
@@ -990,6 +1002,11 @@ def drop(state, rng, ground_items: Item, branch: int, level: int, slot_idx: int)
         weight      = ground_items.weight.at[branch, level, row, col, safe_gs].set(new_wt_at_pos),
         ac_bonus    = _set_ground(ground_items.ac_bonus,    inv.ac_bonus),
         is_two_handed = _set_ground(ground_items.is_two_handed, inv.is_two_handed),
+        # Preserve obj->oartifact across the drop (Audit K wire-up).  Without
+        # this, dropping an artifact loses its identity — subsequent pickup
+        # would not re-grant cspfx extrinsics.  Cite: vendor/nethack/include/
+        # obj.h obj->oartifact.
+        artifact_idx = _set_ground(ground_items.artifact_idx, inv.artifact_idx),
     )
 
     # Zero the inventory slot (item leaves inventory regardless of merge/fresh).
@@ -1004,6 +1021,10 @@ def drop(state, rng, ground_items: Item, branch: int, level: int, slot_idx: int)
         weight     = inv.weight.at[slot_idx].set(jnp.where(can_drop, jnp.int32(0), inv.weight[slot_idx])),
         ac_bonus   = inv.ac_bonus.at[slot_idx].set(jnp.where(can_drop, jnp.int8(0), inv.ac_bonus[slot_idx])),
         is_two_handed = inv.is_two_handed.at[slot_idx].set(jnp.where(can_drop, jnp.bool_(False), inv.is_two_handed[slot_idx])),
+        # Clear the dropped slot's artifact_idx back to -1.
+        artifact_idx = inv.artifact_idx.at[slot_idx].set(
+            jnp.where(can_drop, jnp.int8(-1), inv.artifact_idx[slot_idx])
+        ),
     )
 
     new_inv = state_altared.inventory.replace(
