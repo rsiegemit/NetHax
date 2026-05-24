@@ -6,7 +6,7 @@ Tests:
   1. test_poly_while_riding_dismounts     — polyself.c:1412
   2. test_silver_armor_drops_on_vampire_poly — polyself.c::retouch_equipment
   3. test_genocide_self_kills_on_revert   — polyself.c::rehumanize (ugenocided)
-  4. test_newman_resets_hunger            — polyself.c:336
+  4. test_newman_resets_hunger            — polyself.c:414
   5. test_poly_clamps_pw                  — polyself.c (Pw rescale)
 """
 import os
@@ -212,9 +212,15 @@ def test_genocide_self_kills_on_revert():
 # ---------------------------------------------------------------------------
 
 def test_newman_resets_hunger():
-    """newman() resets nutrition to 1000 (NORMAL) regardless of prior value.
+    """newman() resets nutrition to rn1(500, 500) ∈ [500, 999] per vendor.
 
-    polyself.c:336 — newman() restores the player to normal hunger.
+    Wave 36e (commit eedac47) corrected newman to vendor polyself.c:414:
+        u.uhunger = rn1(500, 500);
+    where rn1(x, y) := rn2(x) + y, giving the range [500, 999] inclusive
+    (uniform).  The previous assertion ``== 1000`` pinned the pre-wave-36e
+    flat-1000 simplification, which was a documented Nethax-only divergence
+    cited (incorrectly) at polyself.c:336 — the real vendor reference is
+    line 414.
     """
     state = _base_state()
 
@@ -225,8 +231,9 @@ def test_newman_resets_hunger():
 
     new_state = newman(state, _RNG)
 
-    assert int(new_state.status.nutrition) == 1000, (
-        f"newman() should reset nutrition to 1000; got {int(new_state.status.nutrition)}"
+    n = int(new_state.status.nutrition)
+    assert 500 <= n < 1000, (
+        f"newman() should reset nutrition to rn1(500, 500) ∈ [500, 999); got {n}"
     )
 
 
