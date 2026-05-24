@@ -7,7 +7,7 @@ Covers:
   - MAGIC_TRAP outcome 1: gain ability (+1 random stat)
   - MAGIC_TRAP outcome 3: polymorph self
   - MAGIC_TRAP outcome 6: heal hp = hp_max
-  - DART_TRAP 1/3 poison chance -> SICK + STR loss
+  - DART_TRAP 1/6 poison chance -> SICK + A_CON loss + rnd(10) HP (Wave 42b)
   - POLY_TRAP polymorphs player
 """
 import os
@@ -307,48 +307,61 @@ class TestMagicTrapHeal:
 # ---------------------------------------------------------------------------
 
 class TestDartTrapPoisonChance:
-    """DART_TRAP 1/3 poison -> SICK status + STR loss — trap.c:1273."""
+    """DART_TRAP 1/6 poison -> SICK + A_CON drain + rnd(10) HP — trap.c:1273-1284.
+
+    Wave 42b (Audit M #1, #2): old expectation was 1/3 chance + STR loss; vendor
+    actually uses ``!rn2(6)`` (1/6) and ``poisoned("dart", A_CON, ..., 10, TRUE)``
+    which drains A_CON (not STR) and adds up to rnd(10) HP poison damage on
+    top of the dart's d3 damage.
+    """
 
     def test_dart_trap_poison_chance(self):
-        """Over 60 seeds at 1/3 chance, at least one should trigger SICK."""
+        """Over 200 seeds at 1/6 chance, at least one should trigger SICK."""
+        # Wave 42b: vendor is 1/6 (not 1/3) so widen the sample size.
         got_poison = False
-        for i in range(60):
+        for i in range(200):
             rng = jax.random.PRNGKey(i + 6000)
-            state = _make_state(hp=50)
-            state = state.replace(player_str=jnp.int16(18))
+            state = _make_state(hp=200)
+            state = state.replace(player_con=jnp.int8(18))
             state = _place_trap_at(state, 5, 5, TrapType.DART_TRAP)
             new_state = trigger_trap_envstate(state, rng, 5, 5)
             sick = int(new_state.status.timed_statuses[int(TimedStatus.SICK)])
             if sick > 0:
                 got_poison = True
                 break
-        assert got_poison, "DART_TRAP should sometimes apply SICK (1/3 chance)"
+        assert got_poison, "DART_TRAP should sometimes apply SICK (1/6 chance)"
 
-    def test_dart_trap_poison_str_loss(self):
-        """When poisoned, STR should decrease by 1."""
-        for i in range(200):
+    def test_dart_trap_poison_con_loss(self):
+        """Wave 42b: when poisoned, A_CON should decrease by 1 (vendor A_CON)."""
+        for i in range(400):
             rng = jax.random.PRNGKey(i + 7000)
-            state = _make_state(hp=50)
-            state = state.replace(player_str=jnp.int16(18))
+            state = _make_state(hp=200)
+            state = state.replace(player_con=jnp.int8(18))
             state = _place_trap_at(state, 5, 5, TrapType.DART_TRAP)
             new_state = trigger_trap_envstate(state, rng, 5, 5)
             sick = int(new_state.status.timed_statuses[int(TimedStatus.SICK)])
             if sick > 0:
-                assert int(new_state.player_str) == 17, (
-                    f"DART_TRAP poison should reduce STR by 1; got {int(new_state.player_str)}"
+                assert int(new_state.player_con) == 17, (
+                    f"DART_TRAP poison should reduce CON by 1; got "
+                    f"{int(new_state.player_con)}"
                 )
                 return
-        pytest.skip("No poisoned dart found in 200 seeds — increase range")
+        pytest.skip("No poisoned dart found in 400 seeds — increase range")
 
     def test_dart_trap_deals_damage(self):
-        """DART_TRAP always deals d3 damage."""
-        for i in range(10):
+        """DART_TRAP deals d3 dart damage; on poison adds up to rnd(10) HP.
+
+        Wave 42b: previously asserted strict ``dmg in [1,3]``; vendor poison
+        path adds rnd(10) HP damage so range becomes [1, 13] when poisoned.
+        """
+        for i in range(40):
             rng = jax.random.PRNGKey(i + 8000)
-            state = _make_state(hp=50)
+            state = _make_state(hp=200)  # higher HP so poison doesn't kill us
             state = _place_trap_at(state, 5, 5, TrapType.DART_TRAP)
             new_state = trigger_trap_envstate(state, rng, 5, 5)
-            dmg = 50 - int(new_state.player_hp)
-            assert 1 <= dmg <= 3, f"DART_TRAP damage {dmg} out of [1,3]"
+            dmg = 200 - int(new_state.player_hp)
+            # vendor: d3 dart + (1/6)*rnd(10) poison = 1..3 or 2..13.
+            assert 1 <= dmg <= 13, f"DART_TRAP damage {dmg} out of [1,13]"
 
 
 # ---------------------------------------------------------------------------

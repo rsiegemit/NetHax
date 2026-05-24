@@ -605,33 +605,41 @@ def _trap_arrow(state, rng):
 
 
 def _trap_dart(state, rng):
-    """DART_TRAP — d3 damage + 1/3 poison → SICK + STR loss.
+    """DART_TRAP — d3 damage + 1/6 poison → A_CON drain + rnd(10) HP.
 
-    Audit parity: 1/3 chance of poison (rn2(3)==0) → SICK timed status
-    and -1 STR loss, mirroring vendor/nethack/src/trap.c:1273-1284 where
-    otmp->opoisoned = 1 triggers poisoned("dart", A_CON, ...) which drains
-    a constitution/strength point.  We map to STR loss here per audit spec.
+    Wave 42b (Audit M #1, #2): vendor uses ``!rn2(6)`` (1/6 chance), not 1/3,
+    and on poison calls ``poisoned("dart", A_CON, ..., 10, TRUE)`` which drains
+    a CON point and (in the dominant path) applies rnd(10)-ish HP poison damage
+    on top of the dart damage.
 
-    Citation: vendor/nethack/src/trap.c:1273 DART_TRAP poison branch.
+    Citation: vendor/nethack/src/trap.c:1273-1284 DART_TRAP poison branch
+    (``if (!rn2(6)) otmp->opoisoned = 1`` then
+    ``poisoned("dart", A_CON, "little dart", 10, TRUE)``).
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
-    k0, k1, k2 = jax.random.split(rng, 3)
+    k0, k1, k2, k3 = jax.random.split(rng, 4)
     s = _apply_hp_damage(state, _d(k0, 3))
-    # 1/3 poison chance: rn2(3)==0.
-    poisoned = jax.random.randint(k1, (), 0, 3) == jnp.int32(0)
-    poison_turns = _d(k2, 10)
+    # Audit M #1 — 1/6 poison chance via !rn2(6).
+    poisoned = jax.random.randint(k1, (), 0, 6) == jnp.int32(0)
+    # Audit M #2 — vendor drains A_CON + up to rnd(10) HP poison damage.
+    poison_hp_dmg = _d(k2, 10)
+    poison_sick_turns = _d(k3, 10)
 
     def _do_poison(s_):
         new_sick_ts = s_.status.timed_statuses.at[int(TimedStatus.SICK)].set(
-            jnp.maximum(s_.status.timed_statuses[int(TimedStatus.SICK)], poison_turns)
+            jnp.maximum(s_.status.timed_statuses[int(TimedStatus.SICK)],
+                        poison_sick_turns)
         )
         new_status = s_.status.replace(
             sick_kind=jnp.int8(1),
             timed_statuses=new_sick_ts,
         )
-        # STR loss: clamp at 3 (minimum meaningful strength).
-        new_str = jnp.maximum(s_.player_str - jnp.int16(1), jnp.int16(3))
-        return s_.replace(status=new_status, player_str=new_str)
+        # vendor A_CON -1 drain (was incorrectly STR; cite trap.c:1281 "A_CON").
+        new_con = jnp.maximum(s_.player_con - jnp.int8(1), jnp.int8(3))
+        new_hp = jnp.maximum(s_.player_hp - poison_hp_dmg.astype(jnp.int32),
+                             jnp.int32(0))
+        return s_.replace(status=new_status, player_con=new_con,
+                          player_hp=new_hp)
 
     return jax.lax.cond(poisoned, _do_poison, lambda s_: s_, s)
 
@@ -742,8 +750,16 @@ def _trap_fire(state, rng):
 def _trap_pit(state, rng):
     """PIT — rnd(6)=1..6 damage; FROZEN for rn1(6,2)=2..7 climb-out turns.
 
-    vendor/nethack/src/trap.c:1920 — ``set_utrap((unsigned) rn1(6, 2), TT_PIT);``
-    vendor/nethack/src/trap.c:1950 — ``losehp(Maybe_Half_Phys(rnd(adj_pit ? 3 : 6)), ...);``
+    Wave 42b (Audit M #4): vendor uses ``rnd(adj_pit ? 3 : 6)`` and skips fall
+    damage entirely when ``conjoined_pit`` is set or the player is ``Flying``
+    or ``is_clinger``.  Those flags aren't plumbed into ``EnvState`` yet, so
+    we apply the default ``rnd(6)`` branch (matches vendor when adj_pit=FALSE
+    and player is grounded), and DEFER the corner-case branches.
+
+    Citations:
+      vendor/nethack/src/trap.c:1920 — ``set_utrap((unsigned) rn1(6, 2), TT_PIT);``
+      vendor/nethack/src/trap.c:1948-1953 — ``if (!conj_pit && !deliberate
+        && !(plunged && (Flying || is_clinger(...)))) losehp(rnd(adj_pit ? 3 : 6), ...);``
     rn1(6,2) = rn2(6)+2 = 2..7 turns trapped (we model as `_d(rng,6)+1` = 2..7).
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
@@ -754,30 +770,40 @@ def _trap_pit(state, rng):
 
 
 def _trap_spiked_pit(state, rng):
-    """SPIKED_PIT — rnd(10)=1..10 damage + 1/6 poison; FROZEN rn1(6,2)=2..7.
+    """SPIKED_PIT — rnd(10)=1..10 damage + 1/6 poison: A_STR drain + rnd(8) HP.
 
-    vendor/nethack/src/trap.c:1920 — ``set_utrap((unsigned) rn1(6, 2), TT_PIT);``
-    vendor/nethack/src/trap.c:1925 — ``losehp(Maybe_Half_Phys(rnd(conj_pit ? 4 : adj_pit ? 6 : 10)), ...);``
-    vendor/nethack/src/trap.c:1938 — ``if (!rn2(6)) poisoned("spikes", ...)`` → 1/6 poison.
+    Wave 42b (Audit M #3): vendor calls
+    ``poisoned("spikes", A_STR, ..., 8, FALSE)`` which drains an A_STR point
+    and may add up to rnd(8) HP poison damage on top of the spike damage.
+
+    Citations:
+      vendor/nethack/src/trap.c:1920 — ``set_utrap((unsigned) rn1(6, 2), TT_PIT);``
+      vendor/nethack/src/trap.c:1925 — ``losehp(... rnd(conj_pit ? 4 : adj_pit ? 6 : 10) ...);``
+      vendor/nethack/src/trap.c:1938-1945 — ``if (!rn2(6)) poisoned("spikes", A_STR, ..., 8, FALSE);``
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
-    k0, k1, k2, k3 = jax.random.split(rng, 4)
+    k0, k1, k2, k3, k4 = jax.random.split(rng, 5)
     s = _apply_hp_damage(state, _d(k0, 10))
     # rn1(6,2) = 2..7 turns held.
     s = _set_timed_status(s, int(TimedStatus.FROZEN), _d(k1, 6) + jnp.int32(1))
     # 1/6 poison: vendor uses !rn2(6).
     poisoned = jax.random.randint(k2, (), 0, 6) == jnp.int32(0)
-    poison_turns = _d(k3, 10)
+    poison_hp_dmg = _d(k3, 8)            # Audit M #3 — +rnd(8) HP poison.
+    poison_sick_turns = _d(k4, 10)
 
     def _do_poison(s_):
         new_sick = s_.status.replace(
             sick_kind=jnp.int8(1),
             timed_statuses=s_.status.timed_statuses.at[int(TimedStatus.SICK)].set(
                 jnp.maximum(s_.status.timed_statuses[int(TimedStatus.SICK)],
-                            poison_turns)
+                            poison_sick_turns)
             ),
         )
-        return s_.replace(status=new_sick)
+        # Audit M #3 — vendor drains A_STR (NOT just SICK timer).
+        new_str = jnp.maximum(s_.player_str - jnp.int16(1), jnp.int16(3))
+        new_hp = jnp.maximum(s_.player_hp - poison_hp_dmg.astype(jnp.int32),
+                             jnp.int32(0))
+        return s_.replace(status=new_sick, player_str=new_str, player_hp=new_hp)
 
     return jax.lax.cond(poisoned, _do_poison, lambda s_: s_, s)
 
