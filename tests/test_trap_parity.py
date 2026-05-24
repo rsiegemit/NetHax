@@ -191,8 +191,15 @@ def test_spiked_pit_d10_damage():
 
 
 def test_fire_trap_burns_scrolls_in_inv():
-    """FIRE_TRAP: d(2,4) = 2..8 damage + burns SCROLL/SPBOOK/POTION
-    (vendor trap.c:4238 + fire_damage in trap.c:4514)."""
+    """FIRE_TRAP: d(2,4) = 2..8 damage + sometimes burns SCROLL/SPBOOK/POTION
+    (vendor trap.c:4238 + fire_damage in trap.c:4514).
+
+    Wave 42b (Audit M #11, #12): old expectation was that every trigger burns
+    the scroll.  Vendor uses ``burnarmor(youmonst) || rn2(3)`` (2/3 of
+    triggers actually invoke fire_damage on items) AND each item then runs
+    a luck save ``(Luck + 5) > rn2(20)``.  We assert the looser invariant
+    that across many seeds the scroll burns OFTEN but not always.
+    """
     base = _make_state()
     inv = base.inventory
     new_items = inv.items.replace(
@@ -204,15 +211,27 @@ def test_fire_trap_burns_scrolls_in_inv():
     base = _place(base, TrapType.FIRE_TRAP)
 
     losses = []
-    for seed in range(32):
+    burned = 0
+    n_trials = 128
+    for seed in range(n_trials):
         rng = jax.random.PRNGKey(seed)
-        out = trigger_trap_envstate(base, rng, 5, 5)
-        losses.append(_hp_loss(base, out))
-        # Scroll must always burn.
-        assert int(out.inventory.items.quantity[0]) == 0, (
-            f"seed={seed}: expected scroll qty 0, got "
-            f"{int(out.inventory.items.quantity[0])}"
+        # Reset scroll qty between trials so we can count burn events.
+        trial = base.replace(
+            inventory=base.inventory.replace(
+                items=base.inventory.items.replace(
+                    quantity=base.inventory.items.quantity.at[0].set(jnp.int16(5))
+                )
+            )
         )
+        out = trigger_trap_envstate(trial, rng, 5, 5)
+        losses.append(_hp_loss(trial, out))
+        if int(out.inventory.items.quantity[0]) == 0:
+            burned += 1
+    # Wave 42b: scroll should burn often (>30%) but not always; vendor expected
+    # rate is ~ (2/3) * P(luck save fails) ≈ 50% at Luck=0.
+    assert 0.30 * n_trials <= burned <= 0.95 * n_trials, (
+        f"FIRE_TRAP scroll burn rate {burned}/{n_trials} outside [30%, 95%]"
+    )
     assert all(2 <= l <= 8 for l in losses), (
         f"FIRE_TRAP HP loss out of [2,8]: {sorted(set(losses))}"
     )

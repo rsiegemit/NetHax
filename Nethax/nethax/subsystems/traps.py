@@ -775,24 +775,98 @@ def _trap_rust(state, rng):
 
 
 def _trap_fire(state, rng):
-    """FIRE_TRAP — d(2,4)=2..8 damage; destroys scrolls / spellbooks / potions.
+    """FIRE_TRAP — vendor-parity dofiretrap (Audit M #8-#12, Wave 42b).
 
-    vendor/nethack/src/trap.c:4238 — ``orig_dmg = num = d(2, 4);`` inside
-    ``dofiretrap`` (the player branch of FIRE_TRAP).
-    vendor/nethack/src/trap.c:4514-4538 — ``fire_damage`` destroys SCROLL,
-    SPBOOK, and POTION objects in the inventory.
+    Implements the player branch of vendor/nethack/src/trap.c::dofiretrap
+    (lines 4232-4314):
+
+    * (#10) Underwater / box-in-pool branch (line 4244): if standing in
+      water, take ``rnd(3)`` boiling-water HP (0 if Fire_resistance) and
+      return — no UHPMAX drain, no item destruction.
+    * (#9) Fire_resistance branch (line 4258): ``num = rn2(2)`` HP damage
+      (0..1) instead of the full d(2,4).
+    * (#8) UHPMAX drain (line 4289): if not Fire_resistance and not Upolyd,
+      ``u.uhpmax -= rn2(min(u.uhpmax, num+1))``.
+    * (#11) Item destruction gate (line 4306): items only burn when
+      ``burnarmor(youmonst) || rn2(3)`` — i.e. 2/3 chance per trigger
+      (we omit the burnarmor short-circuit; corpse-strapping
+      burnarmor plumbing not exposed to traps).
+    * (#12) Per-item luck save (line 4514, ``fire_damage``): each item
+      survives when ``(Luck + 5) > rn2(20)`` (uses ``player_luck``).
+      Iceboxes / statues are vendor-immune (we don't model those item
+      sub-types here; SCROLL/SPBOOK/POTION are all eligible).
+
+    Citations:
+      vendor/nethack/src/trap.c:4238 — ``orig_dmg = num = d(2, 4);``
+      vendor/nethack/src/trap.c:4244 — underwater branch ``rnd(3)``
+      vendor/nethack/src/trap.c:4255-4258 — fire-resistance ``num = rn2(2)``
+      vendor/nethack/src/trap.c:4285-4297 — UHPMAX drain
+      vendor/nethack/src/trap.c:4306-4309 — ``burnarmor(...) || rn2(3)`` gate
+      vendor/nethack/src/trap.c:4453+ ``fire_damage`` (per-item luck save)
     """
     from Nethax.nethax.subsystems.inventory import ItemCategory
-    k0, k1 = jax.random.split(rng, 2)
-    s = _apply_hp_damage(state, _d(k0, 4) + _d(k1, 4))
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    k0, k1, k2, k3, k4, k5, k6 = jax.random.split(rng, 7)
+
+    has_fire_res = state.status.intrinsics[int(Intrinsic.RESIST_FIRE)]
+    in_water     = state.player_in_water
+
+    # vendor trap.c:4287 — base ``num = d(2, 4) = 2..8`` for the normal player branch.
+    base_num = _d(k0, 4) + _d(k1, 4)
+    # vendor trap.c:4258 — fire-resistance: ``num = rn2(2) = 0..1``.
+    fire_res_num = jax.random.randint(k2, (), 0, 2).astype(jnp.int32)
+    # vendor trap.c:4250 — underwater: ``rnd(3) = 1..3`` boiling water, 0 if fire-res.
+    water_num = _d(k3, 3)
+
+    # Pick the damage according to which branch fires.
+    num = jnp.where(
+        in_water,
+        jnp.where(has_fire_res, jnp.int32(0), water_num),
+        jnp.where(has_fire_res, fire_res_num, base_num),
+    )
+
+    new_hp = jnp.maximum(state.player_hp - num, jnp.int32(0))
+    # Audit M #8 — UHPMAX drain ``rn2(min(uhpmax, num+1))`` when not fire-res
+    # and not polymorphed.  We don't track u.uhpmax separately on poly so the
+    # not-polymorphed branch always applies.
+    uhpmax_cap = jnp.minimum(state.player_hp_max, num + jnp.int32(1))
+    # rn2(cap): cap may be <= 0 so guard against an invalid randint range.
+    uhpmax_drain = jnp.where(
+        uhpmax_cap > jnp.int32(0),
+        jax.random.randint(k4, (), 0, jnp.maximum(uhpmax_cap, jnp.int32(1))).astype(jnp.int32),
+        jnp.int32(0),
+    )
+    apply_uhpmax_drain = (~has_fire_res) & (~in_water)
+    new_hp_max = jnp.where(
+        apply_uhpmax_drain,
+        jnp.maximum(state.player_hp_max - uhpmax_drain, jnp.int32(1)),
+        state.player_hp_max,
+    )
+    new_hp_clamped = jnp.minimum(new_hp, new_hp_max)
+    s = state.replace(player_hp=new_hp_clamped, player_hp_max=new_hp_max)
+
+    # Audit M #11 — item destruction gate ``rn2(3) == 0 is the SKIP case`` so
+    # 2/3 of triggers actually burn items.  Underwater branch skips item burn
+    # entirely (vendor returns early after the boiling-water message).
+    burn_items_roll = jax.random.randint(k5, (), 0, 3) != jnp.int32(0)
+    burn_items_active = burn_items_roll & (~in_water)
+
+    # Audit M #12 — per-item luck save: object survives when (Luck + 5) > rn2(20).
     inv = s.inventory
-    is_burnable = (
+    luck = state.player_luck.astype(jnp.int32) + state.player_moreluck.astype(jnp.int32)
+    n_slots = inv.items.category.shape[0]
+    luck_keys = jax.random.split(k6, n_slots)  # distinct stream per slot.
+    luck_rolls = jax.vmap(lambda k: jax.random.randint(k, (), 0, 20))(luck_keys)
+    # Item is destroyed when (Luck + 5) <= rn2(20).
+    luck_destroys = (jnp.int32(luck + jnp.int32(5))) <= luck_rolls.astype(jnp.int32)
+    is_burnable_cat = (
         (inv.items.category == jnp.int8(int(ItemCategory.SCROLL)))
         | (inv.items.category == jnp.int8(int(ItemCategory.SPBOOK)))
         | (inv.items.category == jnp.int8(int(ItemCategory.POTION)))
     )
-    new_qty = jnp.where(is_burnable, jnp.int16(0), inv.items.quantity)
-    new_cat = jnp.where(is_burnable, jnp.int8(0), inv.items.category)
+    destroyed = burn_items_active & is_burnable_cat & luck_destroys
+    new_qty = jnp.where(destroyed, jnp.int16(0), inv.items.quantity)
+    new_cat = jnp.where(destroyed, jnp.int8(0), inv.items.category)
     new_items = inv.items.replace(quantity=new_qty, category=new_cat)
     return s.replace(inventory=inv.replace(items=new_items))
 
