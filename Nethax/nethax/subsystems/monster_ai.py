@@ -260,7 +260,7 @@ def _build_monster_nattk_table() -> tuple:
             n_arr[mi][ai] = int(atk[2])
             s_arr[mi][ai] = int(atk[3])
     return (
-        jnp.array(aatyp, dtype=jnp.int8),
+        jnp.array(aatyp, dtype=jnp.int16),
         jnp.array(n_arr, dtype=jnp.int16),
         jnp.array(s_arr, dtype=jnp.int16),
     )
@@ -3566,7 +3566,7 @@ def mattackm(state, attacker_idx: jnp.ndarray, defender_idx: jnp.ndarray,
         jnp.int32(1),
     )
 
-    AT_NONE = jnp.int8(0)
+    AT_NONE = jnp.int16(0)
     aatyp_row = _MONSTER_ATTACK_AATYP_TABLE[a_entry]
     n_row     = _MONSTER_ATTACK_N_TABLE[a_entry]
     s_row     = _MONSTER_ATTACK_S_TABLE[a_entry]
