@@ -695,25 +695,59 @@ def _skill_hit_bonus(state) -> jnp.ndarray:
 # To-hit roll (vendor/nethack/src/uhitm.c::find_roll_to_hit, lines 365-427)
 # ---------------------------------------------------------------------------
 def _compute_encumbrance(state) -> jnp.ndarray:
-    """Compute encumbrance level (0=normal .. 5=overloaded) from inventory weight.
+    """Compute encumbrance level (0=UNENCUMBERED .. 5=OVERLOADED).
 
-    Vendor reference: vendor/nethack/src/uhitm.c:407-409 — near_capacity().
-    Capacity approximation: cap = 25 * Str + 50 (vendor weight.c heuristic).
-    enc_level = floor(total_weight / (cap / 2.5)) clamped to [0, 5].
+    Bit-equal mirror of vendor/nethack/src/hack.c:
+      * ``weight_cap`` (hack.c:4294-4346) —
+            carrcap = WT_WEIGHTCAP_STRCON * (ACURRSTR + ACURR(A_CON))
+                      + WT_WEIGHTCAP_SPARE
+            min(carrcap, MAX_CARR_CAP), then max(carrcap, 1)
+        Constants from vendor/nethack/include/weight.h:
+          WT_WEIGHTCAP_STRCON = 25, WT_WEIGHTCAP_SPARE = 50,
+          MAX_CARR_CAP = 1000.
+      * ``calc_capacity`` (hack.c:4371-4382) —
+            wt = inv_weight() = sum(item weight) - carrcap
+            if wt <= 0:       return UNENCUMBERED (0)
+            if carrcap <= 1:  return OVERLOADED   (5)
+            return min((wt * 2 / carrcap) + 1, OVERLOADED)
+      * ``near_capacity`` (hack.c:4385-4388) = calc_capacity(0)
 
-    # vendor/nethack/src/uhitm.c:407 (near_capacity() != 0 → subtract penalty)
+    Vendor STR uses the ``ACURRSTR`` macro (attrib.c:1245-1262 acurrstr)
+    which collapses 18/01..125 into 3..25 before the multiply.
+
+    # JAX-required divergence: the Upolyd / Levitation / Wounded-legs /
+    # Steed branches of vendor weight_cap are not modelled — the player
+    # neither rides a steed nor has a wounded-leg state field today.
     """
     items = state.inventory.items
     weight_total = jnp.sum(
         items.weight.astype(jnp.int32) * items.quantity.astype(jnp.int32)
     ).astype(jnp.int32)
-    str_val = state.player_str.astype(jnp.int32)
-    cap = jnp.int32(25) * str_val + jnp.int32(50)
-    # cap/2.5 = cap*2//5
-    half_cap = cap * jnp.int32(2) // jnp.int32(5)
-    safe_half_cap = jnp.maximum(half_cap, jnp.int32(1))
-    enc = weight_total // safe_half_cap
-    return jnp.clip(enc, jnp.int32(0), jnp.int32(5)).astype(jnp.int32)
+
+    # ACURRSTR mapping (vendor attrib.c:1245-1262).
+    raw_str = state.player_str.astype(jnp.int32)
+    s_le18 = jnp.maximum(raw_str, jnp.int32(3))
+    s_le121 = jnp.int32(19) + raw_str // jnp.int32(50)
+    s_high = jnp.minimum(raw_str, jnp.int32(125)) - jnp.int32(100)
+    acurr_str = jnp.where(
+        raw_str <= jnp.int32(18), s_le18,
+        jnp.where(raw_str <= jnp.int32(121), s_le121, s_high),
+    )
+
+    con = state.player_con.astype(jnp.int32)
+    carrcap = jnp.int32(25) * (acurr_str + con) + jnp.int32(50)
+    carrcap = jnp.minimum(carrcap, jnp.int32(1000))
+    carrcap = jnp.maximum(carrcap, jnp.int32(1))
+
+    wt = weight_total - carrcap
+    overloaded = carrcap <= jnp.int32(1)
+    enc_calc = (wt * jnp.int32(2)) // carrcap + jnp.int32(1)
+    enc = jnp.where(
+        wt <= jnp.int32(0),
+        jnp.int32(0),
+        jnp.where(overloaded, jnp.int32(5), jnp.minimum(enc_calc, jnp.int32(5))),
+    )
+    return enc.astype(jnp.int32)
 
 
 def to_hit_roll(rng: jax.Array, attacker_state, target_ac: jnp.ndarray) -> jnp.ndarray:
@@ -1264,9 +1298,17 @@ def _single_melee_strike(
     # Award XP/score for kill.
     # Vendor reference: vendor/nethack/src/exper.c::experience (table-driven
     # XP value) followed by more_experienced (uexp / urexp accumulation;
-    # exper.c:168-203).  kill_count gates the repeated-kill halving in
-    # vendor — we pass scoring.monsters_killed as a running approximation
-    # since per-pm-vital kill counters aren't tracked yet.
+    # exper.c:168-203).
+    #
+    # vendor exper.c:143-163 halves XP via ``nk`` only when the slain monster
+    # is mrevived or mcloned; vendor's ``nk`` comes from
+    # ``svm.mvitals[mtmp->data - mons].died`` (a per-PM kill counter).
+    #
+    # JAX-required divergence: Nethax does not maintain a per-PM kill counter
+    # (no ``mvitals.died`` analog).  When mcloned is False the halving is a
+    # no-op and the XP value is bit-equal to vendor; when mcloned is True we
+    # fall back to ``scoring.monsters_killed`` (total kill counter) as the
+    # closest available proxy.
     entry = jnp.clip(
         mai.entry_idx[idx].astype(jnp.int32),
         0, _MONSTER_XP_TABLE.shape[0] - 1,
