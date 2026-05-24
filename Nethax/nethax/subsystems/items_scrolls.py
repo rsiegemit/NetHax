@@ -376,11 +376,14 @@ def apply_genocide(state, rng, class_letter=None):
 
 # ---- identification -------------------------------------------------------
 
-def _effect_identify(state, rng, buc):
+def _effect_identify(state, rng, buc, slot_idx=jnp.int32(-1)):
     """scroll of identify — identify inventory items.
 
-    Canonical: seffect_identify — identify 1 item (uncursed), all (blessed),
-    or ask which (interactive).
+    Canonical: vendor/nethack/src/read.c::seffect_identify lines 2055-2099.
+    Vendor flow: ``useup(sobj); *sobjp = 0;`` is called BEFORE
+    ``identify_pack(cval, !already_known)`` so the scroll itself is no longer
+    in inventory when items are picked.  We mirror that by skipping
+    ``slot_idx`` (the slot of the scroll being read) during the scan.
     Wave 3: blessed identifies first 4 unidentified items; uncursed identifies
     the first unidentified item; cursed no-op.
     Identification sets item.identified = True on the relevant slots.
@@ -407,16 +410,19 @@ def _effect_identify(state, rng, buc):
     # type-level table (NUM_OBJECTS bool); fall back if absent.
     type_mask_in = state.identification.identified  # [NUM_OBJECTS] bool
 
-    def _mark_up_to_n(carry, slot_idx):
+    scroll_slot = jnp.int32(slot_idx)
+
+    def _mark_up_to_n(carry, slot_idx_):
         identified_arr, remaining, type_mask = carry
-        is_unid   = ~identified_arr[slot_idx]
-        should_id = is_unid & (remaining > jnp.int32(0))
+        is_unid   = ~identified_arr[slot_idx_]
+        is_self   = slot_idx_ == scroll_slot
+        should_id = is_unid & (remaining > jnp.int32(0)) & ~is_self
         new_arr   = jnp.where(should_id,
-                              identified_arr.at[slot_idx].set(jnp.bool_(True)),
+                              identified_arr.at[slot_idx_].set(jnp.bool_(True)),
                               identified_arr)
         new_rem   = jnp.where(should_id, remaining - jnp.int32(1), remaining)
         # Cascade type-level: set type_mask[type_id] = True when identified.
-        t = type_ids[slot_idx].astype(jnp.int32)
+        t = type_ids[slot_idx_].astype(jnp.int32)
         t = jnp.clip(t, jnp.int32(0), jnp.int32(type_mask.shape[0] - 1))
         new_type_mask = jnp.where(
             should_id,
@@ -1395,11 +1401,18 @@ assert len(_EFFECT_TABLE) == N_SCROLLS, (
     f"Effect table has {len(_EFFECT_TABLE)} entries; expected {N_SCROLLS}"
 )
 
-# Build lax.switch branch list: each branch unpacks (state, rng, buc).
-_SWITCH_BRANCHES = [
-    (lambda operand, fn=fn: fn(operand[0], operand[1], operand[2]))
-    for fn in _EFFECT_TABLE
-]
+# Build lax.switch branch list: each branch unpacks (state, rng, buc, slot_idx).
+# slot_idx is forwarded so handlers that mirror vendor "useup(sobj) before
+# inventory iteration" semantics (e.g. seffect_identify) can skip the scroll
+# being read.  Most handlers ignore it.
+def _make_branch(fn):
+    import inspect
+    sig = inspect.signature(fn)
+    if len(sig.parameters) >= 4:
+        return lambda operand, fn=fn: fn(operand[0], operand[1], operand[2], operand[3])
+    return lambda operand, fn=fn: fn(operand[0], operand[1], operand[2])
+
+_SWITCH_BRANCHES = [_make_branch(fn) for fn in _EFFECT_TABLE]
 
 
 # ---------------------------------------------------------------------------
@@ -1533,7 +1546,9 @@ def read_scroll(state, rng, slot_idx):
         confused_state = jax.lax.switch(
             effect_id, _CONFUSED_BRANCHES, (s, rng, _slot_idx)
         )
-        sane_state = jax.lax.switch(effect_id, _SWITCH_BRANCHES, (s, rng, buc))
+        sane_state = jax.lax.switch(
+            effect_id, _SWITCH_BRANCHES, (s, rng, buc, _slot_idx)
+        )
 
         new_state = jax.tree.map(
             lambda c, ns: jnp.where(use_confused, c, ns),
