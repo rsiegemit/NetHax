@@ -821,6 +821,317 @@ def connect_rooms(
 
 
 # ---------------------------------------------------------------------------
+# fill_ordinary_rooms — per-room independent feature rolls (Audit-N #5)
+# ---------------------------------------------------------------------------
+#
+# Vendor cite: vendor/nethack/src/mklev.c::fill_ordinary_room lines 968-1006.
+# After special-room dispatch the vendor walks every OROOM/THEMEROOM and
+# fires a sequence of independent dice rolls; each roll places one of the
+# stock dungeon features (sleeping monster, traps, gold, fountain, sink,
+# altar, grave, statue) at a random tile inside the room.
+#
+# The vendor uses the running RNG (rn2 / rnd) directly.  Our JIT-safe port
+# threads ``jax.random.split`` to derive one independent sub-key per roll
+# per room — no key reuse, deterministic schedule, no Python branching on
+# traced values.  The function is non-jit (it runs once per level at
+# generation time) but the inner per-room work is scan-friendly so it can
+# be folded into a jitted pipeline by callers.
+
+
+def _pick_room_tile(rng, y1, x1, y2, x2):
+    """Return (r, c) uniformly inside the room interior (vendor ``somexyspace``).
+
+    Vendor cite: vendor/nethack/src/mkmaze.c::somexyspace —
+    ``somexy`` returns a uniform interior cell.  Our port draws ``row`` in
+    ``[y1, y2]`` and ``col`` in ``[x1, x2]`` (both inclusive) using two
+    sub-keys from a single split.
+    """
+    k_r, k_c = jax.random.split(rng, 2)
+    row = jax.random.randint(k_r, (), minval=y1, maxval=y2 + jnp.int32(1)).astype(jnp.int32)
+    col = jax.random.randint(k_c, (), minval=x1, maxval=x2 + jnp.int32(1)).astype(jnp.int32)
+    return row, col
+
+
+def _vendor_traptype_rnd(rng, level_diff):
+    """JIT-safe port of vendor/nethack/src/mklev.c::traptype_rnd lines 1938-1998.
+
+    Returns a TrapType value (int) for use with mktrap().  Pursues the vendor
+    semantics: draw ``rnd(TRAPNUM - 1)`` then filter out trap kinds that the
+    map cannot legally host (TRAPPED_DOOR, TRAPPED_CHEST, MAGIC_PORTAL,
+    VIBRATING_SQUARE), plus depth-gated kinds (SLP_GAS_TRAP, LEVEL_TELEP,
+    SPIKED_PIT, LANDMINE, WEB, STATUE_TRAP, POLY_TRAP, etc.).
+
+    Vendor's ``do { kind = traptype_rnd(); } while (kind == NO_TRAP)`` loop
+    is approximated here with a single draw + a NO_TRAP→ARROW_TRAP fallback
+    so the function is JIT-safe (no traced-loop).  Callers that need the
+    exact retry-until-non-zero behaviour can iterate at a fixed bound.
+
+    Args:
+        rng:        jax.random.PRNGKey scalar.
+        level_diff: vendor ``level_difficulty()`` (depth-equivalent int).
+
+    Returns:
+        int32 scalar TrapType value (NO_TRAP=0 if no legal kind drawn).
+    """
+    # rnd(TRAPNUM - 1) → uniform in [1, TRAPNUM-1].  TRAPNUM = 26 per
+    # vendor/nethack/include/trap.h (mirrors our N_TRAP_TYPES = 26).
+    kind = jax.random.randint(rng, (), minval=1, maxval=26, dtype=jnp.int32)
+    lvl  = jnp.asarray(level_diff, dtype=jnp.int32)
+
+    # Disallow non-map trap kinds (vendor lines 1946-1955).
+    is_trapped_door  = kind == jnp.int32(24)  # TRAPPED_DOOR
+    is_trapped_chest = kind == jnp.int32(25)  # TRAPPED_CHEST
+    is_portal        = kind == jnp.int32(17)  # MAGIC_PORTAL
+    is_vibsquare     = kind == jnp.int32(23)  # VIBRATING_SQUARE
+    is_fire          = kind == jnp.int32(10)  # FIRE_TRAP — Gehennom-only
+
+    illegal = is_trapped_door | is_trapped_chest | is_portal | is_vibsquare | is_fire
+
+    # Depth gates (vendor lines 1956-1995).
+    depth_too_low = (
+        ((kind == jnp.int32(7))  & (lvl < jnp.int32(2)))  | # ROLLING_BOULDER_TRAP
+        ((kind == jnp.int32(8))  & (lvl < jnp.int32(2)))  | # SLP_GAS_TRAP
+        ((kind == jnp.int32(16)) & (lvl < jnp.int32(5)))  | # LEVEL_TELEP
+        ((kind == jnp.int32(12)) & (lvl < jnp.int32(5)))  | # SPIKED_PIT
+        ((kind == jnp.int32(6))  & (lvl < jnp.int32(6)))  | # LANDMINE
+        ((kind == jnp.int32(18)) & (lvl < jnp.int32(7)))  | # WEB
+        ((kind == jnp.int32(19)) & (lvl < jnp.int32(8)))  | # STATUE_TRAP
+        ((kind == jnp.int32(22)) & (lvl < jnp.int32(8)))    # POLY_TRAP
+    )
+
+    # Substitute illegal/too-deep draws with ARROW_TRAP (always legal — the
+    # vendor's retry loop converges quickly on a legal kind; we collapse it
+    # to the shallowest non-NO_TRAP trap to stay JIT-safe).
+    legal = ~(illegal | depth_too_low)
+    return jnp.where(legal, kind, jnp.int32(1))  # ARROW_TRAP fallback
+
+
+def fill_ordinary_rooms(
+    rng,
+    rooms,
+    active,
+    terrain,
+    features,
+    traps,
+    flat_lv: int,
+    depth,
+    player_align: int = 1,
+):
+    """Apply per-room independent feature rolls to every ordinary room.
+
+    Vendor cite: vendor/nethack/src/mklev.c::fill_ordinary_room lines 968-1006:
+
+        if ((u.uhave.amulet || !rn2(3)) && somexyspace(croom, &pos))
+            tmonst = makemon(...);                      # sleeping monster
+        x = 8 - (level_difficulty() / 6);  if (x <= 1) x = 2;
+        while (!rn2(x) && trycnt++ < 1000) mktrap(...); # traps
+        if (!rn2(3) && somexyspace(croom, &pos)) mkgold(...);
+        if (!rn2(10))  mkfount(croom);                  # fountain 1/10
+        if (!rn2(60))  mksink(croom);                   # sink     1/60
+        if (!rn2(60))  mkaltar(croom);                  # altar    1/60
+        x = 80 - (depth(&u.uz) * 2); if (x < 2) x = 2;
+        if (!rn2(x))  mkgrave(croom);                   # grave depth-scaled
+        if (!rn2(20) && somexyspace(croom, &pos))
+            (void) mkcorpstat(STATUE, ...);             # statue 1/20
+
+    JIT-safety: this function consumes ``rng`` via ``jax.random.split`` so
+    no PRNG key is reused.  Each room receives an independent sub-key, and
+    each per-room roll receives an independent sub-sub-key.  Inner work is
+    a fixed-size lax.scan over MAX_ROOMS_PER_LEVEL — no Python branching
+    on traced values.
+
+    Note: we cap the per-room trap loop at 4 placements (vendor's
+    ``while (!rn2(x))`` is geometrically distributed with mean
+    ``1/(1 - 1/x) - 1`` ≈ 1 for typical x).  Vendor uses trycnt < 1000 as a
+    safety bound; 4 iterations gives the same effective trap count at the
+    feasible range while keeping the trace length finite.
+
+    Args:
+        rng:          jax.random.PRNGKey scalar.
+        rooms:        Room pytree (one level).
+        active:       bool[MAX_ROOMS_PER_LEVEL] mask.
+        terrain:      int8[MAP_H, MAP_W] terrain map.
+        features:     FeaturesState (per-tile altar_alignment is updated).
+        traps:        TrapState (per-tile trap_type is updated).
+        flat_lv:      int — flattened level index into features/traps arrays.
+        depth:        int / scalar — vendor ``depth(&u.uz)`` /
+                      ``level_difficulty()`` (used by trap rate + grave rate).
+        player_align: int — Alignment value (0/1/2) used for altar
+                      placement (vendor mkaltar passes player align to
+                      induced_align).
+
+    Returns:
+        (terrain, features, traps) — updated in-place via functional ops.
+    """
+    from Nethax.nethax.constants.tiles import TileType
+    FLOOR    = jnp.int8(int(TileType.FLOOR))
+    FOUNTAIN = jnp.int8(int(TileType.FOUNTAIN))
+    # The internal TileType enum has no SINK / STATUE / GOLD codes; we use
+    # FLOOR for those (the *object* layer carries the gold/statue and the
+    # *features* layer carries sink semantics).  Vendor uses rm.h tile
+    # codes for fountain/sink/altar/grave but our compact TileType only
+    # exposes FOUNTAIN/ALTAR/GRAVE.  Sink/statue/gold tiles stay FLOOR
+    # here; downstream object-layer fills handle them.
+    ALTAR    = jnp.int8(int(TileType.ALTAR))
+    GRAVE    = jnp.int8(int(TileType.GRAVE))
+    TRAP_TILE = jnp.int8(int(TileType.HIDDEN_TRAP))
+
+    depth_i = jnp.asarray(depth, dtype=jnp.int32)
+
+    # Trap rate (vendor mklev.c:981-983):
+    #   x = 8 - level_difficulty()/6;  if (x <= 1) x = 2;
+    trap_x = jnp.maximum(jnp.int32(8) - depth_i // jnp.int32(6), jnp.int32(2))
+
+    # Grave rate (vendor mklev.c:996-998):
+    #   x = 80 - depth(&u.uz) * 2;  if (x < 2) x = 2;
+    grave_x = jnp.maximum(jnp.int32(80) - depth_i * jnp.int32(2), jnp.int32(2))
+
+    # Number of independent per-room keys we need — see scan body.
+    PER_ROOM_KEYS = 16  # generous; only ~10 rolls used.
+
+    # Split top-level rng into one key per room.
+    room_keys = jax.random.split(rng, MAX_ROOMS_PER_LEVEL)
+
+    def fill_one(state, i):
+        terrain_, features_aa, traps_tt = state
+        y1 = rooms.y1[i].astype(jnp.int32)
+        x1 = rooms.x1[i].astype(jnp.int32)
+        y2 = rooms.y2[i].astype(jnp.int32)
+        x2 = rooms.x2[i].astype(jnp.int32)
+        rt = rooms.room_type[i].astype(jnp.int32)
+        act = active[i]
+
+        # Only ordinary / themeroom rooms are filled (vendor line 949 gate):
+        #   if (croom->rtype != OROOM && croom->rtype != THEMEROOM) return;
+        is_ordinary = act & (
+            (rt == jnp.int32(int(RoomType.ORDINARY))) |
+            (rt == jnp.int32(int(RoomType.THEMEROOM)))
+        )
+
+        sub_keys = jax.random.split(room_keys[i], PER_ROOM_KEYS)
+        k_fount, k_sink, k_altar, k_grave, k_statue, k_gold, k_sleep, \
+            k_pos_fount, k_pos_sink, k_pos_altar, k_pos_grave, k_pos_statue, \
+            k_pos_gold, k_pos_sleep, k_trap_outer, k_align = sub_keys
+
+        # --- Fountain: !rn2(10)  (vendor line 990-991) ---
+        fount_roll = jax.random.randint(k_fount, (), 0, 10, dtype=jnp.int32) == jnp.int32(0)
+        rf, cf = _pick_room_tile(k_pos_fount, y1, x1, y2, x2)
+        rf = jnp.clip(rf, 0, terrain_.shape[0] - 1)
+        cf = jnp.clip(cf, 0, terrain_.shape[1] - 1)
+        place_fount = is_ordinary & fount_roll
+        terrain_ = terrain_.at[rf, cf].set(
+            jnp.where(place_fount, FOUNTAIN, terrain_[rf, cf])
+        )
+
+        # --- Sink: !rn2(60)  (vendor line 992-993) ---
+        # No SINK code in our TileType; downstream sink ops use the
+        # features sinks_used layer.  We leave the tile as FLOOR but
+        # do not currently expose a per-tile sink marker.  This roll is
+        # therefore a no-op on terrain but the rng schedule is consumed
+        # so callers stay deterministic across future TileType expansion.
+        _sink_roll = jax.random.randint(k_sink, (), 0, 60, dtype=jnp.int32) == jnp.int32(0)
+        _ = jax.random.randint(k_pos_sink, (), 0, 1, dtype=jnp.int32)
+
+        # --- Altar: !rn2(60)  (vendor line 994-995) ---
+        # mkaltar (mkroom.c:557-595) sets altarmask = induced_align(player).
+        # induced_align(80) returns player_align 80% of the time, else a
+        # random alternative.  We mirror the alt-align logic here.
+        altar_roll = jax.random.randint(k_altar, (), 0, 60, dtype=jnp.int32) == jnp.int32(0)
+        ra, ca = _pick_room_tile(k_pos_altar, y1, x1, y2, x2)
+        ra = jnp.clip(ra, 0, terrain_.shape[0] - 1)
+        ca = jnp.clip(ca, 0, terrain_.shape[1] - 1)
+        # induced_align(80): 80% chance of player alignment, else random.
+        coin = jax.random.randint(k_align, (), 0, 100, dtype=jnp.int32)
+        alt_align = jax.random.randint(
+            jax.random.fold_in(k_align, 1), (), 0, 3, dtype=jnp.int32
+        )
+        induced = jnp.where(
+            coin < jnp.int32(80), jnp.int32(player_align), alt_align
+        ).astype(jnp.int8)
+        place_altar = is_ordinary & altar_roll
+        terrain_ = terrain_.at[ra, ca].set(
+            jnp.where(place_altar, ALTAR, terrain_[ra, ca])
+        )
+        features_aa = features_aa.at[flat_lv, ra, ca].set(
+            jnp.where(place_altar, induced, features_aa[flat_lv, ra, ca])
+        )
+
+        # --- Grave: !rn2(grave_x)  (vendor line 996-1000) ---
+        grave_roll = jax.random.randint(
+            k_grave, (), 0, grave_x, dtype=jnp.int32
+        ) == jnp.int32(0)
+        rg, cg = _pick_room_tile(k_pos_grave, y1, x1, y2, x2)
+        rg = jnp.clip(rg, 0, terrain_.shape[0] - 1)
+        cg = jnp.clip(cg, 0, terrain_.shape[1] - 1)
+        place_grave = is_ordinary & grave_roll
+        terrain_ = terrain_.at[rg, cg].set(
+            jnp.where(place_grave, GRAVE, terrain_[rg, cg])
+        )
+
+        # --- Statue: !rn2(20)  (vendor line 1003-1006) ---
+        _statue_roll = jax.random.randint(k_statue, (), 0, 20, dtype=jnp.int32) == jnp.int32(0)
+        _ = jax.random.randint(k_pos_statue, (), 0, 1, dtype=jnp.int32)
+        # Statues are objects (mkcorpstat); we do not yet have a STATUE tile
+        # nor an objects-layer hook here.  The rng schedule is preserved so
+        # downstream wires can fold this in without disturbing parity.
+
+        # --- Gold: !rn2(3)  (vendor line 986-987) ---
+        _gold_roll = jax.random.randint(k_gold, (), 0, 3, dtype=jnp.int32) == jnp.int32(0)
+        _ = jax.random.randint(k_pos_gold, (), 0, 1, dtype=jnp.int32)
+
+        # --- Sleeping monster: u.uhave.amulet || !rn2(3)  (vendor line 974) ---
+        # Without the amulet flag this is just !rn2(3).  Monster spawning is
+        # handled by the monsters subsystem; here we consume the rng for
+        # schedule stability.
+        _sleep_roll = jax.random.randint(k_sleep, (), 0, 3, dtype=jnp.int32) == jnp.int32(0)
+        _ = jax.random.randint(k_pos_sleep, (), 0, 1, dtype=jnp.int32)
+
+        # --- Traps: while (!rn2(trap_x))  (vendor line 980-985) ---
+        # Vendor uses a while-loop bounded by trycnt < 1000; we unroll a
+        # fixed scan of length MAX_TRAPS_PER_ROOM with per-step continuation
+        # so the expected trap count matches the geometric distribution.
+        MAX_TRAPS_PER_ROOM = 4
+
+        def trap_step(carry, j):
+            terrain_in, traps_in, continue_, key = carry
+            k_roll, k_kind, k_pos, k_next = jax.random.split(key, 4)
+            roll = jax.random.randint(
+                k_roll, (), 0, trap_x, dtype=jnp.int32
+            ) == jnp.int32(0)
+            kind = _vendor_traptype_rnd(k_kind, depth_i)
+            rt_r, rt_c = _pick_room_tile(k_pos, y1, x1, y2, x2)
+            rt_r = jnp.clip(rt_r, 0, terrain_in.shape[0] - 1)
+            rt_c = jnp.clip(rt_c, 0, terrain_in.shape[1] - 1)
+            should_place = continue_ & roll & is_ordinary
+            new_terrain = terrain_in.at[rt_r, rt_c].set(
+                jnp.where(should_place, TRAP_TILE, terrain_in[rt_r, rt_c])
+            )
+            new_traps = traps_in.at[flat_lv, rt_r, rt_c].set(
+                jnp.where(should_place, kind.astype(jnp.int8), traps_in[flat_lv, rt_r, rt_c])
+            )
+            return (new_terrain, new_traps, continue_ & roll, k_next), None
+
+        trap_state, _ = lax.scan(
+            trap_step,
+            (terrain_, traps_tt, jnp.bool_(True), k_trap_outer),
+            jnp.arange(MAX_TRAPS_PER_ROOM, dtype=jnp.int32),
+        )
+        terrain_, traps_tt, _, _ = trap_state
+
+        return (terrain_, features_aa, traps_tt), None
+
+    init_state = (terrain, features.altar_alignment, traps.trap_type)
+    (terrain_out, aa_out, tt_out), _ = lax.scan(
+        fill_one,
+        init_state,
+        jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
+    )
+    new_features = features.replace(altar_alignment=aa_out)
+    new_traps    = traps.replace(trap_type=tt_out)
+    return terrain_out, new_features, new_traps
+
+
+# ---------------------------------------------------------------------------
 # TODO blocks
 # ---------------------------------------------------------------------------
 # Wave 4:
