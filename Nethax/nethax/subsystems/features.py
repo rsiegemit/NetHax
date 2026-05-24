@@ -151,6 +151,23 @@ class FeaturesState:
                        Parallel bool grid mirrors vendor/nethack/include/rm.h
                        D_TRAPPED bit on doormask; stored separately for JAX
                        int8 array compatibility.
+    altar_known      : bool  [num_levels, map_h, map_w]
+                       True once player has stood on this altar (BUC sense /
+                       sacrifice).  Mirrors vendor pray.c::doaltar where
+                       altars become known on first interaction.
+    altar_sacrifice_count : int8 [num_levels, map_h, map_w]
+                       Counter of coaligned-corpse sacrifices on each altar
+                       (vendor pray.c::dosacrifice — reset on altar
+                       conversion, max ALTAR_CONVERT_THRESHOLD=5).
+    vault_pos        : int16 [num_levels, 2]
+                       (row, col) of vault interior centre per level; (-1,-1)
+                       means no vault.  Mirrors vendor vault.c::mk_vault.
+    guard_slot       : int32 scalar
+                       Monster-AI slot for the current vault guard; -1 = none.
+                       Mirrors vendor vault.c::invault line 407 makemon call.
+    guard_escort_active : bool scalar
+                       True while the vault guard is escorting the player out
+                       (vendor vault.c::gd_move line 888).
     """
 
     fountains_used:  jnp.ndarray   # [num_levels, map_h, map_w]  bool
@@ -159,6 +176,11 @@ class FeaturesState:
     altar_alignment: jnp.ndarray   # [num_levels, map_h, map_w]  int8
     door_state:      jnp.ndarray   # [num_levels, map_h, map_w]  int8
     door_trapped:    jnp.ndarray   # [num_levels, map_h, map_w]  bool
+    altar_known:     jnp.ndarray   # [num_levels, map_h, map_w]  bool
+    altar_sacrifice_count: jnp.ndarray  # [num_levels, map_h, map_w]  int8
+    vault_pos:       jnp.ndarray   # [num_levels, 2]             int16
+    guard_slot:      jnp.ndarray   # scalar                       int32
+    guard_escort_active: jnp.ndarray   # scalar                   bool
 
     @classmethod
     def default(cls, num_levels: int, map_h: int, map_w: int) -> "FeaturesState":
@@ -171,6 +193,11 @@ class FeaturesState:
             altar_alignment=jnp.full(shape, -1, dtype=jnp.int8),
             door_state=jnp.zeros(shape, dtype=jnp.int8),
             door_trapped=jnp.zeros(shape, dtype=jnp.bool_),
+            altar_known=jnp.zeros(shape, dtype=jnp.bool_),
+            altar_sacrifice_count=jnp.zeros(shape, dtype=jnp.int8),
+            vault_pos=jnp.full((num_levels, 2), -1, dtype=jnp.int16),
+            guard_slot=jnp.int32(-1),
+            guard_escort_active=jnp.bool_(False),
         )
 
 
@@ -980,7 +1007,17 @@ def altar_buc_sense(state):
         bknown=new_bknown,
     )
     new_inv = state.inventory.replace(items=new_items)
-    return state.replace(inventory=new_inv)
+
+    # Wave 30 — mark altar_known when player interacts with the altar.
+    # Vendor: pray.c::doaltar (~1900) — altars become known when stepped on.
+    on_any_altar_tile = altar_align >= jnp.int32(0)
+    new_altar_known = jnp.where(
+        on_any_altar_tile,
+        state.features.altar_known.at[flat_lv, row, col].set(jnp.bool_(True)),
+        state.features.altar_known,
+    )
+    new_features = state.features.replace(altar_known=new_altar_known)
+    return state.replace(inventory=new_inv, features=new_features)
 
 
 # ---------------------------------------------------------------------------
@@ -1903,15 +1940,27 @@ def drop_at_altar(state, slot_idx: jnp.ndarray):
     altar_align = state.features.altar_alignment[flat_lv, row, col].astype(jnp.int32)
     player_align = state.player_align.astype(jnp.int32)
     on_altar = altar_align >= jnp.int32(0)
-    coaligned = on_altar & (altar_align == player_align)
-    cross_aligned = on_altar & (altar_align != player_align)
+    # Coaligned: same alignment.  Opposite (cross): max-distance alignment
+    # mismatch (|diff|==2 with our 0=chaotic, 1=neutral, 2=lawful encoding).
+    # Neutral-altar drops (|diff|==1) leave BUC unchanged per
+    # vendor/nethack/src/pray.c::doaltar — only flash colours bless/curse,
+    # which corresponds to a coaligned or opposite-aligned altar match.
+    align_diff = jnp.abs(altar_align - player_align)
+    coaligned = on_altar & (align_diff == jnp.int32(0))
+    cross_aligned = on_altar & (align_diff == jnp.int32(2))
 
     safe_slot = jnp.clip(slot_idx.astype(jnp.int32), 0,
                          state.inventory.items.buc_status.shape[0] - 1)
     old_buc = state.inventory.items.buc_status[safe_slot].astype(jnp.int32)
 
-    new_buc = jnp.where(coaligned, jnp.int32(3),
-              jnp.where(cross_aligned, jnp.int32(1),
+    # Already-blessed items keep their blessing on cross-aligned altars
+    # (vendor pickup.c::drop_on_altar — only uncursed→curse, blessed→bless).
+    is_blessed = old_buc == jnp.int32(3)
+    is_cursed  = old_buc == jnp.int32(1)
+    bless_now  = coaligned & ~is_blessed
+    curse_now  = cross_aligned & ~is_cursed & ~is_blessed
+    new_buc = jnp.where(bless_now, jnp.int32(3),
+              jnp.where(curse_now, jnp.int32(1),
               old_buc))
 
     new_buc_arr = state.inventory.items.buc_status.at[safe_slot].set(
