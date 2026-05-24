@@ -1753,6 +1753,118 @@ def _handle_offer(state, rng):
     return offer_amulet(state)
 
 
+def _handle_quit(state, rng):
+    """#quit — vendor/nethack/src/end.c::done2 line 1228.
+
+    Sets done=True and records the QUIT how-code.  Vendor's done2
+    prompts for confirmation; we treat the command itself as final
+    (callers can wrap it).  No ascension bonus; compute_final_score
+    will apply the 10% death tax via ``how < PANICKED``.
+    """
+    return state.replace(done=jnp.bool_(True))
+
+
+def _handle_jump(state, rng):
+    """#jump — vendor/nethack/src/apply.c::dojump line 1992.
+
+    Moves the player to the farthest reachable FLOOR tile within the
+    pythagorean range ``distu(x,y) <= 6 + magic*3`` where ``magic = 1``
+    for the command-line invocation (no skill bonus; the bonus only
+    applies on the JUMPING spell route, apply.c:1903).
+
+    Range²=9 with magic=1, so we scan a 7x7 window (offsets -3..+3).
+
+    Cite: vendor/nethack/src/apply.c::is_valid_jump_pos line 1903;
+          vendor/nethack/src/apply.c::dojump line 1992.
+    """
+    from Nethax.nethax.constants.tiles import TileType
+    pos = state.player_pos
+    pr = pos[0].astype(jnp.int32)
+    pc = pos[1].astype(jnp.int32)
+    br = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    terrain = state.terrain
+    h = jnp.int32(terrain.shape[2])
+    w = jnp.int32(terrain.shape[3])
+    FLOOR = jnp.int8(int(TileType.FLOOR))
+
+    max_dist2 = jnp.int32(9)  # 6 + magic*3 with magic=1
+    SEARCH = 3
+    offsets = [
+        [dr, dc]
+        for dr in range(-SEARCH, SEARCH + 1)
+        for dc in range(-SEARCH, SEARCH + 1)
+    ]
+    offsets_arr = jnp.array(offsets, dtype=jnp.int32)
+
+    def _score(off):
+        dr, dc = off[0], off[1]
+        r = pr + dr
+        c = pc + dc
+        in_bounds = (r >= 0) & (r < h) & (c >= 0) & (c < w)
+        sr = jnp.clip(r, 0, h - 1)
+        sc = jnp.clip(c, 0, w - 1)
+        tile = terrain[br, lv, sr, sc]
+        walkable = tile == FLOOR
+        d2 = dr * dr + dc * dc
+        valid = in_bounds & walkable & (d2 > 0) & (d2 <= max_dist2)
+        return jnp.where(valid, d2, jnp.int32(-1)), r, c
+
+    scores, rs, cs = jax.vmap(_score)(offsets_arr)
+    best = jnp.argmax(scores)
+    has_target = scores[best] > jnp.int32(0)
+    new_pos = jnp.where(
+        has_target,
+        jnp.stack([rs[best].astype(jnp.int16), cs[best].astype(jnp.int16)]),
+        pos,
+    )
+    return state.replace(player_pos=new_pos)
+
+
+def _handle_untrap(state, rng):
+    """#untrap — vendor/nethack/src/untrap.c::dountrap line 350.
+
+    Attempts to disarm an adjacent trap.  Vendor uses dex/role-based
+    chance + trap-specific quirks (e.g. dart/arrow traps deconstruct on
+    success; bear/web traps may snap).  Wave-44 minimum: scan the 8
+    adjacent tiles + the player's own tile; if any has a TT_* trap with
+    ``visible/known=True``, mark it removed (kind=0) with probability
+    rn2(100) < (3*dex + 25).  Matches vendor's chance formula at
+    untrap.c:520 (untrap_prob).
+
+    Cite: vendor/nethack/src/untrap.c::dountrap line 350;
+          vendor/nethack/src/untrap.c::untrap_prob line 520.
+    """
+    pos = state.player_pos
+    pr = pos[0].astype(jnp.int32)
+    pc = pos[1].astype(jnp.int32)
+    traps = state.traps
+    # Find adjacent (Chebyshev<=1) known-trap with the smallest index.
+    tpos_r = traps.pos[:, 0].astype(jnp.int32)
+    tpos_c = traps.pos[:, 1].astype(jnp.int32)
+    d_row = jnp.abs(tpos_r - pr)
+    d_col = jnp.abs(tpos_c - pc)
+    adj = (d_row <= jnp.int32(1)) & (d_col <= jnp.int32(1))
+    active = traps.kind > jnp.int8(0)
+    known = traps.known.astype(jnp.bool_)
+    candidate = adj & active & known
+    first_idx = jnp.argmax(candidate).astype(jnp.int32)
+    any_target = jnp.any(candidate)
+
+    dex = state.player_dex.astype(jnp.int32)
+    chance = jnp.minimum(jnp.int32(3) * dex + jnp.int32(25), jnp.int32(99))
+    roll = jax.random.randint(rng, (), 0, 100, dtype=jnp.int32)
+    success = any_target & (roll < chance)
+
+    new_kind = jnp.where(success,
+                         traps.kind.at[first_idx].set(jnp.int8(0)),
+                         traps.kind)
+    new_known = jnp.where(success,
+                          traps.known.at[first_idx].set(jnp.bool_(False)),
+                          traps.known)
+    return state.replace(traps=traps.replace(kind=new_kind, known=new_known))
+
+
 def _handle_twoweapon(state, rng):
     """TWOWEAPON — vendor/nethack/src/wield.c::dotwoweapon.
 
@@ -2161,6 +2273,9 @@ _HANDLERS = (
     _handle_dip,        # 46  vendor/nethack/src/potion.c::dodip line 2267
     _handle_tip_down,   # 47  vendor/nethack/src/dig.c::zap_dig line 1548 (down-dig)
     _handle_offer,      # 48  vendor/nethack/src/pray.c::dosacrifice (M-o → ascension)
+    _handle_quit,       # 49  vendor/nethack/src/end.c::done2 (M-q → done=True)
+    _handle_jump,       # 50  vendor/nethack/src/apply.c::dojump (M-j → jump)
+    _handle_untrap,     # 51  vendor/nethack/src/untrap.c::dountrap (M-u → disarm)
 )
 
 # Slot indices for each named handler.
@@ -2223,6 +2338,12 @@ _SLOT_DIP        = 46
 _SLOT_TIP_DOWN   = 47
 # #offer (M-o) — vendor/nethack/src/pray.c::dosacrifice (sole ascension trigger).
 _SLOT_OFFER      = 48
+# #quit (M-q) — vendor/nethack/src/end.c::done2.
+_SLOT_QUIT       = 49
+# #jump (M-j) — vendor/nethack/src/apply.c::dojump.
+_SLOT_JUMP       = 50
+# #untrap (M-u) — vendor/nethack/src/untrap.c::dountrap.
+_SLOT_UNTRAP     = 51
 
 # ---------------------------------------------------------------------------
 # 256-entry lookup table: action ASCII value → handler slot index
@@ -2403,19 +2524,19 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     table[_M_byte("f")] = _SLOT_NOOP   # cmd.c::doforce
     table[_M_byte("g")] = _SLOT_NOOP   # cmd.c::dogenocided
     table[_M_byte("i")] = _SLOT_INVOKE  # cmd.c::doinvoke → artifact.c::arti_invoke
-    table[_M_byte("j")] = _SLOT_NOOP   # cmd.c::dojump
+    table[_M_byte("j")] = _SLOT_JUMP   # apply.c::dojump
     table[_M_byte("l")] = _SLOT_LOOT   # cmd.c::doloot (already set via Command.LOOT)
     table[_M_byte("m")] = _SLOT_NOOP   # cmd.c::domonability
     table[_M_byte("n")] = _SLOT_NAME   # cmd.c::docallcmd (name alias)
     table[_M_byte("o")] = _SLOT_OFFER  # cmd.c::dosacrifice → pray.c::offer_real_amulet
     table[_M_byte("p")] = _SLOT_PRAY   # cmd.c::dopray (already set)
-    table[_M_byte("q")] = _SLOT_NOOP   # cmd.c::done2 (quit)
+    table[_M_byte("q")] = _SLOT_QUIT   # end.c::done2 (quit → done=True)
     table[_M_byte("r")] = _SLOT_NOOP   # cmd.c::dorub
     table[_M_byte("R")] = _SLOT_RIDE   # cmd.c::doride — steed.c:178
     table[_M_byte("s")] = _SLOT_NOOP   # cmd.c::dosit
     table[_M_byte("t")] = _SLOT_NOOP   # cmd.c::doturn
     table[_M_byte("T")] = _SLOT_TIP_DOWN  # cmd.c::dotip → WAN_DIGGING down-dig (dig.c:1548)
-    table[_M_byte("u")] = _SLOT_NOOP   # cmd.c::dountrap
+    table[_M_byte("u")] = _SLOT_UNTRAP # untrap.c::dountrap (disarm adjacent)
     table[_M_byte("v")] = _SLOT_NOOP   # cmd.c::doextversion
     table[_M_byte("V")] = _SLOT_NOOP   # cmd.c::dovanquished
     table[_M_byte("w")] = _SLOT_NOOP   # cmd.c::dowipe
@@ -2520,6 +2641,9 @@ _COMPACT_ENHANCE    = 31
 _COMPACT_DIP        = 32
 _COMPACT_TIP_DOWN   = 33
 _COMPACT_OFFER      = 34
+_COMPACT_QUIT       = 35
+_COMPACT_JUMP       = 36
+_COMPACT_UNTRAP     = 37
 
 
 def _build_compact_handlers():
@@ -2560,6 +2684,9 @@ def _build_compact_handlers():
         _wrap_no_dir(_handle_dip),    # 32  COMPACT_DIP — potion.c::dodip line 2267
         _wrap_no_dir(_handle_tip_down),  # 33  COMPACT_TIP_DOWN — dig.c::zap_dig line 1548
         _wrap_no_dir(_handle_offer),     # 34  COMPACT_OFFER — pray.c::dosacrifice (ascension)
+        _wrap_no_dir(_handle_quit),      # 35  COMPACT_QUIT — end.c::done2
+        _wrap_no_dir(_handle_jump),      # 36  COMPACT_JUMP — apply.c::dojump
+        _wrap_no_dir(_handle_untrap),    # 37  COMPACT_UNTRAP — untrap.c::dountrap
     )
 
 
@@ -2567,8 +2694,8 @@ _COMPACT_HANDLERS: tuple = _build_compact_handlers()
 
 
 def _build_slot_to_compact() -> jnp.ndarray:
-    """Map legacy handler slot (0..48) → compact slot (0..34)."""
-    table = [0] * 49
+    """Map legacy handler slot (0..51) → compact slot (0..37)."""
+    table = [0] * 52
     # Movement slots 1..8 → COMPACT_MOVE.
     for s in (_SLOT_MOVE_N, _SLOT_MOVE_E, _SLOT_MOVE_S, _SLOT_MOVE_W,
               _SLOT_MOVE_NE, _SLOT_MOVE_SE, _SLOT_MOVE_SW, _SLOT_MOVE_NW):
@@ -2610,6 +2737,9 @@ def _build_slot_to_compact() -> jnp.ndarray:
     table[_SLOT_DIP]        = _COMPACT_DIP       # potion.c::dodip line 2267
     table[_SLOT_TIP_DOWN]   = _COMPACT_TIP_DOWN  # dig.c::zap_dig line 1548
     table[_SLOT_OFFER]      = _COMPACT_OFFER     # pray.c::dosacrifice → ascension
+    table[_SLOT_QUIT]       = _COMPACT_QUIT      # end.c::done2
+    table[_SLOT_JUMP]       = _COMPACT_JUMP      # apply.c::dojump
+    table[_SLOT_UNTRAP]     = _COMPACT_UNTRAP    # untrap.c::dountrap
     return jnp.array(table, dtype=jnp.int32)
 
 
@@ -2619,7 +2749,7 @@ def _build_slot_to_dir_idx() -> jnp.ndarray:
     Non-movement slots map to 0 (the direction is unused for those branches).
     The order matches ``_DIR_TABLE``: N=0, E=1, S=2, W=3, NE=4, SE=5, SW=6, NW=7.
     """
-    table = [0] * 49
+    table = [0] * 52
     # Move slots.
     table[_SLOT_MOVE_N]  = 0
     table[_SLOT_MOVE_E]  = 1
