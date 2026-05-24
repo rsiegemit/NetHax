@@ -1321,7 +1321,6 @@ def _pray_impl(state, rng: jax.Array):
     #   4,5,6 → DESTROY_ARMOR (rndcurse), case 6 → punish if !Punished
     #   7,8   → SUMMON_DEMON
     #   default → god_zaps_you (anger bolt)
-    rng_max = jax.random.PRNGKey(0)  # placeholder; rng_smite reused below
     record_for_anger = state.prayer.alignment_record.astype(jnp.int32)
     luck_for_anger = state.player_luck.astype(jnp.int32)
     ugangr_a = state.prayer.god_anger.astype(jnp.int32)

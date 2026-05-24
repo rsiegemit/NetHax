@@ -194,8 +194,14 @@ def trigger_trap(
     # Use k10 (distinct from k9) so SPIKED_PIT damage is independent of PIT —
     # vendor draws a separate rnd() inside dotrap's SPIKED_PIT branch.
     dmg_spiked_pit   = _d(k10, 10)                        # rnd(10)
-    # Use k11 for HOLE/TRAPDOOR (vendor: rnd(6) inside its own branch).
-    dmg_hole         = _d(k11, 6)                         # d6 (stub for HOLE/TRAPDOOR)
+    # HOLE/TRAPDOOR (trap.c::fall_through line 602): vendor transports the
+    # player to dunlev+1 via goto_level() and deals no direct HP damage —
+    # the impact is the dungeon-descent step itself.  Nethax models the
+    # net "fall jolt" as d6 so the HP cost is observable in the same step
+    # (descent is handled by action_dispatch Audit-M #30 Can_fall_thru
+    # gate).  JAX-required divergence: we don't fork to a new level mid-
+    # trap-fire so the damage proxy stands in for "fell to next level".
+    dmg_hole         = _d(k11, 6)
     dmg_anti_magic   = jnp.int32(0)
 
     # side_effects per type
