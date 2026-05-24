@@ -167,10 +167,16 @@ def test_lock_pick_dex_low():
     assert rate < 0.40, f"Expected <40% success at Dex=6, got {rate:.2f}"
 
 
+@pytest.mark.timeout(240)
 def test_skeleton_key_higher_rate_than_lock_pick():
     """Skeleton key (ch=70+Dex) should open more reliably than lock pick (ch=3*Dex).
 
     Cite: lock.c:638 vs lock.c:636.
+
+    Note: two separate _lock_pick_success_rate calls each trigger a fresh
+    JIT trace of _handle_apply (different otyp constants), so the wall-time
+    is dominated by ~170s of compilation.  The 240s timeout absorbs cold-JIT
+    on slower runners.
     """
     rate_key  = _lock_pick_success_rate(_SKELETON_KEY_TYPE_ID, dex=10, n_trials=200)
     rate_pick = _lock_pick_success_rate(_LOCK_PICK_TYPE_ID,    dex=10, n_trials=200)

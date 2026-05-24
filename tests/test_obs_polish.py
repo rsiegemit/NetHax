@@ -177,11 +177,14 @@ def test_internal_current_level_matches_dungeon_state():
 
 
 def test_internal_xplevel_matches_player_score():
-    """internal[8] should mirror player score (NLE u.urexp)."""
+    """internal[8] should mirror player u.urexp (NLE winrl.cc:286-287).
+
+    wave17i moved the source from ``scoring.score`` to the dedicated
+    ``player_urexp`` int64 field (vendor you.h:399 running-XP accumulator);
+    bump the test fixture accordingly.
+    """
     state = _default_state()
-    # Bump scoring.score
-    new_scoring = state.scoring.replace(score=jnp.int32(4242))
-    state = state.replace(scoring=new_scoring)
+    state = state.replace(player_urexp=jnp.int64(4242))
     internal = build_internal(state)
     assert int(internal[8]) == 4242
 
