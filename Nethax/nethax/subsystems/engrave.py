@@ -687,3 +687,174 @@ def is_elbereth_at(eng: EngraveState, row, col, moves=None) -> jnp.ndarray:
         readable = eng.engr_time[r, c].astype(jnp.int32) <= m
 
     return has & matches & not_headstone & readable
+
+
+# ---------------------------------------------------------------------------
+# Wave 46b: text-only Elbereth predicate + scares-monster helper +
+# coarse per-turn DUST decay tick.
+# Cite: vendor/nethack/src/engrave.c::sengr_at strict-mode (lines 250-261);
+#       vendor/nethack/src/monmove.c::onscary (lines 240-303);
+#       vendor/nethack/src/engrave.c::wipe_engr_at (lines 270-289).
+# ---------------------------------------------------------------------------
+
+def is_elbereth(text: jnp.ndarray) -> jnp.ndarray:
+    """Text-only Elbereth predicate.
+
+    Returns True iff the inscription bytes are exactly the canonical
+    ASCII "Elbereth" sequence (zero-padded to ENGRAVE_TEXT_LEN).  This
+    mirrors vendor ``strcmp(ep->engr_txt[actual_text], "Elbereth") == 0``
+    used inside ``sengr_at`` (engrave.c:250-261) before the type / time
+    gating that ``is_elbereth_at`` adds on top.
+
+    Parameters
+    ----------
+    text : int8[ENGRAVE_TEXT_LEN] — the raw inscription bytes.
+    """
+    target = _elbereth_bytes_array()
+    t = jnp.asarray(text, dtype=jnp.int8)
+    # Truncate / pad if caller passed a different length.
+    if t.shape[0] != ENGRAVE_TEXT_LEN:
+        pad = jnp.zeros((ENGRAVE_TEXT_LEN,), dtype=jnp.int8)
+        upto = min(int(t.shape[0]), ENGRAVE_TEXT_LEN)
+        t = pad.at[:upto].set(t[:upto])
+    return jnp.all(t == target)
+
+
+def engrave_scares_monster(state, monster_idx) -> jnp.ndarray:
+    """Return True iff the engraving on the player's tile scares monster ``monster_idx``.
+
+    Mirrors the Elbereth half of vendor ``onscary`` (monmove.c:240-303):
+
+      1. The tile contains an Elbereth inscription that is readable
+         and not a headstone (delegated to ``is_elbereth_at``).
+      2. The monster is not Elbereth-exempt (humanoids, Wizard of
+         Yendor, Archon, Riders — see ``_IGNORES_ELBERETH`` in
+         monster_ai.py for the same vendor list).
+      3. The monster can see (``mtmp->mcansee``; vendor line 299
+         ``!mtmp->mcansee``).  We approximate via the monster's
+         ``blind_timer == 0``.
+      4. The monster has a mind (``!M1_MINDLESS``).  Vendor strictly
+         only excludes mindless creatures via the broader exemption
+         lists, but the task asks us to gate explicitly here; mindless
+         golems / molds / zombies were already exempt because vendor's
+         humanoid / undead checks cover most of them.
+      5. The monster is not peaceful (vendor line 300 ``mtmp->mpeaceful``).
+
+    Parameters
+    ----------
+    state       : EnvState
+    monster_idx : int32 scalar — index into ``state.monster_ai.*``.
+
+    Returns
+    -------
+    bool scalar
+    """
+    from Nethax.nethax.constants.monsters import M1_MINDLESS
+
+    eng = state.engrave
+    mi  = state.monster_ai
+    idx = jnp.asarray(monster_idx, dtype=jnp.int32)
+
+    # 1. Elbereth on player's tile (readable, non-headstone).
+    ppos = state.player_pos.astype(jnp.int32)
+    scared_raw = is_elbereth_at(eng, ppos[0], ppos[1], moves=state.timestep)
+
+    # 2. Per-entry exemption (humanoids / Wizard / Archon / Riders).
+    #    Re-derive the exemption table here to avoid a circular import
+    #    from monster_ai.py.
+    from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
+    import numpy as _np
+    _RIDER = {"Death", "Pestilence", "Famine"}
+    _EXEMPT = {"Wizard of Yendor", "Archon"}
+    _ignores_np = _np.array(
+        [
+            (m.symbol == MonsterSymbol.S_HUMAN)
+            or (m.name in _RIDER)
+            or (m.name in _EXEMPT)
+            for m in MONSTERS
+        ],
+        dtype=bool,
+    )
+    ignores_lut = jnp.asarray(_ignores_np, dtype=jnp.bool_)
+
+    eidx = mi.entry_idx[idx].astype(jnp.int32)
+    safe_e = jnp.clip(eidx, 0, ignores_lut.shape[0] - 1)
+    ignores = ignores_lut[safe_e]
+
+    # 3. Sight: blind_timer == 0 → can see (vendor mcansee).
+    can_see = mi.blind_timer[idx].astype(jnp.int32) == jnp.int32(0)
+
+    # 4. Mind: !M1_MINDLESS on the entry's flags1.
+    flags1_table = jnp.array(
+        [int(m.flags1) for m in MONSTERS], dtype=jnp.uint32
+    )
+    flags1 = flags1_table[safe_e]
+    has_mind = (flags1 & jnp.uint32(M1_MINDLESS)) == jnp.uint32(0)
+
+    # 5. Not peaceful (vendor line 300).
+    not_peaceful = ~mi.peaceful[idx]
+
+    # 6. Monster must be alive.
+    alive = mi.alive[idx]
+
+    return scared_raw & ~ignores & can_see & has_mind & not_peaceful & alive
+
+
+def tick_engravings(state, rng: jax.Array):
+    """Coarse per-turn engraving decay at the player's tile.
+
+    Mirrors vendor wear semantics from engrave.c::wipe_engr_at (lines
+    270-289) at a per-turn granularity:
+
+      - ENGR_DUST   : 1/15 chance per turn to erase entirely when the
+                      player is standing on it (DUST is the only kind
+                      that wears just from being walked over each turn).
+      - ENGR_BLOOD  : permanent absent magical wipe (vendor wipe_engr_at
+                      treats BLOOD like DUST for movement, but the task
+                      spec asks for BLOOD to persist; we follow the
+                      task spec).
+      - ENGRAVE/BURN/MARK/HEADSTONE: permanent (BURN never fades via
+        movement; ENGRAVE/MARK only fade via the slow 1/26 gate on
+        explicit step events, not this coarse per-turn tick).
+
+    This is a coarser companion to ``wipe_engr_on_step``: the latter
+    runs the full vendor rubouts kernel on movement, while
+    ``tick_engravings`` is a lightweight per-turn pass that callers
+    invoke once per game turn.  Both are vendor-cited.
+
+    Parameters
+    ----------
+    state : EnvState
+    rng   : jax.random.PRNGKey
+
+    Returns
+    -------
+    EnvState with state.engrave updated.
+    """
+    eng = state.engrave
+    r = state.player_pos[0].astype(jnp.int32)
+    c = state.player_pos[1].astype(jnp.int32)
+
+    kind = eng.engraving_kind[r, c].astype(jnp.int32)
+    has  = eng.has_engraving[r, c]
+
+    # 1/15 erase roll — only DUST decays on this coarse path.
+    roll = jax.random.randint(rng, (), 0, 15, dtype=jnp.int32)
+    erase = (roll == jnp.int32(0)) & has & (kind == jnp.int32(ENGR_DUST))
+
+    zero_text = jnp.zeros((ENGRAVE_TEXT_LEN,), dtype=jnp.int8)
+    new_text_at = jnp.where(erase, zero_text, eng.text[r, c, :])
+    new_has_at  = jnp.where(erase, jnp.bool_(False), has)
+    new_kind_at = jnp.where(erase, jnp.int8(ENGR_NONE),
+                            eng.engraving_kind[r, c])
+
+    new_texts = eng.text.at[r, c, :].set(new_text_at)
+    new_has   = eng.has_engraving.at[r, c].set(new_has_at)
+    new_kinds = eng.engraving_kind.at[r, c].set(new_kind_at)
+
+    new_eng = eng.replace(
+        text=new_texts,
+        has_engraving=new_has,
+        engraving_kind=new_kinds,
+    )
+    return state.replace(engrave=new_eng)
