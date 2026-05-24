@@ -95,53 +95,15 @@ _OBJECT_CLASS: jnp.ndarray = jnp.array(
 # ---------------------------------------------------------------------------
 # Erosion rendering tables
 # Canonical: vendor/nethack/src/objnam.c::add_erosion_words() lines 1142-1191
+#
+# The per-object erosion-class lookup (``_OBJECT_EROSION_CLASS``) now lives
+# in ``Nethax.nethax.subsystems.items`` so it is constructed at top-level
+# import — before any JIT trace runs.  Previously it was defined here and
+# pulled in via a deferred import inside ``items.erode_obj_slot``, which
+# triggered ``UnexpectedTracerError`` when ``_do_corrode`` (or any other
+# JIT-traced caller) was the first thing to load this module.
 # ---------------------------------------------------------------------------
-
-# Per-object erosion material class — vendor-equal classification.
-# Vendor macros (vendor/nethack/include/objclass.h lines 199-212):
-#   is_rustprone(otmp)   := oc_material == IRON
-#   is_corrodeable(otmp) := oc_material == COPPER || oc_material == IRON
-#   is_flammable(otmp)   := LEATHER|WOOD|CLOTH|PAPER|WAX|VEGGY|FLESH (mkobj.c)
-#
-# Class encoding (consumed by _vulnerable_for_kind in subsystems/items.py and
-# by the erosion-word tables below):
-#   0 = no erosion applicable        — SILVER, GOLD, MITHRIL, PLATINUM, METAL,
-#                                       GLASS (non-armor), GEMSTONE, MINERAL, etc.
-#   1 = rustprone (also corrodeable) — IRON only (vendor is_rustprone)
-#   2 = flammable (also rottable)    — LEATHER/WOOD/CLOTH/PAPER/WAX/VEGGY/FLESH
-#   3 = corrodeable-only             — COPPER only (vendor is_corrodeable
-#                                       minus IRON; no rust word produced)
-#
-# _vulnerable_for_kind treats CORRODE as (class 1 | class 3), matching
-# is_corrodeable = COPPER || IRON.
-_EROSION_RUST_MAT = {int(Material.IRON)}
-_EROSION_CORRODE_MAT = {int(Material.COPPER)}
-_EROSION_FLAME_MAT = {
-    int(Material.LEATHER),
-    int(Material.WOOD),
-    int(Material.CLOTH),
-    int(Material.PAPER),
-    int(Material.WAX),
-    int(Material.VEGGY),
-    int(Material.FLESH),
-}
-
-
-def _erosion_mat_class(obj) -> int:
-    m = int(obj.material)
-    if m in _EROSION_RUST_MAT:
-        return 1
-    if m in _EROSION_CORRODE_MAT:
-        return 3
-    if m in _EROSION_FLAME_MAT:
-        return 2
-    return 0
-
-
-_OBJECT_EROSION_CLASS: jnp.ndarray = jnp.array(
-    [_erosion_mat_class(obj) for obj in OBJECTS],
-    dtype=jnp.uint8,
-)  # uint8[NUM_OBJECTS]: 0=none,1=rustprone,2=flammable,3=corrodeable-only
+from Nethax.nethax.subsystems.items import _OBJECT_EROSION_CLASS  # noqa: E402
 
 # Erosion word tables indexed [mat_class 0..3][level 0..3].
 # vendor/nethack/src/objnam.c lines 1156-1168 (oeroded), 1169-1178 (oeroded2).

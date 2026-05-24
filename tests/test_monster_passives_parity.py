@@ -180,10 +180,18 @@ def test_green_mold_acid():
     Cite: vendor/nethack/src/uhitm.c::passive() lines 5906-5933 (AD_ACID) →
     vendor/nethack/src/trap.c::erode_obj ERODE_CORRODE: is_primary=False so
     corrosion writes to oeroded2 (cite trap.c:225), not oeroded.
+
+    Vendor gates: the splash itself only fires on ``rn2(2)`` (50%, uhitm.c:5907)
+    AND weapon corrosion separately on ``!rn2(30)`` (1/30, uhitm.c:5920).
+    Wave 36b made both gates byte-equal vendor, so picking an arbitrary seed
+    fires corrosion only ~1.6% of the time; seed=9 is a precomputed
+    PRNGKey that satisfies both gates (splash rn2(2)==1; corrode rn2(30)==0
+    given the production split order) so the assertion below exercises the
+    corrosion path deterministically.
     """
     state = _base_state(entry_idx=_IDX_GREEN_MOLD)
     state = _with_weapon(state)
-    result = _run_passive(state, jax.random.PRNGKey(7))
+    result = _run_passive(state, jax.random.PRNGKey(9))
     # HP should decrease
     assert int(result.player_hp) < 50
     # Weapon corrosion is tracked in oeroded2 (ERODE_CORRODE is_primary=False).

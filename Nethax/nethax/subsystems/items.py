@@ -38,6 +38,58 @@ import jax.numpy as jnp
 import jax.lax as lax
 from flax import struct
 
+from Nethax.nethax.constants.objects import OBJECTS, Material
+
+# ---------------------------------------------------------------------------
+# Per-object erosion material class — vendor-equal classification.
+# Vendor macros (vendor/nethack/include/objclass.h lines 199-212):
+#   is_rustprone(otmp)   := oc_material == IRON
+#   is_corrodeable(otmp) := oc_material == COPPER || oc_material == IRON
+#   is_flammable(otmp)   := LEATHER|WOOD|CLOTH|PAPER|WAX|VEGGY|FLESH
+#
+# Encoded for both items.erode_obj_slot (vulnerability gate) and
+# obs/inv_strs (erosion-word rendering):
+#   0 = no erosion applicable; 1 = rustprone (IRON, also corrodeable);
+#   2 = flammable (LEATHER/...); 3 = corrodeable-only (COPPER).
+#
+# Defined here (not in obs/inv_strs) so the constant is created at the
+# top-level import of subsystems.items — which sits early in the
+# dependency graph — instead of being constructed inside a deferred
+# import that runs during a JIT trace.  The deferred-import pattern
+# triggered a JAX UnexpectedTracerError when erode_obj_slot was first
+# called from inside a traced function (e.g. monster_passives._do_corrode).
+# Cite: vendor/nethack/include/objclass.h:199-212.
+# ---------------------------------------------------------------------------
+
+_EROSION_RUST_MAT = {int(Material.IRON)}
+_EROSION_CORRODE_MAT = {int(Material.COPPER)}
+_EROSION_FLAME_MAT = {
+    int(Material.LEATHER),
+    int(Material.WOOD),
+    int(Material.CLOTH),
+    int(Material.PAPER),
+    int(Material.WAX),
+    int(Material.VEGGY),
+    int(Material.FLESH),
+}
+
+
+def _erosion_mat_class(obj) -> int:
+    m = int(obj.material)
+    if m in _EROSION_RUST_MAT:
+        return 1
+    if m in _EROSION_CORRODE_MAT:
+        return 3
+    if m in _EROSION_FLAME_MAT:
+        return 2
+    return 0
+
+
+_OBJECT_EROSION_CLASS: jnp.ndarray = jnp.array(
+    [_erosion_mat_class(obj) for obj in OBJECTS],
+    dtype=jnp.uint8,
+)  # uint8[NUM_OBJECTS]: 0=none,1=rustprone,2=flammable,3=corrodeable-only
+
 
 # ---------------------------------------------------------------------------
 # BUC status
@@ -275,8 +327,6 @@ def erode_obj_slot(
          EF_DESTROY branch is left to higher-level callers since it requires
          item-removal bookkeeping outside this slot-level helper).
     """
-    from Nethax.nethax.obs.inv_strs import _OBJECT_EROSION_CLASS
-
     sidx = jnp.asarray(slot_idx, dtype=jnp.int32)
     k    = jnp.asarray(kind, dtype=jnp.int32)
     f    = jnp.asarray(force, dtype=jnp.bool_)
