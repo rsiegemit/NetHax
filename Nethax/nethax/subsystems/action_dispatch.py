@@ -1821,6 +1821,32 @@ def _handle_jump(state, rng):
     return state.replace(player_pos=new_pos)
 
 
+def _handle_force(state, rng):
+    """#force — vendor/nethack/src/lock.c::doforce line 1116.
+
+    Bashes open a locked carried container using the wielded weapon.
+    Wave-44 minimum: clears `is_locked` on the lowest-index carried
+    container with prob ``min(2*str + 25, 99)`` per rn2(100).  Vendor
+    weapon-class also matters (blunt heavier weapons are better) — we
+    approximate with str-based chance only.
+
+    Cite: vendor/nethack/src/lock.c::doforce line 1116.
+    """
+    cs = state.containers
+    locked = cs.is_locked
+    candidate = locked
+    first = jnp.argmax(candidate.astype(jnp.int32)).astype(jnp.int32)
+    any_locked = jnp.any(candidate)
+    strv = state.player_str.astype(jnp.int32)
+    chance = jnp.minimum(jnp.int32(2) * strv + jnp.int32(25), jnp.int32(99))
+    roll = jax.random.randint(rng, (), 0, 100, dtype=jnp.int32)
+    success = any_locked & (roll < chance)
+    new_locked = jnp.where(success,
+                           locked.at[first].set(jnp.bool_(False)),
+                           locked)
+    return state.replace(containers=cs.replace(is_locked=new_locked))
+
+
 def _handle_wipe(state, rng):
     """#wipe — vendor/nethack/src/apply.c::dowipe line 2009.
 
@@ -2385,6 +2411,7 @@ _HANDLERS = (
     _handle_rub,        # 52  vendor/nethack/src/apply.c::dorub (M-r → lamp wish)
     _handle_sit,        # 53  vendor/nethack/src/sit.c::dosit (M-s → throne)
     _handle_wipe,       # 54  vendor/nethack/src/apply.c::dowipe (M-w → clear blind)
+    _handle_force,      # 55  vendor/nethack/src/lock.c::doforce (M-f → break lock)
 )
 
 # Slot indices for each named handler.
@@ -2459,6 +2486,8 @@ _SLOT_RUB        = 52
 _SLOT_SIT        = 53
 # #wipe (M-w) — vendor/nethack/src/apply.c::dowipe.
 _SLOT_WIPE       = 54
+# #force (M-f) — vendor/nethack/src/lock.c::doforce.
+_SLOT_FORCE      = 55
 
 # ---------------------------------------------------------------------------
 # 256-entry lookup table: action ASCII value → handler slot index
@@ -2636,7 +2665,7 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     table[_M_byte("C")] = _SLOT_NOOP   # cmd.c::doconduct
     table[_M_byte("d")] = _SLOT_DIP    # cmd.c::dodip — potion.c::dodip line 2267
     table[_M_byte("e")] = _SLOT_ENHANCE  # cmd.c:1716 — M('e') → enhance_weapon_skill
-    table[_M_byte("f")] = _SLOT_NOOP   # cmd.c::doforce
+    table[_M_byte("f")] = _SLOT_FORCE  # lock.c::doforce (break locked container)
     table[_M_byte("g")] = _SLOT_NOOP   # cmd.c::dogenocided
     table[_M_byte("i")] = _SLOT_INVOKE  # cmd.c::doinvoke → artifact.c::arti_invoke
     table[_M_byte("j")] = _SLOT_JUMP   # apply.c::dojump
@@ -2762,6 +2791,7 @@ _COMPACT_UNTRAP     = 37
 _COMPACT_RUB        = 38
 _COMPACT_SIT        = 39
 _COMPACT_WIPE       = 40
+_COMPACT_FORCE      = 41
 
 
 def _build_compact_handlers():
@@ -2808,6 +2838,7 @@ def _build_compact_handlers():
         _wrap_no_dir(_handle_rub),       # 38  COMPACT_RUB — apply.c::dorub
         _wrap_no_dir(_handle_sit),       # 39  COMPACT_SIT — sit.c::dosit
         _wrap_no_dir(_handle_wipe),      # 40  COMPACT_WIPE — apply.c::dowipe
+        _wrap_no_dir(_handle_force),     # 41  COMPACT_FORCE — lock.c::doforce
     )
 
 
@@ -2816,7 +2847,7 @@ _COMPACT_HANDLERS: tuple = _build_compact_handlers()
 
 def _build_slot_to_compact() -> jnp.ndarray:
     """Map legacy handler slot (0..54) → compact slot (0..40)."""
-    table = [0] * 55
+    table = [0] * 56
     # Movement slots 1..8 → COMPACT_MOVE.
     for s in (_SLOT_MOVE_N, _SLOT_MOVE_E, _SLOT_MOVE_S, _SLOT_MOVE_W,
               _SLOT_MOVE_NE, _SLOT_MOVE_SE, _SLOT_MOVE_SW, _SLOT_MOVE_NW):
@@ -2864,6 +2895,7 @@ def _build_slot_to_compact() -> jnp.ndarray:
     table[_SLOT_RUB]        = _COMPACT_RUB       # apply.c::dorub
     table[_SLOT_SIT]        = _COMPACT_SIT       # sit.c::dosit
     table[_SLOT_WIPE]       = _COMPACT_WIPE      # apply.c::dowipe
+    table[_SLOT_FORCE]      = _COMPACT_FORCE     # lock.c::doforce
     return jnp.array(table, dtype=jnp.int32)
 
 
@@ -2873,7 +2905,7 @@ def _build_slot_to_dir_idx() -> jnp.ndarray:
     Non-movement slots map to 0 (the direction is unused for those branches).
     The order matches ``_DIR_TABLE``: N=0, E=1, S=2, W=3, NE=4, SE=5, SW=6, NW=7.
     """
-    table = [0] * 55
+    table = [0] * 56
     # Move slots.
     table[_SLOT_MOVE_N]  = 0
     table[_SLOT_MOVE_E]  = 1
