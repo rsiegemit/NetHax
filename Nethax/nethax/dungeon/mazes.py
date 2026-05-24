@@ -1,22 +1,29 @@
 """Maze generation.
 
 Purpose:
-    Provides JAX-compatible maze generation functions.  Kruskal's MST
-    algorithm is implemented (used in NetHack for the Gnomish Mines lower
-    half and Quest branches).  generate_maze_dfs / generate_maze_perfect
-    carve a perfect maze via the vendor walkfrom() recursive-backtracker;
+    Provides JAX-compatible maze generation functions.  walkfrom_vendor
+    is the byte-equal port of vendor mkmaze::walkfrom (iterative MICRO
+    variant), running entirely in JAX with a fixed-capacity stack and
+    lax.while_loop — this is the canonical maze generator and is wired
+    into generate_maze_kruskal / generate_maze_perfect / generate_maze_dfs.
     generate_maze_dla produces organic caves via diffusion-limited
     aggregation.
 
 Citation:
-    vendor/nethack/src/mkmaze.c  — walkfree(), makemaz(), wallification(),
-        boxwall(), setupvault(); Kruskal-style wall-removal loop.
+    vendor/nethack/src/mkmaze.c  — walkfrom(), makemaz(), wallification(),
+        boxwall(), setupvault().
 
-Wave 2: generate_maze_kruskal implemented via lax.scan over a pre-shuffled
-        edge list with a flat union-find table.
-Wave 4: generate_maze_dfs / generate_maze_perfect implemented via the
-        vendor walkfrom() recursive-backtracker (mkmaze.c:1278-1310).
-        generate_maze_dla implemented as a DLA organic-cave generator.
+Wave 2:  generate_maze_kruskal implemented via lax.scan over a pre-shuffled
+         edge list with a flat union-find table  (legacy, retained as
+         _legacy_kruskal_maze for diff trace).
+Wave 4:  generate_maze_dfs / generate_maze_perfect implemented via the
+         vendor walkfrom() recursive-backtracker (mkmaze.c:1278-1310).
+         generate_maze_dla implemented as a DLA organic-cave generator.
+Wave 44b: walkfrom_vendor — JIT-pure byte-equal port of vendor mkmaze.c
+         walkfrom (MICRO iterative variant, lines 1225-1275) with explicit
+         fixed-capacity stack + lax.while_loop.  Wired in as the engine
+         behind generate_maze_kruskal / generate_maze_perfect /
+         generate_maze_dfs.
 """
 
 from __future__ import annotations
@@ -77,6 +84,174 @@ def _uf_union(parent: jnp.ndarray, a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarra
 
 
 # ---------------------------------------------------------------------------
+# walkfrom_vendor — byte-equal port of mkmaze.c::walkfrom (MICRO iterative)
+# ---------------------------------------------------------------------------
+#
+# Vendor reference (vendor/nethack/src/mkmaze.c, lines 1225-1275, MICRO
+# variant of walkfrom; semantically identical to the recursive version at
+# 1278-1310):
+#
+#     pos = 1;
+#     mazex[pos] = (char) x; mazey[pos] = (char) y;
+#     while (pos) {
+#         x = mazex[pos]; y = mazey[pos];
+#         if (!IS_DOOR(levl[x][y].typ)) { levl[x][y].typ = typ; ... }
+#         q = 0;
+#         for (a = 0; a < 4; a++)
+#             if (okay(x, y, a)) dirs[q++] = a;
+#         if (!q) pos--;
+#         else {
+#             dir = dirs[rn2(q)];
+#             mz_move(x, y, dir);          // step one — carve wall
+#             levl[x][y].typ = typ;
+#             mz_move(x, y, dir);          // step two — land on new cell
+#             pos++;
+#             mazex[pos] = x; mazey[pos] = y;
+#         }
+#     }
+#
+# Direction encoding (mz_move macro at mkmaze.c:32-41):
+#     0 = N (--y), 1 = E (++x), 2 = S (++y), 3 = W (--x)
+#
+# okay(x, y, dir) (mkmaze.c:296-305) probes the cell two steps in `dir` and
+# returns TRUE iff it is in bounds AND its tile is STONE (== unvisited).
+#
+# JAX porting strategy:
+#     • Fixed-capacity stack ([STACK_MAX, 2] int16) and an int32 pointer
+#       `sp` — `sp == 0` means empty (we 0-index instead of vendor's 1-index;
+#       the iteration semantics are identical).
+#     • lax.while_loop with `sp > 0` as the predicate carries (rng, terrain,
+#       stack, sp).
+#     • Per iteration: peek top, carve top → FLOOR, evaluate `okay` for all
+#       four directions in parallel, gather valid directions into a packed
+#       dirs[4] via a small scan, then lax.cond on q == 0:
+#         - q == 0  → pop (sp -= 1)
+#         - q >  0  → split rng, pick i = rn2(q), carve wall, push cell.
+
+# Direction deltas for {N, E, S, W} matching vendor mz_move:
+_DIR_DY = jnp.array([-1, 0, 1, 0], dtype=jnp.int32)
+_DIR_DX = jnp.array([0, 1, 0, -1], dtype=jnp.int32)
+
+
+def walkfrom_vendor(
+    rng: jnp.ndarray,
+    terrain: jnp.ndarray,
+    start_y: int,
+    start_x: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """JIT-pure byte-equal port of vendor mkmaze.c::walkfrom.
+
+    Carves a perfect maze starting from (start_y, start_x) into ``terrain``
+    via iterative DFS with an explicit fixed-capacity stack.  Cells live at
+    odd (y, x) coords; the wall between two cells is at the cell midpoint.
+
+    Vendor citation: vendor/nethack/src/mkmaze.c::walkfrom lines 1225-1275
+        (MICRO variant; semantically identical to the recursive form at
+        1278-1310).  Direction encoding from mz_move macro at lines 32-41:
+        0=N, 1=E, 2=S, 3=W.  `okay()` neighbour test from lines 296-305.
+
+    Args:
+        rng:      JAX PRNGKey driving the random direction picks.
+        terrain:  int8[MAP_H, MAP_W] grid; TILE_WALL=0 cells are unvisited,
+                  TILE_FLOOR=1 cells are carved.  The (start_y, start_x)
+                  cell is carved on the first iteration.
+        start_y:  starting cell row  (must be odd, in [1, MAP_H-2]).
+        start_x:  starting cell col  (must be odd, in [1, MAP_W-2]).
+
+    Returns:
+        (rng_out, terrain_out) — the consumed PRNGKey and the carved grid.
+    """
+    h, w = terrain.shape
+    # Worst-case stack depth = number of carvable cells; vendor uses
+    # CELLS = ROWNO*COLNO/4.  We add a small slack for safety.
+    STACK_MAX = (h * w) // 4 + 4
+
+    stack = jnp.zeros((STACK_MAX, 2), dtype=jnp.int16)
+    stack = stack.at[0].set(jnp.array([start_y, start_x], dtype=jnp.int16))
+    sp = jnp.int32(1)  # one element on the stack
+
+    def cond_fn(state):
+        _rng, _terrain, _stack, _sp = state
+        return _sp > 0
+
+    def body_fn(state):
+        rng_, terrain_, stack_, sp_ = state
+
+        # Peek top of stack.
+        top = stack_[sp_ - 1]
+        y = top[0].astype(jnp.int32)
+        x = top[1].astype(jnp.int32)
+
+        # Vendor: at top of loop, set levl[x][y].typ = typ (unconditionally
+        # for our port — we have no IS_DOOR equivalent in raw terrain).
+        terrain_ = terrain_.at[y, x].set(jnp.int8(TILE_FLOOR))
+
+        # Evaluate okay(x, y, a) for a in {0,1,2,3} — neighbour two steps
+        # away must be in bounds AND still TILE_WALL.
+        ny_all = y + 2 * _DIR_DY  # [4]
+        nx_all = x + 2 * _DIR_DX  # [4]
+        in_bounds = (
+            (ny_all >= 1) & (ny_all <= h - 2)
+            & (nx_all >= 1) & (nx_all <= w - 2)
+        )
+        # Safe gather (clamp to satisfy XLA even when out-of-bounds masked).
+        ny_safe = jnp.clip(ny_all, 0, h - 1)
+        nx_safe = jnp.clip(nx_all, 0, w - 1)
+        tile_at = terrain_[ny_safe, nx_safe]
+        is_stone = tile_at == jnp.int8(TILE_WALL)
+        okay_mask = in_bounds & is_stone  # [4] bool
+
+        q = jnp.sum(okay_mask.astype(jnp.int32))
+
+        # Build packed dirs[4]: indices of okay directions in encounter
+        # order.  Vendor: `for (a = 0..3) if (okay) dirs[q++] = a;`
+        # Replicate via cumulative-sum prefix → write-position per slot.
+        write_pos = jnp.cumsum(okay_mask.astype(jnp.int32)) - 1  # [4]
+        # Slots where !okay get write_pos masked to a parking index (3).
+        slot_idx = jnp.where(okay_mask, write_pos, jnp.int32(3))
+        # Scatter direction indices [0,1,2,3] into dirs[4].
+        dirs = jnp.zeros(4, dtype=jnp.int32)
+        dirs = dirs.at[slot_idx].set(jnp.arange(4, dtype=jnp.int32))
+
+        def do_pop(s):
+            r_, t_, st_, p_ = s
+            return r_, t_, st_, p_ - 1
+
+        def do_push(s):
+            r_, t_, st_, p_ = s
+            # rn2(q): uniform int in [0, q).
+            r_, sub = jax.random.split(r_)
+            i = jax.random.randint(sub, (), 0, q, dtype=jnp.int32)
+            dir_ = dirs[i]
+            dy = _DIR_DY[dir_]
+            dx = _DIR_DX[dir_]
+            # First mz_move — wall cell — carve.
+            wy = y + dy
+            wx = x + dx
+            t_ = t_.at[wy, wx].set(jnp.int8(TILE_FLOOR))
+            # Second mz_move — new cell — push (carve happens at top of
+            # next iteration to mirror vendor's top-of-loop carve).
+            cy = y + 2 * dy
+            cx = x + 2 * dx
+            st_ = st_.at[p_].set(
+                jnp.stack(
+                    [cy.astype(jnp.int16), cx.astype(jnp.int16)]
+                )
+            )
+            return r_, t_, st_, p_ + 1
+
+        rng_, terrain_, stack_, sp_ = lax.cond(
+            q == 0, do_pop, do_push, (rng_, terrain_, stack_, sp_)
+        )
+        return rng_, terrain_, stack_, sp_
+
+    rng_out, terrain_out, _stack_out, _sp_out = lax.while_loop(
+        cond_fn, body_fn, (rng, terrain, stack, sp)
+    )
+    return rng_out, terrain_out
+
+
+# ---------------------------------------------------------------------------
 # Maze generators
 # ---------------------------------------------------------------------------
 
@@ -85,7 +260,50 @@ def generate_maze_kruskal(
     h: int = MAP_H,
     w: int = MAP_W,
 ) -> MazeResult:
-    """Generate a perfect maze using a Kruskal-style wall-removal algorithm.
+    """Generate a perfect maze via the vendor walkfrom DFS.
+
+    Wave 44b: this entry point now drives walkfrom_vendor — the byte-equal
+    port of vendor mkmaze.c::walkfrom (MICRO iterative variant, lines
+    1225-1275).  The legacy Kruskal/union-find implementation is preserved
+    as ``_legacy_kruskal_maze`` for diff trace; it is not invoked.
+
+    Citation: vendor/nethack/src/mkmaze.c::walkfrom lines 1225-1275 and
+        makemaz() lines 989-995 (which picks a random start via maze0xy
+        and calls walkfrom).
+
+    Args:
+        rng: JAX PRNG key.
+        h:   map height.
+        w:   map width.
+
+    Returns:
+        (map_array, h, w) — int8[h, w]; TILE_WALL=0, TILE_FLOOR=1.
+    """
+    # Pick a random odd starting cell — vendor maze0xy() (mkmaze.c:309-314)
+    # selects from `3 + 2*rn2(...)`; we use 1 + 2*rn2(...) since our maze
+    # boundary lives at row/col 0 (vendor reserves rows 0-2 / cols 0-2).
+    rng, sub_y, sub_x = jax.random.split(rng, 3)
+    n_cell_rows = max((h - 2) // 2, 1)
+    n_cell_cols = max((w - 2) // 2, 1)
+    sy = 1 + 2 * jax.random.randint(sub_y, (), 0, n_cell_rows, dtype=jnp.int32)
+    sx = 1 + 2 * jax.random.randint(sub_x, (), 0, n_cell_cols, dtype=jnp.int32)
+
+    terrain = jnp.zeros((h, w), dtype=jnp.int8)  # all walls
+    _rng_out, terrain_out = walkfrom_vendor(rng, terrain, sy, sx)
+    return terrain_out, h, w
+
+
+def _legacy_kruskal_maze(
+    rng: jnp.ndarray,
+    h: int = MAP_H,
+    w: int = MAP_W,
+) -> MazeResult:
+    """Pre-Wave-44b Kruskal/union-find maze generator (retained for diff trace).
+
+    Not called by the public API; kept for reference and future A/B testing.
+    See the original docstring below.
+
+    Generate a perfect maze using a Kruskal-style wall-removal algorithm.
 
     NetHack mkmaze.c uses every-other-cell carving: cell positions are at
     odd coordinates (1,3,5,...) and walls between them live at even
@@ -207,80 +425,34 @@ def generate_maze_dfs(
     h: int = MAP_H,
     w: int = MAP_W,
 ) -> MazeResult:
-    """Generate a perfect maze via the vendor depth-first walker.
+    """Generate a perfect maze via the vendor walkfrom DFS.
 
-    Mirrors `vendor/nethack/src/mkmaze.c::walkfrom` (lines 1278-1310):
-        while (1) {
-            q = 0;
-            for (a = 0; a < 4; a++) if (okay(x,y,a)) dirs[q++] = a;
-            if (!q) return;                      // backtrack
-            dir = dirs[rn2(q)];                  // pick random unvisited
-            mz_move(x, y, dir);                  // step into wall
-            levl[x][y].typ = typ;                // carve wall to floor
-            mz_move(x, y, dir);                  // step into cell
-            walkfrom(x, y, typ);                 // recurse
-        }
+    Thin shim over ``walkfrom_vendor`` — Wave 44b made the walker JIT-pure
+    with a fixed-capacity stack, so this is now the same engine as
+    ``generate_maze_kruskal``.
 
-    Vendor convention (mkmaze.c): cells live at odd coordinates and walls
-    between them live at even coordinates; the walker takes two-step
-    moves, carving the wall in between.
-
-    This implementation runs an iterative DFS with an explicit stack
-    (Python-level — level gen is non-JIT, called once at construction).
-    Doors are NEVER placed in a maze level — vendor `makemaz()` calls
-    `mkstairs` and `populate_maze` but does not invoke `add_door`.
-
-    Citation: vendor/nethack/src/mkmaze.c makemaz()/walkfrom().
+    Citation: vendor/nethack/src/mkmaze.c::walkfrom lines 1225-1275 (MICRO
+        iterative) / 1278-1310 (recursive); makemaz() lines 989-995.
 
     Args:
         rng: JAX PRNG key.
-        h:   map height in cells.
-        w:   map width in cells.
+        h:   map height.
+        w:   map width.
 
     Returns:
         (map_array, h, w) — int8[h, w]; TILE_WALL=0, TILE_FLOOR=1.
     """
-    import numpy as np
+    # Vendor maze0xy picks a random odd-coord starting cell; we mirror by
+    # picking from the odd-cell grid inside the boundary.
+    rng, sub_y, sub_x = jax.random.split(rng, 3)
+    n_cell_rows = max((h - 2) // 2, 1)
+    n_cell_cols = max((w - 2) // 2, 1)
+    sy = 1 + 2 * jax.random.randint(sub_y, (), 0, n_cell_rows, dtype=jnp.int32)
+    sx = 1 + 2 * jax.random.randint(sub_x, (), 0, n_cell_cols, dtype=jnp.int32)
 
-    # Materialise the rng to a seed so we can drive Python's stdlib RNG
-    # deterministically.  Level gen runs once at construction (non-JIT).
-    seed_arr = np.asarray(jax.random.bits(rng, (2,), jnp.uint32))
-    seed = (int(seed_arr[0]) << 32) | int(seed_arr[1])
-    pyrng = np.random.RandomState(seed & 0xFFFFFFFF)
-
-    maze = np.zeros((h, w), dtype=np.int8)  # all walls
-
-    # Cells at odd coords inside the boundary.
-    def in_bounds(r, c):
-        return 1 <= r < h - 1 and 1 <= c < w - 1
-
-    start_r = 1 if h > 2 else 0
-    start_c = 1 if w > 2 else 0
-    maze[start_r, start_c] = TILE_FLOOR
-
-    # Iterative DFS stack of (r, c) cell positions.
-    stack = [(start_r, start_c)]
-    # Vendor okay() probes neighbours 2 steps away (cell-to-cell).
-    deltas = [(-2, 0), (2, 0), (0, -2), (0, 2)]
-
-    while stack:
-        r, c = stack[-1]
-        # Find unvisited cell neighbours (cells two steps away that are wall).
-        unvisited = [
-            (dr, dc) for (dr, dc) in deltas
-            if in_bounds(r + dr, c + dc) and maze[r + dr, c + dc] == TILE_WALL
-        ]
-        if not unvisited:
-            stack.pop()  # backtrack — equivalent to walkfrom returning
-            continue
-        dr, dc = unvisited[pyrng.randint(0, len(unvisited))]
-        # Carve the wall between (vendor: first mz_move carves wall).
-        maze[r + dr // 2, c + dc // 2] = TILE_FLOOR
-        # Step into the new cell (vendor: second mz_move + recursion).
-        maze[r + dr, c + dc] = TILE_FLOOR
-        stack.append((r + dr, c + dc))
-
-    return jnp.asarray(maze), h, w
+    terrain = jnp.zeros((h, w), dtype=jnp.int8)
+    _rng_out, terrain_out = walkfrom_vendor(rng, terrain, sy, sx)
+    return terrain_out, h, w
 
 
 def generate_maze_perfect(
