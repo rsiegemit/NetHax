@@ -1821,6 +1821,81 @@ def _handle_jump(state, rng):
     return state.replace(player_pos=new_pos)
 
 
+def _handle_chat(state, rng):
+    """#chat — vendor/nethack/src/pray.c::dochat line 88.
+
+    Talk to an adjacent monster.  Wave-46 minimum: if there is an
+    adjacent **priest** monster (symbol S_HUMAN with sound MS_PRIEST,
+    approximated here as any priest-class via the entry table), and
+    the player has player_align matching the priest's, restore HP by
+    +5 (priests bless / heal aligned worshipers in vendor pray.c via
+    sit_pray etc.).  Otherwise no-op.
+
+    Cite: vendor/nethack/src/pray.c::dochat line 88;
+          vendor/nethack/src/priest.c::priest_talk lines 372-510.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS as _MM, MS_PRIEST
+    mai = state.monster_ai
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    mpos = mai.pos.astype(jnp.int32)
+    d_row = jnp.abs(mpos[:, 0] - pr)
+    d_col = jnp.abs(mpos[:, 1] - pc)
+    adj = (d_row <= jnp.int32(1)) & (d_col <= jnp.int32(1)) & mai.alive
+    # Build priest-mask from MONSTERS table at import time.
+    priest_mask_arr = jnp.array(
+        [int(getattr(m, "sound", 0) == int(MS_PRIEST)) for m in _MM],
+        dtype=jnp.bool_,
+    )
+    entry = jnp.clip(mai.entry_idx.astype(jnp.int32), 0,
+                     priest_mask_arr.shape[0] - 1)
+    is_priest = priest_mask_arr[entry]
+    can_heal = jnp.any(adj & is_priest)
+    new_hp = jnp.where(
+        can_heal,
+        jnp.minimum(state.player_hp + jnp.int32(5), state.player_hp_max),
+        state.player_hp,
+    )
+    return state.replace(player_hp=new_hp)
+
+
+def _handle_turn_undead(state, rng):
+    """#turn — vendor/nethack/src/pray.c::doturn line 1820.
+
+    Cleric ability: deals d8 damage to every undead monster in a 5x5
+    Chebyshev radius around the player.  Wave-46 minimum: scan all
+    alive monsters with M2_UNDEAD in `flags2`, apply d8 damage if
+    Chebyshev ≤ 5.
+
+    Cite: vendor/nethack/src/pray.c::doturn line 1820;
+          vendor/nethack/include/monflag.h M2_UNDEAD.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS as _MM, M2_UNDEAD
+    mai = state.monster_ai
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    mpos = mai.pos.astype(jnp.int32)
+    d_row = jnp.abs(mpos[:, 0] - pr)
+    d_col = jnp.abs(mpos[:, 1] - pc)
+    in_range = (d_row <= jnp.int32(5)) & (d_col <= jnp.int32(5)) & mai.alive
+    # Build undead-mask from MONSTERS at import time.
+    undead_mask_arr = jnp.array(
+        [int(bool(getattr(m, "flags2", 0) & int(M2_UNDEAD))) for m in _MM],
+        dtype=jnp.bool_,
+    )
+    entry = jnp.clip(mai.entry_idx.astype(jnp.int32), 0,
+                     undead_mask_arr.shape[0] - 1)
+    is_undead = undead_mask_arr[entry]
+    targets = in_range & is_undead
+    dmg = jax.random.randint(rng, (), 1, 9, dtype=jnp.int32)
+    new_hp = jnp.where(targets,
+                       jnp.maximum(mai.hp - dmg, jnp.int32(0)),
+                       mai.hp)
+    new_alive = jnp.where(targets & (new_hp <= jnp.int32(0)),
+                          jnp.bool_(False), mai.alive)
+    return state.replace(monster_ai=mai.replace(hp=new_hp, alive=new_alive))
+
+
 def _handle_force(state, rng):
     """#force — vendor/nethack/src/lock.c::doforce line 1116.
 
@@ -2412,6 +2487,8 @@ _HANDLERS = (
     _handle_sit,        # 53  vendor/nethack/src/sit.c::dosit (M-s → throne)
     _handle_wipe,       # 54  vendor/nethack/src/apply.c::dowipe (M-w → clear blind)
     _handle_force,      # 55  vendor/nethack/src/lock.c::doforce (M-f → break lock)
+    _handle_chat,       # 56  vendor/nethack/src/pray.c::dochat (M-c → priest heal)
+    _handle_turn_undead,# 57  vendor/nethack/src/pray.c::doturn (M-t → smite undead)
 )
 
 # Slot indices for each named handler.
@@ -2488,6 +2565,10 @@ _SLOT_SIT        = 53
 _SLOT_WIPE       = 54
 # #force (M-f) — vendor/nethack/src/lock.c::doforce.
 _SLOT_FORCE      = 55
+# #chat (M-c) — vendor/nethack/src/pray.c::dochat.
+_SLOT_CHAT       = 56
+# #turn (M-t) — vendor/nethack/src/pray.c::doturn.
+_SLOT_TURN       = 57
 
 # ---------------------------------------------------------------------------
 # 256-entry lookup table: action ASCII value → handler slot index
@@ -2661,7 +2742,7 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     # These get bound to the M-prefix key when not running through #extcmd.
     table[_M_byte("a")] = _SLOT_NOOP   # cmd.c::doorganize (adjust)
     table[_M_byte("A")] = _SLOT_NOOP   # cmd.c::donamelevel (annotate)
-    table[_M_byte("c")] = _SLOT_NOOP   # cmd.c::dotalk (chat)
+    table[_M_byte("c")] = _SLOT_CHAT   # pray.c::dochat (talk to adjacent priest)
     table[_M_byte("C")] = _SLOT_NOOP   # cmd.c::doconduct
     table[_M_byte("d")] = _SLOT_DIP    # cmd.c::dodip — potion.c::dodip line 2267
     table[_M_byte("e")] = _SLOT_ENHANCE  # cmd.c:1716 — M('e') → enhance_weapon_skill
@@ -2678,7 +2759,7 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     table[_M_byte("r")] = _SLOT_RUB    # apply.c::dorub (rub lamp/stone)
     table[_M_byte("R")] = _SLOT_RIDE   # cmd.c::doride — steed.c:178
     table[_M_byte("s")] = _SLOT_SIT    # sit.c::dosit (throne 13-effect table)
-    table[_M_byte("t")] = _SLOT_NOOP   # cmd.c::doturn
+    table[_M_byte("t")] = _SLOT_TURN   # pray.c::doturn (smite undead)
     table[_M_byte("T")] = _SLOT_TIP_DOWN  # cmd.c::dotip → WAN_DIGGING down-dig (dig.c:1548)
     table[_M_byte("u")] = _SLOT_UNTRAP # untrap.c::dountrap (disarm adjacent)
     table[_M_byte("v")] = _SLOT_NOOP   # cmd.c::doextversion
@@ -2792,6 +2873,8 @@ _COMPACT_RUB        = 38
 _COMPACT_SIT        = 39
 _COMPACT_WIPE       = 40
 _COMPACT_FORCE      = 41
+_COMPACT_CHAT       = 42
+_COMPACT_TURN       = 43
 
 
 def _build_compact_handlers():
@@ -2839,6 +2922,8 @@ def _build_compact_handlers():
         _wrap_no_dir(_handle_sit),       # 39  COMPACT_SIT — sit.c::dosit
         _wrap_no_dir(_handle_wipe),      # 40  COMPACT_WIPE — apply.c::dowipe
         _wrap_no_dir(_handle_force),     # 41  COMPACT_FORCE — lock.c::doforce
+        _wrap_no_dir(_handle_chat),      # 42  COMPACT_CHAT — pray.c::dochat
+        _wrap_no_dir(_handle_turn_undead),# 43  COMPACT_TURN — pray.c::doturn
     )
 
 
@@ -2847,7 +2932,7 @@ _COMPACT_HANDLERS: tuple = _build_compact_handlers()
 
 def _build_slot_to_compact() -> jnp.ndarray:
     """Map legacy handler slot (0..54) → compact slot (0..40)."""
-    table = [0] * 56
+    table = [0] * 58
     # Movement slots 1..8 → COMPACT_MOVE.
     for s in (_SLOT_MOVE_N, _SLOT_MOVE_E, _SLOT_MOVE_S, _SLOT_MOVE_W,
               _SLOT_MOVE_NE, _SLOT_MOVE_SE, _SLOT_MOVE_SW, _SLOT_MOVE_NW):
@@ -2896,6 +2981,8 @@ def _build_slot_to_compact() -> jnp.ndarray:
     table[_SLOT_SIT]        = _COMPACT_SIT       # sit.c::dosit
     table[_SLOT_WIPE]       = _COMPACT_WIPE      # apply.c::dowipe
     table[_SLOT_FORCE]      = _COMPACT_FORCE     # lock.c::doforce
+    table[_SLOT_CHAT]       = _COMPACT_CHAT      # pray.c::dochat
+    table[_SLOT_TURN]       = _COMPACT_TURN      # pray.c::doturn
     return jnp.array(table, dtype=jnp.int32)
 
 
@@ -2905,7 +2992,7 @@ def _build_slot_to_dir_idx() -> jnp.ndarray:
     Non-movement slots map to 0 (the direction is unused for those branches).
     The order matches ``_DIR_TABLE``: N=0, E=1, S=2, W=3, NE=4, SE=5, SW=6, NW=7.
     """
-    table = [0] * 56
+    table = [0] * 58
     # Move slots.
     table[_SLOT_MOVE_N]  = 0
     table[_SLOT_MOVE_E]  = 1
