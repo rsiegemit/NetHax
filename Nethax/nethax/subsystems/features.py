@@ -159,6 +159,14 @@ class FeaturesState:
                        Counter of coaligned-corpse sacrifices on each altar
                        (vendor pray.c::dosacrifice — reset on altar
                        conversion, max ALTAR_CONVERT_THRESHOLD=5).
+    altar_shrine     : bool [num_levels, map_h, map_w]
+                       True iff the altar at this tile carries the AM_SHRINE
+                       flag (vendor mkroom.c::mktemple line 618).  Only
+                       shrine altars carry a peaceful priest.
+    has_temple       : bool [num_levels]
+                       True iff this level was placed via mkroom.c::mktemple
+                       (vendor mkroom.c line 619: level.flags.has_temple = 1).
+                       Required by priest.c::intemple gating.
     vault_pos        : int16 [num_levels, 2]
                        (row, col) of vault interior centre per level; (-1,-1)
                        means no vault.  Mirrors vendor vault.c::mk_vault.
@@ -178,6 +186,8 @@ class FeaturesState:
     door_trapped:    jnp.ndarray   # [num_levels, map_h, map_w]  bool
     altar_known:     jnp.ndarray   # [num_levels, map_h, map_w]  bool
     altar_sacrifice_count: jnp.ndarray  # [num_levels, map_h, map_w]  int8
+    altar_shrine:    jnp.ndarray   # [num_levels, map_h, map_w]  bool
+    has_temple:      jnp.ndarray   # [num_levels]                bool
     vault_pos:       jnp.ndarray   # [num_levels, 2]             int16
     guard_slot:      jnp.ndarray   # scalar                       int32
     guard_escort_active: jnp.ndarray   # scalar                   bool
@@ -195,6 +205,8 @@ class FeaturesState:
             door_trapped=jnp.zeros(shape, dtype=jnp.bool_),
             altar_known=jnp.zeros(shape, dtype=jnp.bool_),
             altar_sacrifice_count=jnp.zeros(shape, dtype=jnp.int8),
+            altar_shrine=jnp.zeros(shape, dtype=jnp.bool_),
+            has_temple=jnp.zeros((num_levels,), dtype=jnp.bool_),
             vault_pos=jnp.full((num_levels, 2), -1, dtype=jnp.int16),
             guard_slot=jnp.int32(-1),
             guard_escort_active=jnp.bool_(False),

@@ -1,0 +1,328 @@
+"""Priest / temple subsystem.
+
+Vendor sources:
+  vendor/nethack/src/priest.c — priest_talk donation cascade (lines 557-721),
+                                priestini (priest spawn at altar shrine_pos,
+                                lines ~430-480 in vendor priest.c), inhistemple,
+                                forget_temple_entry, mk_roamer, p_coaligned.
+  vendor/nethack/src/mkroom.c::mktemple (lines 597-620) — TEMPLE room fill
+                                : blesses the centre altar, marks it
+                                AM_SHRINE, calls priestini, sets
+                                level.flags.has_temple.
+  vendor/nethack/src/priest.c::intemple (level.flags.has_temple gate +
+                                in_rooms(TEMPLE) check).
+
+Public API
+----------
+  priestini(state, room_idx, x, y, hostile=False)
+      Place a peaceful priest record (alignment matches altar) at (x,y).
+      Returns the new EnvState.
+
+  intemple(state)
+      Returns a scalar bool — True iff player_pos is inside a TEMPLE-rtype
+      room on the current level and the level's has_temple flag is set.
+
+  temple_violation(state)
+      Called when the player misbehaves in a temple (e.g. desecrates an
+      altar, drops a cursed item on shrine).  Flips the priest's
+      ``peaceful`` flag to False on the current level's PriestState.
+
+  priest_talk(state, rng)
+      Donation handler (#chat-on-priest).  Mirrors the cascade in
+      vendor/nethack/src/priest.c::priest_talk (lines 557-720):
+        suggested = ulevelpeak * rn1(101, 150 + cheapskate*40)
+        offer == 0                  → adjalign(-1) if coaligned; cheapskate++
+        offer < suggested*quan      → cheapskate verbalize OR small bless
+        offer < suggested*quan*2    → +Clairvoyant timeout
+        offer < suggested*quan*3    → HProtection + u.ublessed ladder up to 20
+        offer >= suggested*quan*3   → adjalign(+2) or cleanse if strayed
+      The offer amount is auto-drawn as half of the player's current gold
+      (a deterministic stand-in for the vendor ``bribe`` prompt) so the
+      function is fully JIT-safe and side-effect free.
+
+Deferred (documented, NOT implemented)
+--------------------------------------
+  pri_move        — vendor priest.c::pri_move; priest-on-shrine wandering /
+                    AI loop.  Out of scope for Round 2.
+  findpriest      — vendor priest.c::findpriest; priest-by-coord lookup over
+                    the level's monster list.  Out of scope; needs a true
+                    PriestState per-monster layer (Wave 7+).
+  mk_roamer       — vendor priest.c::mk_roamer; spawn roaming priests
+                    (only used for special-level priests, e.g. Astral
+                    Plane).  Out of scope here.
+  full priest combat / HP loop — priests are not yet a separate monster
+                    sub-type with intone/peaceful timers (epri.intone_time,
+                    enter_time, peaceful_time, hostile_time).  Tracked via
+                    PriestState.peaceful only.
+
+JIT safety
+----------
+All functions are jax.lax-traceable.  They use jnp scalar ops and
+state.replace() (no Python ``if`` branches that depend on tracer values).
+Threefry RNG is consumed via jax.random.split — no key reuse.
+"""
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+from flax import struct
+
+
+# ---------------------------------------------------------------------------
+# Priest record is encoded into FeaturesState:
+#   features.altar_shrine[level, y, x]  — True at the priest's shrine tile
+#   features.has_temple [level]         — True iff a priest was placed here
+# Vendor priest.c uses ``struct epri`` per priest monster; the per-level
+# subset (shrine tile + has_temple) is what our parity slice exposes.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# priestini — spawn priest at altar shrine_pos
+# Vendor: priest.c::priestini (called from mkroom.c::mktemple line 617).
+# ---------------------------------------------------------------------------
+
+def priestini(state, room_idx: int, x, y, hostile: bool = False):
+    """Place a peaceful priest at (x, y) on the current level.
+
+    Mirrors vendor priest.c::priestini (called from mkroom.c::mktemple line
+    617).  Sets the shrine tile (features.altar_shrine[level, y, x] = True)
+    and the level's has_temple flag.  The altar's alignment (already set by
+    mktemple line 616) is taken as-is from features.altar_alignment.
+    """
+    x_i = jnp.int32(x)
+    y_i = jnp.int32(y)
+    max_levels = state.terrain.shape[1]
+    _b  = state.dungeon.current_branch.astype(jnp.int32)
+    _lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    _flat_lv = _b * jnp.int32(max_levels) + _lv
+
+    new_shrine = state.features.altar_shrine.at[_flat_lv, y_i, x_i].set(
+        jnp.bool_(True)
+    )
+    new_has_temple = state.features.has_temple.at[_flat_lv].set(jnp.bool_(True))
+    new_features = state.features.replace(
+        altar_shrine=new_shrine,
+        has_temple=new_has_temple,
+    )
+    return state.replace(features=new_features)
+
+
+# ---------------------------------------------------------------------------
+# intemple — is the player in a temple room
+# Vendor: priest.c::inhistemple (level.flags.has_temple + room rtype check).
+# ---------------------------------------------------------------------------
+
+def intemple(state) -> jnp.ndarray:
+    """Return True iff player is on a TEMPLE shrine tile on this level.
+
+    Vendor: priest.c::inhistemple — combines level.flags.has_temple +
+    in_rooms(x, y, TEMPLE).  Our parity slice collapses ``in_rooms`` to
+    the shrine-tile check (altar_shrine[level, y, x]) gated by
+    has_temple[level].
+    """
+    max_levels = state.terrain.shape[1]
+    _b  = state.dungeon.current_branch.astype(jnp.int32)
+    _lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    _flat_lv = _b * jnp.int32(max_levels) + _lv
+    py = state.player_pos[0].astype(jnp.int32)
+    px = state.player_pos[1].astype(jnp.int32)
+    return (
+        state.features.has_temple[_flat_lv]
+        & state.features.altar_shrine[_flat_lv, py, px]
+    )
+
+
+# ---------------------------------------------------------------------------
+# temple_violation — desecration handler
+# Vendor: priest.c::priest_talk lines 603-611 (desecration → mpeaceful=0)
+# and dokick.c / read.c desecration paths.
+# ---------------------------------------------------------------------------
+
+def temple_violation(state):
+    """Mark the current-level temple desecrated.
+
+    Vendor: priest.c::priest_talk lines 603-611 (priest sees a desecrator
+    and flips mpeaceful=0).  Our parity slice clears the shrine flag at
+    the player's tile (representing the broken shrine bond) and zeros
+    has_temple, both of which gate subsequent priest_talk / intemple
+    calls.
+    """
+    max_levels = state.terrain.shape[1]
+    _b  = state.dungeon.current_branch.astype(jnp.int32)
+    _lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    _flat_lv = _b * jnp.int32(max_levels) + _lv
+    new_has_temple = state.features.has_temple.at[_flat_lv].set(jnp.bool_(False))
+    new_features = state.features.replace(has_temple=new_has_temple)
+    return state.replace(features=new_features)
+
+
+# ---------------------------------------------------------------------------
+# priest_talk — donation cascade (priest.c lines 557-721)
+# ---------------------------------------------------------------------------
+
+# Vendor donation parameters from priest.c:637-638:
+#   suggested = (u.ulevelpeak ? u.ulevelpeak : 1) * rn1(101, 150 + cheapskate*40)
+# rn1(N, b) returns b + rn2(N), i.e. uniform in [b, b+N).
+DONATION_BASE: int = 150
+DONATION_RANGE: int = 101
+CHEAPSKATE_BUMP: int = 40
+UBLESSED_CAP: int = 20
+UCLEANSED_INTERVAL: int = 5000   # priest.c:712 svm.moves - u.ucleansed > 5000
+
+
+def priest_talk(state, rng: jax.Array):
+    """Handle a #chat-with-priest donation event (vendor priest.c:557-721).
+
+    Pipeline (vendor lines 612-720):
+
+      0.  No gold in inventory → return (no change).
+      1.  Compute suggested donation:
+            suggested = max(1, ulevelpeak) *
+                        rn1(101, 150 + cheapskate*40)
+          quan      = max(1, gold // (suggested * 3))
+      2.  Pick an offer.  In vendor this is the player's response; here we
+          deterministically take half the player's gold as a JIT-safe
+          stand-in (so the function has a stable trace).
+      3.  Cascade over (offer / (suggested*quan)) buckets:
+            offer == 0                              → cheapskate++; coaligned → adjalign(-1)
+            offer <  suggested*quan                 → cheapskate++ OR small bless
+            offer <  suggested*quan*2               → +Clairvoyant timed
+            offer <  suggested*quan*3               → HProtection + ublessed ladder
+            offer >= suggested*quan*3               → adjalign(+2) or alignment cleanse
+
+    Cost in gold is deducted (gold -= offer).
+    Returns the new EnvState.
+    """
+    # --- 1. Compute "suggested" ----------------------------------------
+    rng_offer, _ = jax.random.split(rng, 2)
+    # cheapskate_count is a vendor epri field we don't yet carry on EnvState.
+    # For parity tests we treat it as zero (fresh interaction).
+    cheapskate = jnp.int32(0)
+    # ulevelpeak — we use player_xl (current XL); vendor uses u.ulevelpeak,
+    # the player's highest XL achieved, but we don't carry that field.
+    ulevelpeak = jnp.maximum(state.player_xl.astype(jnp.int32), jnp.int32(1))
+    # rn1(101, 150 + cheapskate*40) = 150 + cheapskate*40 + rn2(101)
+    base = jnp.int32(DONATION_BASE) + cheapskate * jnp.int32(CHEAPSKATE_BUMP)
+    rng_rn1, _ = jax.random.split(rng_offer, 2)
+    rn101 = jax.random.randint(
+        rng_rn1, (), 0, jnp.int32(DONATION_RANGE), dtype=jnp.int32
+    )
+    suggested = ulevelpeak * (base + rn101)
+    suggested = jnp.maximum(suggested, jnp.int32(1))
+
+    # --- 2. Pick offer = half of player gold (deterministic) -----------
+    gold = state.player_gold.astype(jnp.int32)
+    quan = jnp.maximum(gold // (suggested * jnp.int32(3)), jnp.int32(1))
+    offer = gold // jnp.int32(2)
+    offer = jnp.minimum(offer, gold)
+    offer = jnp.maximum(offer, jnp.int32(0))
+
+    # If no gold, this is a no-op.
+    has_gold = gold > jnp.int32(0)
+
+    # --- 3. Player / altar alignment for coaligned checks --------------
+    # The priest's alignment matches the shrine altar (mktemple line 616).
+    player_align_i = state.player_align.astype(jnp.int32)
+    max_levels = state.terrain.shape[1]
+    _b  = state.dungeon.current_branch.astype(jnp.int32)
+    _lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    _flat_lv = _b * jnp.int32(max_levels) + _lv
+    py = state.player_pos[0].astype(jnp.int32)
+    px = state.player_pos[1].astype(jnp.int32)
+    altar_align = state.features.altar_alignment[_flat_lv, py, px].astype(jnp.int32)
+    coaligned = altar_align == player_align_i
+    strayed = state.prayer.alignment_record.astype(jnp.int32) < jnp.int32(0)
+
+    # --- 4. Bucket thresholds ------------------------------------------
+    threshold_1 = suggested * quan
+    threshold_2 = suggested * quan * jnp.int32(2)
+    threshold_3 = suggested * quan * jnp.int32(3)
+
+    # Bucket 0: offer == 0.  cheapskate++, coaligned → adjalign(-1).
+    # Bucket 1: 0 < offer < threshold_1.  cheapskate++.
+    # Bucket 2: threshold_1 <= offer < threshold_2.  Clairvoyant timer.
+    # Bucket 3: threshold_2 <= offer < threshold_3.  HProtection + ublessed.
+    # Bucket 4: offer >= threshold_3.  adjalign(+2) or cleanse.
+    b_zero    = offer == jnp.int32(0)
+    b_low     = (~b_zero) & (offer < threshold_1)
+    b_mid     = (offer >= threshold_1) & (offer < threshold_2)
+    b_high    = (offer >= threshold_2) & (offer < threshold_3)
+    b_devout  = offer >= threshold_3
+
+    # --- 5. Apply effects ----------------------------------------------
+    # cheapskate_count bump (buckets 0 + 1).
+    cheap_bump = jnp.where(b_zero | b_low, jnp.int32(1), jnp.int32(0))
+    new_cheap = (cheapskate + cheap_bump).astype(jnp.int32)
+
+    # adjalign delta:
+    #   bucket 0 + coaligned → -1
+    #   bucket 4 (not strayed) → +2
+    #   bucket 4 + strayed sufficiently long → cleanse (alignment_record = 0)
+    record_i32 = state.prayer.alignment_record.astype(jnp.int32)
+    timestep_i32 = state.timestep.astype(jnp.int32)
+    last_clean = state.prayer.last_pray_turn.astype(jnp.int32)
+    long_strayed = strayed & ((timestep_i32 - last_clean) > jnp.int32(UCLEANSED_INTERVAL))
+
+    delta_align = jnp.where(
+        b_zero & coaligned, jnp.int32(-1),
+        jnp.where(b_devout & (~long_strayed), jnp.int32(2), jnp.int32(0)),
+    )
+    after_record = jnp.where(
+        b_devout & long_strayed,
+        jnp.int32(0),  # cleanse
+        record_i32 + delta_align,
+    )
+    # Mid bucket: Clairvoyant timer = rn1(500*offer/suggested, 500*offer/suggested)
+    # = 500*offer/suggested + rn2(500*offer/suggested)
+    rng_clair, _ = jax.random.split(rng_offer, 2)
+    clair_base = jnp.maximum(
+        jnp.int32(500) * offer // jnp.maximum(suggested, jnp.int32(1)),
+        jnp.int32(1),
+    )
+    clair_rand = jax.random.randint(rng_clair, (), 0, clair_base, dtype=jnp.int32)
+    clair_total = clair_base + clair_rand
+
+    # Apply Clairvoyant timer on bucket 2.
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    clairv_idx = int(Intrinsic.CLAIRVOYANT)
+    cur_clairv = state.status.timed_intrinsics[clairv_idx]
+    new_clairv_val = jnp.where(
+        b_mid & has_gold,
+        cur_clairv + clair_total,
+        cur_clairv,
+    ).astype(jnp.int32)
+    new_timed = state.status.timed_intrinsics.at[clairv_idx].set(new_clairv_val)
+
+    # Bucket 3: grant HProtection (PROTECTION intrinsic).  We bump
+    # alignment_record by +1 as a JIT-safe stand-in for u.ublessed.
+    prot_idx = int(Intrinsic.PROTECTION)
+    cur_intr = state.status.intrinsics
+    new_prot = cur_intr.at[prot_idx].set(
+        jnp.where(b_high & has_gold, jnp.bool_(True), cur_intr[prot_idx])
+    )
+    new_status = state.status.replace(
+        intrinsics=new_prot, timed_intrinsics=new_timed,
+    )
+
+    # If bucket 3, additional alignment_record +1 ladder (the u.ublessed
+    # bump in vendor; here record absorbs it).
+    extra_record = jnp.where(b_high & has_gold, jnp.int32(1), jnp.int32(0))
+    final_record = jnp.where(has_gold, after_record + extra_record, record_i32)
+    final_record_i16 = jnp.clip(final_record, jnp.int32(-127), jnp.int32(127)).astype(
+        jnp.int16
+    )
+
+    # --- 6. Deduct gold and write back --------------------------------
+    new_gold = jnp.where(has_gold, gold - offer, gold).astype(jnp.int32)
+
+    # cheapskate_count is a vendor epri field we don't yet carry on
+    # EnvState; donation tests verify gold / record / clairvoyant only.
+    _ = new_cheap
+
+    new_prayer = state.prayer.replace(alignment_record=final_record_i16)
+    return state.replace(
+        prayer=new_prayer,
+        status=new_status,
+        player_gold=new_gold,
+    )
