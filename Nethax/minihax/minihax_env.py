@@ -190,17 +190,16 @@ class MinihaxEnv:
         # or we hit max_steps.
         done = bool(rm_done) or bool(_engine_done) or truncated
 
-        # Wave17i parity: apply reward_win / reward_lose / penalty_step /
-        # penalty_time per vendor MiniHack base.py.  ``reward_win`` is paid
-        # once on terminal success (rm_done), ``reward_lose`` on engine
-        # death.  ``penalty_step`` is paid every step; ``penalty_time`` is
-        # multiplied by the in-game turn delta (clamped to 1 to avoid
-        # double-counting when the reward manager already handles it).
+        # Vendor parity: vendor/minihack/minihack/base.py::_reward_fn lines
+        # 378-392 — when a ``reward_manager`` is present, the per-step reward
+        # is ``reward_manager.collect_reward()`` only (no ``reward_win`` /
+        # ``reward_lose`` addition).  ``reward_win`` / ``reward_lose`` apply
+        # only on the "no reward_manager" branch (else-clause line 385).
+        # Our wrapper always has a RewardManager (custom or registry-default
+        # sparse-stair), so the win/lose additions would double-count and
+        # are not applied.  ``penalty_step`` is kept and added unconditionally;
+        # in vendor it is paid each step when frozen (tasks.py:55-80).
         reward = float(reward) + self._penalty_step
-        if bool(rm_done):
-            reward += self._reward_win
-        if bool(_engine_done) and not bool(rm_done):
-            reward += self._reward_lose
 
         info: Dict[str, Any] = {
             "fired_mask": new_fired,

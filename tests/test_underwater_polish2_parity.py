@@ -120,6 +120,12 @@ def test_no_breath_still_drowns():
 
     Cite: vendor/nethack/src/hack.c::pooleffects line 3304 (enter),
           vendor/nethack/src/trap.c::drown() lines 5059-5195 (damage).
+
+    Vendor drowning is binary: ``drown()`` either lets the hero crawl out
+    or calls ``done(DROWNING)`` (instakill).  Our ``water_step`` models
+    this with a per-5-turns rnl(50)-vs-turns_underwater check; the kill
+    probability grows from 12% at turn 5 to ~100% at turn 50.  We tick
+    50 turns so the insta-drown fires deterministically.
     """
     state = _make_state(player_pos=(10, 10))
     state = _place_tile(state, 10, 11, TileType.POOL)
@@ -130,9 +136,10 @@ def test_no_breath_still_drowns():
     state = _try_step(state, 0, 1, _RNG)
     assert bool(state.player_in_water), "Stepping into POOL should set player_in_water."
 
-    # Apply 5 drowning ticks.
+    # Apply 50 drowning ticks; by turn 50 the rnl(50) <= turns_underwater
+    # check at turn 50 is guaranteed to trigger insta-drown.
     rng = _RNG
-    for _ in range(5):
+    for _ in range(50):
         rng, sub = jax.random.split(rng)
         state = water_step(state, sub)
 
