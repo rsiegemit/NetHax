@@ -950,16 +950,36 @@ def cursed_bag_consume(state, rng, container_idx: int):
 # Action handlers (dispatched from action_dispatch.py)
 # ---------------------------------------------------------------------------
 
-def handle_loot(state, rng):
-    """LOOT — open the first held container (vendor/nethack/src/pickup.c::doloot).
+def handle_loot_floor(state, rng):
+    """#loot — open the first FLOOR container at the player's tile.
 
-    Wave 5 stand-in: pick the lowest-index slot that has a container and call
-    ``open_container``.  If none, no-op.
+    Vendor ``#loot`` (vendor/nethack/src/pickup.c::doloot line 2166 →
+    doloot_core line 2178) calls ``container_at(cc.x, cc.y, TRUE)`` to
+    find containers on the floor at the hero's spot and routes the
+    chosen one through ``do_loot_cont`` → ``use_container``.  Carried
+    bags are handled via ``apply`` (the ``handle_apply_container`` path
+    below), not via ``#loot``.
+
+    Audit L #10: the prior ``handle_loot`` opened any container in
+    ``state.containers`` (including carried bags), which was a Nethax-only
+    divergence.  Splitting into a floor-only and a carried-only path
+    matches the vendor command boundary.
+
+    Cite: vendor/nethack/src/pickup.c::doloot lines 2166-2174;
+          vendor/nethack/src/pickup.c::doloot_core lines 2178-2295
+          (``container_at(cc.x, cc.y, TRUE)`` at line 2217).
+
+    Implementation: filter by ``parent_slot == -1`` (the sentinel for
+    "not held in any inventory slot"; floor containers populate this
+    array via the same ContainerState struct in this port).  Open the
+    lowest-index floor container; no-op if none.
     """
     cs = state.containers
-    has_any = cs.container_type != jnp.int8(ContainerType.NONE)
-    first_idx = jnp.argmax(has_any).astype(jnp.int32)
-    any_present = jnp.any(has_any)
+    has_container = cs.container_type != jnp.int8(ContainerType.NONE)
+    is_floor      = cs.parent_slot == jnp.int8(-1)
+    usable        = has_container & is_floor
+    first_idx     = jnp.argmax(usable).astype(jnp.int32)
+    any_present   = jnp.any(usable)
 
     def _open(s):
         return open_container(s, first_idx)
@@ -967,12 +987,36 @@ def handle_loot(state, rng):
     return jax.lax.cond(any_present, _open, lambda s: s, state)
 
 
+# Back-compat alias: legacy name ``handle_loot`` still referenced by
+# ``cancel_bag_of_holding`` doc strings and external imports prior to the
+# Audit L #10 split.  Points at the floor path so ``_handle_loot`` →
+# ``handle_loot`` continues to dispatch the vendor ``#loot`` behavior.
+handle_loot = handle_loot_floor
+
+
 def handle_apply_container(state, rng):
-    """APPLY-to-container — if the player APPLYs while holding a container,
-    open it (vendor/nethack/src/apply.c::doapply routes containers to
-    use_container).  This is the JIT-safe handler hooked from action dispatch.
+    """APPLY-to-container — open the first CARRIED container.
+
+    Vendor ``apply`` (vendor/nethack/src/apply.c::doapply) routes a
+    container in the player's inventory through ``use_container``.  This
+    path is the carried-bag side of the Audit L #10 split: it filters by
+    ``parent_slot >= 0`` so it never opens a floor container (those go
+    through ``#loot`` → ``handle_loot_floor`` instead).
+
+    Cite: vendor/nethack/src/apply.c::doapply (container branch);
+          vendor/nethack/src/pickup.c::use_container.
     """
-    return handle_loot(state, rng)
+    cs = state.containers
+    has_container = cs.container_type != jnp.int8(ContainerType.NONE)
+    is_carried    = cs.parent_slot >= jnp.int8(0)
+    usable        = has_container & is_carried
+    first_idx     = jnp.argmax(usable).astype(jnp.int32)
+    any_present   = jnp.any(usable)
+
+    def _open(s):
+        return open_container(s, first_idx)
+
+    return jax.lax.cond(any_present, _open, lambda s: s, state)
 
 
 # ---------------------------------------------------------------------------

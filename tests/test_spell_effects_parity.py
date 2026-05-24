@@ -350,15 +350,20 @@ class TestMonsterControl:
         assert int(new_state.monster_ai.mstrategy[0]) == int(MoveStrategy.PARALYZE)
 
     def test_slow_monster_paralyzes_slot0(self):
-        """SLOW_MONSTER: monster slot 0 PARALYZE in Wave 6 model.
+        """SLOW_MONSTER: monster slot 0 gets speed_mod = -1 (MSLOW).
 
-        Vendor: zap.c::bhitm SLOW_MONSTER calls mon_adjust_speed(mon, -1, obj).
-        Wave 6 simplification: same as SLEEP — sets PARALYZE state.
+        Vendor: zap.c::bhitm lines 218-232 — ``mon_adjust_speed(mtmp, -1, otmp)``
+        flips the monster into the MSLOW speed bucket.  Audit K Batch C
+        replaces the previous PARALYZE alias with the canonical speed_mod
+        update (Wave 40b semantics).
+        Cite: vendor/nethack/src/zap.c lines 218-232.
         """
-        from Nethax.nethax.subsystems.monster_ai import MoveStrategy
         state = _with_monster(_state(), hp=50)
         new_state = _run_effect(SpellId.SLOW_MONSTER, state, seed=0)
-        assert int(new_state.monster_ai.mstrategy[0]) == int(MoveStrategy.PARALYZE)
+        assert int(new_state.monster_ai.speed_mod[0]) == -1, (
+            f"Expected speed_mod=-1 (MSLOW), got "
+            f"{int(new_state.monster_ai.speed_mod[0])}"
+        )
 
     def test_confuse_monster_sets_confused_strategy(self):
         """CONFUSE_MONSTER: Wave 6 model sets CONFUSED strategy on slot 0.

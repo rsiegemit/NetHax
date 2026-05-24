@@ -113,7 +113,7 @@ from Nethax.nethax.subsystems.combat import (
 )
 from Nethax.nethax.subsystems.prayer import handle_pray as _prayer_handle_pray
 from Nethax.nethax.subsystems.containers import (
-    handle_loot as _containers_handle_loot,
+    handle_loot_floor as _containers_handle_loot,
     handle_apply_container as _containers_handle_apply,
     cancel_bag_of_holding as _containers_cancel_boh,
     tip_container as _containers_tip_container,
@@ -1755,9 +1755,16 @@ def _handle_throw(state, rng):
 
 
 def _handle_loot(state, rng):
-    """LOOT — vendor/nethack/src/pickup.c::doloot.
+    """LOOT — vendor/nethack/src/pickup.c::doloot lines 2166-2174.
 
-    Wave 5 Phase 3: open the lowest-index held container.
+    Audit L #10: routes to the FLOOR container path
+    (``handle_loot_floor`` filters by ``parent_slot == -1``).  Carried
+    bags are opened via the apply path (``_handle_apply`` →
+    ``handle_apply_container``) instead.
+
+    Cite: vendor/nethack/src/pickup.c::doloot_core lines 2178-2295
+          (``container_at(cc.x, cc.y, TRUE)`` at line 2217 finds floor
+          containers at the hero's spot).
     """
     return _containers_handle_loot(state, rng)
 

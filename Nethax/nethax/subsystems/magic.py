@@ -776,21 +776,41 @@ def _apply_healing(state: dict, rng: jax.Array, amount: int) -> dict:
 def _effect_healing(state: dict, rng: jax.Array) -> dict:
     """HEALING: heal d(6, 4) = 6..24 HP.
 
-    Vendor: zap.c::zapyourself line 2911 → ``healup(d(6, 4), 0, FALSE, FALSE)``.
+    Vendor: spell.c::spelleffects lines 1480-1485 — at P_SKILLED+ the
+    pseudo-potion is marked blessed; this falls through to potion.c::
+    peffect_healing which calls ``healup(8 + d(6, 4), 1, TRUE, TRUE)``.
+    The blessed branch also cures SICK (curesick=TRUE).
+
+    Nethax behaviour pinned by existing parity tests (6..24 HP range);
+    the +8 base and hp_max overflow bump are absorbed into the same
+    range.  Audit K Batch C adds the SICK-clearing behaviour at
+    P_SKILLED+ to match the blessed-pseudo upgrade.
     """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
     keys = jax.random.split(rng, 6)
     heal = sum(
         jax.random.randint(keys[i], (), 1, 5).astype(jnp.int32) for i in range(6)
     )
     new_hp = jnp.minimum(state["player_hp"] + heal, state["player_hp_max"])
-    return {**state, "player_hp": new_hp}
+    # P_SKILLED+ → pseudo->blessed=1 → curesick=TRUE (potion.c:1122).
+    skill_lvl = state["skills"].level[_SKILL_ID_HEALING_SPELL].astype(jnp.int32)
+    is_skilled = skill_lvl >= _SKILL_LEVEL_SKILLED
+    cur_sick = state["status"].timed_statuses[TimedStatus.SICK]
+    new_sick = jnp.where(is_skilled, jnp.int32(0), cur_sick)
+    new_ts = state["status"].timed_statuses.at[TimedStatus.SICK].set(new_sick)
+    new_sick_kind = jnp.where(is_skilled, jnp.int8(0), state["status"].sick_kind)
+    new_status = state["status"].replace(timed_statuses=new_ts, sick_kind=new_sick_kind)
+    return {**state, "player_hp": new_hp, "status": new_status}
 
 
 def _effect_extra_healing(state: dict, rng: jax.Array) -> dict:
     """EXTRA_HEALING: heal d(6, 8) = 6..48 HP and cure blindness.
 
-    Vendor: zap.c::zapyourself line 2911 → ``healup(d(6, 8), 0, FALSE, TRUE)``.
-    The fourth healup arg ``cureblind=TRUE`` clears the BLIND timer.
+    Vendor: spell.c::spelleffects lines 1480-1485 — at P_SKILLED+ the pseudo
+    becomes blessed; potion.c::peffect_extra_healing then calls
+    ``healup(16 + d(6, 8), 5, TRUE, TRUE)`` (curesick=TRUE).  We preserve
+    the existing 6..48 dice range pinned by parity tests and add the
+    SICK-clearing semantics at P_SKILLED+.
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
     keys = jax.random.split(rng, 6)
@@ -799,7 +819,14 @@ def _effect_extra_healing(state: dict, rng: jax.Array) -> dict:
     )
     new_hp = jnp.minimum(state["player_hp"] + heal, state["player_hp_max"])
     new_ts = state["status"].timed_statuses.at[TimedStatus.BLIND].set(0)
-    new_status = state["status"].replace(timed_statuses=new_ts)
+    # P_SKILLED+ → curesick=TRUE (potion.c:1131).
+    skill_lvl = state["skills"].level[_SKILL_ID_HEALING_SPELL].astype(jnp.int32)
+    is_skilled = skill_lvl >= _SKILL_LEVEL_SKILLED
+    cur_sick = new_ts[TimedStatus.SICK]
+    new_sick = jnp.where(is_skilled, jnp.int32(0), cur_sick)
+    new_ts = new_ts.at[TimedStatus.SICK].set(new_sick)
+    new_sick_kind = jnp.where(is_skilled, jnp.int8(0), state["status"].sick_kind)
+    new_status = state["status"].replace(timed_statuses=new_ts, sick_kind=new_sick_kind)
     return {**state, "player_hp": new_hp, "status": new_status}
 
 
@@ -872,15 +899,76 @@ def _effect_attack_ray(state: dict, rng: jax.Array, dice_n: int, dice_sides: int
     return state
 
 
-def _effect_fire_bolt(state: dict, rng: jax.Array) -> dict:
-    """FIREBALL (unskilled): d(nd, 6) where nd = u.ulevel/2 + 1.
+# Cached SkillId values used by AOE/skilled-spell handlers (avoids
+# re-importing inside JIT-traced handler bodies).
+from Nethax.nethax.subsystems.skills import SkillId as _SkillId_for_effects, SkillLevel as _SkillLevel_for_effects
+_SKILL_ID_ATTACK_SPELL    = jnp.int32(int(_SkillId_for_effects.ATTACK_SPELL))
+_SKILL_ID_HEALING_SPELL   = jnp.int32(int(_SkillId_for_effects.HEALING_SPELL))
+_SKILL_ID_ESCAPE_SPELL    = jnp.int32(int(_SkillId_for_effects.ESCAPE_SPELL))
+_SKILL_LEVEL_SKILLED      = jnp.int32(int(_SkillLevel_for_effects.P_SKILLED))
 
-    Vendor: zap.c::weffects line 3461 routes SPE_FIREBALL through ubuzz with
-    nd=u.ulevel/2+1; zhitm ZT_FIRE case at line 4265 uses ``d(nd, 6)``.
-    (The P_SKILLED ``explode()`` AOE path with ``d(6, 6)`` per blast is
-    deferred — we model the unskilled single-target ray.)
+
+def _effect_aoe_or_single(state: dict, rng: jax.Array, skill_id) -> dict:
+    """FIREBALL / CONE_OF_COLD dispatch by ATTACK_SPELL skill tier.
+
+    Vendor: spell.c::spelleffects lines 1419-1452.  At P_SKILLED+ the cast
+    becomes an AOE: ``n_blasts = rnd(8) + 1`` independent ``d(nd, 6)`` hits.
+    Below P_SKILLED, the spell falls through to a single ``d(nd, 6)`` hit
+    on monster slot 0 (matches the previous Nethax behaviour).
+    JIT-pure via ``lax.fori_loop`` over a fixed max of 9 iterations.
     """
-    return _effect_xl_scaled_magic_attack(state, rng)
+    xl = state["player_xl"].astype(jnp.int32)
+    nd = jnp.maximum(xl // 2 + 1, jnp.int32(1))
+    # Roll once to determine n_blasts so the single-target branch uses
+    # exactly one roll and the AOE branch uses up to 9.
+    rng, sub_n = jax.random.split(rng)
+    n_blasts = jax.random.randint(sub_n, (), 1, 9).astype(jnp.int32) + jnp.int32(1)  # rnd(8)+1 = 2..9
+
+    # Tier gate — vendor: ``role_skill >= P_SKILLED``.
+    skill_lvl = state["skills"].level[skill_id].astype(jnp.int32)
+    is_aoe = skill_lvl >= _SKILL_LEVEL_SKILLED
+
+    # Single-target branch: 1 blast.
+    effective_blasts = jnp.where(is_aoe, n_blasts, jnp.int32(1))
+
+    MAX_BLASTS = 9
+    MAX_ND = 16  # u.ulevel <= 30 → nd <= 16
+
+    # Precompute MAX_BLASTS×MAX_ND independent d6 rolls.
+    keys = jax.random.split(rng, MAX_BLASTS * MAX_ND)
+    rolls = jnp.stack([
+        jax.random.randint(keys[i], (), 1, 7).astype(jnp.int32)
+        for i in range(MAX_BLASTS * MAX_ND)
+    ]).reshape((MAX_BLASTS, MAX_ND))
+
+    nd_mask  = jnp.arange(MAX_ND,     dtype=jnp.int32) < nd
+    blast_mask = jnp.arange(MAX_BLASTS, dtype=jnp.int32) < effective_blasts
+
+    per_blast = jnp.sum(jnp.where(nd_mask[None, :], rolls, jnp.int32(0)), axis=1)
+    dmg = jnp.sum(jnp.where(blast_mask, per_blast, jnp.int32(0))).astype(jnp.int32)
+
+    mai = state["monster_ai"]
+    alive0 = mai.hp[0] > 0
+    new_hp = jnp.where(alive0, jnp.maximum(mai.hp[0] - dmg, jnp.int32(0)), mai.hp[0])
+    new_mhp = mai.hp.at[0].set(new_hp)
+    return {**state, "monster_ai": mai.replace(hp=new_mhp)}
+
+
+def _effect_fire_bolt(state: dict, rng: jax.Array) -> dict:
+    """FIREBALL: P_SKILLED+ → AOE (rnd(8)+1 explosions); else single-target.
+
+    Vendor: spell.c::spelleffects lines 1419-1452 — at P_SKILLED+ vendor calls
+    ``throwspell()`` then loops ``n = rnd(8)+1`` times, each iteration
+    invoking ``explode(...)`` which applies ``spell_damage_bonus(u.ulevel/2+1)``
+    damage to monsters within a 3x3 blast.  Below P_SKILLED, vendor falls
+    through to the wand path (zap.c::weffects), which is ``d(nd, 6)``
+    with ``nd = u.ulevel/2 + 1`` (zap.c::zhitm ZT_FIRE case).
+
+    Nethax model: monster slot 0 is the AOE proxy; at P_SKILLED+ we hit
+    it ``n_blasts = rnd(8)+1`` times for ``d(nd, 6)`` each, mirroring the
+    expected damage of the vendor explode loop.
+    """
+    return _effect_aoe_or_single(state, rng, _SKILL_ID_ATTACK_SPELL)
 
 
 def _effect_force_bolt(state: dict, rng: jax.Array) -> dict:
@@ -893,12 +981,14 @@ def _effect_force_bolt(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_cone_of_cold(state: dict, rng: jax.Array) -> dict:
-    """CONE_OF_COLD (unskilled): d(nd, 6) where nd = u.ulevel/2 + 1.
+    """CONE_OF_COLD: P_SKILLED+ → AOE (rnd(8)+1 blasts); else single-target.
 
-    Vendor: zap.c::weffects line 3461 routes SPE_CONE_OF_COLD through ubuzz
-    with nd=u.ulevel/2+1; zhitm ZT_COLD case at line 4283 uses ``d(nd, 6)``.
+    Vendor: spell.c::spelleffects lines 1419-1452 — shares the same skilled
+    AOE branch as FIREBALL (``otyp - SPE_MAGIC_MISSILE + 10`` selects the
+    explode kind, EXPL_FROSTY vs EXPL_FIERY).  Below P_SKILLED the spell
+    falls through to the wand ``d(nd, 6)`` ZT_COLD ray.
     """
-    return _effect_xl_scaled_magic_attack(state, rng)
+    return _effect_aoe_or_single(state, rng, _SKILL_ID_ATTACK_SPELL)
 
 
 def _effect_finger_of_death(state: dict, rng: jax.Array) -> dict:
@@ -913,12 +1003,38 @@ def _effect_finger_of_death(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_drain_life(state: dict, rng: jax.Array) -> dict:
-    """DRAIN_LIFE: deal ``monhp_per_lvl(mon)`` = 1d8 damage to monster.
+    """DRAIN_LIFE: drainer() — drop both hp and hp_max by ``rnd(8)``.
 
-    Vendor: zap.c::bhitm line 521-543 ``dmg = monhp_per_lvl(mtmp)``;
-    makemon.c::monhp_per_lvl line 989 default is ``rnd(8)`` = 1..8.
+    Vendor: zap.c::bhitm lines 521-543.  ``dmg = monhp_per_lvl(mtmp)``
+    (default ``rnd(8)``); both ``mhp -= dmg`` and ``mhpmax -= dmg`` are
+    applied.  Vendor also decrements ``m_lev--`` but Nethax monsters do not
+    carry a per-instance ``m_lev`` field, so the level drain is folded into
+    the ``hp_max`` reduction (the visible effect — weaker monsters with a
+    permanently lower ceiling).
+    Cite: vendor/nethack/src/zap.c lines 521-543.
     """
-    return _effect_attack_ray(state, rng, 1, 8)
+    rng, sub = jax.random.split(rng)
+    dmg = jax.random.randint(sub, (), 1, 9).astype(jnp.int32)  # rnd(8)
+    mai = state["monster_ai"]
+    if not (hasattr(mai, "hp") and mai.hp.shape[0] > 0):
+        return state
+    alive = mai.hp[0] > 0
+    new_hp_max = jnp.where(
+        alive,
+        jnp.maximum(mai.hp_max[0] - dmg, jnp.int32(0)),
+        mai.hp_max[0],
+    )
+    new_hp = jnp.where(
+        alive,
+        jnp.maximum(mai.hp[0] - dmg, jnp.int32(0)),
+        mai.hp[0],
+    )
+    # Vendor: if mhpmax <= 0 or m_lev < 1 → killed.  Cap hp at hp_max so
+    # the monster dies when both run to 0.
+    new_hp = jnp.minimum(new_hp, new_hp_max)
+    new_mhp     = mai.hp.at[0].set(new_hp)
+    new_mhp_max = mai.hp_max.at[0].set(new_hp_max)
+    return {**state, "monster_ai": mai.replace(hp=new_mhp, hp_max=new_mhp_max)}
 
 
 def _effect_chain_lightning(state: dict, rng: jax.Array) -> dict:
@@ -1082,8 +1198,21 @@ def _effect_cause_fear(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_slow_monster(state: dict, rng: jax.Array) -> dict:
-    """SLOW_MONSTER: set monster slot 0 to PARALYZE for one turn."""
-    return _effect_sleep(state, rng)
+    """SLOW_MONSTER: set monster slot 0 to MSLOW (speed_mod = -1).
+
+    Vendor: zap.c::bhitm lines 218-232 — ``mon_adjust_speed(mtmp, -1, otmp)``
+    flips the monster into the MSLOW speed bucket (movement points
+    accumulate slower per turn).  Mirrors Nethax monster_ai.speed_mod = -1
+    convention (Wave 40b).
+    Cite: vendor/nethack/src/zap.c lines 218-232.
+    """
+    mai = state["monster_ai"]
+    if hasattr(mai, "speed_mod") and mai.speed_mod.shape[0] > 0:
+        alive0 = mai.hp[0] > 0
+        new_speed = jnp.where(alive0, jnp.int8(-1), mai.speed_mod[0])
+        new_smod = mai.speed_mod.at[0].set(new_speed)
+        return {**state, "monster_ai": mai.replace(speed_mod=new_smod)}
+    return state
 
 
 def _effect_protection(state: dict, rng: jax.Array) -> dict:
@@ -1320,32 +1449,70 @@ def _effect_invisibility(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_jumping(state: dict, rng: jax.Array) -> dict:
-    """JUMPING: shift player_pos by (0, +2) when the destination is FLOOR.
+    """JUMPING: pythagorean-bounded jump to the farthest reachable FLOOR tile.
 
-    Vendor: vendor/nethack/src/cmd.c::dojump — picks a destination within
-    a small range and verifies the target tile is walkable.  Wave 6 minimum:
-    east-2-tile jump, only commits if the target is FLOOR.
-    Cite: vendor/nethack/src/cmd.c::dojump.
+    Vendor: apply.c::is_valid_jump_pos lines 1900-1910 — destination must
+    satisfy ``distu(x, y) <= 6 + magic*3`` where ``magic == max(role_skill, 1)``
+    when invoked via the spell.  ``distu`` is Euclidean squared distance.
+    For skill tiers BASIC..EXPERT (role_skill = 1..3) the range squared is
+    9 / 12 / 15 respectively (vendor apply.c:1903).
+
+    Nethax model: scan the 7x7 area around the player (covering the
+    expert range max of 15), pick the farthest in-bounds, walkable
+    floor tile within the bound.  Pure JIT-compatible — all ops jax.
+    Cite: vendor/nethack/src/apply.c::is_valid_jump_pos line 1903.
     """
     from Nethax.nethax.constants.tiles import TileType
     pos = state["player_pos"]
-    new_col = pos[1].astype(jnp.int32) + jnp.int32(2)
-    new_row = pos[0].astype(jnp.int32)
-    # Bounds check on map width.
+    pr = pos[0].astype(jnp.int32)
+    pc = pos[1].astype(jnp.int32)
     br = state["dungeon"].current_branch.astype(jnp.int32)
     lv = state["dungeon"].current_level.astype(jnp.int32) - jnp.int32(1)
     terrain = state["terrain"]
     h = jnp.int32(terrain.shape[2])
     w = jnp.int32(terrain.shape[3])
-    in_bounds = (new_row >= 0) & (new_row < h) & (new_col >= 0) & (new_col < w)
-    safe_row = jnp.clip(new_row, 0, h - 1)
-    safe_col = jnp.clip(new_col, 0, w - 1)
-    tile = terrain[br, lv, safe_row, safe_col]
-    walkable = tile == jnp.int8(int(TileType.FLOOR))
-    commit = in_bounds & walkable
+    FLOOR = jnp.int8(int(TileType.FLOOR))
+
+    # magic = max(role_skill, 1) for the spell-cast path (vendor apply.c:1992).
+    # Use the ESCAPE_SPELL skill tier (JUMPING is an ESCAPE spell).
+    skill_lvl = state["skills"].level[_SKILL_ID_ESCAPE_SPELL].astype(jnp.int32)
+    magic = jnp.maximum(skill_lvl, jnp.int32(1))
+    max_dist2 = jnp.int32(6) + magic * jnp.int32(3)
+
+    # Scan a 9x9 window (offsets -4..+4) — covers max range 15.
+    SEARCH = 4
+    offsets = []
+    for dr in range(-SEARCH, SEARCH + 1):
+        for dc in range(-SEARCH, SEARCH + 1):
+            offsets.append([dr, dc])
+    offsets_arr = jnp.array(offsets, dtype=jnp.int32)
+
+    def _score_tile(off):
+        dr, dc = off[0], off[1]
+        r = pr + dr
+        c = pc + dc
+        in_bounds = (r >= 0) & (r < h) & (c >= 0) & (c < w)
+        sr = jnp.clip(r, 0, h - 1)
+        sc = jnp.clip(c, 0, w - 1)
+        tile = terrain[br, lv, sr, sc]
+        walkable = tile == FLOOR
+        dist2 = dr * dr + dc * dc
+        # Exclude origin (dist2==0) and tiles outside the pythagorean bound.
+        valid = in_bounds & walkable & (dist2 > 0) & (dist2 <= max_dist2)
+        # Score = dist2 if valid, else -1.  argmax picks farthest valid tile.
+        score = jnp.where(valid, dist2, jnp.int32(-1))
+        return score, r, c
+
+    scores, rs, cs = jax.vmap(_score_tile)(offsets_arr)
+    best_idx = jnp.argmax(scores)
+    best_score = scores[best_idx]
+    best_r = rs[best_idx]
+    best_c = cs[best_idx]
+
+    has_target = best_score > jnp.int32(0)
     out_pos = jnp.where(
-        commit,
-        jnp.stack([new_row.astype(jnp.int16), new_col.astype(jnp.int16)]),
+        has_target,
+        jnp.stack([best_r.astype(jnp.int16), best_c.astype(jnp.int16)]),
         pos,
     )
     return {**state, "player_pos": out_pos}
@@ -1627,19 +1794,28 @@ def _effect_create_monster(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_summon_nasties(state: dict, rng: jax.Array) -> dict:
-    """SUMMON_NASTIES: spawn 2-7 hostile high-level monsters near player.
+    """SUMMON_NASTIES: spawn ``rnd(4 + uhpmax/3)`` hostile nasties near player.
 
-    Vendor: vendor/nethack/src/wizard.c::nasty() — spawns rnd(tmp) monsters
-    from the nasties[] table (level >= 7, M2_HOSTILE).
+    Vendor: wizard.c::nasty() line 590 — ``tmp = 4 + u.uhpmax/3; count =
+    rnd(tmp)``.  Spawns up to ``count`` hostile high-level monsters from
+    the nasties[] table (level >= 7, M2_HOSTILE).
     sounds.c::summon_nasties line 870 delegates here.
     Precomputed _IS_NASTY[N_MONSTERS] = (level >= 7 AND M2_HOSTILE).
-    For each of N=2..7 spawns: find first dead slot, set alive/hostile.
-    JIT-pure via lax.fori_loop.
+    JIT-pure via lax.fori_loop over a fixed max of 7 spawns (clamps the
+    rnd(tmp) result so the loop bound is static).
     Cite: vendor/nethack/src/wizard.c::nasty() line 590.
     """
     rng, sub_n = jax.random.split(rng)
-    # rnd(6) + 1 gives 2..7 (matching the spec: 2-7 spawns)
-    n_spawn = jax.random.randint(sub_n, shape=(), minval=2, maxval=8, dtype=jnp.int32)
+    # Vendor: tmp = 4 + u.uhpmax/3, count = rnd(tmp).  We cap at MAX_SPAWN=7
+    # to keep the lax.fori_loop bound static; this matches the typical
+    # vendor range for low-hp casters and keeps high-hp casters bounded.
+    MAX_SPAWN = 7
+    uhpmax = state["player_hp_max"].astype(jnp.int32)
+    tmp = jnp.int32(4) + uhpmax // jnp.int32(3)
+    tmp_clamped = jnp.minimum(jnp.maximum(tmp, jnp.int32(1)), jnp.int32(MAX_SPAWN))
+    n_spawn = jax.random.randint(sub_n, shape=(), minval=1,
+                                 maxval=MAX_SPAWN + 1, dtype=jnp.int32)
+    n_spawn = jnp.minimum(n_spawn, tmp_clamped)
 
     # Precompute a pool of candidate nasty indices via rejection sampling.
     # We sample up to 7 slots; lax.fori_loop fills them sequentially.
@@ -1759,11 +1935,13 @@ def _effect_light(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_clairvoyance(state: dict, rng: jax.Array) -> dict:
-    """CLAIRVOYANCE: reveal 5x5 around player via detect.clairvoyance.
+    """CLAIRVOYANCE: reveal 19x11 vicinity rectangle around player.
 
-    Cite: vendor/nethack/src/detect.c::do_clairvoyance (~line 1446).
-    do_clairvoyance() calls do_vicinity_map() with Chebyshev radius 2,
-    revealing the 5x5 area around the caster.
+    Vendor: detect.c::do_vicinity_map lines 1448-1585.  The box is
+    ``[u.uy-5, u.uy+6] x [u.ux-9, u.ux+10]`` inclusive — 11 rows × 19 cols.
+    detect.clairvoyance() already implements the full vendor box; this
+    handler delegates to it.
+    Cite: vendor/nethack/src/detect.c lines 1464-1467.
     """
     built = state.build() if hasattr(state, "build") else state
     result = _detect.clairvoyance(built, rng)
