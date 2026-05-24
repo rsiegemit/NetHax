@@ -244,7 +244,9 @@ def test_score_combined_terms():
     """All bonus channels combine additively per vendor formula (end.c:1325-1352).
 
     Wave 35 implements the full vendor base:
-        gold_adj = max(gold,0) - max(gold,0)//10        (end.c:1337 death tax)
+        gold_adj = max(gold,0) - max(gold,0)//10        (end.c:1337 death tax,
+                                                         skipped on ASCENDED per
+                                                         end.c:1336 — Audit G #3)
         travel_b = 50  * max(deepest-1, 0)              (end.c:1338)
         deep_b   = 1000 * min(10, max(deepest-20, 0))   (end.c:1340)
         base     = xp + gold_adj + travel_b + deep_b
@@ -262,7 +264,7 @@ def test_score_combined_terms():
     )
     state = state.replace(scoring=mark_ascended(state.scoring))
 
-    gold_adj = 40 - 40 // 10            # 36
+    gold_adj = 40                       # ASCENDED → no death tax (end.c:1336)
     travel_b = 50 * (25 - 1)            # 1200
     deep_b   = DEEP_LEVEL_BONUS * 5     # 5000
     base     = 100 + gold_adj + travel_b + deep_b
