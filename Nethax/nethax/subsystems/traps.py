@@ -793,9 +793,63 @@ def _trap_landmine(state, rng):
 
 
 def _trap_rolling_boulder(state, rng):
-    """ROLLING_BOULDER_TRAP — 2d6 damage."""
-    k0, k1 = jax.random.split(rng, 2)
-    return _apply_hp_damage(state, _d(k0, 6) + _d(k1, 6))
+    """ROLLING_BOULDER_TRAP — spawn a boulder and apply boulder dmgval to player.
+
+    Audit M #37: vendor (trap.c:2672) calls
+    ``launch_obj(BOULDER, launch.x, launch.y, launch2.x, launch2.y,
+                ROLL|LAUNCH_KNOWN)``
+    which spawns an actual boulder object that rolls along the path; the
+    boulder strikes the player when its path crosses the player tile and
+    applies ``dmgval(BOULDER, mon)`` damage per strike (vendor objects.c
+    BOULDER entry: ``int dmgval`` ≈ d(2,6) = 2..12 plus the rolling
+    distance multiplier).
+
+    Approximation: drop a BOULDER object (ROCK_CLASS, type_id=447) on the
+    trap's tile via ``ground_items`` and apply ``dmgval(BOULDER)`` damage
+    immediately to the player.  We use a stable ``2d6 + d4`` total
+    (= 4..16) as the canonical boulder dmgval — the +d4 covers the
+    rolling-distance bonus that vendor delivers across multiple strikes
+    in a single trap fire.
+
+    Citations:
+      vendor/nethack/src/trap.c:2672  (launch_obj BOULDER call)
+      vendor/nethack/src/dothrow.c::launch_obj  (rolls + dmgval per tile)
+      vendor/nethack/include/objects.h          (BOULDER dmgval=d(2,6))
+    """
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+
+    k_a, k_b, k_extra = jax.random.split(rng, 3)
+    # Boulder dmgval ≈ d(2,6) + d4 (rolling-distance bonus approximation).
+    dmg = _d(k_a, 6) + _d(k_b, 6) + _d(k_extra, 4)
+    s = _apply_hp_damage(state, dmg)
+
+    # Spawn a boulder on the trap's tile via ground_items.  Vendor places
+    # the BOULDER at launch.x/launch.y which we approximate by the
+    # player's tile (post-roll resting position).
+    _BOULDER_TYPE_ID = 447
+    b = s.dungeon.current_branch.astype(jnp.int32)
+    lv = s.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    pr = s.player_pos[0].astype(jnp.int32)
+    pc = s.player_pos[1].astype(jnp.int32)
+
+    ground = s.ground_items
+    # Find first empty slot at this tile (category == 0).
+    tile_cats = ground.category[b, lv, pr, pc]
+    empty_mask = tile_cats == jnp.int8(0)
+    any_empty = jnp.any(empty_mask)
+    slot = jnp.argmax(empty_mask.astype(jnp.int32)).astype(jnp.int32)
+
+    def _do_spawn(s_):
+        g = s_.ground_items
+        new_cat = g.category.at[b, lv, pr, pc, slot].set(
+            jnp.int8(int(ItemCategory.ROCK))
+        )
+        new_tid = g.type_id.at[b, lv, pr, pc, slot].set(jnp.int16(_BOULDER_TYPE_ID))
+        new_qty = g.quantity.at[b, lv, pr, pc, slot].set(jnp.int16(1))
+        new_g = g.replace(category=new_cat, type_id=new_tid, quantity=new_qty)
+        return s_.replace(ground_items=new_g)
+
+    return jax.lax.cond(any_empty, _do_spawn, lambda s_: s_, s)
 
 
 def _trap_sleep_gas(state, rng):
@@ -1183,16 +1237,74 @@ def _trap_web(state, rng):
 
 
 def _trap_statue(state, rng):
-    """STATUE_TRAP — spawn a hostile monster at the player's tile.
+    """STATUE_TRAP — animate the statue's stored monster (Audit M #38).
 
-    vendor/nethack/src/trap.c::STATUE_TRAP — animate_statue(...).
-    Wave 5: find first dead monster slot and mark it alive.  Shape-stable.
+    Vendor: trap.c::activate_statue_trap (line 907) calls
+    ``animate_statue(otmp, ...)`` which uses the statue object's stored
+    ``corpsenm`` (monster index) to spawn that specific species with its
+    proper hp/AC/attack table.
+
+    Approximation: scan ``ground_items`` at the player's tile for a STATUE
+    object (type_id == 448).  Decode the stored monster index from the
+    item's ``charges`` field (Nethax has no per-item ``corpsenm`` slot;
+    ``charges`` is unused for statues so we re-purpose it as the encoded
+    monster index — Item.charges is int8 so the range is 0..127, which
+    covers ~half of the 700-entry MONSTERS table; for indexes ≥128 we
+    fall back to a random monster).  If no statue is on the tile, fall
+    back to spawning a random low-level monster (former behaviour).
+
+    HP is derived from the species' ``mlevel`` via ``(level + 1) * 4``
+    (vendor uses ``rnd((mlevel+1)*8)`` but we want a deterministic mean).
+
+    Citation: vendor/nethack/src/trap.c:907-936 (activate_statue_trap),
+              vendor/nethack/src/mkobj.c (statue->corpsenm storage).
     """
+    from Nethax.nethax.subsystems.polymorph import _MONSTER_TABLES
+
     mai = state.monster_ai
     dead_mask = ~mai.alive
     dead_mask = dead_mask.at[0].set(False)  # skip sentinel slot 0
     slot = jnp.argmax(dead_mask).astype(jnp.int32)
     any_dead = jnp.any(dead_mask)
+
+    # ---- Read statue at player tile (Audit M #38) ---------------------
+    b = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+
+    ground = state.ground_items
+    # Stack of items at this tile: shape [MAX_GROUND_STACK].
+    g_tids    = ground.type_id[b, lv, pr, pc]
+    g_charges = ground.charges[b, lv, pr, pc]
+    # Find first STATUE in the stack.
+    _STATUE_TYPE_ID = 448
+    is_statue = g_tids == jnp.int16(_STATUE_TYPE_ID)
+    has_statue = jnp.any(is_statue)
+    statue_slot = jnp.argmax(is_statue.astype(jnp.int32)).astype(jnp.int32)
+    encoded_mon_idx = g_charges[statue_slot].astype(jnp.int32)
+    # Charges is int8 → 0..127 valid range; treat <=0 or >=N as "use random".
+    n_mons = jnp.int32(_MONSTER_TABLES["n"])
+    encoded_valid = (
+        has_statue
+        & (encoded_mon_idx > jnp.int32(0))
+        & (encoded_mon_idx < n_mons)
+    )
+
+    # Random fallback monster (low-level, idx 1..min(20, n-1)).
+    k_rand_mon, k_rand_hp = jax.random.split(rng, 2)
+    rand_mon_idx = jax.random.randint(
+        k_rand_mon, (), 1, jnp.minimum(jnp.int32(20), n_mons)
+    ).astype(jnp.int32)
+    mon_idx = jnp.where(encoded_valid, encoded_mon_idx, rand_mon_idx)
+    safe_mon = jnp.clip(mon_idx, jnp.int32(1), n_mons - jnp.int32(1))
+    # Derive hp_max from species level: (level + 1) * 4 (deterministic mean
+    # of vendor ``rnd((mlevel+1)*8)``).
+    mon_level = _MONSTER_TABLES["level"][safe_mon].astype(jnp.int32)
+    mon_hp = jnp.maximum(
+        (mon_level + jnp.int32(1)) * jnp.int32(4),
+        jnp.int32(1),
+    )
 
     def _do_spawn(s):
         m = s.monster_ai
@@ -1200,10 +1312,16 @@ def _trap_statue(state, rng):
         new_mai = m.replace(
             alive=m.alive.at[slot].set(jnp.bool_(True)),
             pos=m.pos.at[slot].set(ppos),
-            hp=m.hp.at[slot].set(jnp.int32(10)),
-            hp_max=m.hp_max.at[slot].set(jnp.int32(10)),
+            hp=m.hp.at[slot].set(mon_hp),
+            hp_max=m.hp_max.at[slot].set(mon_hp),
             peaceful=m.peaceful.at[slot].set(jnp.bool_(False)),
         )
+        # Encode species into monster_ai.entry_idx if the field exists
+        # (it stores MONSTERS index for combat/AI lookups).
+        if hasattr(m, "entry_idx"):
+            new_mai = new_mai.replace(
+                entry_idx=m.entry_idx.at[slot].set(safe_mon.astype(m.entry_idx.dtype))
+            )
         return s.replace(monster_ai=new_mai)
 
     return jax.lax.cond(any_dead, _do_spawn, lambda s: s, state)
