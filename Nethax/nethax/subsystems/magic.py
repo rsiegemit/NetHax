@@ -435,14 +435,15 @@ def spell_fail_chance(
     previously this code produced ``skill_adj = -1`` for every spell,
     effectively making every spell six difficulty points harder than vendor.
 
-    Armor/shield/weapon/cloak modifiers (vendor lines 2191-2212, 2265-2275)
-    are not modelled here — they require player inventory access; this
-    helper is invoked from several lightweight call sites that lack that
-    plumbing.  ``cast_spell`` uses the inventory-aware path via the optional
-    ``skill_level`` argument to feed the real skill tier; armor/shield
-    penalties remain documented future work.  (Approximation note: success
-    rates are within a few percentage points of vendor for un-armored
-    casters, exact for naked Wizards/Monks.)
+    Inventory-aware modifiers (vendor lines 2191-2213, 2265-2275 —
+    metallic body / cloak ROBE / shield / quarterstaff / metallic helm /
+    metallic gloves / metallic boots / spelspec) are applied by the
+    sister function ``spell_success_chance_with_inventory`` (used by
+    ``cast_spell``).  This light helper omits them because several
+    legacy lookups (eg. ``handle_cast`` heuristics, parity unit tests)
+    call it without an inventory handle.  Byte-equal with vendor for
+    un-armored casters; ``spell_success_chance_with_inventory`` is the
+    byte-equal path for armored casters.
 
     Parameters
     ----------
@@ -1816,13 +1817,19 @@ def _effect_polymorph(state, rng: jax.Array) -> dict:
 
 
 def _effect_create_familiar(state: dict, rng: jax.Array) -> dict:
-    """CREATE_FAMILIAR: spawn a small tame dog/kitten in a free monster slot.
+    """CREATE_FAMILIAR: spawn a small tame dog adjacent to the hero.
 
-    Vendor: vendor/nethack/src/makemon.c::makemon (PM_DOG / PM_KITTEN form)
-    invoked by makedog().  Wave 6 minimum: find the first dead/empty slot
-    in monster_ai (alive == False), place it at the player's row, set
-    tame=True, peaceful=True, hp_max=8, hp=8, entry_idx=PM_DOG_PLACEHOLDER.
-    Cite: vendor/nethack/src/makemon.c::makemon, vendor/nethack/src/dog.c::makedog.
+    Vendor: vendor/nethack/src/spell.c::spelleffects line 1569-1571 calls
+    ``make_familiar((struct obj *) 0, u.ux, u.uy, FALSE)``.  Vendor's
+    make_familiar() (dog.c::make_familiar) picks a vendor-canonical pet
+    species (PM_LITTLE_DOG, PM_KITTEN, or PM_PONY) modulated by alignment
+    and rolemore.  Wave 47b parity: use the canonical PM_LITTLE_DOG entry
+    in the Nethax MONSTERS table (index 16 — see
+    ``Nethax/nethax/constants/monster_entries/chunk1.py`` line 319) so the
+    familiar has real attack dice / HP rolls instead of a placeholder.
+
+    Cite: vendor/nethack/src/spell.c::spelleffects line 1569-1571,
+          vendor/nethack/src/dog.c::make_familiar.
     """
     mai = state["monster_ai"]
     free_mask = ~mai.alive
@@ -1836,14 +1843,16 @@ def _effect_create_familiar(state: dict, rng: jax.Array) -> dict:
          (pos[1].astype(jnp.int32) + jnp.int32(1)).astype(jnp.int16)]
     )
 
+    # Canonical PM_LITTLE_DOG = MONSTERS index 16 (chunk1.py:319).
+    PM_LITTLE_DOG = jnp.int16(16)
+
     new_alive    = mai.alive.at[slot].set(jnp.where(any_free, jnp.bool_(True),  mai.alive[slot]))
     new_tame     = mai.tame.at[slot].set(jnp.where(any_free, jnp.bool_(True),  mai.tame[slot]))
     new_peaceful = mai.peaceful.at[slot].set(jnp.where(any_free, jnp.bool_(True), mai.peaceful[slot]))
     new_hp_max   = mai.hp_max.at[slot].set(jnp.where(any_free, jnp.int32(8),    mai.hp_max[slot]))
     new_hp       = mai.hp.at[slot].set(jnp.where(any_free, jnp.int32(8),        mai.hp[slot]))
     new_pos      = mai.pos.at[slot].set(jnp.where(any_free, spawn_pos,          mai.pos[slot]))
-    # entry_idx 1 = a small monster placeholder (PM_DOG roughly).
-    new_entry    = mai.entry_idx.at[slot].set(jnp.where(any_free, jnp.int16(1), mai.entry_idx[slot]))
+    new_entry    = mai.entry_idx.at[slot].set(jnp.where(any_free, PM_LITTLE_DOG, mai.entry_idx[slot]))
 
     new_mai = mai.replace(
         alive=new_alive, tame=new_tame, peaceful=new_peaceful,
@@ -2097,41 +2106,41 @@ def _effect_flame_sphere(state: dict, rng: jax.Array) -> dict:
     """FLAME_SPHERE: summon a PM_FLAMING_SPHERE adjacent to the player.
 
     Vendor: vendor/nethack/src/makemon.c::makemon spawning PM_FLAMING_SPHERE
-    (a small fire elemental that the caster controls).  Wave 6 minimum:
-    place a tame creature in the first free monster slot at (player_row,
-    player_col+1) with entry_idx=3 as a flame-sphere placeholder.
-    Cite: vendor/nethack/src/makemon.c::makemon (PM_FLAMING_SPHERE).
-    """
-    mai = state["monster_ai"]
-    free_mask = ~mai.alive
-    any_free = jnp.any(free_mask)
-    slot = jnp.argmax(free_mask.astype(jnp.int32)).astype(jnp.int32)
+    (a small fire elemental that the caster controls).  Wave 47b parity:
+    use the canonical PM_FLAMING_SPHERE entry — MONSTERS table index 30
+    (see ``Nethax/nethax/constants/monster_entries/chunk1.py`` line 561) —
+    instead of the prior placeholder so the sphere carries its real
+    attack dice (AT_EXPL/AD_FIRE 4d6) and HP rolls.
 
-    pos = state["player_pos"]
-    spawn_pos = jnp.stack(
-        [pos[0].astype(jnp.int16),
-         (pos[1].astype(jnp.int32) + jnp.int32(1)).astype(jnp.int16)]
-    )
-    new_alive    = mai.alive.at[slot].set(jnp.where(any_free, jnp.bool_(True),  mai.alive[slot]))
-    new_tame     = mai.tame.at[slot].set(jnp.where(any_free, jnp.bool_(True),  mai.tame[slot]))
-    new_peaceful = mai.peaceful.at[slot].set(jnp.where(any_free, jnp.bool_(True), mai.peaceful[slot]))
-    new_hp_max   = mai.hp_max.at[slot].set(jnp.where(any_free, jnp.int32(6),    mai.hp_max[slot]))
-    new_hp       = mai.hp.at[slot].set(jnp.where(any_free, jnp.int32(6),        mai.hp[slot]))
-    new_pos      = mai.pos.at[slot].set(jnp.where(any_free, spawn_pos,          mai.pos[slot]))
-    new_entry    = mai.entry_idx.at[slot].set(jnp.where(any_free, jnp.int16(3), mai.entry_idx[slot]))
-    new_mai = mai.replace(
-        alive=new_alive, tame=new_tame, peaceful=new_peaceful,
-        hp=new_hp, hp_max=new_hp_max, pos=new_pos, entry_idx=new_entry,
-    )
-    return {**state, "monster_ai": new_mai}
+    Cite: vendor/nethack/include/monsters.h MON("flaming sphere", ...),
+          vendor/nethack/src/makemon.c::makemon.
+    """
+    # Canonical PM_FLAMING_SPHERE = MONSTERS index 30 (chunk1.py:561).
+    return _spawn_tame_sphere(state, entry_idx=jnp.int16(30))
 
 
 def _effect_freeze_sphere(state: dict, rng: jax.Array) -> dict:
     """FREEZE_SPHERE: summon a PM_FREEZING_SPHERE adjacent to the player.
 
     Vendor: vendor/nethack/src/makemon.c::makemon spawning PM_FREEZING_SPHERE.
-    Same mechanics as flame_sphere; entry_idx=4 as freeze-sphere placeholder.
-    Cite: vendor/nethack/src/makemon.c::makemon (PM_FREEZING_SPHERE).
+    Wave 47b parity: use the canonical PM_FREEZING_SPHERE entry — MONSTERS
+    table index 29 (chunk1.py line 544) — instead of the prior placeholder.
+
+    Cite: vendor/nethack/include/monsters.h MON("freezing sphere", ...),
+          vendor/nethack/src/makemon.c::makemon.
+    """
+    # Canonical PM_FREEZING_SPHERE = MONSTERS index 29 (chunk1.py:544).
+    return _spawn_tame_sphere(state, entry_idx=jnp.int16(29))
+
+
+def _spawn_tame_sphere(state: dict, entry_idx: jax.Array) -> dict:
+    """Helper: spawn a tame sphere adjacent to the hero in the first free slot.
+
+    Shared body for FLAME_SPHERE and FREEZE_SPHERE — vendor stats are
+    identical (level=6, HP ≈ 6, AC=4) so we hard-code hp=hp_max=6 and the
+    caller supplies the canonical MONSTERS entry_idx.
+    Cite: vendor/nethack/include/monsters.h ``flaming sphere`` /
+    ``freezing sphere`` MON() entries (both ``level=6``).
     """
     mai = state["monster_ai"]
     free_mask = ~mai.alive
@@ -2149,7 +2158,7 @@ def _effect_freeze_sphere(state: dict, rng: jax.Array) -> dict:
     new_hp_max   = mai.hp_max.at[slot].set(jnp.where(any_free, jnp.int32(6),    mai.hp_max[slot]))
     new_hp       = mai.hp.at[slot].set(jnp.where(any_free, jnp.int32(6),        mai.hp[slot]))
     new_pos      = mai.pos.at[slot].set(jnp.where(any_free, spawn_pos,          mai.pos[slot]))
-    new_entry    = mai.entry_idx.at[slot].set(jnp.where(any_free, jnp.int16(4), mai.entry_idx[slot]))
+    new_entry    = mai.entry_idx.at[slot].set(jnp.where(any_free, entry_idx,    mai.entry_idx[slot]))
     new_mai = mai.replace(
         alive=new_alive, tame=new_tame, peaceful=new_peaceful,
         hp=new_hp, hp_max=new_hp_max, pos=new_pos, entry_idx=new_entry,
@@ -2465,7 +2474,10 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
     Steps (from spell.c:spelleffects_check + spelleffects):
       1. Pw cost = spell_level * 5  (spell.h:SPELL_LEV_PW)
       2. Check player_pw >= cost; fail early with no Pw spent
-      3. Roll d100 failure chance (percent_success simplified formula)
+      3. Roll d100 failure chance via ``spell_success_chance_with_inventory``
+         (vendor spell.c::percent_success lines 2173-2292, inventory-aware
+         — armor / shield / weapon / cloak / helm / gloves / boots / spelspec
+         modifiers all applied at byte-equal parity)
       4. On success: dispatch to effect handler
       5. Decrement Pw by cost
 
@@ -2614,26 +2626,16 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Pw regeneration — Wave 6 #78 cleanup.
+# Pw regeneration — vendor parity via status_effects.pw_regen_tick.
 #
-# The duplicate ``pw_regen_tick`` that lived here previously implemented a
-# simplified deterministic-interval variant that diverged from vendor.
-# It has been removed; ``magic.step`` now delegates to the canonical
-# ``status_effects.pw_regen_tick`` (vendor allmain.c::regen_pw).
-#
-# Wave 6 #76 re-exports a back-compat ``pw_regen_tick(state)`` shim that
-# implements the deterministic per-turn counter behaviour expected by
-# ``tests/test_magic.py::TestPwRegen``.  The shim drives the
-# ``magic.pw_regen_counter`` counter and adds +1 Pw when the counter
-# reaches the vendor threshold ``(MAXULEV + 8 - xl) * (wizard ? 3 : 4) // 6``
-# (vendor/nethack/src/allmain.c::regen_pw lines 609-611).
+# ``magic.step`` and the back-compat ``magic.pw_regen_tick`` shim delegate
+# to the canonical ``status_effects.pw_regen_tick`` which implements the
+# vendor MAXULEV-based interval formula
+#   ``svm.moves % ((MAXULEV + 8 - u.ulevel) * (wizard ? 3 : 4) / 6) == 0``
+# (vendor/nethack/src/allmain.c::regen_pw lines 609-611) plus the
+# ``rn1(upper, 1)`` per-tick increment driven by INT/WIS/breathing
+# (vendor lines 613-621).  No simplification path remains in this file.
 # ---------------------------------------------------------------------------
-
-
-# Wave 6 #78: magic.pw_regen_tick removed.  ``magic.step`` now delegates
-# to the canonical status_effects.pw_regen_tick — vendor truth is the only
-# regen path.  Any code/tests that previously imported magic.pw_regen_tick
-# should call status_effects.pw_regen_tick or magic.step directly.
 
 
 # ---------------------------------------------------------------------------

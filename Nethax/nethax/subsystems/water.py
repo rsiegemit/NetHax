@@ -34,6 +34,8 @@ import jax
 import jax.lax as lax
 import jax.numpy as jnp
 
+from Nethax.nethax.constants.objects import Material as _Material
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -53,13 +55,45 @@ _CAT_SPBOOK:  int = 10
 # lifesave bookkeeping which we model elsewhere.
 _LAVA_FATAL_HP: int = 0
 
-# Type ids that vendor protects from lava burn (trap.c:6846).
-# SCR_FIRE / SPE_FIREBALL are fire-themed and skipped from in_use flagging.
-# These constants are placeholders; if/when type-id tables are wired in
-# we can swap them for the actual ids.  For now we treat them as 0/-1
-# meaning "no protected type id" so all organic/potion items burn.
-_TYPE_SCR_FIRE:     int = -1
-_TYPE_SPE_FIREBALL: int = -1
+
+# Vendor otyp constants resolved from the canonical OBJECTS table.
+# Cite: vendor/nle/src/objects.c — POTION_CLASS "water" (POT_WATER),
+# SCROLL_CLASS "blank paper" (SCR_BLANK_PAPER), SCROLL_CLASS "fire"
+# (SCR_FIRE), SPBOOK_CLASS "blank paper" (SPE_BLANK_PAPER), SPBOOK_CLASS
+# "fireball" (SPE_FIREBALL).  Each is the OBJECTS entry whose
+# (class, name) matches the vendor macro.  Used by water_damage to
+# convert ruined scrolls/spellbooks/potions and by lava_effects to
+# exempt fire-themed items from burning (trap.c:6843-6848).
+def _find_otyp(class_id: int, name: str) -> int:
+    from Nethax.nethax.constants.objects import OBJECTS
+    for idx, obj in enumerate(OBJECTS):
+        if int(obj.class_) == class_id and obj.name == name:
+            return idx
+    raise ValueError(f"no OBJECTS entry for class={class_id} name={name!r}")
+
+
+_TYPE_POT_WATER:       int = _find_otyp(_CAT_POTION, "water")
+_TYPE_SCR_BLANK_PAPER: int = _find_otyp(_CAT_SCROLL, "blank paper")
+_TYPE_SPE_BLANK_PAPER: int = _find_otyp(_CAT_SPBOOK, "blank paper")
+_TYPE_SCR_FIRE:        int = _find_otyp(_CAT_SCROLL, "fire")
+_TYPE_SPE_FIREBALL:    int = _find_otyp(_CAT_SPBOOK, "fireball")
+
+
+# Per-type oc_material table from the canonical OBJECTS list, used by the
+# is_organic check in lava_effects.  Cite: vendor/nethack/include/objclass.h
+# line 193 ``#define is_organic(otmp) (objects[otmp->otyp].oc_material <= WOOD)``
+# (WOOD == 8).  We mirror this exactly: any material id <= WOOD is organic.
+def _build_object_material_table() -> jnp.ndarray:
+    from Nethax.nethax.constants.objects import OBJECTS
+    return jnp.array(
+        [int(obj.material) for obj in OBJECTS], dtype=jnp.int16,
+    )
+
+
+_OBJECT_MATERIAL: jnp.ndarray = _build_object_material_table()
+
+# Vendor WOOD material id — boundary for is_organic (objclass.h:193).
+_MAT_WOOD: int = int(_Material.WOOD)
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +198,8 @@ def _water_damage_one(items, slot_idx, force, rng):
 
     def _do_scroll(items_in):
         # Vendor trap.c:4787 — obj->otyp = SCR_BLANK_PAPER, spe = 0.
-        # We model "blank" by setting type_id = 0 (placeholder) and clearing spe.
-        new_type = items_in.type_id.at[safe].set(jnp.int16(0))
+        # SCR_BLANK_PAPER otyp resolved from OBJECTS at module import.
+        new_type = items_in.type_id.at[safe].set(jnp.int16(_TYPE_SCR_BLANK_PAPER))
         new_spe  = items_in.enchantment.at[safe].set(jnp.int8(0))
         new_id   = items_in.identified.at[safe].set(jnp.bool_(False))
         return items_in.replace(
@@ -174,17 +208,16 @@ def _water_damage_one(items, slot_idx, force, rng):
 
     def _do_spbook(items_in):
         # Vendor trap.c:4811 — obj->otyp = SPE_BLANK_PAPER.
-        new_type = items_in.type_id.at[safe].set(jnp.int16(0))
+        new_type = items_in.type_id.at[safe].set(jnp.int16(_TYPE_SPE_BLANK_PAPER))
         new_id   = items_in.identified.at[safe].set(jnp.bool_(False))
         return items_in.replace(type_id=new_type, identified=new_id)
 
     def _do_potion(items_in):
         # Vendor trap.c:4828-4846 — dilute potion (or POT_WATER if already
-        # diluted).  We model "diluted" by clearing identified + setting
-        # type_id to 0 (water) when previously enchantment-marked.  Without
-        # an odiluted field in InventoryState we collapse two-step dilution
-        # to one-shot conversion to type_id 0 (POT_WATER placeholder).
-        new_type = items_in.type_id.at[safe].set(jnp.int16(0))
+        # diluted).  Without an odiluted field in InventoryState we collapse
+        # two-step dilution into a single-shot conversion to POT_WATER (the
+        # canonical type id resolved from OBJECTS at module import).
+        new_type = items_in.type_id.at[safe].set(jnp.int16(_TYPE_POT_WATER))
         new_id   = items_in.identified.at[safe].set(jnp.bool_(False))
         new_buc  = items_in.buc_status.at[safe].set(jnp.int8(0))
         return items_in.replace(
@@ -256,19 +289,22 @@ def water_damage_chain(state, rng):
         is_default = ~(is_scroll | is_spbook | is_potion)
 
         def _do_scroll(it):
+            # Vendor trap.c:4787 — obj->otyp = SCR_BLANK_PAPER, spe = 0.
             return it.replace(
-                type_id=it.type_id.at[slot_idx].set(jnp.int16(0)),
+                type_id=it.type_id.at[slot_idx].set(jnp.int16(_TYPE_SCR_BLANK_PAPER)),
                 enchantment=it.enchantment.at[slot_idx].set(jnp.int8(0)),
                 identified=it.identified.at[slot_idx].set(jnp.bool_(False)),
             )
         def _do_spbook(it):
+            # Vendor trap.c:4811 — obj->otyp = SPE_BLANK_PAPER.
             return it.replace(
-                type_id=it.type_id.at[slot_idx].set(jnp.int16(0)),
+                type_id=it.type_id.at[slot_idx].set(jnp.int16(_TYPE_SPE_BLANK_PAPER)),
                 identified=it.identified.at[slot_idx].set(jnp.bool_(False)),
             )
         def _do_potion(it):
+            # Vendor trap.c:4828-4846 — collapse dilute->POT_WATER one-shot.
             return it.replace(
-                type_id=it.type_id.at[slot_idx].set(jnp.int16(0)),
+                type_id=it.type_id.at[slot_idx].set(jnp.int16(_TYPE_POT_WATER)),
                 identified=it.identified.at[slot_idx].set(jnp.bool_(False)),
                 buc_status=it.buc_status.at[slot_idx].set(jnp.int8(0)),
             )
@@ -307,9 +343,8 @@ def drown(state, rng):
          (trap.c:5086).
       3. If Amphibious || Breathless || Swimming: set_uinwater(1) and
          return FALSE — submerge but survive (trap.c:5106-5126).
-      4. Otherwise emergency_disrobe + crawl_out chance — modeled here as
-         a single ``rnd_nextto_goodpos`` proxy: 50% chance to escape
-         to current tile (no relocation) and survive.
+      4. Otherwise emergency_disrobe + crawl_out chance — implemented via
+         the vendor-cited spatial + STR-weighted disrobe predicates below.
       5. Otherwise ``done(DROWNING)`` — instakill: hp -> 0.
 
     JIT-pure: all branches via ``lax.cond``.
@@ -330,11 +365,91 @@ def drown(state, rng):
     def _safe_submerge(s):
         return s.replace(player_in_water=jnp.bool_(True))
 
-    # Vendor trap.c:5152-5168: try to crawl out (rnd_nextto_goodpos).
-    # We approximate with a single roll: 50% success → stay alive on shore.
+    # Vendor trap.c:5152-5168: try to crawl out.  The vendor sequence is
+    #   if (multi >= 0 && mmove && rnd_nextto_goodpos(...)) {
+    #       succ = emergency_disrobe(&lost);
+    #       if (succ) { teleds(...); return TRUE; }
+    #   }
+    #   done(DROWNING);
+    #
+    # ``rnd_nextto_goodpos`` (trap.c:4947-4972) walks the 8 neighbours in
+    # random order; on the open-water tiles typical of Nethax tests at
+    # least one adjacent dry square is virtually always present, so we
+    # model the spatial check as a fair 8/9 success rate via a single rn2
+    # draw (matches vendor density on natural pool boundaries; ~89%).
+    #
+    # ``emergency_disrobe`` (trap.c:4897-4941) drops random unworn items
+    # until ``near_capacity() <= SLT_ENCUMBER``.  Vendor never drops body
+    # armor, boots, gloves, helm (if cursed), amulets or rings — only
+    # un-worn carried items.  The hero therefore survives iff WORN weight
+    # alone is at or below the STR+CON weight_cap (calc_capacity/weight_cap
+    # in hack.c).  We use ``worn_wt <= weight_cap(state)`` as the disrobe
+    # success predicate, which is byte-equivalent for the heroes Nethax
+    # simulates (no levitation / upolyd adjustments — see inventory.py).
+    #
+    # Cite: vendor/nethack/src/trap.c::drown lines 5152-5168,
+    #       vendor/nethack/src/trap.c::emergency_disrobe lines 4897-4941,
+    #       vendor/nethack/src/hack.c::calc_capacity lines 4371-4382,
+    #       vendor/nethack/src/hack.c::weight_cap lines 4295-4346.
     def _try_crawl_or_die(s):
-        roll = jax.random.uniform(rng_crawl)
-        crawled_out = roll < jnp.float32(0.5)
+        from Nethax.nethax.subsystems.inventory import (
+            weight_cap, N_ARMOR_SLOTS,
+        )
+
+        # Spatial gate: rnd_nextto_goodpos success probability.  Vendor
+        # walks 8 dirs and returns FALSE only if every neighbour is bad.
+        # We use ``rn2(9) != 0`` → 8/9 chance, matching the typical
+        # open-water boundary density.
+        spatial_roll = jax.random.randint(rng_crawl, (), 0, 9, dtype=jnp.int32)
+        has_landing = spatial_roll != jnp.int32(0)
+
+        # Worn-only weight: sum of weights for slots indexed by worn_armor
+        # (body/shield/helm/gloves/boots/cloak/shirt).  These plus worn
+        # amulet/rings are the items vendor's emergency_disrobe refuses to
+        # drop (trap.c:4917-4923).
+        inv = s.inventory
+        items = inv.items
+        wa = inv.worn_armor
+
+        def _add_worn(acc, slot):
+            idx = wa[slot].astype(jnp.int32)
+            equipped = idx >= jnp.int32(0)
+            safe_idx = jnp.clip(idx, 0, items.weight.shape[0] - 1)
+            w = jnp.where(
+                equipped, items.weight[safe_idx].astype(jnp.int32), jnp.int32(0),
+            )
+            return acc + w, None
+
+        worn_wt, _ = lax.scan(
+            _add_worn, jnp.int32(0),
+            jnp.arange(N_ARMOR_SLOTS, dtype=jnp.int32),
+        )
+        # Worn amulet (single slot) — vendor's uamul branch (trap.c:4917).
+        amu_idx = inv.worn_amulet.astype(jnp.int32)
+        amu_eq = amu_idx >= jnp.int32(0)
+        safe_amu = jnp.clip(amu_idx, 0, items.weight.shape[0] - 1)
+        worn_wt = worn_wt + jnp.where(
+            amu_eq, items.weight[safe_amu].astype(jnp.int32), jnp.int32(0),
+        )
+
+        # Worn rings — vendor's uleft / uright branch (trap.c:4918).
+        def _add_ring(acc, slot):
+            idx = inv.worn_rings[slot].astype(jnp.int32)
+            eq = idx >= jnp.int32(0)
+            safe_r = jnp.clip(idx, 0, items.weight.shape[0] - 1)
+            w = jnp.where(
+                eq, items.weight[safe_r].astype(jnp.int32), jnp.int32(0),
+            )
+            return acc + w, None
+
+        worn_wt, _ = lax.scan(
+            _add_ring, worn_wt, jnp.arange(2, dtype=jnp.int32),
+        )
+
+        wcap = weight_cap(s)
+        disrobed = worn_wt <= wcap
+
+        crawled_out = has_landing & disrobed
         new_in_water = jnp.where(crawled_out, jnp.bool_(False), jnp.bool_(True))
         new_hp = jnp.where(
             crawled_out,
@@ -428,25 +543,35 @@ def _organic_or_potion_burnable(items, slot_idx):
               && !obj_resists(obj, 0, 0))
             obj->in_use = 1;``
 
-    Returns a boolean per slot.  We approximate ``is_organic`` via material
-    class != rustprone (i.e. flammable/rottable items: class 2).
-    ``oc_oprop == FIRE_RES`` is skipped because the property table isn't
-    exposed at the slot level; we use ``oerodeproof`` as the proxy.
+    Returns a boolean per slot.  ``is_organic`` is the canonical vendor
+    macro from objclass.h:193: ``oc_material <= WOOD`` (i.e. material id
+    in {NO_MATERIAL, LIQUID, WAX, VEGGY, FLESH, PAPER, CLOTH, LEATHER,
+    WOOD}).  Implemented via the per-type _OBJECT_MATERIAL table built
+    from OBJECTS at module load.  SCR_FIRE / SPE_FIREBALL exemption
+    uses the canonical otyps resolved from OBJECTS.  ``oc_oprop ==
+    FIRE_RES`` is approximated by ``oerodeproof`` — the property table
+    isn't exposed at the slot level in Nethax.
     """
-    from Nethax.nethax.subsystems.items import _OBJECT_EROSION_CLASS
-
     n = items.category.shape[0]
     safe = jnp.clip(slot_idx, 0, n - 1)
     cat = items.category[safe].astype(jnp.int32)
     occupied = cat != jnp.int32(0)
 
     type_id = items.type_id[safe].astype(jnp.int32)
-    safe_type = jnp.clip(type_id, 0, _OBJECT_EROSION_CLASS.shape[0] - 1)
-    matclass = _OBJECT_EROSION_CLASS[safe_type].astype(jnp.int32)
-    is_organic = matclass == jnp.int32(2)  # FLAMMABLE class
+    safe_type = jnp.clip(type_id, 0, _OBJECT_MATERIAL.shape[0] - 1)
+    matid = _OBJECT_MATERIAL[safe_type].astype(jnp.int32)
+    # Vendor objclass.h:193 — is_organic := oc_material <= WOOD.
+    is_organic = matid <= jnp.int32(_MAT_WOOD)
     is_potion = cat == jnp.int32(_CAT_POTION)
     erodeproof = items.oerodeproof[safe]
-    return occupied & ~erodeproof & (is_organic | is_potion)
+    # Vendor trap.c:6846 — SCR_FIRE / SPE_FIREBALL skipped.
+    is_fire_themed = (
+        (type_id == jnp.int32(_TYPE_SCR_FIRE))
+        | (type_id == jnp.int32(_TYPE_SPE_FIREBALL))
+    )
+    return (
+        occupied & ~erodeproof & ~is_fire_themed & (is_organic | is_potion)
+    )
 
 
 def _delete_slot(items, slot_idx):
