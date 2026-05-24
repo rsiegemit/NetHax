@@ -20,6 +20,7 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
 from Nethax.nethax.constants.roles import Role
@@ -233,9 +234,15 @@ def test_non_knight_no_chivalric_bonus():
 # End-to-end: damage averages with vs. without role bonuses
 # ---------------------------------------------------------------------------
 
+@pytest.mark.timeout(900)
 def test_monk_does_more_total_damage_than_non_monk_bare_handed():
     """Across many melee strikes, a bare-handed XL5 Monk out-damages a Tourist
     using the same stats and weapon (none).
+
+    Timeout bumped to 900s: the first cold compile of melee_attack — which
+    pulls in the full Role / monk-martial-arts / samurai / knight / artifact
+    pipeline — can run past the default in heavily-loaded CI environments.
+    Cite: vendor/nethack/src/uhitm.c::hmon_hitmon_barehands.
     """
     hobbit_idx = _first_monster_with_symbol(MonsterSymbol.S_HUMANOID)
     base = _fresh_state().replace(

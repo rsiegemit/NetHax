@@ -2132,11 +2132,13 @@ def _handle_polearm_attack(state, rng, dir_idx: jnp.ndarray):
     at_target = (m_rows == target_row) & (m_cols == target_col) & mai.alive
     idx = jnp.argmax(at_target).astype(jnp.int32)
 
-    # Fall through to melee_attack — vendor uhitm.c::dolean ends in
-    # `attack(level, mtmp)` which is the standard hitmu dispatch.  Name
-    # collision with builtin `attack` in older code; the real entry point
-    # in this module is `melee_attack`.
-    return melee_attack(state, rng, idx)
+    # Fall through to melee_attack — vendor apply.c::use_pole (line 3491)
+    # ends in `gb.bhitpos = cc; mtmp = m_at(...); ... attack(mtmp)` which is
+    # the standard hitmu dispatch.  Return only the new state, mirroring
+    # vendor's ECMD_TIME side-effect-via-state pattern.
+    # Cite: vendor/nethack/src/apply.c::use_pole lines 3489-3510.
+    new_state, _dmg, _hit = melee_attack(state, rng, idx)
+    return new_state
 
 
 def _apply_cleave_splash(state, rng, primary_idx: jnp.ndarray, primary_dmg: jnp.ndarray):

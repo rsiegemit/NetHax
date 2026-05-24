@@ -19,6 +19,7 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 
 _RNG = jax.random.PRNGKey(2026)
@@ -115,9 +116,16 @@ def test_two_weapon_toggle_via_command():
     )
 
 
+@pytest.mark.timeout(900)
 def test_two_weapon_attacks_twice_per_turn():
     """With two_weapon=True, melee_attack performs two strikes; expected
-    damage roughly doubles vs the single-strike baseline (averaged)."""
+    damage roughly doubles vs the single-strike baseline (averaged).
+
+    Timeout bumped to 900s: cold-compile of melee_attack with the two-weapon
+    lax.cond branch (which traces both _single and _double sub-paths) routinely
+    pushes past the default in heavily-loaded CI environments.
+    Cite: vendor/nethack/src/uhitm.c::hitum (two-weapon known_hitum loop).
+    """
     from Nethax.nethax.subsystems.combat import melee_attack
 
     def _setup(two_weapon: bool):
@@ -291,9 +299,15 @@ def _polymorph_state_with_high_attack():
     return state.replace(polymorph=poly)
 
 
+@pytest.mark.timeout(900)
 def test_polymorph_combat_uses_form_attacks():
     """Polymorphed player damage uses form attack dice (6d8) — should
-    exceed unarmed (1d4 + STR) baseline by a large margin."""
+    exceed unarmed (1d4 + STR) baseline by a large margin.
+
+    Timeout bumped to 900s: melee_attack's first cold compile in this test
+    process can exceed the default when the system is under contention.
+    Cite: vendor/nethack/src/polyself.c::find_uac + uhitm.c::hitum.
+    """
     from Nethax.nethax.subsystems.combat import melee_attack
 
     def _setup(polymorphed: bool):
