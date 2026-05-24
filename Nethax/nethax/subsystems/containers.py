@@ -382,6 +382,18 @@ def put_in_container(state, container_idx, src_slot):
       succeeds but ``parent_slot`` won't be updated for the nested bag
       (deferred to a full explosion handler in a future wave).
 
+    Refused items (Audit L #8, vendor pickup.c lines 2577-2622) — these
+    silently no-op rather than inserting:
+      * cursed loadstone (line 2577)
+      * Amulet of Yendor / Candelabrum of Invocation / Bell of Opening /
+        Book of the Dead (lines 2581-2589 — the four quest artifacts)
+      * active leash (line 2591 — approximated here as any leash since we
+        don't track the leashed-monster bit)
+      * BOULDER / large STATUE (line 2616-2617)
+      * any physical box (LARGE_BOX / CHEST / ICE_BOX, line 2616 Is_box)
+    Welded uwep (pickup.c:2594-2599) — deferred; would need the wield-
+    slot welded bit propagated through to the inventory.Item record.
+
     Parameters
     ----------
     state         : EnvState
@@ -401,8 +413,44 @@ def put_in_container(state, container_idx, src_slot):
     has_container = cs.container_type[c_idx] != jnp.int8(ContainerType.NONE)
     has_src_item  = inv.category[s_idx] != jnp.int8(0)
 
+    # Audit L #8: vendor pickup.c::in_container lines 2577-2622 refuses
+    # to insert the following classes of items into ANY container.  Each
+    # rejection is silent (vendor prints a "you can't" message we don't
+    # model here; the operation just no-ops).
+    src_tid = inv.type_id[s_idx]
+    src_buc = inv.buc_status[s_idx]
+    is_cursed_loadstone = (
+        (src_tid == jnp.int16(_LOADSTONE_TYPE_ID))
+        & (src_buc == jnp.int8(BUCStatus.CURSED))
+    )
+    is_quest_item = (
+        (src_tid == jnp.int16(_AMULET_OF_YENDOR_TYPE_ID))
+        | (src_tid == jnp.int16(_CANDELABRUM_OF_INVOCATION_TYPE_ID))
+        | (src_tid == jnp.int16(_BELL_OF_OPENING_TYPE_ID))
+        | (src_tid == jnp.int16(_BOOK_OF_THE_DEAD_TYPE_ID))
+    )
+    is_oversize = (
+        (src_tid == jnp.int16(_BOULDER_TYPE_ID))
+        | (src_tid == jnp.int16(_STATUE_TYPE_ID))
+    )
+    is_leash = src_tid == jnp.int16(_LEASH_TYPE_ID)
+    # Boxes inside boxes are also refused (pickup.c:2616 Is_box(obj)).  All
+    # containers we model are boxes / bags; a coarse-grained gate that
+    # forbids inserting any container-typed item via inventory.category
+    # would over-restrict, so we narrow to the specific physical-box
+    # otyps (LARGE_BOX / CHEST / ICE_BOX).
+    is_box_inside_box = (
+        (src_tid == jnp.int16(_LARGE_BOX_CONTAINER_TYPE_ID))
+        | (src_tid == jnp.int16(_CHEST_CONTAINER_TYPE_ID))
+        | (src_tid == jnp.int16(_ICE_BOX_CONTAINER_TYPE_ID))
+    )
+    item_allowed = ~(
+        is_cursed_loadstone | is_quest_item | is_oversize
+        | is_leash         | is_box_inside_box
+    )
+
     found_pos, dst_pos = _find_first_empty_in_container(cs, c_idx)
-    can_put = has_container & has_src_item & found_pos
+    can_put = has_container & has_src_item & found_pos & item_allowed
     safe_pos = jnp.clip(dst_pos, 0, MAX_ITEMS_PER_CONTAINER - 1)
 
     def _set_field(cs_field, inv_field, dtype):
@@ -830,6 +878,17 @@ _BAG_OF_TRICKS_CONTAINER_TYPE_ID:  int = 195   # vendor objects.h:911  BAG_OF_TR
 # ::mbag_explodes (line 2488-2507) — WAN_CANCELLATION or a nested Is_mbag
 # (BAG_OF_HOLDING / BAG_OF_TRICKS, gated by spe>0 for the latter two).
 _WAN_CANCELLATION_TYPE_ID:         int = 395   # vendor objects.h:8084-8086
+
+# Audit L #8: vendor pickup.c::in_container lines 2577-2622 refuses to insert
+# certain items into ANY container.  Cite: constants/objects.py line numbers.
+_AMULET_OF_YENDOR_TYPE_ID:           int = 188   # objects.py:3944
+_CANDELABRUM_OF_INVOCATION_TYPE_ID:  int = 237   # objects.py:4924
+_BELL_OF_OPENING_TYPE_ID:            int = 238   # objects.py:4944
+_BOOK_OF_THE_DEAD_TYPE_ID:           int = 382   # objects.py:7824
+_LOADSTONE_TYPE_ID:                  int = 443   # objects.py:9045
+_BOULDER_TYPE_ID:                    int = 447   # objects.py:9129
+_STATUE_TYPE_ID:                     int = 448   # objects.py:9149
+_LEASH_TYPE_ID:                      int = 211   # objects.py:4404
 
 
 def cancel_bag_of_holding(state, container_idx: int, src_slot: int = -1):
