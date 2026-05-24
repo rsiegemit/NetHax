@@ -1018,6 +1018,40 @@ def pathfind_step(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
     return jnp.where(reachable, bfs_step, greedy_delta)
 
 
+# Vendor mfndpos confusion gate: ``if (mon->mconf) flag |= ALLOW_ALL`` at
+# mon.c:2199-2202.  Combined with the dochug confused-pursuit override in
+# monmove.c::dochug (mtmp->mconf forces random direction selection rather
+# than goal-directed pursuit), a confused monster steps to a uniformly
+# random 8-neighbor tile each turn.  ``apply_confusion_to_step`` is the
+# JIT-safe one-liner override: when ``confuse_timer > 0`` it replaces the
+# pathfind/retreat step with a fresh uniform (dy, dx) in {-1, 0, 1}^2 \ {(0,0)}.
+#
+# Cite: vendor/nethack/src/mon.c::mfndpos lines 2199-2202;
+#       vendor/nethack/src/monmove.c::dochug confused-pursuit gate.
+def apply_confusion_to_step(
+    step_delta: jnp.ndarray,
+    is_confused: jnp.ndarray,
+    rng: jax.Array,
+) -> jnp.ndarray:
+    """Override ``step_delta`` with a uniform random 8-direction when confused.
+
+    Returns the original ``step_delta`` when ``is_confused`` is False, otherwise
+    a random (dy, dx) drawn uniformly from the 8 neighbour offsets.
+    """
+    # 8 offsets — match the order used by ``pathfind_step``.
+    _OFFSETS = jnp.array(
+        [
+            (-1, -1), (-1, 0), (-1, 1),
+            (0, -1),           (0, 1),
+            (1, -1),  (1, 0),  (1, 1),
+        ],
+        dtype=jnp.int32,
+    )
+    pick = jax.random.randint(rng, (), 0, 8, dtype=jnp.int32)
+    rand_step = _OFFSETS[pick]
+    return jnp.where(is_confused, rand_step, step_delta.astype(jnp.int32))
+
+
 # ---------------------------------------------------------------------------
 # 3.  Muse — monster item use  (src/muse.c)
 # ---------------------------------------------------------------------------
@@ -2861,11 +2895,19 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
     def _follow_player(s):
         """FOLLOW mode: BFS pathfind toward player (mfndpos).
 
-        Vendor: dogmove.c::dog_move uses mfndpos for path-finding.
-        Cite: vendor/nethack/src/monmove.c::mfndpos.
+        Vendor: dogmove.c::dog_move uses mfndpos for path-finding.  Confused
+        pets randomise their step (vendor mfndpos mon.c:2199-2202 sets
+        ``flag |= ALLOW_ALL`` and dochug degenerates pursuit to a random
+        adjacent square).
+        Cite: vendor/nethack/src/monmove.c::mfndpos lines 2199-2202.
         """
         _mai = s.monster_ai
         step_delta = pathfind_step(s, idx)
+        _rng_conf_pet = jax.random.fold_in(rng, jnp.int32(0x636F6E66))  # "conf"
+        is_confused_pet = _mai.confuse_timer[idx] > jnp.int16(0)
+        step_delta = apply_confusion_to_step(
+            step_delta, is_confused_pet, _rng_conf_pet,
+        )
         cur = _mai.pos[idx].astype(jnp.int32)
         new_r = jnp.clip(cur[0] + step_delta[0], 0, _MAP_H - 1).astype(jnp.int16)
         new_c = jnp.clip(cur[1] + step_delta[1], 0, _MAP_W - 1).astype(jnp.int16)
@@ -3271,7 +3313,7 @@ def monster_turn(state, rng: jax.Array, monster_idx: jnp.ndarray) -> object:
     mai = state.monster_ai
 
     (rng_pet, rng_cast, rng_atk, rng_pick,
-     rng_decay, rng_wake) = jax.random.split(rng, 6)
+     rng_decay, rng_wake, rng_conf_step) = jax.random.split(rng, 7)
     rng_mconf, rng_mstun = jax.random.split(rng_decay)
 
     # Branch 1 + 2: pet has its own turn.
@@ -3361,6 +3403,15 @@ def monster_turn(state, rng: jax.Array, monster_idx: jnp.ndarray) -> object:
             wants_retreat = jnp.any(retreat_step != 0)
             path_step = pathfind_step(st, idx)
             step_delta = jnp.where(wants_retreat, retreat_step, path_step)
+            # Confusion-driven random step: vendor mfndpos sets ``flag |=
+            # ALLOW_ALL`` when ``mon->mconf`` (mon.c:2199-2202), and dochug's
+            # pursuit logic degenerates to a random adjacent square when
+            # ``mtmp->mconf``.  Override AFTER retreat so a confused fleeing
+            # monster still picks randomly (vendor behaviour).
+            is_confused_mi = st.monster_ai.confuse_timer[idx] > jnp.int16(0)
+            step_delta = apply_confusion_to_step(
+                step_delta, is_confused_mi, rng_conf_step,
+            )
             step_delta = jnp.where(
                 scared, jnp.zeros(2, dtype=jnp.int32), step_delta
             )
