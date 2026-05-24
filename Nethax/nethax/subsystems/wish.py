@@ -913,8 +913,16 @@ def _find_first_empty_ground_slot(ground_items, b, lv, r, c) -> int:
 
 
 def _write_inventory_slot(state, slot_idx: int, category: int, type_id: int,
-                          buc: int, enchant: int, weight: int, quantity: int = 1):
-    """Return new state with the given inventory slot populated with the wished item."""
+                          buc: int, enchant: int, weight: int, quantity: int = 1,
+                          artifact_idx: int = -1):
+    """Return new state with the given inventory slot populated with the wished item.
+
+    ``artifact_idx`` populates ``Item.artifact_idx`` (vendor obj->oartifact)
+    so ``apply_carried_artifact_extrinsics`` (artifact_powers.py) walks the
+    carried artifact and ORs its cspfx bits into the player's extrinsics.
+    Defaults to -1 (non-artifact).  cite: vendor/nethack/include/obj.h
+    obj->oartifact; artifact.c::set_artifact_intrinsic.
+    """
     items = state.inventory.items
     new_items = items.replace(
         category    = items.category.at[slot_idx].set(jnp.int8(category)),
@@ -927,6 +935,7 @@ def _write_inventory_slot(state, slot_idx: int, category: int, type_id: int,
         weight      = items.weight.at[slot_idx].set(jnp.int32(weight * quantity)),
         ac_bonus    = items.ac_bonus.at[slot_idx].set(jnp.int8(0)),
         is_two_handed = items.is_two_handed.at[slot_idx].set(jnp.bool_(False)),
+        artifact_idx = items.artifact_idx.at[slot_idx].set(jnp.int8(artifact_idx)),
     )
     new_inv = state.inventory.replace(items=new_items)
     return state.replace(inventory=new_inv)
@@ -934,8 +943,14 @@ def _write_inventory_slot(state, slot_idx: int, category: int, type_id: int,
 
 def _write_ground_slot(state, b: int, lv: int, r: int, c: int, gslot: int,
                        category: int, type_id: int, buc: int, enchant: int,
-                       weight: int, quantity: int = 1):
-    """Return new state with the wished item placed on the ground stack."""
+                       weight: int, quantity: int = 1, artifact_idx: int = -1):
+    """Return new state with the wished item placed on the ground stack.
+
+    See ``_write_inventory_slot`` for ``artifact_idx`` semantics.  The
+    ground-stack copy of the artifact_idx field becomes carried over the
+    next ``pickup`` thanks to the field-by-field copy in
+    ``inventory.pickup`` (added in commit 45827a5 / Wave 42d stack-merge).
+    """
     g = state.ground_items
     new_g = g.replace(
         category    = g.category.at[b, lv, r, c, gslot].set(jnp.int8(category)),
@@ -948,6 +963,7 @@ def _write_ground_slot(state, b: int, lv: int, r: int, c: int, gslot: int,
         weight      = g.weight.at[b, lv, r, c, gslot].set(jnp.int32(weight * quantity)),
         ac_bonus    = g.ac_bonus.at[b, lv, r, c, gslot].set(jnp.int8(0)),
         is_two_handed = g.is_two_handed.at[b, lv, r, c, gslot].set(jnp.bool_(False)),
+        artifact_idx = g.artifact_idx.at[b, lv, r, c, gslot].set(jnp.int8(artifact_idx)),
     )
     return state.replace(ground_items=new_g)
 
@@ -1025,8 +1041,11 @@ def grant_wish(state, rng, wish_string):
     # Place item: prefer inventory; fall back to ground stack.
     slot = _find_first_empty_slot(state.inventory.items)
     if slot >= 0:
+        # Thread artifact_idx through so apply_carried_artifact_extrinsics
+        # picks up the wished artifact (Wave 41a / Audit K wire-up).
         state = _write_inventory_slot(state, slot, category, type_id, buc,
-                                      enchant, weight, quantity=quantity)
+                                      enchant, weight, quantity=quantity,
+                                      artifact_idx=int(artifact_idx))
         if user_name:
             state = _set_user_name_at(state, slot, user_name)
     else:
@@ -1038,7 +1057,8 @@ def grant_wish(state, rng, wish_string):
         if gslot >= 0:
             state = _write_ground_slot(state, b, lv, r, c, gslot,
                                        category, type_id, buc, enchant, weight,
-                                       quantity=quantity)
+                                       quantity=quantity,
+                                       artifact_idx=int(artifact_idx))
         # else: nowhere to put it; vendor would print "nothing happens".
 
     return _mark_wish_conducts(state, artifact=(artifact_idx >= 0))
