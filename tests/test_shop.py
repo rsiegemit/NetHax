@@ -108,11 +108,19 @@ def test_shop_state_initial_inactive():
 # 2. Bill accrual
 # ---------------------------------------------------------------------------
 def test_pickup_in_shop_accrues_bill():
-    """Pickup inside the shop room flags the slot and bumps the bill."""
+    """Pickup inside the shop room flags the slot and bumps the bill.
+
+    Wave 15 / Audit L: accrual against an empty slot resolves to
+    ``DEFAULT_ITEM_PRICE`` via the fallback in
+    ``_compute_item_price_from_slot``; slots 0-9 carry starting inventory
+    whose real ``get_cost`` differs by role and CHA tier.  Use slot 10
+    (post-starting-inv, empty) so the assertion exercises the default-
+    price code path.  See test_pay_at_exit_* for the same pattern.
+    """
     state = _env_with_shop(player_pos=(6, 7))  # inside (rows 5-7, cols 5-10)
-    new_state = accrue_bill(state, slot_idx=3)
+    new_state = accrue_bill(state, slot_idx=10)
     assert int(new_state.shop.bill) == DEFAULT_ITEM_PRICE
-    assert bool(new_state.shop.items_owned_by_shop[3]) is True
+    assert bool(new_state.shop.items_owned_by_shop[10]) is True
     # Other slots untouched.
     assert bool(new_state.shop.items_owned_by_shop[0]) is False
 
@@ -120,7 +128,7 @@ def test_pickup_in_shop_accrues_bill():
 def test_pickup_outside_shop_no_bill():
     """Pickup outside the shop room is a no-op."""
     state = _env_with_shop(player_pos=(15, 15))  # outside any room
-    new_state = accrue_bill(state, slot_idx=3)
+    new_state = accrue_bill(state, slot_idx=10)
     assert int(new_state.shop.bill) == 0
     assert not bool(jnp.any(new_state.shop.items_owned_by_shop))
 
@@ -129,7 +137,7 @@ def test_pickup_when_shop_inactive_is_noop():
     """Pickup when no shop is active does nothing."""
     shop = ShopState.default()
     state = _env_with_shop(shop=shop, player_pos=(6, 6))
-    new_state = accrue_bill(state, slot_idx=3)
+    new_state = accrue_bill(state, slot_idx=10)
     assert int(new_state.shop.bill) == 0
     assert not bool(jnp.any(new_state.shop.items_owned_by_shop))
 
