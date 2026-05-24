@@ -1132,6 +1132,195 @@ def fill_ordinary_rooms(
 
 
 # ---------------------------------------------------------------------------
+# maybe_create_vault — 2x2 detached vault with teleport-trap entry
+# ---------------------------------------------------------------------------
+#
+# Vendor cite: vendor/nethack/src/mklev.c lines 404-410, 1316-1342.
+#
+#   while (svn.nroom < (MAXNROFROOMS - 1) && rnd_rect()) {
+#       if (svn.nroom >= (MAXNROFROOMS / 6) && rn2(2) && !tried_vault) {
+#           tried_vault = TRUE;
+#           if (create_vault()) {                    /* sets vault_x/vault_y */
+#               gv.vault_x = svr.rooms[svn.nroom].lx;
+#               gv.vault_y = svr.rooms[svn.nroom].ly;
+#               svr.rooms[svn.nroom].hx = -1;
+#           }
+#       } ...
+#   }
+#   ...
+#   if (do_vault()) {                                /* vault_x != -1 */
+#       w = 1; h = 1;
+#       if (check_room(...)) {
+#           add_room(vault_x, vault_y, vault_x + w, vault_y + h,
+#                    TRUE, VAULT, FALSE);            /* 2x2 interior */
+#           svl.level.flags.has_vault = 1;
+#           ...
+#           mk_knox_portal(vault_x + w, vault_y + h);
+#           if (!noteleport && !rn2(3))
+#               makevtele();                          /* TELEP_TRAP entry */
+#       }
+#   }
+#
+# Vendor's create_vault macro expands to
+# ``create_room(-1, -1, 2, 2, -1, -1, VAULT, TRUE)`` — a 2x2 interior
+# (the "w=1, h=1" later in check_room refers to half-width/half-height).
+# The vault is gated on having at least MAXNROFROOMS/6 = 6 ordinary rooms
+# already, then a 50 % rn2(2) coin-flip.  The teleport-trap entry is then
+# placed with !rn2(3) (66 % chance) if the level allows teleport.
+
+
+def maybe_create_vault(
+    rng,
+    rooms,
+    active,
+    terrain,
+    features,
+    traps,
+    flat_lv: int,
+):
+    """Try to carve a 2x2 detached vault and record its centre + teleport trap.
+
+    Vendor cite: vendor/nethack/src/mklev.c lines 404-410 (gate) +
+    lines 1316-1342 (placement) + line 1332 makevtele() teleport trap.
+
+    Behavior:
+      1. Gate: require at least ``MAXNROFROOMS // 6 = 6`` active ordinary
+         rooms on the level, then a 50 % ``rn2(2)`` coin-flip — vendor
+         lines 404-410.  This deviates from the legacy TODO comment which
+         hypothesised an ``rn2(7)`` rate; the vendor source uses ``rn2(2)``
+         gated on the room count.
+      2. Pick a 2x2 area whose 4-tile bounding box (with 1-cell wall
+         margin) overlaps no active room.  We sweep a small candidate
+         set drawn from a fixed grid; the first non-adjacent candidate
+         is chosen.
+      3. Stamp all 4 interior tiles as FLOOR.
+      4. Place TELEP_TRAP (TrapType=15) at the vault centre (the
+         vendor ``makevtele`` teleport trap — line 1332).  Vendor gates
+         this on a further ``!rn2(3)`` and ``!noteleport`` flag; we
+         apply both gates here.
+      5. Record ``features.vault_pos[flat_lv]`` = (centre_row, centre_col).
+
+    JIT-safety: the candidate sweep is implemented as ``lax.scan`` over a
+    fixed candidate grid.  All RNG draws use ``jax.random.split`` — no
+    key reuse.
+
+    Args:
+        rng:      jax.random.PRNGKey scalar.
+        rooms:    Room pytree.
+        active:   bool[MAX_ROOMS_PER_LEVEL] mask.
+        terrain:  int8[MAP_H, MAP_W].
+        features: FeaturesState (vault_pos is updated).
+        traps:    TrapState (TELEP_TRAP placed at centre).
+        flat_lv:  int — flattened level index.
+
+    Returns:
+        (terrain, features, traps) — updated.  When the gate fails or no
+        non-adjacent 2x2 site exists, returns the inputs unchanged
+        (vault_pos remains (-1, -1)).
+    """
+    from Nethax.nethax.constants.tiles import TileType
+    FLOOR = jnp.int8(int(TileType.FLOOR))
+    TELEP_TRAP = jnp.int8(15)  # vendor/nethack/include/trap.h TELEP_TRAP=15.
+
+    h, w = terrain.shape
+    n_active = jnp.sum(active.astype(jnp.int32))
+
+    # MAXNROFROOMS = 40 (vendor/nethack/include/global.h); /6 = 6.
+    MIN_ROOMS_FOR_VAULT = jnp.int32(MAX_ROOMS_PER_LEVEL // 6)
+
+    k_gate, k_coin, k_tele, k_pos = jax.random.split(rng, 4)
+    # Gate 1: room count.
+    rooms_ok = n_active >= MIN_ROOMS_FOR_VAULT
+    # Gate 2: rn2(2) — vendor line 404.
+    coin = jax.random.randint(k_coin, (), 0, 2, dtype=jnp.int32) == jnp.int32(0)
+    # Combined gate (drops the rn2(2) when room count not met).
+    gate = rooms_ok & coin
+
+    # ---- Candidate sweep -----------------------------------------------------
+    # We tile the map with 2x2 candidate slots on a 4-cell stride to ensure
+    # each candidate's bounding box (with 1-cell margin) is independent.
+    # For each candidate, compute its overlap-with-any-active-room flag.
+    cand_step  = 4
+    cand_rows  = jnp.arange(2, h - 4, cand_step, dtype=jnp.int32)
+    cand_cols  = jnp.arange(2, w - 4, cand_step, dtype=jnp.int32)
+    rr, cc = jnp.meshgrid(cand_rows, cand_cols, indexing="ij")
+    cand_y1 = rr.reshape(-1)
+    cand_x1 = cc.reshape(-1)
+    n_cand = cand_y1.shape[0]
+
+    def overlaps_any(y1, x1):
+        # 2x2 interior → y2=y1+1, x2=x1+1.  Add 1-cell margin for the
+        # adjacency check (vendor uses check_room's >=1 wall buffer).
+        y2 = y1 + jnp.int32(1)
+        x2 = x1 + jnp.int32(1)
+        # Vmap _rooms_overlap-style test across all active rooms.
+        def per_room(ry1, rx1, ry2, rx2, act):
+            margin = jnp.int32(1)
+            ry1i = ry1.astype(jnp.int32)
+            rx1i = rx1.astype(jnp.int32)
+            ry2i = ry2.astype(jnp.int32)
+            rx2i = rx2.astype(jnp.int32)
+            sep = (
+                (y2 + margin < ry1i) |
+                (ry2i + margin < y1) |
+                (x2 + margin < rx1i) |
+                (rx2i + margin < x1)
+            )
+            return act & ~sep
+        flags = jax.vmap(per_room)(
+            rooms.y1, rooms.x1, rooms.y2, rooms.x2, active
+        )
+        return jnp.any(flags)
+
+    overlap_mask = jax.vmap(overlaps_any)(cand_y1, cand_x1)
+    is_valid = ~overlap_mask
+
+    # Pick the first valid candidate.  argmax on a bool returns the first
+    # True index (or 0 if none); we OR with any_valid to suppress action.
+    any_valid = jnp.any(is_valid)
+    pick_idx  = jnp.argmax(is_valid.astype(jnp.int32)).astype(jnp.int32)
+    vy1 = cand_y1[pick_idx]
+    vx1 = cand_x1[pick_idx]
+
+    should_place = gate & any_valid
+
+    # ---- Stamp 4 interior tiles ----------------------------------------------
+    # 2x2 interior at (vy1, vx1), (vy1, vx1+1), (vy1+1, vx1), (vy1+1, vx1+1).
+    def stamp(t, dy, dx):
+        r = vy1 + jnp.int32(dy)
+        c = vx1 + jnp.int32(dx)
+        return t.at[r, c].set(jnp.where(should_place, FLOOR, t[r, c]))
+
+    terrain_out = terrain
+    terrain_out = stamp(terrain_out, 0, 0)
+    terrain_out = stamp(terrain_out, 0, 1)
+    terrain_out = stamp(terrain_out, 1, 0)
+    terrain_out = stamp(terrain_out, 1, 1)
+
+    # ---- Teleport trap at the centre (top-left of interior is conventional) ---
+    # Vendor's makevtele() places the trap at the vault centre; the
+    # interior is 2x2 so any cell is the centre.  We use (vy1, vx1).
+    tele_gate = jax.random.randint(k_tele, (), 0, 3, dtype=jnp.int32) == jnp.int32(0)
+    place_trap = should_place & tele_gate
+    new_tt = traps.trap_type.at[flat_lv, vy1, vx1].set(
+        jnp.where(place_trap, TELEP_TRAP, traps.trap_type[flat_lv, vy1, vx1])
+    )
+
+    # ---- Record vault_pos -----------------------------------------------------
+    # FeaturesState.vault_pos is int16[num_levels, 2].
+    cur_vp = features.vault_pos[flat_lv]
+    new_vp_row = jnp.where(should_place, vy1.astype(jnp.int16), cur_vp[0])
+    new_vp_col = jnp.where(should_place, vx1.astype(jnp.int16), cur_vp[1])
+    new_vp = features.vault_pos.at[flat_lv].set(
+        jnp.stack([new_vp_row, new_vp_col]).astype(jnp.int16)
+    )
+
+    new_features = features.replace(vault_pos=new_vp)
+    new_traps    = traps.replace(trap_type=new_tt)
+    return terrain_out, new_features, new_traps
+
+
+# ---------------------------------------------------------------------------
 # TODO blocks
 # ---------------------------------------------------------------------------
 # Wave 4:
