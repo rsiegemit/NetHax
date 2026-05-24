@@ -1,8 +1,22 @@
 """Vendor-parity tests: cursed/blessed spellbook backfire.
 
-Cite: vendor/nethack/src/spell.c::study_book / cursed_book lines 130-185.
-Cursed: skip success roll, five-branch backfire, spell NOT learned.
-Blessed: +2 read_ability bonus over uncursed.
+Cite: vendor/nethack/src/spell.c::study_book lines 577-602 +
+      vendor/nethack/src/spell.c::cursed_book lines 130-185.
+
+  Cursed:   skip success roll; switch (rn2(oc_level)) over 7 vendor cases
+            (tele / aggravate / blind / take_gold / confuse / poison / explode),
+            spell NOT learned.
+  Blessed:  vendor line 577 short-circuits the failure roll entirely
+            (``if (!blessed && otyp != SPE_BOOK_OF_THE_DEAD)``).  Blessed books
+            always succeed — there is no separate "+N" read_ability bonus.
+
+REBALANCE NOTE: the pre-Wave-15 cursed model used a 5-branch
+``(rnd(20)-1)//4`` selector with invented branches {explode, paralyze,
+poison, amnesia, blank}.  Vendor has *seven* branches selected by
+``rn2(lev)``: {tele, aggravate, blind, take_gold, confuse, poison, explode}
+plus an unreachable rndcurse default.  Tests that depended on the old
+branch list have been rewritten to assert vendor behaviour, with each
+docstring noting the prior bug-pin.
 """
 import os
 
@@ -33,6 +47,7 @@ def _state_with_spellbook(
     player_xl: int = 5,
     player_role: int = 0,
     player_hp: int = 20,
+    player_gold: int = 100,
 ) -> tuple:
     """Return (state, slot_idx) with a spellbook in inventory slot 0."""
     rng = jax.random.PRNGKey(0)
@@ -46,6 +61,7 @@ def _state_with_spellbook(
         player_hp_max=jnp.int32(player_hp),
         player_pw=jnp.int32(50),
         player_pw_max=jnp.int32(50),
+        player_gold=jnp.int32(player_gold),
     )
     item = make_item(
         category=int(ItemCategory.SPBOOK),
@@ -84,77 +100,109 @@ def test_cursed_book_no_learn():
 
 
 def test_cursed_book_some_branch_triggers():
-    """Cursed spellbook triggers one of the five backfire branches across seeds.
+    """Cursed spellbook triggers some observable side-effect across seeds.
 
-    Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185 —
-    five-branch backfire: explode / paralyze / poison / amnesia / blank.
-    At least one non-blank branch should fire in 20 seeds.
+    REBALANCE: previously this test allowed {hp_changed, paralyzed, poisoned,
+    destroyed} as proxies — those were the 5-branch model's observables.
+    Vendor's 7-branch model has different observables, so we widen to cover
+    the vendor branches that are reachable for a level-7 book (CANCELLATION):
+
+      branch 0 (tele):      player_pos changes
+      branch 1 (aggravate): monster_ai.asleep set decreases  (skipped — no
+                                                              sleeping mons here)
+      branch 2 (blind):     BLIND timer goes positive
+      branch 3 (take_gold): player_gold drops
+      branch 4 (confuse):   CONFUSION timer goes positive
+      branch 5 (poison):    ATTRIBUTE_AWAY timer goes positive
+      branch 6 (explode):   hp drops AND book destroyed
+
+    Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
     """
-    spell_id = int(SpellId.HEALING)
-    initial_hp = 50
-    state, slot = _state_with_spellbook(
-        spell_id, buc_status=_BUC_CURSED, player_hp=initial_hp
+    # CANCELLATION = level 7 → rn2(7) ∈ [0,6] so every branch is hit.
+    spell_id = int(SpellId.CANCELLATION)
+    initial_hp = 60
+    initial_gold = 200
+    initial_pos_state, slot = _state_with_spellbook(
+        spell_id, buc_status=_BUC_CURSED,
+        player_hp=initial_hp, player_gold=initial_gold,
     )
+    pos_before = tuple(int(x) for x in initial_pos_state.player_pos)
 
     any_effect = False
-    for seed in range(20):
+    for seed in range(30):
         rng = jax.random.PRNGKey(seed)
-        new_state = read_spellbook(state, rng, slot)
-        hp_changed = int(new_state.player_hp) != initial_hp
-        paralyzed = int(new_state.status.timed_statuses[int(TimedStatus.FROZEN)]) > 0
-        poisoned = int(new_state.status.timed_statuses[int(TimedStatus.ATTRIBUTE_AWAY)]) > 0
-        destroyed = int(new_state.inventory.items.quantity[slot]) == 0
-        if hp_changed or paralyzed or poisoned or destroyed:
+        new_state = read_spellbook(initial_pos_state, rng, slot)
+
+        hp_changed   = int(new_state.player_hp) != initial_hp
+        blind_set    = int(new_state.status.timed_statuses[int(TimedStatus.BLIND)]) > 0
+        conf_set     = int(new_state.status.timed_statuses[int(TimedStatus.CONFUSION)]) > 0
+        attr_set     = int(new_state.status.timed_statuses[int(TimedStatus.ATTRIBUTE_AWAY)]) > 0
+        gold_dropped = int(new_state.player_gold) < initial_gold
+        destroyed    = int(new_state.inventory.items.quantity[slot]) == 0
+        pos_after    = tuple(int(x) for x in new_state.player_pos)
+        pos_changed  = pos_after != pos_before
+
+        if (hp_changed or blind_set or conf_set or attr_set
+                or gold_dropped or destroyed or pos_changed):
             any_effect = True
-    assert any_effect, "No cursed-book branch had any observable effect across 20 seeds"
+            break
+    assert any_effect, "No cursed-book vendor branch had any observable effect across 30 seeds"
 
 
 def test_cursed_book_damages():
-    """Cursed explode branch (rnd20 in 1-4) deals hp damage and destroys book.
+    """Cursed explode branch (vendor case 6) deals hp damage and destroys book.
 
-    Cite: vendor/nethack/src/spell.c::cursed_book line 176 —
-    book explodes in face; dmg = 2*rnd(10)+5; we model as rnd(20).
+    REBALANCE: explode used to be old-branch 0 (selected by rnd(20)∈[1,4]).
+    Vendor explode is case 6 (selected by rn2(lev) == 6, needing lev≥7).
+    Also: vendor damage is ``2*rnd(10)+5`` (= 7..25) without the old invented
+    ``+rnd(4)`` hand-burn.  Test now uses a level-7 spell and asserts the
+    vendor damage range.
+
+    Cite: vendor/nethack/src/spell.c::cursed_book lines 169-179.
     """
-    spell_id = int(SpellId.HEALING)
+    spell_id = int(SpellId.CANCELLATION)  # level 7
+    assert int(_SPELL_LEVELS[spell_id]) == 7
     initial_hp = 60
     state, slot = _state_with_spellbook(
         spell_id, buc_status=_BUC_CURSED, player_hp=initial_hp
     )
 
-    # Find a seed that hits the explode branch (b in 1-4 → branch index 0)
-    from Nethax.nethax.rng import rnd as nethax_rnd
+    # Find a seed that hits the explode branch (rn2(7) == 6).
+    from Nethax.nethax.rng import rn2 as nethax_rn2
     explode_seed = None
-    for seed in range(200):
+    for seed in range(1000):
         rng = jax.random.PRNGKey(seed)
-        rng, sub_b, *_ = jax.random.split(rng, 5)
-        b = int(nethax_rnd(sub_b, 20))
-        if (b - 1) // 4 == 0:
+        subs = jax.random.split(rng, 9)
+        if int(nethax_rn2(subs[0], 7)) == 6:
             explode_seed = seed
             break
 
-    assert explode_seed is not None, "No explode seed found in 200 tries"
+    assert explode_seed is not None, "No explode seed (rn2(7)==6) found in 1000 tries"
     rng = jax.random.PRNGKey(explode_seed)
     new_state = read_spellbook(state, rng, slot)
     hp_after = int(new_state.player_hp)
-    assert hp_after < initial_hp, (
-        f"Explode branch: hp {hp_after} should be < {initial_hp}"
+    hp_loss = initial_hp - hp_after
+    assert 7 <= hp_loss <= 25, (
+        f"Explode branch: hp loss {hp_loss} should be in [7, 25] (vendor 2*rnd(10)+5)"
     )
     assert int(new_state.inventory.items.quantity[slot]) == 0, (
         "Explode branch: book should be destroyed"
     )
 
 
-def test_blessed_book_higher_success():
-    """Blessed level-7 book has higher success rate than uncursed over 200 trials.
+def test_blessed_book_succeeds_more_than_uncursed():
+    """Blessed level-7 book always succeeds while uncursed sometimes fails.
 
-    Cite: vendor/nethack/src/spell.c::study_book ~lines 555-560 —
-    blessed book adds +2 to read_ability.
+    REBALANCE: previously this test ran ``blessed_rate > uncursed_rate - 0.05``
+    using the OLD "blessed = +2 read_ability" model.  Vendor blessed skips
+    the failure roll entirely (spell.c line 577), so the blessed rate is
+    ALWAYS 100% — much tighter than the old ±5% slack.
+
+    Cite: vendor/nethack/src/spell.c::study_book line 577 ``if (!blessed && ...)``.
     """
     spell_id = int(SpellId.CANCELLATION)  # level 7
     assert int(_SPELL_LEVELS[spell_id]) == 7
 
-    # INT=14, xl=5: uncursed read_ability = 14+4+2-14 = 6 → 30% success
-    #               blessed  read_ability = 6+2 = 8      → 40% success
     n_trials = 200
     blessed_successes = 0
     uncursed_successes = 0
@@ -187,11 +235,12 @@ def test_blessed_book_higher_success():
     blessed_rate = blessed_successes / n_trials
     uncursed_rate = uncursed_successes / n_trials
 
-    assert blessed_rate > uncursed_rate - 0.05, (
-        f"Blessed success rate {blessed_rate:.2%} should exceed uncursed "
-        f"{uncursed_rate:.2%} (minus 5% slack)"
+    # Blessed should be exactly 100% (no failure roll).
+    assert blessed_rate == 1.0, (
+        f"Blessed level-7 book success rate {blessed_rate:.2%} should be 100% "
+        f"(vendor spell.c:577 short-circuits the failure roll)."
     )
-    # Both rates should be non-zero for a meaningful level-7 test
-    assert blessed_rate > 0.10, (
-        f"Blessed rate {blessed_rate:.2%} too low — check formula"
+    # Uncursed at INT=14, xl=5, lev=7: read_ability = 14+4+2-14 = 6 → ~30%.
+    assert uncursed_rate < blessed_rate, (
+        f"Uncursed rate {uncursed_rate:.2%} should be < blessed {blessed_rate:.2%}"
     )

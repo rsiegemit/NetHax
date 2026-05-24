@@ -1,41 +1,56 @@
-"""Spellbook reading subsystem — study_book logic.
+"""Spellbook reading subsystem — study_book + cursed_book logic.
 
 Canonical sources:
-  vendor/nethack/src/spell.c::study_book  — learning chance, memory init
-  vendor/nethack/include/spell.h          — KEEN = 20000, SPELL_LEV_PW
-  vendor/nethack/include/objects.h        — SPELL() table (level, delay)
+  vendor/nethack/src/spell.c::study_book   — learning chance, memory init
+  vendor/nethack/src/spell.c::cursed_book  — 7-branch backfire (lines 130-185)
+  vendor/nethack/include/spell.h           — KEEN = 20000, SPELL_LEV_PW
+  vendor/nethack/include/objects.h         — SPELL() table (level, delay)
 
-Wave 8d implementation (vendor-probabilistic formula):
-  Vendor spell.c::study_book lines 582-599 (uncursed book path):
-    read_ability = ACURR(A_INT) + 4 + u.ulevel/2 - 2 * book_level
-    success if rnd(20) <= read_ability   (rnd(20) is 1..20)
+Vendor formula (spell.c::study_book lines 577-603):
+  if (!blessed && otyp != SPE_BOOK_OF_THE_DEAD):
+      if (cursed):       too_hard = TRUE      → cursed_book backfire
+      else:              read_ability = INT + 4 + xl/2 - 2*oc_level
+                                       + (lenses ? 2 : 0)
+                         if rnd(20) > read_ability: too_hard = TRUE
+  # blessed (and SPE_BOOK_OF_THE_DEAD) skip the failure roll entirely.
 
-  We use player_int for A_INT and player_xl for u.ulevel.
-  For Wizard role (role_id=12) we apply an additional +2 bonus matching
-  the lenses bonus range (wizard tends toward high INT giving naturally
-  higher read_ability; the +2 models the Wizard's studied comprehension
-  advantage — see vendor study_book:587-596 wizard-only early check).
+  We use player_int for A_INT and player_xl for u.ulevel.  For the Wizard
+  role (role_id=12) we apply an additional +_WIZARD_STUDY_BONUS to model
+  the wizard-only "too difficult?" early check (spell.c line 587).
 
   On success: spell_known[spell_id] = True, spell_memory = KEEN + 1
     (vendor incrnknow(i, 1); spell.c line 22 + lines 410/428)
-  On failure: no change (side effects like confusion/paralysis are Wave 4+)
+  On failure: no change.
 
-BUC handling (vendor spell.c::study_book / cursed_book lines 590-650):
-  CURSED  (buc_status == 1): skips success roll; five-branch backfire via
-    rnd(20) (1-4 explode, 5-8 paralyze, 9-12 poison, 13-16 amnesia,
-    17-20 blank), spell never learned.
-    Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
-  UNCURSED (buc_status == 2): standard formula (see above).
-  BLESSED  (buc_status == 3): +2 bonus to read_ability (vendor line ~555-560).
+Cursed-book backfire (vendor spell.c::cursed_book lines 130-185):
+  switch (rn2(lev))  where lev = objects[booktype].oc_level:
+    case 0  (line 137):  tele()                 — random teleport
+    case 1  (line 141):  aggravate()            — wake monsters on level
+    case 2  (line 145):  make_blinded(rn1(100, 250))
+    case 3  (line 148):  take_gold()            — leprechaun-style theft
+    case 4  (line 151):  make_confused(rn1(7, 16))
+    case 5  (line 155):  poison_strdmg(...)     — STR drain
+    case 6  (line 169):  dmg = 2*rnd(10) + 5    — explode (Antimagic→0)
+    default (line 180):  rndcurse()             — only fires for lev≥8 (never
+                                                  in vanilla NetHack; lev≤7).
 
-Wave 8d simplifications:
-  - Blank-book and novel detection: treated as unknown spell_id (-1) → no-op
+Wave-15+ simplifications and deferrals (audited):
+  - Lenses (spell.c line 584): not modelled — no worn-blindfold slot.
+  - Dull-book sleep (spell.c lines 474-494): deferred — vendor's "dull"
+    description is per-game-procedural; no Item field tracks it.
+  - MAX_SPELL_STUDY faded-book path (spell.c lines 401-411): deferred —
+    requires a per-Item `spestudied` counter that doesn't yet exist.
+  - Antimagic intrinsic: not yet modelled — treated as always FALSE so the
+    explode-branch Antimagic gate is a no-op (full damage applies).
+  - Multi-turn occupation (spell.c line 608 `nomul + set_occupation(learn)`):
+    deferred — nethax has no occupation primitive; we apply the full
+    study_book_delay() turn cost atomically on success.
 """
 
 import jax
 import jax.numpy as jnp
 
-from Nethax.nethax.rng import rnd, rn1
+from Nethax.nethax.rng import rnd, rn1, rn2
 from Nethax.nethax.subsystems.magic import (
     KEEN,
     MagicState,
@@ -62,8 +77,11 @@ _BUC_CURSED   = 1
 _BUC_UNCURSED = 2
 _BUC_BLESSED  = 3
 
-# Blessed spellbook bonus to read_ability (vendor spell.c study_book ~lines 555-560).
-_BLESSED_STUDY_BONUS = 2
+# Blessed books skip the failure roll entirely (vendor spell.c line 577:
+# ``if (!spellbook->blessed && spellbook->otyp != SPE_BOOK_OF_THE_DEAD)``);
+# there is no separate "+N" bonus.  Kept as a legacy alias = 0 so importers
+# that reference it (e.g. older tests) still resolve to a non-effect.
+_BLESSED_STUDY_BONUS = 0
 
 
 # ---------------------------------------------------------------------------
@@ -173,28 +191,217 @@ def study_success_chance(
 ) -> float:
     """Return success probability in [0.0, 1.0] for studying a spellbook.
 
-    Vendor formula (spell.c::study_book lines 582-599, uncursed path):
-        read_ability = INT + 4 + xl//2 - 2 * book_level
-        success iff rnd(20) <= read_ability   (rnd(20) in 1..20)
-        => success_chance = clamp(read_ability, 0, 20) / 20
+    Vendor formula (spell.c::study_book lines 577-602):
+        if (!blessed && otyp != SPE_BOOK_OF_THE_DEAD):
+            if (cursed) too_hard = TRUE   → backfire, chance 0.0
+            else read_ability = INT + 4 + xl//2 - 2*book_level
+                 success iff rnd(20) <= read_ability   (rnd(20) in 1..20)
+                 => chance = clamp(read_ability, 0, 20) / 20
+        else: blessed (or Book of the Dead) → automatic success, chance 1.0
 
-    Blessed (+2 to read_ability) and Wizard (+_WIZARD_STUDY_BONUS) modifiers
-    are applied before clamping.  Cursed books always return 0.0 (backfire).
+    Wizard (+_WIZARD_STUDY_BONUS) bonus is applied before clamping.
 
-    Cite: vendor/nethack/src/spell.c::study_book lines 590-650.
+    Cite: vendor/nethack/src/spell.c::study_book lines 577-602.
     This function is used outside JIT (e.g. for tests / host-side validation).
     """
-    # Cursed books always backfire — never learn (vendor lines 590-650).
+    # Cursed books always backfire — never learn (vendor lines 577-580).
     if buc_status == _BUC_CURSED:
         return 0.0
+    # Blessed books skip the failure roll entirely (vendor line 577).
+    if buc_status == _BUC_BLESSED:
+        return 1.0
     ra = player_int + 4 + player_xl // 2 - 2 * book_level
     if role_id == _ROLE_WIZARD:
         ra += _WIZARD_STUDY_BONUS
-    # Blessed: +2 bonus (vendor spell.c study_book ~lines 555-560).
-    if buc_status == _BUC_BLESSED:
-        ra += _BLESSED_STUDY_BONUS
     ra = max(0, min(ra, 20))
     return ra / 20.0
+
+
+# ---------------------------------------------------------------------------
+# Cursed-book backfire — 8-branch vendor switch
+# Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
+#
+# Vendor: switch (rn2(lev)) where lev = objects[booktype].oc_level (1..7).
+#   case 0   tele()                          rloc-style random teleport
+#   case 1   aggravate()                     wake all monsters on level
+#   case 2   make_blinded(rn1(100, 250))     250..349 turns of blindness
+#   case 3   take_gold()                     leprechaun-style gold theft
+#   case 4   make_confused(rn1(7, 16))       16..22 turns of confusion
+#   case 5   poison_strdmg → STR drain       1d4 STR drop (+/- res rolls)
+#   case 6   dmg = 2*rnd(10) + 5; book gone  Antimagic gates damage to 0
+#   default  rndcurse()                      vanilla unreachable (lev≤7)
+# ---------------------------------------------------------------------------
+
+# Antimagic gate: vendor spell.c:170 checks the Antimagic intrinsic.  Nethax
+# does not yet model that intrinsic (see items_potions.py:474, 483 — same
+# deferral note).  Treated as always FALSE so case 6 always inflicts damage.
+_PLAYER_HAS_ANTIMAGIC = False
+
+
+def _cursed_book_backfire(state, rng: jax.Array, slot_idx: int, book_level: int):
+    """Apply a cursed-book backfire effect (vendor cursed_book switch).
+
+    Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
+
+    ``book_level`` is the spell's ``oc_level`` (1..7).  Branch index is
+    ``rn2(book_level)``; with vanilla lev≤7 the default branch (rndcurse)
+    is structurally unreachable but kept in the switch for vendor parity.
+
+    All 8 branches return the same pytree shape so this is safe for both
+    eager and JIT execution.  The driver (:func:`read_spellbook`) extracts
+    spell_id / buc_status with Python ``int(...)`` so the outer scope is
+    not JIT-compiled today; the inner ``lax.switch`` keeps us compatible
+    with a future JIT lowering pass.
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus, _roll_rn1
+
+    # One RNG split for every branch's stochastic decisions.  We split into
+    # disjoint sub-keys so any branch can consume its own without reuse.
+    (rng_branch, sub_tele, sub_blind, sub_gold_amt, sub_gold_pos,
+     sub_confuse, sub_poison, sub_dmg, sub_curse) = jax.random.split(rng, 9)
+
+    lev = max(1, int(book_level))      # static; safe for lax.switch arity
+
+    def b0_teleport(s):
+        # vendor spell.c:139  tele();  — random teleport to a FLOOR tile.
+        # Cite: vendor/nethack/src/teleport.c::dotele (rloc-equivalent).
+        from Nethax.nethax.constants.tiles import TileType
+        br = s.dungeon.current_branch.astype(jnp.int32)
+        lv = s.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+        level_tiles = s.terrain[br, lv]                       # [H, W]
+        floor_mask = level_tiles == jnp.int8(int(TileType.FLOOR))
+        flat_mask = floor_mask.reshape(-1).astype(jnp.float32)
+        total = jnp.sum(flat_mask)
+        H, W = level_tiles.shape
+        has_floor = total > 0
+        probs = jnp.where(
+            has_floor,
+            flat_mask / jnp.maximum(total, jnp.float32(1.0)),
+            jnp.ones((H * W,), dtype=jnp.float32) / jnp.float32(H * W),
+        )
+        flat_idx = jax.random.choice(sub_tele, H * W, p=probs).astype(jnp.int32)
+        new_row = (flat_idx // W).astype(jnp.int16)
+        new_col = (flat_idx % W).astype(jnp.int16)
+        new_pos = jnp.stack([new_row, new_col])
+        out_pos = jnp.where(has_floor, new_pos, s.player_pos)
+        return s.replace(player_pos=out_pos)
+
+    def b1_aggravate(s):
+        # vendor spell.c:143  aggravate();  — wakes every monster on the
+        # current level.  Vendor scans fmon (all monsters); we approximate
+        # with wake_monsters_near using a level-spanning Chebyshev radius.
+        # Cite: vendor/nethack/src/wizard.c::aggravate lines 493-511.
+        from Nethax.nethax.subsystems.monster_ai import wake_monsters_near
+        return wake_monsters_near(s, s.player_pos, radius=999, petcall=False)
+
+    def b2_blind(s):
+        # vendor spell.c:146  make_blinded(BlindedTimeout + rn1(100, 250), TRUE);
+        # rn1(100, 250) → 250..349 turns added to current BLIND timer.
+        # Cite: vendor/nethack/src/spell.c::cursed_book line 146.
+        ts = s.status.timed_statuses
+        add = _roll_rn1(sub_blind, 100, 250)
+        new_blind = ts[int(TimedStatus.BLIND)] + add
+        new_ts = ts.at[int(TimedStatus.BLIND)].set(new_blind)
+        return s.replace(status=s.status.replace(timed_statuses=new_ts))
+
+    def b3_take_gold(s):
+        # vendor spell.c:149  take_gold();  — leprechaun-style theft.
+        # Vendor mhitu.c::take_gold steals min(igold, somegold(igold)).
+        # Cite: vendor/nethack/src/spell.c::cursed_book line 149.
+        gold = s.player_gold.astype(jnp.int32)
+        # Vendor somegold() bracketed rn1 ranges, mirroring
+        # monster_actions.py::_leprechaun_steal_gold (steal.c:14-34).
+        bracket_n = jnp.where(
+            gold < jnp.int32(50), jnp.int32(1),
+            jnp.where(gold < jnp.int32(100), gold - jnp.int32(25) + jnp.int32(1),
+            jnp.where(gold < jnp.int32(500), gold - jnp.int32(50) + jnp.int32(1),
+            jnp.where(gold < jnp.int32(1000), gold - jnp.int32(100) + jnp.int32(1),
+            jnp.where(gold < jnp.int32(5000), gold - jnp.int32(500) + jnp.int32(1),
+            jnp.where(gold < jnp.int32(10000), gold - jnp.int32(1000) + jnp.int32(1),
+                                                gold - jnp.int32(5000) + jnp.int32(1)))))),
+        )
+        bracket_x = jnp.where(
+            gold < jnp.int32(50), jnp.int32(0),
+            jnp.where(gold < jnp.int32(100), jnp.int32(25),
+            jnp.where(gold < jnp.int32(500), jnp.int32(50),
+            jnp.where(gold < jnp.int32(1000), jnp.int32(100),
+            jnp.where(gold < jnp.int32(5000), jnp.int32(500),
+            jnp.where(gold < jnp.int32(10000), jnp.int32(1000),
+                                                jnp.int32(5000)))))),
+        )
+        safe_n = jnp.maximum(bracket_n, jnp.int32(1))
+        rn2_roll = jax.random.randint(sub_gold_amt, (), 0, safe_n, dtype=jnp.int32)
+        rn1_result = (bracket_x + rn2_roll).astype(jnp.int32)
+        stolen = jnp.where(gold < jnp.int32(50), gold, rn1_result)
+        stolen = jnp.minimum(stolen, gold)
+        new_gold = jnp.maximum(gold - stolen, jnp.int32(0)).astype(jnp.int32)
+        return s.replace(player_gold=new_gold)
+
+    def b4_confuse(s):
+        # vendor spell.c:153  make_confused(HConfusion + rn1(7, 16), FALSE);
+        # rn1(7, 16) → 16..22 turns added to current CONFUSION timer.
+        # Cite: vendor/nethack/src/spell.c::cursed_book line 153.
+        ts = s.status.timed_statuses
+        add = _roll_rn1(sub_confuse, 7, 16)
+        new_conf = ts[int(TimedStatus.CONFUSION)] + add
+        new_ts = ts.at[int(TimedStatus.CONFUSION)].set(new_conf)
+        return s.replace(status=s.status.replace(timed_statuses=new_ts))
+
+    def b5_poison(s):
+        # vendor spell.c:164  poison_strdmg(rn1(2,1)|rn1(4,3), rnd(6|10), ...);
+        # STR is drained by 1d4 (we use 1) and ATTRIBUTE_AWAY is set so the
+        # drain re-applies via the existing attribute_away timeout machinery.
+        # Cite: vendor/nethack/src/spell.c::cursed_book lines 155-168.
+        ts = s.status.timed_statuses
+        new_attr = jnp.int32(10)
+        new_ts = ts.at[int(TimedStatus.ATTRIBUTE_AWAY)].set(new_attr)
+        # str -= rnd(2); floor at 3 to match vendor poison_strdmg semantics.
+        drain = rnd(sub_poison, 2)
+        new_str = jnp.maximum(
+            s.player_str - drain.astype(jnp.int16), jnp.int16(3)
+        ).astype(jnp.int16)
+        return s.replace(
+            player_str=new_str,
+            status=s.status.replace(timed_statuses=new_ts),
+        )
+
+    def b6_explode(s):
+        # vendor spell.c:169-179:
+        #     if (Antimagic) { pline("...unharmed!"); }
+        #     else {
+        #       dmg = 2 * rnd(10) + 5;
+        #       losehp(Maybe_Half_Phys(dmg), "exploding rune", KILLED_BY_AN);
+        #     }
+        #     return TRUE;  /* caller destroys the book */
+        # Antimagic intrinsic not yet modelled in nethax → always FALSE.
+        # Cite: vendor/nethack/src/spell.c::cursed_book lines 169-179.
+        dmg = jnp.int32(2) * rnd(sub_dmg, 10) + jnp.int32(5)
+        gated_dmg = jnp.where(_PLAYER_HAS_ANTIMAGIC, jnp.int32(0), dmg)
+        new_hp = jnp.maximum(s.player_hp - gated_dmg, jnp.int32(1))
+        # Book is destroyed (vendor return TRUE → useup(book) in study_book).
+        new_qty = s.inventory.items.quantity.at[slot_idx].set(jnp.int16(0))
+        new_items = s.inventory.items.replace(quantity=new_qty)
+        new_inv = s.inventory.replace(items=new_items)
+        return s.replace(player_hp=new_hp, inventory=new_inv)
+
+    def b_default(s):
+        # vendor spell.c:181  rndcurse();
+        # Cite: vendor/nethack/src/sit.c::rndcurse — flips one or more random
+        # inventory items toward cursed.  Reuses the shared scrolls helper.
+        from Nethax.nethax.subsystems.items_scrolls import rndcurse
+        return rndcurse(s, sub_curse)
+
+    branches = (
+        b0_teleport, b1_aggravate, b2_blind, b3_take_gold,
+        b4_confuse,  b5_poison,    b6_explode, b_default,
+    )
+
+    # Branch index = rn2(lev).  rn2_lev ∈ [0, lev); for lev≤7 the default
+    # branch (index 7) is unreachable, matching vendor (lev never ≥ 8).
+    # lax.switch clamps the index into [0, len(branches)-1], so an
+    # accidental lev=8 still selects the rndcurse default.
+    rn2_lev = rn2(rng_branch, lev).astype(jnp.int32)
+    return jax.lax.switch(rn2_lev, branches, state)
 
 
 def read_spellbook(state, rng: jax.Array, slot_idx: int):
@@ -205,18 +412,20 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
 
     Returns updated state.
 
-    BUC handling (vendor spell.c::study_book / cursed_book lines 590-650):
-      CURSED  (buc_status == 1): skips success roll; five-branch backfire
-        selected by rnd(20): 1-4 explode (damage+destroy), 5-8 paralyze,
-        9-12 poison (str-1), 13-16 amnesia (clear all spells), 17-20 blank.
+    BUC handling (vendor spell.c::study_book lines 577-603):
+      CURSED  (buc_status == 1): skips success roll, calls cursed_book()
+        which selects a backfire branch via ``switch (rn2(oc_level))``
+        — see :func:`_cursed_book_backfire` for the 8 vendor branches.
+        Spell is never learned on the cursed path.
         Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
       UNCURSED (buc_status == 2): standard formula (see below).
-      BLESSED  (buc_status == 3): +_BLESSED_STUDY_BONUS to read_ability.
+      BLESSED  (buc_status == 3): vendor short-circuits the failure check
+        entirely (spell.c line 577: ``!blessed && otyp != SPE_BOOK_OF_THE_DEAD``
+        gates the whole roll); blessed books always succeed.
 
     Vendor study check (spell.c::study_book lines 582-599, uncursed path):
         read_ability = INT + 4 + xl//2 - 2 * book_level
-        [+ _WIZARD_STUDY_BONUS for Wizard role]
-        [+ _BLESSED_STUDY_BONUS for blessed book]
+        [+ _WIZARD_STUDY_BONUS for Wizard role; spell.c line 587]
         roll = jax.random.randint in [1..20]
         success iff roll <= read_ability
 
@@ -248,114 +457,45 @@ def read_spellbook(state, rng: jax.Array, slot_idx: int):
     book_level = int(_SPELL_LEVELS[spell_id])
 
     # --- CURSED path (vendor spell.c::cursed_book lines 130-185) ---
-    # Five branches selected by rnd(20), grouped in blocks of 4:
-    #   1-4  explode: rnd(20) hp damage, book destroyed (quantity=0)
-    #   5-8  paralyze: FROZEN timer rn1(5,10) = 10..14 turns
-    #   9-12 poison: ATTRIBUTE_AWAY timer set, player_str decremented (min 3)
-    #   13-16 amnesia: all spell_known cleared
-    #   17-20 blank: no effect (turn wasted)
-    # Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
+    # Vendor: switch (rn2(lev)) where lev = objects[booktype].oc_level.
+    #   case 0   tele()                              [spell.c:137-140]
+    #   case 1   aggravate()                         [spell.c:141-144]
+    #   case 2   make_blinded(rn1(100, 250))         [spell.c:145-147]
+    #   case 3   take_gold()                         [spell.c:148-150]
+    #   case 4   make_confused(rn1(7, 16))           [spell.c:151-154]
+    #   case 5   poison_strdmg → STR drain           [spell.c:155-168]
+    #   case 6   explode dmg = 2*rnd(10)+5; book gone[spell.c:169-179]
+    #   default  rndcurse()                          [spell.c:180-182]
+    #            (unreachable for vanilla lev≤7)
     if buc_status == _BUC_CURSED:
-        rng, sub_b, sub_dmg, sub_par, _sub_pois, sub_burn, sub_drop = jax.random.split(rng, 7)
-
-        # rnd(20) in [1,20]; branch index = (b-1)//4 in [0,4]:
-        #   0=explode, 1=paralyze, 2=poison, 3=amnesia, 4=blank
-        # Cite: vendor/nethack/src/spell.c::cursed_book lines 130-185.
-        b = rnd(sub_b, 20)
-        branch = (b - jnp.int32(1)) // jnp.int32(4)  # [0,4]
-
-        is_explode  = branch == jnp.int32(0)
-        is_paralyze = branch == jnp.int32(1)
-        is_poison   = branch == jnp.int32(2)
-        is_amnesia  = branch == jnp.int32(3)
-
-        # --- Branch 0: explode — rnd(20) hp damage, destroy book, burn hands ---
-        # Vendor spell.c::cursed_book line 176: book explodes in face.
-        # Additional: 1d4 damage to hands from burning (spell.c:590-650 full table).
-        # Cite: vendor/nethack/src/spell.c::cursed_book lines 590-650.
-        explode_dmg = rnd(sub_dmg, 20)
-        burn_dmg    = rnd(sub_burn, 4)   # additional 1d4 hand burn
-        total_explode_dmg = explode_dmg + burn_dmg
-        new_hp = jnp.where(
-            is_explode,
-            jnp.maximum(state.player_hp - total_explode_dmg, jnp.int32(1)),
-            state.player_hp,
-        )
-        new_qty = jnp.where(
-            is_explode,
-            jnp.int16(0),
-            state.inventory.items.quantity[slot_idx],
-        ).astype(jnp.int16)
-        new_inventory_qty = state.inventory.items.quantity.at[slot_idx].set(new_qty)
-        new_items_stage = state.inventory.items.replace(quantity=new_inventory_qty)
-
-        # Explode also force-drops the wielded item (burned hands can't hold weapon).
-        # Cite: vendor/nethack/src/spell.c::cursed_book — item drop on explode branch.
-        cur_wielded = state.inventory.wielded.astype(jnp.int32)
-        new_wielded = jnp.where(is_explode, jnp.int8(-1), state.inventory.wielded)
-        new_inventory = state.inventory.replace(items=new_items_stage, wielded=new_wielded)
-
-        # --- Branch 1: paralyze — FROZEN timer rn1(5,10) = 10..14 turns ---
-        # Vendor spell.c::cursed_book (paralysis path).
-        par_turns = rn1(sub_par, 5, 10)
-        ts = state.status.timed_statuses
-        cur_frozen = ts[int(TimedStatus.FROZEN)]
-        new_frozen = jnp.where(is_paralyze, jnp.maximum(cur_frozen, par_turns), cur_frozen)
-
-        # --- Branch 2: poison — ATTRIBUTE_AWAY set, str -1 (min 3) ---
-        # Vendor spell.c::cursed_book line 164: poison_strdmg.
-        cur_attr = ts[int(TimedStatus.ATTRIBUTE_AWAY)]
-        new_attr = jnp.where(is_poison, jnp.int32(10), cur_attr)
-        new_str = jnp.where(
-            is_poison,
-            jnp.maximum(state.player_str - jnp.int16(1), jnp.int16(3)),
-            state.player_str,
-        ).astype(jnp.int16)
-
-        # --- Branch 3: amnesia — all spell_known cleared ---
-        new_known = jnp.where(
-            is_amnesia,
-            jnp.zeros_like(state.magic.spell_known),
-            state.magic.spell_known,
-        )
-
-        # Commit timed_statuses with all branch updates applied selectively.
-        new_ts = (
-            ts
-            .at[int(TimedStatus.FROZEN)].set(new_frozen)
-            .at[int(TimedStatus.ATTRIBUTE_AWAY)].set(new_attr)
-        )
-        new_status = state.status.replace(timed_statuses=new_ts)
-        new_magic  = state.magic.replace(spell_known=new_known)
-
-        return state.replace(
-            player_hp=new_hp,
-            player_str=new_str,
-            inventory=new_inventory,
-            status=new_status,
-            magic=new_magic,
-        )
+        return _cursed_book_backfire(state, rng, slot_idx, book_level)
 
     # --- UNCURSED / BLESSED path ---
-    player_int = int(state.player_int)
-    player_xl  = int(state.player_xl)
-    role_id    = int(state.player_role)
+    # Vendor (spell.c lines 577-602):
+    #   if (!blessed && otyp != SPE_BOOK_OF_THE_DEAD) {
+    #       if (cursed) too_hard = TRUE;             # handled above
+    #       else { read_ability = ... ; if (rnd(20) > read_ability) too_hard; }
+    #   }
+    # i.e. blessed books skip the failure roll entirely (always succeed).
+    # Cite: vendor/nethack/src/spell.c::study_book lines 577-602.
+    if buc_status != _BUC_BLESSED:
+        player_int = int(state.player_int)
+        player_xl  = int(state.player_xl)
+        role_id    = int(state.player_role)
 
-    # Vendor formula: read_ability = INT + 4 + xl//2 - 2*book_level
-    read_ability = player_int + 4 + player_xl // 2 - 2 * book_level
-    if role_id == _ROLE_WIZARD:
-        read_ability += _WIZARD_STUDY_BONUS
-    # Blessed bonus (vendor spell.c study_book ~lines 555-560)
-    if buc_status == _BUC_BLESSED:
-        read_ability += _BLESSED_STUDY_BONUS
-    read_ability = max(0, min(read_ability, 20))
+        # Vendor formula: read_ability = INT + 4 + xl//2 - 2*book_level
+        # (lenses +2 deferred — no worn-blindfold slot in nethax).
+        read_ability = player_int + 4 + player_xl // 2 - 2 * book_level
+        if role_id == _ROLE_WIZARD:
+            read_ability += _WIZARD_STUDY_BONUS
+        read_ability = max(0, min(read_ability, 20))
 
-    # Roll 1..20; success if roll <= read_ability.
-    rng, sub = jax.random.split(rng)
-    roll = int(jax.random.randint(sub, (), 1, 21))
+        # Roll 1..20; success if roll <= read_ability.
+        rng, sub = jax.random.split(rng)
+        roll = int(jax.random.randint(sub, (), 1, 21))
 
-    if roll > read_ability:
-        return state
+        if roll > read_ability:
+            return state
 
     # --- update MagicState ---
     # Vendor: study_book success calls ``incrnknow(i, 1)`` which sets
