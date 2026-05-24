@@ -656,19 +656,35 @@ def _trap_sqky_board(state, rng):
 
 
 def _trap_bear(state, rng):
-    """BEAR_TRAP — d(2,4)=2..8 damage + FROZEN rn1(4,4)=4..7 turns.
+    """BEAR_TRAP — d(2,4)=2..8 dmg + FROZEN rn1(4,4)=4..7 + WOUNDED_LEGS 10..19.
 
-    vendor/nethack/src/trap.c:1490 — ``int dmg = d(2, 4);``
-    vendor/nethack/src/trap.c:1506 — ``set_utrap((unsigned) rn1(4, 4), TT_BEARTRAP);``
-    rn1(4,4) = rn2(4)+4 = 4..7 turns (matches old impl: _d(rng,4)+3 = 4..7).
+    Wave 42b (Audit M #5): vendor also fires
+    ``set_wounded_legs(rn2(2) ? RIGHT_SIDE : LEFT_SIDE, rn1(10, 10))``
+    (10..19 turns) immediately after the iron-shoes check.
+
+    Audit M #6 (iron-shoes protection: ``wearing_iron_shoes`` skips both the
+    wounded-legs roll and the losehp call) and Audit M #7 (immunity for
+    amorphous / is_whirly / unsolid / msize <= MZ_SMALL polyforms) require
+    state plumbing that isn't yet exposed to traps (worn-armor slot type and
+    polyform body-tag tests), and are DEFERRED with citations.
+
+    Citations:
+      vendor/nethack/src/trap.c:1490         ``int dmg = d(2, 4);``
+      vendor/nethack/src/trap.c:1495-1505    (amorphous/whirly/unsolid/MZ_SMALL skips)
+      vendor/nethack/src/trap.c:1506         ``set_utrap((unsigned) rn1(4, 4), TT_BEARTRAP);``
+      vendor/nethack/src/trap.c:1517-1521    iron-shoes branch / set_wounded_legs
+    rn1(4,4) = rn2(4)+4 = 4..7 turns; rn1(10,10) = rn2(10)+10 = 10..19 turns.
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
-    k0, k1, k2 = jax.random.split(rng, 3)
+    k0, k1, k2, k3 = jax.random.split(rng, 4)
     # d(2,4) HP damage — losehp(Maybe_Half_Phys(dmg), "bear trap", ...).
     s = _apply_hp_damage(state, _d(k0, 4) + _d(k1, 4))
     # rn1(4,4) = rn2(4)+4 = 4..7 turns held.
     turns = _d(k2, 4) + jnp.int32(3)
-    return _set_timed_status(s, int(TimedStatus.FROZEN), turns)
+    s = _set_timed_status(s, int(TimedStatus.FROZEN), turns)
+    # Audit M #5 — rn1(10,10) = rn2(10)+10 = 10..19 turns of WOUNDED_LEGS.
+    leg_turns = _d(k3, 10) + jnp.int32(9)
+    return _set_timed_status(s, int(TimedStatus.WOUNDED_LEGS), leg_turns)
 
 
 def _trap_landmine(state, rng):
@@ -709,19 +725,53 @@ def _trap_sleep_gas(state, rng):
 
 
 def _trap_rust(state, rng):
-    """RUST_TRAP — decrement enchantment on the worn body-armor slot."""
-    inv = state.inventory
-    body_slot = inv.worn_armor[0]
-    has_armor = body_slot >= jnp.int8(0)
-    safe_idx = jnp.clip(body_slot.astype(jnp.int32), 0,
-                        inv.items.category.shape[0] - 1)
-    cur_ench = inv.items.enchantment[safe_idx]
-    new_ench = jnp.maximum(cur_ench - jnp.int8(1), jnp.int8(-3))
-    upd_ench = jnp.where(has_armor, new_ench, cur_ench)
-    new_items = inv.items.replace(
-        enchantment=inv.items.enchantment.at[safe_idx].set(upd_ench)
+    """RUST_TRAP — water-damage random worn slot; instant death as iron golem.
+
+    Wave 42b (Audit M #13, #14): vendor switches on ``rn2(5)`` (trap.c:1610-1644):
+      case 0 → uarmh
+      case 1 → uarms (shield) → uwep|uswapwep if two-handed → uarmg
+      case 2 → uwep + uarmg
+      default → splash-lit objects + (uarmc OR uarm OR uarmu)
+    Each branch calls ``water_damage`` which rusts/rots the targeted item.
+    Then (trap.c:1647-1651) if hero is polymorphed into PM_IRON_GOLEM (form
+    idx 267) the trap is instant lethal: ``losehp(u.mhmax)``.
+
+    Audit M #13 5-way switch: this implementation decrements enchantment on
+    the body-armor slot for every roll (a simplification — the full per-slot
+    targeting matrix requires worn_armor helm/shield/cloak/shirt plumbing
+    that traps doesn't yet have).  We keep the simplification but DOCUMENT
+    the vendor switch; tests rely only on body-armor enchantment dropping.
+
+    Audit M #14 (PM_IRON_GOLEM instant kill): wired here using the polymorph
+    state's current_form_idx field (iron golem = monster index 267 in our
+    constants/monster_entries/chunk5.py).
+    """
+    # Audit M #14 — iron-golem polyform: losehp(uhmax) = instant death.
+    is_iron_golem = (
+        state.polymorph.is_polymorphed
+        & (state.polymorph.current_form_idx == jnp.int16(267))
     )
-    return state.replace(inventory=inv.replace(items=new_items))
+
+    def _do_iron_golem_death(s):
+        # vendor trap.c:1648 ``int dam = u.mhmax; losehp(Maybe_Half_Phys(dam), "rusting away", ...)``
+        return s.replace(player_hp=jnp.int32(0))
+
+    def _do_normal_rust(s):
+        inv = s.inventory
+        body_slot = inv.worn_armor[0]
+        has_armor = body_slot >= jnp.int8(0)
+        safe_idx = jnp.clip(body_slot.astype(jnp.int32), 0,
+                            inv.items.category.shape[0] - 1)
+        cur_ench = inv.items.enchantment[safe_idx]
+        new_ench = jnp.maximum(cur_ench - jnp.int8(1), jnp.int8(-3))
+        upd_ench = jnp.where(has_armor, new_ench, cur_ench)
+        new_items = inv.items.replace(
+            enchantment=inv.items.enchantment.at[safe_idx].set(upd_ench)
+        )
+        return s.replace(inventory=inv.replace(items=new_items))
+
+    return jax.lax.cond(is_iron_golem, _do_iron_golem_death,
+                        _do_normal_rust, state)
 
 
 def _trap_fire(state, rng):
