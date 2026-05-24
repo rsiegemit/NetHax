@@ -932,14 +932,57 @@ def pathfind_step(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
 
     passable = terrain_ok & ~occ
 
+    # Wave 40b Item #9 partial: vendor mfndpos (mon.c:2140-2382) restricts
+    # diagonal moves under several conditions.  We model two of them in the
+    # BFS relaxation:
+    #   * NODIAG (vendor hack.h:1414 NODIAG(monnum) == PM_GRID_BUG): grid bugs
+    #     can't move diagonally.  Block ALL diagonal relaxations for the mover
+    #     when its species is grid bug.
+    #   * Diagonal squeeze: a diagonal step from (r,c) to (r+dy,c+dx) is
+    #     blocked if BOTH cardinal neighbors (r+dy,c) and (r,c+dx) are
+    #     impassable (e.g. two walls form a corner — vendor "bad_rock" /
+    #     diagonal door rules at mon.c:2245-2257).
+    # Full mfndpos rewrite (8-neighbor enumeration with per-tile info flags,
+    # OPENDOOR/UNLOCKDOOR/BUSTDOOR, mm_displacement, mon_knows_traps) is left
+    # as TODO — see Wave 40b Item #9 follow-up.
+    # Cite: vendor/nethack/src/mon.c::mfndpos lines 2140-2382;
+    #       vendor/nethack/include/hack.h:1414 NODIAG macro.
+    _PM_GRID_BUG_NAMES = ("grid bug",)
+    from Nethax.nethax.constants.monsters import MONSTERS as _MM
+    _grid_bug_entry = next(
+        (i for i, m in enumerate(_MM) if m.name in _PM_GRID_BUG_NAMES), -1,
+    )
+    nodiag = jnp.int32(_grid_bug_entry) == entry.astype(jnp.int32)
+
     def bfs_body(_k, dist_field):
-        # For each tile, min(dist[r,c], 1 + min over 8 neighbors).
         neigh_min = jnp.full_like(dist_field, INF)
         for dy, dx in offsets:
             shifted = shift_one(dist_field, dy, dx)
+            is_diag = (dy != 0) and (dx != 0)
+            if is_diag:
+                # NODIAG: drop diagonal contributions for grid bugs.
+                shifted = jnp.where(nodiag, INF, shifted)
+                # Diagonal squeeze: block if both orthogonal neighbors are
+                # impassable.  The diagonal move goes from (r-dy, c-dx) to
+                # (r, c); the orthogonals to check are (r-dy, c) and
+                # (r, c-dx).  Shift the passable mask by (dy, 0) and (0, dx)
+                # so that the value at (r, c) tells us whether the orthogonal
+                # neighbor (r-dy, c) / (r, c-dx) is passable.
+                orth_a = jnp.roll(passable, shift=(dy, 0), axis=(0, 1))
+                orth_b = jnp.roll(passable, shift=(0, dx), axis=(0, 1))
+                # Mask wrap rows/cols similar to shift_one.
+                if dy > 0:
+                    orth_a = orth_a.at[0:dy, :].set(jnp.bool_(False))
+                elif dy < 0:
+                    orth_a = orth_a.at[_MAP_H + dy:_MAP_H, :].set(jnp.bool_(False))
+                if dx > 0:
+                    orth_b = orth_b.at[:, 0:dx].set(jnp.bool_(False))
+                elif dx < 0:
+                    orth_b = orth_b.at[:, _MAP_W + dx:_MAP_W].set(jnp.bool_(False))
+                squeeze_ok = orth_a | orth_b
+                shifted = jnp.where(squeeze_ok, shifted, INF)
             neigh_min = jnp.minimum(neigh_min, shifted)
         candidate = neigh_min + jnp.int32(1)
-        # Only fill in if the tile is passable.
         candidate = jnp.where(passable, candidate, INF)
         return jnp.minimum(dist_field, candidate)
 
