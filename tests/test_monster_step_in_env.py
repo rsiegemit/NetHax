@@ -68,10 +68,17 @@ def _env_with_adjacent_monster(
     return env, state, rng
 
 
+@pytest.mark.timeout(300)
 def test_env_step_calls_monster_ai_step():
     """env.step should advance the monster: monster either moved closer or
     attacked the player (HP dropped). Either way, some monster-driven state
-    change occurs on a WAIT step."""
+    change occurs on a WAIT step.
+
+    Wave 40b expanded monster_ai with new bands/decay/balk/mattackm paths;
+    the cold env.step JIT compile now budgets ~150-200s.  Bumped from the
+    conftest 120s default per the established JIT-timeout polish pattern
+    (cite: commits ab9c839 / 9437b51).
+    """
     env, state, rng = _env_with_adjacent_monster(
         player_pos=(10, 10),
         monster_pos=(10, 12),  # 2 tiles away -> monster should move closer
@@ -97,9 +104,13 @@ def test_env_step_calls_monster_ai_step():
     )
 
 
+@pytest.mark.timeout(300)
 def test_monster_attacks_waiting_player():
     """Place a hostile monster adjacent to the player; after several WAIT
-    steps the player's HP should decrease (monster_ai.step is firing)."""
+    steps the player's HP should decrease (monster_ai.step is firing).
+
+    Same Wave 40b cold-JIT budget bump as ``test_env_step_calls_monster_ai_step``.
+    """
     env, state, rng = _env_with_adjacent_monster(
         player_pos=(10, 10),
         monster_pos=(10, 11),  # adjacent

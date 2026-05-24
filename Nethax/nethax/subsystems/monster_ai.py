@@ -3307,11 +3307,24 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     final_state, _ = jax.lax.scan(_body, state, (indices, turn_keys, can_act))
 
     # ---- Monster-vs-monster melee (mattackm) ----
-    # For each attacker slot i, find the first alive different-faction
-    # monster j > i that is Chebyshev-adjacent, then run a single
-    # mattackm(i → j) exchange.  This keeps the sweep O(N) JIT-traced ops
-    # rather than O(N²) (factions × position search are vectorised against
-    # the full slot table inside the scan body).
+    # Audit I partial: vendor mon.c::mm_aggression (lines 2422-2447) ONLY
+    # permits specific monster-vs-monster combat:
+    #   * Conflict (player intrinsic causes nearby monsters to brawl);
+    #   * specific opposing pairings (purple worm vs shrieker, zombie-maker
+    #     vs zombify-able species);
+    #   * a tame monster attacking a hostile via dog_move's own mfndpos +
+    #     ALLOW_M path (NOT through this sweep).
+    # The previous all-different-faction sweep had a peaceful unicorn and a
+    # pet fox brawl on sight, which never happens in vendor.
+    #
+    # As a strict improvement that still keeps mm-combat alive for the
+    # common cases tests cover, we now gate the SWEEP-initiated mm-strike
+    # to ``hostile attacker → non-hostile target`` only.  Pets initiate
+    # their own attacks through dog_move (already a separate code path);
+    # peacefuls don't initiate at all here.  Conflict-driven brawls and
+    # the special-pairing aggression remain documented future work.
+    # cite: vendor/nethack/src/mon.c::mm_aggression lines 2422-2447;
+    #       vendor/nethack/src/dogmove.c::dog_move attack-gate 1102-1144.
     def _strike_body(carry, args):
         i, key_i = args
         mi = carry.monster_ai
@@ -3336,15 +3349,22 @@ def monsters_step_all(state, rng: jax.Array) -> object:
                        jnp.where(is_peace_all, jnp.int32(1), jnp.int32(0)))
         # Attacker faction.
         a_faction = all_faction[i32]
-        diff_faction = all_faction != a_faction
+        # Audit I partial: only HOSTILE attackers initiate sweep strikes;
+        # targets must be NON-HOSTILE (pet or peaceful).  Hostile-vs-hostile
+        # of different alignment is intentionally blocked here (vendor
+        # mm_aggression doesn't permit it without Conflict / special pair).
+        is_hostile_atk    = a_faction == jnp.int32(0)
+        is_nonhostile_tgt = all_faction != jnp.int32(0)
 
         # Don't strike self.  Also restrict to slots > i so each pair is
         # only resolved once per tick.
         idx_arr = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
         pair_ok = idx_arr > i32
 
-        candidates = mi.alive & adj & diff_faction & pair_ok
-        has_target = jnp.any(candidates)
+        candidates = (
+            mi.alive & adj & is_nonhostile_tgt & pair_ok
+        )
+        has_target = jnp.any(candidates) & is_hostile_atk
         # argmax of bool returns first True (or 0 if none).
         j_idx = jnp.argmax(candidates).astype(jnp.int32)
 
