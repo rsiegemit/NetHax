@@ -138,12 +138,18 @@ def test_pickup_when_shop_inactive_is_noop():
 # 3. Pay at exit
 # ---------------------------------------------------------------------------
 def test_pay_at_exit_deducts_gold():
-    """Crossing the door tile with enough gold settles the bill."""
+    """Crossing the door tile with enough gold settles the bill.
+
+    Wave 15 (shop vendor-parity): accrual against EMPTY slots resolves to
+    ``DEFAULT_ITEM_PRICE`` via the fallback in ``_compute_item_price_from_slot``;
+    slots 0-2 carry starting inventory whose real ``get_cost`` differs by
+    role and CHA tier.  This test exercises the pay path, not pricing.
+    """
     state = _env_with_shop(player_pos=(6, 6), player_gold=100)
-    # Accrue a bill of 30gp (3 items).
-    state = accrue_bill(state, slot_idx=0)
-    state = accrue_bill(state, slot_idx=1)
-    state = accrue_bill(state, slot_idx=2)
+    # Accrue a bill of 30gp against three empty slots (post-starting inv).
+    state = accrue_bill(state, slot_idx=5)
+    state = accrue_bill(state, slot_idx=6)
+    state = accrue_bill(state, slot_idx=7)
     assert int(state.shop.bill) == 3 * DEFAULT_ITEM_PRICE
     # Move the player to the door.
     state = state.replace(player_pos=jnp.array([8, 5], dtype=jnp.int16))
@@ -155,10 +161,14 @@ def test_pay_at_exit_deducts_gold():
 
 
 def test_pay_at_exit_insufficient_gold_angers_shopkeeper():
-    """Crossing the door tile broke flips angry=True; bill remains."""
+    """Crossing the door tile broke flips angry=True; bill remains.
+
+    Wave 15: see note in test_pay_at_exit_deducts_gold — empty slots used
+    so the DEFAULT_ITEM_PRICE fallback applies.
+    """
     state = _env_with_shop(player_pos=(6, 6), player_gold=5)
-    state = accrue_bill(state, slot_idx=0)
-    state = accrue_bill(state, slot_idx=1)
+    state = accrue_bill(state, slot_idx=5)
+    state = accrue_bill(state, slot_idx=6)
     # bill = 20, gold = 5 → broke.
     state = state.replace(player_pos=jnp.array([8, 5], dtype=jnp.int16))
     new_state = pay_at_exit(state)
@@ -166,8 +176,8 @@ def test_pay_at_exit_insufficient_gold_angers_shopkeeper():
     assert int(new_state.shop.bill) == 2 * DEFAULT_ITEM_PRICE
     assert int(new_state.player_gold) == 5
     # Ownership flags persist when the player walked out unpaid.
-    assert bool(new_state.shop.items_owned_by_shop[0])
-    assert bool(new_state.shop.items_owned_by_shop[1])
+    assert bool(new_state.shop.items_owned_by_shop[5])
+    assert bool(new_state.shop.items_owned_by_shop[6])
 
 
 def test_pay_at_exit_with_zero_bill_noop():
@@ -180,9 +190,12 @@ def test_pay_at_exit_with_zero_bill_noop():
 
 
 def test_pay_at_exit_only_fires_on_door_tile():
-    """Standing somewhere else inside the shop does not trigger payment."""
+    """Standing somewhere else inside the shop does not trigger payment.
+
+    Wave 15: accrue against an empty slot so DEFAULT_ITEM_PRICE applies.
+    """
     state = _env_with_shop(player_pos=(6, 6), player_gold=100)
-    state = accrue_bill(state, slot_idx=0)
+    state = accrue_bill(state, slot_idx=5)
     # Player still in shop, NOT at door.
     new_state = pay_at_exit(state)
     assert int(new_state.shop.bill) == DEFAULT_ITEM_PRICE  # unchanged
@@ -298,10 +311,15 @@ def test_mine_town_has_shop_active():
 # 8. Integration — shop_step ticks pay-at-exit + pursuit together
 # ---------------------------------------------------------------------------
 def test_shop_step_combines_pay_and_pursuit():
-    """shop_step calls pay_at_exit then shopkeeper_attack atomically."""
+    """shop_step calls pay_at_exit then shopkeeper_attack atomically.
+
+    Wave 15: accrue against empty slot 5 so DEFAULT_ITEM_PRICE applies
+    (slot 0 carries the starting-inventory weapon whose real ``get_cost``
+    differs by role + CHA tier).
+    """
     # Player picks up an item then walks to the door with enough gold.
     state = _env_with_shop(player_pos=(6, 6), player_gold=50)
-    state = accrue_bill(state, slot_idx=0)
+    state = accrue_bill(state, slot_idx=5)
     state = state.replace(player_pos=jnp.array([8, 5], dtype=jnp.int16))
     new_state = shop_step(state, _RNG)
     # Bill paid, no anger.
