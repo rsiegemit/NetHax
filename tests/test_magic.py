@@ -20,6 +20,7 @@ import pytest
 from Nethax.nethax.state import EnvState, StaticParams
 from Nethax.nethax.subsystems.magic import (
     MagicState,
+    KEEN,
     MAX_SPELL_MEMORY,
     N_SPELLS,
     SpellId,
@@ -267,7 +268,16 @@ class TestReadSpellbook:
         )
 
     def test_read_spellbook_sets_max_memory(self):
-        """On successful read, spell_memory is set to MAX_SPELL_MEMORY."""
+        """On successful read, spell_memory is set to KEEN + 1.
+
+        Vendor: spell.c::study_book line 410 / 428 invokes
+        ``incrnknow(i, 1)``, which by the macro at spell.c:22
+        (``svs.spl_book[spell].sp_know = KEEN + (x)``) sets sp_know to
+        ``KEEN + 1`` = 20001.  The constant ``MAX_SPELL_MEMORY`` is the
+        bare-KEEN alias used for initial spell-grants (character.py
+        starting-spell init at character.py:910) where vendor uses
+        ``sp_know = KEEN`` (spell.c:1739, restore-from-save).
+        """
         state = self._state_with_spellbook(SpellId.HEALING, player_int=20)
 
         for seed in range(100):
@@ -277,7 +287,8 @@ class TestReadSpellbook:
                 break
 
         mem = int(new_state.magic.spell_memory[SpellId.HEALING])
-        assert mem == MAX_SPELL_MEMORY, f"spell_memory should be {MAX_SPELL_MEMORY}, got {mem}"
+        expected = KEEN + 1
+        assert mem == expected, f"spell_memory should be {expected} (KEEN+1, vendor spell.c:410), got {mem}"
 
     def test_read_spellbook_assigns_letter(self):
         """On successful read, spell_letter[spell_id] is set (>= 0)."""

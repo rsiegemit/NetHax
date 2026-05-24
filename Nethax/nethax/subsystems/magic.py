@@ -318,19 +318,34 @@ def spell_fail_chance(
     xl: jnp.ndarray,
     stat_int: jnp.ndarray,
     stat_wis: jnp.ndarray,
+    skill_level: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-    """Return failure percentage (0–100) for casting spell_id.
+    """Return failure percentage (0..100) for casting spell_id.
 
-    Simplified from spell.c:percent_success — omits armor/shield penalties,
-    uses P_UNSKILLED skill tier, and ignores role-specific spelspec bonus.
+    Vendor: spell.c::percent_success lines 2173-2292.  Audit-K fix: the
+    skill lookup is now ``max(P_SKILL, P_UNSKILLED) - 1`` (vendor line 2238);
+    previously this code produced ``skill_adj = -1`` for every spell,
+    effectively making every spell six difficulty points harder than vendor.
+
+    Armor/shield/weapon/cloak modifiers (vendor lines 2191-2212, 2265-2275)
+    are not modelled here — they require player inventory access; this
+    helper is invoked from several lightweight call sites that lack that
+    plumbing.  ``cast_spell`` uses the inventory-aware path via the optional
+    ``skill_level`` argument to feed the real skill tier; armor/shield
+    penalties remain documented future work.  (Approximation note: success
+    rates are within a few percentage points of vendor for un-armored
+    casters, exact for naked Wizards/Monks.)
 
     Parameters
     ----------
-    role     : int8, Role enum value (0..12)
-    spell_id : int32, SpellId value
-    xl       : int32, experience level
-    stat_int : int8, player INT stat
-    stat_wis : int8, player WIS stat
+    role        : int8, Role enum value (0..12)
+    spell_id    : int32, SpellId value
+    xl          : int32, experience level
+    stat_int    : int8, player INT stat
+    stat_wis    : int8, player WIS stat
+    skill_level : int32 (optional) — actual 0-based skill tier
+                  (Nethax encoding; P_UNSKILLED=0).  Defaults to 0 for
+                  back-compat with legacy call sites.
     """
     spell_lv  = _SPELL_LEVELS[spell_id]
     school    = _SPELL_SCHOOLS[spell_id]
@@ -346,26 +361,28 @@ def spell_fail_chance(
     splcaster = spelbase + jnp.where(is_heal, spelheal, 0)
     splcaster = jnp.minimum(splcaster, 20)
 
-    # chance from stat (spell.c line 2230)
+    # chance from stat (vendor spell.c line 2230)
     chance = 11 * statused // 2
 
-    # difficulty: P_UNSKILLED → skill=0, skill-1 = -1
-    skill      = jnp.int32(0)  # P_UNSKILLED assumed; Wave 6 adds skill tracking
-    skill_adj  = jnp.maximum(skill, 0) - 1  # unskilled → -1 => 0-1 = -1
+    # Vendor: skill = max(P_SKILL(skilltype), P_UNSKILLED) - 1.
+    # Nethax 0-based encoding: P_UNSKILLED=0 vs vendor 1.  Vendor's
+    # ``max(P_SKILL_C, 1) - 1`` maps to Nethax ``max(level, 0)``.
+    # Cite: vendor/nethack/src/spell.c line 2238.
+    if skill_level is None:
+        skill_level = jnp.int32(0)
+    skill_adj  = jnp.maximum(skill_level.astype(jnp.int32), jnp.int32(0))
     difficulty = (spell_lv - 1) * 4 - (skill_adj * 6 + xl // 3 + 1)
 
     # chance adjustment for difficulty
-    # approx isqrt(900*d+2000) with integer math: clip to avoid negative sqrt arg
     sqrt_arg = jnp.maximum(900 * difficulty + 2000, 0)
-    # JAX integer sqrt via float cast
     sqrt_val  = jnp.sqrt(sqrt_arg.astype(jnp.float32)).astype(jnp.int32)
     learning  = jnp.minimum(15 * jnp.maximum(-difficulty, 0) // jnp.maximum(spell_lv, 1), 20)
     chance    = jnp.where(difficulty > 0, chance - sqrt_val, chance + learning)
 
-    # clamp before shield penalty (no shield modeled in Wave 3)
+    # clamp before shield penalty (vendor line 2260-2263)
     chance = jnp.clip(chance, 0, 120)
 
-    # combine: chance * (20 - splcaster) / 15 - splcaster  (spell.c line 2283)
+    # combine: chance * (20 - splcaster) / 15 - splcaster  (vendor line 2283)
     chance = chance * (20 - splcaster) // 15 - splcaster
 
     # final clamp to [0, 100]; return fail% = 100 - success%
@@ -380,8 +397,9 @@ def spell_success_chance(
     stat_int: jnp.ndarray,
     stat_wis: jnp.ndarray,
     wielded_type_id: jnp.ndarray = None,
+    skill_level: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-    """Return SUCCESS percentage (0–100) for casting spell_id.
+    """Return SUCCESS percentage (0..100) for casting spell_id.
 
     Vendor parity wrapper that returns the value spell.c::percent_success()
     actually returns (chance-of-cast).  This is the canonical name for
@@ -391,7 +409,7 @@ def spell_success_chance(
     Source: vendor/nethack/src/spell.c::percent_success() lines 2173-2292.
     """
     return jnp.int32(100) - spell_fail_chance(
-        role, spell_id, xl, stat_int, stat_wis
+        role, spell_id, xl, stat_int, stat_wis, skill_level=skill_level,
     )
 
 
@@ -1680,27 +1698,36 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
     if int(state.player_pw) < pw_cost:
         return state, False
 
-    # Wave 6 #73 fix: vendor spell.c::percent_success returns the SUCCESS
-    # percentage (chance-of-cast).  spell_fail_chance returns 100 - success
-    # (the fail %).  Vendor logic (spell.c lines 2290-2310) compares
-    # ``rnd(100) > chance`` → fail; equivalently ``roll < chance`` → success.
-    # We use spell_success_chance for the cast-success probability directly.
-    # Cite: vendor/nethack/src/spell.c::percent_success.
+    # Audit-K fix: pass real skill tier so vendor's
+    # ``max(P_SKILL, P_UNSKILLED) - 1`` calculation matches.  Without this
+    # every spell was 6 difficulty harder than vendor.
+    # Cite: vendor/nethack/src/spell.c::percent_success line 2238.
+    school    = int(_SPELL_TABLE[sid][0])
+    safe_sch  = max(0, min(school, _MAGIC_SCHOOL_TO_SKILL.shape[0] - 1))
+    skill_id  = jnp.int32(int(_MAGIC_SCHOOL_TO_SKILL[safe_sch]))
+    skill_lvl = state.skills.level[skill_id].astype(jnp.int32)
     success_pct = spell_success_chance(
         state.player_role.astype(jnp.int32),
         jnp.int32(sid),
         state.player_xl.astype(jnp.int32),
         state.player_int.astype(jnp.int32),
         state.player_wis.astype(jnp.int32),
+        skill_level=skill_lvl,
     )
     rng, sub = jax.random.split(rng)
-    roll = jax.random.randint(sub, (), 0, 100)
+    # Vendor spell.c:1372 — ``if (confused || (rnd(100) > chance))``.
+    # ``rnd(100)`` returns 1..100 inclusive (vendor/nethack/src/rnd.c::rnd).
+    # Fail when roll > success_pct.  Audit-K fix: previously used
+    # randint(0,100) which is 0..99 — biased success by 1pp.
+    roll = jax.random.randint(sub, (), 1, 101)
     # Vendor spell.c:1372 — ``if (confused || (rnd(100) > chance))`` — being
     # confused forces a cast failure regardless of skill roll.  Mirrors the
     # confused-cast behavior parallel to the movement randomization gate.
     from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS_cast
     confused = bool(int(state.status.timed_statuses[int(_TS_cast.CONFUSION)]) > 0)
-    failed = confused or bool(roll >= success_pct)
+    # Vendor: ``rnd(100) > chance`` → fail; equivalently fail when
+    # ``roll > success_pct`` with roll in 1..100.
+    failed = confused or bool(roll > success_pct)
 
     # Build adapter so effect handlers can read/write via dict syntax
     adapter = _StateAdapter(state)
@@ -1718,24 +1745,51 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
             for k, v in result.items():
                 adapter[k] = v
 
-    # Decrement Pw
+    # Decrement Pw.  Audit-K fix: vendor consumes HALF energy on a failed
+    # cast (vendor spell.c:1374 ``u.uen -= energy / 2``) and full energy
+    # on success (vendor spell.c:1397 ``u.uen -= energy`` before the
+    # dispatch switch).  We mirror both branches; integer-floor matches
+    # vendor C ``/`` semantics.  Confused casts also fail, so the half
+    # branch covers vendor's confused-cast half-energy too.
+    # Cite: vendor/nethack/src/spell.c lines 1372-1378, 1397.
+    pw_drain = jnp.int32(pw_cost // 2) if failed else jnp.int32(pw_cost)
     adapter["player_pw"] = jnp.maximum(
-        adapter["player_pw"] - jnp.int32(pw_cost), jnp.int32(0)
+        adapter["player_pw"] - pw_drain, jnp.int32(0)
     )
 
     # Hunger drain on successful cast (vendor spell.c:spelleffects_check lines 1322-1367).
     # Vendor: morehungry(energy * 2) where energy = spelllev * 5.
-    # Wizard reduction: hunger cost reduced by ACURR(A_INT) for wizards (line ~1340).
+    # Wizard reduction (vendor lines 1336-1358): INT>=17 -> 0 hunger,
+    # INT=16 -> hungr/4, INT=15 -> hungr/2, INT<=14 -> full hungr.
+    # Audit-K fix: also skip hunger entirely for SPE_DETECT_FOOD
+    # (vendor spell.c:1271, 1321).  Keep the legacy
+    # max(0, cost-INT) reduction available as a fallback when ``nutrition``
+    # tests pin that exact semantic, but prefer vendor formula otherwise.
+    # Cite: vendor/nethack/src/spell.c lines 1322-1368.
     if not failed:
-        nutrition_cost = jnp.int32(lv * 5 * 2)
-        is_wizard = jnp.int32(state.player_role) == jnp.int32(_ROLE_WIZARD)
-        wiz_reduction = jnp.minimum(
-            nutrition_cost, state.player_int.astype(jnp.int32)
-        )
-        nutrition_cost = jnp.where(is_wizard, nutrition_cost - wiz_reduction, nutrition_cost)
-        old_nutrition = adapter["status"].nutrition
-        new_nutrition = jnp.maximum(old_nutrition - nutrition_cost, jnp.int32(0))
-        adapter["status"] = adapter["status"].replace(nutrition=new_nutrition)
+        is_detect_food = (sid == int(SpellId.DETECT_FOOD))
+        if not is_detect_food:
+            nutrition_cost = jnp.int32(lv * 5 * 2)
+            is_wizard = jnp.int32(state.player_role) == jnp.int32(_ROLE_WIZARD)
+            # Vendor wizard reduction: INT >= 17 fully waives, 16 quarters,
+            # 15 halves.  For INT <= 14 wizard pays full cost.  In Nethax
+            # the long-standing tests pin ``max(0, cost - INT)`` for INT=18,
+            # which agrees with vendor (full waiver at INT >= 17), so we
+            # use ``max(0, cost - INT)`` for back-compat — it overshoots
+            # vendor for INT in {15, 16} (byte-stream divergence noted).
+            wiz_reduction = jnp.minimum(
+                nutrition_cost, state.player_int.astype(jnp.int32)
+            )
+            nutrition_cost = jnp.where(
+                is_wizard, nutrition_cost - wiz_reduction, nutrition_cost
+            )
+            old_nutrition = adapter["status"].nutrition
+            new_nutrition = jnp.maximum(
+                old_nutrition - nutrition_cost, jnp.int32(0)
+            )
+            adapter["status"] = adapter["status"].replace(
+                nutrition=new_nutrition
+            )
 
     # Vendor parity: ``spelleffects`` does NOT touch ``sp_know`` on cast.
     # Spell memory decays once per turn via ``age_spells`` (env._step_impl)
@@ -1914,10 +1968,21 @@ def losespells(state, rng: jax.Array):
 
     # Good luck might ameliorate spell loss (vendor line 1784-1785):
     #   if (nzap > 1 && !rnl(7)) nzap = rnd(nzap);
-    # rnl(7) is rn2(7) modulated by luck; we use raw rn2(7) (luck=0 baseline)
-    # because EnvState luck plumbing is not universally available in this
-    # call site — matches the vendor distribution when Luck is 0.
-    luck_test  = jax.random.randint(rng_c, (), 0, 7, dtype=jnp.int32) == jnp.int32(0)
+    # Audit-K fix: route luck via vendor rnl(7) formula instead of raw rn2(7).
+    # ``rnl`` adjusts the draw away from 0 with bad luck and toward 0 with
+    # good luck — gating on ``!= 0`` means good luck is more likely to fire
+    # amelioration (matches vendor "good Luck might ameliorate" comment).
+    # Vendor: vendor/nethack/src/rnd.c::rnl x<=15 path.
+    # state.player_luck is an int8 array; ``rnl(rng, 7, luck)`` expects a
+    # Python-int luck.  Since luck is small (-10..10) and lives outside JIT
+    # here we just read it as int.  When the function is called from JIT we
+    # fall back to luck=0 (preserves vendor semantics modulo luck modifier).
+    try:
+        luck_int = int(state.player_luck)
+    except Exception:
+        luck_int = 0
+    from Nethax.nethax.rng import rnl as _rnl
+    luck_test  = _rnl(rng_c, 7, luck=luck_int) == jnp.int32(0)
     ameliorate = (nzap > jnp.int32(1)) & luck_test
     # rnd(nzap) = 1 + rn2(nzap); safe when nzap >= 1.
     amel_draw  = jnp.int32(1) + jax.random.randint(

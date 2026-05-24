@@ -74,19 +74,26 @@ def _with_known_spell(state: EnvState, spell_id: int, memory: int = KEEN):
 
 class TestPercentSuccess:
     def test_percent_success_wizard_int16_xl5_healing(self):
-        """Wizard (role=12), INT=16, XL=5, casting HEALING (lv1) → success% = 16.
+        """Wizard (role=12), INT=16, XL=5, casting HEALING (lv1) → success% = 100.
 
-        Hand-trace per spell.c::percent_success (lines 2173-2292):
-          splcaster = spelbase(0) + spelheal(1)   = 1   # HEALING is healing
-          splcaster = min(1, 20)                  = 1
+        Audit-K corrected hand-trace per spell.c::percent_success
+        (lines 2173-2292).  Vendor: ``skill = max(P_SKILL, P_UNSKILLED) - 1``
+        — for an *un*skilled Wizard P_SKILL == P_UNSKILLED == 1, so
+        ``skill - 1 == 0`` (not ``-1`` as the previous Nethax impl
+        produced).  In Nethax's 0-based encoding, ``skill_adj =
+        max(level, 0)`` likewise gives 0.
+
+          splcaster = spelbase(0) + spelheal(1)   = 1
           chance    = 11 * 16 / 2                 = 88
-          skill     = max(0, 0) - 1               = -1   # P_UNSKILLED
-          difficulty= (1-1)*4 - ((-1)*6 + 5/3 + 1)= 4
-          chance   -= isqrt(900*4 + 2000)
-                    = isqrt(5600)                 = 74
-          chance   -= 74                          = 14
-          chance    = 14 * (20-1) / 15 - 1
-                    = 266 / 15 - 1                = 17 - 1 = 16
+          skill_adj = max(0, 0)                   = 0
+          difficulty= (1-1)*4 - (0*6 + 5/3 + 1)   = -2
+          learning  = min(15*2/1, 20)             = 20
+          chance   += 20                          = 108
+          clamp [0,120]                           = 108
+          chance    = 108 * (20-1) / 15 - 1
+                    = 2052 / 15 - 1               = 136 - 1 = 135
+          clamp [0,100]                           = 100
+        Cite: vendor/nethack/src/spell.c line 2238.
         """
         s = spell_success_chance(
             jnp.int32(12),
@@ -95,7 +102,7 @@ class TestPercentSuccess:
             jnp.int8(16),
             jnp.int8(10),
         )
-        assert int(s) == 16, f"Expected 16% success, got {int(s)}%"
+        assert int(s) == 100, f"Expected 100% success, got {int(s)}%"
 
         # spell_fail_chance is the back-compat wrapper returning 100 - success.
         f = spell_fail_chance(
@@ -105,20 +112,22 @@ class TestPercentSuccess:
             jnp.int8(16),
             jnp.int8(10),
         )
-        assert int(f) == 84, f"Expected 84% fail, got {int(f)}%"
+        assert int(f) == 0, f"Expected 0% fail, got {int(f)}%"
 
     def test_percent_success_low_int_high_level_spell(self):
         """Caveman INT=8 XL=1 casting FINGER_OF_DEATH (lv 7) → success% = 0.
 
-        Hand-trace per spell.c::percent_success:
+        Audit-K corrected hand-trace per spell.c::percent_success:
           splcaster = spelbase(0)                 = 0   # not healing spell
           chance    = 11 * 8 / 2                  = 44
-          difficulty= (7-1)*4 - ((-1)*6 + 1/3 + 1)= 24 - (-5) = 29
-          chance   -= isqrt(900*29 + 2000)
-                    = isqrt(28100)                = 167
-          chance    = 44 - 167                    = -123 → clamp 0
+          skill_adj = max(0, 0)                   = 0
+          difficulty= (7-1)*4 - (0*6 + 1/3 + 1)   = 24 - 1 = 23
+          chance   -= isqrt(900*23 + 2000)
+                    = isqrt(22700)                = 150
+          chance    = 44 - 150                    = -106 → clamp 0
           chance    = 0 * 20/15 - 0               = 0
           → success% = 0   (cast nearly always fails)
+        Cite: vendor/nethack/src/spell.c line 2238.
         """
         s = spell_success_chance(
             jnp.int32(2),   # Caveman
@@ -159,23 +168,62 @@ class TestSpellPwCost:
         ],
     )
     def test_spell_pw_cost_level_n_equals_5n(self, spell_id, expected_level):
-        """Pw cost equals spell_level * 5 for every level (spell.h SPELL_LEV_PW)."""
+        """Pw cost equals spell_level * 5 on success (spell.h SPELL_LEV_PW).
+
+        Audit-K note: a failed cast drains only ``energy / 2`` Pw
+        (vendor spell.c:1374 ``u.uen -= energy / 2``), so we must
+        retry seeds until we observe a success to compare against the
+        full cost.
+        """
         lv = int(_SPELL_LEVELS[spell_id])
         assert lv == expected_level, (
             f"Spell {SpellId(spell_id).name} should be level {expected_level}, got {lv}"
         )
         expected_cost = expected_level * 5
+        half_cost     = expected_cost // 2  # vendor C int-div on failure
 
-        # Deduct Pw via cast_spell with a Wizard at high stats; check Pw delta.
         state = _base_state(player_pw=50, player_pw_max=50,
                             player_int=18, player_xl=30, player_role=12)
         state = _with_known_spell(state, spell_id)
+        # Bump every spell-school skill to P_EXPERT (= 3 in Nethax 0-based)
+        # so high-level spells can succeed, and so the full-cost branch is
+        # observable for the level-6/7 cases.
+        from Nethax.nethax.subsystems.skills import SkillId, SkillLevel
+        skills = state.skills
+        new_lv = skills.level
+        new_cap = skills.max_level
+        for sk in (
+            SkillId.ATTACK_SPELL, SkillId.HEALING_SPELL,
+            SkillId.DIVINATION_SPELL, SkillId.ENCHANTMENT_SPELL,
+            SkillId.CLERIC_SPELL, SkillId.ESCAPE_SPELL, SkillId.MATTER_SPELL,
+        ):
+            new_lv  = new_lv.at[int(sk)].set(jnp.int8(int(SkillLevel.P_EXPERT)))
+            new_cap = new_cap.at[int(sk)].set(jnp.int8(int(SkillLevel.P_EXPERT)))
+        state = state.replace(skills=skills.replace(level=new_lv, max_level=new_cap))
 
-        rng = jax.random.PRNGKey(7)
-        new_state, _ = cast_spell(state, rng, spell_id)
-        delta = int(state.player_pw) - int(new_state.player_pw)
-        assert delta == expected_cost, (
-            f"{SpellId(spell_id).name} should cost {expected_cost} Pw, deducted {delta}"
+        # Loop seeds: assert delta is either expected_cost (success) or
+        # half_cost (failure).  Require at least one observed success
+        # within the seed window to lock the full-cost branch.
+        observed_success = False
+        for seed in range(40):
+            rng = jax.random.PRNGKey(seed + 7)
+            new_state, success = cast_spell(state, rng, spell_id)
+            delta = int(state.player_pw) - int(new_state.player_pw)
+            if success:
+                observed_success = True
+                assert delta == expected_cost, (
+                    f"{SpellId(spell_id).name} success: expected {expected_cost} "
+                    f"Pw drain, got {delta}"
+                )
+                break
+            else:
+                assert delta == half_cost, (
+                    f"{SpellId(spell_id).name} failure: expected {half_cost} "
+                    f"Pw drain (energy/2), got {delta}"
+                )
+        assert observed_success, (
+            f"{SpellId(spell_id).name} never succeeded in 40 seeds — "
+            f"cannot verify full-cost branch"
         )
 
 
@@ -239,15 +287,14 @@ class TestSpellMemoryDecay:
 # ---------------------------------------------------------------------------
 
 class TestCastSpellSuccessRate:
-    def test_wizard_int16_xl5_force_bolt_succeeds_about_18_percent(self):
-        """Wizard INT=16 XL=5 casting FORCE_BOLT (lv 1): vendor success% = 18.
+    def test_wizard_int16_xl5_force_bolt_empirical_matches_vendor(self):
+        """Wizard INT=16 XL=5 casting FORCE_BOLT (lv 1): empirical rate matches.
 
-        Run 1000 trials and verify empirical success rate is within a wide
-        tolerance (±5 percentage points) of the vendor-computed success%.
+        Audit-K corrected vendor success%: with proper skill_adj=0 (not -1),
+        an un-armored Wizard at INT=16 XL=5 lands FORCE_BOLT every time
+        (success% = 100).  Verify empirical agreement over 200 trials.
 
-        Wave 6 #73: locks the cast-success semantics — vendor's
-        percent_success() returns chance-of-cast; ``rnd(100) > chance`` →
-        fail.  Cite: vendor/nethack/src/spell.c::percent_success.
+        Cite: vendor/nethack/src/spell.c::percent_success line 2238.
         """
         success_pct = int(spell_success_chance(
             jnp.int32(12),               # Wizard
@@ -256,11 +303,12 @@ class TestCastSpellSuccessRate:
             jnp.int8(16),
             jnp.int8(10),
         ))
-        assert 10 <= success_pct <= 30, (
-            f"Sanity: expected FORCE_BOLT success in [10..30]%, got {success_pct}%"
+        # Sanity bound — naked Wizard at xl=5 INT=16 should cast lv1 cleanly.
+        assert 80 <= success_pct <= 100, (
+            f"Sanity: expected FORCE_BOLT success in [80..100]%, got {success_pct}%"
         )
 
-        n_trials = 1000
+        n_trials = 200
         successes = 0
         for seed in range(n_trials):
             state = _base_state(player_pw=50, player_pw_max=50,
@@ -272,18 +320,18 @@ class TestCastSpellSuccessRate:
                 successes += 1
 
         empirical_pct = 100 * successes / n_trials
-        # ±5 pp tolerance over 1000 trials (std ~1.2 pp at p=0.18).
         assert abs(empirical_pct - success_pct) <= 5.0, (
             f"Empirical success rate {empirical_pct:.1f}% should be within "
             f"±5 pp of vendor success% = {success_pct}% ({successes}/{n_trials})"
         )
 
     def test_cast_spell_succeeds_at_vendor_success_rate(self):
-        """1000-trial empirical match for Wizard INT=16 XL=5 HEALING.
+        """Empirical match for Wizard INT=16 XL=5 HEALING.
 
-        Vendor percent_success for HEALING here = 16% (see
-        test_percent_success_wizard_int16_xl5_healing).  Cast must succeed
-        ~16% of the time.  Wave 6 #73 fix verification.
+        Audit-K corrected: vendor percent_success for HEALING here = 100%
+        once the skill_adj underflow bug is fixed.  Verify the cast
+        succeeds ~100% of the time over 200 trials.
+        Cite: vendor/nethack/src/spell.c::percent_success line 2238.
         """
         success_pct = int(spell_success_chance(
             jnp.int32(12),
@@ -292,9 +340,9 @@ class TestCastSpellSuccessRate:
             jnp.int8(16),
             jnp.int8(10),
         ))
-        assert success_pct == 16
+        assert success_pct == 100
 
-        n_trials = 1000
+        n_trials = 200
         successes = 0
         for seed in range(n_trials):
             state = _base_state(player_pw=50, player_pw_max=50,
