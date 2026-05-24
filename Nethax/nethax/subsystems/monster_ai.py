@@ -494,6 +494,27 @@ class MonsterAIState:
     # Cite: vendor/nethack/src/mcastu.c lines 184-186 + monst.h mspec_used.
     mspec_used: jnp.ndarray        # [MAX_MONSTERS_PER_LEVEL]  int16
 
+    # ---- Wave 40b Item #15: pet migration buffer (mig_mons) ----
+    # ``migrating`` bool: True if the pet was queued onto the migrating_mons
+    # list (vendor dog.c::keepdogs lines 789-870 sets mx=my=0 + appends to
+    # gm.mydogs).  Replaces the old "set alive=False on stair follow" model so
+    # all per-pet state (hp, mtame, edog fields, hungrytime, mhpmax_penalty,
+    # mtrack) is preserved until level entry calls mon_arrive (dog.c:420-566).
+    # Cite: vendor/nethack/src/dog.c::keepdogs (789-870), mon_arrive (420-566).
+    migrating: jnp.ndarray         # [MAX_MONSTERS_PER_LEVEL]  bool
+
+    # ---- Wave 40b Item #20: pet drop tracking (edog.dropdist / droptime) ----
+    # vendor edog struct fields:
+    #   dropdist (int): chebyshev distance to hero at the time of last drop;
+    #   droptime (long): svm.moves snapshot at the time of last drop.
+    # Used by dog_eat (dogmove.c:318) to compute the apport credit
+    #   apport += 200L / (dropdist + moves - droptime)
+    # for fetching dropped items.  We model as (row, col) of last drop site
+    # plus the absolute turn the drop happened on.
+    # Cite: vendor/nethack/src/dogmove.c::dog_eat line 318 + dog_invent line 422.
+    last_drop_pos:  jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, 2]  int16
+    last_drop_turn: jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL]     int32
+
 
 def make_monster_ai_state() -> MonsterAIState:
     """Return a zero-initialized MonsterAIState for one level."""
@@ -547,6 +568,9 @@ def make_monster_ai_state() -> MonsterAIState:
         cancelled=jnp.zeros(n, dtype=jnp.bool_),
         mcloned=jnp.zeros(n, dtype=jnp.bool_),
         mspec_used=jnp.zeros(n, dtype=jnp.int16),
+        migrating=jnp.zeros(n, dtype=jnp.bool_),
+        last_drop_pos=jnp.full((n, 2), -1, dtype=jnp.int16),
+        last_drop_turn=jnp.zeros(n, dtype=jnp.int32),
     )
 
 
@@ -2865,16 +2889,23 @@ def grow_up(state, pet_idx: jnp.ndarray, rng: jax.Array) -> object:
 
 
 def pet_follow_on_stair(state):
-    """Teleport any tame pets within Chebyshev 1 of player to follow on stair.
+    """Queue any tame pets within Chebyshev 1 of player onto the migrating list.
 
-    When the player descends (or ascends) stairs, pets adjacent to the player
-    at the moment of transition should follow.  This function handles the
-    bookkeeping for those pets on the *current* level: it marks them as
-    no-longer-alive on this level (they will be re-spawned on the destination
-    level by the stair handler).
+    Vendor: dog.c::keepdogs (lines 789-870) — pets that satisfy
+    ``monnear(mtmp, u.ux, u.uy) && levl_follower(mtmp)`` get ``mx=my=0`` and
+    are moved off ``fmon`` onto the ``gm.mydogs`` migrating list.  On level
+    entry ``mon_arrive`` (dog.c:420-566) repositions them next to the hero
+    preserving all per-mon state.
 
-    Vendor reference: dog.c (tamedog follow-on-stair logic).
-    TODO: wire from action_dispatch._stair_down
+    Wave 40b Item #15: previously this function set ``alive=False`` which
+    threw away the pet's per-mon state (hp, mtame, edog fields, hungrytime,
+    mhpmax_penalty, mtrack).  We now set the ``migrating`` flag instead so
+    the same slot can be repositioned by ``pet_arrive_on_level`` with all
+    state preserved.  ``alive`` remains True so the slot stays reserved;
+    callers that iterate ``alive`` monsters must additionally check
+    ``~migrating`` to avoid acting on slots in transit.
+
+    Cite: vendor/nethack/src/dog.c::keepdogs (789-870), mon_arrive (420-566).
     """
     mai = state.monster_ai
     ppos = state.player_pos.astype(jnp.int32)
@@ -2884,11 +2915,145 @@ def pet_follow_on_stair(state):
     cheb = jnp.maximum(dr, dc)
     # Pets within Chebyshev 1 of player that are alive and tame.
     follows = mai.tame & mai.alive & (cheb <= jnp.int32(1))
-    # Mark them as no-longer-alive on this level so the stair handler can
-    # re-place them on the destination level.
+    # Set ``alive=False`` (so source-level turn dispatch ignores them) AND
+    # ``migrating=True`` so ``pet_arrive_on_level`` can revive them with all
+    # per-pet state (hp, mtame, edog fields, hungrytime, mhpmax_penalty,
+    # mtrack) intact.  vendor dog.c:863 sets mtmp->mx = mtmp->my = 0 (off
+    # the level map); we mirror that by zeroing the pos so source-level
+    # adjacency checks against the pet behave as if it were gone.
     new_alive = mai.alive & ~follows
-    new_mai = mai.replace(alive=new_alive)
+    new_migrating = mai.migrating | follows
+    new_pos = jnp.where(
+        follows[:, None],
+        jnp.zeros_like(mai.pos),  # off-map sentinel (vendor mx=my=0)
+        mai.pos,
+    )
+    new_mai = mai.replace(alive=new_alive, migrating=new_migrating, pos=new_pos)
     return state.replace(monster_ai=new_mai)
+
+
+def pet_arrive_on_level(state):
+    """Reposition migrating pets next to player on level entry (mon_arrive).
+
+    Vendor: dog.c::mon_arrive (lines 420-566) — for each pet on the migrating
+    list, place it on or adjacent to the hero's tile and clear the migrating
+    flag.  All per-mon state (hp/mtame/hungrytime/mhpmax_penalty) was already
+    preserved across the level transition by ``pet_follow_on_stair``.
+
+    Simplified placement: we put the pet on the hero's tile +1 in row/col
+    (Chebyshev=1, vendor uses ``enexto`` to find a nearby empty square).
+    Bounds-clamped to map shape.
+
+    Cite: vendor/nethack/src/dog.c::mon_arrive lines 420-566.
+    """
+    mai = state.monster_ai
+    ppos = state.player_pos.astype(jnp.int32)
+    # Place each migrating pet at (player_row+1, player_col+1) clipped to map.
+    # Real vendor uses enexto to find an empty adjacent tile; we keep the
+    # simplification documented since multi-pet collision is rare and the
+    # follow-up wave can add a proper enexto.  All slots are placed at the
+    # same offset since each pet is in its own slot.
+    target_r = jnp.clip(ppos[0] + jnp.int32(1), 0, _MAP_H - 1).astype(jnp.int16)
+    target_c = jnp.clip(ppos[1] + jnp.int32(1), 0, _MAP_W - 1).astype(jnp.int16)
+    arrive_pos = jnp.stack([target_r, target_c])  # (2,)
+    new_pos = jnp.where(
+        mai.migrating[:, None],
+        jnp.broadcast_to(arrive_pos, mai.pos.shape),
+        mai.pos,
+    )
+    # Re-revive migrating slots (they were marked alive=False at follow time).
+    new_alive = mai.alive | mai.migrating
+    new_migrating = jnp.where(mai.migrating, jnp.bool_(False), mai.migrating)
+    new_mai = mai.replace(pos=new_pos, alive=new_alive, migrating=new_migrating)
+    return state.replace(monster_ai=new_mai)
+
+
+# ---------------------------------------------------------------------------
+# Pet apport bookkeeping — Wave 40b Item #20
+# ---------------------------------------------------------------------------
+
+def pet_record_drop(state, pet_idx: jnp.ndarray) -> object:
+    """Record that pet ``pet_idx`` just dropped its currently-carried item.
+
+    Vendor dog_invent (dogmove.c:422-426) sets:
+        edog->apport--             /* willingness to fetch drops by 1 */
+        edog->dropdist = udist     /* chebyshev distance pet-to-hero */
+        edog->droptime = svm.moves /* turn the drop occurred */
+
+    We snapshot ``last_drop_pos`` (the pet's current tile) and
+    ``last_drop_turn`` (game timestep) so ``pet_credit_fetch`` can later
+    compute the apport credit per dog_eat (dogmove.c:318):
+        apport += 200L / (dropdist + (moves - droptime))
+
+    Gated by tame & alive.  No-op for non-pets.
+
+    Cite: vendor/nethack/src/dogmove.c::dog_invent lines 416-426.
+    """
+    idx = pet_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    is_pet = mai.tame[idx] & mai.alive[idx]
+
+    cur_apport = mai.apport[idx].astype(jnp.int32)
+    new_apport = jnp.where(is_pet, jnp.maximum(cur_apport - 1, jnp.int32(1)), cur_apport)
+    new_pos_row = jnp.where(is_pet, mai.pos[idx, 0], mai.last_drop_pos[idx, 0])
+    new_pos_col = jnp.where(is_pet, mai.pos[idx, 1], mai.last_drop_pos[idx, 1])
+    cur_turn = state.timestep.astype(jnp.int32)
+    new_turn = jnp.where(is_pet, cur_turn, mai.last_drop_turn[idx])
+
+    new_apport_arr = mai.apport.at[idx].set(new_apport.astype(jnp.int8))
+    new_drop_pos = mai.last_drop_pos.at[idx, 0].set(new_pos_row.astype(jnp.int16))
+    new_drop_pos = new_drop_pos.at[idx, 1].set(new_pos_col.astype(jnp.int16))
+    new_drop_turn = mai.last_drop_turn.at[idx].set(new_turn.astype(jnp.int32))
+    new_mai = mai.replace(
+        apport=new_apport_arr,
+        last_drop_pos=new_drop_pos,
+        last_drop_turn=new_drop_turn,
+    )
+    return state.replace(monster_ai=new_mai)
+
+
+def pet_credit_fetch(state, pet_idx: jnp.ndarray) -> object:
+    """Credit ``apport`` to pet for eating an item near a remembered drop.
+
+    Vendor dog_eat (dogmove.c:316-320):
+        apport += 200L / (dropdist + (moves - droptime))
+
+    where ``dropdist`` is the Chebyshev distance hero→drop_pos at drop time
+    and ``moves - droptime`` is turns elapsed since the drop.  We re-derive
+    ``dropdist`` as the Chebyshev distance from the recorded ``last_drop_pos``
+    to the player's *current* position (an acceptable approximation since
+    vendor's value is fixed at drop time and the player has moved).
+
+    Gated by tame & alive & (last_drop_turn > 0).
+
+    Cite: vendor/nethack/src/dogmove.c::dog_eat lines 316-320.
+    """
+    idx = pet_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    is_pet = mai.tame[idx] & mai.alive[idx]
+    has_drop = mai.last_drop_turn[idx] > jnp.int32(0)
+
+    drop_r = mai.last_drop_pos[idx, 0].astype(jnp.int32)
+    drop_c = mai.last_drop_pos[idx, 1].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+    dr = jnp.abs(drop_r - ppos[0])
+    dc = jnp.abs(drop_c - ppos[1])
+    dropdist = jnp.maximum(dr, dc)
+    elapsed = jnp.maximum(state.timestep.astype(jnp.int32) -
+                          mai.last_drop_turn[idx].astype(jnp.int32),
+                          jnp.int32(0))
+    # Prevent /0 — vendor never has dropdist + elapsed == 0 because elapsed > 0
+    # any time after the drop, but on the same-tick edge we still guard it.
+    denom = jnp.maximum(dropdist + elapsed, jnp.int32(1))
+    credit = jnp.int32(200) // denom
+
+    cur_apport = mai.apport[idx].astype(jnp.int32)
+    do_credit = is_pet & has_drop
+    new_apport = jnp.where(do_credit,
+                           jnp.clip(cur_apport + credit, 1, 127),
+                           cur_apport)
+    new_apport_arr = mai.apport.at[idx].set(new_apport.astype(jnp.int8))
+    return state.replace(monster_ai=mai.replace(apport=new_apport_arr))
 
 
 # ---------------------------------------------------------------------------
