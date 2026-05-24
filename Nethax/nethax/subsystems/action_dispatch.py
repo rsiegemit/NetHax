@@ -1824,45 +1824,62 @@ def _handle_jump(state, rng):
 def _handle_untrap(state, rng):
     """#untrap — vendor/nethack/src/untrap.c::dountrap line 350.
 
-    Attempts to disarm an adjacent trap.  Vendor uses dex/role-based
-    chance + trap-specific quirks (e.g. dart/arrow traps deconstruct on
-    success; bear/web traps may snap).  Wave-44 minimum: scan the 8
-    adjacent tiles + the player's own tile; if any has a TT_* trap with
-    ``visible/known=True``, mark it removed (kind=0) with probability
-    rn2(100) < (3*dex + 25).  Matches vendor's chance formula at
-    untrap.c:520 (untrap_prob).
+    Attempts to disarm a trap on the player's tile or one of the 8
+    adjacent tiles.  Vendor uses dex-based chance + trap-specific
+    quirks; Wave-44 minimum: scan 3x3 around player_pos, find the
+    first revealed trap, and on success ``rn2(100) < min(3*dex+25, 99)``
+    clear its trap_type to NO_TRAP (= 0) and clear revealed.
 
     Cite: vendor/nethack/src/untrap.c::dountrap line 350;
           vendor/nethack/src/untrap.c::untrap_prob line 520.
     """
-    pos = state.player_pos
-    pr = pos[0].astype(jnp.int32)
-    pc = pos[1].astype(jnp.int32)
     traps = state.traps
-    # Find adjacent (Chebyshev<=1) known-trap with the smallest index.
-    tpos_r = traps.pos[:, 0].astype(jnp.int32)
-    tpos_c = traps.pos[:, 1].astype(jnp.int32)
-    d_row = jnp.abs(tpos_r - pr)
-    d_col = jnp.abs(tpos_c - pc)
-    adj = (d_row <= jnp.int32(1)) & (d_col <= jnp.int32(1))
-    active = traps.kind > jnp.int8(0)
-    known = traps.known.astype(jnp.bool_)
-    candidate = adj & active & known
-    first_idx = jnp.argmax(candidate).astype(jnp.int32)
-    any_target = jnp.any(candidate)
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    br = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    max_levels = jnp.int32(state.dungeon.stair_links.shape[1])
+    flat_lv = br * max_levels + lv
+
+    # Scan 3x3 around player; pick first revealed trap.
+    offsets = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
+    H = jnp.int32(traps.trap_type.shape[1])
+    W = jnp.int32(traps.trap_type.shape[2])
+
+    found_r = jnp.int32(-1)
+    found_c = jnp.int32(-1)
+    any_found = jnp.bool_(False)
+    for dr, dc in offsets:
+        r = pr + jnp.int32(dr)
+        c = pc + jnp.int32(dc)
+        in_b = (r >= 0) & (r < H) & (c >= 0) & (c < W)
+        sr = jnp.clip(r, 0, H - 1)
+        sc = jnp.clip(c, 0, W - 1)
+        ttype = traps.trap_type[flat_lv, sr, sc].astype(jnp.int32)
+        revealed = traps.revealed[flat_lv, sr, sc]
+        hit = in_b & revealed & (ttype > jnp.int32(0)) & ~any_found
+        found_r = jnp.where(hit, r, found_r)
+        found_c = jnp.where(hit, c, found_c)
+        any_found = any_found | hit
 
     dex = state.player_dex.astype(jnp.int32)
     chance = jnp.minimum(jnp.int32(3) * dex + jnp.int32(25), jnp.int32(99))
     roll = jax.random.randint(rng, (), 0, 100, dtype=jnp.int32)
-    success = any_target & (roll < chance)
+    success = any_found & (roll < chance)
 
-    new_kind = jnp.where(success,
-                         traps.kind.at[first_idx].set(jnp.int8(0)),
-                         traps.kind)
-    new_known = jnp.where(success,
-                          traps.known.at[first_idx].set(jnp.bool_(False)),
-                          traps.known)
-    return state.replace(traps=traps.replace(kind=new_kind, known=new_known))
+    sr = jnp.clip(found_r, 0, H - 1)
+    sc = jnp.clip(found_c, 0, W - 1)
+    new_tt = jnp.where(
+        success,
+        traps.trap_type.at[flat_lv, sr, sc].set(jnp.int8(0)),
+        traps.trap_type,
+    )
+    new_rev = jnp.where(
+        success,
+        traps.revealed.at[flat_lv, sr, sc].set(jnp.bool_(False)),
+        traps.revealed,
+    )
+    return state.replace(traps=traps.replace(trap_type=new_tt, revealed=new_rev))
 
 
 def _handle_twoweapon(state, rng):
