@@ -210,13 +210,13 @@ BRANCH_TABLE: Tuple[BranchInfo, ...] = (
 # rand == 0 ⇒ fixed; rand > 0 ⇒ rn1(rand, base) = rn2(rand) + base.
 _DUNGEON_NUM_LEVELS_VENDOR_SPEC: dict = {
     int(Branch.MAIN):          (25, 5),   # dungeon.def line 17
+    int(Branch.GEHENNOM):      (20, 5),   # dungeon.def line 51
+    int(Branch.ENDGAME):       (6, 0),    # dungeon.def line 134 (rand=0 ⇒ fixed)
     # Subsequent commits will populate:
-    # int(Branch.GEHENNOM):    (20, 5),  # dungeon.def line 51
     # int(Branch.GNOMISH_MINES):(8, 2),   # dungeon.def line 71
     # int(Branch.QUEST):       (5, 2),   # dungeon.def line 86
     # int(Branch.SOKOBAN):     (4, 0),   # dungeon.def line 94
     # int(Branch.VLAD):        (3, 0),   # dungeon.def line 116
-    # int(Branch.ENDGAME):     (6, 0),   # dungeon.def line 134
 }
 
 
