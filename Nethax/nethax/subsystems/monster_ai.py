@@ -2750,6 +2750,120 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
     return jax.lax.cond(is_pet, _pet_act, lambda s: s, state)
 
 
+# ---------------------------------------------------------------------------
+# Pet untaming helpers — Wave 40b Item #21
+# ---------------------------------------------------------------------------
+#
+# Vendor-cite: dog.c::abuse_dog (lines 1023-1065) decrements mtame whenever the
+# master damages their pet (uhitm.c master-melee path) and when sufficient
+# abuse occurs the pet reverts to peaceful/hostile (mtame=0, mpeaceful=0).
+# Combat / shop callers (which we can't touch this wave) will invoke these
+# public helpers; we expose pure JIT-friendly entry points here so they can be
+# wired in later waves without further state-shape changes.
+
+def decrement_mtame(state, pet_idx: jnp.ndarray) -> object:
+    """Decrement ``mtame`` for pet at ``pet_idx`` by 1 (vendor abuse_dog).
+
+    Pet remains tame unless mtame is then untamed via ``untame_on_threshold``.
+    Safe to call on non-pet slots: gated by ``tame & alive``.
+
+    Cite: vendor/nethack/src/dog.c::abuse_dog lines 1023-1065.
+    """
+    idx = pet_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    is_pet = mai.tame[idx] & mai.alive[idx]
+    cur = mai.mtame[idx].astype(jnp.int32)
+    new_val = jnp.where(is_pet, jnp.maximum(cur - 1, jnp.int32(0)), cur).astype(jnp.int8)
+    new_mtame = mai.mtame.at[idx].set(new_val)
+    return state.replace(monster_ai=mai.replace(mtame=new_mtame))
+
+
+def untame_on_threshold(state, pet_idx: jnp.ndarray) -> object:
+    """If pet's mtame reached 0, untame it (tame=False, peaceful=False).
+
+    Vendor: dog.c::abuse_dog sets mtame=0/mpeaceful=0 when abuse counter
+    exhausts the tame value.  We split this from ``decrement_mtame`` so
+    callers can decrement multiple times before checking the threshold.
+
+    Cite: vendor/nethack/src/dog.c::abuse_dog (mtame == 0 → revert).
+    """
+    idx = pet_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    is_pet  = mai.tame[idx] & mai.alive[idx]
+    at_zero = mai.mtame[idx] == jnp.int8(0)
+    revert  = is_pet & at_zero
+    new_tame     = mai.tame.at[idx].set(jnp.where(revert, jnp.bool_(False), mai.tame[idx]))
+    new_peaceful = mai.peaceful.at[idx].set(jnp.where(revert, jnp.bool_(False), mai.peaceful[idx]))
+    new_mai = mai.replace(tame=new_tame, peaceful=new_peaceful)
+    return state.replace(monster_ai=new_mai)
+
+
+# ---------------------------------------------------------------------------
+# Pet experience / leveling — Wave 40b Item #22
+# ---------------------------------------------------------------------------
+
+def grow_up(state, pet_idx: jnp.ndarray, rng: jax.Array) -> object:
+    """Grow up a pet when its ``mon_xp`` exceeds the level threshold.
+
+    Vendor logic (makemon.c::grow_up lines 2051-2140): on monster kill the
+    pet bumps ``mhpmax`` by ``rnd(victim_lev + 1)`` and gains a level if
+    ``mhpmax > m_lev * 8``.
+
+    Simplification for JIT-safe parity: we use the accumulated ``mon_xp``
+    counter as the level threshold proxy (kill xp is added at attack time
+    in ``pet_move._attack_hostile``).  When ``mon_xp >= mhpmax`` (vendor
+    ``mhpmax > hp_threshold = m_lev*8`` after the kill bumps it), gain a
+    level — increment a synthetic ``m_lev``-equivalent and bump ``hp_max``
+    by ``rnd(8)`` (vendor's default cur_increase upper bound when there is
+    no victim).
+
+    Since we don't store a separate ``m_lev`` field (level is read from
+    MONSTERS table), we just bump ``hp_max`` and reset ``mon_xp`` on level
+    gain.  Pets gain HP and the threshold rises.
+
+    Gated by ``tame & alive``.
+
+    Cite: vendor/nethack/src/makemon.c::grow_up lines 2051-2140.
+    """
+    idx = pet_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    is_pet = mai.tame[idx] & mai.alive[idx]
+
+    # Level threshold proxy: monster table level * 8 (vendor m_lev*8).
+    entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0,
+                     _MONSTER_LEVEL_TABLE.shape[0] - 1)
+    base_lev = _MONSTER_LEVEL_TABLE[entry].astype(jnp.int32)
+    # Synthetic per-pet level = base + (hp_max - base*8)//8, floored at base.
+    effective_lev = jnp.maximum(
+        base_lev,
+        mai.hp_max[idx].astype(jnp.int32) // jnp.int32(8),
+    )
+    threshold = effective_lev * jnp.int32(8)
+    xp = mai.mon_xp[idx].astype(jnp.int32)
+
+    will_grow = is_pet & (xp >= threshold)
+
+    # vendor rnd(8) for cur_increase / max_increase when no victim ptr.
+    hp_bump = jax.random.randint(rng, (), 1, 9, dtype=jnp.int32)
+
+    new_hp_max = jnp.where(
+        will_grow, mai.hp_max[idx].astype(jnp.int32) + hp_bump,
+        mai.hp_max[idx].astype(jnp.int32),
+    ).astype(mai.hp_max.dtype)
+    new_hp = jnp.where(
+        will_grow, mai.hp[idx].astype(jnp.int32) + hp_bump,
+        mai.hp[idx].astype(jnp.int32),
+    ).astype(mai.hp.dtype)
+    new_xp = jnp.where(will_grow, xp - threshold, xp).astype(mai.mon_xp.dtype)
+
+    new_mai = mai.replace(
+        hp_max=mai.hp_max.at[idx].set(new_hp_max),
+        hp=mai.hp.at[idx].set(new_hp),
+        mon_xp=mai.mon_xp.at[idx].set(new_xp),
+    )
+    return state.replace(monster_ai=new_mai)
+
+
 def pet_follow_on_stair(state):
     """Teleport any tame pets within Chebyshev 1 of player to follow on stair.
 
@@ -3265,25 +3379,52 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     """
     mai = state.monster_ai
 
-    # ---- Speed-energy accumulation (vendor monmove.c:1731) ----
+    # ---- Speed-energy accumulation (vendor mon.c::mcalcmove lines 1126-1167) ----
+    # Vendor piecewise speed adjust:
+    #   MSLOW (speed_mod<0):
+    #     mmove < NORMAL_SPEED → (2*mmove + 1) / 3
+    #     mmove >= NORMAL_SPEED → 4 + mmove/3
+    #   MFAST (speed_mod>0):
+    #     mmove = (4*mmove + 2) / 3
+    # Then stochastic rounding to NORMAL_SPEED multiples:
+    #     mmove_adj = mmove % NORMAL_SPEED
+    #     mmove -= mmove_adj
+    #     if rn2(NORMAL_SPEED) < mmove_adj: mmove += NORMAL_SPEED
+    # Cite: vendor/nethack/src/mon.c::mcalcmove lines 1126-1167.
     safe_entry = jnp.clip(
         mai.entry_idx.astype(jnp.int32),
         0, _MONSTER_MOVE_SPEED_TABLE.shape[0] - 1,
     )
     base_speed = _MONSTER_MOVE_SPEED_TABLE[safe_entry].astype(jnp.int32)
     smod = mai.speed_mod.astype(jnp.int32)
-    # Vendor WAN_SLOW halves effective speed; WAN_SPEED bumps by 1.5×.
-    # Use integer math to stay JIT-pure: multiply by (1,2,3) then divide by 2.
-    factor_num = jnp.where(smod < 0, jnp.int32(1),
-                  jnp.where(smod > 0, jnp.int32(3), jnp.int32(2)))
-    factor_den = jnp.int32(2)
-    add_points = (base_speed * factor_num) // factor_den
-    add_points = jnp.where(mai.alive, add_points, jnp.int32(0))
+    NS = jnp.int32(_MOVEMENT_THRESHOLD)  # NORMAL_SPEED = 12
+
+    # MSLOW piecewise
+    slow_lo = (2 * base_speed + 1) // jnp.int32(3)
+    slow_hi = jnp.int32(4) + base_speed // jnp.int32(3)
+    mslow_speed = jnp.where(base_speed < NS, slow_lo, slow_hi)
+    # MFAST formula
+    mfast_speed = (4 * base_speed + 2) // jnp.int32(3)
+    # Apply piecewise based on smod sign
+    pre_round = jnp.where(smod < 0, mslow_speed,
+                  jnp.where(smod > 0, mfast_speed, base_speed))
+
+    # Stochastic rounding to NORMAL_SPEED multiples (vendor rn2(NORMAL_SPEED)).
+    # Threefry-safe: derive a per-slot rounding key from rng before slot keys split.
+    rng, round_key = jax.random.split(rng)
+    round_keys = jax.random.split(round_key, MAX_MONSTERS_PER_LEVEL)
+    # rn2(NORMAL_SPEED) per slot.
+    rn_vals = jax.vmap(lambda k: jax.random.randint(k, (), 0, NS, dtype=jnp.int32))(round_keys)
+    mmove_adj = pre_round % NS
+    mmove_floored = pre_round - mmove_adj
+    rounded = mmove_floored + jnp.where(rn_vals < mmove_adj, NS, jnp.int32(0))
+
+    add_points = jnp.where(mai.alive, rounded, jnp.int32(0))
     new_acc = mai.movement_points.astype(jnp.int32) + add_points
 
-    can_act = new_acc >= jnp.int32(_MOVEMENT_THRESHOLD)
+    can_act = new_acc >= NS
     # Deduct threshold on action.
-    post_acc = jnp.where(can_act, new_acc - jnp.int32(_MOVEMENT_THRESHOLD), new_acc)
+    post_acc = jnp.where(can_act, new_acc - NS, new_acc)
     new_mp = jnp.clip(post_acc, 0, 32000).astype(jnp.int16)
 
     mai = mai.replace(movement_points=new_mp)
