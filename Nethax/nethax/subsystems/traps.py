@@ -1354,15 +1354,37 @@ def _trap_poly(state, rng):
     tile's object list and then polymorphs the victim that triggered the
     trap.  Wave 5 Phase 4 wires both branches; conduct flags
     POLYPILELESS / POLYSELFLESS are each set in their respective helper.
+
+    Audit M #39: vendor trap.c:2486-2490 short-circuits the player
+    polymorph when the victim has ``Antimagic`` or ``Unchanging`` —
+    prints "You feel momentarily different" and skips polyself.  The
+    pile branch still fires (item poly is independent of magic-resist).
     """
     from Nethax.nethax.subsystems.polymorph import poly_trap_effect
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _PolyIntr
+
     rng_pile, rng_self = jax.random.split(rng)
-    # Pile branch first so the item polymorph is applied before player poly
-    # has a chance to change inventory wiring.
+    # Pile branch first (independent of Antimagic / Unchanging).
     new_state = poly_pile_effect(
         state, rng_pile, state.player_pos[0], state.player_pos[1]
     )
-    return poly_trap_effect(new_state, rng_self)
+
+    # Audit M #39 short-circuit: Antimagic (Nethax: MAGIC_RESIST) OR
+    # Unchanging blocks the player polymorph.  Vendor prints "You feel
+    # momentarily different" and skips polyself.  The pile branch already
+    # fired above (poly_pile is independent of magic-resist).
+    # Cite: vendor/nethack/src/trap.c lines 2486-2490.
+    intrinsics = new_state.status.intrinsics
+    has_antimagic  = intrinsics[int(_PolyIntr.MAGIC_RESIST)]
+    has_unchanging = intrinsics[int(_PolyIntr.UNCHANGING)]
+    block_poly = has_antimagic | has_unchanging
+
+    return jax.lax.cond(
+        block_poly,
+        lambda s: s,
+        lambda s: poly_trap_effect(s, rng_self),
+        new_state,
+    )
 
 
 def _trap_vibrating_square(state, rng):
