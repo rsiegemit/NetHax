@@ -120,6 +120,42 @@ SHOPKEEPER_ANGRY_DAMAGE: int = 8
 
 
 # ---------------------------------------------------------------------------
+# Shopkeeper class variants (Wave-45d)
+# ---------------------------------------------------------------------------
+# Vendor distinguishes between several shopkeeper-class actors that share the
+# core ``eshk``/billing scaffolding but diverge in pricing / transaction rules:
+#   - GENERIC: standard shtypes[] vendors (shk.c).
+#   - CROESUS: Fort Ludios shopkeeper-like NPC (vendor monst.c PM_CROESUS
+#     definition; vendor include/monsters.h:2869 — CROESUS entry).  Treated as
+#     a shopkeeper for pathfinding/dialogue, but holds no bill.
+#   - VAULT_KEEPER: vault guard (vendor vault.c, PM_GUARD).  Gold-only
+#     "transaction": demands a fixed extortion amount and leads the player to
+#     the door if they refuse / cannot pay.  See vault.c::vault_gd_watching
+#     (line 1278) and the umoney handshake around vault.c:551-584.
+#   - ALIGNED_PRIEST: temple priest (vendor priest.c) — charges 2x base price
+#     to misaligned customers; see priest.c::histemple_at / temple_occupied.
+class ShopkeeperKind:
+    GENERIC: int = 0
+    CROESUS: int = 1
+    VAULT_KEEPER: int = 2
+    ALIGNED_PRIEST: int = 3
+
+
+# Vault keeper extortion demand: vendor vault.c historically demands
+# ``rn1(1000, 50)`` gold from the player (range [50, 1049]) — see vault.c:184
+# in the original 3.4 sources and the equivalent gold check at vault.c:551.
+# In this byte-equal slice we expose the *expected* demand as a deterministic
+# midpoint constant; callers that want RNG variance can override via the
+# ``demand`` argument to ``vault_keeper_collect``.
+VAULT_KEEPER_DEMAND_BASE: int = 50    # rn1 second arg (vault.c:184)
+VAULT_KEEPER_DEMAND_RANGE: int = 1000 # rn1 first arg
+VAULT_KEEPER_DEMAND_DEFAULT: int = VAULT_KEEPER_DEMAND_BASE + VAULT_KEEPER_DEMAND_RANGE // 2
+
+# Aligned-priest misalignment surcharge multiplier (priest.c pri_keeper path).
+ALIGNED_PRIEST_MISALIGN_MUL: int = 2
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 @struct.dataclass
@@ -180,6 +216,11 @@ class ShopState:
         default_factory=lambda: jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int32)
     )
 
+    # Shopkeeper variant (Wave-45d).  See ``ShopkeeperKind`` for cites.
+    kind: jnp.ndarray = dataclasses.field(
+        default_factory=lambda: jnp.int8(ShopkeeperKind.GENERIC)
+    )
+
     @classmethod
     def default(cls) -> "ShopState":
         """Return a zeroed ShopState (no shop on the current level)."""
@@ -201,6 +242,7 @@ class ShopState:
             customer=jnp.zeros((PL_NSIZ_LITE,), dtype=jnp.int8),
             shoptype=jnp.int8(SHOP_NONE),
             bill_prices=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int32),
+            kind=jnp.int8(ShopkeeperKind.GENERIC),
         )
 
 
@@ -783,3 +825,105 @@ def shop_step(state, rng) -> object:
 def step(state: ShopState, rng: jax.Array) -> ShopState:
     """Per-turn no-op for the ShopState slice (Wave-1 API parity)."""
     return state
+
+
+# ---------------------------------------------------------------------------
+# Wave-45d — shopkeeper-class variants
+# ---------------------------------------------------------------------------
+# These helpers refine the generic shop.py behaviour for the three non-generic
+# shopkeeper variants vendor distinguishes:
+#   - Croesus (Fort Ludios shopkeeper; vendor monst.c PM_CROESUS).
+#   - Vault keeper (vendor vault.c).
+#   - Aligned priest (vendor priest.c::pri_keeper / temple_occupied).
+# Each helper is JIT-pure and gates on ``shop.kind`` so callers can apply them
+# unconditionally; non-matching variants pass through untouched.
+# ---------------------------------------------------------------------------
+def croesus_clamp(state) -> object:
+    """Vendor monst.c PM_CROESUS: Croesus does not run a billable shop.
+
+    When ``shop.kind == CROESUS`` we zero the bill / bill_prices /
+    items_owned_by_shop (no transactions ever accrue) and force
+    ``angry = False`` to stay sticky (Croesus is non-hostile at first sight;
+    see vendor monst.c CROESUS flags — no SEDUCE / no anger spawn).
+    JIT-safe.
+    """
+    shop = state.shop
+    is_croesus = shop.kind == jnp.int8(ShopkeeperKind.CROESUS)
+    new_bill = jnp.where(is_croesus, jnp.int32(0), shop.bill)
+    new_prices = jnp.where(
+        is_croesus,
+        jnp.zeros_like(shop.bill_prices),
+        shop.bill_prices,
+    )
+    new_owned = jnp.where(
+        is_croesus,
+        jnp.zeros_like(shop.items_owned_by_shop),
+        shop.items_owned_by_shop,
+    )
+    new_angry = jnp.where(is_croesus, jnp.bool_(False), shop.angry)
+    new_shop = shop.replace(
+        bill=new_bill,
+        bill_prices=new_prices,
+        items_owned_by_shop=new_owned,
+        angry=new_angry,
+    )
+    return state.replace(shop=new_shop)
+
+
+def vault_keeper_collect(state, demand: int = VAULT_KEEPER_DEMAND_DEFAULT) -> object:
+    """Vault keeper gold extortion (vendor vault.c::vault_gd_watching, line 1278).
+
+    Vendor flow (vault.c:551-584 — umoney handshake):
+        - guard demands ``rn1(1000, 50)`` gold (vault.c:184 in the original
+          3.4 sources; range [50, 1049]).
+        - if player has >= demand: deduct from player_gold, keeper goes away.
+        - if player has < demand: keeper leads player out (we model that as
+          a teleport to ``shop.door_pos`` — the original code escorts via a
+          fake corridor; the door tile is the byte-equal endpoint of that
+          sequence).
+
+    Only fires when ``shop.kind == VAULT_KEEPER`` AND ``shop_active``.
+    JIT-safe; ``demand`` is a Python int (compile-time constant) so callers
+    that want RNG variance call this twice with different demand values.
+    """
+    shop = state.shop
+    is_vault = shop.kind == jnp.int8(ShopkeeperKind.VAULT_KEEPER)
+    active = shop.shop_active & is_vault
+
+    demand_i = jnp.int32(int(demand))
+    can_pay = state.player_gold >= demand_i
+
+    # Pay path — deduct gold.
+    paid = active & can_pay
+    refused = active & (~can_pay)
+
+    new_gold = jnp.where(paid, state.player_gold - demand_i, state.player_gold)
+
+    # Refused path — teleport player to the door (the keeper's escort
+    # endpoint in vault.c::gd_mv_monaway, line 734).
+    door = shop.door_pos.astype(state.player_pos.dtype)
+    new_pp = jnp.where(refused, door, state.player_pos)
+
+    return state.replace(player_gold=new_gold, player_pos=new_pp)
+
+
+def aligned_priest_price(
+    base_price: jnp.ndarray,
+    shop_kind: jnp.ndarray,
+    player_alignment: jnp.ndarray,
+    shop_alignment: jnp.ndarray,
+) -> jnp.ndarray:
+    """Aligned-priest temple charge (vendor priest.c::pri_keeper logic).
+
+    Misaligned customers pay ``ALIGNED_PRIEST_MISALIGN_MUL * base_price``
+    (vendor priest.c sets the temple donation/charge floor to 2x for
+    customers whose alignment does not match the temple's altar alignment;
+    see priest.c::temple_occupied + histemple_at, lines 142-216).
+
+    Pure function — no state mutation.  Returns the adjusted price as int32.
+    """
+    base = base_price.astype(jnp.int32)
+    is_priest = shop_kind == jnp.int8(ShopkeeperKind.ALIGNED_PRIEST)
+    misaligned = player_alignment.astype(jnp.int32) != shop_alignment.astype(jnp.int32)
+    surcharge = is_priest & misaligned
+    return jnp.where(surcharge, base * jnp.int32(ALIGNED_PRIEST_MISALIGN_MUL), base)
