@@ -993,13 +993,34 @@ def fill_ordinary_rooms(
     room_keys = jax.random.split(rng, MAX_ROOMS_PER_LEVEL)
 
     def fill_one(state, i):
-        terrain_, features_aa, traps_tt = state
+        terrain_, features_aa, features_lit, traps_tt = state
         y1 = rooms.y1[i].astype(jnp.int32)
         x1 = rooms.x1[i].astype(jnp.int32)
         y2 = rooms.y2[i].astype(jnp.int32)
         x2 = rooms.x2[i].astype(jnp.int32)
         rt = rooms.room_type[i].astype(jnp.int32)
         act = active[i]
+
+        # Per-room lit stamp — vendor mklev.c::do_room_or_subroom lines
+        # 249-255: when ``lit`` is true the inner loop walks the room's
+        # bounding box (including the 1-cell wall border) and sets
+        # ``lev->lit = 1`` on every tile.  ``rooms.is_lit`` was rolled at
+        # generation time per vendor mkmap.c::litstate_rnd lines 442-448
+        # (``rnd(1+abs(depth))<11 && rn2(77)`` when rlit=-1).  We mirror
+        # that here on every *active* room regardless of room type so
+        # special rooms (shops, temples, …) also get their lit floors.
+        H = features_lit.shape[1]
+        W = features_lit.shape[2]
+        rows_idx = jnp.arange(H, dtype=jnp.int32).reshape(H, 1)
+        cols_idx = jnp.arange(W, dtype=jnp.int32).reshape(1, W)
+        in_room = (
+            (rows_idx >= y1) & (rows_idx <= y2)
+            & (cols_idx >= x1) & (cols_idx <= x2)
+        )
+        room_lit = rooms.is_lit[i] & act
+        cur_lit = features_lit[flat_lv]
+        new_lit = jnp.where(in_room & room_lit, jnp.bool_(True), cur_lit)
+        features_lit = features_lit.at[flat_lv].set(new_lit)
 
         # Only ordinary / themeroom rooms are filled (vendor line 949 gate):
         #   if (croom->rtype != OROOM && croom->rtype != THEMEROOM) return;
@@ -1118,15 +1139,20 @@ def fill_ordinary_rooms(
         )
         terrain_, traps_tt, _, _ = trap_state
 
-        return (terrain_, features_aa, traps_tt), None
+        return (terrain_, features_aa, features_lit, traps_tt), None
 
-    init_state = (terrain, features.altar_alignment, traps.trap_type)
-    (terrain_out, aa_out, tt_out), _ = lax.scan(
+    init_state = (
+        terrain,
+        features.altar_alignment,
+        features.lit,
+        traps.trap_type,
+    )
+    (terrain_out, aa_out, lit_out, tt_out), _ = lax.scan(
         fill_one,
         init_state,
         jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
     )
-    new_features = features.replace(altar_alignment=aa_out)
+    new_features = features.replace(altar_alignment=aa_out, lit=lit_out)
     new_traps    = traps.replace(trap_type=tt_out)
     return terrain_out, new_features, new_traps
 

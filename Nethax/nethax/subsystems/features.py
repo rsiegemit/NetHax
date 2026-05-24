@@ -176,6 +176,20 @@ class FeaturesState:
     guard_escort_active : bool scalar
                        True while the vault guard is escorting the player out
                        (vendor vault.c::gd_move line 888).
+    lit              : bool [num_levels, map_h, map_w]
+                       True iff the tile is permanently lit.  Mirrors vendor
+                       ``levl[x][y].lit`` (vendor/nethack/include/rm.h line
+                       165 — ``Bitfield(lit, 1)``).  Set during dungeon
+                       generation per-room (vendor mklev.c::do_room_or_subroom
+                       lines 249-255) and later toggled by light spells /
+                       artifacts (vendor read.c::litroom, set_lit lines
+                       2471-2488; artifact.c::arti_invoke line 2063).
+    waslit           : bool [num_levels, map_h, map_w]
+                       True once the hero has seen this tile lit.  Mirrors
+                       vendor ``levl[x][y].waslit`` (vendor/nethack/include/
+                       rm.h line 166 — ``Bitfield(waslit, 1)``).  Used by
+                       vision/redraw logic to remember which tiles were lit
+                       between visits (vendor display.c, vision.c).
     """
 
     fountains_used:  jnp.ndarray   # [num_levels, map_h, map_w]  bool
@@ -191,6 +205,8 @@ class FeaturesState:
     vault_pos:       jnp.ndarray   # [num_levels, 2]             int16
     guard_slot:      jnp.ndarray   # scalar                       int32
     guard_escort_active: jnp.ndarray   # scalar                   bool
+    lit:             jnp.ndarray   # [num_levels, map_h, map_w]  bool
+    waslit:          jnp.ndarray   # [num_levels, map_h, map_w]  bool
 
     @classmethod
     def default(cls, num_levels: int, map_h: int, map_w: int) -> "FeaturesState":
@@ -210,6 +226,11 @@ class FeaturesState:
             vault_pos=jnp.full((num_levels, 2), -1, dtype=jnp.int16),
             guard_slot=jnp.int32(-1),
             guard_escort_active=jnp.bool_(False),
+            # Per-tile lighting (vendor rm.h lines 165-166: lit / waslit
+            # bitfields).  Zero-init: dungeon generation later flips lit=True
+            # for tiles inside lit rooms (vendor mklev.c lines 249-255).
+            lit=jnp.zeros(shape, dtype=jnp.bool_),
+            waslit=jnp.zeros(shape, dtype=jnp.bool_),
         )
 
 
@@ -692,6 +713,64 @@ def handle_search(state, rng: jax.Array):
             idx += 1
     new_features = state.features.replace(door_state=door_state)
     return state.replace(features=new_features)
+
+
+# ---------------------------------------------------------------------------
+# Per-tile lighting (vendor rm.h lit / waslit, light.c::set_lit, read.c::litroom)
+# ---------------------------------------------------------------------------
+
+def litroom_at(
+    features: FeaturesState,
+    flat_lv,
+    row,
+    col,
+    radius: int = 0,
+) -> FeaturesState:
+    """Set ``lit=True`` on a tile and its Chebyshev neighbours up to ``radius``.
+
+    Mirrors vendor/nethack/src/read.c::litroom (line 2491) +
+    set_lit (line 2471) — the latter sets ``levl[x][y].lit = 1`` for a
+    single coordinate; the former walks a ``do_clear_area`` Chebyshev
+    radius around the hero and calls set_lit() on each tile.  Radius=0
+    matches the Sunsword artifact-invoke path (vendor artifact.c:2063
+    + read.c:2599 — direct ``set_lit(u.ux, u.uy)`` call) which lights
+    just the hero's own tile.  Radius=5/9 matches the scroll-of-light
+    blessed/unblessed paths (vendor read.c:2601).
+
+    JIT-pure: uses ``lax.dynamic_update_slice``-equivalent ``.at[].set``
+    over a fixed-size square window; out-of-bounds neighbours are
+    clipped via ``jnp.where`` so the update is safe at the map edges.
+
+    Args:
+        features: FeaturesState pytree.
+        flat_lv:  flattened level index (int / scalar).
+        row, col: target tile (int / scalar).
+        radius:   Chebyshev radius (Python int; must be compile-time
+                  constant so the unrolled square is fixed-size).
+                  ``radius=0`` lights only the (row, col) tile.
+
+    Returns:
+        Updated FeaturesState with ``lit`` set to True for each tile
+        within radius of (row, col) on level ``flat_lv``.
+    """
+    lit = features.lit
+    H = lit.shape[1]
+    W = lit.shape[2]
+    flv = jnp.asarray(flat_lv, dtype=jnp.int32)
+    r0  = jnp.asarray(row,     dtype=jnp.int32)
+    c0  = jnp.asarray(col,     dtype=jnp.int32)
+    r_i = int(radius)
+    for dr in range(-r_i, r_i + 1):
+        for dc in range(-r_i, r_i + 1):
+            rr = r0 + jnp.int32(dr)
+            cc = c0 + jnp.int32(dc)
+            rr_s = jnp.clip(rr, 0, H - 1)
+            cc_s = jnp.clip(cc, 0, W - 1)
+            in_bounds = (rr >= 0) & (rr < H) & (cc >= 0) & (cc < W)
+            cur = lit[flv, rr_s, cc_s]
+            new_val = jnp.where(in_bounds, jnp.bool_(True), cur)
+            lit = lit.at[flv, rr_s, cc_s].set(new_val)
+    return features.replace(lit=lit)
 
 
 # ---------------------------------------------------------------------------
