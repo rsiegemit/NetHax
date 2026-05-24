@@ -1821,6 +1821,95 @@ def _handle_jump(state, rng):
     return state.replace(player_pos=new_pos)
 
 
+def _handle_wipe(state, rng):
+    """#wipe — vendor/nethack/src/apply.c::dowipe line 2009.
+
+    Wipes the player's face — clears the BLIND timed status if it
+    originated from cream-pie or venom (we conservatively clear BLIND
+    regardless of source, since Nethax doesn't track the source).
+
+    Cite: vendor/nethack/src/apply.c::dowipe line 2009.
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+    new_ts = state.status.timed_statuses.at[int(TimedStatus.BLIND)].set(
+        jnp.int32(0).astype(state.status.timed_statuses.dtype)
+    )
+    return state.replace(status=state.status.replace(timed_statuses=new_ts))
+
+
+def _handle_sit(state, rng):
+    """#sit — vendor/nethack/src/sit.c::dosit line 49.
+
+    If the player stands on a THRONE tile, fires the 13-outcome
+    throne_sit_effect() table via features.sit_on_throne.  Otherwise
+    no-op (vendor also handles fountain-edge spills and sink seats but
+    those are minor; covered by features.sit_on_altar for altars).
+
+    Cite: vendor/nethack/src/sit.c::dosit line 49;
+          vendor/nethack/src/sit.c::throne_sit_effect lines 39-234.
+    """
+    from Nethax.nethax.subsystems.features import sit_on_throne
+    from Nethax.nethax.constants.tiles import TileType
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    br = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    tile = state.terrain[br, lv, pr, pc].astype(jnp.int32)
+    on_throne = tile == jnp.int32(int(TileType.THRONE))
+    return jax.lax.cond(on_throne, lambda s: sit_on_throne(s, rng),
+                        lambda s: s, state)
+
+
+def _handle_rub(state, rng):
+    """#rub — vendor/nethack/src/apply.c::dorub line 1785.
+
+    Rubs the wielded item.  If it's a MAGIC_LAMP with ``spe > 0`` (djinni
+    inside): rn2(3)==0 → release djinni, grant +500 gold as wish proxy
+    (vendor opens a wish prompt — we proxy with gold since the
+    interactive picker is unavailable), transform lamp → OIL_LAMP, drain
+    spe to 0.  Otherwise no-op.
+
+    Cite: vendor/nethack/src/apply.c::dorub line 1785;
+          vendor/nethack/src/apply.c::djinni_from_bottle line 1820.
+    """
+    _MAGIC_LAMP_TID = 203
+    _OIL_LAMP_TID = 202
+    inv = state.inventory
+    slot = inv.wielded.astype(jnp.int32)
+    has_wielded = slot >= jnp.int32(0)
+    safe = jnp.clip(slot, 0, inv.items.type_id.shape[0] - 1)
+    tid = jnp.where(has_wielded,
+                    inv.items.type_id[safe].astype(jnp.int32),
+                    jnp.int32(0))
+    spe = jnp.where(has_wielded,
+                    inv.items.charges[safe].astype(jnp.int32),
+                    jnp.int32(0))
+    is_magic_lamp = has_wielded & (tid == jnp.int32(_MAGIC_LAMP_TID))
+    has_djinni = is_magic_lamp & (spe > jnp.int32(0))
+
+    rub_roll = jax.random.randint(rng, (), 0, 3, dtype=jnp.int32)
+    release = has_djinni & (rub_roll == jnp.int32(0))
+
+    new_tid = jnp.where(
+        release,
+        inv.items.type_id.at[safe].set(jnp.int16(_OIL_LAMP_TID)),
+        inv.items.type_id,
+    )
+    new_charges = jnp.where(
+        release,
+        inv.items.charges.at[safe].set(jnp.int8(0)),
+        inv.items.charges,
+    )
+    new_items = inv.items.replace(type_id=new_tid, charges=new_charges)
+    new_gold = jnp.where(release,
+                         state.player_gold + jnp.int32(500),
+                         state.player_gold)
+    return state.replace(
+        inventory=inv.replace(items=new_items),
+        player_gold=new_gold,
+    )
+
+
 def _handle_untrap(state, rng):
     """#untrap — vendor/nethack/src/untrap.c::dountrap line 350.
 
@@ -2293,6 +2382,9 @@ _HANDLERS = (
     _handle_quit,       # 49  vendor/nethack/src/end.c::done2 (M-q → done=True)
     _handle_jump,       # 50  vendor/nethack/src/apply.c::dojump (M-j → jump)
     _handle_untrap,     # 51  vendor/nethack/src/untrap.c::dountrap (M-u → disarm)
+    _handle_rub,        # 52  vendor/nethack/src/apply.c::dorub (M-r → lamp wish)
+    _handle_sit,        # 53  vendor/nethack/src/sit.c::dosit (M-s → throne)
+    _handle_wipe,       # 54  vendor/nethack/src/apply.c::dowipe (M-w → clear blind)
 )
 
 # Slot indices for each named handler.
@@ -2361,6 +2453,12 @@ _SLOT_QUIT       = 49
 _SLOT_JUMP       = 50
 # #untrap (M-u) — vendor/nethack/src/untrap.c::dountrap.
 _SLOT_UNTRAP     = 51
+# #rub (M-r) — vendor/nethack/src/apply.c::dorub.
+_SLOT_RUB        = 52
+# #sit (M-s) — vendor/nethack/src/sit.c::dosit.
+_SLOT_SIT        = 53
+# #wipe (M-w) — vendor/nethack/src/apply.c::dowipe.
+_SLOT_WIPE       = 54
 
 # ---------------------------------------------------------------------------
 # 256-entry lookup table: action ASCII value → handler slot index
@@ -2548,15 +2646,15 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     table[_M_byte("o")] = _SLOT_OFFER  # cmd.c::dosacrifice → pray.c::offer_real_amulet
     table[_M_byte("p")] = _SLOT_PRAY   # cmd.c::dopray (already set)
     table[_M_byte("q")] = _SLOT_QUIT   # end.c::done2 (quit → done=True)
-    table[_M_byte("r")] = _SLOT_NOOP   # cmd.c::dorub
+    table[_M_byte("r")] = _SLOT_RUB    # apply.c::dorub (rub lamp/stone)
     table[_M_byte("R")] = _SLOT_RIDE   # cmd.c::doride — steed.c:178
-    table[_M_byte("s")] = _SLOT_NOOP   # cmd.c::dosit
+    table[_M_byte("s")] = _SLOT_SIT    # sit.c::dosit (throne 13-effect table)
     table[_M_byte("t")] = _SLOT_NOOP   # cmd.c::doturn
     table[_M_byte("T")] = _SLOT_TIP_DOWN  # cmd.c::dotip → WAN_DIGGING down-dig (dig.c:1548)
     table[_M_byte("u")] = _SLOT_UNTRAP # untrap.c::dountrap (disarm adjacent)
     table[_M_byte("v")] = _SLOT_NOOP   # cmd.c::doextversion
     table[_M_byte("V")] = _SLOT_NOOP   # cmd.c::dovanquished
-    table[_M_byte("w")] = _SLOT_NOOP   # cmd.c::dowipe
+    table[_M_byte("w")] = _SLOT_WIPE   # apply.c::dowipe (clear face → BLIND=0)
     table[_M_byte("X")] = _SLOT_NOOP   # cmd.c::enter_explore_mode
     table[_M_byte("?")] = _SLOT_NOOP   # cmd.c::doextlist
 
@@ -2661,6 +2759,9 @@ _COMPACT_OFFER      = 34
 _COMPACT_QUIT       = 35
 _COMPACT_JUMP       = 36
 _COMPACT_UNTRAP     = 37
+_COMPACT_RUB        = 38
+_COMPACT_SIT        = 39
+_COMPACT_WIPE       = 40
 
 
 def _build_compact_handlers():
@@ -2704,6 +2805,9 @@ def _build_compact_handlers():
         _wrap_no_dir(_handle_quit),      # 35  COMPACT_QUIT — end.c::done2
         _wrap_no_dir(_handle_jump),      # 36  COMPACT_JUMP — apply.c::dojump
         _wrap_no_dir(_handle_untrap),    # 37  COMPACT_UNTRAP — untrap.c::dountrap
+        _wrap_no_dir(_handle_rub),       # 38  COMPACT_RUB — apply.c::dorub
+        _wrap_no_dir(_handle_sit),       # 39  COMPACT_SIT — sit.c::dosit
+        _wrap_no_dir(_handle_wipe),      # 40  COMPACT_WIPE — apply.c::dowipe
     )
 
 
@@ -2711,8 +2815,8 @@ _COMPACT_HANDLERS: tuple = _build_compact_handlers()
 
 
 def _build_slot_to_compact() -> jnp.ndarray:
-    """Map legacy handler slot (0..51) → compact slot (0..37)."""
-    table = [0] * 52
+    """Map legacy handler slot (0..54) → compact slot (0..40)."""
+    table = [0] * 55
     # Movement slots 1..8 → COMPACT_MOVE.
     for s in (_SLOT_MOVE_N, _SLOT_MOVE_E, _SLOT_MOVE_S, _SLOT_MOVE_W,
               _SLOT_MOVE_NE, _SLOT_MOVE_SE, _SLOT_MOVE_SW, _SLOT_MOVE_NW):
@@ -2757,6 +2861,9 @@ def _build_slot_to_compact() -> jnp.ndarray:
     table[_SLOT_QUIT]       = _COMPACT_QUIT      # end.c::done2
     table[_SLOT_JUMP]       = _COMPACT_JUMP      # apply.c::dojump
     table[_SLOT_UNTRAP]     = _COMPACT_UNTRAP    # untrap.c::dountrap
+    table[_SLOT_RUB]        = _COMPACT_RUB       # apply.c::dorub
+    table[_SLOT_SIT]        = _COMPACT_SIT       # sit.c::dosit
+    table[_SLOT_WIPE]       = _COMPACT_WIPE      # apply.c::dowipe
     return jnp.array(table, dtype=jnp.int32)
 
 
@@ -2766,7 +2873,7 @@ def _build_slot_to_dir_idx() -> jnp.ndarray:
     Non-movement slots map to 0 (the direction is unused for those branches).
     The order matches ``_DIR_TABLE``: N=0, E=1, S=2, W=3, NE=4, SE=5, SW=6, NW=7.
     """
-    table = [0] * 52
+    table = [0] * 55
     # Move slots.
     table[_SLOT_MOVE_N]  = 0
     table[_SLOT_MOVE_E]  = 1
