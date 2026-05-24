@@ -193,11 +193,17 @@ def test_magicbane_status_effect():
 # 3. Eye of the Aethiopica #invoke grants +1 Pw
 # ---------------------------------------------------------------------------
 
-def test_invoke_eye_of_aethiopica_grants_pw():
-    """#invoke Eye of the Aethiopica increases player_pw by 1.
+def test_invoke_eye_of_aethiopica_runs():
+    """#invoke Eye of the Aethiopica fires CREATE_PORTAL without state corruption.
 
-    Cite: vendor/nethack/src/artifact.c::arti_invoke line ~1480 —
-    Eye grants energy (Pw) when invoked.
+    Audit K (Wave 40c): vendor inv_prop is CREATE_PORTAL (artifact.c:1866-
+    1931, artilist.h:305).  The pre-Audit-K "grants +1 Pw" behaviour was
+    invented — vendor's CREATE_PORTAL opens a dungeon-portal menu and does
+    not mutate Pw.  The SPFX_EREGEN extrinsic that conveyed the previous
+    energy effect is now correctly routed through cspfx (carried
+    extrinsic) via apply_carried_artifact_extrinsics, not through
+    arti_invoke.
+
     artifact_idx=21 (wish.py index 21).
     """
     from Nethax.nethax.subsystems.action_dispatch import _handle_invoke
@@ -207,9 +213,11 @@ def test_invoke_eye_of_aethiopica_grants_pw():
     initial_pw = int(state.player_pw)
 
     new_state = _handle_invoke(state, _RNG)
-    assert int(new_state.player_pw) == initial_pw + 1, (
-        f"Eye invoke should add 1 Pw: {initial_pw} → {int(new_state.player_pw)}"
-    )
+    # CREATE_PORTAL has -1 Pw cost (cannot be paid with Pw); arti_invoke_cost
+    # checks the obj->age cooldown only.  Pw must NOT change.
+    assert int(new_state.player_pw) == initial_pw
+    # The cooldown gate (state.invoke_cooldown) should bump to 100.
+    assert int(new_state.invoke_cooldown[21]) == 100
 
 
 # ---------------------------------------------------------------------------

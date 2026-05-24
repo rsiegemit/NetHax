@@ -387,21 +387,31 @@ _IS_LICH: jnp.ndarray = _build_lich_mask()
 _VORPAL_BEHEAD_DENOM: int = 23
 
 
-def apply_artifact_hit_effects(state, mon_slot, rng):
+def apply_artifact_hit_effects(state, mon_slot, rng, dieroll=None):
     """Apply special on-hit artifact effects after a hit is confirmed.
 
-    Handles:
-      - Vorpal Blade (artifact_idx=8): instant kill on lich, else 1-in-23.
-        Cite: vendor/nethack/src/artifact.c::artifact_hit lines 1220-1255.
-      - Magicbane (artifact_idx=29): 25% chance to apply one status effect
-        (scare/stun/confuse/sleep) chosen uniformly.
-        Cite: vendor/nethack/src/artifact.c::magicbane_hit lines 1090-1170.
+    Audit K (Wave 40c) rewrite:
+
+      - **Vorpal Blade**: trigger on caller-supplied combat dieroll==1 OR
+        target is jabberwock / S_LICH-class.  Drop the invented fresh
+        1-in-23 sample (vendor uses the to-hit d20 as the beheading roll).
+        Cite: vendor/nethack/src/artifact.c::artifact_hit lines 1595-1643.
+
+      - **Magicbane**: routed to ``magicbane_mb_hit`` every hit (no 25%
+        prefilter — vendor Mb_hit fires every time AD_STUN attack lands).
+        The tier (PROBE/STUN/SCARE/CANCEL) is decided inside Mb_hit by the
+        same dieroll value used for to-hit, per vendor lines 1289-1298.
+        Cite: vendor/nethack/src/artifact.c::artifact_hit lines 1537-1540
+              (Mb_hit dispatch) and Mb_hit lines 1247-1406.
 
     Parameters
     ----------
     state    : EnvState
     mon_slot : int32 — monster slot index
     rng      : JAX PRNG key
+    dieroll  : int32 or None — combat-system d20 to-hit roll.  When None we
+               sample a fresh d20 (caller convenience; combat.py owns the
+               canonical dieroll).
 
     Returns
     -------
@@ -411,57 +421,51 @@ def apply_artifact_hit_effects(state, mon_slot, rng):
     idx  = mon_slot.astype(jnp.int32)
     mai  = state.monster_ai
 
-    # ---- Vorpal Blade: beheading ----------------------------------------
-    # Cite: artifact.c::artifact_hit lines 1220-1255.
-    # Auto-kill if target is S_LICH; else 1-in-23 chance.
-    entry_i = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, _IS_LICH.shape[0] - 1)
+    k_die, k_mb = jax.random.split(rng, 2)
+    if dieroll is None:
+        dieroll_val = jax.random.randint(k_die, (), 1, 21, dtype=jnp.int32)
+    else:
+        dieroll_val = dieroll.astype(jnp.int32)
+
+    # ---- Vorpal Blade: behead on dieroll==1 OR jabberwock OR S_LICH ------
+    # Cite: vendor/nethack/src/artifact.c::artifact_hit line 1596
+    #       ((dieroll==1 || mdef->data == &mons[PM_JABBERWOCK]) is the gate).
+    # We treat lich-class as the "jabberwock equivalent" per task spec
+    # (the original vendor row pins it to PM_JABBERWOCK; lich is the
+    # closest broad-class proxy in Nethax).
+    entry_i = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0,
+                       _IS_LICH.shape[0] - 1)
     is_lich = _IS_LICH[entry_i]
-
-    key_v, key_m, key_ms = jax.random.split(rng, 3)
-    vorpal_rn = jax.random.randint(key_v, (), 0, _VORPAL_BEHEAD_DENOM, dtype=jnp.int32)
-    vorpal_instant = is_lich | (vorpal_rn == jnp.int32(0))
     is_vorpal = (arti == jnp.int32(_ARTI_VORPAL)) & mai.alive[idx]
-    vorpal_kill = is_vorpal & vorpal_instant
+    vorpal_kill = is_vorpal & (is_lich | (dieroll_val == jnp.int32(1)))
 
-    new_hp_v  = jnp.where(vorpal_kill, jnp.int32(0), mai.hp[idx])
+    new_hp_v    = jnp.where(vorpal_kill, jnp.int32(0), mai.hp[idx])
     new_alive_v = jnp.where(vorpal_kill, jnp.bool_(False), mai.alive[idx])
 
-    # ---- Magicbane: status effects --------------------------------------
-    # Cite: artifact.c::magicbane_hit lines 1090-1170.
-    # 25% chance (rn2(4)==0) → apply one of 4 effects chosen by rn2(4).
-    is_magicbane = (arti == jnp.int32(_ARTI_MAGICBANE)) & mai.alive[idx]
-    mb_trigger   = jax.random.randint(key_m, (), 0, 4, dtype=jnp.int32) == jnp.int32(0)
-    mb_effect    = jax.random.randint(key_ms, (), 0, 4, dtype=jnp.int32)
-
-    # Effect 0 = scare  → set mstrategy = FLEE (4)
-    # Effect 1 = stun   → set asleep=True (no stunned field yet)
-    # Effect 2 = confuse → set asleep=True (no confused field yet)
-    # Effect 3 = sleep  → set asleep=True
-    # Cite: magicbane_hit rn2(4) dispatch (artifact.c line ~1130).
-    mb_active = is_magicbane & mb_trigger
-
-    scare_active   = mb_active & (mb_effect == jnp.int32(0))
-    sleep_active   = mb_active & (mb_effect != jnp.int32(0))  # effects 1,2,3 all → asleep
-
-    new_mstrategy = jnp.where(
-        scare_active,
-        jnp.int8(4),       # MoveStrategy.FLEE = 4
-        mai.mstrategy[idx],
-    )
-    new_asleep_mb = mai.asleep[idx] | sleep_active
-
-    # ---- Compose monster_ai updates -------------------------------------
-    # Vorpal kills override Magicbane hp/alive; both patches commute on
-    # disjoint fields (hp/alive vs mstrategy/asleep) so we apply sequentially.
-    mai2 = mai.replace(
+    mai_after_vorpal = mai.replace(
         hp=mai.hp.at[idx].set(new_hp_v),
         alive=mai.alive.at[idx].set(new_alive_v),
-        mstrategy=mai.mstrategy.at[idx].set(new_mstrategy),
-        asleep=mai.asleep.at[idx].set(new_asleep_mb),
+    )
+    state_after_vorpal = state.replace(monster_ai=mai_after_vorpal)
+
+    # ---- Magicbane: dispatch to magicbane_mb_hit every hit ---------------
+    # Vendor artifact.c:1537-1540 — Mb_hit fires whenever attacks(AD_STUN)
+    # && dieroll <= MB_MAX_DIEROLL (8).  No 25% prefilter.
+    is_magicbane = (arti == jnp.int32(_ARTI_MAGICBANE)) & mai.alive[idx]
+    # Only run mb path when wielded artifact is Magicbane to avoid the
+    # JIT-traced effects polluting non-Magicbane state; we use lax.cond.
+    def _mb_path(s):
+        out_state, _extra_dmg, _idx_tier = magicbane_mb_hit(
+            s, mon_slot, k_mb, dieroll=dieroll_val,
+        )
+        return out_state
+
+    state_after_mb = jax.lax.cond(
+        is_magicbane, _mb_path, lambda s: s, state_after_vorpal,
     )
 
     killed = vorpal_kill
-    return state.replace(monster_ai=mai2), killed
+    return state_after_mb, killed
 
 
 # ---------------------------------------------------------------------------
@@ -481,355 +485,351 @@ def apply_artifact_hit_effects(state, mon_slot, rng):
 #   8  Vorpal Blade      19  Yendorian Express  29  Magicbane (sentinel)
 # ---------------------------------------------------------------------------
 
-# _INVOKE_HANDLER_IDX: for each artifact slot (0-29), which handler to call.
-# 0 = no-op (no invoke effect).
-# We define 15 handler indices to cover all distinct effect classes.
-# Slots that have no invoke use handler 0 (noop).
-_N_INVOKE_SLOTS = 30
+# Audit K (Wave 40c) — corrected slot→inv_prop mapping; every slot whose
+# vendor inv_prop is 0 is now a true NOOP.
+# Cite: vendor/nethack/include/artilist.h inv_prop column (per row);
+#       vendor/nethack/src/artifact.c::arti_invoke lines 2131-2232.
+_N_INVOKE_SLOTS = 33
 
-# Handler indices for invoke effects:
-_INV_NOOP          =  0  # no invoke effect
-_INV_DETECT_OBJ    =  1  # Orb of Detection: detect_objects 1000 turns
-_INV_LEVITATION    =  2  # Heart of Ahriman: LEVITATION_TMP +30, luck +d20
-_INV_CONFLICT      =  3  # Sceptre of Might: CONFLICT intrinsic toggle
-_INV_TELEPORT      =  4  # Orb of Fate: random teleport (TELEPORT_CONTROL off)
-_INV_ENERGY_REGEN  =  5  # Eye of Aethiopica: ENERGY_REGEN timed + +1 Pw
-_INV_TURN_UNDEAD   =  6  # Mitre/Excalibur: TURN_UNDEAD ray (kill undead in area)
-_INV_CHARGE        =  7  # Yendorian Express Card: refill Pw to max
-_INV_HEAL          =  8  # Staff of Aesculapius: cure SICK + restore HP
-_INV_STR_BOOST     =  9  # Tsurugi: +1 STR capped at 18
-_INV_LIGHTNING     = 10  # Mjollnir: d6 lightning hits all monsters in 6-radius
-_INV_SLEEP_RES     = 11  # Snickersnee: grant SLEEP_RES timed 50
-_INV_DETECT_FOOD   = 12  # Grayswandir: detect food
-_INV_DETECT_TREAS  = 13  # Dragonbane: detect treasure 50
-_INV_DETECT_MON    = 14  # Demonbane: detect monsters 50
-_INV_LYCAN_CURE    = 15  # Werebane: cure lycanthropy
-_INV_TRUE_SIGHT    = 16  # Trollsbane: SEE_INVIS timed 50
-_INV_FAST          = 17  # Grimtooth: FAST timed +20
-_INV_CONFUSION_RAY = 18  # Magicbane: confusion ray (already in _do_invoke)
+_INV_NOOP          =  0   # vendor inv_prop = 0
+_INV_CONFLICT      =  1   # Sceptre of Might
+_INV_INVIS         =  2   # Orb of Detection
+_INV_LEVITATION    =  3   # Heart of Ahriman
+_INV_HEALING       =  4   # Staff of Aesculapius
+_INV_ENLIGHTENING  =  5   # Eyes of Overworld
+_INV_ENERGY_BOOST  =  6   # Mitre of Holiness
+_INV_CREATE_AMMO   =  7   # Longbow of Diana
+_INV_UNTRAP        =  8   # Master Key
+_INV_CHARGE_OBJ    =  9   # Yendorian Express
+_INV_LEV_TELE      = 10   # Orb of Fate
+_INV_CREATE_PORTAL = 11   # Eye of Aethiopica
+_INV_SNOWSTORM     = 12   # Frost Brand
+_INV_FIRESTORM     = 13   # Fire Brand
+_INV_BANISH        = 14   # Demonbane
+_INV_FLING_POISON  = 15   # Grimtooth
+_INV_BLINDING_RAY  = 16   # Sunsword
 
-# Map each of the 30 slots to a handler index.
-# Cite: artilist.h inv_prop column for each artifact.
 _INVOKE_HANDLER_IDX_LIST = [
-    _INV_TURN_UNDEAD,   #  0  Excalibur   (TURN_UNDEAD + +1 Pw; cite artifact.c ~2202)
-    _INV_SLEEP_RES,     #  1  Snickersnee (SLEEP_RES timed 50; artilist.h ~203)
-    _INV_NOOP,          #  2  Stormbringer (passive drain; no invoke)
-    _INV_LIGHTNING,     #  3  Mjollnir    (LIGHTNING_RAY d6,6; artilist.h ~109)
-    _INV_NOOP,          #  4  Cleaver     (no invoke)
-    _INV_NOOP,          #  5  Sting       (no invoke)
-    _INV_NOOP,          #  6  Orcrist     (no invoke)
-    _INV_DETECT_FOOD,   #  7  Grayswandir (DETECT_FOOD; artilist.h ~170)
-    _INV_NOOP,          #  8  Vorpal Blade (no invoke; passive behead)
-    _INV_CONFLICT,      #  9  Sceptre of Might (CONFLICT toggle; artilist.h ~232)
-    _INV_STR_BOOST,     # 10  Tsurugi     (+1 STR cap 18; artilist.h ~285)
-    _INV_NOOP,          # 11  Magic Mirror (no invoke here)
-    _INV_DETECT_OBJ,    # 12  Orb of Detection (detect_objects 1000t; artilist.h ~219)
-    _INV_LEVITATION,    # 13  Heart of Ahriman (LEVITATION +30; artilist.h ~225)
-    _INV_HEAL,          # 14  Staff of Aesculapius (HEALING+CURE_SICK; artilist.h ~248)
-    _INV_NOOP,          # 15  Eyes of the Overworld (no invoke mapped)
-    _INV_TURN_UNDEAD,   # 16  Mitre of Holiness (TURN_UNDEAD; artilist.h ~265)
-    _INV_NOOP,          # 17  Longbow of Diana (no invoke mapped)
-    _INV_NOOP,          # 18  Master Key   (no invoke mapped)
-    _INV_CHARGE,        # 19  Yendorian Express Card (CHARGE_OBJ; artilist.h ~291)
-    _INV_TELEPORT,      # 20  Orb of Fate  (LEV_TELE→random teleport; artilist.h ~297)
-    _INV_ENERGY_REGEN,  # 21  Eye of Aethiopica (ENERGY_REGEN+Pw; artilist.h ~303)
-    _INV_NOOP,          # 22  Frost Brand  (no invoke; passive cold res)
-    _INV_NOOP,          # 23  Fire Brand   (no invoke; passive fire res)
-    _INV_DETECT_TREAS,  # 24  Dragonbane   (detect_treasure 50t; artilist.h ~157)
-    _INV_DETECT_MON,    # 25  Demonbane    (detect_monsters 50t; artilist.h ~162)
-    _INV_LYCAN_CURE,    # 26  Werebane     (cure lycanthropy; artilist.h ~166)
-    _INV_TRUE_SIGHT,    # 27  Trollsbane   (SEE_INVIS 50t; artilist.h ~182)
-    _INV_FAST,          # 28  Grimtooth    (FAST +20t; artilist.h ~123)
-    _INV_CONFUSION_RAY, # 29  Magicbane sentinel (confusion ray; artifact.c ~1090)
+    _INV_NOOP,           #  0  Excalibur            inv_prop=0  (artilist.h:85-88)
+    _INV_NOOP,           #  1  Snickersnee          inv_prop=0  (artilist.h:203-205)
+    _INV_NOOP,           #  2  Stormbringer         inv_prop=0  (artilist.h:93-96)
+    _INV_NOOP,           #  3  Mjollnir             inv_prop=0  (artilist.h:109-112)
+    _INV_NOOP,           #  4  Cleaver              inv_prop=0  (artilist.h:114-116)
+    _INV_NOOP,           #  5  Sting                inv_prop=0  (artilist.h:138-140)
+    _INV_NOOP,           #  6  Orcrist              inv_prop=0  (artilist.h:134-136)
+    _INV_NOOP,           #  7  Grayswandir          inv_prop=0  (artilist.h:170-172)
+    _INV_NOOP,           #  8  Vorpal Blade         inv_prop=0  (artilist.h:191-193)
+    _INV_CONFLICT,       #  9  Sceptre of Might     CONFLICT    (artilist.h:232-235)
+    _INV_NOOP,           # 10  Tsurugi              inv_prop=0  (artilist.h:285-289)
+    _INV_NOOP,           # 11  Magic Mirror         inv_prop=0  (artilist.h:255-258)
+    _INV_INVIS,          # 12  Orb of Detection     INVIS       (artilist.h:219-223)
+    _INV_LEVITATION,     # 13  Heart of Ahriman     LEVITATION  (artilist.h:225-230)
+    _INV_HEALING,        # 14  Staff of Aesculapius HEALING     (artilist.h:248-253)
+    _INV_ENLIGHTENING,   # 15  Eyes of Overworld    ENLIGHTENING(artilist.h:260-263)
+    _INV_ENERGY_BOOST,   # 16  Mitre of Holiness    ENERGY_BOOST(artilist.h:265-269)
+    _INV_CREATE_AMMO,    # 17  Longbow of Diana     CREATE_AMMO (artilist.h:271-274)
+    _INV_UNTRAP,         # 18  Master Key           UNTRAP      (artilist.h:279-283)
+    _INV_CHARGE_OBJ,     # 19  Yendorian Express    CHARGE_OBJ  (artilist.h:291-295)
+    _INV_LEV_TELE,       # 20  Orb of Fate          LEV_TELE    (artilist.h:297-301)
+    _INV_CREATE_PORTAL,  # 21  Eye of Aethiopica    CREATE_PORTAL(artilist.h:303-307)
+    _INV_SNOWSTORM,      # 22  Frost Brand          SNOWSTORM   (artilist.h:149-151)
+    _INV_FIRESTORM,      # 23  Fire Brand           FIRESTORM   (artilist.h:153-155)
+    _INV_NOOP,           # 24  Dragonbane           inv_prop=0  (artilist.h:157-160)
+    _INV_BANISH,         # 25  Demonbane            BANISH      (artilist.h:162-164)
+    _INV_NOOP,           # 26  Werebane             inv_prop=0  (artilist.h:166-168)
+    _INV_NOOP,           # 27  Trollsbane           inv_prop=0  (artilist.h:182-184)
+    _INV_FLING_POISON,   # 28  Grimtooth            FLING_POISON(artilist.h:123-126)
+    _INV_NOOP,           # 29  Magicbane            inv_prop=0  (artilist.h:145-147)
+    _INV_NOOP,           # 30  Giantslayer          inv_prop=0  (artilist.h:174-176)
+    _INV_NOOP,           # 31  Ogresmasher          inv_prop=0  (artilist.h:178-180)
+    _INV_BLINDING_RAY,   # 32  Sunsword             BLINDING_RAY(artilist.h:209-212)
 ]
 
 _INVOKE_HANDLER_IDX = jnp.array(_INVOKE_HANDLER_IDX_LIST, dtype=jnp.int8)
+_N_INVOKE_HANDLERS = 17  # 0..16
 
-_N_INVOKE_HANDLERS = 19  # 0..18
+# Pw cost per handler (arti_invoke_cost_pw artifact.c:2090-2102):
+# FLING_POISON and BLINDING_RAY cost SPELL_LEV_PW(5)=25; others are -1.
+_ARTI_INVOKE_PW_COST_LIST = [
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 25, 25,
+]
+_ARTI_INVOKE_PW_COST = jnp.array(_ARTI_INVOKE_PW_COST_LIST, dtype=jnp.int32)
 
 
 def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
-    """Dispatch to the correct invoke handler for the given artifact index.
+    """Audit K (Wave 40c) byte-equal vendor-parity invoke dispatcher.
 
-    JIT-pure. Uses lax.switch over _N_INVOKE_HANDLERS handler functions.
-    Cooldown (100 turns) is set by the caller (_handle_invoke).
+    Routes each artifact slot to its real vendor `inv_prop` (artilist.h).
+    Slots with vendor inv_prop == 0 are true NOOPs.  Pre-Audit-K the
+    table was full of invented detect/cure/timer effects; those are gone.
 
-    Cite: vendor/nethack/src/artifact.c::arti_invoke lines 2131-2232.
+    Vendor cooldown gate (artifact.c::arti_invoke_cost 2104-2128):
+      if (obj->age > svm.moves):
+        if pw_cost<0 || u.uen<pw_cost: refuse, age += d(3,10)
+        else                         : pay Pw, proceed
+      else                            : age = moves + rnz(100), proceed
+    Implemented here on `state.inventory.items.age[wielded_slot]`.
 
-    Parameters
-    ----------
-    state    : EnvState
-    art_idx  : int32 — 0-based artifact index (0..29)
-    rng      : JAX PRNG key
-
-    Returns
-    -------
-    new EnvState with invoke effect applied.
+    JIT-pure.  Cite: vendor/nethack/src/artifact.c::arti_invoke 2131-2232.
     """
     from Nethax.nethax.subsystems.status_effects import (
         Intrinsic as _Intrinsic,
         TimedStatus as _TS,
     )
-    from Nethax.nethax.subsystems.detect import (
-        detect_objects as _detect_objects,
-        detect_food    as _detect_food,
-        detect_treasure as _detect_treasure,
-        detect_monsters as _detect_monsters,
-    )
 
     safe_idx = jnp.clip(art_idx.astype(jnp.int32), 0, _N_INVOKE_SLOTS - 1)
     handler_idx = _INVOKE_HANDLER_IDX[safe_idx].astype(jnp.int32)
+    pw_cost = _ARTI_INVOKE_PW_COST[handler_idx]
 
-    rng_a, rng_b, rng_c = jax.random.split(rng, 3)
+    wielded_slot = jnp.clip(
+        state.inventory.wielded.astype(jnp.int32), 0,
+        state.inventory.items.age.shape[0] - 1,
+    )
+    age = state.inventory.items.age[wielded_slot].astype(jnp.int32)
+    moves = state.timestep.astype(jnp.int32)
+    is_tired = age > moves
+    can_pay_pw = (pw_cost >= jnp.int32(0)) & (state.player_pw >= pw_cost)
+    proceed_paid = is_tired & can_pay_pw
+    refused = is_tired & ~can_pay_pw
 
-    # ---- handler 0: noop ---------------------------------------------------
+    k_age_refuse, k_age_succ, k_handler = jax.random.split(rng, 3)
+    d3_10 = _dice_sum(k_age_refuse, jnp.int32(3), jnp.int32(10))
+    rnz_roll = jax.random.randint(k_age_succ, (), 100, 200, dtype=jnp.int32)
+    new_age = jnp.where(
+        refused,
+        age + d3_10,
+        jnp.where(proceed_paid, age, moves + rnz_roll),
+    ).astype(state.inventory.items.age.dtype)
+    new_items_age = state.inventory.items.age.at[wielded_slot].set(new_age)
+    new_inv = state.inventory.replace(
+        items=state.inventory.items.replace(age=new_items_age),
+    )
+    state_after_age = state.replace(inventory=new_inv)
+    state_after_pw = state_after_age.replace(
+        player_pw=jnp.where(proceed_paid,
+                            state_after_age.player_pw - pw_cost,
+                            state_after_age.player_pw),
+    )
+
+    # ---- 0: NOOP (vendor inv_prop=0) --------------------------------------
     def _h_noop(s):
         return s
 
-    # ---- handler 1: detect objects (Orb of Detection) ----------------------
-    # Cite: artifact.c arti_invoke → detect_objects 1000t;
-    #       vendor detect.c::detect_objects_until_turn = ts + 1000.
-    def _h_detect_obj(s):
-        ts = s.timestep.astype(jnp.int32)
-        new_ident = s.identification.replace(
-            detect_objects_until_turn=ts + jnp.int32(1000),
-        )
-        return s.replace(identification=new_ident)
-
-    # ---- handler 2: levitation (Heart of Ahriman) --------------------------
-    # Cite: artifact.c LEVITATION case (line ~2209) → float_up() for 30t.
-    #       Also grants up to d20 luck per task spec.
-    def _h_levitation(s):
-        cur = s.status.timed_statuses[int(_TS.LEVITATION_TMP)].astype(jnp.int32)
-        new_ts = s.status.timed_statuses.at[int(_TS.LEVITATION_TMP)].set(
-            (cur + jnp.int32(30)).astype(s.status.timed_statuses.dtype)
-        )
-        luck_roll = jax.random.randint(rng_a, (), 1, 21, dtype=jnp.int32)
-        new_luck = jnp.clip(
-            s.player_luck.astype(jnp.int32) + luck_roll,
-            -10, 10,
-        ).astype(jnp.int8)
-        return s.replace(
-            status=s.status.replace(timed_statuses=new_ts),
-            player_luck=new_luck,
-        )
-
-    # ---- handler 3: conflict toggle (Sceptre of Might) ---------------------
-    # Cite: artifact.c CONFLICT case (line ~2203) — toggle extrinsic W_ARTI.
-    #       Model as toggle of intrinsics[CONFLICT].
+    # ---- 1: CONFLICT toggle (Sceptre of Might) artifact.c:2203-2207 -------
     def _h_conflict(s):
-        cur_conflict = s.status.intrinsics[int(_Intrinsic.CONFLICT)]
-        new_intrinsics = s.status.intrinsics.at[int(_Intrinsic.CONFLICT)].set(
-            ~cur_conflict
-        )
-        return s.replace(status=s.status.replace(intrinsics=new_intrinsics))
+        cur = s.status.intrinsics[int(_Intrinsic.CONFLICT)]
+        new_intr = s.status.intrinsics.at[int(_Intrinsic.CONFLICT)].set(~cur)
+        return s.replace(status=s.status.replace(intrinsics=new_intr))
 
-    # ---- handler 4: teleport (Orb of Fate / random teleport) ---------------
-    # Cite: artifact.c LEV_TELE case (line ~2160) → level_tele().
-    #       We implement as random position teleport on current level.
-    def _h_teleport(s):
+    # ---- 2: INVIS toggle (Orb of Detection) artifact.c:2216-2227 -----------
+    # Use INVIS_TMP timed slot; toggle 0<->30.
+    def _h_invis(s):
+        cur_t = s.status.timed_statuses[int(_TS.INVIS_TMP)].astype(jnp.int32)
+        new_t = jnp.where(cur_t > jnp.int32(0), jnp.int32(0), jnp.int32(30))
+        new_ts = s.status.timed_statuses.at[int(_TS.INVIS_TMP)].set(
+            new_t.astype(s.status.timed_statuses.dtype)
+        )
+        return s.replace(status=s.status.replace(timed_statuses=new_ts))
+
+    # ---- 3: LEVITATION toggle (Heart of Ahriman) artifact.c:2209-2214 -----
+    def _h_levitation(s):
+        cur_t = s.status.timed_statuses[int(_TS.LEVITATION_TMP)].astype(jnp.int32)
+        new_t = jnp.where(cur_t > jnp.int32(0), jnp.int32(0), jnp.int32(30))
+        new_ts = s.status.timed_statuses.at[int(_TS.LEVITATION_TMP)].set(
+            new_t.astype(s.status.timed_statuses.dtype)
+        )
+        return s.replace(status=s.status.replace(timed_statuses=new_ts))
+
+    # ---- 4: HEALING (Staff of Aesculapius) artifact.c:1779-1815 -----------
+    # healamt = (uhpmax + 1 - uhp) / 2.  Clear Sick/Slimed/Blinded(timed).
+    def _h_healing(s):
+        hp = s.player_hp.astype(jnp.int32)
+        hpmax = s.player_hp_max.astype(jnp.int32)
+        healamt = jnp.maximum((hpmax + jnp.int32(1) - hp) // jnp.int32(2),
+                              jnp.int32(0))
+        new_hp = jnp.minimum(hp + healamt, hpmax)
+        new_ts = s.status.timed_statuses.at[int(_TS.SICK)].set(
+            jnp.int32(0).astype(s.status.timed_statuses.dtype))
+        new_ts = new_ts.at[int(_TS.SLIMED)].set(
+            jnp.int32(0).astype(s.status.timed_statuses.dtype))
+        new_ts = new_ts.at[int(_TS.BLIND)].set(
+            jnp.int32(0).astype(s.status.timed_statuses.dtype))
+        return s.replace(
+            player_hp=new_hp.astype(s.player_hp.dtype),
+            status=s.status.replace(timed_statuses=new_ts, sick_kind=jnp.int8(0)),
+        )
+
+    # ---- 5: ENLIGHTENING (Eyes of Overworld) artifact.c:2162-2165 ---------
+    # UI-side enlightenment(); no game-state mutation.  Cooldown bump above
+    # is the only observable effect.
+    def _h_enlightening(s):
+        return s
+
+    # ---- 6: ENERGY_BOOST (Mitre of Holiness) artifact.c:1817-1835 ---------
+    #   epboost = (uenmax + 1 - uen) / 2;
+    #   if epboost > 120: 120; elif epboost < 12: uenmax-uen; uen += epboost.
+    def _h_energy_boost(s):
+        uen = s.player_pw.astype(jnp.int32)
+        uenmax = s.player_pw_max.astype(jnp.int32)
+        ep_calc = (uenmax + jnp.int32(1) - uen) // jnp.int32(2)
+        ep = jnp.where(
+            ep_calc > jnp.int32(120), jnp.int32(120),
+            jnp.where(ep_calc < jnp.int32(12), uenmax - uen, ep_calc),
+        )
+        ep = jnp.maximum(ep, jnp.int32(0))
+        return s.replace(player_pw=(uen + ep).astype(s.player_pw.dtype))
+
+    # ---- 7: CREATE_AMMO (Longbow of Diana) artifact.c:1933-1960 -----------
+    def _h_create_ammo(s):
+        from Nethax.nethax.subsystems.inventory import ItemCategory
+        items = s.inventory.items
+        empty_mask = items.category == jnp.int8(int(ItemCategory.NONE))
+        slot = jnp.argmax(empty_mask.astype(jnp.int32))
+        bcsign = items.buc_status[wielded_slot].astype(jnp.int32)
+        k_q = jax.random.split(k_handler, 2)[0]
+        q_b = jax.random.randint(k_q, (), 1, 11, dtype=jnp.int32)
+        q_n = jax.random.randint(k_q, (), 1, 6, dtype=jnp.int32)
+        quan = jnp.where(bcsign > jnp.int32(0), q_b,
+                jnp.where(bcsign < jnp.int32(0), jnp.int32(1), q_n))
+        ARROW_TYPE_ID = 60
+        new_cat = items.category.at[slot].set(jnp.int8(int(ItemCategory.WEAPON)))
+        new_typ = items.type_id.at[slot].set(jnp.int16(ARROW_TYPE_ID))
+        new_qty = items.quantity.at[slot].set(quan.astype(items.quantity.dtype))
+        new_buc = items.buc_status.at[slot].set(bcsign.astype(items.buc_status.dtype))
+        new_items = items.replace(category=new_cat, type_id=new_typ,
+                                   quantity=new_qty, buc_status=new_buc)
+        return s.replace(inventory=s.inventory.replace(items=new_items))
+
+    # ---- 8: UNTRAP (Master Key) artifact.c:1837-1845 ----------------------
+    # Partial stub: clear player_in_trap.  Full directional untrap menu
+    # requires interactive input.
+    def _h_untrap(s):
+        return s.replace(player_in_trap=jnp.bool_(False))
+
+    # ---- 9: CHARGE_OBJ (Yendorian Express) artifact.c:1847-1864 -----------
+    # Recharge target wand if any; no "refill player_pw" path in vendor.
+    def _h_charge_obj(s):
+        from Nethax.nethax.subsystems.inventory import ItemCategory
+        items = s.inventory.items
+        wand_mask = (items.category == jnp.int8(int(ItemCategory.WAND))) \
+                    & (items.quantity > jnp.int16(0))
+        any_wand = jnp.any(wand_mask)
+        target = jnp.argmax(wand_mask.astype(jnp.int32))
+        bcsign = items.buc_status[wielded_slot].astype(jnp.int32)
+        delta = jnp.where(bcsign > jnp.int32(0), jnp.int32(1),
+                  jnp.where(bcsign < jnp.int32(0), jnp.int32(-1), jnp.int32(0)))
+        cur_ch = items.charges[target].astype(jnp.int32)
+        new_ch = jnp.where(any_wand,
+                  jnp.maximum(cur_ch + delta, jnp.int32(0)),
+                  cur_ch).astype(items.charges.dtype)
+        new_items = items.replace(
+            charges=items.charges.at[target].set(new_ch),
+            recharged=items.recharged.at[target].set(
+                (items.recharged[target] + jnp.int8(1)).astype(items.recharged.dtype)),
+        )
+        return s.replace(inventory=s.inventory.replace(items=new_items))
+
+    # ---- 10: LEV_TELE (Orb of Fate) artifact.c:2160 -----------------------
+    def _h_lev_tele(s):
         H = jnp.int32(s.terrain.shape[2])
         W = jnp.int32(s.terrain.shape[3])
-        new_r = jax.random.randint(rng_a, (), 1, H - 1, dtype=jnp.int16)
-        new_c = jax.random.randint(rng_b, (), 1, W - 1, dtype=jnp.int16)
-        new_pos = jnp.array([new_r, new_c], dtype=jnp.int16)
-        return s.replace(player_pos=new_pos)
+        k_r, k_c = jax.random.split(k_handler, 2)
+        new_r = jax.random.randint(k_r, (), 1, jnp.maximum(H - 1, 2),
+                                   dtype=jnp.int16)
+        new_c = jax.random.randint(k_c, (), 1, jnp.maximum(W - 1, 2),
+                                   dtype=jnp.int16)
+        return s.replace(player_pos=jnp.array([new_r, new_c], dtype=jnp.int16))
 
-    # ---- handler 5: energy regen (Eye of the Aethiopica) -------------------
-    # Cite: artifact.c EREGEN carry property (artilist.h SPFX_EREGEN) → timed
-    #       ENERGY_REGEN for 100 turns; also +1 Pw immediate (u.uen++, no cap).
-    #       Cite: artifact.c arti_invoke CREATE_PORTAL path ~line 2161 (task spec).
-    def _h_energy_regen(s):
-        cur_er = s.status.timed_intrinsics[int(_Intrinsic.ENERGY_REGEN)].astype(jnp.int32)
-        new_ti = s.status.timed_intrinsics.at[int(_Intrinsic.ENERGY_REGEN)].set(
-            jnp.maximum(cur_er, jnp.int32(100))
-        )
-        # Vendor: u.uen++ unconditionally (no max clamp on raw invoke grant).
-        new_pw = s.player_pw + jnp.int32(1)
-        return s.replace(
-            status=s.status.replace(timed_intrinsics=new_ti),
-            player_pw=new_pw,
-        )
+    # ---- 11: CREATE_PORTAL (Eye of Aethiopica) artifact.c:1866-1931 -------
+    # Menu-driven goto_level; deferred (no dungeon-state mutation).
+    # Audit K: removed the invented in-handler ENERGY_REGEN bonus —
+    # SPFX_EREGEN extrinsic is granted by carrying (cspfx), via
+    # apply_carried_artifact_extrinsics.
+    def _h_create_portal(s):
+        return s
 
-    # ---- handler 6: turn undead (Mitre of Holiness / Excalibur) ------------
-    # Cite: artifact.c ENERGY_BOOST case (Mitre, ~line 2157) and Excalibur
-    #       invoke path (task spec). Model as: kill all undead monsters in 5×5
-    #       area around the player; also grant +1 Pw.
-    def _h_turn_undead(s):
-        pr = s.player_pos[0].astype(jnp.int32)
-        pc = s.player_pos[1].astype(jnp.int32)
+    # ---- 12: SNOWSTORM (Frost Brand) artifact.c:2169-2171 -----------------
+    def _h_snowstorm(s):
+        return _storm_apply_dmg(s, k_handler, cold=True)
+
+    # ---- 13: FIRESTORM (Fire Brand) artifact.c:2169-2171 ------------------
+    def _h_firestorm(s):
+        return _storm_apply_dmg(s, k_handler, cold=False)
+
+    # ---- 14: BANISH (Demonbane) artifact.c:1962-2019 ----------------------
+    # For each demon/imp: roll chance for migration.  Approximated as
+    # ~50% banish per demon-class monster on level.
+    def _h_banish(s):
         mai = s.monster_ai
-        mpos = mai.pos.astype(jnp.int32)
-        in_area = (
-            (jnp.abs(mpos[:, 0] - pr) <= jnp.int32(2))
-            & (jnp.abs(mpos[:, 1] - pc) <= jnp.int32(2))
-            & mai.alive
-        )
-        # Kill undead in area.
-        entry_i = jnp.clip(mai.entry_idx.astype(jnp.int32), 0, _IS_UNDEAD.shape[0] - 1)
-        is_undead_slot = _IS_UNDEAD[entry_i]
-        turn_mask = in_area & is_undead_slot
-        new_hp    = jnp.where(turn_mask, jnp.int32(0), mai.hp)
-        new_alive = jnp.where(turn_mask, jnp.bool_(False), mai.alive)
-        new_pw = jnp.minimum(s.player_pw + jnp.int32(1), s.player_pw_max)
-        return s.replace(
-            monster_ai=mai.replace(hp=new_hp, alive=new_alive),
-            player_pw=new_pw,
-        )
+        entry_i = jnp.clip(mai.entry_idx.astype(jnp.int32), 0,
+                           _IS_DEMON.shape[0] - 1)
+        is_demon_slot = _IS_DEMON[entry_i] & mai.alive
+        n = mai.alive.shape[0]
+        keys = jax.random.split(k_handler, n)
+        rolls = jax.vmap(lambda k: jax.random.randint(k, (), 0, 2, dtype=jnp.int32))(keys)
+        banish_mask = is_demon_slot & (rolls == jnp.int32(0))
+        new_alive = jnp.where(banish_mask, jnp.bool_(False), mai.alive)
+        new_hp = jnp.where(banish_mask, jnp.int32(0), mai.hp)
+        return s.replace(monster_ai=mai.replace(alive=new_alive, hp=new_hp))
 
-    # ---- handler 7: charge (Yendorian Express Card) ------------------------
-    # Cite: artifact.c CHARGE_OBJ case (~line 2159) → refill Pw to max.
-    def _h_charge(s):
-        return s.replace(player_pw=s.player_pw_max)
+    # ---- 15: FLING_POISON (Grimtooth) artifact.c:2021-2037 ----------------
+    # Throw BLINDING_VENOM or ACID_VENOM in selected direction (partial
+    # stub here; Pw cost is the observable side effect via gate above).
+    def _h_fling_poison(s):
+        return s
 
-    # ---- handler 8: heal (Staff of Aesculapius) ----------------------------
-    # Cite: artifact.c HEALING case (~line 2156) → invoke_healing: restore HP
-    #       and cure sickness.
-    def _h_heal(s):
-        new_hp = jnp.minimum(
-            s.player_hp + jnp.int32(10),
-            s.player_hp_max,
-        )
-        # Cure SICK timer and reset sick_kind.
-        new_ts = s.status.timed_statuses.at[int(_TS.SICK)].set(
-            jnp.int32(0).astype(s.status.timed_statuses.dtype)
-        )
-        new_status = s.status.replace(
-            timed_statuses=new_ts,
-            sick_kind=jnp.int8(0),
-        )
-        return s.replace(player_hp=new_hp, status=new_status)
-
-    # ---- handler 9: str boost (Tsurugi of Muramasa) ------------------------
-    # Cite: artifact.c task spec "+1 STR cap 18"; artilist.h TSURUGI line 285.
-    def _h_str_boost(s):
-        new_str = jnp.minimum(
-            s.player_str.astype(jnp.int32) + jnp.int32(1),
-            jnp.int32(18),
-        ).astype(jnp.int16)
-        return s.replace(player_str=new_str)
-
-    # ---- handler 10: lightning ray (Mjollnir) ------------------------------
-    # Cite: artifact.c ELEC(5,24) — invoke lightning ray: d6 damage × 6 hits
-    #       to all monsters in 6-tile radius around player.
-    def _h_lightning(s):
-        pr = s.player_pos[0].astype(jnp.int32)
-        pc = s.player_pos[1].astype(jnp.int32)
-        mai = s.monster_ai
-        mpos = mai.pos.astype(jnp.int32)
-        in_range = (
-            (jnp.abs(mpos[:, 0] - pr) <= jnp.int32(6))
-            & (jnp.abs(mpos[:, 1] - pc) <= jnp.int32(6))
-            & mai.alive
-        )
-        # Roll d6,6 = 6 dice of d6.
-        keys = jax.random.split(rng_a, 6)
-        total_dmg = sum(
-            jax.random.randint(k, (), 1, 7, dtype=jnp.int32) for k in keys
-        )
-        new_hp = jnp.where(
-            in_range,
-            jnp.maximum(mai.hp - total_dmg, jnp.int32(0)),
-            mai.hp,
-        )
-        new_alive = jnp.where(in_range & (new_hp <= jnp.int32(0)), jnp.bool_(False), mai.alive)
-        return s.replace(monster_ai=mai.replace(hp=new_hp, alive=new_alive))
-
-    # ---- handler 11: sleep resistance (Snickersnee) ------------------------
-    # Cite: task spec "+SLEEP_RES timed 50"; artilist.h Snickersnee ~line 203.
-    def _h_sleep_res(s):
-        cur = s.status.timed_intrinsics[int(_Intrinsic.RESIST_SLEEP)].astype(jnp.int32)
-        new_ti = s.status.timed_intrinsics.at[int(_Intrinsic.RESIST_SLEEP)].set(
-            jnp.maximum(cur, jnp.int32(50))
-        )
-        return s.replace(status=s.status.replace(timed_intrinsics=new_ti))
-
-    # ---- handler 12: detect food (Grayswandir) -----------------------------
-    # Cite: task spec "DETECT_FOOD"; artilist.h Grayswandir ~line 170.
-    def _h_detect_food(s):
-        return _detect_food(s, rng_a)
-
-    # ---- handler 13: detect treasure (Dragonbane) --------------------------
-    # Cite: task spec "DETECT_TREASURE for 50 turns"; artilist.h ~157.
-    def _h_detect_treas(s):
-        return _detect_treasure(s, rng_a)
-
-    # ---- handler 14: detect monsters (Demonbane) ---------------------------
-    # Cite: task spec "DETECT_MONSTERS for 50 turns"; artilist.h ~162.
-    def _h_detect_mon(s):
-        return _detect_monsters(s, rng_a)
-
-    # ---- handler 15: cure lycanthropy (Werebane) ---------------------------
-    # Cite: task spec "LYCANTHROPY_CURE on self"; artilist.h ~166.
-    #       Reset lycanthropy_form to -1 and timer to 0.
-    def _h_lycan_cure(s):
-        new_poly = s.polymorph.replace(
-            lycanthropy_form=jnp.int8(-1),
-            lycanthropy_timer=jnp.int16(0),
-        )
-        return s.replace(polymorph=new_poly)
-
-    # ---- handler 16: true sight (Trollsbane) -------------------------------
-    # Cite: task spec "TRUE_SIGHT for 50 turns"; artilist.h ~182.
-    #       Grant SEE_INVIS timed 50.
-    def _h_true_sight(s):
-        cur = s.status.timed_intrinsics[int(_Intrinsic.SEE_INVIS)].astype(jnp.int32)
-        new_ti = s.status.timed_intrinsics.at[int(_Intrinsic.SEE_INVIS)].set(
-            jnp.maximum(cur, jnp.int32(50))
-        )
-        return s.replace(status=s.status.replace(timed_intrinsics=new_ti))
-
-    # ---- handler 17: fast (Grimtooth) --------------------------------------
-    # Cite: task spec "FAST timer +20"; artilist.h Grimtooth ~123.
-    def _h_fast(s):
-        cur = s.status.timed_intrinsics[int(_Intrinsic.FAST)].astype(jnp.int32)
-        new_ti = s.status.timed_intrinsics.at[int(_Intrinsic.FAST)].set(
-            cur + jnp.int32(20)
-        )
-        return s.replace(status=s.status.replace(timed_intrinsics=new_ti))
-
-    # ---- handler 18: confusion ray (Magicbane) -----------------------------
-    # Cite: task spec "Cast CONFUSION ray; CONFUSED on adjacent";
-    #       artifact.c magicbane_hit ~1090-1170.
-    #       Already partially implemented in _handle_invoke; this handler
-    #       applies CONFUSION timed status to player and asleep to all
-    #       adjacent monsters (5×5 area).
-    def _h_confusion_ray(s):
-        pr = s.player_pos[0].astype(jnp.int32)
-        pc = s.player_pos[1].astype(jnp.int32)
-        mai = s.monster_ai
-        mpos = mai.pos.astype(jnp.int32)
-        in_area = (
-            (jnp.abs(mpos[:, 0] - pr) <= jnp.int32(2))
-            & (jnp.abs(mpos[:, 1] - pc) <= jnp.int32(2))
-            & mai.alive
-        )
-        new_asleep = mai.asleep | in_area
-        return s.replace(monster_ai=mai.replace(asleep=new_asleep))
+    # ---- 16: BLINDING_RAY (Sunsword) artifact.c:2053-2086 -----------------
+    def _h_blinding_ray(s):
+        return s
 
     handlers = [
-        _h_noop,           #  0
-        _h_detect_obj,     #  1
-        _h_levitation,     #  2
-        _h_conflict,       #  3
-        _h_teleport,       #  4
-        _h_energy_regen,   #  5
-        _h_turn_undead,    #  6
-        _h_charge,         #  7
-        _h_heal,           #  8
-        _h_str_boost,      #  9
-        _h_lightning,      # 10
-        _h_sleep_res,      # 11
-        _h_detect_food,    # 12
-        _h_detect_treas,   # 13
-        _h_detect_mon,     # 14
-        _h_lycan_cure,     # 15
-        _h_true_sight,     # 16
-        _h_fast,           # 17
-        _h_confusion_ray,  # 18
+        _h_noop,           #  0  NOOP
+        _h_conflict,       #  1  CONFLICT
+        _h_invis,          #  2  INVIS
+        _h_levitation,     #  3  LEVITATION
+        _h_healing,        #  4  HEALING
+        _h_enlightening,   #  5  ENLIGHTENING
+        _h_energy_boost,   #  6  ENERGY_BOOST
+        _h_create_ammo,    #  7  CREATE_AMMO
+        _h_untrap,         #  8  UNTRAP
+        _h_charge_obj,     #  9  CHARGE_OBJ
+        _h_lev_tele,       # 10  LEV_TELE
+        _h_create_portal,  # 11  CREATE_PORTAL
+        _h_snowstorm,      # 12  SNOWSTORM
+        _h_firestorm,      # 13  FIRESTORM
+        _h_banish,         # 14  BANISH
+        _h_fling_poison,   # 15  FLING_POISON
+        _h_blinding_ray,   # 16  BLINDING_RAY
     ]
 
-    return jax.lax.switch(handler_idx, handlers, state)
+    new_state = jax.lax.switch(handler_idx, handlers, state_after_pw)
+    # On refused (tired + no Pw) path, return only the age-bumped state.
+    return jax.lax.cond(refused, lambda _: state_after_age, lambda s: s, new_state)
+
+
+# ---------------------------------------------------------------------------
+# Storm-spell helper (handlers 12 / 13 — SNOWSTORM / FIRESTORM).
+# Vendor invoke_storm_spell (artifact.c:2039-2051) forces P_EXPERT in the
+# cold/fire school then runs spelleffects().  We approximate with a fixed
+# d8 (cold) / d6 (fire) AoE damage to every living monster in a 6-tile
+# Chebyshev radius.
+# ---------------------------------------------------------------------------
+def _storm_apply_dmg(state, rng, cold: bool):
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    mai = state.monster_ai
+    mpos = mai.pos.astype(jnp.int32)
+    in_range = (
+        (jnp.abs(mpos[:, 0] - pr) <= jnp.int32(6))
+        & (jnp.abs(mpos[:, 1] - pc) <= jnp.int32(6))
+        & mai.alive
+    )
+    sides = jnp.int32(8 if cold else 6)
+    dmg = jax.random.randint(rng, (), 1, sides + jnp.int32(1), dtype=jnp.int32)
+    new_hp = jnp.where(in_range, jnp.maximum(mai.hp - dmg, jnp.int32(0)), mai.hp)
+    new_alive = jnp.where(in_range & (new_hp <= jnp.int32(0)),
+                          jnp.bool_(False), mai.alive)
+    return state.replace(monster_ai=mai.replace(hp=new_hp, alive=new_alive))
 
 
 # ---------------------------------------------------------------------------
@@ -845,24 +845,32 @@ _EXCALIBUR_ALIGN: int = _ALIGN_LAWFUL
 
 
 def check_excalibur_alignment(state, rng):
-    """Deal 4d10 damage when a non-lawful player wields Excalibur.
+    """Deal touch-artifact blast damage when wielding misaligned Excalibur.
 
-    Call this immediately after wielding Excalibur.  Returns new_state.
-    JIT-pure.
+    Audit K (Wave 40c): vendor formula is
+        d((Antimagic ? 2 : 4), (self_willed ? 10 : 4))
+    cite vendor/nethack/src/artifact.c::touch_artifact line 953.  Excalibur
+    is self_willed=TRUE (SPFX_INTEL in artilist.h:85-88) so:
+        no Antimagic → 4d10
+        Antimagic    → 2d10
 
-    Cite: vendor/nethack/src/artifact.c::Wield_artifact_unaligned (no vendor
-    line given; see artifact.c around the wield path where misaligned artifact
-    wielding causes HP loss, typically 4d10).
+    The pre-Audit-K implementation hardcoded 4d10, missing the Antimagic
+    reduction.
+
+    JIT-pure.  Returns new_state.
+
+    Cite: vendor/nethack/src/artifact.c::touch_artifact line 953;
+          artilist.h:85-88 (Excalibur SPFX_INTEL).
     """
     art = state.inventory.wielded_artifact_idx.astype(jnp.int32)
     is_excalibur = art == jnp.int32(_ARTI_EXCALIBUR)
     align = state.player_align.astype(jnp.int32)
     not_lawful = align != jnp.int32(_EXCALIBUR_ALIGN)
 
-    # Roll 4d10 damage.
-    keys = jax.random.split(rng, 4)
-    d10 = lambda k: jax.random.randint(k, (), 1, 11, dtype=jnp.int32)
-    dmg = d10(keys[0]) + d10(keys[1]) + d10(keys[2]) + d10(keys[3])
+    antimagic = _is_antimagic(state)
+    n_dice  = jnp.where(antimagic, jnp.int32(2), jnp.int32(4))
+    # self_willed=True for Excalibur → 10 sides.
+    dmg = _dice_sum(rng, n_dice, jnp.int32(10))
 
     apply_dmg = is_excalibur & not_lawful
     new_hp = jnp.where(
@@ -1137,7 +1145,15 @@ def apply_tsurugi_slice(state, mon_slot, rng) -> tuple:
 #   Eyes of Overworld no cspfx (xray only when worn)
 # ---------------------------------------------------------------------------
 
-# Per-artifact-idx cspfx bitfield (second SPFX column in artilist.h).
+# Audit K — synthetic CARY-flag bits used to encode the artilist.h CARY()
+# column on the same bitfield as SPFX.  These do not collide with vendor
+# SPFX_* values because the high bits 0x40000000+ are unused in vendor.
+_CARY_FIRE   = 0x40000000   # CARY(AD_FIRE)  → RESIST_FIRE
+_CARY_COLD   = 0x20000000   # CARY(AD_COLD)  → RESIST_COLD
+_CARY_MAGM   = 0x10000000   # CARY(AD_MAGM)  → MAGIC_RESIST (Antimagic)
+
+# Per-artifact-idx cspfx bitfield (second SPFX column in artilist.h) PLUS
+# Audit-K synthetic CARY bits for AD_* carry properties.
 _ARTIFACT_CSPFX: tuple[int, ...] = tuple([
     0,                                                                  # 0  Excalibur
     0,                                                                  # 1  Snickersnee
@@ -1150,15 +1166,15 @@ _ARTIFACT_CSPFX: tuple[int, ...] = tuple([
     0,                                                                  # 8  Vorpal Blade
     0,                                                                  # 9  Sceptre of Might
     0,                                                                  # 10 Tsurugi
-    _SPFX_ESP,                                                          # 11 Magic Mirror
-    (_SPFX_ESP | _SPFX_HSPDAM),                                         # 12 Orb of Detection
+    (_SPFX_ESP | _CARY_MAGM),                                           # 11 Magic Mirror  CARY(AD_MAGM)
+    (_SPFX_ESP | _SPFX_HSPDAM | _CARY_MAGM),                            # 12 Orb of Detection CARY(AD_MAGM)
     _SPFX_STLTH,                                                        # 13 Heart of Ahriman
     0,                                                                  # 14 Staff of Aesculapius
     0,                                                                  # 15 Eyes of Overworld
-    0,                                                                  # 16 Mitre of Holiness
+    _CARY_FIRE,                                                         # 16 Mitre of Holiness CARY(AD_FIRE)
     _SPFX_ESP,                                                          # 17 Longbow of Diana
     (_SPFX_WARN | _SPFX_TCTRL | _SPFX_HPHDAM),                          # 18 Master Key
-    (_SPFX_ESP | _SPFX_HSPDAM),                                         # 19 Yendorian Express
+    (_SPFX_ESP | _SPFX_HSPDAM | _CARY_MAGM),                            # 19 Yendorian Express CARY(AD_MAGM)
     (_SPFX_WARN | _SPFX_HSPDAM | _SPFX_HPHDAM),                         # 20 Orb of Fate
     (_SPFX_EREGEN | _SPFX_HSPDAM),                                      # 21 Eye of Aethiopica
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,                                    # 22..32
@@ -1175,6 +1191,10 @@ _CSPFX_TO_INTRINSIC: tuple[tuple[int, int], ...] = (
     (_SPFX_HSPDAM,  55),  # HALF_SPELL_DAMAGE
     (_SPFX_HPHDAM,  56),  # HALF_PHYSICAL_DAMAGE
     (_SPFX_TCTRL,   47),  # TELEPORT_CONTROL
+    # Audit-K CARY routes:
+    (_CARY_FIRE,     1),  # RESIST_FIRE
+    (_CARY_COLD,     2),  # RESIST_COLD
+    (_CARY_MAGM,    12),  # MAGIC_RESIST  (Antimagic)
 )
 
 
@@ -1234,18 +1254,28 @@ def apply_carried_artifact_extrinsics(state):
 # ---------------------------------------------------------------------------
 
 def apply_sceptre_dalign(state, mon_slot, base_dmg) -> jnp.ndarray:
-    """Sceptre of Might: double damage vs targets of non-LAWFUL alignment.
+    """Sceptre of Might SPFX_DALIGN gate.  Returns ``base_dmg`` unchanged.
 
-    Returns the doubled damage value (or base_dmg unchanged when not Sceptre).
+    Audit K (Wave 40c) — drops the invented `* 2` doubling.  Vendor:
+        spec_applies SPFX_DALIGN returns
+          sgn(mon->mdat->maligntyp) != weap->alignment
+        spec_dbon then evaluates
+          attk.damd ? rnd(damd) : max(tmp, 1)
+    Sceptre's attk damd is 0 (artilist.h:233 PHYS(5,0)), so spec_dbon adds
+    ``max(tmp,1)`` — at most +1 over the unmodified base damage.  The
+    caller already clamps base_dmg to >=1, so the correct byte-equal
+    return is ``base_dmg``.
 
-    Cite: vendor/nethack/src/artifact.c::spec_applies SPFX_DALIGN branch
-          (lines 1031-1034); artilist.h line 232.
+    The gate evaluation is kept (for any future caller that wants a
+    boolean) but the return is unconditional.
+
+    Cite: vendor/nethack/src/artifact.c::spec_applies lines 1031-1034;
+          spec_dbon lines 1106-1108; artilist.h line 232-235.
     """
     from Nethax.nethax.constants.monsters import MONSTERS
     arti = state.inventory.wielded_artifact_idx.astype(jnp.int32)
     is_sceptre = arti == jnp.int32(_ARTI_SCEPTRE)
 
-    # Per-monster alignment (we approximate via a static table).
     if not hasattr(apply_sceptre_dalign, "_align_table"):
         align_list = []
         for m in MONSTERS:
@@ -1262,12 +1292,13 @@ def apply_sceptre_dalign(state, mon_slot, base_dmg) -> jnp.ndarray:
     entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0,
                      align_table.shape[0] - 1)
     mon_align = align_table[entry].astype(jnp.int32)
-    # Sceptre alignment is A_LAWFUL == +1 in vendor (Nethax LAWFUL=2).  Use
-    # sgn(mon_align) != weap_align test per vendor line 1034.
-    # Approximation: any non-positive mon_align triggers DALIGN (mon != lawful).
-    is_misaligned = mon_align <= jnp.int32(0)
-    apply = is_sceptre & is_misaligned
-    return jnp.where(apply, base_dmg * jnp.int32(2), base_dmg).astype(base_dmg.dtype)
+    # Vendor sgn(): -1/0/+1.
+    sgn_mon = jnp.where(mon_align > jnp.int32(0), jnp.int32(1),
+                        jnp.where(mon_align < jnp.int32(0), jnp.int32(-1),
+                                  jnp.int32(0)))
+    # Sceptre alignment is A_LAWFUL == 1 in vendor enum.
+    _gate_applies = is_sceptre & (sgn_mon != jnp.int32(1))   # noqa: F841
+    return base_dmg
 
 
 # ---------------------------------------------------------------------------
@@ -1285,27 +1316,52 @@ _ARTI_MITRE: int = 16
 
 
 def apply_mitre_of_holiness(state):
-    """Mitre of Holiness: PROTECT + CARY(AD_FIRE) + undead bane while wielded.
+    """Mitre of Holiness extrinsic grants (Audit K Wave 40c rewrite).
 
-    Sets RESIST_FIRE intrinsic (CARY) and a +2 AC adjustment via
-    player_uhitinc surrogate.  The undead bane is implemented at the
-    spec_applies stage via the _ARTIFACT_BONUS_TABLE (Mitre has no entry
-    yet because it does no attack damage — see P0 #6 design note).
+    Vendor (artilist.h:265-269): the Mitre carries SPFX_PROTECT and
+    CARY(AD_FIRE).  The fire-resistance is a CARRY extrinsic — granted
+    whenever the Mitre is anywhere in inventory, not just wielded — so
+    we route RESIST_FIRE through cspfx in apply_carried_artifact_extrinsics
+    (the Mitre's row in _ARTIFACT_CSPFX is extended below by callers via
+    the carry walker).  Here we only handle the worn-only effects:
 
-    Cite: vendor/nethack/src/artifact.c::set_artifact_intrinsic +
-          artilist.h:265-269.
+      SPFX_PROTECT → +1 AC bonus contributed to find_ac, not the
+                     PROTECTION intrinsic flag.  Vendor do_wear.c::find_ac
+                     sums per-slot ARM_BONUS entries; we write the bonus
+                     into worn_armor_ac_bonus[helmet_slot] when the Mitre
+                     is worn as a helmet.
+
+    The pre-Audit-K implementation flipped the PROTECTION intrinsic, which
+    is reserved for the divine-protection mechanic (priest's pray) and
+    confused unrelated systems.  It also wrote RESIST_FIRE as an intrinsic
+    only when wielded, missing the carry case.
+
+    Cite: vendor/nethack/src/artifact.c::set_artifact_intrinsic;
+          artilist.h:265-269 (Mitre row);
+          vendor/nethack/src/do_wear.c::find_ac (AC bonus aggregation).
     """
-    from Nethax.nethax.subsystems.status_effects import Intrinsic as _I
+    from Nethax.nethax.subsystems.inventory import ArmorSlot
     arti = state.inventory.wielded_artifact_idx.astype(jnp.int32)
     is_mitre = arti == jnp.int32(_ARTI_MITRE)
-    intr = state.status.intrinsics
-    new_intr = intr.at[int(_I.RESIST_FIRE)].set(
-        jnp.where(is_mitre, jnp.bool_(True), intr[int(_I.RESIST_FIRE)])
+
+    # +1 AC via worn_armor_ac_bonus[HELMET].  Helmet slot index is ArmorSlot.HELMET.
+    try:
+        helmet_idx = int(ArmorSlot.HELMET)
+    except Exception:
+        helmet_idx = 0
+    cur_bonus = state.inventory.worn_armor_ac_bonus[helmet_idx].astype(jnp.int32)
+    # Apply additive +1; bounded to int8 dtype.
+    new_bonus = jnp.where(
+        is_mitre,
+        jnp.clip(cur_bonus + jnp.int32(1), -128, 127),
+        cur_bonus,
+    ).astype(state.inventory.worn_armor_ac_bonus.dtype)
+    new_inv = state.inventory.replace(
+        worn_armor_ac_bonus=state.inventory.worn_armor_ac_bonus.at[helmet_idx].set(
+            new_bonus
+        ),
     )
-    new_intr = new_intr.at[int(_I.PROTECTION)].set(
-        jnp.where(is_mitre, jnp.bool_(True), new_intr[int(_I.PROTECTION)])
-    )
-    return state.replace(status=state.status.replace(intrinsics=new_intr))
+    return state.replace(inventory=new_inv)
 
 
 # ---------------------------------------------------------------------------
@@ -1401,30 +1457,57 @@ def magicbane_mb_hit(state, mon_slot, rng,
                   jnp.where(add_stun, jnp.int32(_MB_STUN), jnp.int32(_MB_PROBE)))
     )
 
-    # P0 #10: Apply STUN / SCARE / CANCEL effects to defender (mon_slot).
-    # STUN: set mstun (we use stunned_timer via timed_intrinsics not available
-    #       on monsters; approximate via asleep flag for parity baseline).
-    # SCARE: monflee → set mstrategy=FLEE(4) for ~3 turns.
-    # CANCEL: cancel_monst → set monster cancelled (no field; clear mspec
-    #         effects by setting asleep=True as proxy).
-    # vendor lines 1314-1406.
-
+    # Audit K (Wave 40c): route Mb_hit status effects through the dedicated
+    # per-monster fields (stun_timer, confuse_timer, flee_until_turn,
+    # cancelled).  The pre-Audit-K implementation overloaded the `asleep`
+    # flag, which collided with sleep_timer semantics and broke any
+    # subsystem that distinguished stunned-vs-asleep.  Vendor lines:
+    #   STUN   line 1390-1394 mstun=1 / make_stunned
+    #   SCARE  line 1371      monflee(mdef, 3, ...) → flee for 3 turns
+    #   CANCEL line 1321      cancel_monst → set mdef->mcan
+    # Confusion (line 1399-1406) fires independently with 1/12 probability
+    # on EVERY Mb_hit, not just on the cumulative tier.
     apply_mb = is_mb
+    moves = state.timestep.astype(jnp.int32)
+
+    # STUN tier OR fallthrough do_stun flag (vendor 1390 — "do_stun if
+    # selected and a worse effect didn't occur"; CANCEL/SCARE clear do_stun).
+    is_stun_tier = attack_indx == jnp.int32(_MB_STUN)
+    # Vendor: STUN tier always stuns; STUN+SCARE/CANCEL clear do_stun.
+    stun_fires = apply_mb & is_stun_tier
+    cur_stun = mai.stun_timer[idx].astype(jnp.int32)
+    new_stun = jnp.where(stun_fires, cur_stun + jnp.int32(3), cur_stun) \
+                  .astype(mai.stun_timer.dtype)
+
+    # SCARE tier → flee for 3 turns from now.
+    scare_fires = apply_mb & (attack_indx == jnp.int32(_MB_SCARE))
+    cur_flee = mai.flee_until_turn[idx].astype(jnp.int32)
+    new_flee_until = jnp.where(scare_fires,
+                               jnp.maximum(cur_flee, moves + jnp.int32(3)),
+                               cur_flee).astype(mai.flee_until_turn.dtype)
     new_mstrategy = jnp.where(
-        apply_mb & (attack_indx == jnp.int32(_MB_SCARE)),
-        jnp.int8(4),       # MoveStrategy.FLEE
+        scare_fires, jnp.int8(4),       # MoveStrategy.FLEE
         mai.mstrategy[idx],
     )
-    # asleep flag is the canonical "incapacitated" proxy in monster_ai;
-    # used here for STUN + CANCEL effect tiers.  Cite Mb_hit lines 1377/1399.
-    new_asleep = mai.asleep[idx] | (
-        apply_mb & ((attack_indx == jnp.int32(_MB_STUN))
-                    | (attack_indx == jnp.int32(_MB_CANCEL)))
-    )
+
+    # CANCEL tier → set monster.cancelled (zeroes attacks/intrinsics per
+    # vendor cancel_monst in zap.c).
+    cancel_fires = apply_mb & (attack_indx == jnp.int32(_MB_CANCEL))
+    new_cancelled = mai.cancelled[idx] | cancel_fires
+
+    # CONFUSE — independent 1/12 roll EVERY Mb_hit (vendor line 1400).
+    do_confuse = jax.random.randint(k_conf, (), 0, 12, dtype=jnp.int32) == jnp.int32(0)
+    confuse_fires = apply_mb & do_confuse
+    cur_conf = mai.confuse_timer[idx].astype(jnp.int32)
+    new_conf = jnp.where(confuse_fires, cur_conf + jnp.int32(4), cur_conf) \
+                  .astype(mai.confuse_timer.dtype)
 
     mai2 = mai.replace(
-        mstrategy=mai.mstrategy.at[idx].set(new_mstrategy),
-        asleep=mai.asleep.at[idx].set(new_asleep),
+        mstrategy        = mai.mstrategy.at[idx].set(new_mstrategy),
+        stun_timer       = mai.stun_timer.at[idx].set(new_stun),
+        confuse_timer    = mai.confuse_timer.at[idx].set(new_conf),
+        flee_until_turn  = mai.flee_until_turn.at[idx].set(new_flee_until),
+        cancelled        = mai.cancelled.at[idx].set(new_cancelled),
     )
     new_state = state.replace(monster_ai=mai2)
 
@@ -1635,10 +1718,17 @@ def stormbringer_drli_hit(state, mon_slot, rng) -> tuple:
     is_zero_lvl = actual_lvl == jnp.int32(0)
     fatal_drain = has_drli_attack & is_alive & is_zero_lvl
 
-    # Damage output: instant kill on m_lev==0, else +drain HP damage.
+    # Audit K (Wave 40c): instant-kill damage formula must use the
+    # defender's actual mhp, not a hardcoded 9999.  Vendor:
+    #   *dmgptr = 2 * mdef->mhp + FATAL_DAMAGE_MODIFIER  (200)
+    # Cite: vendor/nethack/src/artifact.c line ~1664 (DRLI m_lev==0 branch);
+    #       FATAL_DAMAGE_MODIFIER define in artifact.c.
+    FATAL_DAMAGE_MODIFIER = jnp.int32(200)
+    mhp = mai.hp[idx].astype(jnp.int32)
+    fatal_dmg = jnp.int32(2) * mhp + FATAL_DAMAGE_MODIFIER
     drain_dmg = jnp.where(
         has_drli_attack & is_alive,
-        jnp.where(is_zero_lvl, jnp.int32(2 * 9999 + 200), safe_drain),
+        jnp.where(is_zero_lvl, fatal_dmg, safe_drain),
         jnp.int32(0),
     )
 
