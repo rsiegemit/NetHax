@@ -398,8 +398,21 @@ def _try_step(state, dy: int, dx: int, rng: jax.Array):
         ttype == jnp.int32(int(_TT.SPIKED_PIT))
     )
     is_web   = ttype == jnp.int32(int(_TT.WEB))
-    is_lava  = jnp.bool_(False)  # LAVA trap kind not in TrapType enum; deferred
-    is_floor = jnp.bool_(False)  # INFLOOR (sandsink) not modeled here yet
+    # TT_LAVA — vendor trap.h: stuck-in-lava is a player utrap category, not
+    # a trap-tile type.  We detect it via the current terrain: if the player
+    # is standing on a LAVA tile, they're "stuck" and the utrap counter
+    # decrements each move attempt per trap.c:1617-1627.  Audit M item #62.
+    # Cite: vendor/nethack/src/trap.c lines 1617-1627 (TT_LAVA escape).
+    _terr_2d = _current_level_terrain(state)
+    _pr = state.player_pos[0].astype(jnp.int32)
+    _pc = state.player_pos[1].astype(jnp.int32)
+    _here_tile = _terr_2d[
+        jnp.clip(_pr, 0, _terr_2d.shape[0] - 1),
+        jnp.clip(_pc, 0, _terr_2d.shape[1] - 1),
+    ].astype(jnp.int32)
+    is_lava  = _here_tile == jnp.int32(int(TileType.LAVA))
+    # TT_INFLOOR (sandsink / quicksand): no Nethax tile yet, deferred.
+    is_floor = jnp.bool_(False)
 
     # Bear-trap escape: diagonal move OR rn2(5)==0 → decrement.
     bear_rn5 = jax.random.randint(rng_trap, (), 0, 5, dtype=jnp.int32) == jnp.int32(0)
