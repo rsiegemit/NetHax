@@ -369,6 +369,7 @@ _WAN_MAKE_INVISIBLE: int = 23 # WandEffect.MAKE_INVISIBLE
 # M-flag bits we need at JIT-time (vendor/nethack/include/monflag.h).
 _M1_FLY: int          = 0x00000001
 _M1_SWIM: int         = 0x00000002
+_M1_AMORPHOUS: int    = 0x00000004  # vendor monflag.h:87 — can flow under doors / through bars.
 _M1_AMPHIBIOUS: int   = 0x00000200
 _M1_BREATHLESS: int   = 0x00000400
 _M1_MINDLESS: int     = 0x00010000
@@ -378,7 +379,9 @@ _M1_NOHANDS: int      = 0x00002000
 _M1_SEE_INVIS: int    = 0x01000000
 
 _M2_UNDEAD: int       = 0x00000002
+_M2_HUMAN: int        = 0x00000008  # vendor monflag.h:126 — is a human.
 _M2_DEMON: int        = 0x00000100
+_M2_GIANT: int        = 0x00002000  # vendor monflag.h:136 — is_giant → BUSTDOOR.
 _M2_PEACEFUL: int     = 0x00200000
 
 # Tile constants — kept local to avoid an import cycle with constants.tiles.
@@ -389,6 +392,16 @@ _TILE_OPEN_DOOR: int   = 5  # see-thru in vendor; non-blocking for LoS.
 _TILE_WATER: int       = 8
 _TILE_LAVA: int        = 9
 _TILE_TREE: int        = 20  # blocks LoS per vendor vision.c:166.
+_TILE_IRONBARS: int    = 22  # IRONBARS — vendor mon.c:2225 ALLOW_BARS gate.
+
+# Trap-type codes (mirror constants/TrapType) that are "always avoided" in vendor —
+# pets/hostiles never path into a known fall/hole/lava-trap.  vendor mon.c:2353-2368
+# routes trap avoidance through mon_knows_traps; we treat these specific types as
+# always-known because they kill regardless of awareness.
+_TT_PIT: int        = 11
+_TT_SPIKED_PIT: int = 12
+_TT_HOLE: int       = 13
+_TT_TRAPDOOR: int   = 14
 
 
 class MoveStrategy(IntEnum):
@@ -714,6 +727,69 @@ def _has_flag2(entry_idx: jnp.ndarray, bit: int) -> jnp.ndarray:
     return (_entry_flag(entry_idx, _MONSTER_FLAGS2_TABLE) & jnp.int32(bit)) != 0
 
 
+# ---------------------------------------------------------------------------
+# mfndpos per-monster movement gates  (vendor/nethack/src/mon.c::mon_allowflags
+# lines 2062-2126 + mfndpos body lines 2140-2382).  Helpers return scalar bool
+# jnp.ndarray suitable for use inside JIT'd path/bfs masks.
+# ---------------------------------------------------------------------------
+
+def _mover_can_open_door(entry_idx: jnp.ndarray) -> jnp.ndarray:
+    """True iff this monster can walk through a closed (unlocked) door.
+
+    Vendor mon.c:2067 ``boolean can_open = !(nohands(mtmp->data)
+    || verysmall(mtmp->data));`` then 2100-2101 ``if (can_open)
+    allowflags |= OPENDOOR;``.
+
+    JAX approximation: a monster can open doors if it has hands
+    (~M1_NOHANDS) AND is at least roughly humanoid/intelligent — we use
+    M1_HUMANOID as a proxy for "not verysmall, has dexterous limbs",
+    plus humans / minotaurs via M2_HUMAN as a secondary proxy.  Amorphous
+    creatures also pass under closed doors (vendor mon.c:2234).
+    """
+    nohands   = _has_flag1(entry_idx, _M1_NOHANDS)
+    humanoid  = _has_flag1(entry_idx, _M1_HUMANOID)
+    human     = _has_flag2(entry_idx, _M2_HUMAN)
+    amorphous = _has_flag1(entry_idx, _M1_AMORPHOUS)
+    return ((~nohands) & (humanoid | human)) | amorphous
+
+
+def _mover_can_bust_door(entry_idx: jnp.ndarray) -> jnp.ndarray:
+    """True iff this monster busts closed/locked doors when bumping them.
+
+    Vendor mon.c:2070 ``doorbuster = is_giant(mtmp->data);`` then 2098-2099
+    ``if (doorbuster) allowflags |= BUSTDOOR;``.  ``is_giant`` is defined
+    as ``(mflags2 & M2_GIANT) != 0`` (mondata.h:107).
+    """
+    return _has_flag2(entry_idx, _M2_GIANT)
+
+
+def _mover_avoids_traps(entry_idx: jnp.ndarray) -> jnp.ndarray:
+    """True iff this monster avoids known traps when pathing.
+
+    Vendor mon.c:2353-2368: ``if (mon_knows_traps(mon, ttmp->ttyp))
+    continue;`` — i.e. the monster skips any tile carrying a trap it
+    knows about.  Mindless creatures (M1_MINDLESS) never know about
+    traps; everyone else conservatively does (we err on the side of
+    avoidance for non-mindless monsters).  Animals also typically avoid
+    visible traps once seen.
+    """
+    mindless = _has_flag1(entry_idx, _M1_MINDLESS)
+    return ~mindless
+
+
+def _mover_can_pass_bars(entry_idx: jnp.ndarray) -> jnp.ndarray:
+    """True iff this monster can move through iron bars (IRONBARS tile).
+
+    Vendor mon.c:2225-2230 ``if (ntyp == IRONBARS && !(flag & ALLOW_BARS))
+    continue;`` — ALLOW_BARS is set by ``passes_bars()`` (mondata.c:554),
+    which combines passes_walls / amorphous / unsolid / whirly /
+    verysmall / corrosive / metallivorous / slithy.  We use M1_AMORPHOUS
+    as the conservative JAX proxy (vendor monflag.h:87 — "can flow
+    under doors / through bars").
+    """
+    return _has_flag1(entry_idx, _M1_AMORPHOUS)
+
+
 def _monster_level(entry_idx: jnp.ndarray) -> jnp.ndarray:
     """Look up MONSTERS[entry_idx].level."""
     e = entry_idx.astype(jnp.int32)
@@ -907,28 +983,95 @@ def pathfind_step(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
     can_swim = _has_flag1(entry, _M1_SWIM) | _has_flag1(entry, _M1_AMPHIBIOUS)
     can_fly  = _has_flag1(entry, _M1_FLY)
 
+    # Wave 44a (vendor mon.c:2062-2126 mon_allowflags + mfndpos body 2225-2237):
+    # per-monster door / bars / trap gates.
+    door_opener = _mover_can_open_door(entry)
+    door_buster = _mover_can_bust_door(entry)
+    bars_passer = _mover_can_pass_bars(entry)
+    trap_avoider = _mover_avoids_traps(entry)
+
     # Mask of passable tiles for THIS mover.
     tile_field = terrain.astype(jnp.int32)
-    not_wall   = (tile_field != _TILE_WALL) & (tile_field != _TILE_CLOSED_DOOR) \
-                 & (tile_field != _TILE_TREE)
-    is_water   = (tile_field == _TILE_WATER)
-    is_lava    = (tile_field == _TILE_LAVA)
+    is_wall          = (tile_field == _TILE_WALL)
+    is_closed_door   = (tile_field == _TILE_CLOSED_DOOR)
+    is_tree          = (tile_field == _TILE_TREE)
+    is_ironbars      = (tile_field == _TILE_IRONBARS)
+    is_water         = (tile_field == _TILE_WATER)
+    is_lava          = (tile_field == _TILE_LAVA)
+
+    # vendor mon.c:2235-2237 — closed door blocks unless OPENDOOR or BUSTDOOR
+    # (thrudoor) is granted to the mover.
+    door_ok = door_opener | door_buster
+    # vendor mon.c:2225-2230 — iron bars block unless ALLOW_BARS (passes_bars).
+    bars_ok = bars_passer
+
+    not_wall   = ~is_wall & ~is_tree \
+                 & (~is_closed_door | door_ok) \
+                 & (~is_ironbars    | bars_ok)
     water_ok   = can_swim | can_fly
     lava_ok    = can_fly  # vendor: lava only flyable.
     terrain_ok = not_wall & jnp.where(is_water, water_ok, jnp.bool_(True)) \
                           & jnp.where(is_lava,  lava_ok,  jnp.bool_(True))
 
+    # ----- Trap-avoidance mask (vendor mon.c:2353-2368) ---------------------
+    # Build a [MAP_H, MAP_W] bool grid: True where the mover must NOT step.
+    # A tile is forbidden when:
+    #   (a) trap_type at that tile is a fall-/hole-trap (PIT/SPIKED_PIT/HOLE/
+    #       TRAPDOOR) — these are "always-known" because they're lethal
+    #       irrespective of awareness, and the mover is trap-avoiding, OR
+    #   (b) trap_type is any non-zero AND state.traps.revealed[here] is True
+    #       AND the mover is trap-avoiding (vendor mon_knows_traps gate).
+    # Mindless monsters skip all trap avoidance.
+    # We index state.traps with the flat per-level idx used elsewhere
+    # (vendor mon.c works per-current-level only).
+    max_lv  = jnp.int32(state.terrain.shape[1])
+    branch  = state.dungeon.current_branch.astype(jnp.int32)
+    level0  = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    flat_lv = branch * max_lv + level0
+    trap_t  = state.traps.trap_type[flat_lv].astype(jnp.int32)   # [MAP_H, MAP_W]
+    trap_rv = state.traps.revealed[flat_lv]                       # [MAP_H, MAP_W] bool
+
+    always_lethal = (
+        (trap_t == jnp.int32(_TT_PIT))
+        | (trap_t == jnp.int32(_TT_SPIKED_PIT))
+        | (trap_t == jnp.int32(_TT_HOLE))
+        | (trap_t == jnp.int32(_TT_TRAPDOOR))
+    )
+    known_any = (trap_t != jnp.int32(0)) & trap_rv
+    trap_block = (always_lethal | known_any) & trap_avoider
+
+    terrain_ok = terrain_ok & ~trap_block
+
     # MM_PEACEFUL: hostile movers do not path through peaceful monsters
     # (vendor mfndpos.h::ALLOW_M / MM_PEACEFUL handling).  Build a [MAP_H,
     # MAP_W] mask of "blocked by peaceful" using scatter.
+    #
+    # Wave 44a (vendor mon.c:2148 mm_displacement + 2305-2316):
+    # a tame mover MAY swap with another tame / peaceful monster on its path
+    # (ALLOW_MDISP).  When the mover is tame, do not block on friendly /
+    # peaceful tiles — only on alive monsters that are neither tame nor
+    # peaceful (i.e. hostile, which are "attack squares", still permitted
+    # as path destinations via ALLOW_M but treated as cost-1 nodes here).
     self_mask_n = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32) == idx
-    blocking_peaceful = mai.alive & mai.peaceful & ~self_mask_n  # [N]
-    # Scatter peaceful positions into a [MAP_H, MAP_W] occupancy mask.
+    self_is_tame = mai.tame[idx]
+    # Hostile movers: block on peaceful AND tame other monsters (don't trample
+    # friendlies).  Tame movers: pass through other tame/peaceful via
+    # mm_displacement.  Vendor mon.c:2148 mm_displacement returns ALLOW_MDISP
+    # when both monsters are tame OR both peaceful in the right configuration.
+    other_alive_peaceful = mai.alive & mai.peaceful & ~self_mask_n  # [N]
+    other_alive_tame     = mai.alive & mai.tame     & ~self_mask_n  # [N]
+    blocking_friendly = jnp.where(
+        self_is_tame,
+        # tame self: friendlies are SWAP-able, not blockers
+        jnp.zeros_like(other_alive_peaceful),
+        other_alive_peaceful | other_alive_tame,
+    )
+    # Scatter blocker positions into a [MAP_H, MAP_W] occupancy mask.
     occ = jnp.zeros((_MAP_H, _MAP_W), dtype=jnp.bool_)
     pp = mai.pos.astype(jnp.int32)
     safe_r = jnp.clip(pp[:, 0], 0, _MAP_H - 1)
     safe_c = jnp.clip(pp[:, 1], 0, _MAP_W - 1)
-    occ = occ.at[safe_r, safe_c].max(blocking_peaceful)
+    occ = occ.at[safe_r, safe_c].max(blocking_friendly)
 
     passable = terrain_ok & ~occ
 
