@@ -1670,6 +1670,154 @@ class _StateAdapter:
 # cast_spell  (spell.c:spelleffects)
 # ---------------------------------------------------------------------------
 
+_AMULET_OF_YENDOR_TYPE_ID = 188  # vendor objects.h AMULET_OF_YENDOR
+
+
+def _player_carrying_amulet_of_yendor(state) -> bool:
+    """Return True if any inventory slot holds the real Amulet of Yendor.
+
+    Vendor ``u.uhave.amulet`` is the persistent flag that is set when the hero
+    picks up the real Amulet (do.c::pickup_object) and cleared when it is
+    dropped or destroyed (do.c::drop_object).  We mirror it by scanning the
+    inventory for an item with type_id == AMULET_OF_YENDOR (188).
+    Cite: vendor/nethack/include/you.h u.uhave.amulet.
+    """
+    inv = state.inventory
+    cat = inv.items.category
+    tid = inv.items.type_id
+    # Amulet class items with type_id == AMULET_OF_YENDOR.
+    has = bool(jnp.any((cat != jnp.int8(0)) & (tid == jnp.int16(_AMULET_OF_YENDOR_TYPE_ID))))
+    return has
+
+
+def _spell_backfire(state, rng: jax.Array, spell_level: int):
+    """Apply vendor spell_backfire() side effects to ``state``.
+
+    Vendor: spell.c::spell_backfire lines 1181-1217.
+
+      duration = (spell_level + 1) * 3       # 6..24
+      switch (rn2(10)) {
+        0..3 : make_confused(old_conf + duration)        # 40% pure confusion
+        4..6 : make_confused(old_conf + 2*duration/3)
+               + make_stunned(old_stun + duration/3)     # 30% mixed
+        7..8 : make_stunned(old_stun + 2*duration/3)
+               + make_confused(old_conf + duration/3)    # 20% mixed
+          9  : make_stunned(old_stun + duration)         # 10% pure stun
+      }
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS
+    duration = (int(spell_level) + 1) * 3  # 6..24, identical to vendor
+    rng, sub = jax.random.split(rng)
+    branch = int(jax.random.randint(sub, (), 0, 10))  # rn2(10) = 0..9
+    ts = state.status.timed_statuses
+    old_conf = int(ts[int(_TS.CONFUSION)])
+    old_stun = int(ts[int(_TS.STUNNED)])
+    if branch <= 3:                              # 0..3 → 40%
+        new_conf = old_conf + duration
+        new_stun = old_stun
+    elif branch <= 6:                            # 4..6 → 30%
+        new_conf = old_conf + (2 * duration) // 3
+        new_stun = old_stun + duration // 3
+    elif branch <= 8:                            # 7..8 → 20%
+        new_stun = old_stun + (2 * duration) // 3
+        new_conf = old_conf + duration // 3
+    else:                                        # 9 → 10%
+        new_stun = old_stun + duration
+        new_conf = old_conf
+    new_ts = ts.at[int(_TS.CONFUSION)].set(jnp.int32(new_conf))
+    new_ts = new_ts.at[int(_TS.STUNNED)].set(jnp.int32(new_stun))
+    new_status = state.status.replace(timed_statuses=new_ts)
+    return state.replace(status=new_status), rng
+
+
+def _spelleffects_check(state, rng: jax.Array, spell_id: int):
+    """Pre-flight gate before a spell's effect handler runs.
+
+    Vendor: spell.c::spelleffects_check lines 1220-1379.  Returns a tuple
+    ``(action, new_state, new_rng, energy)`` where ``action`` is one of:
+
+      - ``"cast"``   : checks all passed; proceed to roll for cast.  Caller
+                       deducts ``energy`` from Pw on success.
+      - ``"noop"``   : refusal, no Pw spent, no turn consumed (ECMD_OK).
+      - ``"time"``   : refusal, but a turn was consumed (Pw drain handled
+                       here when applicable).  Caller returns immediately.
+
+    Implements (in vendor order):
+      1. UNKNOWN_SPELL gate (spell.c:1240).
+      2. Energy = spell_level * 5 (spell.c:1243).
+      3. spellknow(spell) <= 0 → spell_backfire + drain rnd(energy) Pw,
+         return ECMD_TIME (spell.c:1252-1266).
+      4. uhunger <= 10 → refuse (spell.c:1271-1273).
+      5. ACURR(A_STR) < 4 → refuse (spell.c:1274-1276).
+      6. check_capacity (Encumbrance >= STRESSED) → refuse w/ time
+         (spell.c:1280-1284).
+      7. u.uhave.amulet && u.uen >= energy → drain rnd(2*energy) Pw,
+         return ECMD_TIME (spell.c:1290-1303).
+      8. energy > u.uen → "not enough energy", refuse no time
+         (spell.c:1305-1320; Nethax already gates this earlier — kept for
+         completeness when amulet drain dropped u.uen below energy).
+    """
+    from Nethax.nethax.subsystems.status_effects import Encumbrance
+
+    sid = int(spell_id)
+    lv = int(_SPELL_LEVELS[sid])
+    energy = lv * 5
+
+    # 1. UNKNOWN_SPELL gate — vendor: ``spell == UNKNOWN_SPELL || rejectcasting()``.
+    # In Nethax the caller passes a SpellId enum value (always known), but the
+    # *player* may not actually know that spell.  Mirror vendor by requiring
+    # ``spell_known[sid]`` (set via study_book).  Cite: spell.c:1240.
+    if not bool(state.magic.spell_known[sid]):
+        return ("noop", state, rng, energy)
+
+    # 3. Forgotten-spell backfire — vendor spell.c:1252 ``if (spellknow(spell) <= 0)``.
+    # In Nethax, sp_know is encoded as MagicState.spell_memory[sid] decremented
+    # once per turn by age_spells.  When it hits 0 the spell is forgotten and
+    # casting triggers spell_backfire().
+    if int(state.magic.spell_memory[sid]) <= 0:
+        new_state, rng = _spell_backfire(state, rng, lv)
+        # Vendor: u.uen -= rnd(*energy); clamp at 0.
+        rng, sub = jax.random.split(rng)
+        drain = int(jax.random.randint(sub, (), 1, energy + 1))  # rnd(energy) = 1..energy
+        new_pw = max(int(new_state.player_pw) - drain, 0)
+        new_state = new_state.replace(player_pw=jnp.int32(new_pw))
+        return ("time", new_state, rng, energy)
+
+    # 4. Hunger gate — vendor: ``u.uhunger <= 10 && spellid != SPE_DETECT_FOOD``.
+    # Cite: spell.c:1271-1273.
+    if int(state.status.nutrition) <= 10 and sid != int(SpellId.DETECT_FOOD):
+        return ("noop", state, rng, energy)
+
+    # 5. Strength gate — vendor: ``ACURR(A_STR) < 4 && spellid != SPE_RESTORE_ABILITY``.
+    # Cite: spell.c:1274-1276.
+    if int(state.player_str) < 4 and sid != int(SpellId.RESTORE_ABILITY):
+        return ("noop", state, rng, energy)
+
+    # 6. Encumbrance gate — vendor: ``check_capacity(...)``, which returns
+    # TRUE when encumbrance >= MOD_ENCUMBER (STRESSED).
+    # Cite: spell.c:1280-1284; hack.c::check_capacity.
+    if int(state.status.encumbrance) >= int(Encumbrance.STRESSED):
+        return ("time", state, rng, energy)
+
+    # 7. Amulet of Yendor energy drain — vendor spell.c:1290-1303.
+    # Only triggers when player has sufficient energy to cast (otherwise the
+    # cast would have been rejected first and no drain occurs).
+    if _player_carrying_amulet_of_yendor(state) and int(state.player_pw) >= energy:
+        rng, sub = jax.random.split(rng)
+        drain = int(jax.random.randint(sub, (), 1, 2 * energy + 1))  # rnd(2*energy)
+        new_pw = max(int(state.player_pw) - drain, 0)
+        new_state = state.replace(player_pw=jnp.int32(new_pw))
+        # Vendor: ECMD_TIME is set; if drain dropped uen below energy, caller
+        # bails before deducting energy (we return "time" so the actual cast
+        # is skipped and a turn is consumed).
+        if new_pw < energy:
+            return ("time", new_state, rng, energy)
+        # Otherwise the cast continues with the post-drain Pw.
+        return ("cast", new_state, rng, energy)
+
+    return ("cast", state, rng, energy)
+
+
 def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
     """Cast spell_id.  Returns (new_state, success: bool).
 
@@ -1696,6 +1844,19 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
 
     # Pw check — early return, state unchanged
     if int(state.player_pw) < pw_cost:
+        return state, False
+
+    # Vendor pre-flight: spell.c::spelleffects_check (lines 1220-1379).
+    # Gates UNKNOWN_SPELL, forgotten-spell backfire, hunger, strength,
+    # encumbrance, and amulet-of-yendor energy drain.  Returns the action to
+    # take ("cast"/"noop"/"time"), an updated state (post-amulet-drain or
+    # post-backfire), and an updated rng key.
+    check_action, state, rng, _check_energy = _spelleffects_check(state, rng, sid)
+    if check_action == "noop":
+        return state, False
+    if check_action == "time":
+        # Vendor: turn was consumed but no spell cast.  Hunger/Pw effects
+        # already applied inside _spelleffects_check.
         return state, False
 
     # Audit-K fix: pass real skill tier so vendor's
