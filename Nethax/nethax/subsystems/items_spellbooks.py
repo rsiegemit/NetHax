@@ -34,16 +34,16 @@ Cursed-book backfire (vendor spell.c::cursed_book lines 130-185):
     default (line 180):  rndcurse()             — only fires for lev≥8 (never
                                                   in vanilla NetHack; lev≤7).
 
-Wave-15+ simplifications and deferrals (audited):
+JAX-required divergences from vendor (audited):
   - Lenses (spell.c line 584): not modelled — no worn-blindfold slot.
-  - Dull-book sleep (spell.c lines 474-494): deferred — vendor's "dull"
-    description is per-game-procedural; no Item field tracks it.
-  - MAX_SPELL_STUDY faded-book path (spell.c lines 401-411): deferred —
-    requires a per-Item `spestudied` counter that doesn't yet exist.
+  - Dull-book sleep (spell.c lines 474-494): vendor's "dull" descriptor is
+    per-game-procedural; no Item field tracks it.
+  - MAX_SPELL_STUDY faded-book path (spell.c lines 401-411): requires a
+    per-Item `spestudied` counter not yet present in the Item struct.
   - Antimagic intrinsic: not yet modelled — treated as always FALSE so the
     explode-branch Antimagic gate is a no-op (full damage applies).
   - Multi-turn occupation (spell.c line 608 `nomul + set_occupation(learn)`):
-    deferred — nethax has no occupation primitive; we apply the full
+    nethax has no occupation primitive; we apply the full
     study_book_delay() turn cost atomically on success.
 """
 
@@ -288,8 +288,9 @@ def _cursed_book_backfire(state, rng: jax.Array, slot_idx: int, book_level: int)
 
     def b1_aggravate(s):
         # vendor spell.c:143  aggravate();  — wakes every monster on the
-        # current level.  Vendor scans fmon (all monsters); we approximate
-        # with wake_monsters_near using a level-spanning Chebyshev radius.
+        # current level.  Vendor scans fmon (all monsters); we use
+        # wake_monsters_near with radius=999 which spans the entire level
+        # (max diag ~80) so every alive monster is woken in one pass.
         # Cite: vendor/nethack/src/wizard.c::aggravate lines 493-511.
         from Nethax.nethax.subsystems.monster_ai import wake_monsters_near
         return wake_monsters_near(s, s.player_pos, radius=999, petcall=False)

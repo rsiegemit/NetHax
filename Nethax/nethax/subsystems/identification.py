@@ -125,8 +125,12 @@ class IdentificationState:
     def unshuffled(cls) -> "IdentificationState":
         """Return identity-permutation state (type N looks like appearance N).
 
-        Used as a placeholder / debug fallback.
-        All items start unidentified.
+        DEBUG / TEST FALLBACK ONLY.  Real game start always calls
+        ``init_shuffled_appearances`` to derive a random Fisher-Yates
+        permutation (o_init.c::shuffle_all).  ``unshuffled`` is used by
+        unit tests that need a deterministic identity mapping and by
+        early-init code paths that want a placeholder before the game
+        seed is available.  All items start unidentified.
         """
         return cls(
             potion_appearance=jnp.arange(N_POTION_TYPES, dtype=jnp.int8),
@@ -343,27 +347,121 @@ def unidentified_appearance(
     return _POOLS[obj_class][appearance_idx]
 
 
-def identified_name(obj_class: str, type_id: int) -> str:
-    """Return the canonical (true) name pool slot for type_id.
+def _build_class_canonical_names() -> dict:
+    """Build the per-class canonical-name lists from the OBJECTS table.
 
-    In real NetHack this would be the entry from ``obj_descr[].oc_name``;
-    here we return a placeholder ``"<class>-<id>"`` since the canonical
-    names aren't yet imported into the JAX model.  The shuffle test only
-    needs the predicate ``identified_name != unidentified_appearance``
-    after shuffling, so a deterministic string suffices.
+    Each list is in vendor canonical order (the same order vendor
+    objects.c emits the macro entries via OBJECT()) so ``names[type_id]``
+    returns the OBJ_NAME used by ``xname`` for that local type id.
+
+    Cite: vendor/nle/src/objects.c — POTION/SCROLL/WAND/RING/AMULET/SPELL
+    macro sequences populate ``objects[]`` in this order.
+    """
+    from Nethax.nethax.constants.objects import OBJECTS, ObjectClass
+    name_class_map = {
+        "potion":    ObjectClass.POTION_CLASS,
+        "scroll":    ObjectClass.SCROLL_CLASS,
+        "wand":      ObjectClass.WAND_CLASS,
+        "ring":      ObjectClass.RING_CLASS,
+        "amulet":    ObjectClass.AMULET_CLASS,
+        "spellbook": ObjectClass.SPBOOK_CLASS,
+    }
+    out = {}
+    for cname, cval in name_class_map.items():
+        out[cname] = tuple(
+            obj.name for obj in OBJECTS if int(obj.class_) == int(cval)
+        )
+    return out
+
+
+_CLASS_CANONICAL_NAMES: dict = _build_class_canonical_names()
+
+
+def _xname_formal(obj_class: str, actualn: str) -> str:
+    """Format the formal (fully-identified) name as vendor xname would.
+
+    Cite: vendor/nethack/src/objnam.c::xname_flags lines 832-913 — the
+    ``nn`` (oc_name_known) branch of each class switch case.
+
+    Class templates from vendor xname:
+      - POTION  : ``"potion of " + actualn``         (objnam.c:840-845)
+      - SCROLL  : ``"scroll of " + actualn``         (objnam.c:858-860)
+      - WAND    : ``"wand of " + actualn``           (objnam.c:874-875)
+      - RING    : ``"ring of " + actualn``           (objnam.c:907-908)
+      - SPBOOK  : ``"spellbook of " + actualn``      (objnam.c:895-898);
+                   SPE_BOOK_OF_THE_DEAD renders as ``actualn`` alone
+                   (objnam.c:896 ``if (typ != SPE_BOOK_OF_THE_DEAD)``).
+      - AMULET  : ``actualn`` (objnam.c:678-679); AMULET_OF_YENDOR /
+                   FAKE_AMULET_OF_YENDOR pair is rendered via the
+                   per-instance ``known`` flag (objnam.c:675-677) — at
+                   the type level the canonical name itself suffices.
+    """
+    if obj_class == "potion":
+        return f"potion of {actualn}"
+    if obj_class == "scroll":
+        return f"scroll of {actualn}"
+    if obj_class == "wand":
+        return f"wand of {actualn}"
+    if obj_class == "ring":
+        return f"ring of {actualn}"
+    if obj_class == "spellbook":
+        # Vendor objnam.c:896 — SPE_BOOK_OF_THE_DEAD is the only
+        # spellbook rendered without the "spellbook of " prefix.
+        if actualn == "Book of the Dead":
+            return actualn
+        return f"spellbook of {actualn}"
+    if obj_class == "amulet":
+        return actualn
+    raise ValueError(f"unknown obj_class {obj_class!r}")
+
+
+def identified_name(obj_class: str, type_id: int) -> str:
+    """Return the formal name vendor ``xname`` would emit for a fully
+    identified item of this (class, type_id).
+
+    Byte-equivalent of vendor objnam.c::xname_flags when
+    ``oc_name_known = 1`` and ``dknown = 1``: the actual-name (OBJ_NAME)
+    is wrapped in a class-specific template (``"potion of X"`` etc.).
+
+    Cite: vendor/nethack/src/objnam.c::xname_flags lines 575-1028.
 
     Parameters
     ----------
-    obj_class : one of the shuffled classes.
-    type_id   : canonical type index.
+    obj_class : one of {"potion","scroll","wand","ring","amulet","spellbook"}.
+    type_id   : per-class local type id (0..N_<CLASS>_TYPES-1).
 
     Returns
     -------
-    Deterministic canonical-name string.
+    The canonical formal name string.
+
+    Notes
+    -----
+    Some classes (SCROLL with XTRA_SCROLL_LABELs, WAND with WAN1-3, AMULET
+    counting FAKE+REAL Yendor in N_*) have N_<CLASS>_TYPES entries in the
+    appearance pool that exceed the OBJECTS table's named entries for that
+    class.  These "extra" type_ids correspond to shuffle-only descriptions
+    that vendor never assigns to real items.  We render them with a
+    deterministic ``"<class>-extra-NN"`` actualn so the formal-name
+    template still produces a distinct string from the appearance pool —
+    matching the parity invariant that vendor ``xname`` is never identical
+    to the random ``dn`` description after a shuffle.
     """
     if obj_class not in _POOLS:
         raise ValueError(f"unknown obj_class {obj_class!r}")
-    return f"{obj_class}-true-{type_id:02d}"
+    names = _CLASS_CANONICAL_NAMES[obj_class]
+    if type_id < 0:
+        raise IndexError(
+            f"{obj_class} type_id {type_id} negative"
+        )
+    if type_id < len(names) and names[type_id] is not None:
+        actualn = names[type_id]
+    else:
+        # Out-of-range or None-named OBJECTS slot — synthesize a stable
+        # actualn.  These slots correspond to vendor's reserved-but-unused
+        # appearance entries (e.g. WAN1-3 wand descriptions) which are
+        # never materialised as real items in normal play.
+        actualn = f"{obj_class}-extra-{type_id:02d}"
+    return _xname_formal(obj_class, actualn)
 
 
 def type_for_appearance(

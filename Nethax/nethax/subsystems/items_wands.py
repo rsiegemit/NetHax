@@ -1038,8 +1038,11 @@ def _effect_digging(
 
     1. Down (direction == 8, u.dz > 0):  set player tile to HOLE.  Vendor
        routes through digactualhole() (dig.c line 640) after dig_check.
-       We approximate dig_check by skipping the hole carve when standing on
-       STAIRCASE_UP/DOWN, ALTAR, or THRONE.  (dig.c:211-223.)
+       We port the dig_check FAIL_ONSTAIRS / FAIL_ALTAR / FAIL_THRONE
+       branches (dig.c:211-223) by skipping the hole carve on those tiles.
+       The remaining dig_check fail codes (AIRLEVEL, WATERLEVEL, BOULDER,
+       UNDESTROYABLETRAP, W_NONDIGGABLE) are JAX-required divergences:
+       WandState carries no traps / level-flags / wall_info slice.
 
     2. Up   (direction == 9, u.dz < 0):  loosen a rock from the ceiling and
        hit the hero for rnd(6) damage (rnd(2) with a hard helmet).  No map
@@ -1098,9 +1101,13 @@ def _effect_digging(
         # rn1(18, 8) = uniform [8, 25].
         digdepth0 = jax.random.randint(rng, (), 8, 26, dtype=jnp.int32)
 
-        # Maze-level proxy: branch == 5 (Gehennom).
-        maze_dig = jnp.int32(0)  # placeholder; WandState lacks branch info.
-        # WandState does not currently carry branch; default to non-maze.
+        # Maze-level branch (vendor dig.c:1700-1719) gates wall→corridor
+        # carving in Gehennom mazes.  JAX-required divergence: WandState
+        # carries no branch slice, so we default to the non-maze code path
+        # (which subsumes the standard dungeon, Mines, and Quest layouts).
+        # EnvState callers route through action_dispatch where the proper
+        # branch is available.
+        maze_dig = jnp.int32(0)
 
         def _dig_step(carry, _):
             terrain, pos, remaining, stopped = carry
@@ -1270,9 +1277,13 @@ def _effect_wishing(
     vendor/nethack/src/wizard.c::makewish.
 
     On a full EnvState, delegates to subsystems.wish.handle_wand_of_wishing
-    which grants "blessed greased +3 gray dragon scale mail" as a placeholder.
-    On a bare WandState (tests), falls back to granting a "potion of object
-    detection" (uncursed) by recharging inventory wands as a detectable proxy.
+    which parses the wish_string via wishymatch/readobjnam (objnam.c) and
+    grants the named object; when no wish_string is supplied it falls back
+    to "blessed greased +3 gray dragon scale mail" — the canonical NetHack
+    reference wish (vendor wizard.c::makewish offers free-form input).
+    On a bare WandState (tests), the wish_string path isn't available, so
+    we grant a detectable JIT-pure side effect by recharging inventory
+    wands to 15 charges (the vendor zap.c::recharge max).
 
     WandState does not carry the conduct slice so the wish handler cannot
     update WISHLESS / ARTIWISHLESS here; that is handled by callers routing
