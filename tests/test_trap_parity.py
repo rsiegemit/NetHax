@@ -283,11 +283,14 @@ def test_sleep_gas_duration_1_to_25():
     )
 
 
-def test_landmine_damage_1_to_16():
-    """LANDMINE: rnd(16) = 1..16 damage (vendor trap.c:2533).
+def test_landmine_damage_total_with_recursive_pit():
+    """LANDMINE: rnd(16) base damage + recursive PIT rnd(6) (Audit M #27).
 
-    Note: prompt sheet said "d(4,8) = 4..32" but vendor source is
-    ``int damage = rnd(16);`` — vendor wins.
+    Vendor trap.c:2533 is ``int damage = rnd(16);`` for the landmine itself,
+    but trap.c:2587 sets ``trap->ttyp = PIT`` and trap.c:2594-2596 invokes
+    ``dotrap(trap, RECURSIVETRAP)`` so an additional ``rnd(6)`` PIT fall
+    damage lands on the same turn.  Total HP loss range is therefore
+    [1+1, 16+6] = [2, 22].
     """
     base = _make_state()
     base = _place(base, TrapType.LANDMINE)
@@ -296,11 +299,11 @@ def test_landmine_damage_1_to_16():
         rng = jax.random.PRNGKey(seed)
         out = trigger_trap_envstate(base, rng, 5, 5)
         losses.append(_hp_loss(base, out))
-    assert all(1 <= l <= 16 for l in losses), (
-        f"LANDMINE HP loss out of [1,16]: {sorted(set(losses))}"
+    assert all(2 <= l <= 22 for l in losses), (
+        f"LANDMINE total HP loss out of [2,22]: {sorted(set(losses))}"
     )
-    assert min(losses) <= 3 and max(losses) >= 13, (
-        f"Expected LANDMINE distribution to span 1..16, got "
+    assert min(losses) <= 6 and max(losses) >= 18, (
+        f"Expected LANDMINE+PIT distribution to span widely, got "
         f"min={min(losses)} max={max(losses)}"
     )
 

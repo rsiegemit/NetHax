@@ -688,25 +688,108 @@ def _trap_bear(state, rng):
 
 
 def _trap_landmine(state, rng):
-    """LANDMINE — rnd(16)=1..16 damage + WOUNDED_LEGS for rn1(35,41)=41..75.
+    """LANDMINE — vendor-parity ``trapeffect_landmine`` (lines 2527-2597).
 
-    vendor/nethack/src/trap.c:2533 — ``int damage = rnd(16);``
-    vendor/nethack/src/trap.c:2581-2582 — ``set_wounded_legs(LEFT_SIDE, rn1(35, 41));``
-                                          ``set_wounded_legs(RIGHT_SIDE, rn1(35, 41));``
-    rn1(35,41) = rn2(35)+41 = 41..75 turns; we set WOUNDED_LEGS to max of
-    the two limb rolls (vendor stores them separately on each leg).
+    Mirrors vendor/nethack/src/trap.c::trapeffect_landmine player branch:
+
+    * Audit M #25 — Iron-shoes damage gate (line 2537-2538): when wearing
+      ``IRON_SHOES``, damage is reduced to ``(damage + 3) / 4``.
+    * Audit M #26 — Levitation/Flying short-circuit (lines 2548-2550):
+      when ``Levitation`` or ``Flying`` is set, 2/3 chance (``rn2(3)``
+      non-zero) to skip trigger entirely and return without damage or
+      pit conversion.
+    * Audit M #24 — Per-leg WOUNDED_LEGS counters (lines 2581-2582):
+      vendor stores left/right side timers separately via
+      ``set_wounded_legs(LEFT_SIDE, rn1(35, 41))`` /
+      ``set_wounded_legs(RIGHT_SIDE, rn1(35, 41))``.  We APPROXIMATE
+      with a single ``WOUNDED_LEGS`` slot storing the max of the two
+      rolls (status_effects.py has only one WOUNDED_LEGS index).
+    * Audit M #27 — Recursive PIT conversion (lines 2587-2596): vendor
+      sets ``trap->ttyp = PIT`` then calls ``dotrap(trap, RECURSIVETRAP)``
+      to deliver pit damage from the freshly-converted tile.  We
+      approximate by applying ``rnd(6)`` PIT damage immediately after
+      landmine damage (the trap-type conversion happens later via the
+      caller's state mutation; ``trigger_trap_envstate`` already marks
+      the tile as revealed).  We also update ``state.traps.trap_type``
+      on the tile to ``PIT`` so subsequent triggers fire the pit branch.
+
+    Citations:
+      vendor/nethack/src/trap.c:2533 — ``int damage = rnd(16);``
+      vendor/nethack/src/trap.c:2537-2538 — iron-shoes ``(damage+3)/4``
+      vendor/nethack/src/trap.c:2548-2550 — Levitation/Flying skip
+      vendor/nethack/src/trap.c:2581-2582 — per-leg ``rn1(35, 41)``
+      vendor/nethack/src/trap.c:2587-2597 — PIT conversion + recursive trap
     """
-    from Nethax.nethax.subsystems.status_effects import TimedStatus
-    k0, k1, k2 = jax.random.split(rng, 3)
-    # vendor/nethack/src/trap.c:2533 — rnd(16) HP damage.
-    s = _apply_hp_damage(state, _d(k0, 16))
-    # vendor/nethack/src/trap.c:2581 — two rn1(35,41) wounded-leg timers;
-    # we record the max so the timed status persists for the longer of the two.
-    legs_left  = _d(k1, 35) + jnp.int32(40)
-    legs_right = _d(k2, 35) + jnp.int32(40)
-    return _set_timed_status(
-        s, int(TimedStatus.WOUNDED_LEGS), jnp.maximum(legs_left, legs_right)
+    from Nethax.nethax.subsystems.inventory import ArmorSlot
+    from Nethax.nethax.subsystems.status_effects import (
+        TimedStatus,
+        Intrinsic as _Intr,
     )
+    from Nethax.nethax.subsystems.character import ObjType as _ObjType
+
+    k_dmg, k_legL, k_legR, k_lev_skip, k_pit_dmg, k_pit_freeze = jax.random.split(rng, 6)
+
+    # vendor trap.c:2533 — rnd(16) base damage.
+    base_damage = _d(k_dmg, 16)
+
+    # Audit M #25 — iron-shoes damage gate.
+    inv = state.inventory
+    boots_idx = inv.worn_armor[int(ArmorSlot.BOOTS)].astype(jnp.int32)
+    has_boots = boots_idx >= jnp.int32(0)
+    safe_b = jnp.clip(boots_idx, 0, inv.items.type_id.shape[0] - 1)
+    boot_type = jnp.where(
+        has_boots,
+        inv.items.type_id[safe_b].astype(jnp.int32),
+        jnp.int32(0),
+    )
+    iron_shoes_worn = has_boots & (boot_type == jnp.int32(int(_ObjType.IRON_SHOES)))
+    damage = jnp.where(
+        iron_shoes_worn,
+        (base_damage + jnp.int32(3)) // jnp.int32(4),
+        base_damage,
+    )
+
+    # Audit M #26 — Levitation/Flying 2/3 skip (vendor: !already_seen branch
+    # returns immediately on rn2(3) non-zero, second already_seen branch also
+    # skips on rn2(3) non-zero; we collapse to a single 2/3 skip roll).
+    intrinsics = state.status.intrinsics
+    has_lev   = intrinsics[int(_Intr.LEVITATION)]
+    has_fly   = intrinsics[int(_Intr.FLYING)]
+    lev_or_fly = has_lev | has_fly
+    skip_roll = jax.random.randint(k_lev_skip, (), 0, 3) != jnp.int32(0)
+    skip_trigger = lev_or_fly & skip_roll
+
+    def _do_skip(s):
+        return s
+
+    def _do_fire(s):
+        # Apply landmine damage.
+        s1 = _apply_hp_damage(s, damage)
+        # Audit M #24 — two per-leg rn1(35, 41) rolls; approximated as max
+        # since traps state has only one WOUNDED_LEGS slot.
+        legs_left  = _d(k_legL, 35) + jnp.int32(40)
+        legs_right = _d(k_legR, 35) + jnp.int32(40)
+        s2 = _set_timed_status(
+            s1, int(TimedStatus.WOUNDED_LEGS), jnp.maximum(legs_left, legs_right)
+        )
+        # Audit M #27 — Recursive PIT: convert this tile's trap to PIT and
+        # immediately apply PIT damage + FROZEN climb-out turns (mirrors
+        # vendor's ``dotrap(trap, RECURSIVETRAP)`` call after trap->ttyp=PIT).
+        flat_lv = _flat_level_idx(s2)
+        row = s2.player_pos[0].astype(jnp.int32)
+        col = s2.player_pos[1].astype(jnp.int32)
+        new_trap_type = s2.traps.trap_type.at[flat_lv, row, col].set(
+            jnp.int8(int(TrapType.PIT))
+        )
+        new_traps = s2.traps.replace(trap_type=new_trap_type)
+        s3 = s2.replace(traps=new_traps)
+        # Recursive PIT effect: rnd(6) fall dmg + rn1(6,2)=2..7 FROZEN turns.
+        s4 = _apply_hp_damage(s3, _d(k_pit_dmg, 6))
+        return _set_timed_status(
+            s4, int(TimedStatus.FROZEN), _d(k_pit_freeze, 6) + jnp.int32(1)
+        )
+
+    return jax.lax.cond(skip_trigger, _do_skip, _do_fire, state)
 
 
 def _trap_rolling_boulder(state, rng):
