@@ -11,12 +11,28 @@ Canonical sources:
   vendor/nethack/src/detect.c::do_vicinity_map (lines 1448-1585)
   vendor/nethack/src/detect.c::cvt_sdoor_to_door (lines 1589-1604)
   vendor/nethack/src/teleport.c::safe_teleds  (lines 716-770)
+
+Line-of-sight helper:
+  Callers that need a vendor-parity LoS check (``cansee`` / ``couldsee`` /
+  ``clear_path`` from vendor vision.h/vision.c) should import the helpers
+  exposed in ``Nethax.nethax.subsystems.vision``.  The detect routines below
+  all reveal the entire current level (matching vendor's level-wide
+  ``map_object`` / ``map_monst`` sweeps with NO distance limit), so they do
+  not perform per-tile LoS gating themselves.
 """
 import jax
 import jax.numpy as jnp
 
 from Nethax.nethax.constants.tiles import TileType, VendorTileType
 from Nethax.nethax.subsystems.inventory import ItemCategory
+# Re-export the LoS primitives so that callers preferring the historical
+# detect.cansee / detect.couldsee names see them surfaced from this module.
+from Nethax.nethax.subsystems.vision import (  # noqa: F401  (public re-export)
+    cansee,
+    cansee_with_blind,
+    clear_path,
+    couldsee,
+)
 
 
 # ---------------------------------------------------------------------------
