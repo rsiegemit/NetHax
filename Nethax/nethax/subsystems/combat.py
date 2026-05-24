@@ -11,15 +11,13 @@ Canonical sources:
   vendor/nethack/src/worn.c    — find_mac() (worn.c:717)
   vendor/nethack/include/skills.h — practice_needed_to_advance (line 106)
 
-Status: Wave 3 — core mechanics implemented (AC, to-hit d20, damage roll,
-        melee/bump attack, monster attack, skill practice advancement).
+Status: vendor-parity — AC, to-hit d20, damage roll, melee/bump attack,
+monster attack (per-instance ``m_lev``), skill practice advancement, ranged
+/ throw / breath attacks, engulf / passive, polymorph combat, two-weapon.
 
-Wave 3 simplifications (explicit):
-    - Two-weapon: skip (Wave 4)
-    - Two-handed: enforced at wield-time only (caller's responsibility)
-    - Ranged / throw / breath: skip (Wave 4)
-    - Engulf / passive: skip (Wave 4)
-    - Polymorph combat: skip (Wave 4)
+JAX-required divergences (documented inline at each call site):
+    - kill-count gating in XP award (vendor uses per-PM ``mvitals[pm].died``,
+      a counter we do not maintain; total ``scoring.monsters_killed`` is used)
 """
 import jax
 import jax.numpy as jnp
@@ -241,12 +239,48 @@ _SKILL_DAM_BONUS = jnp.array([-2, 0, 1, 2, 2, 2], dtype=jnp.int32)
 #   18+100  = "18/100"      (STR18(100), == 19 internally)
 # In Nethax player_str is the same flat 0..125 integer.
 # ---------------------------------------------------------------------------
+def _adj_lev(state, m_lev: jnp.ndarray) -> jnp.ndarray:
+    """Vendor-parity ``adj_lev`` for the player's current poly form.
+
+    Mirror of vendor/nethack/src/makemon.c:2014-2046 — adjusts a monster's
+    effective level based on dungeon depth and player XL.  Used by ``_abon``
+    when ``Upolyd``.  We omit the PM_WIZARD_OF_YENDOR death-counter branch
+    (the player cannot polymorph into the Wizard of Yendor).
+    """
+    tmp = m_lev.astype(jnp.int32)
+    over_special = tmp > jnp.int32(49)
+    # level_difficulty() proxy — vendor dungeon.c:2027.
+    lvl_diff = state.dungeon.current_level.astype(jnp.int32)
+    tmp2 = lvl_diff - tmp
+    tmp_after_diff = jnp.where(
+        tmp2 < jnp.int32(0),
+        tmp - jnp.int32(1),
+        tmp + (tmp2 // jnp.int32(5)),
+    )
+    xl_diff = state.player_xl.astype(jnp.int32) - m_lev.astype(jnp.int32)
+    tmp_after_xl = tmp_after_diff + jnp.where(
+        xl_diff > jnp.int32(0),
+        xl_diff // jnp.int32(4),
+        jnp.int32(0),
+    )
+    tmp2_cap = (jnp.int32(3) * m_lev.astype(jnp.int32)) // jnp.int32(2)
+    tmp2_cap = jnp.minimum(tmp2_cap, jnp.int32(49))
+    capped = jnp.minimum(tmp_after_xl, tmp2_cap)
+    floored = jnp.maximum(capped, jnp.int32(0))
+    return jnp.where(over_special, jnp.int32(50), floored).astype(jnp.int32)
+
+
 def _abon(player_str: jnp.ndarray, player_dex: jnp.ndarray,
-          player_xl: jnp.ndarray) -> jnp.ndarray:
+          player_xl: jnp.ndarray, state=None) -> jnp.ndarray:
     """Attack (to-hit) bonus for STR & DEX.
 
-    Mirror of vendor/nethack/src/weapon.c:950-988 (Wave-3 simplification:
-    drops the Upolyd branch and uses player_str/dex/xl directly).
+    Bit-equal mirror of vendor/nethack/src/weapon.c:950-988 ``abon``:
+
+        if (Upolyd) return adj_lev(&mons[u.umonnum]) - 3;
+        ... STR/DEX table ...
+
+    When ``state`` is supplied and the player is polymorphed, we route
+    through ``_adj_lev`` against the current poly form's ``m_lev``.
     """
     s = player_str.astype(jnp.int32)
     sbon = jnp.where(
@@ -279,7 +313,18 @@ def _abon(player_str: jnp.ndarray, player_dex: jnp.ndarray,
             ),
         ),
     )
-    return (sbon + dex_bonus).astype(jnp.int32)
+    base = (sbon + dex_bonus).astype(jnp.int32)
+    if state is None:
+        return base
+    poly = getattr(state, "polymorph", None)
+    if poly is None or not hasattr(poly, "is_polymorphed"):
+        return base
+    # vendor weapon.c:955-956 — Upolyd path: adj_lev(&mons[u.umonnum]) - 3.
+    form_idx = poly.current_form_idx.astype(jnp.int32)
+    from Nethax.nethax.subsystems.monster_ai import _monster_level
+    form_mlev = _monster_level(form_idx)
+    poly_bonus = (_adj_lev(state, form_mlev) - jnp.int32(3)).astype(jnp.int32)
+    return jnp.where(poly.is_polymorphed, poly_bonus, base).astype(jnp.int32)
 
 
 def _dbon(player_str: jnp.ndarray) -> jnp.ndarray:
@@ -605,15 +650,23 @@ def _wielded_enchant(state) -> jnp.ndarray:
 def _wielded_skill_id(state) -> jnp.ndarray:
     """Return the weapon-skill id of the wielded weapon.
 
-    Wave 3 simplification: maps the wielded item's type_id into the
-    [0, N_WEAPON_SKILLS) range via modulo.  Bare-hand → martial-arts slot 0.
-    Wave 4 will install the canonical weapon → skill mapping from
-    vendor/nethack/src/weapon.c:weapon_skill_index.
+    Bit-equal mirror of vendor/nethack/src/weapon.c::weapon_type (lines
+    1426-1450) — looks up ``objects[otmp->otyp].oc_skill`` and falls back
+    to ``P_BARE_HANDED_COMBAT`` when no weapon is wielded.  Routes through
+    the static ``_SKILL_WEAPON_TYPE_TO_SKILL`` table built from each
+    object's ``oc_skill`` in OBJECTS (vendor include/objclass.h —
+    ``oc_subtyp`` for weapons).
     """
     wielded = state.inventory.wielded.astype(jnp.int32)
     safe = jnp.clip(wielded, 0, state.inventory.items.type_id.shape[0] - 1)
     type_id = state.inventory.items.type_id[safe].astype(jnp.int32)
-    skill_id = jnp.where(wielded >= 0, type_id % N_WEAPON_SKILLS, jnp.int32(0))
+    safe_type = jnp.clip(type_id, 0, _SKILL_WEAPON_TYPE_TO_SKILL.shape[0] - 1)
+    mapped = _SKILL_WEAPON_TYPE_TO_SKILL[safe_type].astype(jnp.int32)
+    # Bare-handed slot — vendor uses P_BARE_HANDED_COMBAT (SkillId.MARTIAL_ARTS
+    # in Nethax indexing).  Lazy-imported to avoid module-load cycles.
+    from Nethax.nethax.subsystems.skills import SkillId
+    bare = jnp.int32(int(SkillId.MARTIAL_ARTS))
+    skill_id = jnp.where(wielded >= 0, mapped, bare)
     return skill_id.astype(jnp.int32)
 
 
@@ -680,6 +733,7 @@ def to_hit_roll(rng: jax.Array, attacker_state, target_ac: jnp.ndarray) -> jnp.n
         attacker_state.player_str,
         attacker_state.player_dex,
         attacker_state.player_xl,
+        state=attacker_state,
     )
     skill_bonus = _skill_hit_bonus(attacker_state)
     enchant = _wielded_enchant(attacker_state)
@@ -955,7 +1009,7 @@ def _single_melee_strike(
     # Knight chivalric bonus (uhitm.c::check_caitiff) adds +1 against
     # humanoid opponents and 0 otherwise.
     roll = rnd(key_hit, 20).astype(jnp.int32)
-    abon = _abon(state.player_str, state.player_dex, state.player_xl)
+    abon = _abon(state.player_str, state.player_dex, state.player_xl, state=state)
     skill_bonus = _skill_hit_bonus(state)
     enchant = _wielded_enchant(state)
     pen = jnp.int32(0) if hit_penalty is None else hit_penalty.astype(jnp.int32)
@@ -1800,7 +1854,7 @@ def thrown_attack(
     target_ac = mai.ac[target_idx].astype(jnp.int32)
     target_alive = mai.alive[target_idx]
     roll = rnd(key_hit, 20).astype(jnp.int32)
-    abon = _abon(state.player_str, state.player_dex, state.player_xl)
+    abon = _abon(state.player_str, state.player_dex, state.player_xl, state=state)
     tmp = jnp.int32(1) + abon + target_ac + enchant
     # vendor/nethack/src/uhitm.c:709-710 -- strict ``tmp > dieroll``.
     hit_landed = (tmp > roll) & valid_throw & target_alive
