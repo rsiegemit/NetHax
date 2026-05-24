@@ -435,6 +435,12 @@ class MonsterAIState:
 
     Shapes use MAX_MONSTERS_PER_LEVEL so this struct is level-agnostic;
     callers index by [level] in the outer EnvState.
+
+    Wave 45a: ``m_lev`` (per-monster level) and ``blind_timer`` (turns of
+    blindness remaining) are reserved for vendor-parity consumers
+    (DRAIN_LIFE in magic.py, BLINDING_RAY / FLING_POISON in
+    artifact_powers.py).  The schema is ready; consumer wiring lands in a
+    follow-up wave.
     """
 
     # Accumulated movement points; a monster acts when this reaches its speed.
@@ -613,6 +619,21 @@ class MonsterAIState:
     last_drop_pos:  jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, 2]  int16
     last_drop_turn: jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL]     int32
 
+    # ---- Wave 45a: per-monster level + blind timer ----
+    # ``m_lev`` is the per-monster level field from vendor's ``struct monst``
+    # (include/monst.h).  Populated from MONSTERS[entry_idx].level at spawn;
+    # zero for slots not yet wired via monster_ai's internal spawn paths.
+    # Consumers (DRAIN_LIFE in magic.py, BLINDING_RAY in artifact_powers.py)
+    # are wired in a follow-up wave; the schema is ready now.
+    # Cite: vendor/nethack/include/monst.h::struct monst::m_lev.
+    m_lev: jnp.ndarray             # [MAX_MONSTERS_PER_LEVEL]  int16
+    # ``blind_timer`` mirrors ``mblinded`` from vendor monst.h — turns of
+    # blindness remaining.  Set by flash_hits_mon (zap.c:2925: mtmp->mblinded
+    # = damage turns).  Decremented once per turn (mon.c::mon_update_state).
+    # Cite: vendor/nethack/include/monst.h::mblinded;
+    #       vendor/nethack/src/zap.c::flash_hits_mon line ~2925.
+    blind_timer: jnp.ndarray       # [MAX_MONSTERS_PER_LEVEL]  int16
+
 
 def make_monster_ai_state() -> MonsterAIState:
     """Return a zero-initialized MonsterAIState for one level."""
@@ -669,6 +690,9 @@ def make_monster_ai_state() -> MonsterAIState:
         migrating=jnp.zeros(n, dtype=jnp.bool_),
         last_drop_pos=jnp.full((n, 2), -1, dtype=jnp.int16),
         last_drop_turn=jnp.zeros(n, dtype=jnp.int32),
+        # Wave 45a: per-monster level + blind timer (zero until set at spawn).
+        m_lev=jnp.zeros(n, dtype=jnp.int16),
+        blind_timer=jnp.zeros(n, dtype=jnp.int16),
     )
 
 
@@ -3709,6 +3733,10 @@ def clone_mon(state, mon_idx: jnp.ndarray, rng: jax.Array) -> object:
         new_asleep_v  = m.asleep.at[dead_idx].set(jnp.bool_(False))
         new_mstrat    = m.mstrategy.at[dead_idx].set(jnp.int8(MoveStrategy.HUNT))
         new_mcloned   = m.mcloned.at[dead_idx].set(jnp.bool_(True))
+        # Clone inherits parent's m_lev (vendor makemon.c::clone_mon copies
+        # mtmp2 = *mtmp1 before tweaking flags).
+        # Cite: vendor/nethack/src/makemon.c::clone_mon lines 837-944.
+        new_m_lev     = m.m_lev.at[dead_idx].set(m.m_lev[idx])
         # Halve parent HP too (vendor splits HP between original and clone).
         new_hp_parent = new_hp.at[idx].set(half_hp)
 
@@ -3731,6 +3759,7 @@ def clone_mon(state, mon_idx: jnp.ndarray, rng: jax.Array) -> object:
             asleep=new_asleep_v,
             mstrategy=new_mstrat,
             mcloned=new_mcloned,
+            m_lev=new_m_lev,
         )
         return s.replace(monster_ai=new_m)
 
@@ -4065,6 +4094,10 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     new_stun      = jnp.maximum(mai.stun_timer.astype(jnp.int32)      - 1, 0).astype(jnp.int16)
     new_confuse   = jnp.maximum(mai.confuse_timer.astype(jnp.int32)   - 1, 0).astype(jnp.int16)
     new_paralyzed = jnp.maximum(mai.paralyzed_timer.astype(jnp.int32) - 1, 0).astype(jnp.int16)
+    # Wave 45a: blind_timer ticks once per turn, floor at 0.
+    # Cite: vendor/nethack/src/mon.c::mon_update_state per-turn decrement;
+    #       vendor/nethack/include/monst.h::mblinded.
+    new_blind     = jnp.maximum(mai.blind_timer.astype(jnp.int32)     - 1, 0).astype(jnp.int16)
     # Vendor mspec_used decrement: vendor/nethack/src/allmain.c (per-turn
     # loop) ticks every monster's mspec_used so casts re-arm.
     new_mspec     = jnp.maximum(mai.mspec_used.astype(jnp.int32)      - 1, 0).astype(jnp.int16)
@@ -4075,6 +4108,7 @@ def monsters_step_all(state, rng: jax.Array) -> object:
         stun_timer=new_stun,
         confuse_timer=new_confuse,
         paralyzed_timer=new_paralyzed,
+        blind_timer=new_blind,
         mspec_used=new_mspec,
         asleep=new_asleep,
     )
@@ -4190,10 +4224,15 @@ def shrieker_summon(state, rng: jax.Array) -> object:
     new_peaceful = mai.peaceful.at[dead_idx].set(jnp.where(should, jnp.bool_(False), mai.peaceful[dead_idx]))
     new_asleep   = mai.asleep.at[dead_idx].set(jnp.where(should, jnp.bool_(False),  mai.asleep[dead_idx]))
     new_entry    = mai.entry_idx.at[dead_idx].set(jnp.where(should, jnp.int16(1),   mai.entry_idx[dead_idx]))
+    # Populate per-monster level from MONSTERS[entry_idx].level.
+    # Cite: vendor/nethack/include/monst.h::struct monst::m_lev (set at makemon).
+    summon_lev   = _MONSTER_LEVEL_TABLE[jnp.int32(1)].astype(mai.m_lev.dtype)
+    new_m_lev    = mai.m_lev.at[dead_idx].set(jnp.where(should, summon_lev, mai.m_lev[dead_idx]))
 
     new_mai = mai.replace(
         alive=new_alive, pos=new_pos, hp=new_hp, hp_max=new_hp_max,
         peaceful=new_peaceful, asleep=new_asleep, entry_idx=new_entry,
+        m_lev=new_m_lev,
     )
     return state.replace(monster_ai=new_mai)
 
