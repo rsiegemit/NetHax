@@ -713,21 +713,45 @@ def _h_tinning_kit(state, rng: jax.Array) -> object:
 # ---------------------------------------------------------------------------
 def _h_expensive_camera(state, rng: jax.Array) -> object:
     from Nethax.nethax.subsystems.status_effects import TimedStatus
-    # Flash blinds the player for 50 turns if no target (use_camera line 67-74).
-    # Vendor blinding a monster: handled in flash_hits_mon; we blind nearest alive.
+    # Wave 46a: vendor flash_hits_mon blinds the targeted monster via
+    # ``mtmp->mblinded`` (zap.c:2925).  With the per-monster blind_timer
+    # field (45a) we now set it on the nearest adjacent alive monster
+    # for 50 turns and skip the player-blind effect; the player-blind
+    # fallback (use_camera lines 67-74) still fires when no adjacent
+    # monster exists.
+    # Cite: vendor/nethack/src/apply.c::use_camera lines 67-79;
+    #       vendor/nethack/src/zap.c::flash_hits_mon line 2925.
     mai = state.monster_ai
     pr = state.player_pos[0].astype(jnp.int32)
     pc = state.player_pos[1].astype(jnp.int32)
-    dist = jax.vmap(lambda pos: _chebyshev(pos.astype(jnp.int32),
-                                           jnp.array([pr, pc])))(mai.pos)
-    has_target = jnp.any(mai.alive & (dist == jnp.int32(1)))
-    # Blind player if no adjacent monster.
+    mpos = mai.pos.astype(jnp.int32)
+    d_row = jnp.abs(mpos[:, 0] - pr)
+    d_col = jnp.abs(mpos[:, 1] - pc)
+    adj = (d_row <= jnp.int32(1)) & (d_col <= jnp.int32(1)) & mai.alive
+    has_target = jnp.any(adj)
+    # Pick first adjacent alive monster (argmax over bool — 0 if none).
+    target_idx = jnp.argmax(adj.astype(jnp.int32))
+    cur_blind = mai.blind_timer.astype(jnp.int32)
+    new_blind_val = jnp.minimum(
+        cur_blind[target_idx] + jnp.int32(50),
+        jnp.iinfo(jnp.int16).max,
+    ).astype(jnp.int16)
+    new_blind_arr = jnp.where(
+        has_target,
+        mai.blind_timer.at[target_idx].set(new_blind_val),
+        mai.blind_timer,
+    )
+    new_mai = mai.replace(blind_timer=new_blind_arr)
+    # Player-blind fallback (no adjacent monster).
     new_ts = jnp.where(
         ~has_target,
         state.status.timed_statuses.at[int(TimedStatus.BLIND)].set(jnp.int32(50)),
         state.status.timed_statuses,
     )
-    return state.replace(status=state.status.replace(timed_statuses=new_ts))
+    return state.replace(
+        monster_ai=new_mai,
+        status=state.status.replace(timed_statuses=new_ts),
+    )
 
 
 # ---------------------------------------------------------------------------

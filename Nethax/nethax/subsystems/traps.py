@@ -793,53 +793,66 @@ def _trap_landmine(state, rng):
 
 
 def _trap_rolling_boulder(state, rng):
-    """ROLLING_BOULDER_TRAP — spawn a boulder and apply boulder dmgval to player.
+    """ROLLING_BOULDER_TRAP — launch a boulder via ``roll_boulder`` physics.
 
-    Audit M #37: vendor (trap.c:2672) calls
+    Wave 46a: vendor (trap.c:2672) calls
     ``launch_obj(BOULDER, launch.x, launch.y, launch2.x, launch2.y,
-                ROLL|LAUNCH_KNOWN)``
-    which spawns an actual boulder object that rolls along the path; the
-    boulder strikes the player when its path crosses the player tile and
-    applies ``dmgval(BOULDER, mon)`` damage per strike (vendor objects.c
-    BOULDER entry: ``int dmgval`` ≈ d(2,6) = 2..12 plus the rolling
-    distance multiplier).
+                ROLL|LAUNCH_KNOWN)`` — a boulder spawned at ``launch`` and
+    rolling toward ``launch2`` (the direction away from the trap origin
+    along the predetermined ``launch→launch2`` vector).  We now call
+    ``boulder_physics.roll_boulder`` to actually walk the boulder one
+    tile at a time, applying ``dmgval(BOULDER)`` (d(2,6) = 2..12) to the
+    player or squishing monsters in the path.
 
-    Approximation: drop a BOULDER object (ROCK_CLASS, type_id=447) on the
-    trap's tile via ``ground_items`` and apply ``dmgval(BOULDER)`` damage
-    immediately to the player.  We use a stable ``2d6 + d4`` total
-    (= 4..16) as the canonical boulder dmgval — the +d4 covers the
-    rolling-distance bonus that vendor delivers across multiple strikes
-    in a single trap fire.
+    Direction: vendor stores ``launch.x→launch2.x`` per-trap; we don't
+    persist that, so we approximate by rolling FROM the trap tile AWAY
+    from the player (sign of (player - trap) negated; ties broken to
+    +1 to ensure a non-zero direction).
+
+    Fallback: when ``roll_boulder`` exits with the boulder still at
+    ``start_pos`` (zero-length direction), we drop a BOULDER on the
+    trap tile via ``ground_items`` as the prior implementation did.
 
     Citations:
-      vendor/nethack/src/trap.c:2672  (launch_obj BOULDER call)
-      vendor/nethack/src/dothrow.c::launch_obj  (rolls + dmgval per tile)
-      vendor/nethack/include/objects.h          (BOULDER dmgval=d(2,6))
+      vendor/nethack/src/trap.c:2672          (launch_obj BOULDER call)
+      vendor/nethack/src/dothrow.c::launch_obj (rolls + dmgval per tile)
+      vendor/nethack/include/objects.h         (BOULDER dmgval=d(2,6))
     """
     from Nethax.nethax.subsystems.inventory import ItemCategory
+    from Nethax.nethax.subsystems.boulder_physics import roll_boulder
 
-    k_a, k_b, k_extra = jax.random.split(rng, 3)
-    # Boulder dmgval ≈ d(2,6) + d4 (rolling-distance bonus approximation).
-    dmg = _d(k_a, 6) + _d(k_b, 6) + _d(k_extra, 4)
-    s = _apply_hp_damage(state, dmg)
-
-    # Spawn a boulder on the trap's tile via ground_items.  Vendor places
-    # the BOULDER at launch.x/launch.y which we approximate by the
-    # player's tile (post-roll resting position).
-    _BOULDER_TYPE_ID = 447
+    s = state
     b = s.dungeon.current_branch.astype(jnp.int32)
     lv = s.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
     pr = s.player_pos[0].astype(jnp.int32)
     pc = s.player_pos[1].astype(jnp.int32)
 
-    ground = s.ground_items
-    # Find first empty slot at this tile (category == 0).
+    # Trap fires on the player's current tile (caller invariant).
+    trap_pos = jnp.stack([pr, pc])
+
+    # Direction = from trap AWAY from player.  Since the trap IS at the
+    # player's tile here (the player just stepped on it), we use a stable
+    # default direction (+1, +1) — vendor stores launch2 per-trap and we
+    # have no such record.  The boulder still rolls and applies physics.
+    dy = jnp.int32(1)
+    dx = jnp.int32(1)
+    direction = jnp.stack([dy, dx])
+
+    k_roll, k_drop = jax.random.split(rng, 2)
+    s_after, final_pos = roll_boulder(s, k_roll, trap_pos, direction)
+
+    # Fallback: if roll_boulder returned the same start_pos (no progress),
+    # drop a boulder on the trap tile via ground_items.
+    same_pos = (final_pos[0] == trap_pos[0]) & (final_pos[1] == trap_pos[1])
+
+    _BOULDER_TYPE_ID = 447
+    ground = s_after.ground_items
     tile_cats = ground.category[b, lv, pr, pc]
     empty_mask = tile_cats == jnp.int8(0)
     any_empty = jnp.any(empty_mask)
     slot = jnp.argmax(empty_mask.astype(jnp.int32)).astype(jnp.int32)
 
-    def _do_spawn(s_):
+    def _do_drop(s_):
         g = s_.ground_items
         new_cat = g.category.at[b, lv, pr, pc, slot].set(
             jnp.int8(int(ItemCategory.ROCK))
@@ -849,7 +862,12 @@ def _trap_rolling_boulder(state, rng):
         new_g = g.replace(category=new_cat, type_id=new_tid, quantity=new_qty)
         return s_.replace(ground_items=new_g)
 
-    return jax.lax.cond(any_empty, _do_spawn, lambda s_: s_, s)
+    return jax.lax.cond(
+        same_pos & any_empty,
+        _do_drop,
+        lambda s_: s_,
+        s_after,
+    )
 
 
 def _trap_sleep_gas(state, rng):

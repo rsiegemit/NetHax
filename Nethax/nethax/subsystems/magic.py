@@ -1048,14 +1048,14 @@ def _effect_finger_of_death(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_drain_life(state: dict, rng: jax.Array) -> dict:
-    """DRAIN_LIFE: drainer() — drop both hp and hp_max by ``rnd(8)``.
+    """DRAIN_LIFE: drainer() — decrement ``m_lev`` and drop ``hp`` by ``rnd(8)``.
 
     Vendor: zap.c::bhitm lines 521-543.  ``dmg = monhp_per_lvl(mtmp)``
-    (default ``rnd(8)``); both ``mhp -= dmg`` and ``mhpmax -= dmg`` are
-    applied.  Vendor also decrements ``m_lev--`` but Nethax monsters do not
-    carry a per-instance ``m_lev`` field, so the level drain is folded into
-    the ``hp_max`` reduction (the visible effect — weaker monsters with a
-    permanently lower ceiling).
+    (default ``rnd(8)``); ``mhp -= dmg`` and ``mtmp->m_lev--`` are applied
+    (the ``mhpmax`` reduction in older vendor revisions is no longer
+    present — only the level and current HP drop).  Wave 46a wires the
+    per-monster ``m_lev`` field (added in 45a) so we now decrement it
+    directly and only deal HP damage.
     Cite: vendor/nethack/src/zap.c lines 521-543.
     """
     rng, sub = jax.random.split(rng)
@@ -1064,22 +1064,22 @@ def _effect_drain_life(state: dict, rng: jax.Array) -> dict:
     if not (hasattr(mai, "hp") and mai.hp.shape[0] > 0):
         return state
     alive = mai.hp[0] > 0
-    new_hp_max = jnp.where(
-        alive,
-        jnp.maximum(mai.hp_max[0] - dmg, jnp.int32(0)),
-        mai.hp_max[0],
-    )
     new_hp = jnp.where(
         alive,
         jnp.maximum(mai.hp[0] - dmg, jnp.int32(0)),
         mai.hp[0],
     )
-    # Vendor: if mhpmax <= 0 or m_lev < 1 → killed.  Cap hp at hp_max so
-    # the monster dies when both run to 0.
-    new_hp = jnp.minimum(new_hp, new_hp_max)
-    new_mhp     = mai.hp.at[0].set(new_hp)
-    new_mhp_max = mai.hp_max.at[0].set(new_hp_max)
-    return {**state, "monster_ai": mai.replace(hp=new_mhp, hp_max=new_mhp_max)}
+    # Vendor: m_lev-- clamped at 0 (mon dies when m_lev<1 in some paths,
+    # but the HP drop itself drives the death check here).
+    cur_lev = mai.m_lev[0].astype(jnp.int32)
+    new_lev = jnp.where(
+        alive,
+        jnp.maximum(cur_lev - jnp.int32(1), jnp.int32(0)).astype(jnp.int16),
+        mai.m_lev[0],
+    )
+    new_mhp   = mai.hp.at[0].set(new_hp)
+    new_mlev  = mai.m_lev.at[0].set(new_lev)
+    return {**state, "monster_ai": mai.replace(hp=new_mhp, m_lev=new_mlev)}
 
 
 def _effect_chain_lightning(state: dict, rng: jax.Array) -> dict:

@@ -956,17 +956,16 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
 
     # ---- 15: FLING_POISON (Grimtooth) artifact.c:2021-2037 ----------------
     # Vendor: rn2(2) picks BLINDING_VENOM or ACID_VENOM, mksobj + throwit
-    # towards getdir().  Nethax has no per-monster blind timer and no
-    # direction param at this layer, so we approximate by applying d6
-    # damage to the nearest alive adjacent monster (Chebyshev <= 1) —
-    # ACID_VENOM deals 1d6 acid in vendor, and BLINDING_VENOM's
-    # observable side-effect (blind) is omitted here since per-monster
-    # blind isn't tracked.  The 50/50 venom roll is kept as an rng
-    # consumer for schedule stability.
-    # Cite: vendor/nethack/src/artifact.c::invoke_fling_poison lines 2021-2037.
+    # towards getdir().  Wave 46a wires the per-monster ``blind_timer``
+    # (added 45a) so BLINDING_VENOM now sets the nearest adjacent
+    # monster's blind timer by ``rnd(25)`` and ACID_VENOM still applies
+    # ``d6`` HP damage (vendor objects.h ACID_VENOM dmgval).
+    # Cite: vendor/nethack/src/artifact.c::invoke_fling_poison lines 2021-2037;
+    #       vendor/nethack/src/zap.c::flash_hits_mon line 2925 (blind_timer).
     def _h_fling_poison(s):
-        k_venom, k_dmg = jax.random.split(k_handler, 2)
-        _ = jax.random.randint(k_venom, (), 0, 2, dtype=jnp.int32)  # rn2(2)
+        k_venom, k_dmg, k_blind = jax.random.split(k_handler, 3)
+        venom_roll = jax.random.randint(k_venom, (), 0, 2, dtype=jnp.int32)  # rn2(2)
+        is_blinding = venom_roll == jnp.int32(0)
         mai = s.monster_ai
         pr = s.player_pos[0].astype(jnp.int32)
         pc = s.player_pos[1].astype(jnp.int32)
@@ -974,26 +973,41 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
         d_row = jnp.abs(mpos[:, 0] - pr)
         d_col = jnp.abs(mpos[:, 1] - pc)
         in_range = (d_row <= jnp.int32(1)) & (d_col <= jnp.int32(1)) & mai.alive
+        # ACID_VENOM half: d6 HP damage applied when ~is_blinding.
         dmg = _dice_sum(k_dmg, jnp.int32(1), jnp.int32(6))
-        new_hp = jnp.where(in_range,
+        hit_acid = in_range & ~is_blinding
+        new_hp = jnp.where(hit_acid,
                            jnp.maximum(mai.hp - dmg, jnp.int32(0)),
                            mai.hp)
-        new_alive = jnp.where(in_range & (new_hp <= jnp.int32(0)),
+        new_alive = jnp.where(hit_acid & (new_hp <= jnp.int32(0)),
                               jnp.bool_(False), mai.alive)
-        return s.replace(monster_ai=mai.replace(hp=new_hp, alive=new_alive))
+        # BLINDING_VENOM half: blind_timer += rnd(25).
+        blind_amt = jax.random.randint(k_blind, (), 1, 26, dtype=jnp.int32)
+        hit_blind = in_range & is_blinding
+        cur_blind = mai.blind_timer.astype(jnp.int32)
+        new_blind = jnp.where(hit_blind,
+                              jnp.minimum(cur_blind + blind_amt,
+                                          jnp.iinfo(jnp.int16).max),
+                              cur_blind).astype(jnp.int16)
+        return s.replace(monster_ai=mai.replace(
+            hp=new_hp, alive=new_alive, blind_timer=new_blind
+        ))
 
     # ---- 16: BLINDING_RAY (Sunsword) artifact.c:2053-2086 -----------------
     # Vendor: do_blinding_ray (apply.c:60-76) → bhit + flash_hits_mon
     # blinds an adjacent monster for ``damg + rnd(damg)`` turns where
-    # ``damg = blessed?15 : !cursed?10 : 5``.  Nethax has no per-monster
-    # blind timer; we approximate by dealing ``damg + rnd(damg)`` HP
-    # damage to the nearest adjacent alive monster (the observable
-    # side-effect of having the monster's actions degraded).  We assume
-    # uncursed (damg=10) since the wielded-slot artifact is the most
-    # common state.
-    # Cite: vendor/nethack/src/artifact.c::invoke_blinding_ray lines 2053-2086;
+    # ``damg = blessed?15 : !cursed?10 : 5``.  Wave 46a wires the per-
+    # monster ``blind_timer`` (added 45a) so the blinding effect now
+    # actually sets the timer (no HP damage — flash_hits_mon only blinds).
+    # Additionally vendor artifact.c:2063 calls ``litroom(TRUE, obj)`` on
+    # the u.dz!=0 branch — we have no direction at this layer so we light
+    # the player's own tile as the "ray illuminates the area" side-effect.
+    # We assume uncursed (damg=10) since the wielded-slot artifact is the
+    # most common state.
+    # Cite: vendor/nethack/src/artifact.c::invoke_blinding_ray lines 2053-2086
+    #       (litroom call at line 2063);
     #       vendor/nethack/src/apply.c::do_blinding_ray lines 60-76;
-    #       vendor/nethack/src/zap.c::flash_hits_mon line 2925.
+    #       vendor/nethack/src/zap.c::flash_hits_mon line 2925 (mblinded set).
     def _h_blinding_ray(s):
         mai = s.monster_ai
         pr = s.player_pos[0].astype(jnp.int32)
@@ -1004,13 +1018,27 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
         in_range = (d_row <= jnp.int32(1)) & (d_col <= jnp.int32(1)) & mai.alive
         damg = jnp.int32(10)  # uncursed default per artifact.c:2070
         rnd_damg = jax.random.randint(k_handler, (), 1, 11, dtype=jnp.int32)
-        total = damg + rnd_damg
-        new_hp = jnp.where(in_range,
-                           jnp.maximum(mai.hp - total, jnp.int32(0)),
-                           mai.hp)
-        new_alive = jnp.where(in_range & (new_hp <= jnp.int32(0)),
-                              jnp.bool_(False), mai.alive)
-        return s.replace(monster_ai=mai.replace(hp=new_hp, alive=new_alive))
+        total = damg + rnd_damg  # damg + rnd(damg)
+        cur_blind = mai.blind_timer.astype(jnp.int32)
+        new_blind = jnp.where(in_range,
+                              jnp.minimum(cur_blind + total,
+                                          jnp.iinfo(jnp.int16).max),
+                              cur_blind).astype(jnp.int16)
+        # Light the player's tile (artifact.c:2063 litroom call).
+        from Nethax.nethax.subsystems.features import (
+            litroom_at, _flat_lv_from_state,
+        )
+        flv = _flat_lv_from_state(s)
+        new_features = litroom_at(
+            s.features, flv,
+            s.player_pos[0].astype(jnp.int32),
+            s.player_pos[1].astype(jnp.int32),
+            radius=0,
+        )
+        return s.replace(
+            monster_ai=mai.replace(blind_timer=new_blind),
+            features=new_features,
+        )
 
     handlers = [
         _h_noop,           #  0  NOOP
