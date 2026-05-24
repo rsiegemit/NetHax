@@ -3741,65 +3741,76 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     final_state, _ = jax.lax.scan(_body, state, (indices, turn_keys, can_act))
 
     # ---- Monster-vs-monster melee (mattackm) ----
-    # Audit I partial: vendor mon.c::mm_aggression (lines 2422-2447) ONLY
-    # permits specific monster-vs-monster combat:
-    #   * Conflict (player intrinsic causes nearby monsters to brawl);
-    #   * specific opposing pairings (purple worm vs shrieker, zombie-maker
-    #     vs zombify-able species);
-    #   * a tame monster attacking a hostile via dog_move's own mfndpos +
-    #     ALLOW_M path (NOT through this sweep).
-    # The previous all-different-faction sweep had a peaceful unicorn and a
-    # pet fox brawl on sight, which never happens in vendor.
-    #
-    # As a strict improvement that still keeps mm-combat alive for the
-    # common cases tests cover, we now gate the SWEEP-initiated mm-strike
-    # to ``hostile attacker → non-hostile target`` only.  Pets initiate
-    # their own attacks through dog_move (already a separate code path);
-    # peacefuls don't initiate at all here.  Conflict-driven brawls and
-    # the special-pairing aggression remain documented future work.
-    # cite: vendor/nethack/src/mon.c::mm_aggression lines 2422-2447;
-    #       vendor/nethack/src/dogmove.c::dog_move attack-gate 1102-1144.
+    # Wave 40b Item #8: vendor mm_aggression (mon.c:2422-2447) permits
+    # monster-vs-monster combat under any of:
+    #   * Conflict (player intrinsic 44 causes ALL adjacent monsters to brawl);
+    #   * purple worm / baby purple worm vs shrieker (mon.c:2440-2442);
+    #   * zombie_maker (S_ZOMBIE except ghoul/skeleton, or S_LICH, not
+    #     cancelled) vs species with a zombie_form (any non-zombie symbol),
+    #     and neither attacker nor defender is mtame (mon.c:2425-2429);
+    #   * fallback: hostile attacker → non-hostile target (kept for sweep
+    #     completeness — pets and peacefuls still don't initiate via this).
+    # Cite: vendor/nethack/src/mon.c::mm_aggression lines 2422-2447;
+    #       vendor/nethack/src/uhitm.c — Conflict intrinsic gate (44).
+    _status = getattr(state, "status", None)
+    if _status is not None and hasattr(_status, "intrinsics"):
+        _conflict_active = _status.intrinsics[_INTRINSIC_CONFLICT]
+    else:
+        _conflict_active = jnp.bool_(False)
+
     def _strike_body(carry, args):
         i, key_i = args
         mi = carry.monster_ai
         i32 = i.astype(jnp.int32)
 
-        # Attacker viability.
         atk_alive = mi.alive[i32]
-
-        # Position of attacker.
         pi = mi.pos[i32].astype(jnp.int32)
 
-        # Compute adjacency / different-faction mask against all other slots.
         all_pos = mi.pos.astype(jnp.int32)            # [N, 2]
         d_row = jnp.abs(all_pos[:, 0] - pi[0])
         d_col = jnp.abs(all_pos[:, 1] - pi[1])
         adj = jnp.maximum(d_row, d_col) == 1
 
-        # Faction of every slot.
         is_tame_all = mi.tame
         is_peace_all = mi.peaceful & ~is_tame_all
         all_faction = jnp.where(is_tame_all, jnp.int32(2),
                        jnp.where(is_peace_all, jnp.int32(1), jnp.int32(0)))
-        # Attacker faction.
         a_faction = all_faction[i32]
-        # Audit I partial: only HOSTILE attackers initiate sweep strikes;
-        # targets must be NON-HOSTILE (pet or peaceful).  Hostile-vs-hostile
-        # of different alignment is intentionally blocked here (vendor
-        # mm_aggression doesn't permit it without Conflict / special pair).
         is_hostile_atk    = a_faction == jnp.int32(0)
         is_nonhostile_tgt = all_faction != jnp.int32(0)
 
-        # Don't strike self.  Also restrict to slots > i so each pair is
-        # only resolved once per tick.
         idx_arr = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
         pair_ok = idx_arr > i32
 
-        candidates = (
-            mi.alive & adj & is_nonhostile_tgt & pair_ok
-        )
-        has_target = jnp.any(candidates) & is_hostile_atk
-        # argmax of bool returns first True (or 0 if none).
+        # Species-pair aggression (vendor mon.c:2422-2447).
+        a_entry = jnp.clip(mi.entry_idx[i32].astype(jnp.int32),
+                           0, _MM_IS_PURPLE_WORM.shape[0] - 1)
+        all_entry = jnp.clip(mi.entry_idx.astype(jnp.int32),
+                             0, _MM_IS_PURPLE_WORM.shape[0] - 1)
+        a_is_pw = _MM_IS_PURPLE_WORM[a_entry]
+        t_is_shr = _MM_IS_SHRIEKER[all_entry]
+        a_is_zm = _MM_IS_ZOMBIE_MAKER[a_entry] & ~mi.cancelled[i32]
+        t_has_zform = _MM_HAS_ZOMBIE_FORM[all_entry]
+
+        # vendor mm_aggression early-out: "don't allow pets to fight each
+        # other" (mon.c:2434).
+        pets_brawl = mi.tame[i32] & mi.tame
+
+        species_purple = a_is_pw & t_is_shr & ~pets_brawl
+        species_zombie = a_is_zm & t_has_zform & ~pets_brawl & ~mi.tame[i32] & ~mi.tame
+
+        # Under Conflict, ALL adjacent monsters brawl regardless of faction
+        # (vendor uhitm.c Conflict gate).
+        conflict_allow = _conflict_active
+
+        baseline_allow = is_hostile_atk & is_nonhostile_tgt
+        per_target_allow = (baseline_allow
+                            | species_purple
+                            | species_zombie
+                            | conflict_allow)
+
+        candidates = mi.alive & adj & pair_ok & per_target_allow
+        has_target = jnp.any(candidates)
         j_idx = jnp.argmax(candidates).astype(jnp.int32)
 
         do_strike = atk_alive & has_target
