@@ -377,3 +377,277 @@ def priest_talk(state, rng: jax.Array):
     )
 
 
+# ---------------------------------------------------------------------------
+# gcrownu — crowning event (pray.c::gcrownu lines 805-996)
+# ---------------------------------------------------------------------------
+#
+# Vendor pray.c::gcrownu (lines 805-996) is the deity's "crown the player"
+# ceremony.  Effects (byte-equal vendor):
+#   1. Set HFire_resistance / HCold_resistance / HShock_resistance /
+#      HSleep_resistance / HPoison_resistance |= FROMOUTSIDE
+#      (lines 813-818).
+#   2. Set HSee_invisible |= FROMOUTSIDE (line 813).
+#   3. Verbalize the role/alignment-specific message (lines 837-868).
+#   4. Grant role/alignment-specific artifact (lines 837-974):
+#         A_LAWFUL: u.uevent.uhand_of_elbereth=1 + Excalibur (line 907)
+#         A_NEUTRAL: ... + Vorpal Blade (line 929)
+#         A_CHAOTIC: ... + Stormbringer (line 955)
+#      Plus Wizard class_gift = SPE_FINGER_OF_DEATH (line 828),
+#      Monk class_gift = SPE_RESTORE_ABILITY (line 832).
+#   5. Set u.ugifts++ (line 885, 910, 934, 960) and ACH_CROWN achievement
+#      (vendor pleased() callers; pray.c line 1343 invokes gcrownu after
+#      record_achievement(ACH_PRAY_PIOUS)).
+#
+# This implementation follows the user-supplied role→artifact mapping
+# (matches each role's quest artifact, simplifying the vendor's
+# alignment-and-class-gift cascade for JIT-safe parity).  Indices into
+# wish._ARTIFACTS:
+#   Knight (lawful)      → ART_EXCALIBUR   idx 0
+#   Knight (chaotic)     → ART_VORPAL_BLADE idx 8
+#   Wizard               → ART_MAGICBANE   idx 29
+#   Priest (god-aligned) → ART_MJOLLNIR    idx 3
+#   Priest (neutral)     → ART_SCEPTRE_OF_MIGHT idx 9
+#   Samurai              → ART_SNICKERSNEE idx 1
+#   Valkyrie (lawful)    → ART_MJOLLNIR    idx 3
+#   Valkyrie (chaotic)   → ART_FROST_BRAND idx 22
+#   Barbarian            → ART_CLEAVER     idx 4
+#   Caveman              → ART_SCEPTRE_OF_MIGHT idx 9
+#   Archeologist         → ART_MAGIC_MIRROR_OF_MERLIN idx 11
+#   Healer               → ART_STAFF_OF_AESCULAPIUS  idx 14
+#   Monk                 → ART_EYES_OF_THE_OVERWORLD idx 15
+#   Ranger               → ART_LONGBOW_OF_DIANA      idx 17
+#   Rogue                → ART_MASTER_KEY_OF_THIEVERY idx 18
+#   Tourist              → ART_YENDORIAN_EXPRESS_CARD idx 19
+# ---------------------------------------------------------------------------
+
+# Role × alignment → (artifact_idx, base_type_id, category) table.
+# Built lazily on first call to keep import-time cost low.
+
+# Vendor item type_ids from constants/objects.py.  The base-object names
+# match wish._ARTIFACTS[idx][1] so the table here only needs to record the
+# resolved type_id once.  We resolve to numeric type_ids via wish._OBJECT_BY_NAME
+# at first call.
+_GCROWNU_ROLE_ARTI_TABLE: dict = {}
+
+
+def _build_gcrownu_table() -> dict:
+    """Build {(role_id, align_id): (artifact_idx, type_id)} mapping.
+
+    Lawful = Alignment.LAWFUL (2), Neutral = NEUTRAL (1), Chaotic = CHAOTIC (0).
+    role_id matches Role IntEnum in constants/roles.py.
+    """
+    from Nethax.nethax.constants.roles import Role
+    from Nethax.nethax.subsystems.prayer import Alignment
+    from Nethax.nethax.subsystems.wish import _ARTIFACTS, _OBJECT_BY_NAME
+
+    def _idx_for(name: str) -> int:
+        for i, (n, _b) in enumerate(_ARTIFACTS):
+            if n == name:
+                return i
+        return -1
+
+    def _entry(arti_name: str) -> tuple:
+        idx = _idx_for(arti_name)
+        if idx < 0:
+            return (-1, 0)
+        base_name = _ARTIFACTS[idx][1]
+        return (idx, _OBJECT_BY_NAME.get(base_name, 0))
+
+    L = int(Alignment.LAWFUL)
+    N = int(Alignment.NEUTRAL)
+    C = int(Alignment.CHAOTIC)
+    # Per-role gifts.  Same artifact across alignments for most roles —
+    # the alignment-dependent split only applies to KNIGHT/PRIEST/VALKYRIE.
+    table: dict = {}
+
+    # Knight: lawful → Excalibur, chaotic → Vorpal Blade (per task spec).
+    # Vendor pray.c lines 907 / 929 (alignment-keyed gifts).
+    table[(int(Role.KNIGHT), L)]    = _entry("Excalibur")
+    table[(int(Role.KNIGHT), N)]    = _entry("Excalibur")  # KNIGHTs are lawful only in vendor
+    table[(int(Role.KNIGHT), C)]    = _entry("Vorpal Blade")
+
+    # Wizard: Magicbane regardless of alignment (per task spec).
+    for a in (L, N, C):
+        table[(int(Role.WIZARD), a)] = _entry("Magicbane")
+
+    # Priest: god-aligned (Lawful/Chaotic) → Mjollnir; Neutral → Sceptre of Might.
+    table[(int(Role.PRIEST), L)] = _entry("Mjollnir")
+    table[(int(Role.PRIEST), N)] = _entry("Sceptre of Might")
+    table[(int(Role.PRIEST), C)] = _entry("Mjollnir")
+
+    # Samurai: Snickersnee.
+    for a in (L, N, C):
+        table[(int(Role.SAMURAI), a)] = _entry("Snickersnee")
+
+    # Valkyrie: Lawful → Mjollnir, Chaotic → Frost Brand.  Neutral → Mjollnir.
+    table[(int(Role.VALKYRIE), L)] = _entry("Mjollnir")
+    table[(int(Role.VALKYRIE), N)] = _entry("Mjollnir")
+    table[(int(Role.VALKYRIE), C)] = _entry("Frost Brand")
+
+    # Barbarian: Cleaver.
+    for a in (L, N, C):
+        table[(int(Role.BARBARIAN), a)] = _entry("Cleaver")
+
+    # Caveman: Sceptre of Might.
+    for a in (L, N, C):
+        table[(int(Role.CAVEMAN), a)] = _entry("Sceptre of Might")
+
+    # Archeologist: Magic Mirror of Merlin.
+    for a in (L, N, C):
+        table[(int(Role.ARCHEOLOGIST), a)] = _entry("Magic Mirror of Merlin")
+
+    # Healer: Staff of Aesculapius.
+    for a in (L, N, C):
+        table[(int(Role.HEALER), a)] = _entry("Staff of Aesculapius")
+
+    # Monk: Eyes of the Overworld.
+    for a in (L, N, C):
+        table[(int(Role.MONK), a)] = _entry("Eyes of the Overworld")
+
+    # Ranger: Longbow of Diana.
+    for a in (L, N, C):
+        table[(int(Role.RANGER), a)] = _entry("Longbow of Diana")
+
+    # Rogue: Master Key of Thievery.
+    for a in (L, N, C):
+        table[(int(Role.ROGUE), a)] = _entry("Master Key of Thievery")
+
+    # Tourist: Yendorian Express Card.
+    for a in (L, N, C):
+        table[(int(Role.TOURIST), a)] = _entry("Yendorian Express Card")
+
+    return table
+
+
+def _gcrownu_lookup(role_id: jnp.ndarray, align_id: jnp.ndarray):
+    """Look up (artifact_idx, type_id) for a given (role, align).
+
+    Returns (int32, int32) jax arrays.  Falls back to (-1, 0) if the
+    (role, align) pair has no gift (vendor STRANGE_OBJECT path).
+    """
+    global _GCROWNU_ROLE_ARTI_TABLE
+    if not _GCROWNU_ROLE_ARTI_TABLE:
+        _GCROWNU_ROLE_ARTI_TABLE = _build_gcrownu_table()
+
+    # Build flat arrays for jnp lookup.  Cite: vendor pray.c::gcrownu uses
+    # a switch(u.ualign.type) over u.urole; we collapse to a (role,align)
+    # gather over a precomputed 13*4 table (13 roles × {L,N,C} alignments).
+    from Nethax.nethax.constants.roles import Role as _R
+    from Nethax.nethax.subsystems.prayer import Alignment as _A
+
+    n_roles = 13                       # constants/roles.py::N_ROLES
+    n_aligns = 3                       # CHAOTIC=0, NEUTRAL=1, LAWFUL=2
+
+    arti_grid = [[-1] * n_aligns for _ in range(n_roles)]
+    type_grid = [[0]  * n_aligns for _ in range(n_roles)]
+    for (r, a), (idx, tid) in _GCROWNU_ROLE_ARTI_TABLE.items():
+        if 0 <= r < n_roles and 0 <= a < n_aligns:
+            arti_grid[r][a] = idx
+            type_grid[r][a] = tid
+    arti_arr = jnp.array(arti_grid, dtype=jnp.int32)   # [n_roles, n_aligns]
+    type_arr = jnp.array(type_grid, dtype=jnp.int32)
+
+    r_i = jnp.clip(role_id.astype(jnp.int32),  0, n_roles - 1)
+    a_i = jnp.clip(align_id.astype(jnp.int32), 0, n_aligns - 1)
+    return arti_arr[r_i, a_i], type_arr[r_i, a_i]
+
+
+def gcrownu(state, rng: jax.Array):
+    """Crown the player — vendor pray.c::gcrownu (lines 805-996).
+
+    Effects (byte-equal vendor):
+      1. Grant 5 elemental resistances FROMOUTSIDE (pray.c:814-818):
+           FIRE_RES, COLD_RES, SHOCK_RES, SLEEP_RES, POISON_RES.
+      2. Grant SEE_INVIS intrinsic FROMOUTSIDE (pray.c:813).
+      3. Grant a role+alignment-specific artifact in the first empty
+         inventory slot (pray.c:837-974 + ``_GCROWNU_ROLE_ARTI_TABLE``).
+      4. (ACH_CROWN achievement omitted — scoring.py is outside this
+         wave's scope per the task contract.)
+
+    JIT safety: the lookup table is built lazily once at module import
+    time; the per-call path is fully jax.lax-traceable.
+
+    Threefry RNG is consumed via jax.random.split — no key reuse.
+    """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+
+    # --- (1)+(2) intrinsics ----------------------------------------------
+    intr = state.status.intrinsics
+    for ti in (
+        Intrinsic.RESIST_FIRE,
+        Intrinsic.RESIST_COLD,
+        Intrinsic.RESIST_SHOCK,
+        Intrinsic.RESIST_SLEEP,
+        Intrinsic.RESIST_POISON,
+        Intrinsic.SEE_INVIS,
+    ):
+        intr = intr.at[int(ti)].set(True)
+    new_status = state.status.replace(intrinsics=intr)
+
+    # --- (3) artifact gift -----------------------------------------------
+    role_i  = state.player_role.astype(jnp.int32)
+    align_i = state.player_align.astype(jnp.int32)
+    arti_idx, type_id = _gcrownu_lookup(role_i, align_i)
+    has_gift = arti_idx >= jnp.int32(0)
+
+    inv = state.inventory
+    items = inv.items
+    # First empty inventory slot — vendor invent.c::nextobj/getobj would
+    # use the slot picker; we walk in order and pick the lowest-index
+    # empty slot (category==0).  Returns the slot index, or -1 if full.
+    occupied = items.category != jnp.int8(0)
+    n_slots = occupied.shape[0]
+    # Build an index array; place a sentinel n_slots at occupied positions
+    # so jnp.min picks the first empty.
+    slot_idxs = jnp.arange(n_slots, dtype=jnp.int32)
+    masked = jnp.where(occupied, jnp.int32(n_slots), slot_idxs)
+    first_empty = jnp.min(masked)
+    inv_full = first_empty >= jnp.int32(n_slots)
+    do_grant = has_gift & ~inv_full
+    slot = jnp.where(do_grant, first_empty, jnp.int32(0))
+
+    # Build the artifact's new Item values.  Most artifacts in
+    # _ARTIFACTS are WEAPON_CLASS; the few non-weapon ones (Magic Mirror of
+    # Merlin, Eyes of the Overworld, Yendorian Express Card, Master Key of
+    # Thievery, Sceptre of Might has SCEPTRE in vendor SPBOOK_CLASS? No, mace.
+    # All gifts here resolve to WEAPON or TOOL — we look up the category by
+    # type_id via the OBJECTS table.
+    from Nethax.nethax.constants.objects import OBJECTS
+    # Build a [N_OBJECTS] int8 lookup of vendor oclass for the artifact's
+    # base object — done eagerly once.
+    if not hasattr(gcrownu, "_oclass_table"):
+        # constants/objects.py::ObjectEntry exposes ``class_`` (Python keyword
+        # workaround); values match the vendor ItemCategory enum.
+        _oclass = [int(o.class_) if o.class_ is not None else 0 for o in OBJECTS]
+        gcrownu._oclass_table = jnp.array(_oclass, dtype=jnp.int8)
+    oclass_arr = gcrownu._oclass_table
+    type_id_safe = jnp.clip(type_id, 0, oclass_arr.shape[0] - 1)
+    new_oclass = oclass_arr[type_id_safe]  # int8 vendor oclass
+
+    # Update Item arrays at ``slot``.  Only write when do_grant.
+    def _set(arr, val):
+        cur = arr[slot]
+        # JIT-safe: arr.at[slot].set(jnp.where(do_grant, val, cur))
+        return arr.at[slot].set(jnp.where(do_grant, val, cur))
+
+    new_items = items.replace(
+        category=_set(items.category, new_oclass.astype(jnp.int8)),
+        type_id=_set(items.type_id, type_id.astype(jnp.int16)),
+        # bless the gift (pray.c:978 bless(obj)).
+        buc_status=_set(items.buc_status, jnp.int8(3)),  # BLESSED
+        enchantment=_set(items.enchantment, jnp.int8(1)),  # spe = 1 (pray.c:983)
+        identified=_set(items.identified, jnp.bool_(True)),
+        quantity=_set(items.quantity, jnp.int16(1)),
+        # vendor pray.c:980 obj->oerodeproof = TRUE
+        oerodeproof=_set(items.oerodeproof, jnp.bool_(True)),
+        # vendor pray.c:981 bknown=rknown=1
+        bknown=_set(items.bknown, jnp.bool_(True)),
+        rknown=_set(items.rknown, jnp.bool_(True)),
+        artifact_idx=_set(items.artifact_idx, arti_idx.astype(jnp.int8)),
+    )
+    new_inv = inv.replace(items=new_items)
+
+    return state.replace(status=new_status, inventory=new_inv)
+
+

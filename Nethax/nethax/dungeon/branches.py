@@ -214,9 +214,8 @@ _DUNGEON_NUM_LEVELS_VENDOR_SPEC: dict = {
     int(Branch.GNOMISH_MINES): (8, 2),    # dungeon.def line 71
     int(Branch.QUEST):         (5, 2),    # dungeon.def line 86
     int(Branch.SOKOBAN):       (4, 0),    # dungeon.def line 94 (rand=0 ⇒ fixed)
+    int(Branch.VLAD):          (3, 0),    # dungeon.def line 116 (rand=0 ⇒ fixed)
     int(Branch.ENDGAME):       (6, 0),    # dungeon.def line 134 (rand=0 ⇒ fixed)
-    # Subsequent commits will populate:
-    # int(Branch.VLAD):        (3, 0),   # dungeon.def line 116
 }
 
 
@@ -230,8 +229,23 @@ _DUNGEON_NUM_LEVELS_VENDOR_SPEC: dict = {
 # to Gehennom), Ludios (acouple in Main).
 _BRANCH_ENTRY_VENDOR_SPEC: dict = {
     int(Branch.GNOMISH_MINES): (2, 3),    # dungeon.def line 19, acouple in Main
-    # int(Branch.QUEST):       (6, 2),   # dungeon.def line 26, rcouple oracle +6 portal
-    # int(Branch.VLAD):        (9, 5),   # dungeon.def line 55, acouple in Gehennom
+    int(Branch.VLAD):          (9, 5),    # dungeon.def line 55, acouple in Gehennom
+}
+
+
+# Parent dungeon for each branch (the dungeon in which the BRANCH entry
+# tuple resolves).  Used by callers that need to know whether
+# ``first_level`` is relative to Main, Gehennom, or another anchor.
+# Defaults to Main when not listed.
+#
+# Vendor cite: vendor/nle/dat/dungeon.def — BRANCH directives are nested
+# inside DUNGEON blocks, and the nesting determines the parent.
+_BRANCH_PARENT_DUNGEON: dict = {
+    int(Branch.GNOMISH_MINES): int(Branch.MAIN),       # dungeon.def line 17/19
+    int(Branch.SOKOBAN):       int(Branch.MAIN),       # CHAINBRANCH off oracle (Main)
+    int(Branch.QUEST):         int(Branch.MAIN),       # CHAINBRANCH off oracle (Main)
+    int(Branch.VLAD):          int(Branch.GEHENNOM),   # dungeon.def line 51/55
+    int(Branch.ENDGAME):       int(Branch.MAIN),       # BRANCH at Main bottom + 1
 }
 
 
