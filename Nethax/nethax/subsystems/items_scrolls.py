@@ -1449,12 +1449,45 @@ def _confused_magic_mapping(state, rng, slot_idx):
 
 
 def _confused_charging(state, rng, slot_idx):
-    """Confused charging: restore player_pw instead of wand charges."""
+    """Confused scroll of charging — charge MP instead of wand.
+
+    Vendor: vendor/nethack/src/read.c::seffect_charging lines 1799-1813.
+        if (confused) {
+            if (scursed) { u.uen = 0; }
+            else {
+                u.uen += d(sblessed ? 6 : 4, 4);
+                if (u.uen > u.uenmax) u.uenmax = u.uen;
+                else u.uen = u.uenmax;
+            }
+            return;
+        }
+
+    Static-shape d-roll: always sample 6 d4 rolls; mask to first n (4 or 6).
+    """
     rng1, _ = jax.random.split(rng)
-    pw_max = state.player_pw_max
-    gain_max = jnp.maximum(pw_max // jnp.int32(4) + jnp.int32(1), jnp.int32(2))
-    gain = jax.random.randint(rng1, (), 1, gain_max + 1).astype(jnp.int32)
-    return state.replace(player_pw=jnp.minimum(state.player_pw + gain, pw_max))
+    buc      = state.inventory.items.buc_status[slot_idx]
+    blessed  = _is_blessed(buc)
+    cursed   = _is_cursed(buc)
+
+    # d(sblessed ? 6 : 4, 4) — sample max sides=4, max n=6, mask first n.
+    rolls = jax.random.randint(rng1, (6,), 1, 5, dtype=jnp.int32)
+    n     = jnp.where(blessed, jnp.int32(6), jnp.int32(4))
+    mask  = jnp.arange(6, dtype=jnp.int32) < n
+    delta = jnp.sum(jnp.where(mask, rolls, jnp.int32(0))).astype(jnp.int32)
+
+    uen    = state.player_pw.astype(jnp.int32)
+    uenmax = state.player_pw_max.astype(jnp.int32)
+    new_uen = uen + delta
+    # if new_uen > uenmax: uenmax := new_uen ; else uen := uenmax
+    overshot   = new_uen > uenmax
+    final_uen    = jnp.where(cursed, jnp.int32(0),
+                             jnp.where(overshot, new_uen, uenmax))
+    final_uenmax = jnp.where(cursed, uenmax,
+                             jnp.where(overshot, new_uen, uenmax))
+    return state.replace(
+        player_pw=final_uen.astype(state.player_pw.dtype),
+        player_pw_max=final_uenmax.astype(state.player_pw_max.dtype),
+    )
 
 
 def _confused_remove_curse(state, rng, slot_idx):
