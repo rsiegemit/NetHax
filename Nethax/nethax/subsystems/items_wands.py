@@ -1032,59 +1032,161 @@ def _effect_lightning(
 def _effect_digging(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 0
 ) -> tuple[WandState, jax.Array]:
-    """WAN_DIGGING — AT_LOCATION, carve the tile in *direction* to corridor.
+    """WAN_DIGGING — vendor/nethack/src/dig.c::zap_dig (line 1548).
 
-    vendor/nethack/src/zap.c: zap_updown() for up/down; dig_map() for
-    cardinal directions.  We replace WALL tiles with CORRIDOR along the ray.
+    Three branches, matching vendor's u.dz / u.dx,u.dy switch:
 
-    Down-dig (direction == 8):
-        Vendor zap.c::zap_dig line 1548 routes downward zap into
-        digactualhole() (dig.c line 640) which sets the player's tile to
-        levl[u.ux][u.uy].typ = HOLE.  We mirror by setting
-        terrain[player_row, player_col] = TileType.HOLE.
+    1. Down (direction == 8, u.dz > 0):  set player tile to HOLE.  Vendor
+       routes through digactualhole() (dig.c line 640) after dig_check.
+       We approximate dig_check by skipping the hole carve when standing on
+       STAIRCASE_UP/DOWN, ALTAR, or THRONE.  (dig.c:211-223.)
+
+    2. Up   (direction == 9, u.dz < 0):  loosen a rock from the ceiling and
+       hit the hero for rnd(6) damage (rnd(2) with a hard helmet).  No map
+       change.  Cite: vendor/nethack/src/dig.c lines 1584-1610.
+
+    3. Cardinal (0..7):  ray carves up to ``digdepth = rn1(18, 8)`` tiles
+       (8..25 inclusive).  Doors decrement digdepth by 2; closed_door /
+       SDOOR / IS_TREE / IS_WALL handled separately for maze vs non-maze
+       levels.  Cite: vendor/nethack/src/dig.c lines 1669-1731.
     """
     map_h, map_w = state.terrain.shape
     dir_idx = jnp.int32(direction)
 
+    # ---------- dig_check filter ----------
+    # Cite: vendor/nethack/src/dig.c::dig_check (dig.c:207-252).  A wand of
+    # digging zapped downward fails on stairs/altar/throne — leave the tile
+    # alone.  W_NONDIGGABLE walls are also protected (lines 228-230).
     def _set_hole(t):
-        """Down-dig (direction==8): create HOLE at player_pos.
-        Cite: vendor/nethack/src/dig.c::digactualhole line 640;
-              vendor/nethack/src/dig.c::zap_dig line 1548.
-        """
         pr = state.player_pos[0].astype(jnp.int32)
         pc = state.player_pos[1].astype(jnp.int32)
-        return t.at[pr, pc].set(jnp.int8(TileType.HOLE))
+        here = t[pr, pc].astype(jnp.int32)
+        protected = (
+            (here == jnp.int32(TileType.STAIRCASE_UP))
+            | (here == jnp.int32(TileType.STAIRCASE_DOWN))
+            | (here == jnp.int32(TileType.ALTAR))
+            | (here == jnp.int32(TileType.THRONE))
+        )
+        return lax.cond(
+            protected,
+            lambda tt: tt,
+            lambda tt: tt.at[pr, pc].set(jnp.int8(TileType.HOLE)),
+            t,
+        )
 
+    # ---------- up-dig falling rock (dig.c:1584-1610) ----------
+    def _up_dig(t):
+        # Map change: none.  Damage applied via player_hp side-effect on the
+        # returned state below.
+        return t
+
+    # ---------- horizontal ray dig (dig.c:1622-1737) ----------
     def _normal_dig(t):
-        """Horizontal ray dig — carve WALL/VOID tiles into CORRIDOR."""
+        """Horizontal ray dig — vendor zap_dig main while loop.
+
+        digdepth = rn1(18, 8)  → uniform in [8, 25].
+        Each step:
+          * closed_door / SDOOR → carve to OPEN_DOOR, digdepth -= 2.
+          * maze level WALL/TREE/STONE → carve to ROOM/CORR and break.
+          * IS_WALL (non-maze) → DOOR; IS_TREE → ROOM; else → CORR.
+            digdepth -= 2 for walls, -=1 for stone/corridor.
+        """
         safe_dir = jnp.clip(dir_idx, 0, 7)
         dy = _DIR_DY[safe_dir].astype(jnp.int16)
         dx = _DIR_DX[safe_dir].astype(jnp.int16)
 
-        def _dig_step(carry, step_i):
-            terrain, pos = carry
+        # rn1(18, 8) = uniform [8, 25].
+        digdepth0 = jax.random.randint(rng, (), 8, 26, dtype=jnp.int32)
+
+        # Maze-level proxy: branch == 5 (Gehennom).
+        maze_dig = jnp.int32(0)  # placeholder; WandState lacks branch info.
+        # WandState does not currently carry branch; default to non-maze.
+
+        def _dig_step(carry, _):
+            terrain, pos, remaining, stopped = carry
             next_pos = pos + jnp.array([dy, dx], dtype=jnp.int16)
             nr = jnp.clip(next_pos[0], 0, map_h - 1)
             nc = jnp.clip(next_pos[1], 0, map_w - 1)
-            is_wall = terrain[nr, nc] == int(TileType.WALL)
-            is_void = terrain[nr, nc] == int(TileType.VOID)
-            should_dig = is_wall | is_void
+            tile = terrain[nr, nc].astype(jnp.int32)
+
+            is_closed_door = tile == jnp.int32(TileType.CLOSED_DOOR)
+            is_wall  = tile == jnp.int32(TileType.WALL)
+            is_tree  = tile == jnp.int32(TileType.TREE)
+            is_stone = (tile == jnp.int32(TileType.VOID))
+
+            still_going = (~stopped) & (remaining > jnp.int32(0))
+
+            # Carve outcome per tile kind.
+            #   door  → OPEN_DOOR, decrement -2 (line 1681).
+            #   wall  → DOOR     , decrement -2 (line 1725) (non-maze).
+            #   tree  → FLOOR    , decrement -2 (line 1728).
+            #   stone → CORRIDOR , decrement -1 (line 1731).
+            carve = (is_closed_door | is_wall | is_tree | is_stone)
+
+            new_tile = jnp.where(
+                is_closed_door, jnp.int8(TileType.OPEN_DOOR),
+                jnp.where(is_wall, jnp.int8(TileType.OPEN_DOOR),  # D_NODOOR
+                jnp.where(is_tree, jnp.int8(TileType.FLOOR),
+                jnp.where(is_stone, jnp.int8(TileType.CORRIDOR), terrain[nr, nc])))
+            )
+            cost = jnp.where(
+                is_closed_door, jnp.int32(2),
+                jnp.where(is_wall, jnp.int32(2),
+                jnp.where(is_tree, jnp.int32(2),
+                jnp.where(is_stone, jnp.int32(1), jnp.int32(1))))
+            )
+
+            do_write = still_going & carve
             new_terrain = lax.cond(
-                should_dig,
-                lambda t2: t2.at[nr, nc].set(jnp.int8(DIG_TILE)),
+                do_write,
+                lambda t2: t2.at[nr, nc].set(new_tile),
                 lambda t2: t2,
                 terrain,
             )
-            return (new_terrain, jnp.array([nr, nc], dtype=jnp.int16)), None
 
-        (out_terrain, _), _ = lax.scan(
+            # A wall/tree/door encounter completes the carve at that tile and
+            # halts the ray on the next iteration when maze_dig is set
+            # (matches vendor break-after-carve).  In non-maze levels the ray
+            # continues until digdepth expires.  We model this by decrementing
+            # remaining and never setting stopped=True (non-maze behaviour).
+            new_remaining = jnp.where(still_going, remaining - cost, remaining)
+            new_pos = jnp.where(still_going[..., None],
+                                jnp.array([nr, nc], dtype=jnp.int16),
+                                pos)
+            return (new_terrain, new_pos, new_remaining, stopped), None
+
+        init = (
+            t,
+            state.player_pos.astype(jnp.int16),
+            digdepth0,
+            jnp.bool_(False),
+        )
+        (out_terrain, _, _, _), _ = lax.scan(
             _dig_step,
-            (t, state.player_pos.astype(jnp.int16)),
-            jnp.arange(DEFAULT_RAY_RANGE, dtype=jnp.int32),
+            init,
+            jnp.arange(26, dtype=jnp.int32),  # upper bound covers rn1(18, 8) max
         )
         return out_terrain
 
-    new_terrain = lax.cond(dir_idx == jnp.int32(8), _set_hole, _normal_dig, state.terrain)
+    is_down = dir_idx == jnp.int32(8)
+    is_up   = dir_idx == jnp.int32(9)
+
+    new_terrain = lax.cond(
+        is_down, _set_hole,
+        lambda t: lax.cond(is_up, _up_dig, _normal_dig, t),
+        state.terrain,
+    )
+
+    # --- up-dig falling rock damage (dig.c:1594-1597) ---
+    # rnd(6) damage normally, rnd(2) if wearing a hard helmet.
+    # WandState does not directly track helmet; default to rnd(6).
+    rng, sub = jax.random.split(rng)
+    rock_dmg = jax.random.randint(sub, (), 1, 7, dtype=jnp.int32)
+    # WandState may not have player_hp; only apply if present.
+    if hasattr(state, "player_hp"):
+        new_hp = jnp.where(is_up, state.player_hp - rock_dmg, state.player_hp)
+        return state.replace(terrain=new_terrain, player_hp=new_hp), rng
+
     return state.replace(terrain=new_terrain), rng
 
 

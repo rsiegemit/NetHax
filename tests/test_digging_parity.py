@@ -101,10 +101,14 @@ def test_dig_progresses_over_turns():
         "effort should increase each tick (or dig completed)"
 
 
-def test_dig_completes_creates_corridor():
-    """After enough ticks, the wall tile becomes CORRIDOR.
+def test_dig_completes_creates_doorway():
+    """After enough ticks on a normal (non-maze, non-cavernous) level, the
+    wall tile becomes an OPEN_DOOR (vendor D_NODOOR).
 
-    Cite: vendor/nethack/src/dig.c line 830.
+    Cite: vendor/nethack/src/dig.c lines 488-501.  Normal level WALL is
+    converted to ``DOOR with D_NODOOR`` (an open doorway).  Maze levels
+    convert to ROOM; cavernous levels (Gnomish Mines) convert to CORR.
+    The earlier port always set CORRIDOR which was the bug fixed by D5.
     """
     state = _make_state(wielded_type_id=PICKAXE_TYPE_ID)
     state = _place_wall_north(state)
@@ -120,12 +124,12 @@ def test_dig_completes_creates_corridor():
     state = start_dig(state, direction=0)
     assert bool(state.dig.active)
 
-    # Run enough ticks to surpass hardness=200 with STR=18 (gain=9/tick → ~23 ticks)
-    state = _run_dig_ticks(state, 200)
+    # Effort gain ≈ 14/tick; WALL_THRESHOLD = 100, so 30 ticks is plenty.
+    state = _run_dig_ticks(state, 60)
 
     tile = int(state.terrain[b, lv, row - 1, col])
-    assert tile == int(TileType.CORRIDOR), \
-        f"expected CORRIDOR ({int(TileType.CORRIDOR)}) after dig, got {tile}"
+    assert tile == int(TileType.OPEN_DOOR), \
+        f"expected OPEN_DOOR ({int(TileType.OPEN_DOOR)}) after dig, got {tile}"
     assert not bool(state.dig.active), "dig should be inactive after completion"
 
 

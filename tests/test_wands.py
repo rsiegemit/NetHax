@@ -192,7 +192,11 @@ def test_magic_missile_hits_multiple_monsters():
 # ---------------------------------------------------------------------------
 
 def test_digging_north_carves_wall():
-    """Zap of WAN_DIGGING north must convert WALL tiles north of player to CORRIDOR."""
+    """Zap of WAN_DIGGING north converts WALL tiles north of player to a
+    walkable opening.  Per vendor zap.c::zap_dig (D12, dig.c lines 1714-1724)
+    non-maze WALL becomes a DOOR with D_NODOOR — we model that as OPEN_DOOR.
+    Stone (VOID) cells along the ray become CORRIDOR.
+    """
     state = _make_state(player_row=10, player_col=10)
 
     # Place WALL tiles north of player.
@@ -205,15 +209,14 @@ def test_digging_north_carves_wall():
     # Direction 0 = North.
     result = zap_wand(state, _RNG, slot_idx=jnp.int32(0), direction=jnp.int32(0))
 
-    # Check that at least some wall tiles became corridor.
-    changed = 0
-    for row in range(3, 10):
-        tile = int(result.terrain[row, 10])
-        if tile == int(TileType.CORRIDOR):
-            changed += 1
+    # At least one WALL must have been carved (to OPEN_DOOR or CORRIDOR).
+    walkable_outcomes = {int(TileType.OPEN_DOOR), int(TileType.CORRIDOR), int(TileType.FLOOR)}
+    changed = sum(
+        1 for row in range(3, 10) if int(result.terrain[row, 10]) in walkable_outcomes
+    )
 
     assert changed > 0, (
-        "Expected at least one WALL tile north of player to become CORRIDOR after digging"
+        "Expected at least one WALL tile north of player to be carved (OPEN_DOOR/CORRIDOR)."
     )
 
 

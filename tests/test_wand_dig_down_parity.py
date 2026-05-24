@@ -72,15 +72,21 @@ def test_dig_down_sets_hole_at_player_pos():
 
 
 def test_dig_horizontal_unaffected_by_down_branch():
-    """direction in [0..7] still carves WALL/VOID to CORRIDOR — no HOLE."""
+    """direction in [0..7] carves a wall away — wand-dig walls become
+    OPEN_DOOR (D_NODOOR per vendor zap.c::zap_dig line 1723).
+
+    Cite: vendor/nethack/src/dig.c lines 1714-1724: non-maze WALL → DOOR
+    with D_NODOOR (an open doorway).  The earlier port produced CORRIDOR
+    unconditionally; D12 fixes the per-tile vendor outcomes.
+    """
     ws = _make_wand_state(player_pos=(5, 5))
     # Place a wall east of player.
     new_terrain = ws.terrain.at[5, 6].set(jnp.int8(TileType.WALL))
     ws = ws.replace(terrain=new_terrain)
     # direction=2 == East.
     new_ws, _ = _effect_digging(ws, _RNG, direction=jnp.int32(2))
-    # The wall has been carved to CORRIDOR.
-    assert int(new_ws.terrain[5, 6]) == int(TileType.CORRIDOR)
+    # The wall has been carved to OPEN_DOOR (D_NODOOR).
+    assert int(new_ws.terrain[5, 6]) == int(TileType.OPEN_DOOR)
     # Player tile is NOT a hole — horizontal dig does not touch player_pos.
     assert int(new_ws.terrain[5, 5]) != int(TileType.HOLE)
 
