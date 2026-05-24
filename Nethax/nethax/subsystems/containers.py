@@ -455,21 +455,26 @@ def put_in_container(state, container_idx, src_slot):
         ),
     )
 
-    # Bag-of-holding weight accounting (pickup.c::in_container).
-    # The item was in inventory at full weight; after moving in, effective
-    # weight = raw * numer // denom.  Delta = effective - raw (negative = savings).
+    # Bag-of-holding weight accounting — vendor mkobj.c::weight 1944-1953
+    # (Audit L #2): blessed (cwt+3)/4, uncursed (cwt+1)/2, cursed cwt*2.
+    # The item was in inventory at full weight; after moving in, the BoH
+    # contributes the ceiling-rounded fraction.  Delta = effective - raw
+    # (negative = savings).
     raw_w = inv.weight[s_idx].astype(jnp.int32)
     ctype = cs.container_type[c_idx]
     cbuc  = cs.container_buc[c_idx]
-    is_boh = ctype == jnp.int8(ContainerType.BAG_OF_HOLDING)
-    w_numer = jnp.where(
-        is_boh & (cbuc == jnp.int8(BUCStatus.BLESSED)),  jnp.int32(_BOH_NUMER_BLESSED),
-        jnp.where(
-            is_boh & (cbuc == jnp.int8(BUCStatus.CURSED)), jnp.int32(_BOH_NUMER_CURSED),
-            jnp.where(is_boh, jnp.int32(_BOH_NUMER_UNCURSED), jnp.int32(_BOH_DENOM)),
-        ),
+    is_boh   = ctype == jnp.int8(ContainerType.BAG_OF_HOLDING)
+    is_bless = is_boh & (cbuc == jnp.int8(BUCStatus.BLESSED))
+    is_curse = is_boh & (cbuc == jnp.int8(BUCStatus.CURSED))
+    is_uncur = is_boh & ~is_bless & ~is_curse
+    blessed_w = (raw_w + jnp.int32(3)) // jnp.int32(4)
+    uncur_w   = (raw_w + jnp.int32(1)) // jnp.int32(2)
+    cursed_w  = raw_w * jnp.int32(2)
+    effective_w = jnp.where(
+        is_bless,  blessed_w,
+        jnp.where(is_uncur, uncur_w,
+                  jnp.where(is_curse, cursed_w, raw_w)),
     )
-    effective_w = (raw_w * w_numer) // jnp.int32(_BOH_DENOM)
     weight_delta = jnp.where(can_put, effective_w - raw_w, jnp.int32(0))
     new_total_weight = state.inventory.total_weight + weight_delta
 
@@ -556,20 +561,25 @@ def take_from_container(state, container_idx, item_pos):
         ),
     )
 
-    # Bag-of-holding weight accounting on take-out (pickup.c::out_container).
-    # Reverse the put-in savings: add back (raw - effective) to total_weight.
+    # Bag-of-holding weight accounting on take-out — vendor mkobj.c::weight
+    # 1944-1953 (Audit L #2): use the same ceiling formulas as on put-in so
+    # the savings reverse exactly.  blessed (cwt+3)/4, uncursed (cwt+1)/2,
+    # cursed cwt*2.
     raw_w_out  = cs.items_weight[c_idx, p_idx].astype(jnp.int32)
     ctype_out  = cs.container_type[c_idx]
     cbuc_out   = cs.container_buc[c_idx]
-    is_boh_out = ctype_out == jnp.int8(ContainerType.BAG_OF_HOLDING)
-    w_numer_out = jnp.where(
-        is_boh_out & (cbuc_out == jnp.int8(BUCStatus.BLESSED)),  jnp.int32(_BOH_NUMER_BLESSED),
-        jnp.where(
-            is_boh_out & (cbuc_out == jnp.int8(BUCStatus.CURSED)), jnp.int32(_BOH_NUMER_CURSED),
-            jnp.where(is_boh_out, jnp.int32(_BOH_NUMER_UNCURSED), jnp.int32(_BOH_DENOM)),
-        ),
+    is_boh_out   = ctype_out == jnp.int8(ContainerType.BAG_OF_HOLDING)
+    is_bless_out = is_boh_out & (cbuc_out == jnp.int8(BUCStatus.BLESSED))
+    is_curse_out = is_boh_out & (cbuc_out == jnp.int8(BUCStatus.CURSED))
+    is_uncur_out = is_boh_out & ~is_bless_out & ~is_curse_out
+    blessed_w_out = (raw_w_out + jnp.int32(3)) // jnp.int32(4)
+    uncur_w_out   = (raw_w_out + jnp.int32(1)) // jnp.int32(2)
+    cursed_w_out  = raw_w_out * jnp.int32(2)
+    effective_w_out = jnp.where(
+        is_bless_out,  blessed_w_out,
+        jnp.where(is_uncur_out, uncur_w_out,
+                  jnp.where(is_curse_out, cursed_w_out, raw_w_out)),
     )
-    effective_w_out   = (raw_w_out * w_numer_out) // jnp.int32(_BOH_DENOM)
     weight_delta_out  = jnp.where(can_take, raw_w_out - effective_w_out, jnp.int32(0))
     new_total_weight  = state.inventory.total_weight + weight_delta_out
 
@@ -586,11 +596,16 @@ def container_total_weight(container_state: ContainerState, container_idx) -> jn
 
     Raw weight = sum of items_weight inside.
 
-    BAG_OF_HOLDING weight multipliers (pickup.c::in_container):
-      blessed   → 1/4
-      uncursed  → 1/2
-      cursed    → 2/1
-    All other containers contribute raw weight (multiplier = 1).
+    BAG_OF_HOLDING weight formulas — vendor ``mkobj.c::weight`` lines
+    1944-1953 (Audit L #1):
+      blessed   → (cwt + 3) / 4   (ceiling division by 4)
+      uncursed  → (cwt + 1) / 2   (ceiling division by 2)
+      cursed    →  cwt * 2
+
+    All other containers contribute raw weight (no scaling).  These are
+    integer ceiling rounds, not floors — previously this function did
+    ``(raw * numer) // _BOH_DENOM`` which floors and is off-by-one for
+    odd weights.
     """
     c_idx = jnp.int32(container_idx)
 
@@ -600,22 +615,23 @@ def container_total_weight(container_state: ContainerState, container_idx) -> jn
     ctype = container_state.container_type[c_idx]
     cbuc  = container_state.container_buc[c_idx]
 
-    is_boh = ctype == jnp.int8(ContainerType.BAG_OF_HOLDING)
+    is_boh    = ctype == jnp.int8(ContainerType.BAG_OF_HOLDING)
+    is_bless  = is_boh & (cbuc == jnp.int8(BUCStatus.BLESSED))
+    is_curse  = is_boh & (cbuc == jnp.int8(BUCStatus.CURSED))
+    is_uncur  = is_boh & ~is_bless & ~is_curse
 
-    numer = jnp.where(
-        is_boh & (cbuc == jnp.int8(BUCStatus.BLESSED)),
-        jnp.int32(_BOH_NUMER_BLESSED),
-        jnp.where(
-            is_boh & (cbuc == jnp.int8(BUCStatus.CURSED)),
-            jnp.int32(_BOH_NUMER_CURSED),
-            jnp.where(
-                is_boh,
-                jnp.int32(_BOH_NUMER_UNCURSED),
-                jnp.int32(_BOH_DENOM),  # multiplier == 1 for non-BoH
-            ),
-        ),
+    # blessed BoH:  (cwt + 3) / 4   — ceiling of cwt/4.
+    blessed_w = (raw_total + jnp.int32(3)) // jnp.int32(4)
+    # uncursed BoH: (cwt + 1) / 2   — ceiling of cwt/2.
+    uncur_w   = (raw_total + jnp.int32(1)) // jnp.int32(2)
+    # cursed BoH:   cwt * 2.
+    cursed_w  = raw_total * jnp.int32(2)
+    # non-BoH containers: raw weight unchanged.
+    return jnp.where(
+        is_bless,  blessed_w,
+        jnp.where(is_uncur, uncur_w,
+                  jnp.where(is_curse, cursed_w, raw_total)),
     )
-    return (raw_total * numer) // jnp.int32(_BOH_DENOM)
 
 
 # ---------------------------------------------------------------------------

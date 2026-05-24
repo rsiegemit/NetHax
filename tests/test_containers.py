@@ -132,7 +132,13 @@ def _stuff_bag_with_weights(state, container_idx, weights):
 
 
 def test_bag_of_holding_reduces_weight():
-    """5kg items uncursed → effective 2.5kg (rounded to 2 due to int math: 5*2//4)."""
+    """5kg uncursed BoH → ceiling((5+1)/2) = 3.
+
+    Audit L #1/#2: vendor mkobj.c::weight 1944-1953 uses ceiling rounds
+    for BoH weight reduction, not floors.  Uncursed formula is
+    ``(cwt + 1) / 2`` (ceiling of cwt/2): 5 → (5+1)/2 = 3.  The old
+    assertion ``w == 2`` was pinning the off-by-one floor bug.
+    """
     from Nethax.nethax.subsystems.containers import (
         container_total_weight, install_container, ContainerType, BUCStatus,
     )
@@ -144,8 +150,8 @@ def test_bag_of_holding_reduces_weight():
     state = _stuff_bag_with_weights(state, 0, [5])
 
     w = int(container_total_weight(state.containers, 0))
-    # uncursed multiplier = 1/2, so 5//2 = 2 (integer truncation).
-    assert w == 2, f"expected 2 (5*2//4), got {w}"
+    # vendor uncursed: (5+1)/2 = 3.
+    assert w == 3, f"expected (5+1)//2 = 3, got {w}"
 
 
 def test_blessed_bag_of_holding_quarter_weight():
