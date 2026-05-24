@@ -211,12 +211,28 @@ BRANCH_TABLE: Tuple[BranchInfo, ...] = (
 _DUNGEON_NUM_LEVELS_VENDOR_SPEC: dict = {
     int(Branch.MAIN):          (25, 5),   # dungeon.def line 17
     int(Branch.GEHENNOM):      (20, 5),   # dungeon.def line 51
+    int(Branch.GNOMISH_MINES): (8, 2),    # dungeon.def line 71
     int(Branch.ENDGAME):       (6, 0),    # dungeon.def line 134 (rand=0 ⇒ fixed)
     # Subsequent commits will populate:
-    # int(Branch.GNOMISH_MINES):(8, 2),   # dungeon.def line 71
     # int(Branch.QUEST):       (5, 2),   # dungeon.def line 86
     # int(Branch.SOKOBAN):     (4, 0),   # dungeon.def line 94
     # int(Branch.VLAD):        (3, 0),   # dungeon.def line 116
+}
+
+
+# (base, rand) for branch-entry depth (BRANCH / CHAINBRANCH @ (b, r)).
+# Interpreted via vendor/nle/src/dungeon.c::level_range — BRANCH uses
+# "acouple" semantics (absolute in parent dungeon), CHAINBRANCH uses
+# "rcouple" (relative to a chain-level's dlevel).
+#
+# Wired in Commit 3: Mines entry @ (2, 3) into Main.  Future commits
+# add Sokoban (chain to oracle), Quest (chain to oracle), Vlad (chain
+# to Gehennom), Ludios (acouple in Main).
+_BRANCH_ENTRY_VENDOR_SPEC: dict = {
+    int(Branch.GNOMISH_MINES): (2, 3),    # dungeon.def line 19, acouple in Main
+    # int(Branch.SOKOBAN):     (1, 0),   # dungeon.def line 24, rcouple oracle +1 up
+    # int(Branch.QUEST):       (6, 2),   # dungeon.def line 26, rcouple oracle +6 portal
+    # int(Branch.VLAD):        (9, 5),   # dungeon.def line 55, acouple in Gehennom
 }
 
 
@@ -269,26 +285,44 @@ def sample_branch_table(rng) -> Tuple[BranchInfo, ...]:
     Returns:
         Tuple of ``BranchInfo`` records, ordered by Branch enum.
     """
-    # Split one key per branch (7 branches in current enum); we always split
-    # so the seed flow is deterministic even when an individual branch falls
-    # back to the static value (the split itself is a no-op for unused keys).
-    keys = jax.random.split(rng, N_BRANCHES)
+    # Split one key per branch, then split each branch-key into two sub-keys
+    # (one for num_levels, one for first_level) so that landing a new branch
+    # in a later commit doesn't reshuffle the samples drawn by branches that
+    # are already wired.  We always split to keep the rng schedule
+    # deterministic even when an individual branch falls back to the static
+    # value.
+    branch_keys = jax.random.split(rng, N_BRANCHES)
 
     out = []
     for b in range(N_BRANCHES):
         static = BRANCH_TABLE[b]
-        spec = _DUNGEON_NUM_LEVELS_VENDOR_SPEC.get(b)
-        if spec is not None:
-            base, rand = spec
-            num_levels_sampled = _vendor_rn1(keys[b], rand, base)
-            out.append(BranchInfo(
-                branch_id=static.branch_id,
-                first_level=static.first_level,
-                num_levels=num_levels_sampled,
-                connection_type=static.connection_type,
-            ))
+        k_nl, k_fl = jax.random.split(branch_keys[b], 2)
+
+        # num_levels: sample from DUNGEON spec when present.
+        nl_spec = _DUNGEON_NUM_LEVELS_VENDOR_SPEC.get(b)
+        if nl_spec is not None:
+            nl_base, nl_rand = nl_spec
+            num_levels_sampled = _vendor_rn1(k_nl, nl_rand, nl_base)
         else:
-            out.append(static)
+            num_levels_sampled = static.num_levels
+
+        # first_level: sample from BRANCH-entry spec when present.  Only
+        # acouple (absolute-in-Main) entries are landed here; CHAINBRANCH
+        # entries that resolve relative to a special level (oracle, valley)
+        # are computed by the cross-branch chain logic.
+        fl_spec = _BRANCH_ENTRY_VENDOR_SPEC.get(b)
+        if fl_spec is not None:
+            fl_base, fl_rand = fl_spec
+            first_level_sampled = _vendor_rn1(k_fl, fl_rand, fl_base)
+        else:
+            first_level_sampled = static.first_level
+
+        out.append(BranchInfo(
+            branch_id=static.branch_id,
+            first_level=first_level_sampled,
+            num_levels=num_levels_sampled,
+            connection_type=static.connection_type,
+        ))
     return tuple(out)
 
 
