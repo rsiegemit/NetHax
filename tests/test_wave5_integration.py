@@ -338,13 +338,18 @@ def test_endgame_ascension_full_flow():
     )
     state = state.replace(inventory=state.inventory.replace(items=inv))
 
+    # Wave 35 audit fix: ascension is the explicit ``#offer`` route only
+    # (M-o byte = ord('o') | 0x80 = 0xEF).  The per-turn ``maybe_ascend``
+    # is a no-op; the action_dispatch ``#offer`` handler calls
+    # offer_amulet → ascend.
     rng = jax.random.PRNGKey(99)
+    offer_byte = ord("o") | 0x80
     new_state, _obs, _r, done, _info = env.step(
-        state, jnp.int32(ord(".")), rng,
+        state, jnp.int32(offer_byte), rng,
     )
-    assert bool(done), "Ascension via env.step did not set done=True"
+    assert bool(done), "Ascension via #offer env.step did not set done=True"
     assert bool(new_state.scoring.achievements[int(Achievement.ASCENDED)]), (
-        "ASCENDED achievement not recorded after env.step"
+        "ASCENDED achievement not recorded after #offer"
     )
 
 

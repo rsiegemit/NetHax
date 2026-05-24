@@ -1737,6 +1737,22 @@ def _handle_pray(state, rng):
     return _prayer_handle_pray(state, rng)
 
 
+def _handle_offer(state, rng):
+    """#offer — vendor/nethack/src/pray.c::dosacrifice line 472.
+
+    Routes to ascension.offer_amulet, which fires ``ascend`` when the
+    player is on the Astral Plane, standing on the coaligned altar, and
+    carrying the Amulet of Yendor.  Wave 35 audit fix: maybe_ascend is
+    a no-op (no per-turn auto-trigger); ``#offer`` is the sole entry.
+
+    Cite: vendor/nethack/src/pray.c::dosacrifice → offer_real_amulet,
+          which sets how=ASCENDED when the sacrificed object is the
+          real Amulet of Yendor.
+    """
+    from Nethax.nethax.subsystems.ascension import offer_amulet
+    return offer_amulet(state)
+
+
 def _handle_twoweapon(state, rng):
     """TWOWEAPON — vendor/nethack/src/wield.c::dotwoweapon.
 
@@ -2144,6 +2160,7 @@ _HANDLERS = (
     _handle_enhance,    # 45  vendor/nethack/src/weapon.c::enhance_weapon_skill line 1329
     _handle_dip,        # 46  vendor/nethack/src/potion.c::dodip line 2267
     _handle_tip_down,   # 47  vendor/nethack/src/dig.c::zap_dig line 1548 (down-dig)
+    _handle_offer,      # 48  vendor/nethack/src/pray.c::dosacrifice (M-o → ascension)
 )
 
 # Slot indices for each named handler.
@@ -2204,6 +2221,8 @@ _SLOT_ENHANCE    = 45
 _SLOT_DIP        = 46
 # #tip down-dig (M-T) — vendor/nethack/src/dig.c::zap_dig line 1548.
 _SLOT_TIP_DOWN   = 47
+# #offer (M-o) — vendor/nethack/src/pray.c::dosacrifice (sole ascension trigger).
+_SLOT_OFFER      = 48
 
 # ---------------------------------------------------------------------------
 # 256-entry lookup table: action ASCII value → handler slot index
@@ -2388,7 +2407,7 @@ def _build_action_to_handler_idx() -> jnp.ndarray:
     table[_M_byte("l")] = _SLOT_LOOT   # cmd.c::doloot (already set via Command.LOOT)
     table[_M_byte("m")] = _SLOT_NOOP   # cmd.c::domonability
     table[_M_byte("n")] = _SLOT_NAME   # cmd.c::docallcmd (name alias)
-    table[_M_byte("o")] = _SLOT_NOOP   # cmd.c::dosacrifice (offer)
+    table[_M_byte("o")] = _SLOT_OFFER  # cmd.c::dosacrifice → pray.c::offer_real_amulet
     table[_M_byte("p")] = _SLOT_PRAY   # cmd.c::dopray (already set)
     table[_M_byte("q")] = _SLOT_NOOP   # cmd.c::done2 (quit)
     table[_M_byte("r")] = _SLOT_NOOP   # cmd.c::dorub
@@ -2500,6 +2519,7 @@ _COMPACT_RIDE       = 30
 _COMPACT_ENHANCE    = 31
 _COMPACT_DIP        = 32
 _COMPACT_TIP_DOWN   = 33
+_COMPACT_OFFER      = 34
 
 
 def _build_compact_handlers():
@@ -2539,6 +2559,7 @@ def _build_compact_handlers():
         _wrap_no_dir(_handle_enhance),# 31  COMPACT_ENHANCE — weapon.c:1329
         _wrap_no_dir(_handle_dip),    # 32  COMPACT_DIP — potion.c::dodip line 2267
         _wrap_no_dir(_handle_tip_down),  # 33  COMPACT_TIP_DOWN — dig.c::zap_dig line 1548
+        _wrap_no_dir(_handle_offer),     # 34  COMPACT_OFFER — pray.c::dosacrifice (ascension)
     )
 
 
@@ -2546,8 +2567,8 @@ _COMPACT_HANDLERS: tuple = _build_compact_handlers()
 
 
 def _build_slot_to_compact() -> jnp.ndarray:
-    """Map legacy handler slot (0..47) → compact slot (0..33)."""
-    table = [0] * 48
+    """Map legacy handler slot (0..48) → compact slot (0..34)."""
+    table = [0] * 49
     # Movement slots 1..8 → COMPACT_MOVE.
     for s in (_SLOT_MOVE_N, _SLOT_MOVE_E, _SLOT_MOVE_S, _SLOT_MOVE_W,
               _SLOT_MOVE_NE, _SLOT_MOVE_SE, _SLOT_MOVE_SW, _SLOT_MOVE_NW):
@@ -2588,6 +2609,7 @@ def _build_slot_to_compact() -> jnp.ndarray:
     table[_SLOT_ENHANCE]    = _COMPACT_ENHANCE  # weapon.c:1329 enhance_weapon_skill
     table[_SLOT_DIP]        = _COMPACT_DIP       # potion.c::dodip line 2267
     table[_SLOT_TIP_DOWN]   = _COMPACT_TIP_DOWN  # dig.c::zap_dig line 1548
+    table[_SLOT_OFFER]      = _COMPACT_OFFER     # pray.c::dosacrifice → ascension
     return jnp.array(table, dtype=jnp.int32)
 
 
@@ -2597,7 +2619,7 @@ def _build_slot_to_dir_idx() -> jnp.ndarray:
     Non-movement slots map to 0 (the direction is unused for those branches).
     The order matches ``_DIR_TABLE``: N=0, E=1, S=2, W=3, NE=4, SE=5, SW=6, NW=7.
     """
-    table = [0] * 48
+    table = [0] * 49
     # Move slots.
     table[_SLOT_MOVE_N]  = 0
     table[_SLOT_MOVE_E]  = 1
