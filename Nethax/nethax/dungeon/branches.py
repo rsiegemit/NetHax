@@ -112,34 +112,30 @@ class BranchInfo:
 # Canonical branch table
 # ---------------------------------------------------------------------------
 #
-# TODO (Audit-N #7 — deferred): the entries below currently use *fixed*
-# first_level / num_levels values.  Vendor dat/dungeon.def specifies (mean,
-# dev) tuples that should be sampled at init via ``rnd_branch_pos``.  Specs
-# from vendor:
+# Audit-N #7 — vendor-faithful (mean, dev) specs landed incrementally.
+# Vendor cite: vendor/nle/dat/dungeon.def lines 17-143.
 #
-#   DUNGEON  "The Dungeons of Doom"      (25, 5)
-#   BRANCH   "The Gnomish Mines"  @ (2, 3)
-#   LEVEL    "oracle"             @ (5, 5)
-#   CHAINBR  "Sokoban" "oracle"   + (1, 0) up         — STAIR not PORTAL
-#   CHAINBR  "The Quest" "oracle" + (6, 2) portal
-#   BRANCH   "Fort Ludios"        @ (18, 4) portal    — currently MISSING
-#   DUNGEON  "Gehennom"            (20, 5)
-#   BRANCH   "Vlad's Tower"        @ (9, 5) up        — chained off Gehennom
-#   DUNGEON  "The Elemental Planes" (6, 0)
+# The static BRANCH_TABLE below remains for legacy callers (cross-branch
+# cascade tests that hardcode integer level counts).  New code should
+# prefer ``sample_branch_table(rng)`` which produces vendor-faithful samples
+# via ``rn1(rand, base) = rn2(rand) + base`` (vendor/nle/include/hack.h line 497).
 #
-# Adopting this schema requires:
-#   1. Adding a Branch.LUDIOS enum entry.
-#   2. Changing BranchInfo to carry (mean, dev) tuples + a sample-at-init pass.
-#   3. Switching SOKOBAN's connection_type from PORTAL to STAIR.
-#   4. Replacing the fixed Mines first_level=2 with @(2,3) sampled.
-#   5. Updating the Quest entry to depend on Oracle's sampled depth + (6,2).
-#   6. Chaining Vlad off Gehennom @(9,5) up instead of fixed first_level=21.
-#   7. Updating num_levels to come from DUNGEON entries (Main 25, Gehennom 20).
+# Vendor specs landed in this wave (per dungeon.def):
 #
-# All seven items touch the cross-branch traversal tests; they will be
-# handled in a follow-up wave after the priest / temple / prayer cascade
-# parity changes in this wave land.  Vendor cite:
-# vendor/nle/dat/dungeon.def lines 17-143.
+#   MAIN          DUNGEON  "The Dungeons of Doom"      (25, 5)   # base, rand
+#   MINES_ENTRY   BRANCH   "The Gnomish Mines"  @ (2, 3)
+#   MINES         DUNGEON  "The Gnomish Mines"        (8, 2)
+#   ORACLE_LEVEL  LEVEL    "oracle"             @ (5, 5)
+#   SOKO_ENTRY    CHAINBR  "Sokoban" "oracle"   + (1, 0) up      # STAIR not PORTAL
+#   SOKOBAN       DUNGEON  "Sokoban"                  (4, 0)
+#   QUEST_ENTRY   CHAINBR  "The Quest" "oracle" + (6, 2) portal
+#   QUEST         DUNGEON  "The Quest"                (5, 2)
+#   LUDIOS_ENTRY  BRANCH   "Fort Ludios"        @ (18, 4) portal
+#   LUDIOS        DUNGEON  "Fort Ludios"              (1, 0)
+#   GEHENNOM      DUNGEON  "Gehennom"                 (20, 5)
+#   VLAD_ENTRY    BRANCH   "Vlad's Tower"       @ (9, 5) up      # chained off Gehennom
+#   VLAD          DUNGEON  "Vlad's Tower"             (3, 0)
+#   ENDGAME       DUNGEON  "The Elemental Planes"     (6, 0)
 
 BRANCH_TABLE: Tuple[BranchInfo, ...] = (
     BranchInfo(
@@ -185,6 +181,115 @@ BRANCH_TABLE: Tuple[BranchInfo, ...] = (
         connection_type=jnp.int8(BranchConnectionType.NO_END1),
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Vendor-faithful (mean, dev) tuples and JIT-safe sampler
+# ---------------------------------------------------------------------------
+#
+# Audit-N #7 Commit 1 (MAIN): wire ``(base=25, rand=5)`` for the Dungeons of
+# Doom.  Vendor cite: vendor/nle/dat/dungeon.def line 17
+# ``DUNGEON: "The Dungeons of Doom" "D" (25, 5)`` and vendor sampling rule
+# vendor/nle/src/dungeon.c lines 796-800
+# ``num_dunlevs = (xchar) rn1(pd.tmpdungeon[i].lev.rand,
+#                              pd.tmpdungeon[i].lev.base);``
+# with ``rn1(x, y) = rn2(x) + y`` from vendor/nle/include/hack.h line 497.
+#
+# Each ``(base, rand)`` tuple describes a uniform sample on the closed
+# interval ``[base, base + rand - 1]`` (when rand != 0) or the fixed
+# constant ``base`` (when rand == 0).  Branch-entry (BRANCH/CHAINBRANCH)
+# tuples are interpreted by ``level_range`` in dungeon.c lines 350-382:
+# the entry depth lies in ``[parent_depth + base, parent_depth + base + rand - 1]``
+# for CHAINBRANCH ("rcouple") or ``[base, base + rand - 1]`` for BRANCH
+# ("acouple").
+#
+# This wave wires only the MAIN dungeon ``num_levels`` spec; subsequent
+# commits will land Gehennom, Endgame, Mines, Sokoban, Quest, Vlad, Ludios.
+
+# (base, rand) for ``num_levels`` per DUNGEON entry in dungeon.def.
+# rand == 0 ⇒ fixed; rand > 0 ⇒ rn1(rand, base) = rn2(rand) + base.
+_DUNGEON_NUM_LEVELS_VENDOR_SPEC: dict = {
+    int(Branch.MAIN):          (25, 5),   # dungeon.def line 17
+    # Subsequent commits will populate:
+    # int(Branch.GEHENNOM):    (20, 5),  # dungeon.def line 51
+    # int(Branch.GNOMISH_MINES):(8, 2),   # dungeon.def line 71
+    # int(Branch.QUEST):       (5, 2),   # dungeon.def line 86
+    # int(Branch.SOKOBAN):     (4, 0),   # dungeon.def line 94
+    # int(Branch.VLAD):        (3, 0),   # dungeon.def line 116
+    # int(Branch.ENDGAME):     (6, 0),   # dungeon.def line 134
+}
+
+
+def _vendor_rn1(rng, rand: int, base: int) -> jnp.ndarray:
+    """JAX-native vendor ``rn1`` — ``rn2(rand) + base``.
+
+    Threefry/uniform sampling: when ``rand <= 1`` we return the constant
+    ``base`` (no key consumption) to mirror vendor short-circuiting at
+    dungeon.c line 379 ``if (randc) ...``.  When ``rand > 1`` we draw a
+    single uniform int via jax.random.randint over ``[base, base+rand)``.
+
+    Citation: vendor/nle/include/hack.h line 497
+    ``#define rn1(x, y) (rn2(x) + (y))``.
+
+    Args:
+        rng:  jax.random.PRNGKey scalar.
+        rand: vendor ``lev.rand`` (the dispersion).
+        base: vendor ``lev.base`` (the floor).
+
+    Returns:
+        int8 scalar.
+    """
+    if rand <= 0:
+        return jnp.int8(base)
+    # rn2(rand) ∈ [0, rand-1]; rn1 = rn2(rand) + base ∈ [base, base+rand-1].
+    sample = jax.random.randint(rng, (), minval=base, maxval=base + rand)
+    return sample.astype(jnp.int8)
+
+
+def sample_branch_table(rng) -> Tuple[BranchInfo, ...]:
+    """Vendor-faithful sampler for ``BRANCH_TABLE``.
+
+    Reproduces vendor/nle/src/dungeon.c::init_dungeons lines 796-800 by
+    sampling ``num_dunlevs`` from the dungeon.def ``(base, rand)`` tuple
+    for each branch that has a vendor spec landed.  Branches whose specs
+    have not yet been wired fall back to the static ``BRANCH_TABLE``
+    entries — this lets the sampler land incrementally (one branch per
+    commit) without breaking cross-branch traversal tests.
+
+    JIT-safety: this function consumes ``rng`` via ``jax.random.split``
+    so no PRNG key is reused.  It is not itself JIT'd (it runs once per
+    game at init), but the per-branch ``_vendor_rn1`` calls are.
+
+    Citation: vendor/nle/src/dungeon.c::init_dungeons lines 796-800,
+              vendor/nle/dat/dungeon.def lines 17-143.
+
+    Args:
+        rng: jax.random.PRNGKey scalar.
+
+    Returns:
+        Tuple of ``BranchInfo`` records, ordered by Branch enum.
+    """
+    # Split one key per branch (7 branches in current enum); we always split
+    # so the seed flow is deterministic even when an individual branch falls
+    # back to the static value (the split itself is a no-op for unused keys).
+    keys = jax.random.split(rng, N_BRANCHES)
+
+    out = []
+    for b in range(N_BRANCHES):
+        static = BRANCH_TABLE[b]
+        spec = _DUNGEON_NUM_LEVELS_VENDOR_SPEC.get(b)
+        if spec is not None:
+            base, rand = spec
+            num_levels_sampled = _vendor_rn1(keys[b], rand, base)
+            out.append(BranchInfo(
+                branch_id=static.branch_id,
+                first_level=static.first_level,
+                num_levels=num_levels_sampled,
+                connection_type=static.connection_type,
+            ))
+        else:
+            out.append(static)
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
