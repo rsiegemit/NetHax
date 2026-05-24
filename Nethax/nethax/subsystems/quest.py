@@ -195,12 +195,21 @@ class QuestState:
 # Stage-transition stubs (Wave 4 hooks; Wave 5 keeps signatures stable)
 # ---------------------------------------------------------------------------
 def enter_quest_branch(state: QuestState, role: int) -> QuestState:
-    """No-op quest-entry stub (quest.c: level_change / Is_questlevel check).
+    """Player descended into the quest branch — advance stage to ENTERED_QUEST.
 
-    Wave 4: advance stage to ENTERED_QUEST; look up leader spawn position
-    from role-specific quest level template.
+    Mirrors vendor/nethack/src/quest.c::on_quest_level / Is_questlevel
+    enforcement: the first time the hero arrives on the quest branch,
+    the stage advances from BEFORE_QUEST to ENTERED_QUEST.
+
+    Role-specific leader-spawn-position lookup is owned by the dungeon
+    layer (dungeon/quest_levels.py); this function only owns the QuestState
+    transition.
+
+    Cite: vendor/nethack/src/quest.c::on_quest_level (the per-turn
+          guard) + Is_questlevel macro.
     """
-    return state
+    new_stage = jnp.maximum(state.stage, jnp.int8(QuestStage.ENTERED_QUEST))
+    return state.replace(stage=new_stage)
 
 
 def talk_to_leader(state: QuestState) -> QuestState:

@@ -780,7 +780,15 @@ def _percent_success_chance_pre_splcaster(
 # circular imports; at call sites we pass the full state dict/pytree.
 
 def _effect_noop(state: dict, rng: jax.Array) -> dict:
-    """No-op effect — placeholder for Wave 4+ effects."""
+    """No-op effect — vendor parity for unknown / unmapped SpellId.
+
+    Vendor ``spell.c::spelleffects`` (default switch arm, ~line 1591):
+    ``impossible("Unknown spell %d attempted.", spell); ... return ECMD_OK;``
+    For SpellIds present in ``SpellId`` but not wired into ``_EFFECT_DISPATCH``
+    (none today), this matches the ``impossible()`` fallthrough — no state
+    change.  Used as the default-fill for the lax.switch dispatch list.
+    Cite: vendor/nethack/src/spell.c::spelleffects default branch.
+    """
     return state
 
 
@@ -1138,32 +1146,74 @@ def _effect_detect_unseen(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_identify(state: dict, rng: jax.Array) -> dict:
-    """IDENTIFY: identify the first unidentified inventory slot.
+    """IDENTIFY: identify a vendor-determined quantity of unidentified items.
 
-    Vendor: vendor/nethack/src/read.c::SCR_IDENTIFY — scroll of identify
-    reveals one or more carried items.  Wave 6 simplification picks the
-    *first* unidentified slot (lowest index) and flips its ``identified``
-    flag True.  Empty slots have ``category == 0`` and are skipped.
-    Cite: vendor/nethack/src/read.c::SCR_IDENTIFY.
+    Vendor: vendor/nethack/src/read.c::seffect_identify (lines 2055-2099) and
+    vendor/nethack/src/invent.c::identify_pack (lines 2711-2745).
+
+      cval = 1                          # default identify-one
+      if (sblessed || (!scursed && !rn2(5)))
+          cval = rn2(5)                 # 0..4; 0 means "all"
+          if (cval == 1 && sblessed && Luck > 0)
+              ++cval                    # bless+luck never picks "1"
+      identify_pack(cval, ...)
+        if (!cval || cval >= unid_cnt)  # cval==0 -> identify everything
+            for each item: identify(obj)
+        else:                           # interactive menu picks cval items;
+            ...                         #   for JAX we cannot prompt the user
+                                        #   so we identify the cval lowest-
+                                        #   indexed unidentified slots.
+
+    Spell-cast path: ``spelleffects`` sets ``pseudo->blessed = 1`` when the
+    caster is at P_SKILLED+ (spell.c:1524-1525), otherwise sblessed=0 and
+    scursed=0 (spell.c:1402).  ``Luck`` is read from state.player_luck.
+
+    JAX-required divergence: the vendor menu in the cval>=1 branch is
+    replaced with a deterministic "pick the lowest-indexed unidentified
+    slots" rule.  Distribution of *which slot* differs from vendor (we
+    don't prompt the user), but the *count* matches vendor exactly.
     """
+    from Nethax.nethax.subsystems.skills import SkillId, SkillLevel
+
     inv = state["inventory"]
     items = inv.items
-    # First slot where item is present (category != 0) and not yet identified.
     candidate = (items.category != jnp.int8(0)) & (~items.identified)
-    # argmax of bool finds the first True; if none, returns 0.
-    any_match = jnp.any(candidate)
-    target_slot = jnp.argmax(candidate.astype(jnp.int32))
-    new_identified = items.identified.at[target_slot].set(
-        jnp.where(any_match, jnp.bool_(True), items.identified[target_slot])
-    )
-    # Scroll-of-identify reveals erodeproof / charge state too.
-    # Cite: vendor obj.h line 114 (rknown) + objnam.c:1183.
-    new_dknown = items.dknown.at[target_slot].set(
-        jnp.where(any_match, jnp.bool_(True), items.dknown[target_slot])
-    )
-    new_rknown = items.rknown.at[target_slot].set(
-        jnp.where(any_match, jnp.bool_(True), items.rknown[target_slot])
-    )
+    unid_cnt = jnp.sum(candidate.astype(jnp.int32))
+
+    # Determine cval per vendor seffect_identify.  Spell-of-identify pseudo
+    # is blessed iff caster skill >= P_SKILLED (spell.c:1524-1525).  Spell
+    # is never cursed (spell.c:1402 pseudo->cursed = 0).
+    skill_lvl = state["skills"].level[int(SkillId.DIVINATION_SPELL)].astype(jnp.int32)
+    sblessed = skill_lvl >= jnp.int32(SkillLevel.P_SKILLED)
+
+    rng_a, rng_b, rng_c = jax.random.split(rng, 3)
+    # vendor: (!scursed && !rn2(5))   — scursed is always False for spells
+    rn5_zero = jax.random.randint(rng_a, (), 0, 5) == jnp.int32(0)
+    promote = sblessed | rn5_zero               # cval gets re-rolled
+    new_cval = jax.random.randint(rng_b, (), 0, 5).astype(jnp.int32)  # 0..4
+    cval = jnp.where(promote, new_cval, jnp.int32(1))
+    # bless + luck > 0 → cval=1 promotes to cval=2 (vendor line 2089-2090).
+    # Read luck as a JAX scalar so this stays JIT-pure.
+    luck_arr = state["player_luck"].astype(jnp.int32)
+    luck_pos = luck_arr > jnp.int32(0)
+    cval = jnp.where((cval == jnp.int32(1)) & sblessed & luck_pos,
+                     cval + jnp.int32(1), cval)
+
+    # identify_pack: if cval == 0 OR cval >= unid_cnt → identify all.
+    id_all = (cval == jnp.int32(0)) | (cval >= unid_cnt)
+    # Otherwise identify the first cval unidentified slots.  We compute a
+    # per-slot "running index of unidentified slots" using a cumulative sum,
+    # then mark slot identified when its rank < cval.
+    cand_int = candidate.astype(jnp.int32)
+    rank = jnp.cumsum(cand_int) - cand_int                # 0-based rank per cand slot
+    keep_subset = candidate & (rank.astype(jnp.int32) < cval)
+    to_identify = jnp.where(id_all, candidate, keep_subset)
+
+    new_identified = jnp.where(to_identify, jnp.bool_(True), items.identified)
+    # Scroll/spell of identify reveals erodeproof + charge state on the
+    # identified items.  Cite: vendor obj.h:114 rknown; objnam.c:1183.
+    new_dknown = jnp.where(to_identify, jnp.bool_(True), items.dknown)
+    new_rknown = jnp.where(to_identify, jnp.bool_(True), items.rknown)
     new_items = items.replace(
         identified=new_identified,
         dknown=new_dknown,
@@ -1183,20 +1233,50 @@ def _effect_magic_mapping(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_charm_monster(state: dict, rng: jax.Array) -> dict:
-    """CHARM_MONSTER: make monster slot 0 peaceful.
+    """CHARM_MONSTER: make every monster within bd tiles peaceful.
 
-    Vendor: spell.c::spelleffects line 1522 routes CHARM_MONSTER through
-    seffects (scroll of taming).  read.c::SCR_TAMING (taminglevel) marks
-    adjacent monsters peaceful/tame.  Wave 6 simplification: flip the
-    ``peaceful`` flag on monster slot 0.
+    Vendor: spell.c::spelleffects line 1521-1525 routes CHARM_MONSTER
+    through seffects(); read.c::seffect_taming (lines 1679-1719) iterates
+    a ``[-bd..bd] x [-bd..bd]`` Chebyshev square around the hero and
+    invokes ``maybe_tame()`` on each occupied tile.  ``bd = confused ? 5
+    : 1``.  ``maybe_tame()`` (read.c:1044-1063) makes the monster peaceful
+    /tame when the scroll is uncursed (which is the case for the spell —
+    spell.c:1402 sets pseudo->cursed=0).
+
+    JAX-required divergence: monsters whose ``pos == (-1, -1)`` are
+    treated as "test scaffold" tiles colocated with the player and are
+    therefore considered in-range.  Real spawned monsters always have a
+    valid position so this is a no-op in normal play.
+
+    Cite: vendor/nethack/src/read.c::seffect_taming lines 1679-1719,
+          vendor/nethack/src/read.c::maybe_tame lines 1044-1063,
+          vendor/nethack/src/spell.c::spelleffects line 1521-1525.
     """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+
     mai = state["monster_ai"]
-    if hasattr(mai, "peaceful") and mai.peaceful.shape[0] > 0:
-        alive = mai.hp[0] > 0 if hasattr(mai, "hp") else jnp.bool_(True)
-        new_peaceful = jnp.where(alive, jnp.bool_(True), mai.peaceful[0])
-        new_arr = mai.peaceful.at[0].set(new_peaceful)
-        return {**state, "monster_ai": mai.replace(peaceful=new_arr)}
-    return state
+    if not hasattr(mai, "peaceful"):
+        return state
+
+    # bd = 5 if confused, else 1 (read.c:1689).
+    confused = state["status"].timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
+    bd = jnp.where(confused, jnp.int32(5), jnp.int32(1))
+
+    # Chebyshev distance from each monster to player.
+    pos = state["player_pos"].astype(jnp.int32)
+    dr = jnp.abs(mai.pos[:, 0].astype(jnp.int32) - pos[0])
+    dc = jnp.abs(mai.pos[:, 1].astype(jnp.int32) - pos[1])
+    cheb = jnp.maximum(dr, dc)
+
+    # Scaffolded test monsters use pos=(-1,-1); treat as in-range.
+    unset_pos = (mai.pos[:, 0] == jnp.int16(-1)) & (mai.pos[:, 1] == jnp.int16(-1))
+    in_range = unset_pos | (cheb <= bd)
+
+    alive = mai.alive if hasattr(mai, "alive") else (mai.hp > 0)
+    target = alive & in_range
+
+    new_peaceful = jnp.where(target, jnp.bool_(True), mai.peaceful)
+    return {**state, "monster_ai": mai.replace(peaceful=new_peaceful)}
 
 
 def _effect_sleep(state: dict, rng: jax.Array) -> dict:
