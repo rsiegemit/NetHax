@@ -103,32 +103,32 @@ def test_turns_underwater_resets_on_leaving():
 # ---------------------------------------------------------------------------
 
 def test_insta_drown_chance():
-    """With turns_underwater > 20, insta-drown must kill the player within
-    at most 100 five-turn check cycles (statistically near-certain at N=25+).
+    """One-shot ``drown()`` produces death within a small number of trials.
 
-    Vendor formula: trap.c::drown line 5059 — rnl(50) <= turns_underwater.
-    At turns_underwater=25 the probability per check is 26/50 > 50 %.
+    Vendor drown is a one-shot event (trap.c:5057-5198): on entry without
+    Swimming/Amphibious/Breathless the hero attempts emergency_disrobe +
+    crawl_out, and otherwise dies via ``done(DROWNING)`` (trap.c:5187).
+    Over 100 trial entries at least one must end in death.
     """
-    state = _fresh_state()
-    state = state.replace(player_hp=jnp.int32(100), player_hp_max=jnp.int32(100))
-
-    # Start at turns_underwater=20 so the very next check (turn 25) has
-    # p(drown) = 26/50 > 50 %.  After 100 ticks (~20 check cycles) the
-    # player is almost certainly dead.
-    state = _set_in_water(state, True, turns=20)
+    from Nethax.nethax.subsystems.water import drown as _drown_fn
 
     rng = _RNG
     died = False
     for _ in range(100):
+        state = _fresh_state()
+        state = state.replace(
+            player_hp=jnp.int32(100), player_hp_max=jnp.int32(100)
+        )
+        state = _set_in_water(state, True, turns=0)
         rng, sub = jax.random.split(rng)
-        state = water_step(state, sub)
-        if int(state.player_hp) == 0:
+        state = _drown_fn(state, sub)
+        if int(state.player_hp) == 0 and bool(state.done):
             died = True
             break
 
     assert died, (
-        "Player should have drowned within 100 ticks with turns_underwater > 20 "
-        "(trap.c::drown line 5059)"
+        "drown() should produce at least one DROWNING death in 100 trials "
+        "(trap.c::drown line 5187)"
     )
 
 

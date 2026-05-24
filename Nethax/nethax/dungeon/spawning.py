@@ -713,6 +713,7 @@ def populate_level_with_monsters(
     state,
     rng: jax.Array,
     n_monsters: int = 5,
+    n_rooms: int | None = None,
 ) -> object:
     """Spawn monsters into state.monster_ai slots [0, n_monsters).
 
@@ -720,7 +721,27 @@ def populate_level_with_monsters(
     Valid spawn tiles: FLOOR or CORRIDOR, not the player's starting position.
 
     Writes into the first n_monsters slots of state.monster_ai.
+
+    Audit-N #6 (mklev.c:804): when ``n_rooms`` is provided the monster
+    count is recomputed as ``rnd((nroom >> 1) + 1)`` instead of the fixed
+    ``n_monsters`` default.  ``rnd(N) = randint(1, N+1)`` is sampled from
+    a sub-key of ``rng``.
+
+    Args:
+        state:      EnvState.
+        rng:        JAX PRNG key.
+        n_monsters: fallback count when ``n_rooms`` is None (default 5).
+        n_rooms:    optional int — current-level active room count.  When
+                    set, ``ct = rnd((nroom >> 1) + 1)`` overrides
+                    ``n_monsters``.
     """
+    if n_rooms is not None:
+        rng_ct, rng = jax.random.split(rng, 2)
+        # rnd(N) = randint(1, N+1).  Per vendor mklev.c:804
+        # ct = rnd((svn.nroom >> 1) + 1).
+        upper = max(int(n_rooms) >> 1, 0) + 1
+        sampled = int(jax.random.randint(rng_ct, (), 1, upper + 1))
+        n_monsters = max(min(sampled, n_monsters), 1)
     terrain = state.terrain[0, 0]  # int8[MAP_H, MAP_W]
     map_h, map_w = terrain.shape
 

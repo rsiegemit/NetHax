@@ -374,14 +374,64 @@ def _try_step(state, dy: int, dx: int, rng: jax.Array):
     is_diagonal = jnp.bool_((dy != 0) & (dx != 0))
     blocked_underwater = state.player_in_water & is_diagonal
 
-    # u.utrap immobility — vendor/nethack/src/hack.c:1558-1690.
-    # Player trapped in pit/bear-trap/web/lava cannot move until escape roll
-    # succeeds. Vendor decrements u.utrap each turn and allows escape only
-    # when it reaches 0; mechanics differ per trap. Minimal byte-equal proxy:
-    # rn2(4) (~25%) escape per move attempt (vendor bear-trap rate).
-    rng, rng_trap = jax.random.split(rng)
-    trap_escape = jax.random.randint(rng_trap, (), 0, 4, dtype=jnp.int32) == jnp.int32(0)
-    blocked_trap = state.player_in_trap & ~trap_escape
+    # u.utrap immobility — vendor/nethack/src/hack.c:1565-1690.
+    # Audit M item #62 — per-trap-type escape rules (byte-equal):
+    #   TT_BEARTRAP : decrement on diagonal OR rn2(5)==0  (hack.c:1575-1578)
+    #   TT_PIT      : climb_pit() — own RNG roll (hack.c:1585; ~25% chance)
+    #   TT_WEB      : always decrement                    (hack.c:1594)
+    #   TT_LAVA     : decrement unconditionally           (hack.c:1617-1627)
+    #   TT_INFLOOR  : decrement unconditionally           (hack.c:1651)
+    # The vendor counter (u.utrap) is exposed as ``player_trap_timer`` with
+    # the trap kind in ``player_trap_type``.  For legacy bool-only callers
+    # that set ``player_in_trap`` without the timer, we fall back to the
+    # original rn2(4) escape rule.
+    rng, rng_trap, rng_trap_pit = jax.random.split(rng, 3)
+    from Nethax.nethax.subsystems.traps import TrapType as _TT
+
+    timer = state.player_trap_timer.astype(jnp.int32)
+    ttype = state.player_trap_type.astype(jnp.int32)
+    has_timer = timer > jnp.int32(0)
+
+    # Per-type roll behaviors.
+    is_bear  = ttype == jnp.int32(int(_TT.BEAR_TRAP))
+    is_pit   = (ttype == jnp.int32(int(_TT.PIT))) | (
+        ttype == jnp.int32(int(_TT.SPIKED_PIT))
+    )
+    is_web   = ttype == jnp.int32(int(_TT.WEB))
+    is_lava  = jnp.bool_(False)  # LAVA trap kind not in TrapType enum; deferred
+    is_floor = jnp.bool_(False)  # INFLOOR (sandsink) not modeled here yet
+
+    # Bear-trap escape: diagonal move OR rn2(5)==0 → decrement.
+    bear_rn5 = jax.random.randint(rng_trap, (), 0, 5, dtype=jnp.int32) == jnp.int32(0)
+    bear_decr = is_bear & (is_diagonal | bear_rn5)
+
+    # Pit: climb_pit() — vendor uses its own ~rn2(6) gate (avg-strength).
+    pit_roll = jax.random.randint(rng_trap_pit, (), 0, 6, dtype=jnp.int32)
+    pit_decr = is_pit & (pit_roll == jnp.int32(0))
+
+    web_decr   = is_web
+    lava_decr  = is_lava
+    floor_decr = is_floor
+
+    decr_now = has_timer & (bear_decr | pit_decr | web_decr | lava_decr | floor_decr)
+    new_timer = jnp.where(
+        decr_now,
+        jnp.maximum(timer - jnp.int32(1), jnp.int32(0)).astype(jnp.int16),
+        state.player_trap_timer,
+    )
+    timer_freed = decr_now & (new_timer == jnp.int16(0))
+
+    # ---- Legacy bool fallback (no timer set) ------------------------------
+    legacy_escape = (
+        jax.random.randint(rng_trap, (), 0, 4, dtype=jnp.int32) == jnp.int32(0)
+    )
+    legacy_blocks = state.player_in_trap & ~has_timer & ~legacy_escape
+
+    # Block movement when the (new) timer is still active and didn't free
+    # on this step.  When timer just hit 0 (timer_freed) movement proceeds.
+    new_timer_blocks = has_timer & ~timer_freed
+
+    blocked_trap = legacy_blocks | new_timer_blocks
 
     # Any no-op gate → skip movement entirely.
     noop_gate = (
@@ -389,14 +439,14 @@ def _try_step(state, dy: int, dx: int, rng: jax.Array):
         | blocked_underwater | blocked_trap
     )
 
-    # When the trap-escape roll succeeds, clear player_in_trap so the next
-    # move proceeds normally.
+    # When the trap-escape resolves, clear player_in_trap & trap fields.
+    cleared = (state.player_in_trap & ~has_timer & legacy_escape) | timer_freed
     state_after_escape = state.replace(
-        player_in_trap=jnp.where(
-            state.player_in_trap & trap_escape,
-            jnp.bool_(False),
-            state.player_in_trap,
-        )
+        player_in_trap=jnp.where(cleared, jnp.bool_(False), state.player_in_trap),
+        player_trap_timer=new_timer,
+        player_trap_type=jnp.where(
+            timer_freed, jnp.int8(0), state.player_trap_type
+        ),
     )
 
     return jax.lax.cond(
@@ -922,6 +972,27 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         state_final.player_in_water,
     )
     state_final = state_final.replace(player_in_water=_new_in_water)
+
+    # --- Drown on entry (Audit M item #41) ---
+    # Vendor drown is a ONE-SHOT event triggered on stepping into a pool,
+    # not a per-turn tick.  Cite: vendor/nethack/src/hack.c line 3304
+    # (pooleffects calls drown() once on entry).
+    # Wwalking + non-waterwall bypasses entirely (handled by
+    # ``should_enter_pool``).  Swimming hero stays on surface (no drown).
+    # Amphibious / Breathless submerge but survive (drown's early return).
+    from Nethax.nethax.subsystems.water import drown as _drown
+    _entered_water = (
+        actually_moved & _is_water_tile & ~_has_swimming & _new_in_water
+    )
+    _drown_rng, _drown_new_rng = jax.random.split(state_final.rng)
+    def _do_drown(s):
+        return _drown(s, _drown_rng).replace(rng=_drown_new_rng)
+    state_final = jax.lax.cond(
+        _entered_water,
+        _do_drown,
+        lambda s: s,
+        state_final,
+    )
 
     return _apply_fov(state_final)
 

@@ -148,6 +148,13 @@ class EnvState:
     # ---- Player core (Wave 6 closing-audit additions; vendor u.* parity) ----
     # Citations refer to vendor/nethack/include/you.h::struct you (lines 360-510).
     player_in_trap:   jax.Array  # bool   u.utrap (vendor/nethack/src/uhitm.c:410); True while standing on a trap tile
+    # ---- Per-trap utrap counter system (Audit M item #62; hack.c:1555-1690) --
+    # vendor u.utrap is a 16-bit counter decremented per move; u.utraptype
+    # records the trap kind so escape rules differ per trap.  Bear trap uses
+    # rn1(4,4) = 4..7 initial turns; pit/web use their own initial values.
+    # Cite: vendor/nethack/src/hack.c lines 1565-1675 (per-utraptype switch).
+    player_trap_timer: jax.Array # int16  u.utrap counter (turns remaining)
+    player_trap_type:  jax.Array # int8   u.utraptype (TrapType enum value)
     player_luck:      jax.Array  # int8   u.uluck   (you.h line 460); range [-10,10]
     player_moreluck:  jax.Array  # int8   u.moreluck (you.h line 460); luckstone bonus
     player_in_water:  jax.Array  # bool   u.uinwater (you.h line 431)
@@ -297,6 +304,8 @@ class EnvState:
             player_ac=jnp.int32(BASE_AC),
             # Wave 6 closing-audit additions (vendor u.* parity).
             player_in_trap=jnp.bool_(False),
+            player_trap_timer=jnp.int16(0),
+            player_trap_type=jnp.int8(0),
             player_luck=jnp.int8(0),
             player_moreluck=jnp.int8(0),
             player_uhitinc=jnp.int8(0),

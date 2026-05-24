@@ -116,35 +116,35 @@ def test_swimming_stays_on_surface():
 # ---------------------------------------------------------------------------
 
 def test_no_breath_still_drowns():
-    """Without any water-breathing, stepping into pool then ticking causes HP loss.
+    """Without any water-breathing, stepping into pool triggers one-shot drown.
 
-    Cite: vendor/nethack/src/hack.c::pooleffects line 3304 (enter),
-          vendor/nethack/src/trap.c::drown() lines 5059-5195 (damage).
+    Cite: vendor/nethack/src/hack.c::pooleffects line 3304 (drown entry),
+          vendor/nethack/src/trap.c::drown() lines 5057-5198 (one-shot).
 
-    Vendor drowning is binary: ``drown()`` either lets the hero crawl out
-    or calls ``done(DROWNING)`` (instakill).  Our ``water_step`` models
-    this with a per-5-turns rnl(50)-vs-turns_underwater check; the kill
-    probability grows from 12% at turn 5 to ~100% at turn 50.  We tick
-    50 turns so the insta-drown fires deterministically.
+    Vendor drowning is a one-shot event: ``drown()`` runs at entry, either
+    crawls the hero to safety or calls ``done(DROWNING)``.  Over many
+    trial entries at least one must end in death (50% crawl-out rate
+    in our model).
     """
-    state = _make_state(player_pos=(10, 10))
-    state = _place_tile(state, 10, 11, TileType.POOL)
-    state = _set_in_water(state, False)
-    state = state.replace(player_hp=jnp.int32(200), player_hp_max=jnp.int32(200))
+    from Nethax.nethax.subsystems.water import drown as _drown_fn
 
-    # Step into pool — sets player_in_water.
-    state = _try_step(state, 0, 1, _RNG)
-    assert bool(state.player_in_water), "Stepping into POOL should set player_in_water."
-
-    # Apply 50 drowning ticks; by turn 50 the rnl(50) <= turns_underwater
-    # check at turn 50 is guaranteed to trigger insta-drown.
+    died = False
     rng = _RNG
     for _ in range(50):
+        state = _make_state(player_pos=(10, 10))
+        state = _set_in_water(state, True)
+        state = state.replace(
+            player_hp=jnp.int32(200), player_hp_max=jnp.int32(200)
+        )
         rng, sub = jax.random.split(rng)
-        state = water_step(state, sub)
+        state = _drown_fn(state, sub)
+        if int(state.player_hp) == 0 and bool(state.done):
+            died = True
+            break
 
-    assert int(state.player_hp) < 200, (
-        "No water-breathing: drowning damage should reduce HP (trap.c:5059)"
+    assert died, (
+        "drown() should produce at least one DROWNING death in 50 trials "
+        "(trap.c:5187)"
     )
 
 

@@ -178,6 +178,7 @@ def generate_rooms(
     h: int = MAP_H,
     w: int = MAP_W,
     n_rooms: int = 8,
+    depth: int = 1,
 ) -> Room:
     """Place rooms on an h×w grid via rejection-sampling.
 
@@ -189,15 +190,19 @@ def generate_rooms(
     on the dungeons of doom main branch are in the 5..9 range (one room
     per ~6 free units of map width).
 
-    To mirror this we:
-      1. Pick a random target count in [5, 9] when `n_rooms < 0`
-         (sentinel for "vendor random count").
-         Vendor distribution: rnd(5) + MAXNROFROOMS/6 ≈ 6..10 trimmed to map fit.
-      2. For each target room slot we draw up to _MAX_RETRIES candidate
-         positions/sizes and accept the first that fits without overlap.
+    Audit-N #1 (mkmap.c::litstate_rnd line 446):
+        is_lit = (rnd(1 + abs(depth)) < 11) & (rn2(77) == 0)
+    Lit rooms are very rare and biased toward shallow depths.
 
-    Per-room sampled dimensions match vendor sp_lev.c create_room lines
-    1548-1549:  width  = 2 + rn2(8),  height = 2 + rn2(4).
+    Audit-N #2 (sp_lev.c::create_room lines 1548-1551):
+        dx = 2 + rn2((hx - lx > 28) ? 12 : 8)
+        dy = 2 + rn2(4)
+        if dx * dy > 50: dy = 50 / dx
+    Big-room enclosures sample dx from a wider range; the dx*dy <= 50 cap
+    truncates height.  Our generator uses the standard 2+rn2(8)/2+rn2(4)
+    width/height sampling because the map is divided into many small
+    rooms (not single-rectangle big rooms); we *do* apply the lit-formula
+    and the dy-cap.
 
     Args:
         rng:     JAX PRNG key.
@@ -205,6 +210,7 @@ def generate_rooms(
         w:       map width in cells (default MAP_W = 80).
         n_rooms: target room count.  Pass -1 to draw a vendor-style random
                  count in [5, 9].  Default 8 preserves Wave 2 behaviour.
+        depth:   current dungeon depth (1..30+).  Used for lit-room formula.
 
     Returns:
         Room pytree with arrays shaped [MAX_ROOMS_PER_LEVEL].
@@ -237,7 +243,29 @@ def generate_rooms(
     all_x_off = jax.random.randint(key_x, (total_samples,), 1, 1 + x_range, dtype=jnp.int16)
     all_heights = jax.random.randint(key_h, (total_samples,), _MIN_ROOM_H, _MAX_ROOM_H + 1, dtype=jnp.int16)
     all_widths  = jax.random.randint(key_w, (total_samples,), _MIN_ROOM_W, _MAX_ROOM_W + 1, dtype=jnp.int16)
-    all_lit     = jax.random.randint(key_lit, (MAX_ROOMS_PER_LEVEL,), 0, 2, dtype=jnp.int8)
+
+    # Audit-N #1: vendor litstate_rnd (mkmap.c:446):
+    #   is_lit = (rnd(1+abs(depth)) < 11) & (rn2(77) == 0)
+    # rnd(N) returns [1, N]; we sample from [1, 1+abs(depth)] as
+    # jax.random.randint(min=1, max=2+abs(depth)).
+    abs_depth = abs(int(depth))
+    key_lit_a, key_lit_b = jax.random.split(key_lit, 2)
+    lit_roll_a = jax.random.randint(
+        key_lit_a, (MAX_ROOMS_PER_LEVEL,), 1, 2 + abs_depth, dtype=jnp.int32
+    )
+    lit_roll_b = jax.random.randint(
+        key_lit_b, (MAX_ROOMS_PER_LEVEL,), 0, 77, dtype=jnp.int32
+    )
+    all_lit = ((lit_roll_a < 11) & (lit_roll_b == 0)).astype(jnp.int8)
+
+    # Audit-N #2: dx*dy <= 50 cap.  Apply after width/height sample —
+    # truncate height when width is wide enough to push the area over 50.
+    capped_h = jnp.where(
+        all_widths * all_heights > 50,
+        (jnp.int16(50) // jnp.maximum(all_widths, jnp.int16(1))).astype(jnp.int16),
+        all_heights,
+    )
+    all_heights = jnp.maximum(capped_h, jnp.int16(_MIN_ROOM_H))
 
     # State carried through fori_loop:
     #   y1[MAX_ROOMS], x1[MAX_ROOMS], y2[MAX_ROOMS], x2[MAX_ROOMS]  — room coords
@@ -349,11 +377,34 @@ _ROOM_PROBS = (
 )
 
 
+# Vendor mklev.c line 1349: u_depth < depth(&medusa_level) — Medusa is on
+# the level just above Castle (~Dlvl 22-25 with the mean/dev placement).  We
+# encode the depth cutoff as a compile-time constant; assign_special_room
+# checks u_depth < MEDUSA_LEVEL_DEPTH before allowing SHOPBASE.
+MEDUSA_LEVEL_DEPTH: int = 24
+
+# Vendor mklev.c line 1350: svn.nroom >= room_threshold (where room_threshold
+# is a static "shops require N or more rooms" gate, usually 4).
+ROOM_THRESHOLD_FOR_SHOP: int = 4
+
+# Vendor monster-extinction PM_ id sentinels (mklev.c lines 1355, 1362, 1369,
+# 1374): if all monsters of the gating species are dead, the special room is
+# skipped.  Indexes into a 5-element ``genocided`` mask passed to
+# assign_special_room.
+GENOCIDE_IDX_LEPRECHAUN = 0
+GENOCIDE_IDX_KILLER_BEE = 1
+GENOCIDE_IDX_SOLDIER    = 2
+GENOCIDE_IDX_COCKATRICE = 3
+GENOCIDE_IDX_ANT        = 4   # antholemon() — any ant species alive
+
+
 def assign_special_room(
     rng: jnp.ndarray,
     rooms: Room,
     active: jnp.ndarray,
     u_depth: int,
+    n_rooms: jnp.ndarray | None = None,
+    genocided: jnp.ndarray | None = None,
 ) -> Room:
     """Assign at most one special room per level following vendor mklev.c.
 
@@ -362,14 +413,27 @@ def assign_special_room(
     mkzoo / mktemple / mkswamp pick the *first* active OROOM slot and
     flip its rtype.
 
+    Audit-N #3:
+      - SHOPBASE row adds ``u_depth < depth(&medusa_level)`` ceiling and
+        ``svn.nroom >= room_threshold`` gate.
+      - LEPREHALL / BEEHIVE / ANTHOLE / BARRACKS / COCKNEST add per-species
+        ``svm.mvitals[...].mvflags & G_GONE`` gates (passed as the
+        ``genocided`` array — bool[5] indexed by GENOCIDE_IDX_*).
+
     JIT-pure: uses jnp.where on the room_type array and walks the table
     via Python iteration (table is static, so the loop unrolls).
 
     Args:
-        rng:     JAX PRNG key.
-        rooms:   Room pytree (room_type currently all ORDINARY).
-        active: bool[MAX_ROOMS_PER_LEVEL] mask.
-        u_depth: 1-based depth in dungeon (compile-time int).
+        rng:        JAX PRNG key.
+        rooms:      Room pytree (room_type currently all ORDINARY).
+        active:    bool[MAX_ROOMS_PER_LEVEL] mask.
+        u_depth:    1-based depth in dungeon (compile-time int).
+        n_rooms:    optional int scalar — total active rooms on this level
+                    (gates SHOPBASE per vendor line 1350).  If None, treated
+                    as ROOM_THRESHOLD_FOR_SHOP (gate satisfied).
+        genocided:  optional bool[5] — per-species extinction mask
+                    (LEPREHALL/BEEHIVE/SOLDIER/COCKATRICE/ANT).  If None,
+                    no species are genocided.
 
     Returns:
         Updated Room pytree with at most one slot flipped to a special type.
@@ -377,6 +441,28 @@ def assign_special_room(
     rng, key_pick = jax.random.split(rng)
     # First active slot index (vendor: scan svr.rooms[0..nroom] for OROOM).
     first_active_idx = jnp.argmax(active).astype(jnp.int32)
+
+    # Default n_rooms = ROOM_THRESHOLD (gate satisfied) when caller omits.
+    if n_rooms is None:
+        n_rooms = jnp.int32(ROOM_THRESHOLD_FOR_SHOP)
+    n_rooms = jnp.asarray(n_rooms, dtype=jnp.int32)
+
+    # Default genocided = all-False when caller omits.
+    if genocided is None:
+        genocided = jnp.zeros((5,), dtype=jnp.bool_)
+    genocided = jnp.asarray(genocided, dtype=jnp.bool_)
+
+    # SHOPBASE gates (vendor mklev.c:1349-1350).
+    shop_depth_ok = u_depth < MEDUSA_LEVEL_DEPTH
+    shop_nroom_ok = n_rooms >= jnp.int32(ROOM_THRESHOLD_FOR_SHOP)
+    shop_extra_gate = shop_depth_ok & shop_nroom_ok
+
+    # Per-species extinction gates.
+    species_alive_lep   = ~genocided[GENOCIDE_IDX_LEPRECHAUN]
+    species_alive_bee   = ~genocided[GENOCIDE_IDX_KILLER_BEE]
+    species_alive_sold  = ~genocided[GENOCIDE_IDX_SOLDIER]
+    species_alive_cock  = ~genocided[GENOCIDE_IDX_COCKATRICE]
+    species_alive_ant   = ~genocided[GENOCIDE_IDX_ANT]
     any_active = jnp.any(active)
 
     # Build a single int32 "chosen_type" via vendor cascade.  Walks the
@@ -392,10 +478,24 @@ def assign_special_room(
             roll = jax.random.randint(keys[i], (), 0,
                                        max(int(u_depth), 1),
                                        dtype=jnp.int32)
-            pass_ = depth_ok & (roll < jnp.int32(3))
+            pass_ = depth_ok & (roll < jnp.int32(3)) & shop_extra_gate
         else:
             roll = jax.random.randint(keys[i], (), 0, modulus, dtype=jnp.int32)
             pass_ = depth_ok & (roll == jnp.int32(0))   # !rn2(modulus)
+
+        # Audit-N #3: per-species genocide gates.  Vendor lines 1355, 1362,
+        # 1369, 1374.
+        if rtype == int(RoomType.LEPREHALL):
+            pass_ = pass_ & species_alive_lep
+        elif rtype == int(RoomType.BEEHIVE):
+            pass_ = pass_ & species_alive_bee
+        elif rtype == int(RoomType.ANTHOLE):
+            pass_ = pass_ & species_alive_ant
+        elif rtype == int(RoomType.BARRACKS):
+            pass_ = pass_ & species_alive_sold
+        elif rtype == int(RoomType.COCKNEST):
+            pass_ = pass_ & species_alive_cock
+
         take = pass_ & ~decided
         chosen = jnp.where(take, jnp.int32(rtype), chosen)
         decided = decided | take
@@ -430,6 +530,12 @@ def fill_special_room(
       * SWAMP  → set (sx + sy) % 2 == 1 interior cells to POOL (vendor 554).
     All other special types are tile-fill no-ops here (monsters/items are
     populated by the spawning subsystem when the room is first entered).
+
+    Note: the temple altar alignment, AM_SHRINE flag, and has_temple level
+    flag are set by :func:`fill_special_room_features` which operates on
+    FeaturesState (mkroom.c::mktemple lines 597-619).  This function
+    handles tile-only updates so callers without FeaturesState (older
+    tests) can still use it.
 
     Args:
         rng:     JAX PRNG key (currently unused — fill is deterministic).
@@ -488,6 +594,86 @@ def fill_special_room(
         fill_one, terrain, jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32)
     )
     return terrain_out
+
+
+def fill_special_room_features(
+    rng: jnp.ndarray,
+    rooms: Room,
+    active: jnp.ndarray,
+    features,                  # FeaturesState
+    flat_lv: int,
+    player_align: int,
+):
+    """Feature-level fill for TEMPLE rooms (Audit-N #4).
+
+    Vendor mkroom.c::mktemple (lines 597-619):
+        sroom->rtype = TEMPLE;
+        shrine_spot = shrine_pos(...);
+        lev->typ = ALTAR;
+        lev->altarmask = induced_align(80);   /* 80 % of player align */
+        priestini(&u.uz, sroom, sx, sy, FALSE);
+        lev->altarmask |= AM_SHRINE;
+        svl.level.flags.has_temple = 1;
+
+    JAX implementation: for the first active TEMPLE room (the one
+    assign_special_room flipped) we:
+      - set features.altar_alignment[flat_lv, cy, cx] = induced_align
+      - set features.altar_shrine [flat_lv, cy, cx] = True
+      - set features.has_temple   [flat_lv]          = True
+
+    ``induced_align(80)`` returns the player's alignment with probability
+    80 % and a random alternative with 20 %.
+
+    Args:
+        rng:         JAX PRNG key.
+        rooms:       Room pytree (with room_type set by assign_special_room).
+        active:      bool[MAX_ROOMS_PER_LEVEL] mask.
+        features:    FeaturesState to update.
+        flat_lv:     int — flattened level index.
+        player_align: int — 0/1/2 Alignment value.
+
+    Returns:
+        Updated FeaturesState.
+    """
+    rng_align, rng_alt = jax.random.split(rng, 2)
+
+    # induced_align(80): 80 % chance of returning player_align, otherwise
+    # a uniformly random {0,1,2} replacement (vendor align.c::induced_align).
+    coin = jax.random.randint(rng_align, (), 0, 100, dtype=jnp.int32)
+    keep_player_align = coin < jnp.int32(80)
+    alt_align = jax.random.randint(rng_alt, (), 0, 3, dtype=jnp.int32)
+    induced = jnp.where(
+        keep_player_align, jnp.int32(player_align), alt_align
+    ).astype(jnp.int8)
+
+    # Iterate over rooms to find the first TEMPLE active slot.  scan keeps
+    # this JIT-safe.
+    is_temple = active & (rooms.room_type == jnp.int8(int(RoomType.TEMPLE)))
+    any_temple = jnp.any(is_temple)
+    temple_idx = jnp.argmax(is_temple).astype(jnp.int32)
+
+    cy = ((rooms.y1[temple_idx] + rooms.y2[temple_idx]) // 2).astype(jnp.int32)
+    cx = ((rooms.x1[temple_idx] + rooms.x2[temple_idx]) // 2).astype(jnp.int32)
+
+    # Only commit changes when there *is* a temple room.
+    aa = features.altar_alignment
+    sh = features.altar_shrine
+    ht = features.has_temple
+
+    new_aa = aa.at[flat_lv, cy, cx].set(
+        jnp.where(any_temple, induced, aa[flat_lv, cy, cx])
+    )
+    new_sh = sh.at[flat_lv, cy, cx].set(
+        jnp.where(any_temple, jnp.bool_(True), sh[flat_lv, cy, cx])
+    )
+    new_ht = ht.at[flat_lv].set(
+        jnp.where(any_temple, jnp.bool_(True), ht[flat_lv])
+    )
+    return features.replace(
+        altar_alignment=new_aa,
+        altar_shrine=new_sh,
+        has_temple=new_ht,
+    )
 
 
 def carve_rooms_into_terrain(

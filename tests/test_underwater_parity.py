@@ -144,29 +144,38 @@ def test_underwater_blocks_diagonal():
 # ---------------------------------------------------------------------------
 
 def test_underwater_drowning_damage():
-    """Staying in water long enough without water breathing eventually kills.
+    """One-shot ``drown()`` on entry kills the player without water breathing.
 
-    Vendor formula (trap.c::drown line 5059): every 5 turns, roll rnl(50);
-    drown (HP→0) if roll <= turns_underwater.  At turns_underwater=25 the
-    probability per check exceeds 50%, so within 50 ticks the player is
-    almost certainly dead.
+    Vendor drown is a one-shot event (trap.c:5057-5198); after
+    ``water_damage_chain`` and the safe-creature early return it tries
+    ``emergency_disrobe`` + ``crawl_out`` and otherwise calls
+    ``done(DROWNING)``.  Cite: vendor/nethack/src/trap.c::drown lines
+    5151-5187.
 
-    Cite: vendor/nethack/src/trap.c::drown() lines 5059-5195.
+    Calling ``drown(state, rng)`` directly with no breath/swim/amphib
+    intrinsics produces either a successful crawl-out (player_in_water
+    cleared) or death (hp=0, done=True).  Over many trials at least one
+    death must occur.
     """
-    _env, state = _make_floor_state(player_pos=(10, 10))
-    state = _set_player_water(state, True)
-    state = state.replace(player_hp=jnp.int32(200), player_hp_max=jnp.int32(200))
+    from Nethax.nethax.subsystems.water import drown as _drown_fn
 
+    died = False
     rng = _RNG
     for _ in range(50):
         rng, sub = jax.random.split(rng)
-        state = water_step(state, sub)
-        if int(state.player_hp) == 0:
+        _env, state = _make_floor_state(player_pos=(10, 10))
+        state = _set_player_water(state, True)
+        state = state.replace(
+            player_hp=jnp.int32(200), player_hp_max=jnp.int32(200)
+        )
+        state = _drown_fn(state, sub)
+        if int(state.player_hp) == 0 and bool(state.done):
+            died = True
             break
 
-    assert int(state.player_hp) < 200, (
-        "HP should have reached 0 within 50 turns underwater (trap.c:5059 "
-        "insta-drown formula: rnl(50) <= turns_underwater)"
+    assert died, (
+        "drown() should produce at least one DROWNING death in 50 trials "
+        "(trap.c::drown line 5187)"
     )
 
 

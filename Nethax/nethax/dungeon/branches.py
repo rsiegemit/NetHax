@@ -111,6 +111,35 @@ class BranchInfo:
 # ---------------------------------------------------------------------------
 # Canonical branch table
 # ---------------------------------------------------------------------------
+#
+# TODO (Audit-N #7 — deferred): the entries below currently use *fixed*
+# first_level / num_levels values.  Vendor dat/dungeon.def specifies (mean,
+# dev) tuples that should be sampled at init via ``rnd_branch_pos``.  Specs
+# from vendor:
+#
+#   DUNGEON  "The Dungeons of Doom"      (25, 5)
+#   BRANCH   "The Gnomish Mines"  @ (2, 3)
+#   LEVEL    "oracle"             @ (5, 5)
+#   CHAINBR  "Sokoban" "oracle"   + (1, 0) up         — STAIR not PORTAL
+#   CHAINBR  "The Quest" "oracle" + (6, 2) portal
+#   BRANCH   "Fort Ludios"        @ (18, 4) portal    — currently MISSING
+#   DUNGEON  "Gehennom"            (20, 5)
+#   BRANCH   "Vlad's Tower"        @ (9, 5) up        — chained off Gehennom
+#   DUNGEON  "The Elemental Planes" (6, 0)
+#
+# Adopting this schema requires:
+#   1. Adding a Branch.LUDIOS enum entry.
+#   2. Changing BranchInfo to carry (mean, dev) tuples + a sample-at-init pass.
+#   3. Switching SOKOBAN's connection_type from PORTAL to STAIR.
+#   4. Replacing the fixed Mines first_level=2 with @(2,3) sampled.
+#   5. Updating the Quest entry to depend on Oracle's sampled depth + (6,2).
+#   6. Chaining Vlad off Gehennom @(9,5) up instead of fixed first_level=21.
+#   7. Updating num_levels to come from DUNGEON entries (Main 25, Gehennom 20).
+#
+# All seven items touch the cross-branch traversal tests; they will be
+# handled in a follow-up wave after the priest / temple / prayer cascade
+# parity changes in this wave land.  Vendor cite:
+# vendor/nle/dat/dungeon.def lines 17-143.
 
 BRANCH_TABLE: Tuple[BranchInfo, ...] = (
     BranchInfo(

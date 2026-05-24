@@ -106,8 +106,12 @@ class Intrinsic(IntEnum):
     FLYING               = 49
     WWALKING             = 50   # water-walking
     SWIMMING             = 51
-    BREATHLESS           = 52   # MAGICAL_BREATHING / amphibious
+    BREATHLESS           = 52   # MAGICAL_BREATHING — no breathing required
     MAGIC_BREATHING      = 52   # alias — vendor prop.h MAGICAL_BREATHING = 52
+    AMPHIBIOUS           = 52   # alias — vendor youprop.h Amphibious shares
+                                #   HMagical_breathing / EMagical_breathing
+                                #   (lines 270-273); distinct only via per-monster
+                                #   ``amphibious()`` helper applied to polymorph form.
     PASSES_WALLS         = 53
     # Physical attributes (prop.h 54-68)
     SLOW_DIGESTION       = 54
