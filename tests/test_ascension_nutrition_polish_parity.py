@@ -82,18 +82,22 @@ def _state_with_food(type_id: int, corpse_entry_idx: int = -1) -> EnvState:
 # ---------------------------------------------------------------------------
 
 def test_ascension_score_formula():
-    """Vendor formula: ascension doubles (xp + gold_adj + travel + deep_b),
-    plus the 5000 alignment bonus (wave35, end.c:1325-1352 ASCENDED branch).
+    """Vendor formula: ascension doubles (xp + gold_adj + travel + deep_b).
 
     Input:  XP=10000, gold=5000, deepest=25, ascended=True.
     gold_adj    = 5000 - 5000//10 = 4500            (end.c:1337 death tax)
     travel_b    = 50 * (25 - 1) = 1200              (end.c:1338-1339)
     deep_b      = 1000 * min(10, 25-20) = 5000      (end.c:1340)
     base        = 10000 + 4500 + 1200 + 5000 = 20700
-    asc_b       = 20700                             (ascension doubles base)
-    alignment_b = 5000                              (wave35; ASCENDED + aligned)
-    conduct_b   = 900                               (counters==0 → all kept)
-    total       = 20700 + 20700 + 5000 + 900 = 47300
+    asc_b       = 20700                             (end.c:1344-1351 doubles)
+    alignment_b = 0                                  (Audit G #2: vendor has no
+                                                      flat align bonus; the 2x
+                                                      doubling already captures
+                                                      the aligned-ascension effect)
+    conduct_b   = 900                               (local helper leaves counters
+                                                      at 0 → all kept under the
+                                                      counters==0 predicate)
+    total       = 20700 + 20700 + 0 + 900 = 42300
     Cite: vendor/nethack/src/end.c::really_done lines 1325-1352.
     """
     state = _violate_all_conducts(_fresh_state())
@@ -107,7 +111,7 @@ def test_ascension_score_formula():
         ),
         player_gold=jnp.int32(5000),
     )
-    assert int(compute_final_score(state)) == 47300
+    assert int(compute_final_score(state)) == 42300
 
 
 def test_ascension_score_no_deep_bonus_below_20():
@@ -115,7 +119,8 @@ def test_ascension_score_no_deep_bonus_below_20():
 
     XP=1000, gold=0, deepest=15, ascended=True.
     gold_adj=0, travel_b=50*14=700, deep_b=0.
-    base=1700, asc_b=1700, alignment_b=5000, conduct_b=900 → total=9300.
+    base=1700, asc_b=1700, alignment_b=0 (Audit G #2), conduct_b=900
+       → total = 1700 + 1700 + 0 + 900 = 4300.
     """
     state = _violate_all_conducts(_fresh_state())
     state = state.replace(
@@ -128,7 +133,7 @@ def test_ascension_score_no_deep_bonus_below_20():
         ),
         player_gold=jnp.int32(0),
     )
-    assert int(compute_final_score(state)) == 9300
+    assert int(compute_final_score(state)) == 4300
 
 
 # ---------------------------------------------------------------------------

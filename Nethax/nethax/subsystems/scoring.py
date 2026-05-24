@@ -192,7 +192,7 @@ def _conduct_bonus_array() -> jnp.ndarray:
 # 0 (not yet implemented).  The deep-level threshold is 20 per end.c:1339.
 
 ARTIFACT_BONUS:  int = 50    # vendor: 50 * artifact_score  (end.c:1452)
-DEEP_LEVEL_BONUS: int = 100  # vendor: 100 * max(0, deepest - 20)  (end.c:1340)
+DEEP_LEVEL_BONUS: int = 1000  # vendor: 1000 * min(10, max(0, deepest - 20))  (end.c:1340)
 
 # Legacy constants kept for backward-compat imports; no longer used by
 # compute_final_score (replaced by vendor formula above).
@@ -385,24 +385,33 @@ def count_artifacts(state) -> jnp.ndarray:
 def compute_alignment_bonus(state) -> jnp.ndarray:
     """Return the alignment bonus awarded at ascension.
 
-    Vendor: end.c::really_done lines 1325-1352 — when ASCENDED with
-    matching alignment, the final score includes a 5000-point bonus.
-    Per the ascension pipeline (subsystems.ascension.check_ascension,
-    citing pray.c::dosacrifice / offer_real_amulet), ``ascended`` is
-    only set when the player stood on the coaligned Astral altar, so
-    "ascended && aligned-with-god" reduces to ``state.scoring.ascended``.
+    Vendor: end.c::really_done lines 1344-1351 — the only alignment-
+    contingent bonus is the XP-doubling (2x when current == original,
+    1.5x when converted via Helm of Opposite Alignment).  There is **no
+    flat 5000-point bonus** anywhere in vendor's score formula.
 
-    Cite: vendor/nethack/src/end.c::really_done lines 1325-1352.
+    The 2x doubling is already realised by ``asc_b = base if ascended``
+    in ``compute_final_score`` (since ``check_ascension`` only sets
+    ``ascended`` on the coaligned Astral altar, which implies the
+    current == original branch of vendor's ternary).  The 1.5x converted-
+    alignment branch would require tracking ``u.ualignbase[A_ORIGINAL]``
+    vs ``u.ualignbase[A_CURRENT]`` — Nethax has no such state today, so
+    we approximate by always treating ascension as "kept original
+    alignment" (the dominant gameplay path) and return 0 here.
+
+    Audit G #2 fix: previously returned a flat 5000, which had no
+    vendor analogue and caused +5000 score divergence across all
+    ascended-fixture parity tests (test_scoring_parity).
+
+    Cite: vendor/nethack/src/end.c::really_done lines 1344-1351.
 
     Returns
     -------
-    jnp.int32 scalar — 5000 if ascended, else 0.
+    jnp.int32 scalar — always 0 (the alignment effect is fully captured
+    by ``asc_b`` in ``compute_final_score``).
     """
-    return jnp.where(
-        state.scoring.ascended,
-        jnp.int32(5000),
-        jnp.int32(0),
-    )
+    del state
+    return jnp.int32(0)
 
 
 def compute_final_score(state) -> jnp.ndarray:
