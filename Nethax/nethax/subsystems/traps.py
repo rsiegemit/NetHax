@@ -1332,14 +1332,122 @@ def _trap_magic(state, rng):
 
 
 def _trap_anti_magic(state, rng):
-    """ANTI_MAGIC — drain Pw by d(2,6)=2..12.
+    """ANTI_MAGIC — vendor-parity Pw drain / Antimagic dmg / iron-shoes branch.
 
-    vendor/nethack/src/trap.c:2386 — ``drain = d(2, 6);  /* 2d6 => 2..12 */``
+    Mirrors vendor/nethack/src/trap.c::trapeffect_anti_magic (lines 2322-2398):
+
+    * Audit M #36 — Iron-shoes intercept (lines 2328-2343): when wearing iron
+      shoes with ``spe > 0``, the trap drains 1 enchantment from the shoes
+      and skips the player Pw drain entirely.
+    * Audit M #34 — Antimagic intrinsic branch (lines 2351-2378): when
+      ``Antimagic`` (MAGIC_RESIST), take ``dmgval2 = rnd(4)`` HP damage in
+      place of Pw drain.  ``dmgval2`` is boosted by ``rnd(4)`` when the
+      hero wields Magicbane (vendor cite: ``u_wield_art(ART_MAGICBANE)``)
+      or has Half_physical/Half_spell damage active; halved (``(d+3)/4``)
+      when ``Passes_walls`` is set.
+    * Audit M #35 — uenmax split (lines 2386-2398): the base 2d6 drain
+      first siphons ``halfd = rnd(drain/2)`` from ``player_pw_max`` (if
+      ``uenmax > drain``) and the remaining ``drain - halfd`` from
+      current Pw — previously the full drain came from current Pw only.
+
+    Citations:
+      vendor/nethack/src/trap.c:2328-2343 (iron-shoes branch / spe-=1)
+      vendor/nethack/src/trap.c:2351-2378 (Antimagic dmgval2 dmgs HP)
+      vendor/nethack/src/trap.c:2386-2398 (drain / halfd uenmax split)
     """
-    k0, k1 = jax.random.split(rng, 2)
-    drain = _d(k0, 6) + _d(k1, 6)  # 2d6 = 2..12 (vendor trap.c:2386)
-    new_pw = jnp.maximum(state.player_pw - drain, jnp.int32(0))
-    return state.replace(player_pw=new_pw)
+    from Nethax.nethax.subsystems.inventory import ArmorSlot
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intr
+    from Nethax.nethax.subsystems.character import ObjType as _ObjType
+
+    k_dmg, k_drain1, k_drain2, k_halfd, k_mb, k_half = jax.random.split(rng, 6)
+
+    # ------------------------------------------------------------------
+    # Iron-shoes intercept (vendor trap.c:2328-2343).
+    # ------------------------------------------------------------------
+    inv = state.inventory
+    boots_idx = inv.worn_armor[int(ArmorSlot.BOOTS)].astype(jnp.int32)
+    has_boots = boots_idx >= jnp.int32(0)
+    safe_b = jnp.clip(boots_idx, 0, inv.items.type_id.shape[0] - 1)
+    boot_type = jnp.where(
+        has_boots,
+        inv.items.type_id[safe_b].astype(jnp.int32),
+        jnp.int32(0),
+    )
+    boot_spe = jnp.where(
+        has_boots,
+        inv.items.enchantment[safe_b].astype(jnp.int32),
+        jnp.int32(0),
+    )
+    iron_shoes_worn = has_boots & (boot_type == jnp.int32(int(_ObjType.IRON_SHOES)))
+    iron_shoes_protect = iron_shoes_worn & (boot_spe > jnp.int32(0))
+
+    def _do_iron_shoes(s):
+        new_spe = jnp.maximum(boot_spe - jnp.int32(1), jnp.int32(-3)).astype(
+            s.inventory.items.enchantment.dtype
+        )
+        new_items = s.inventory.items.replace(
+            enchantment=s.inventory.items.enchantment.at[safe_b].set(new_spe)
+        )
+        return s.replace(inventory=s.inventory.replace(items=new_items))
+
+    # ------------------------------------------------------------------
+    # Antimagic intrinsic branch (vendor trap.c:2351-2378).
+    # ------------------------------------------------------------------
+    intrinsics = state.status.intrinsics
+    has_antimagic    = intrinsics[int(_Intr.MAGIC_RESIST)]
+    has_passes_walls = intrinsics[int(_Intr.PASSES_WALLS)]
+    has_half_phys    = intrinsics[int(_Intr.HALF_PHYSICAL_DAMAGE)]
+    has_half_spell   = intrinsics[int(_Intr.HALF_SPELL_DAMAGE)]
+
+    # Vendor: ``dmgval2 = rnd(4)``; +rnd(4) if Half_phys or Half_spell;
+    # +rnd(4) if u_wield_art(ART_MAGICBANE); halve if Passes_walls.
+    # We omit the carried-artifact AD_MAGM bonus (no carried-artifact
+    # plumbing for AD_MAGM defends_when_carried in traps yet — DEFERRED).
+    _ARTI_MAGICBANE = 29
+    wields_magicbane = (
+        state.inventory.wielded_artifact_idx.astype(jnp.int32)
+        == jnp.int32(_ARTI_MAGICBANE)
+    )
+    dmgval2 = _d(k_dmg, 4)
+    dmgval2 = dmgval2 + jnp.where(
+        has_half_phys | has_half_spell, _d(k_half, 4), jnp.int32(0)
+    )
+    dmgval2 = dmgval2 + jnp.where(wields_magicbane, _d(k_mb, 4), jnp.int32(0))
+    dmgval2 = jnp.where(
+        has_passes_walls, (dmgval2 + jnp.int32(3)) // jnp.int32(4), dmgval2
+    )
+
+    # ------------------------------------------------------------------
+    # uenmax split for the non-Antimagic branch (vendor trap.c:2386-2398).
+    # ------------------------------------------------------------------
+    drain = _d(k_drain1, 6) + _d(k_drain2, 6)  # 2d6 = 2..12
+    # halfd = rnd(drain / 2); range [1, drain/2].
+    halfd_upper = jnp.maximum(drain // jnp.int32(2), jnp.int32(1))
+    halfd = jax.random.randint(
+        k_halfd, (), 1, halfd_upper + jnp.int32(1)
+    ).astype(jnp.int32)
+    # uenmax > drain gate (vendor line 2388).
+    split_uenmax = state.player_pw_max > drain
+    pw_max_drain = jnp.where(split_uenmax, halfd, jnp.int32(0))
+    pw_drain     = jnp.where(split_uenmax, drain - halfd, drain)
+
+    def _do_antimagic(s):
+        # HP damage in place of Pw drain.
+        new_hp = jnp.maximum(s.player_hp - dmgval2, jnp.int32(0))
+        return s.replace(player_hp=new_hp)
+
+    def _do_pw_drain(s):
+        new_pw_max = jnp.maximum(s.player_pw_max - pw_max_drain, jnp.int32(0))
+        new_pw     = jnp.minimum(
+            jnp.maximum(s.player_pw - pw_drain, jnp.int32(0)),
+            new_pw_max,
+        )
+        return s.replace(player_pw=new_pw, player_pw_max=new_pw_max)
+
+    def _do_default(s):
+        return jax.lax.cond(has_antimagic, _do_antimagic, _do_pw_drain, s)
+
+    return jax.lax.cond(iron_shoes_protect, _do_iron_shoes, _do_default, state)
 
 
 def _trap_poly(state, rng):
