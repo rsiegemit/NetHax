@@ -651,3 +651,179 @@ def gcrownu(state, rng: jax.Array):
     return state.replace(status=new_status, inventory=new_inv)
 
 
+# ---------------------------------------------------------------------------
+# pri_move — per-turn priest movement (priest.c::pri_move lines 177-216)
+# ---------------------------------------------------------------------------
+
+def pri_move(state, priest_idx, rng: jax.Array):
+    """Walk the priest at ``priest_idx`` one tile toward its shrine.
+
+    Vendor priest.c::pri_move (lines 177-216):
+      * If the priest is not in its own temple, defer to m_move (-1).
+      * Otherwise mill near the shrine tile (rn1(3, -1)).
+      * If hostile / under Conflict and player is in temple → chase.
+
+    Parity slice: we operate on the level's MonsterAIState slot.  The
+    priest target is its shrine tile (features.altar_shrine of the
+    current level).  If the priest is hostile we set target_pos to
+    player_pos instead.  Movement itself is a single greedy step.
+
+    Returns the new EnvState.  Acceptable to be a no-op when the slot
+    is dead or out of bounds.
+    """
+    mai = state.monster_ai
+    idx = jnp.int32(priest_idx)
+    n = mai.pos.shape[0]
+    valid = (idx >= jnp.int32(0)) & (idx < jnp.int32(n))
+    safe_idx = jnp.clip(idx, 0, n - 1)
+    alive = mai.alive[safe_idx] & valid
+    hostile = ~mai.peaceful[safe_idx]
+
+    # vendor line 191-192: ggx = EPRI->shrpos.x; ggy = EPRI->shrpos.y.
+    # We don't carry a per-monster shrpos; use the shrine tile on the
+    # current level (features.altar_shrine).
+    max_levels = state.terrain.shape[1]
+    _b  = state.dungeon.current_branch.astype(jnp.int32)
+    _lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    _flat_lv = _b * jnp.int32(max_levels) + _lv
+
+    shrine_mask = state.features.altar_shrine[_flat_lv]  # [H, W] bool
+    h, w = shrine_mask.shape
+    yy, xx = jnp.meshgrid(jnp.arange(h), jnp.arange(w), indexing="ij")
+    flat_mask = shrine_mask.reshape(-1)
+    flat_y = yy.reshape(-1)
+    flat_x = xx.reshape(-1)
+    # Pick the first shrine tile.  If none, fall back to current pos.
+    sentinel = jnp.int32(h * w)
+    masked_i = jnp.where(flat_mask, jnp.arange(h * w, dtype=jnp.int32), sentinel)
+    first_shrine_i = jnp.min(masked_i)
+    has_shrine = first_shrine_i < sentinel
+    shrine_y = jnp.where(has_shrine, flat_y[jnp.minimum(first_shrine_i, sentinel - 1)], jnp.int32(0))
+    shrine_x = jnp.where(has_shrine, flat_x[jnp.minimum(first_shrine_i, sentinel - 1)], jnp.int32(0))
+
+    # vendor lines 197-211: hostile or Conflict → chase player if in temple.
+    py = state.player_pos[0].astype(jnp.int32)
+    px = state.player_pos[1].astype(jnp.int32)
+    target_y = jnp.where(hostile, py, shrine_y).astype(jnp.int16)
+    target_x = jnp.where(hostile, px, shrine_x).astype(jnp.int16)
+
+    # Greedy 1-tile step (vendor move_special); clamped to map bounds.
+    cur_y = mai.pos[safe_idx, 0].astype(jnp.int32)
+    cur_x = mai.pos[safe_idx, 1].astype(jnp.int32)
+    dy = jnp.clip(target_y.astype(jnp.int32) - cur_y, -1, 1)
+    dx = jnp.clip(target_x.astype(jnp.int32) - cur_x, -1, 1)
+    new_y = jnp.clip(cur_y + dy, 0, h - 1).astype(jnp.int16)
+    new_x = jnp.clip(cur_x + dx, 0, w - 1).astype(jnp.int16)
+
+    new_pos = jnp.stack([
+        jnp.where(alive, new_y, mai.pos[safe_idx, 0]),
+        jnp.where(alive, new_x, mai.pos[safe_idx, 1]),
+    ])
+    # Write back to slot safe_idx (only if alive).
+    new_pos_arr = mai.pos.at[safe_idx].set(new_pos)
+    # Also update target_pos for downstream AI (vendor sets ggx/ggy).
+    new_target = jnp.stack([target_y, target_x])
+    new_target_arr = mai.target_pos.at[safe_idx].set(
+        jnp.where(alive, new_target, mai.target_pos[safe_idx])
+    )
+    new_mai = mai.replace(pos=new_pos_arr, target_pos=new_target_arr)
+    return state.replace(monster_ai=new_mai)
+
+
+# ---------------------------------------------------------------------------
+# findpriest — locate the priest on a given level (priest.c::findpriest)
+# ---------------------------------------------------------------------------
+
+def findpriest(state, level_idx) -> jnp.ndarray:
+    """Return the monster slot of the priest, or -1 if none.
+
+    Vendor priest.c::findpriest (lines 392-404) walks ``fmon`` and returns
+    the first monster with ``ispriest`` set whose ``EPRI->shroom == roomno``.
+
+    Parity slice: we don't yet tag monster slots with an ``ispriest``
+    flag, so we approximate by finding the first ALIVE peaceful monster
+    standing on a shrine tile on the requested level.  The ``level_idx``
+    argument matches the flat-level index used elsewhere in this module.
+
+    Returns int32 monster slot index, or -1.
+    """
+    mai = state.monster_ai
+    # Build a [N] mask: alive & peaceful & standing on shrine tile of the
+    # given level.
+    n = mai.alive.shape[0]
+    _lvl = jnp.int32(level_idx)
+    shrine_mask = state.features.altar_shrine[_lvl]  # [H, W] bool
+    h, w = shrine_mask.shape
+    # Bounded scatter: each monster's pos → True iff shrine at that pos.
+    pos_y = jnp.clip(mai.pos[:, 0].astype(jnp.int32), 0, h - 1)
+    pos_x = jnp.clip(mai.pos[:, 1].astype(jnp.int32), 0, w - 1)
+    on_shrine = shrine_mask[pos_y, pos_x]
+    is_candidate = mai.alive & mai.peaceful & on_shrine
+    # Argmin over indices, with sentinel n at non-candidates.
+    sentinel = jnp.int32(n)
+    masked = jnp.where(is_candidate, jnp.arange(n, dtype=jnp.int32), sentinel)
+    first = jnp.min(masked)
+    return jnp.where(first < sentinel, first, jnp.int32(-1))
+
+
+# ---------------------------------------------------------------------------
+# mk_roamer — spawn a roaming priest (priest.c::mk_roamer lines 723-752)
+# ---------------------------------------------------------------------------
+
+def mk_roamer(state, rng: jax.Array):
+    """Spawn a roaming (un-temple-bound) priest at the player's level.
+
+    Vendor priest.c::mk_roamer (lines 723-752):
+      * Roamers have ``isminion=1``, ``ispriest=0``.
+      * ``EMIN(roamer)->min_align = alignment`` (caller-supplied).
+      * ``mpeaceful = peaceful`` (caller-supplied; here: False).
+
+    Parity slice: pick the first empty monster slot (alive==False) and
+    fill it as a peaceful=False / hostile priest at the player's tile +
+    one step.  ``entry_idx`` is left at 0 since we don't carry a
+    PM_ALIGNED_CLERIC monster id in MonsterAIState yet (downstream
+    monster_ai_step can still drive movement via pri_move).
+
+    Returns the new EnvState.  No-op if no free slot exists.
+    """
+    mai = state.monster_ai
+    n = mai.alive.shape[0]
+    # Find first empty slot.
+    masked = jnp.where(~mai.alive, jnp.arange(n, dtype=jnp.int32), jnp.int32(n))
+    first = jnp.min(masked)
+    has_slot = first < jnp.int32(n)
+    safe_idx = jnp.clip(first, 0, n - 1)
+
+    # Spawn pos = player_pos + (1, 0) clamped.  RNG split for jitter so
+    # repeated calls hash differently (no key reuse).
+    rng_y, rng_x = jax.random.split(rng, 2)
+    dy = jax.random.randint(rng_y, (), -1, 2, dtype=jnp.int32)
+    dx = jax.random.randint(rng_x, (), -1, 2, dtype=jnp.int32)
+    py = state.player_pos[0].astype(jnp.int32) + dy
+    px = state.player_pos[1].astype(jnp.int32) + dx
+    h = state.terrain.shape[2]
+    w = state.terrain.shape[3]
+    py = jnp.clip(py, 0, h - 1).astype(jnp.int16)
+    px = jnp.clip(px, 0, w - 1).astype(jnp.int16)
+
+    # Build new slot values.  We only write when has_slot is True.
+    def _set(arr, val):
+        cur = arr[safe_idx]
+        return arr.at[safe_idx].set(jnp.where(has_slot, val, cur))
+
+    new_pos = mai.pos.at[safe_idx].set(
+        jnp.where(has_slot, jnp.stack([py, px]), mai.pos[safe_idx])
+    )
+    new_alive    = _set(mai.alive,    jnp.bool_(True))
+    new_peaceful = _set(mai.peaceful, jnp.bool_(False))  # hostile roamer
+    new_hp       = _set(mai.hp,       jnp.int32(20))
+    new_hpmax    = _set(mai.hp_max,   jnp.int32(20))
+
+    new_mai = mai.replace(
+        pos=new_pos,
+        alive=new_alive,
+        peaceful=new_peaceful,
+        hp=new_hp,
+        hp_max=new_hpmax,
+    )
+    return state.replace(monster_ai=new_mai)
