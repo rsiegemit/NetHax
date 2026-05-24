@@ -26,7 +26,10 @@ from Nethax.nethax.subsystems.status_effects import tick_hallu_expiry as _tick_h
 from Nethax.nethax.subsystems.ascension import maybe_ascend
 from Nethax.nethax.subsystems.polymorph import step as _polymorph_step
 from Nethax.nethax.subsystems.shop import shop_step as _shop_step
-from Nethax.nethax.dungeon.branches import generate_main_branch_l1
+from Nethax.nethax.dungeon.branches import (
+    generate_main_branch_l1,
+    generate_main_branch_l1_with_features,
+)
 from Nethax.nethax.dungeon.spawning import populate_level_with_monsters
 from Nethax.nethax.constants.roles import Role
 from Nethax.nethax.constants.races import Race
@@ -81,13 +84,34 @@ class NethaxEnv:
         # Initialise role-specific skill caps (vendor/nethack/src/u_init.c Skill_X tables).
         state = state.replace(skills=init_skills(role))
 
-        # Generate Main branch level 1 and write into the [branch=0, level=0] slot.
-        terrain, _rooms, _active, up_pos, down_pos = generate_main_branch_l1(
-            rng_level, self.static
+        # Generate Main branch level 1 and write into the [branch=0, level=0]
+        # slot.  This includes the per-room independent feature rolls
+        # (fountain / altar / grave / traps) and the 2x2 detached vault —
+        # vendor/nethack/src/mklev.c::mklev (line 1577) which calls
+        # fill_ordinary_room (line 939) for every OROOM/THEMEROOM and the
+        # vault gate at lines 404-410 / 1316-1342.
+        (
+            terrain,
+            _rooms,
+            _active,
+            up_pos,
+            down_pos,
+            new_features,
+            new_traps,
+        ) = generate_main_branch_l1_with_features(
+            rng_level,
+            self.static,
+            state.features,
+            state.traps,
+            flat_lv=0,
+            depth=1,
+            player_align=int(alignment),
         )
         state = state.replace(
             terrain=state.terrain.at[0, 0].set(terrain),
             player_pos=up_pos.astype(jnp.int16),
+            features=new_features,
+            traps=new_traps,
         )
 
         # Populate level 1 with monsters after dungeon gen.

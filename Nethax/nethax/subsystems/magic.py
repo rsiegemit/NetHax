@@ -347,6 +347,23 @@ _ROLE_KNIGHT = 4
 _TYPE_ID_QUARTERSTAFF = 43
 _TYPE_ID_ROBE = 101
 
+# Shield weight gate for spell.c:2269.  Vendor compares
+# ``weight(uarms) > objects[SMALL_SHIELD].oc_weight`` (= 30) before
+# applying the shield-on-cast penalty.  Keyed by ObjType id
+# (subsystems.character).  SMALL_SHIELD (75) is the only shield with
+# weight <= 30 so it's exempt.
+# Cite: vendor/nethack/src/objects.c (SHIELD oc_weight values) and
+#       vendor/nethack/src/spell.c:2269.
+_SHIELD_TYPE_ID_TO_WEIGHT = {
+    75: 30,   # SMALL_SHIELD            — exempt (<= 30)
+    76: 40,   # ELVEN_SHIELD
+    77: 50,   # URUK_HAI_SHIELD
+    78: 50,   # ORCISH_SHIELD
+    79: 100,  # DWARVISH_ROUNDSHIELD
+    80: 100,  # LARGE_SHIELD
+}
+_SMALL_SHIELD_WEIGHT = 30
+
 # Per-slot metallic helm/gloves/boots bonus constants.
 # Cite: vendor/nethack/src/spell.c lines 106-108 (#define uarmhbon/uarmgbon/uarmfbon).
 _UARMHBON = 4   # spell.c:106 — metal helmets interfere with the mind
@@ -689,15 +706,18 @@ def spell_success_chance_with_inventory(state, spell_id: int) -> int:
     # Apply final combination (vendor spell.c:2283).
     chance = chance_pre * (20 - splcaster) // 15 - splcaster
 
-    # Shield-on-non-spelspec penalty (spell.c:2268-2273).
-    # Vendor condition is ``uarms && weight(uarms) > SMALL_SHIELD weight``.
-    # We approximate "any shield" — small-shield-weight test omitted; the
-    # vendor code drops only the SMALL_SHIELD case which is rare.
+    # Shield-on-non-spelspec penalty (spell.c:2269-2273).
+    # Vendor: ``if (uarms && weight(uarms) > objects[SMALL_SHIELD].oc_weight)``
+    # — SMALL_SHIELD (oc_weight=30) is exempt; any heavier shield triggers
+    # the ``chance /= 4`` (``/= 2`` for spelspec) post-clamp penalty.
+    # Cite: vendor/nethack/src/spell.c:2269 + objects.c SMALL_SHIELD entry.
     if has_shield:
-        if sid == spelspec:
-            chance = chance // 2
-        else:
-            chance = chance // 4
+        shield_weight = _SHIELD_TYPE_ID_TO_WEIGHT.get(shield_tid, 0)
+        if shield_weight > _SMALL_SHIELD_WEIGHT:
+            if sid == spelspec:
+                chance = chance // 2
+            else:
+                chance = chance // 4
 
     if chance < 0:
         chance = 0
@@ -912,61 +932,85 @@ def _effect_aoe_or_single(state: dict, rng: jax.Array, skill_id) -> dict:
     """FIREBALL / CONE_OF_COLD dispatch by ATTACK_SPELL skill tier.
 
     Vendor: spell.c::spelleffects lines 1419-1452.  At P_SKILLED+ the cast
-    becomes an AOE: ``n_blasts = rnd(8) + 1`` independent ``d(nd, 6)`` hits.
-    Below P_SKILLED, the spell falls through to a single ``d(nd, 6)`` hit
-    on monster slot 0 (matches the previous Nethax behaviour).
-    JIT-pure via ``lax.fori_loop`` over a fixed max of 9 iterations.
+    becomes a spatial AOE — vendor loops ``n = rnd(8)+1`` ``explode()``
+    calls, each of which damages every monster within a 3x3 blast at a
+    target tile.  We model this as a single 3x3 explosion centred on the
+    player (Nethax has no throwspell() interactive picker yet), striking
+    every alive monster in the 9 tiles {(r+dr, c+dc) : dr,dc in [-1,0,1]}
+    for ``d(nd, 6)`` damage per tile.
+
+    Below P_SKILLED, the spell falls through to the wand path
+    (zap.c::weffects -> ZT_FIRE / ZT_COLD ray, ``d(nd, 6)``) which Nethax
+    models as a single hit on monster slot 0.
     """
     xl = state["player_xl"].astype(jnp.int32)
     nd = jnp.maximum(xl // 2 + 1, jnp.int32(1))
-    # Roll once to determine n_blasts so the single-target branch uses
-    # exactly one roll and the AOE branch uses up to 9.
-    rng, sub_n = jax.random.split(rng)
-    n_blasts = jax.random.randint(sub_n, (), 1, 9).astype(jnp.int32) + jnp.int32(1)  # rnd(8)+1 = 2..9
 
     # Tier gate — vendor: ``role_skill >= P_SKILLED``.
     skill_lvl = state["skills"].level[skill_id].astype(jnp.int32)
     is_aoe = skill_lvl >= _SKILL_LEVEL_SKILLED
 
-    # Single-target branch: 1 blast.
-    effective_blasts = jnp.where(is_aoe, n_blasts, jnp.int32(1))
+    mai = state["monster_ai"]
 
-    MAX_BLASTS = 9
-    MAX_ND = 16  # u.ulevel <= 30 → nd <= 16
-
-    # Precompute MAX_BLASTS×MAX_ND independent d6 rolls.
-    keys = jax.random.split(rng, MAX_BLASTS * MAX_ND)
+    # ----- Roll per-tile damage for the spatial 3x3 AOE -----------------
+    # 9 tiles, each with up to MAX_ND d6 dice.
+    N_TILES = 9
+    MAX_ND  = 16  # u.ulevel <= 30 -> nd <= 16
+    keys = jax.random.split(rng, N_TILES * MAX_ND)
     rolls = jnp.stack([
         jax.random.randint(keys[i], (), 1, 7).astype(jnp.int32)
-        for i in range(MAX_BLASTS * MAX_ND)
-    ]).reshape((MAX_BLASTS, MAX_ND))
+        for i in range(N_TILES * MAX_ND)
+    ]).reshape((N_TILES, MAX_ND))
+    nd_mask = jnp.arange(MAX_ND, dtype=jnp.int32) < nd
+    per_tile_dmg = jnp.sum(
+        jnp.where(nd_mask[None, :], rolls, jnp.int32(0)), axis=1
+    ).astype(jnp.int32)  # [9]
 
-    nd_mask  = jnp.arange(MAX_ND,     dtype=jnp.int32) < nd
-    blast_mask = jnp.arange(MAX_BLASTS, dtype=jnp.int32) < effective_blasts
+    # ----- Spatial path: hit every monster within the 3x3 around player --
+    player_rc = state["player_pos"].astype(jnp.int32)  # (row, col)
+    offsets = jnp.array(
+        [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)],
+        dtype=jnp.int32,
+    )  # [9, 2]
+    tiles = player_rc[None, :] + offsets  # [9, 2]
 
-    per_blast = jnp.sum(jnp.where(nd_mask[None, :], rolls, jnp.int32(0)), axis=1)
-    dmg = jnp.sum(jnp.where(blast_mask, per_blast, jnp.int32(0))).astype(jnp.int32)
+    # mai.pos is [M, 2]; broadcast against tiles [9, 2] -> [9, M].
+    pos = mai.pos.astype(jnp.int32)
+    same_tile = jnp.all(pos[None, :, :] == tiles[:, None, :], axis=-1)  # [9, M]
+    alive_m = mai.alive  # [M]
+    hit_by_tile = same_tile & alive_m[None, :]                          # [9, M]
 
-    mai = state["monster_ai"]
+    # Each monster occupies at most one tile, so summing per_tile_dmg over
+    # tiles where the monster is hit is equivalent to vendor's per-explode
+    # damage application.
+    dmg_per_mon = jnp.sum(
+        jnp.where(hit_by_tile, per_tile_dmg[:, None], jnp.int32(0)), axis=0
+    ).astype(jnp.int32)  # [M]
+    spatial_new_hp = jnp.where(
+        alive_m,
+        jnp.maximum(mai.hp - dmg_per_mon, jnp.int32(0)),
+        mai.hp,
+    )
+
+    # ----- Single-target path: monster slot 0, one tile's d(nd, 6) roll --
+    single_dmg = per_tile_dmg[0]
     alive0 = mai.hp[0] > 0
-    new_hp = jnp.where(alive0, jnp.maximum(mai.hp[0] - dmg, jnp.int32(0)), mai.hp[0])
-    new_mhp = mai.hp.at[0].set(new_hp)
-    return {**state, "monster_ai": mai.replace(hp=new_mhp)}
+    new_hp0 = jnp.where(alive0, jnp.maximum(mai.hp[0] - single_dmg, jnp.int32(0)), mai.hp[0])
+    single_new_hp = mai.hp.at[0].set(new_hp0)
+
+    new_hp = jnp.where(is_aoe, spatial_new_hp, single_new_hp)
+    return {**state, "monster_ai": mai.replace(hp=new_hp)}
 
 
 def _effect_fire_bolt(state: dict, rng: jax.Array) -> dict:
-    """FIREBALL: P_SKILLED+ → AOE (rnd(8)+1 explosions); else single-target.
+    """FIREBALL: P_SKILLED+ -> spatial 3x3 AOE; else single-target ray.
 
-    Vendor: spell.c::spelleffects lines 1419-1452 — at P_SKILLED+ vendor calls
-    ``throwspell()`` then loops ``n = rnd(8)+1`` times, each iteration
-    invoking ``explode(...)`` which applies ``spell_damage_bonus(u.ulevel/2+1)``
-    damage to monsters within a 3x3 blast.  Below P_SKILLED, vendor falls
-    through to the wand path (zap.c::weffects), which is ``d(nd, 6)``
-    with ``nd = u.ulevel/2 + 1`` (zap.c::zhitm ZT_FIRE case).
-
-    Nethax model: monster slot 0 is the AOE proxy; at P_SKILLED+ we hit
-    it ``n_blasts = rnd(8)+1`` times for ``d(nd, 6)`` each, mirroring the
-    expected damage of the vendor explode loop.
+    Vendor: spell.c::spelleffects lines 1419-1452 — at P_SKILLED+ vendor
+    calls ``throwspell()`` then loops ``n = rnd(8)+1`` ``explode()`` calls,
+    each applying ``spell_damage_bonus(u.ulevel/2+1)`` damage to every
+    monster in a 3x3 blast.  Below P_SKILLED, vendor falls through to the
+    wand path (zap.c::weffects -> ZT_FIRE), which is ``d(nd, 6)`` with
+    ``nd = u.ulevel/2 + 1`` (zap.c::zhitm).
     """
     return _effect_aoe_or_single(state, rng, _SKILL_ID_ATTACK_SPELL)
 
@@ -981,12 +1025,13 @@ def _effect_force_bolt(state: dict, rng: jax.Array) -> dict:
 
 
 def _effect_cone_of_cold(state: dict, rng: jax.Array) -> dict:
-    """CONE_OF_COLD: P_SKILLED+ → AOE (rnd(8)+1 blasts); else single-target.
+    """CONE_OF_COLD: P_SKILLED+ -> spatial 3x3 AOE; else single-target ray.
 
-    Vendor: spell.c::spelleffects lines 1419-1452 — shares the same skilled
-    AOE branch as FIREBALL (``otyp - SPE_MAGIC_MISSILE + 10`` selects the
-    explode kind, EXPL_FROSTY vs EXPL_FIERY).  Below P_SKILLED the spell
-    falls through to the wand ``d(nd, 6)`` ZT_COLD ray.
+    Vendor: spell.c::spelleffects lines 1419-1452 — shares the skilled AOE
+    branch with FIREBALL (``otyp - SPE_MAGIC_MISSILE + 10`` selects the
+    explode kind, EXPL_FROSTY vs EXPL_FIERY); each ``explode()`` damages
+    every monster in a 3x3 area.  Below P_SKILLED the spell falls through
+    to the wand ``d(nd, 6)`` ZT_COLD ray.
     """
     return _effect_aoe_or_single(state, rng, _SKILL_ID_ATTACK_SPELL)
 

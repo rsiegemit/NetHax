@@ -708,6 +708,76 @@ def generate_main_branch_l1(
     return terrain, rooms, active, up_stair_pos, down_stair_pos
 
 
+def generate_main_branch_l1_with_features(
+    rng: jnp.ndarray,
+    static_params,
+    features,
+    traps,
+    flat_lv: int = 0,
+    depth: int = 1,
+    player_align: int = 1,
+):
+    """Generate Main Dlvl 1 and apply per-room feature/trap rolls + vault.
+
+    Thin wrapper around :func:`generate_main_branch_l1` that, after the base
+    terrain/rooms/stairs pass, invokes :func:`fill_ordinary_rooms` and
+    :func:`maybe_create_vault` (both from :mod:`Nethax.nethax.dungeon.rooms`)
+    to write per-room independent feature rolls (fountain / altar / grave /
+    traps) and an optional 2x2 detached vault into the supplied
+    ``FeaturesState`` / ``TrapState`` slices.
+
+    Vendor cite: vendor/nethack/src/mklev.c::mklev (line 1577) — the
+    level-generation entry that calls ``fill_ordinary_room`` (line 939) for
+    every OROOM/THEMEROOM and then dispatches the vault check at lines
+    404-410 / 1316-1342.
+
+    JIT-safety: the wrapper is itself jit-compilable; ``rng`` is split into
+    three independent sub-keys (level / fills / vault) so no PRNG key is
+    reused.  Inputs are pure pytrees; outputs replace the supplied slices
+    functionally.
+
+    Args:
+        rng:           JAX PRNG key.
+        static_params: StaticParams.
+        features:      FeaturesState — the full state slice (all levels).
+        traps:         TrapState — the full state slice (all levels).
+        flat_lv:       Flattened level index = branch * MAX_LEVELS_PER_BRANCH
+                       + level; defaults to 0 (Main Dlvl 1).
+        depth:         Vendor ``depth(&u.uz)`` — defaults to 1 for Main Dlvl 1.
+        player_align:  Player alignment (0/1/2) for altar induced_align.
+
+    Returns:
+        (terrain, rooms, active, up_stair_pos, down_stair_pos,
+         features_out, traps_out)
+    """
+    # Import here to avoid circular dependency at module load time.
+    from Nethax.nethax.dungeon.rooms import (
+        fill_ordinary_rooms,
+        maybe_create_vault,
+    )
+
+    k_level, k_fill, k_vault = jax.random.split(rng, 3)
+
+    terrain, rooms, active, up_pos, dn_pos = generate_main_branch_l1(
+        k_level, static_params
+    )
+
+    # vendor/nethack/src/mklev.c::fill_ordinary_room (line 939) — per-room
+    # independent feature rolls applied to every ordinary / themeroom.
+    terrain, features, traps = fill_ordinary_rooms(
+        k_fill, rooms, active, terrain, features, traps,
+        flat_lv=flat_lv, depth=depth, player_align=player_align,
+    )
+
+    # vendor/nethack/src/mklev.c lines 404-410 + 1316-1342 — 2x2 detached
+    # vault with teleport-trap entry.
+    terrain, features, traps = maybe_create_vault(
+        k_vault, rooms, active, terrain, features, traps, flat_lv=flat_lv,
+    )
+
+    return terrain, rooms, active, up_pos, dn_pos, features, traps
+
+
 # ===========================================================================
 # Wave 4 — branches agent: branch graph + Mines / Sokoban / Quest generators
 # ===========================================================================
