@@ -177,7 +177,12 @@ BRANCH_TABLE: Tuple[BranchInfo, ...] = (
         branch_id=jnp.int8(Branch.VLAD),
         first_level=jnp.int8(21),
         num_levels=jnp.int8(3),
-        connection_type=jnp.int8(BranchConnectionType.NO_END2),
+        # dungeon.def line 55 ``BRANCH: "Vlad's Tower" @ (9, 5) up`` has no
+        # explicit branch_type, so dgn_comp.y:322-325 defaults to TBR_STAIR,
+        # which correct_branch_type (dungeon.c:415-417) maps to BR_STAIR.
+        # The legacy NO_END2 here was a placeholder; sample_branch_table
+        # overrides via _BRANCH_CONNECTION_VENDOR_SPEC.
+        connection_type=jnp.int8(BranchConnectionType.STAIR),
     ),
     BranchInfo(
         branch_id=jnp.int8(Branch.GEHENNOM),
@@ -288,7 +293,12 @@ _BRANCH_CHAIN_VENDOR_SPEC: dict = {
         (5, 5),            # Oracle @ (5, 5) — dungeon.def line 22
         (6, 2),            # rcouple offset = oracle + (6, 2) — dungeon.def line 26
     ),
-    # int(Branch.VLAD):  (int(Branch.GEHENNOM), (1, 0), (9, 5)),  # see Commit 6
+    # VLAD uses BRANCH (acouple) rather than CHAINBRANCH (rcouple) per
+    # dungeon.def line 55, so its entry depth is sampled by the BRANCH
+    # path in sample_branch_table via _BRANCH_ENTRY_VENDOR_SPEC[(9, 5)],
+    # not via _BRANCH_CHAIN_VENDOR_SPEC.  Leaving this entry out keeps
+    # chain semantics aligned with vendor/nle/util/dgn_comp.y line 292
+    # (``BRANCH ... acouple`` vs line 306 ``CHBRANCH ... rcouple``).
 }
 
 
@@ -305,6 +315,11 @@ _BRANCH_CONNECTION_VENDOR_SPEC: dict = {
     # to TBR_STAIR (dgn_comp.y line 322), so correct_branch_type returns
     # BR_STAIR — NOT BR_PORTAL as the legacy static table had.
     int(Branch.SOKOBAN): BranchConnectionType.STAIR,
+    # Vlad: ``BRANCH: "Vlad's Tower" @ (9, 5) up`` (dungeon.def line 55) —
+    # no branch_type given → dgn_comp.y:322-325 defaults to TBR_STAIR →
+    # dungeon.c::correct_branch_type:415-417 returns BR_STAIR.  The legacy
+    # static table used NO_END2 which is incorrect.
+    int(Branch.VLAD):    BranchConnectionType.STAIR,
     # Ludios: ``BRANCH @ (18, 4) portal`` → BR_PORTAL.
     int(Branch.LUDIOS):  BranchConnectionType.PORTAL,
 }
@@ -734,6 +749,13 @@ _MAIN_DLVL_QUEST_ENTRY:   int = 14  # canonical Quest portal level (XL gate)
 # the Dead (vendor/nethack/dat/dungeon.lua: valley base = 1).
 _MAIN_DLVL_GEHENNOM_ENTRY: int = 26  # canonical Castle / Main bottom
 
+# Audit-N #7 Commit 6: Vlad's Tower enters from Gehennom via an up-stair.
+# Vendor cite: vendor/nle/dat/dungeon.def line 55
+#   ``BRANCH: "Vlad's Tower" @ (9, 5) up``
+# The acouple ``(9, 5)`` (interpreted by dungeon.c::level_range:350-382) yields
+# Gehennom-relative depths in the closed interval [9, 13].  Canonical mid = 11.
+_GEHENNOM_DLVL_VLAD_ENTRY: int = 11  # canonical Vlad entrance (range 9..13)
+
 # Additional tile constants used by branch-specific levels.
 # BOULDER is not a TileType (TileType has 17 entries; boulders are objects
 # in NetHack, not terrain). To keep this surgical and avoid editing
@@ -856,6 +878,25 @@ def init_branch_graph(rng, static_params=None) -> BranchGraphState:
     )
     parent_branch = parent_branch.at[Branch.GEHENNOM].set(Branch.MAIN)
     entry_dlvl    = entry_dlvl.at[Branch.GEHENNOM].set(_MAIN_DLVL_GEHENNOM_ENTRY)
+
+    # --- Gehennom <-> Vlad's Tower (Audit-N #7 Commit 6) ---
+    # Vendor cite: vendor/nle/dat/dungeon.def line 55
+    #   ``BRANCH: "Vlad's Tower" @ (9, 5) up``
+    # dgn_comp.y:322-325 defaults missing branch_type to TBR_STAIR, so
+    # dungeon.c::correct_branch_type:415-417 yields BR_STAIR — a two-way
+    # staircase.  The "up" token sets tmpbranch.up=1; for BR_STAIR this
+    # only affects connection-type bookkeeping (correct_branch_type cases
+    # TBR_NO_UP/TBR_NO_DOWN), so the stair pair is bidirectional.
+    # The acouple ``(9, 5)`` is sampled by dungeon.c::level_range as a
+    # Gehennom-relative dlvl in [9, 13]; canonical mid = 11.
+    stair_links = stair_links.at[Branch.GEHENNOM, _GEHENNOM_DLVL_VLAD_ENTRY - 1].set(
+        jnp.array([Branch.VLAD, 1], dtype=jnp.int8)
+    )
+    stair_links = stair_links.at[Branch.VLAD, 0].set(
+        jnp.array([Branch.GEHENNOM, _GEHENNOM_DLVL_VLAD_ENTRY], dtype=jnp.int8)
+    )
+    parent_branch = parent_branch.at[Branch.VLAD].set(Branch.GEHENNOM)
+    entry_dlvl    = entry_dlvl.at[Branch.VLAD].set(_GEHENNOM_DLVL_VLAD_ENTRY)
 
     # --- Endgame: Astral planes (Wave 5 Phase 4b) ---
     # The Endgame branch has 5 levels:
