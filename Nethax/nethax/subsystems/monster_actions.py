@@ -467,8 +467,8 @@ def _succubus_drain(state, slot: jnp.ndarray, rng: jax.Array):
         case 2: adjattrib(A_WIS, -1)
         case 3: losexp()
         case 4: losehp()
-    Our simplification: -1 to one of {str,dex,con,int,wis,cha} chosen randomly,
-    and Pw set to 0.  Adjacent check required.
+    Vendor-parity dispatch on rn2(5) with the exact 5 branches above.
+    Adjacent check required.
     """
     mai = state.monster_ai
     idx = slot.astype(jnp.int32)
@@ -478,23 +478,27 @@ def _succubus_drain(state, slot: jnp.ndarray, rng: jax.Array):
 
     def _apply(s):
         rng_which, _ = jax.random.split(rng)
-        which = jax.random.randint(rng_which, (), 0, 6)  # 0..5 → str/dex/con/int/wis/cha
+        which = jax.random.randint(rng_which, (), 0, 5)  # rn2(5) ∈ {0..4}
 
-        new_str = jnp.where(which == 0, jnp.maximum(jnp.int16(3), s.player_str - jnp.int16(1)), s.player_str)
-        new_dex = jnp.where(which == 1, jnp.maximum(jnp.int8(3), s.player_dex - jnp.int8(1)), s.player_dex)
-        new_con = jnp.where(which == 2, jnp.maximum(jnp.int8(3), s.player_con - jnp.int8(1)), s.player_con)
-        new_int = jnp.where(which == 3, jnp.maximum(jnp.int8(3), s.player_int - jnp.int8(1)), s.player_int)
-        new_wis = jnp.where(which == 4, jnp.maximum(jnp.int8(3), s.player_wis - jnp.int8(1)), s.player_wis)
-        new_cha = jnp.where(which == 5, jnp.maximum(jnp.int8(3), s.player_cha - jnp.int8(1)), s.player_cha)
+        is_pw   = which == jnp.int32(0)  # u.uen=0
+        is_con  = which == jnp.int32(1)  # adjattrib(A_CON, -1)
+        is_wis  = which == jnp.int32(2)  # adjattrib(A_WIS, -1)
+        is_xp   = which == jnp.int32(3)  # losexp()  → -1 XL
+        is_hp   = which == jnp.int32(4)  # losehp() → -d6 HP
+
+        new_pw  = jnp.where(is_pw,  jnp.int32(0), s.player_pw)
+        new_con = jnp.where(is_con, jnp.maximum(jnp.int8(3), s.player_con - jnp.int8(1)), s.player_con)
+        new_wis = jnp.where(is_wis, jnp.maximum(jnp.int8(3), s.player_wis - jnp.int8(1)), s.player_wis)
+        new_xl  = jnp.where(is_xp,  jnp.maximum(jnp.int32(1), s.player_xl - jnp.int32(1)), s.player_xl)
+        hp_dmg  = jax.random.randint(rng_which, (), 1, 7, dtype=jnp.int32)  # d6
+        new_hp  = jnp.where(is_hp, jnp.maximum(jnp.int32(0), s.player_hp - hp_dmg), s.player_hp)
 
         return s.replace(
-            player_pw=jnp.int32(0),
-            player_str=new_str,
-            player_dex=new_dex,
+            player_pw=new_pw,
             player_con=new_con,
-            player_int=new_int,
             player_wis=new_wis,
-            player_cha=new_cha,
+            player_xl=new_xl,
+            player_hp=new_hp,
         )
 
     return jax.lax.cond(adjacent, _apply, lambda s: s, state)

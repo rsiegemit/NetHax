@@ -132,8 +132,8 @@ def try_engulf(
                       else      : tim_tmp = rnd(m_lev + 5)        # 10/2 == 5
                       uswldtim  = max(2, tim_tmp)
                     When ``attack_is_dgst`` is ``None``, falls back to the
-                    legacy uniform [25, 100) approximation (3.6's rn1(25, 75)
-                    shape for non-AD_DGST attacks).
+                    vendor 3.6 ``rn1(25, 75)`` = ``rn2(25) + 75`` ∈ [75, 99]
+                    formula for non-AD_DGST attacks.
     m_lev         : engulfer monster level (int32 scalar) — required when
                     ``attack_is_dgst`` is provided.
     con           : player CON (int32 scalar) — required for AD_DGST branch.
@@ -142,9 +142,12 @@ def try_engulf(
     already = state.swallow.swallowed
 
     if attack_is_dgst is None:
-        # Legacy fallback: vendor 3.6 non-AD_DGST shape ``rn1(25, 75)`` ≈
-        # uniform [25, 100).  Clamp to >= 2 mirrors mhitu.c:1395.
-        total = jnp.maximum(jnp.int32(25) + rnd(rng, 75), jnp.int32(2))
+        # Vendor 3.6 non-AD_DGST: ``rn1(25, 75)`` = ``rn2(25) + 75`` ∈ [75, 99].
+        # Clamp to >= 2 mirrors mhitu.c:1395.
+        total = jnp.maximum(
+            jax.random.randint(rng, (), 0, 25, dtype=jnp.int32) + jnp.int32(75),
+            jnp.int32(2),
+        )
     else:
         # Vendor mhitu.c:1380-1395 — split by attack adtyp == AD_DGST.
         rng_dgst, rng_other = jax.random.split(rng, 2)

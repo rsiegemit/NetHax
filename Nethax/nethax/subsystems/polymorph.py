@@ -971,8 +971,15 @@ def newman(state, rng: jax.Array):
 
     vendor/nethack/src/polyself.c:336 — newman():
       - Re-roll player XL ± 2 (clamped 1..30).
-      - Recompute HP_max from new XL  (8 * XL simplified).
-      - Recompute PW_max from new XL  (4 * XL simplified).
+      - Recompute HP_max via vendor formula at polyself.c:386-394:
+        ``new_hp_max = (hp_max * rn1(4,8) // 10) + sum(newhp() per new_lvl)``
+        where ``newhp()`` returns class-dependent HP per level ~ rnd(8)+1.
+        We approximate ``sum(newhp())`` as ``new_lvl * 8`` (mean of the
+        per-level rolls); the ``rn1(4,8)`` retain-factor and proportional
+        current-HP carry are exact.  JAX-required divergence: vendor reads
+        ``u.uhpinc[i]`` per-level history which Nethax does not store.
+      - Recompute PW_max via the same form at polyself.c:401-410
+        (mean newpw() ~ 4 PW/level).
       - Cure SICK and STONED status effects.
 
     Returns
@@ -981,13 +988,29 @@ def newman(state, rng: jax.Array):
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
 
-    rng, sub = jax.random.split(rng)
+    rng, sub, sub_hp, sub_pw = jax.random.split(rng, 4)
     xl_delta  = jax.random.randint(sub, (), -2, 3).astype(jnp.int32)  # [-2,+2]
-    new_xl    = jnp.clip(state.player_xl.astype(jnp.int32) + xl_delta,
-                         jnp.int32(1), jnp.int32(30))
-    new_hp_max = jnp.maximum(new_xl * jnp.int32(8), jnp.int32(1))
-    new_pw_max = jnp.maximum(new_xl * jnp.int32(4), jnp.int32(0))
-    new_hp     = jnp.minimum(state.player_hp.astype(jnp.int32), new_hp_max)
+    old_xl    = state.player_xl.astype(jnp.int32)
+    new_xl    = jnp.clip(old_xl + xl_delta, jnp.int32(1), jnp.int32(30))
+    old_hp_max = state.player_hp_max.astype(jnp.int32)
+    old_pw_max = state.player_pw_max.astype(jnp.int32)
+
+    # Vendor polyself.c:386-397 formula:
+    #   hpmax = u.uhpmax (minus per-level history we don't store)
+    #   hpmax = rounddiv(hpmax * rn1(4,8), 10)         # retain 80-110%
+    #   for i in newlvl: hpmax += newhp()              # ~rnd(8)+1 ≈ 5.5 mean
+    #   hpmax = max(hpmax, ulevel)                     # floor at 1 HP/level
+    hp_retain = jax.random.randint(sub_hp, (), 4, 12, dtype=jnp.int32)  # rn1(4,8)=[4,11]
+    new_hp_max = (old_hp_max * hp_retain) // jnp.int32(10) + new_xl * jnp.int32(8)
+    new_hp_max = jnp.maximum(new_hp_max, new_xl)
+    # PW formula identical with newpw() mean ≈ 4.
+    pw_retain = jax.random.randint(sub_pw, (), 4, 12, dtype=jnp.int32)
+    new_pw_max = (old_pw_max * pw_retain) // jnp.int32(10) + new_xl * jnp.int32(4)
+    new_pw_max = jnp.maximum(new_pw_max, new_xl)
+    # Vendor polyself.c:396 — current HP retains the same proportion.
+    safe_old_max = jnp.maximum(old_hp_max, jnp.int32(1))
+    new_hp = (state.player_hp.astype(jnp.int32) * new_hp_max) // safe_old_max
+    new_hp = jnp.minimum(new_hp, new_hp_max)
 
     # Cure SICK and STONED.
     ts = state.status.timed_statuses
@@ -1467,15 +1490,6 @@ def step(state, rng: jax.Array | None = None):
 
     state = jax.lax.cond(lyc_expired, _spawn_were, lambda s: s, state)
     return state
-
-
-# ---------------------------------------------------------------------------
-# Wave-1 compatibility shim — old name kept so callers keep compiling.
-# ---------------------------------------------------------------------------
-
-def unpolymorph(state, rng: jax.Array | None = None):
-    """Alias for revert_polymorph (legacy name from Wave 1 stubs)."""
-    return revert_polymorph(state, rng)
 
 
 # ---------------------------------------------------------------------------
