@@ -134,18 +134,23 @@ def _passive_cold(state, rng):
 
 
 def _passive_yellow_paralyze(state, rng):
-    """Yellow mold passive: rnd(10) stun (paralysis), gated by magic resistance.
+    """Yellow mold passive: d(mlev+1, 4) stun, gated by magic resistance.
 
-    Cite: vendor/nethack/src/uhitm.c::passive() line 6085-6088 (AD_STUN).
-    Vendor uses make_stunned(); Nethax maps this to FROZEN for the paralytic
-    contact effect (rnd(10) as per damd=4 → d(mlev+1,4) ≈ rnd(10) at mlev=1).
+    Cite: vendor/nethack/src/uhitm.c::passive() lines 5885-5890 + 6085-6088
+    (AD_STUN). tmp computed at 5887-5888 as ``d(mon->m_lev+1, damd)`` when
+    damn==0 (yellow mold has ATTK(AT_NONE, AD_STUN, 0, 4) in monsters.h:1634,
+    so damn==0, damd==4, m_lev==1 ⇒ tmp = d(2, 4)). make_stunned(tmp) at
+    6087 applies the stun duration. Nethax maps the contact stun onto the
+    FROZEN slot (paralytic contact); the duration formula is byte-equal.
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus, Intrinsic
-    from Nethax.nethax.rng import rnd
+    from Nethax.nethax.rng import dice_roll
 
     magic_res = state.status.intrinsics[int(Intrinsic.MAGIC_RESIST)]
 
-    duration = rnd(rng, 10).astype(jnp.int32)
+    # Vendor uhitm.c:5887-5888 — tmp = d((int) mon->m_lev + 1, damd).
+    # Yellow mold: m_lev=1, damd=4 ⇒ d(2, 4).
+    duration = dice_roll(rng, 2, 4).astype(jnp.int32)
     current_frozen = state.status.timed_statuses[int(TimedStatus.FROZEN)].astype(jnp.int32)
     new_frozen = jnp.where(magic_res, current_frozen, current_frozen + duration)
     new_statuses = state.status.timed_statuses.at[int(TimedStatus.FROZEN)].set(new_frozen)
@@ -282,14 +287,18 @@ def _passive_cold_sleep(state, rng):
 
 
 def _passive_stoning(state, rng):
-    """Cockatrice passive: touching without gloves begins petrification.
+    """Cockatrice passive: touching without gloves petrifies instantly.
 
     Cite: vendor/nethack/src/uhitm.c::passive() lines 5934-5957 (AD_STON).
-    Gate: no gloves worn (ArmorSlot.GLOVES == 3) AND no stone resistance.
-    Effect: STONED timer set to 5 (begin_stoning, timeout.c).
+    Vendor effect: ``done_in_by(mon, STONING)`` at uhitm.c:5952 — IMMEDIATE
+    death, NOT a delayed begin_stoning() timer. Gate at uhitm.c:5949-5951:
+    not Stone_resistance and not (poly_when_stoned && polymon(STONE_GOLEM)).
+    Glove gate at uhitm.c:5943-5948: protector mask must indicate no body-part
+    is protected (cockatrice AT_TUCH ⇒ W_ARMG ⇒ no gloves ⇒ stoned).
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus, Intrinsic
     from Nethax.nethax.subsystems.inventory import ArmorSlot
+    from Nethax.nethax.subsystems.scoring import DeathCause
 
     stone_res = (
         state.status.intrinsics[int(Intrinsic.RESIST_STONE)]
@@ -298,13 +307,27 @@ def _passive_stoning(state, rng):
     gloves_slot = state.inventory.worn_armor[int(ArmorSlot.GLOVES)].astype(jnp.int32)
     has_gloves = gloves_slot >= jnp.int32(0)
 
-    # Stone timer: additive cap at 5 (only set if currently 0).
+    # uhitm.c:5949-5953 — immediate done_in_by(mon, STONING).
+    should_stone = (~stone_res) & (~has_gloves)
+    new_hp = jnp.where(should_stone, jnp.int32(0), state.player_hp)
+    new_done = state.done | should_stone
+    new_cause = jnp.where(
+        should_stone,
+        jnp.int8(int(DeathCause.STONING)),
+        state.scoring.death_cause,
+    )
+    new_scoring = state.scoring.replace(death_cause=new_cause)
+    # Also flag STONED status so on-tile observers see petrified state.
     cur_stoned = state.status.timed_statuses[int(TimedStatus.STONED)].astype(jnp.int32)
-    should_stone = (~stone_res) & (~has_gloves) & (cur_stoned <= jnp.int32(0))
-    new_stoned = jnp.where(should_stone, jnp.int32(5), cur_stoned)
+    new_stoned = jnp.where(should_stone, jnp.int32(1), cur_stoned)
     new_statuses = state.status.timed_statuses.at[int(TimedStatus.STONED)].set(new_stoned)
     new_status = state.status.replace(timed_statuses=new_statuses)
-    return state.replace(status=new_status)
+    return state.replace(
+        player_hp=new_hp,
+        done=new_done,
+        scoring=new_scoring,
+        status=new_status,
+    )
 
 
 def _passive_brain_drain(state, rng):

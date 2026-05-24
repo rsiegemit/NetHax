@@ -390,8 +390,17 @@ def _nymph_steal(state, slot: jnp.ndarray, rng: jax.Array):
 def _leprechaun_steal_gold(state, slot: jnp.ndarray, rng: jax.Array):
     """Adjacent leprechaun grabs player gold, then teleports.
 
-    Vendor cite: mhitu.c doseduce() lines ~2269-2302 — leprechaun steals
-    gold proportional to player wealth; monster rlocs after theft.
+    Vendor cite: steal.c::stealgold lines 57-115 — leprechaun seizes gold
+    via somegold(money_cnt(invent)), then rlocs after theft.
+    The amount formula is byte-equal to vendor steal.c::somegold lines 13-34:
+        igold < 50    : steal all
+        igold < 100   : rn1(igold-25+1, 25)   == uniform[25, igold]
+        igold < 500   : rn1(igold-50+1, 50)   == uniform[50, igold]
+        igold < 1000  : rn1(igold-100+1, 100) == uniform[100, igold]
+        igold < 5000  : rn1(igold-500+1, 500) == uniform[500, igold]
+        igold < 10000 : rn1(igold-1000+1, 1000) == uniform[1000, igold]
+        else          : rn1(igold-5000+1, 5000) == uniform[5000, igold]
+    where rn1(n, x) == x + rn2(n).
     """
     mai = state.monster_ai
     idx = slot.astype(jnp.int32)
@@ -402,14 +411,32 @@ def _leprechaun_steal_gold(state, slot: jnp.ndarray, rng: jax.Array):
     def _apply(s):
         rng_amt, rng_tele = jax.random.split(rng)
         gold = s.player_gold.astype(jnp.int32)
-        # Vendor: steal rnd(umoney+10)+500, capped at umoney.
-        # JIT-pure approximation: steal 25-75% of gold (min 1 if gold > 0).
-        roll = jax.random.uniform(rng_amt, ())
-        steal_frac = jnp.float32(0.25) + roll * jnp.float32(0.5)
-        stolen = jnp.maximum(
-            jnp.int32(1),
-            (gold.astype(jnp.float32) * steal_frac).astype(jnp.int32)
+        # Vendor steal.c:14-34 somegold(): bracketed rn1 of gold.
+        # rn1(n, x) = x + rn2(n) = uniform[x, x+n-1].
+        bracket_n = jnp.where(
+            gold < jnp.int32(50), jnp.int32(1),
+            jnp.where(gold < jnp.int32(100), gold - jnp.int32(25) + jnp.int32(1),
+            jnp.where(gold < jnp.int32(500), gold - jnp.int32(50) + jnp.int32(1),
+            jnp.where(gold < jnp.int32(1000), gold - jnp.int32(100) + jnp.int32(1),
+            jnp.where(gold < jnp.int32(5000), gold - jnp.int32(500) + jnp.int32(1),
+            jnp.where(gold < jnp.int32(10000), gold - jnp.int32(1000) + jnp.int32(1),
+                                                gold - jnp.int32(5000) + jnp.int32(1)))))),
         )
+        bracket_x = jnp.where(
+            gold < jnp.int32(50), jnp.int32(0),
+            jnp.where(gold < jnp.int32(100), jnp.int32(25),
+            jnp.where(gold < jnp.int32(500), jnp.int32(50),
+            jnp.where(gold < jnp.int32(1000), jnp.int32(100),
+            jnp.where(gold < jnp.int32(5000), jnp.int32(500),
+            jnp.where(gold < jnp.int32(10000), jnp.int32(1000),
+                                                jnp.int32(5000)))))),
+        )
+        safe_n = jnp.maximum(bracket_n, jnp.int32(1))
+        rn2_roll = jax.random.randint(rng_amt, (), 0, safe_n, dtype=jnp.int32)
+        rn1_result = (bracket_x + rn2_roll).astype(jnp.int32)
+        # Below 50 gold, vendor returns igold unchanged (steal all).
+        stolen = jnp.where(gold < jnp.int32(50), gold, rn1_result)
+        # Vendor steal.c:103 caps at ygold->quan (player's gold quantity).
         stolen = jnp.minimum(stolen, gold)
         new_gold = jnp.maximum(gold - stolen, jnp.int32(0)).astype(jnp.int32)
 

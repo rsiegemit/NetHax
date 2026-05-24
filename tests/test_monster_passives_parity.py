@@ -237,15 +237,21 @@ def test_blue_jelly_sleep():
 
 
 def test_cockatrice_stones_no_gloves():
-    """Cockatrice passive stones player when no gloves are worn.
+    """Cockatrice passive stones player IMMEDIATELY when no gloves are worn.
 
-    Cite: vendor/nethack/src/uhitm.c::passive() lines 5934-5957 (AD_STON).
+    Cite: vendor/nethack/src/uhitm.c::passive() lines 5934-5957 (AD_STON);
+    line 5952 calls done_in_by(mon, STONING) — immediate death, not a
+    delayed begin_stoning timer.
     """
+    from Nethax.nethax.subsystems.scoring import DeathCause
     state = _base_state(entry_idx=_IDX_COCKATRICE)
     # Ensure no gloves (worn_armor[GLOVES] == -1 by default)
     assert int(state.inventory.worn_armor[int(ArmorSlot.GLOVES)]) == -1
     result = _run_passive(state)
-    assert int(result.status.timed_statuses[int(TimedStatus.STONED)]) == 5
+    assert bool(result.done), "passive AD_STON must end the run immediately"
+    assert int(result.player_hp) == 0
+    assert int(result.scoring.death_cause) == int(DeathCause.STONING)
+    assert int(result.status.timed_statuses[int(TimedStatus.STONED)]) >= 1
 
 
 def test_cockatrice_no_stone_with_gloves():
@@ -268,6 +274,7 @@ def test_cockatrice_no_stone_with_gloves():
 
     result = _run_passive(state)
     assert int(result.status.timed_statuses[int(TimedStatus.STONED)]) == 0
+    assert not bool(result.done), "gloves must block immediate stoning"
 
 
 def test_mind_flayer_drains_int():
@@ -350,5 +357,7 @@ def test_passive_fires_via_melee_attack():
     rng = jax.random.PRNGKey(42)
     state_after_melee, _dmg, _hit = melee_attack(state, rng, jnp.int32(0))
     new_state = apply_passive_to_player(state_after_melee, jnp.int32(0), rng)
-    # Cockatrice passive must have fired → player stoned
-    assert int(new_state.status.timed_statuses[int(TimedStatus.STONED)]) == 5
+    # Cockatrice passive must have fired → player stoned and run ended.
+    # Cite: vendor uhitm.c:5952 — done_in_by(mon, STONING) is immediate.
+    assert bool(new_state.done), "cockatrice AD_STON passive must end the run"
+    assert int(new_state.player_hp) == 0
