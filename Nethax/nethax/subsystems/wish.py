@@ -1,26 +1,34 @@
 """Wish subsystem — grant a wish for an object or artifact.
 
 Canonical sources:
-  vendor/nethack/src/wizard.c::makewish   — main wish handler
-  vendor/nethack/src/wizard.c::wishymatch — parse user input to object/artifact
-  vendor/nethack/src/read.c::do_genocide  — wish-like genocide
+  vendor/nethack/src/zap.c::makewish        — interactive wish handler
+  vendor/nethack/src/zap.c::WAN_WISHING     — wand-of-wishing dispatch (line 2575)
+  vendor/nethack/src/objnam.c::readobjnam   — free-form wish-text parser
+  vendor/nethack/src/objnam.c::wishymatch   — name + artifact resolution
+  vendor/nethack/src/read.c::do_genocide    — wish-like genocide
   vendor/nethack/src/spell.c::wishcmdassist — wish command help
 
-Wave 6 Phase B status:
-  Python-side parser (not JIT) covering canonical object/artifact name lookup,
-  BUC prefix ("blessed"/"uncursed"/"cursed"), and enchantment prefix ("+N").
-  Grant creates the wished-for item in the first empty inventory slot
-  (or drops it on the ground at the player position when the inventory is
-  full), and sets WISHLESS / ARTIWISHLESS conducts.
+Vendor parity:
+  ``wishymatch()`` ports the full vendor readobjnam grammar — BUC, holy/unholy,
+  erodeproof, greased, enchantment ("+N"/"-N"), quantity prefix, "named X" /
+  "called X" suffix, gold-piece short-forms, "the " article, plural -> singular
+  normalization, fuzzy abbreviation (longsword, gdsm), nowish substitution,
+  and artifact lookup with SPFX_RESTR alignment/XL gating.
 
-The wish parser is intentionally minimal: NetHack's wishymatch is ~600 lines
-of fuzzy matching, prefix juggling, and grammar parsing.  We support the
-exact-name path plus BUC/enchant prefixes, which is enough for canonical
-"blessed +3 long sword" / "Excalibur" / "gray dragon scale mail" inputs.
+  Grant creates the wished-for item in the first empty inventory slot (or
+  drops it on the ground at the player position when the inventory is full),
+  and sets WISHLESS / ARTIWISHLESS conducts.
 
-Wired conducts (Wave 6 Phase B):
-    WISHLESS      — set on every grant (wishymatch success path).
-    ARTIWISHLESS  — set when the parsed artifact_idx >= 0.
+JAX-required: the parser is Python-side (not JIT) because free-form string
+matching is not expressible in jax.lax primitives.  Wish parsing happens at
+action-handler dispatch time, never in the hot per-step loop, so the Python
+fallback is sound.
+
+Wired conducts:
+    WISHLESS      — set on every successful grant (wishymatch parsed=True).
+    ARTIWISHLESS  — set when the wish text matched an artifact name (vendor
+                    readobjnam flips wisharti on the text match, not the
+                    SPFX-gated grant — objnam.c:5362).
 """
 from __future__ import annotations
 
@@ -816,20 +824,14 @@ def wishymatch(wish_bytes) -> dict:
 
 
 def parse_wish_string(wish_bytes) -> tuple[int, int, int, int, int]:
-    """Parse a wish input into structured fields.
+    """Parse a wish input into structured fields (5-tuple compatibility view).
 
-    Wave 6 simplified parser:
-      - Strip BUC prefix ("blessed"/"uncursed"/"cursed") if present.
-      - Strip cosmetic prefixes ("greased", "fixed", "fireproof", ...).
-      - Strip enchantment prefix ("+N" / "-N").
-      - Strip cosmetic prefixes again (vendor wishymatch accepts them in
-        either order around the enchantment token).
-      - Look the remaining name up in _ARTIFACT_BY_NAME (case-sensitive,
-        vendor proper-noun match): if found, resolve to the artifact's base
-        object type_id and emit artifact_idx.
-      - Else look in _OBJECT_BY_NAME (case-insensitive): emit type_id and
-        artifact_idx=-1.
-      - On miss: return all -1 sentinels except buc/enchant defaults.
+    Thin compatibility wrapper over ``wishymatch`` that projects the full
+    vendor parser dict down to the 5-tuple shape used by early callers.
+    The underlying parser implements the full vendor readobjnam grammar
+    (BUC, holy/unholy, erodeproof, greased, +N enchantment, quantity prefix,
+    "named X" suffix, gold short-forms, "the " article, plural normalization,
+    fuzzy abbreviation, nowish substitution, artifact lookup).
 
     Returns
     -------
@@ -841,12 +843,11 @@ def parse_wish_string(wish_bytes) -> tuple[int, int, int, int, int]:
     enchantment  : int8-range
     artifact_idx : 0-based index into _ARTIFACTS, or -1 if not an artifact
 
-    Python-side (not JIT) — wish parsing happens at action-handler dispatch
-    time, not in the hot loop.  Cite: vendor/nethack/src/wizard.c::wishymatch.
+    JAX-required: Python-side (not JIT).  Free-form string parsing is not
+    expressible in jax.lax primitives, and wish parsing only runs at action-
+    handler dispatch time — never inside the hot per-step loop.
 
-    This is a thin compatibility wrapper around ``wishymatch`` which returns
-    the full vendor parser result.  Existing callers continue to receive the
-    5-tuple they relied on in Wave 6 Phase B.
+    Cite: vendor/nethack/src/objnam.c::readobjnam + wishymatch.
     """
     parsed = wishymatch(wish_bytes)
     if not parsed["parsed"]:
@@ -1067,22 +1068,40 @@ def grant_wish(state, rng, wish_string):
 # ---------------------------------------------------------------------------
 # Wand of wishing — EnvState-level handler.
 #
+# Vendor flow (zap.c::dozap → WAN_WISHING at line 2575 → makewish() at line
+# 6314 → readobjnam()): the engine prompts the player via getlin(), then
+# pipes the response through readobjnam to materialize the wished object.
+#
+# Headless adaptation: the JAX env has no interactive terminal, so the wish
+# text is supplied as the ``wish_string`` parameter and routed through the
+# same readobjnam port (``wishymatch`` → ``grant_wish``) the action-dispatch
+# layer uses for player-issued wishes.  A canonical default text is provided
+# for callers that do not pre-supply one (matching the historical "blessed
+# greased +3 gray dragon scale mail" reference wish used in vendor tutorials
+# and the NetHack wiki strategy pages).
+#
 # The items_wands subsystem operates on its own WandState slice which lacks
 # the ConductState/QuestState/etc. needed to mark WISHLESS / ARTIWISHLESS.
 # This helper is the canonical EnvState entry point: callers wrap the wand
 # zap at the action-dispatch layer (or call this directly in tests).
-# Cite: vendor/nethack/src/zap.c::zapyourself WAN_WISHING branch.
+# Cite: vendor/nethack/src/zap.c::dozap WAN_WISHING branch + makewish().
 # ---------------------------------------------------------------------------
 _DEFAULT_WAND_WISH = b"blessed greased +3 gray dragon scale mail"
 
 
 def handle_wand_of_wishing(state, rng, wish_string=None):
-    """Grant the canonical wand-of-wishing wish on EnvState.
+    """Grant a wand-of-wishing wish on EnvState.
 
-    Wave 6 simplification: wand of wishing grants a fixed canned wish
-    ("blessed greased +3 gray dragon scale mail") because the JAX env has no
-    interactive prompt.  Callers may override the wish_string to test
-    alternate inputs.
+    Vendor parity: vendor zap.c::dozap routes WAN_WISHING to makewish(), which
+    reads a free-form wish string from the player via getlin() and passes it to
+    readobjnam() for parsing.  In our headless env the wish text is provided as
+    the ``wish_string`` parameter (mirroring the prompt buffer vendor would
+    populate) and routed through the same readobjnam port (``wishymatch``) via
+    ``grant_wish``.  When no text is supplied, the canonical default is used.
+
+    Cite: vendor/nethack/src/zap.c::dozap WAN_WISHING (line 2575) +
+          vendor/nethack/src/zap.c::makewish (line 6314) +
+          vendor/nethack/src/objnam.c::readobjnam.
     """
     if wish_string is None:
         wish_string = _DEFAULT_WAND_WISH
