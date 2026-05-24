@@ -15,11 +15,14 @@ in dust at the player's current tile", since that's the only inscription
 that has gameplay effects and the only one the ELBERETHLESS conduct cares
 about.
 
-Engraving kinds (engrave.h:ENGR_*):
-    0 = none    — empty tile
-    1 = dust    — finger in dust (default; fades quickly when stepped on)
-    2 = burn    — fire-wand / fire-trap (permanent)
-    3 = engrave — athame / digging (permanent until specifically erased)
+Engraving kinds (engrave.h:26-31 enum):
+    0 = none      — empty tile
+    1 = dust      — finger in dust (fades quickly when stepped on)
+    2 = engrave   — athame / digging / cold wand
+    3 = burn      — fire-wand / fire-trap / Fire Brand
+    4 = mark      — magic marker (semi-permanent)
+    5 = blood     — vampire/demon finger; wears like dust
+    6 = headstone — graveyard inscription (always considered "fresh")
 """
 from __future__ import annotations
 
@@ -50,6 +53,7 @@ ENGR_ENGRAVE: int = 2
 ENGR_BURN: int    = 3
 ENGR_MARK: int    = 4  # magic marker (engrave.h:MARK=4); semi-permanent, not eroded by wipe_engr_on_step
 ENGR_BLOOD: int   = 5  # blood writing (engrave.h:ENGR_BLOOD=5); vampire/demon finger (engrave.c:doengrave line 573)
+ENGR_HEADSTONE: int = 6  # graveyard headstone (engrave.h:HEADSTONE=6); excluded from is_elbereth_at
 
 # ASCII byte sequence for "Elbereth" — padded with zeros to ENGRAVE_TEXT_LEN.
 _ELBERETH_BYTES = tuple(b"Elbereth") + (0,) * (ENGRAVE_TEXT_LEN - 8)
@@ -72,12 +76,20 @@ class EngraveState:
     ------
     text           : int8[MAP_H, MAP_W, ENGRAVE_TEXT_LEN] — ASCII bytes.
     has_engraving  : bool[MAP_H, MAP_W] — True where text is meaningful.
-    engraving_kind : int8[MAP_H, MAP_W] — ENGR_NONE/DUST/BURN/ENGRAVE.
+    engraving_kind : int8[MAP_H, MAP_W] — ENGR_NONE/DUST/ENGRAVE/BURN/MARK/BLOOD/HEADSTONE.
+    engr_time      : int32[MAP_H, MAP_W] — turn at which the engraving becomes
+                     readable (mirror of vendor engr.engr_time).  Monsters
+                     consult ``engr_time <= moves`` before reacting (sengr_at
+                     at engrave.c:250-261), so a half-dried-up inscription
+                     doesn't yet repel them.  Defaults to 0 (immediately
+                     readable) so existing tests / state defaults work
+                     without a multi-turn write occupation.
     """
 
     text: jnp.ndarray            # int8[MAP_H, MAP_W, ENGRAVE_TEXT_LEN]
     has_engraving: jnp.ndarray   # bool[MAP_H, MAP_W]
     engraving_kind: jnp.ndarray  # int8[MAP_H, MAP_W]
+    engr_time: jnp.ndarray       # int32[MAP_H, MAP_W]  — vendor engr.engr_time
 
     @classmethod
     def default(cls, map_h: int | None = None, map_w: int | None = None) -> "EngraveState":
@@ -93,6 +105,7 @@ class EngraveState:
             text=jnp.zeros((map_h, map_w, ENGRAVE_TEXT_LEN), dtype=jnp.int8),
             has_engraving=jnp.zeros((map_h, map_w), dtype=jnp.bool_),
             engraving_kind=jnp.zeros((map_h, map_w), dtype=jnp.int8),
+            engr_time=jnp.zeros((map_h, map_w), dtype=jnp.int32),
         )
 
 
@@ -169,11 +182,18 @@ def handle_engrave(state, rng):
     new_text  = eng.text.at[row, col, :].set(bytes_vec)
     new_has   = eng.has_engraving.at[row, col].set(jnp.bool_(True))
     new_kind  = eng.engraving_kind.at[row, col].set(kind)
+    # vendor engrave.c::doengrave sets ``engr_time = moves`` on a finger-write
+    # so monsters can react immediately.  Multi-turn occupation-based engraves
+    # (athame inscription, etc.) would set engr_time = moves + delay; since
+    # Nethax doesn't model the occupation loop, we treat all writes as
+    # instantly readable.  Cite: engrave.c::doengrave write-back block.
+    new_time  = eng.engr_time.at[row, col].set(state.timestep.astype(jnp.int32))
 
     new_engrave = eng.replace(
         text=new_text,
         has_engraving=new_has,
         engraving_kind=new_kind,
+        engr_time=new_time,
     )
     new_state = state.replace(engrave=new_engrave)
     # Conduct: ELBERETHLESS broken on any engrave action (insight.c counter).
@@ -216,22 +236,49 @@ def engrave_text_at(eng: EngraveState, row, col) -> jnp.ndarray:
 
 
 def _wipe_engr_tile(eng: EngraveState, row, col, rng: jax.Array) -> EngraveState:
-    """Erode the DUST engraving at (row, col) by 2 chars with probability 0.5.
+    """Erode the engraving at (row, col) per vendor wear rules.
 
-    Mirrors vendor/nethack/src/engrave.c::wipe_engr_at (lines 270-290):
-      - Only DUST engravings erode; BURN/ENGRAVE/MARK/BLOOD are permanent.
-      - With p=0.5 (bernoulli), remove 2 trailing non-zero bytes.
-      - When all bytes become zero, clear has_engraving.
+    Mirrors vendor/nethack/src/engrave.c::wipe_engr_at (lines 270-289):
+
+      - DUST and ENGR_BLOOD wear quickly (vendor uses the full rubouts
+        substitution table; we keep the existing 50% bernoulli + 2-byte
+        trim as an approximation — full character substitution via the
+        ``rubouts`` table is deferred).
+      - ENGRAVE, MARK, and HEADSTONE wear via ``rn2(1 + 50/(cnt+1)) == 0``;
+        with ``cnt=1`` (single wipe-attempt per step) that's
+        ``rn2(26) == 0`` ≈ 1/26 per step.  cite engrave.c:280-285.
+      - BURN only erodes when ``is_ice(x,y) || (magical && !rn2(2))``.
+        Plain movement doesn't visit those branches, so BURN never wears
+        via this path (matches the practical effect).
+      - When all bytes become zero, clear ``has_engraving``.
+
+    Previously: only DUST eroded; ENGRAVE/MARK/BURN/BLOOD were treated
+    as fully permanent, which let bloodwriting and athame-engraved
+    Elbereth last forever instead of degrading slowly.
     """
     r = jnp.asarray(row, dtype=jnp.int32)
     c = jnp.asarray(col, dtype=jnp.int32)
 
     kind = eng.engraving_kind[r, c].astype(jnp.int32)
-    is_dust = (kind == ENGR_DUST)
 
-    # Bernoulli coin flip: erode with p=0.5.
-    erode = jax.random.bernoulli(rng, p=0.5)
-    should_erode = is_dust & erode
+    # vendor wipe_engr_at line 279: DUST and BLOOD pass into the fast
+    # wear path; ENGRAVE/MARK/HEADSTONE wear via the slow per-call gate;
+    # BURN is unaffected by movement.
+    is_dust_class = (kind == ENGR_DUST) | (kind == ENGR_BLOOD)
+    is_slow_class = (
+        (kind == ENGR_ENGRAVE)
+        | (kind == ENGR_MARK)
+        | (kind == ENGR_HEADSTONE)
+    )
+
+    rng_fast, rng_slow = jax.random.split(rng)
+    fast_roll = jax.random.bernoulli(rng_fast, p=0.5)
+    # cnt=1 single wipe attempt: rn2(1 + 50/(1+1)) == rn2(26).
+    slow_roll = jax.random.randint(
+        rng_slow, (), 0, 26, dtype=jnp.int32
+    ) == jnp.int32(0)
+
+    should_erode = (is_dust_class & fast_roll) | (is_slow_class & slow_roll)
 
     text = eng.text[r, c, :]  # int8[ENGRAVE_TEXT_LEN]
 
@@ -286,19 +333,29 @@ def wipe_engr_on_step(state_or_eng, row_or_rng, col=None, rng=None):
         return _wipe_engr_tile(eng, row, col, rng)
 
 
-def is_elbereth_at(eng: EngraveState, row, col) -> jnp.ndarray:
+def is_elbereth_at(eng: EngraveState, row, col, moves=None) -> jnp.ndarray:
     """Return True if the engraving at ``(row, col)`` is exactly 'Elbereth'.
 
-    Mirrors vendor/nethack/src/engrave.c::sengr_at strict-mode usage
-    (engrave.c:250-261), which is the test consulted by monster AI to
-    decide whether to flee/avoid the tile (see monster move-toward-
-    player gating in monster.c).  JIT-safe.
+    Mirrors vendor/nethack/src/engrave.c::sengr_at strict-mode (engrave.c:
+    250-261), the test consulted by monster AI to decide whether to flee /
+    avoid the tile.  The vendor function rejects an engraving in three
+    additional cases beyond the strict-text match:
+      1. ``ep->engr_time > svm.moves`` — the inscription is still being
+         dried / not yet readable.
+      2. ``ep->engr_type == HEADSTONE`` — graveyard inscriptions never
+         repel monsters (they are not "Elbereth on the floor").
+      3. ``ep->engr_txt[0] == '\0'`` — empty inscription; covered by
+         ``has_engraving=False`` here.
 
     Parameters
     ----------
-    eng : EngraveState
-    row : int / scalar int32
-    col : int / scalar int32
+    eng   : EngraveState
+    row   : int / scalar int32
+    col   : int / scalar int32
+    moves : optional scalar int32 — current turn counter (``state.timestep``).
+            When provided, gate on ``engr_time <= moves``.  When omitted,
+            we conservatively treat the engraving as readable (preserves
+            legacy callers that only had the strict-text check).
     """
     r = jnp.asarray(row, dtype=jnp.int32)
     c = jnp.asarray(col, dtype=jnp.int32)
@@ -306,4 +363,16 @@ def is_elbereth_at(eng: EngraveState, row, col) -> jnp.ndarray:
     text_at = eng.text[r, c, :]
     target = _elbereth_bytes_array()
     matches = jnp.all(text_at == target)
-    return has & matches
+
+    # HEADSTONE inscriptions are never read as Elbereth even if text matches.
+    kind = eng.engraving_kind[r, c].astype(jnp.int32)
+    not_headstone = kind != jnp.int32(ENGR_HEADSTONE)
+
+    # Drying-delay gate.  When moves is not supplied, treat as readable.
+    if moves is None:
+        readable = jnp.bool_(True)
+    else:
+        m = jnp.asarray(moves, dtype=jnp.int32)
+        readable = eng.engr_time[r, c].astype(jnp.int32) <= m
+
+    return has & matches & not_headstone & readable
