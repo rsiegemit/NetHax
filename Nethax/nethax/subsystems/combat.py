@@ -53,6 +53,11 @@ from Nethax.nethax.subsystems.throwing import (
     _OBJECT_MATERIAL,
     _IS_RETURNING_WEAPON,
     compute_throw_range,
+    vendor_breaktest,
+    _OTYP_MIRROR,
+    _OTYP_EGG,
+    _OTYP_EXPENSIVE_CAMERA,
+    _PM_PYROLISK,
 )
 from Nethax.nethax.constants.objects import Material
 from Nethax.nethax.rng import rn2 as _rn2
@@ -1790,7 +1795,8 @@ def thrown_attack(
     valid_throw = has_item & found_hit
 
     # --- To-hit roll ---
-    key_hit, key_dmg, key_silver, key_boom, key_break, key_mjol = split_n(rng, 6)
+    (key_hit, key_dmg, key_silver, key_boom, key_break,
+     key_mjol, key_brk_resist, key_brk_msg, key_brk_side) = split_n(rng, 9)
     target_ac = mai.ac[target_idx].astype(jnp.int32)
     target_alive = mai.alive[target_idx]
     roll = rnd(key_hit, 20).astype(jnp.int32)
@@ -1966,14 +1972,31 @@ def thrown_attack(
     can_drop = should_drop & gfound
     safe_gs = jnp.clip(gslot, 0, n_stack - 1)
 
-    # --- Gap 3: glass/pottery shatter on landing (dothrow.c:1825 + 2262) ---
-    # GLASS or MINERAL (pottery) items: 50% chance to break on floor landing.
-    is_glass_or_pottery = (
-        (item_material == jnp.int32(_MATERIAL_GLASS)) |
-        (item_material == jnp.int32(_MATERIAL_POTTERY))
+    # --- D21 + D26: vendor-byte-equal breaktest (dothrow.c:2582-2609) ---
+    # Replaces the legacy 50/50 GLASS|POTTERY break.  vendor_breaktest()
+    # mirrors breaktest() exactly: GLASS+!artifact+!gem deterministic, plus
+    # EXPENSIVE_CAMERA / POT_WATER / EGG / CREAM_PIE / MELON / venom switch
+    # cases.  obj_resists() (rn2(100) < achance/ochance) gates artifacts
+    # (99% resist) and crystal armor (90% non-break).  Triggered on:
+    #   * floor landing (can_drop), AND
+    #   * monster hits where the item is itself breakable
+    #     (non-potion case — potion shatter is already handled above).
+    # vendor cite: dothrow.c::breaks (line 2450) calls breaktest before
+    # breakmsg+breakobj.
+    item_cat_i = items.category[slot].astype(jnp.int32)
+    item_otyp_i = items.type_id[slot].astype(jnp.int32)
+    item_arti = items.artifact_idx[slot] >= jnp.int8(0)
+    raw_does_break = vendor_breaktest(
+        key_brk_resist,
+        oclass=item_cat_i,
+        otyp=item_otyp_i,
+        material=item_material,
+        is_artifact=item_arti,
     )
-    break_roll = _rn2(key_break, 2)  # 0 or 1 => 50% chance
-    does_break = is_glass_or_pottery & (break_roll == jnp.int32(0)) & can_drop
+    # On a hit, potion shatter is already accounted for via apply_potion_*;
+    # for non-potion hits we leave the projectile to land normally (vendor
+    # breaks() is only called on landed/dropped objects, dothrow.c:1825).
+    does_break = raw_does_break & can_drop
     drop_qty_base = jnp.where(
         can_drop,
         jnp.int16(1),

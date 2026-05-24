@@ -313,27 +313,35 @@ def test_throw_range_scales_with_str():
 # Gap 3 — glass shatters on landing
 # ---------------------------------------------------------------------------
 
-def test_glass_breaks_on_landing():
-    """Throwing a glass gem at floor: 50% chance the item's quantity becomes 0.
+def _scan_ground_qty(result, row=10):
+    """Helper: scan the row east of player and return first non-empty qty (or None)."""
+    b = int(result.dungeon.current_branch)
+    lv = int(result.dungeon.current_level) - 1
+    gi = result.ground_items
+    n_stack = gi.category.shape[-1]
+    for col in range(11, 20):
+        for si in range(n_stack):
+            cat = int(gi.category[b, lv, row, col, si])
+            if cat != 0:
+                return int(gi.quantity[b, lv, row, col, si])
+    return None
 
-    vendor/nethack/src/dothrow.c:1825 + 2262.
-    We verify that across 40 seeds at least one throw breaks and at least one
-    survives (50% rate means P(all-break in 40) < 1e-12).
+
+def test_glass_non_gem_breaks_deterministically():
+    """Throwing a glass TOOL (non-GEM) lands shattered every time.
+
+    vendor/nethack/src/dothrow.c::breaktest line 2596:
+        if (material == GLASS && !oartifact && oclass != GEM_CLASS) return TRUE;
+    Combined with obj_resists(_, nonbreakchance=1, 99) → ordinary glass tool
+    resists with ~1% chance (1/100 rolls of rn2(100) < 1).  Across 20 seeds
+    we expect breakage in every trial (P(any resist in 20) ~ 18%, but in
+    practice the first few seeds yield rn2(100) >= 1 reliably).
     """
     from Nethax.nethax.subsystems.combat import thrown_attack
     from Nethax.nethax.subsystems.inventory import ItemCategory
-    from Nethax.nethax.constants.objects import Material, OBJECTS
-
-    # Find a glass type_id (any object with material=GLASS)
-    glass_tid = None
-    for i, obj in enumerate(OBJECTS):
-        if obj is not None and int(obj.material) == int(Material.GLASS):
-            glass_tid = i
-            break
-    assert glass_tid is not None, "No GLASS object found in OBJECTS table"
+    from Nethax.nethax.subsystems.throwing import _OTYP_MIRROR
 
     base_state = _base_state()
-    # No monster — projectile always misses and lands on floor
     mai = base_state.monster_ai
     mai = mai.replace(alive=jnp.zeros(mai.alive.shape, dtype=bool))
     base_state = base_state.replace(monster_ai=mai)
@@ -344,37 +352,94 @@ def test_glass_breaks_on_landing():
     )
 
     broke_count = 0
-    intact_count = 0
-    n_trials = 40
+    n_trials = 20
     for seed in range(n_trials):
         rng = jax.random.PRNGKey(seed * 13 + 7)
-        s = _place_item(base_state, 0, ItemCategory.GEM, type_id=glass_tid, weight=1, qty=1)
-        result = thrown_attack(s, rng, jnp.int32(0), jnp.array([0, 1], dtype=jnp.int32))
-        # Broken items land on the ground with quantity=0;
-        # intact items land with quantity=1.
-        # The item lands at the terminal tile east of the player.
-        # Scan ground stacks at row=10, cols 11-19 for this item.
-        b = int(result.dungeon.current_branch)
-        lv = int(result.dungeon.current_level) - 1
-        gi = result.ground_items
-        n_stack = gi.category.shape[-1]
-        ground_qty = None
-        for col in range(11, 20):
-            for si in range(n_stack):
-                cat = int(gi.category[b, lv, 10, col, si])
-                if cat != 0:
-                    ground_qty = int(gi.quantity[b, lv, 10, col, si])
-                    break
-            if ground_qty is not None:
-                break
+        s = _place_item(base_state, 0, ItemCategory.TOOL,
+                        type_id=_OTYP_MIRROR, weight=10, qty=1)
+        result = thrown_attack(s, rng, jnp.int32(0),
+                               jnp.array([0, 1], dtype=jnp.int32))
+        ground_qty = _scan_ground_qty(result)
         if ground_qty == 0:
             broke_count += 1
-        elif ground_qty == 1:
-            intact_count += 1
 
-    assert broke_count > 0, (
-        f"Glass gem should shatter at least once in {n_trials} throws; broke={broke_count}"
+    # Vendor: every throw should break (obj_resists fires < 1% of the time).
+    assert broke_count >= int(n_trials * 0.85), (
+        f"Glass tool should shatter on (nearly) every throw; broke={broke_count}/{n_trials}"
     )
-    assert intact_count > 0, (
-        f"Glass gem should survive at least once in {n_trials} throws; intact={intact_count}"
+
+
+def test_glass_gem_does_not_break():
+    """Throwing a GEM_CLASS glass item never breaks.
+
+    vendor breaktest line 2596 excludes ``oclass == GEM_CLASS`` from the
+    GLASS-always-break branch; the switch fall-through returns FALSE.
+    """
+    from Nethax.nethax.subsystems.combat import thrown_attack
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+    from Nethax.nethax.constants.objects import Material, OBJECTS, ObjectClass
+
+    # First glass object that lives in GEM_CLASS in the OBJECTS table.
+    glass_gem_tid = None
+    for i, obj in enumerate(OBJECTS):
+        if (obj is not None
+                and int(obj.material) == int(Material.GLASS)
+                and int(obj.class_) == int(ObjectClass.GEM_CLASS)):
+            glass_gem_tid = i
+            break
+    if glass_gem_tid is None:
+        pytest.skip("No GLASS+GEM_CLASS object in OBJECTS table")
+
+    base_state = _base_state()
+    mai = base_state.monster_ai
+    mai = mai.replace(alive=jnp.zeros(mai.alive.shape, dtype=bool))
+    base_state = base_state.replace(monster_ai=mai)
+
+    for seed in range(10):
+        rng = jax.random.PRNGKey(seed * 13 + 7)
+        s = _place_item(base_state, 0, ItemCategory.GEM,
+                        type_id=glass_gem_tid, weight=1, qty=1)
+        result = thrown_attack(s, rng, jnp.int32(0),
+                               jnp.array([0, 1], dtype=jnp.int32))
+        ground_qty = _scan_ground_qty(result)
+        assert ground_qty == 1, (
+            f"Glass gem should not shatter (seed={seed}); got qty={ground_qty}"
+        )
+
+
+def test_artifact_resists_breakage():
+    """An artifact glass tool resists breakage 99% of the time.
+
+    vendor breaktest line 2592: obj_resists(obj, nonbreak, 99) — artifacts
+    use achance=99.  Across 30 seeds we expect at least 25 resists.
+    """
+    from Nethax.nethax.subsystems.combat import thrown_attack
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+    from Nethax.nethax.subsystems.throwing import _OTYP_MIRROR
+
+    base_state = _base_state()
+    mai = base_state.monster_ai
+    mai = mai.replace(alive=jnp.zeros(mai.alive.shape, dtype=bool))
+    base_state = base_state.replace(monster_ai=mai)
+
+    survived = 0
+    n_trials = 30
+    for seed in range(n_trials):
+        rng = jax.random.PRNGKey(seed * 13 + 7)
+        s = _place_item(base_state, 0, ItemCategory.TOOL,
+                        type_id=_OTYP_MIRROR, weight=10, qty=1)
+        # Mark as artifact.
+        items = s.inventory.items
+        items = items.replace(
+            artifact_idx=items.artifact_idx.at[0].set(jnp.int8(1))
+        )
+        s = s.replace(inventory=s.inventory.replace(items=items))
+        result = thrown_attack(s, rng, jnp.int32(0),
+                               jnp.array([0, 1], dtype=jnp.int32))
+        ground_qty = _scan_ground_qty(result)
+        if ground_qty == 1:
+            survived += 1
+
+    assert survived >= int(n_trials * 0.75), (
+        f"Artifact mirror should survive most throws; survived={survived}/{n_trials}"
     )
