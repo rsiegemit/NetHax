@@ -171,6 +171,22 @@ class Item:
     # ("rknown && oerodeproof") gates rustproof/fireproof display on this.
     # cite: vendor/nethack/include/obj.h line 114.
     rknown: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
+    # age: vendor obj->age (long) — repurposed by arti_invoke as a
+    # per-object "tired until move N" cooldown timestamp.  Default 0 means
+    # "never invoked" (age <= moves => ready).
+    # cite: vendor/nethack/include/obj.h obj->age;
+    #       vendor/nethack/src/artifact.c::arti_invoke_cost lines 2106-2127
+    #       (obj->age vs svm.moves "tired" gate; obj->age = svm.moves + rnz(100)).
+    age: jnp.ndarray = field(default_factory=lambda: jnp.int32(0))
+    # artifact_idx: per-slot artifact identity (-1 == not an artifact).
+    # Mirrors vendor obj->oartifact (uchar) which tags ordinary objects with
+    # their artifact list index (artilist[oartifact]).  Needed so carried
+    # artifact extrinsics (cspfx) can be ORed across the whole inventory
+    # rather than only the wielded slot.
+    # cite: vendor/nethack/include/obj.h obj->oartifact;
+    #       vendor/nethack/src/artifact.c::set_artifact_intrinsic
+    #       (loops over all worn/carried artifacts).
+    artifact_idx: jnp.ndarray = field(default_factory=lambda: jnp.int8(-1))
 
 
 def make_empty_item() -> Item:
@@ -188,6 +204,8 @@ def make_empty_item() -> Item:
         tin_poisoned=jnp.bool_(False),
         dknown=jnp.bool_(False),
         rknown=jnp.bool_(False),
+        age=jnp.int32(0),
+        artifact_idx=jnp.int8(-1),
     )
 
 
@@ -238,6 +256,8 @@ def make_item(
         tin_poisoned=jnp.bool_(tin_poisoned),
         dknown=jnp.bool_(False),
         rknown=jnp.bool_(False),
+        age=jnp.int32(0),
+        artifact_idx=jnp.int8(-1),
     )
 
 
@@ -283,6 +303,10 @@ def _stack_items(items: list) -> Item:
         ),
         dknown=jnp.array([bool(it.dknown) for it in items], dtype=jnp.bool_),
         rknown=jnp.array([bool(it.rknown) for it in items], dtype=jnp.bool_),
+        age=jnp.array([int(it.age) for it in items], dtype=jnp.int32),
+        artifact_idx=jnp.array(
+            [int(it.artifact_idx) for it in items], dtype=jnp.int8
+        ),
     )
 
 
@@ -313,6 +337,8 @@ def _empty_items_array() -> Item:
         tin_poisoned=jnp.zeros((n,), dtype=jnp.bool_),
         dknown=jnp.zeros((n,), dtype=jnp.bool_),
         rknown=jnp.zeros((n,), dtype=jnp.bool_),
+        age=jnp.zeros((n,), dtype=jnp.int32),
+        artifact_idx=jnp.full((n,), -1, dtype=jnp.int8),
     )
 
 
@@ -343,6 +369,8 @@ def _empty_ground_items_array(n_branches: int, max_levels: int, map_h: int, map_
         tin_poisoned=jnp.zeros(shape, dtype=jnp.bool_),
         dknown=jnp.zeros(shape, dtype=jnp.bool_),
         rknown=jnp.zeros(shape, dtype=jnp.bool_),
+        age=jnp.zeros(shape, dtype=jnp.int32),
+        artifact_idx=jnp.full(shape, -1, dtype=jnp.int8),
     )
 
 
