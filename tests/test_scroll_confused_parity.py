@@ -138,14 +138,21 @@ def test_confused_remove_curse_mixed():
 
 
 def test_sane_remove_curse_always_uncurses():
-    """Sane remove curse: a cursed item always becomes uncursed (not cursed)."""
-    scroll = _scroll_item(ScrollEffect.REMOVE_CURSE)
+    """Sane (non-confused) BLESSED remove-curse uncurses any carried cursed item.
+
+    Vendor: read.c::seffect_remove_curse line 1554 gates the uncurse on
+    ``sblessed || wornmask || obj->otyp == LOADSTONE || ...`` — so an
+    uncursed (non-blessed) scroll only uncurses *worn* items, while a
+    blessed scroll uncurses all.  Test now uses a blessed scroll so the
+    "uncurse a carried weapon" assertion matches vendor semantics.
+    """
+    scroll = _scroll_item(ScrollEffect.REMOVE_CURSE, buc=_BUC_BLESSED)
     weapon = make_item(category=int(ItemCategory.WEAPON), type_id=1,
                        quantity=1, buc_status=_BUC_CURSED)
     state  = _state_clear([scroll, weapon])
     result = read_scroll(state, _RNG, 0)
     assert int(result.inventory.items.buc_status[1]) != _BUC_CURSED, (
-        "Sane remove-curse must uncurse cursed items"
+        "Blessed remove-curse must uncurse any cursed inventory item"
     )
 
 

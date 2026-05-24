@@ -342,9 +342,16 @@ def test_enchant_weapon_blessed_diminishes_at_high_spe():
 # vendor read.c::seffect_remove_curse ~1489
 # ---------------------------------------------------------------------------
 
-def test_remove_curse_uncursed_uncurses_all_carried():
-    """Uncursed remove curse uncurses ALL cursed items in inventory."""
-    scroll = _scroll(ScrollEffect.REMOVE_CURSE, buc=_BUC_UNCURSED)
+def test_remove_curse_blessed_uncurses_all_carried():
+    """Blessed remove curse uncurses ALL cursed items in inventory.
+
+    Vendor read.c::seffect_remove_curse line 1554 gates per-item uncurse on
+    ``sblessed || wornmask || obj->otyp == LOADSTONE || ...``; only the
+    BLESSED branch ignores ``wornmask`` and uncurses every carried item.
+    An *uncursed* scroll only touches worn/wielded items, so the original
+    "uncurses all carried" assertion required a blessed scroll.
+    """
+    scroll = _scroll(ScrollEffect.REMOVE_CURSE, buc=_BUC_BLESSED)
     item1  = make_item(category=int(ItemCategory.WEAPON), type_id=1,
                        quantity=1, buc_status=_BUC_CURSED)
     item2  = make_item(category=int(ItemCategory.ARMOR), type_id=2,
@@ -354,15 +361,23 @@ def test_remove_curse_uncursed_uncurses_all_carried():
     result = read_scroll(state, _RNG, 0)
 
     assert int(result.inventory.items.buc_status[1]) != _BUC_CURSED, (
-        "Remove curse must uncurse item at slot 1"
+        "Blessed remove-curse must uncurse item at slot 1"
     )
     assert int(result.inventory.items.buc_status[2]) != _BUC_CURSED, (
-        "Remove curse must uncurse item at slot 2"
+        "Blessed remove-curse must uncurse item at slot 2"
     )
 
 
-def test_remove_curse_cursed_scroll_recurses_all():
-    """Cursed remove curse re-curses all non-empty inventory items."""
+def test_remove_curse_cursed_scroll_has_no_inventory_effect():
+    """Cursed remove curse only prints "scroll disintegrates" — no inventory effect.
+
+    Vendor read.c::seffect_remove_curse lines 1505-1506: the cursed branch
+    is `pline_The("scroll disintegrates.")` and falls through; the per-item
+    blessorcurse loop is in the *else* (non-cursed) branch only.  Items in
+    inventory are left untouched.  Prior assertion that cursed scrolls
+    re-curse blessed items was a documented Wave-6 simplification that
+    diverged from vendor; this test now verifies the byte-equal behaviour.
+    """
     scroll = _scroll(ScrollEffect.REMOVE_CURSE, buc=_BUC_CURSED)
     item1  = make_item(category=int(ItemCategory.WEAPON), type_id=1,
                        quantity=1, buc_status=_BUC_BLESSED)
@@ -370,6 +385,6 @@ def test_remove_curse_cursed_scroll_recurses_all():
 
     result = read_scroll(state, _RNG, 0)
 
-    assert int(result.inventory.items.buc_status[1]) == _BUC_CURSED, (
-        "Cursed remove-curse must re-curse blessed item"
+    assert int(result.inventory.items.buc_status[1]) == _BUC_BLESSED, (
+        "Cursed remove-curse must NOT alter inventory items (vendor read.c:1505)"
     )
