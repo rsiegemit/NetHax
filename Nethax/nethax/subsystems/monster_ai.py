@@ -232,6 +232,91 @@ _MONSTER_PRIMARY_ATTACK_TABLE: tuple = (
 )
 
 
+# NATTK = 6 per vendor/nethack/include/permonst.h:48.
+_NATTK: int = 6
+
+
+def _build_monster_nattk_table() -> tuple:
+    """Precompute the full NATTK attack table per MONSTERS[i].
+
+    For each monster entry, returns (NATTK,) rows of (aatyp, n, s) per attack
+    slot.  Inactive slots have ``aatyp == AT_NONE`` (0); the NATTK loop in
+    mattackm skips them.
+
+    Cite: vendor/nethack/src/mhitm.c::mattackm lines 293-592 + permonst.h
+    NATTK = 6 (line 48).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, AttackType
+    AT_NONE = int(AttackType.AT_NONE)
+    nm = len(MONSTERS)
+    aatyp = [[AT_NONE] * _NATTK for _ in range(nm)]
+    n_arr = [[0] * _NATTK for _ in range(nm)]
+    s_arr = [[0] * _NATTK for _ in range(nm)]
+    for mi, m in enumerate(MONSTERS):
+        for ai, atk in enumerate(m.attacks or ()):
+            if ai >= _NATTK:
+                break
+            aatyp[mi][ai] = int(atk[0])
+            n_arr[mi][ai] = int(atk[2])
+            s_arr[mi][ai] = int(atk[3])
+    return (
+        jnp.array(aatyp, dtype=jnp.int8),
+        jnp.array(n_arr, dtype=jnp.int16),
+        jnp.array(s_arr, dtype=jnp.int16),
+    )
+
+
+(_MONSTER_ATTACK_AATYP_TABLE,
+ _MONSTER_ATTACK_N_TABLE,
+ _MONSTER_ATTACK_S_TABLE) = _build_monster_nattk_table()
+
+
+def _build_mm_aggression_tables() -> tuple:
+    """Precompute species-pair tables for vendor mm_aggression.
+
+    Returns bool[NUMMONS] tables for JIT-time gating:
+      * is_purple_worm  — purple worm or baby purple worm
+      * is_shrieker     — shrieker
+      * is_zombie_maker — S_ZOMBIE class (except ghoul/skeleton) and S_LICH
+      * has_zombie_form — any non-zombie symbol (approx vendor zombie_form)
+
+    Cite: vendor/nethack/src/mon.c::mm_aggression lines 2422-2447;
+          vendor/nethack/src/mon.c::zombie_maker lines 362-381.
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
+    pw_names = frozenset({"purple worm", "baby purple worm"})
+    shrieker_names = frozenset({"shrieker"})
+    ghoul_skel_names = frozenset({"ghoul", "skeleton"})
+    S_ZOMBIE = MonsterSymbol.S_ZOMBIE
+    S_LICH   = MonsterSymbol.S_LICH
+    is_pw, is_shr, is_zm, is_zform = [], [], [], []
+    for m in MONSTERS:
+        is_pw.append(m.name in pw_names)
+        is_shr.append(m.name in shrieker_names)
+        zm_eligible = (
+            (m.symbol == S_ZOMBIE and m.name not in ghoul_skel_names)
+            or m.symbol == S_LICH
+        )
+        is_zm.append(bool(zm_eligible))
+        is_zform.append(bool(m.symbol != S_ZOMBIE))
+    return (
+        jnp.array(is_pw, dtype=jnp.bool_),
+        jnp.array(is_shr, dtype=jnp.bool_),
+        jnp.array(is_zm, dtype=jnp.bool_),
+        jnp.array(is_zform, dtype=jnp.bool_),
+    )
+
+
+(_MM_IS_PURPLE_WORM,
+ _MM_IS_SHRIEKER,
+ _MM_IS_ZOMBIE_MAKER,
+ _MM_HAS_ZOMBIE_FORM) = _build_mm_aggression_tables()
+
+# CONFLICT intrinsic index (matches Nethax.nethax.subsystems.status_effects).
+# Cite: vendor/nethack/src/uhitm.c — Conflict gate.
+_INTRINSIC_CONFLICT: int = 44
+
+
 def _build_monster_move_speed_table() -> jnp.ndarray:
     """Precompute MONSTERS[i].move_speed eagerly at module load.
 
