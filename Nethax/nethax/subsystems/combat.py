@@ -126,6 +126,42 @@ def _build_monster_primary_adtyp_table() -> jnp.ndarray:
 
 _MONSTER_PRIMARY_ADTYP_TABLE: jnp.ndarray = _build_monster_primary_adtyp_table()
 
+
+# ---------------------------------------------------------------------------
+# Per-monster MONSTERS-table fields needed by JIT-side spawn paths
+# (release_camera_demon, summon scrolls).  Each cell holds the species-level
+# default for one MONSTERS row; spawn paths copy them into monster_ai.
+# Vendor refs: include/monst.h (struct permonst), src/makemon.c::newmonhp.
+# ---------------------------------------------------------------------------
+def _build_monster_spawn_tables():
+    from Nethax.nethax.constants.monsters import MONSTERS
+    levels = jnp.array([int(m.level) for m in MONSTERS], dtype=jnp.int16)
+    acs    = jnp.array([int(m.ac)    for m in MONSTERS], dtype=jnp.int16)
+    # int16 because some "dice" values overflow int8 (e.g. AT_BREA sentinel
+    # rows where damd can be 255).  Camera demon ranks (homunculus / imp)
+    # fit easily in int8 but we keep the broader type for table uniformity.
+    atk_n  = jnp.array(
+        [int(m.attacks[0][2]) if m.attacks else 1 for m in MONSTERS],
+        dtype=jnp.int16,
+    )
+    atk_s  = jnp.array(
+        [int(m.attacks[0][3]) if m.attacks else 1 for m in MONSTERS],
+        dtype=jnp.int16,
+    )
+    return levels, acs, atk_n, atk_s
+
+
+(_MONSTER_SPAWN_LEVEL,
+ _MONSTER_SPAWN_AC,
+ _MONSTER_SPAWN_ATK_N,
+ _MONSTER_SPAWN_ATK_S) = _build_monster_spawn_tables()
+
+# Vendor MONSTERS indices for release_camera_demon (dothrow.c:2461).
+# Verified against Nethax.nethax.constants.monster_entries.chunk1 lines
+# 934-967 (homunculus row 51, imp row 52).
+_PM_HOMUNCULUS: int = 51
+_PM_IMP:        int = 52
+
 # AD_WERE value as a module-level int constant (mirrors DamageType.AD_WERE=29).
 _AD_WERE: int = 29
 
@@ -2258,16 +2294,37 @@ def thrown_attack(
         jnp.int32(0),
     ).astype(jnp.int32)
 
-    # --- D24: camera breakage releases a demon (dothrow.c::breakobj
-    # EXPENSIVE_CAMERA line 2522 → release_camera_demon @ 2457-2470).
-    # vendor: rn2(3) == 0 success rate; spawns IMP (rn2(3)) or HOMUNCULUS.
-    # We approximate as a generic monster spawn (entry_idx=1 placeholder
-    # pattern, mirrors magic.py spawn) in a free monster slot adjacent to
-    # the drop tile.  rn2(3) gate fires only when does_break.
+    # --- D24: camera breakage releases a demon (dothrow.c::breakobj line
+    # 2522 → release_camera_demon @ 2457-2470).  Vendor body:
+    #     if (!rn2(3) && makemon(&mons[rn2(3) ? PM_HOMUNCULUS : PM_IMP], ...))
+    # i.e. 1-in-3 chance to spawn, and within that 1-in-3 IMP / 2-in-3
+    # HOMUNCULUS.  HP / m_lev / AC / attack dice are seeded from the MONSTERS
+    # row exactly as ``newmonhp`` (makemon.c:1012-1054) does for non-special,
+    # non-golem, non-Rider, non-dragon entries:
+    #     m_lev = adj_lev(ptr) ≈ ptr->mlevel
+    #     hp = hp_max = d(level, 8)   (basehp == level; floor at level+1)
     is_camera = item_otyp_i == jnp.int32(_OTYP_EXPENSIVE_CAMERA)
     camera_broke = does_break & is_camera
     cam_roll = _rn2(key_brk_msg, 3)
     cam_spawn = camera_broke & (cam_roll == jnp.int32(0))
+
+    # Species pick: rn2(3) ? PM_HOMUNCULUS : PM_IMP  (so rn2==0 → IMP).
+    key_cam_species = jax.random.fold_in(key_brk_msg, jnp.uint32(0xCAFE))
+    species_roll = _rn2(key_cam_species, 3)
+    cam_entry = jnp.where(
+        species_roll == jnp.int32(0),
+        jnp.int32(_PM_IMP),
+        jnp.int32(_PM_HOMUNCULUS),
+    )
+
+    # newmonhp roll: d(level, 8); floor at level+1 (vendor:1050-1053).
+    key_cam_hp = jax.random.fold_in(key_brk_msg, jnp.uint32(0xC0DE))
+    cam_level = _MONSTER_SPAWN_LEVEL[cam_entry].astype(jnp.int32)
+    cam_ac    = _MONSTER_SPAWN_AC[cam_entry].astype(jnp.int16)
+    cam_atk_n = _MONSTER_SPAWN_ATK_N[cam_entry]
+    cam_atk_s = _MONSTER_SPAWN_ATK_S[cam_entry]
+    cam_hp = _roll_dice_sum(key_cam_hp, cam_level, jnp.int32(8))
+    cam_hp = jnp.maximum(cam_hp, cam_level + jnp.int32(1))
 
     # Find a free monster slot.
     free_mask = ~new_mai.alive
@@ -2280,24 +2337,42 @@ def thrown_attack(
         drop_row.astype(jnp.int16),
         drop_col.astype(jnp.int16),
     ])
-    # entry_idx 1 → small monster placeholder; vendor uses
-    # PM_HOMUNCULUS / PM_IMP but Nethax JIT-side spawn uses a generic.
     new_alive2 = new_mai.alive.at[spawn_slot].set(
         jnp.where(do_spawn, jnp.bool_(True), new_mai.alive[spawn_slot]))
     new_hp_max2 = new_mai.hp_max.at[spawn_slot].set(
-        jnp.where(do_spawn, jnp.int32(8), new_mai.hp_max[spawn_slot]))
+        jnp.where(do_spawn, cam_hp, new_mai.hp_max[spawn_slot]))
     new_hp2 = new_mai.hp.at[spawn_slot].set(
-        jnp.where(do_spawn, jnp.int32(8), new_mai.hp[spawn_slot]))
+        jnp.where(do_spawn, cam_hp, new_mai.hp[spawn_slot]))
     new_pos2 = new_mai.pos.at[spawn_slot].set(
         jnp.where(do_spawn, spawn_pos, new_mai.pos[spawn_slot]))
     new_entry2 = new_mai.entry_idx.at[spawn_slot].set(
-        jnp.where(do_spawn, jnp.int16(1), new_mai.entry_idx[spawn_slot]))
+        jnp.where(do_spawn, cam_entry.astype(jnp.int16),
+                  new_mai.entry_idx[spawn_slot]))
+    new_mlev2 = new_mai.m_lev.at[spawn_slot].set(
+        jnp.where(do_spawn, cam_level.astype(new_mai.m_lev.dtype),
+                  new_mai.m_lev[spawn_slot]))
+    new_ac2 = new_mai.ac.at[spawn_slot].set(
+        jnp.where(do_spawn, cam_ac.astype(new_mai.ac.dtype),
+                  new_mai.ac[spawn_slot]))
+    new_atk_n2 = new_mai.attack_dice_n.at[spawn_slot].set(
+        jnp.where(do_spawn, cam_atk_n.astype(new_mai.attack_dice_n.dtype),
+                  new_mai.attack_dice_n[spawn_slot]))
+    new_atk_s2 = new_mai.attack_dice_sides.at[spawn_slot].set(
+        jnp.where(do_spawn, cam_atk_s.astype(new_mai.attack_dice_sides.dtype),
+                  new_mai.attack_dice_sides[spawn_slot]))
+    # vendor dothrow.c:2467 sets ``mtmp->mpeaceful = !obj->cursed``; we do
+    # not track the thrown camera's curse flag at this point, so default to
+    # hostile (matches vendor's subsequent set_malign call for non-peaceful).
     final_mai = new_mai.replace(
         alive=new_alive2,
         hp=new_hp2,
         hp_max=new_hp_max2,
         pos=new_pos2,
         entry_idx=new_entry2,
+        m_lev=new_mlev2,
+        ac=new_ac2,
+        attack_dice_n=new_atk_n2,
+        attack_dice_sides=new_atk_s2,
     )
 
     return state_after_hit.replace(
