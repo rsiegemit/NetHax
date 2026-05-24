@@ -859,6 +859,16 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     # the deepest_level scoring trace, mirroring _stair_down's level bump.
     descend = trap_se[_SE_LEVEL_DESCEND] > jnp.int32(0)
     _max_level_branch = jnp.int8(state_final.terrain.shape[1])
+    # Audit M #30: vendor ``Can_fall_thru(&u.uz)`` gate (trap.c:2013-2020).
+    # Vendor blocks the level-descend on bottoms of branches and in
+    # endgame branches.  We approximate ``Can_fall_thru`` as
+    # ``current_level < max_level_branch`` — if the player is already on
+    # the bottom-most level of the current branch, the fall-through is
+    # blocked.  Endgame branches (ENDGAME) have their own protections
+    # at the dungeon-traversal level; here we just refuse to bump past
+    # the bottom.  Cite: vendor/nethack/src/trap.c:2013-2020.
+    _can_fall_thru = state_final.dungeon.current_level < _max_level_branch
+    descend = descend & _can_fall_thru
     _bumped_level = jnp.minimum(
         state_final.dungeon.current_level + jnp.int8(1),
         _max_level_branch,

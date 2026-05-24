@@ -1051,17 +1051,52 @@ def _trap_magic_portal(state, rng):
 
 
 def _trap_web(state, rng):
-    """WEB — held: FROZEN for rn1(4,2)=2..5 turns (avg-strength hero).
+    """WEB — STR-tiered held timer per vendor trap.c:2181-2202.
 
-    vendor/nethack/src/trap.c:2187-2188 — for STR 9..11 the trap holds for
-    ``tim = rn1(4, 2)`` = rn2(4)+2 = 2..5 turns.  We model the default-strength
-    case (STR 9..11) here; stronger heroes break free faster in vendor but the
-    parity ranges still match because the wide-carrier branch is the same call
-    for every hero.
+    Vendor's per-strength escape table (Audit M #28):
+        STR ≤ 3   :  rn1(6, 6)  = 6..11
+        STR < 6   :  rn1(6, 4)  = 4..9
+        STR < 9   :  rn1(4, 4)  = 4..7
+        STR < 12  :  rn1(4, 2)  = 2..5
+        STR < 15  :  rn1(2, 2)  = 2..3
+        STR < 18  :  rnd(2)     = 1..2
+        STR < 69  :  1
+        STR ≥ 69  :  0 (web destroyed immediately)
+
+    rn1(x, y) = rn2(x) + y; rnd(x) = rn2(x) + 1.
+
+    Previously this used the fixed STR-9..11 case only (rn1(4, 2)).
+
+    Cite: vendor/nethack/src/trap.c:2181-2202 (per-strength web-escape
+    branches inside dotrap WEB).
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
-    # rn1(4,2) = rn2(4)+2 = 2..5  →  _d(rng,4)+1 = 2..5
-    return _set_timed_status(state, int(TimedStatus.FROZEN), _d(rng, 4) + jnp.int32(1))
+
+    # Per-tier dice rolls (each as a fresh draw against ``rng``).  We
+    # split the rng up-front and pick the one matching the player's STR
+    # tier so the byte-stream stays deterministic per seed.
+    k0, k1, k2, k3, k4, k5 = jax.random.split(rng, 6)
+    s = state.player_str.astype(jnp.int32)
+
+    # All tiers (low-STR first so jnp.where chains in narrow-to-broad order).
+    t_3   = _d(k0, 6) + jnp.int32(5)     # rn1(6,6) = 6..11
+    t_6   = _d(k1, 6) + jnp.int32(3)     # rn1(6,4) = 4..9
+    t_9   = _d(k2, 4) + jnp.int32(3)     # rn1(4,4) = 4..7
+    t_12  = _d(k3, 4) + jnp.int32(1)     # rn1(4,2) = 2..5
+    t_15  = _d(k4, 2) + jnp.int32(1)     # rn1(2,2) = 2..3
+    t_18  = jax.random.randint(k5, (), 1, 3, dtype=jnp.int32)  # rnd(2) = 1..2
+
+    timer = jnp.where(
+        s <= jnp.int32(3),  t_3,
+        jnp.where(s < jnp.int32(6),  t_6,
+            jnp.where(s < jnp.int32(9),  t_9,
+                jnp.where(s < jnp.int32(12), t_12,
+                    jnp.where(s < jnp.int32(15), t_15,
+                        jnp.where(s < jnp.int32(18), t_18,
+                            jnp.where(s < jnp.int32(69), jnp.int32(1),
+                                                          jnp.int32(0))))))),
+    )
+    return _set_timed_status(state, int(TimedStatus.FROZEN), timer)
 
 
 def _trap_statue(state, rng):
