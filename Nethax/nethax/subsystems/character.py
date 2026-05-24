@@ -246,6 +246,18 @@ class ObjType:
     CREDIT_CARD       = 606
     MAGIC_MARKER      = 607
 
+    # Food (FOOD_CLASS = 7) — vendor otyp values (objects.py:252-268).
+    # Audit L #14-#26 references for starting inventory items.
+    APPLE             = 252   # objects.py:252
+    ORANGE            = 253   # objects.py:253
+    CARROT            = 257   # objects.py:257
+    SPRIG_OF_WOLFSBANE = 258  # objects.py:258
+    CLOVE_OF_GARLIC   = 259   # objects.py:259
+    FORTUNE_COOKIE    = 264   # objects.py:264
+    LEMBAS_WAFER      = 266   # objects.py:266
+    CRAM_RATION       = 267   # objects.py:267
+    FOOD_RATION       = 268   # objects.py:268
+
 
 # ---------------------------------------------------------------------------
 # AC values for starting armor
@@ -410,6 +422,39 @@ def _tool(type_id: int, buc: int = _BUC_UNCURSED) -> "Item":
                      weight=30, buc_status=buc, identified=True)
 
 
+def _food(type_id: int, qty: int = 1, buc: int = _BUC_UNCURSED) -> "Item":
+    """Build a FOOD-class starting-inventory item.
+
+    Cite: vendor/nethack/src/u_init.c starting trobj arrays use FOOD with
+    ``oc_weight`` looked up from objects.h.  We pass a per-type weight via
+    the lookup table below; ``identified=True`` mirrors vendor's
+    ``otmp->known = TRUE`` on starting items (u_init.c::ini_inv).
+    """
+    from Nethax.nethax.subsystems.inventory import make_item
+    # objects.h oc_weight per food otyp (Audit L #14-#26).  Lightweight
+    # items default to 2 if missing — the corpse / egg cases (otyp 250-251)
+    # aren't in this helper's scope.
+    _FOOD_WEIGHT = {
+        ObjType.APPLE: 2,
+        ObjType.ORANGE: 2,
+        ObjType.CARROT: 2,
+        ObjType.SPRIG_OF_WOLFSBANE: 1,
+        ObjType.CLOVE_OF_GARLIC: 1,
+        ObjType.FORTUNE_COOKIE: 1,
+        ObjType.LEMBAS_WAFER: 5,
+        ObjType.CRAM_RATION: 15,
+        ObjType.FOOD_RATION: 20,
+    }
+    return make_item(
+        category=ItemCategory.FOOD,
+        type_id=type_id,
+        quantity=qty,
+        weight=_FOOD_WEIGHT.get(type_id, 2) * qty,
+        buc_status=buc,
+        identified=True,
+    )
+
+
 def _wand(type_id: int, buc: int = _BUC_UNCURSED) -> "Item":
     from Nethax.nethax.subsystems.inventory import make_item
     return make_item(category=ItemCategory.WAND, type_id=type_id, quantity=1,
@@ -423,20 +468,32 @@ def _wand(type_id: int, buc: int = _BUC_UNCURSED) -> "Item":
 # ---------------------------------------------------------------------------
 
 STARTING_INVENTORY: dict = {
-    # Arc: bullwhip+2, leather jacket+0, fedora+0, pick-axe, tinning kit
-    # u_init.c Archeologist[]:  BULLWHIP spe=2, LEATHER_JACKET 0, FEDORA 0.
+    # Arc: bullwhip+2, leather jacket+0, fedora+0, pick-axe, tinning kit,
+    #      sack, touchstone, 3 food rations.
+    # u_init.c Archeologist[] (42-53): BULLWHIP spe=2, LEATHER_JACKET 0,
+    # FEDORA 0, PICK_AXE, TINNING_KIT, SACK, TOUCHSTONE, FOOD_RATION qty=3.
+    # Audit L #14: added the missing SACK, TOUCHSTONE, FOOD_RATION×3.
     Role.ARCHEOLOGIST: [
         _weapon(ObjType.BULLWHIP, enchant=2),
         _armor(ObjType.LEATHER_JACKET),
         _armor(ObjType.FEDORA),
         _tool(ObjType.PICK_AXE),
         _tool(ObjType.TINNING_KIT),
+        _tool(ObjType.SACK),
+        _tool(ObjType.TOUCHSTONE),
+        _food(ObjType.FOOD_RATION, 3),
     ],
-    # Bar variant 0: two-handed sword+0, axe+0, ring mail+0 (u_init.c Barbarian_0)
+    # Bar variant 0: two-handed sword+0, axe+0, ring mail+0, food ration.
+    # u_init.c Barbarian_0 (54-67): TWO_HANDED_SWORD, AXE, RING_MAIL,
+    # FOOD_RATION qty=1.  (Barbarian_1 variant TWO_HANDED_SWORD+AXE swapped
+    # for BATTLE_AXE+SHORT_SWORD is selected by rn2(2) — deferred since the
+    # current single-variant model is byte-equal vendor for variant 0.)
+    # Audit L #15: added the missing FOOD_RATION×1.
     Role.BARBARIAN: [
         _weapon(ObjType.TWO_HANDED_SWORD),
         _weapon(ObjType.AXE),
         _armor(ObjType.RING_MAIL),
+        _food(ObjType.FOOD_RATION, 1),
     ],
     # Cav: club+1, sling+2, rocks, leather armor+0 (u_init.c Caveman[])
     Role.CAVEMAN: [
@@ -447,8 +504,10 @@ STARTING_INVENTORY: dict = {
         _armor(ObjType.LEATHER_ARMOR),
     ],
     # Hea: scalpel+0, leather gloves+1, stethoscope, 4 healing + 4 extra healing,
-    #      wand of sleep, spellbooks (3 of them BLESSED per u_init.c).
-    # u_init.c Healer[]:  SCALPEL 0, LEATHER_GLOVES 1, spellbooks trbless=1.
+    #      wand of sleep, spellbooks (3 of them BLESSED per u_init.c), 5 apples.
+    # u_init.c Healer[] (76-89): SCALPEL 0, LEATHER_GLOVES 1, spellbooks
+    # trbless=1, APPLE qty=5.
+    # Audit L #17: added the missing APPLE×5.
     Role.HEALER: [
         _weapon(ObjType.SCALPEL),
         _armor(ObjType.LEATHER_GLOVES, enchant=1),
@@ -459,10 +518,12 @@ STARTING_INVENTORY: dict = {
         _spellbook(ObjType.SPE_HEALING, buc=_BUC_BLESSED),
         _spellbook(ObjType.SPE_EXTRA_HEALING, buc=_BUC_BLESSED),
         _spellbook(ObjType.SPE_STONE_TO_FLESH, buc=_BUC_BLESSED),
+        _food(ObjType.APPLE, 5),
     ],
     # Kni: long sword+1, lance+1, ring mail+1, helmet+0, small shield+0,
-    #      leather gloves+0 (u_init.c Knight[]).  trbless=UNDEF_BLESS for all
-    #      → cursed=0; default blessed flag is 0 → UNCURSED.
+    #      leather gloves+0, 10 apples, 10 carrots (u_init.c Knight[]).
+    # u_init.c Knight[] (90-100): trbless=UNDEF_BLESS for all → UNCURSED.
+    # Audit L #18: added the missing APPLE×10 + CARROT×10.
     Role.KNIGHT: [
         _weapon(ObjType.LONG_SWORD, enchant=1),
         _weapon(ObjType.LANCE, enchant=1),
@@ -470,38 +531,64 @@ STARTING_INVENTORY: dict = {
         _armor(ObjType.HELMET),
         _armor(ObjType.SMALL_SHIELD),
         _armor(ObjType.LEATHER_GLOVES),
+        _food(ObjType.APPLE, 10),
+        _food(ObjType.CARROT, 10),
     ],
-    # Mon: leather gloves+2, robe+1 (fights barehanded — no weapon).
-    # u_init.c Monk[]:  LEATHER_GLOVES spe=2, ROBE spe=1.
+    # Mon: leather gloves+2, robe+1 (fights barehanded), 3 healing potions,
+    #      3 food rations, 5 apples, 5 oranges, 3 fortune cookies.
+    # u_init.c Monk[] (101-113): LEATHER_GLOVES spe=2, ROBE spe=1, POT_HEALING
+    # qty=3, FOOD_RATION qty=3, APPLE qty=5, ORANGE qty=5, FORTUNE_COOKIE qty=3.
+    # Audit L #19: added missing potions + food.  Random SCROLL also in vendor —
+    # deferred since the random-scroll-on-init pipeline isn't wired yet.
     Role.MONK: [
         _armor(ObjType.LEATHER_GLOVES, enchant=2),
         _armor(ObjType.ROBE, enchant=1),
+        _potion(ObjType.POT_HEALING, 3),
+        _food(ObjType.FOOD_RATION, 3),
+        _food(ObjType.APPLE, 5),
+        _food(ObjType.ORANGE, 5),
+        _food(ObjType.FORTUNE_COOKIE, 3),
     ],
     # Pri: mace+1 (BLESSED — vendor trbless=1), robe+0, small shield+0,
-    #      4 holy water (BLESSED — vendor trbless=1).
-    # u_init.c Priest[]:  MACE spe=1 trbless=1, POT_WATER trbless=1.
+    #      4 holy water (BLESSED), clove of garlic, sprig of wolfsbane.
+    # u_init.c Priest[] (114-123): MACE spe=1 trbless=1, POT_WATER trbless=1,
+    # CLOVE_OF_GARLIC, SPRIG_OF_WOLFSBANE.  Two random spellbooks also in
+    # vendor — deferred (random-spellbook init not wired).
+    # Audit L #20: added missing garlic + wolfsbane.
     Role.PRIEST: [
         _weapon(ObjType.MACE, enchant=1, buc=_BUC_BLESSED),
         _armor(ObjType.ROBE),
         _armor(ObjType.SMALL_SHIELD),
         _potion(ObjType.POT_WATER, 4, buc=_BUC_BLESSED),   # holy water
+        _food(ObjType.CLOVE_OF_GARLIC, 1),
+        _food(ObjType.SPRIG_OF_WOLFSBANE, 1),
     ],
-    # Ran: dagger+1, bow+1, arrow+2 x50, cloak of displacement+2
-    # u_init.c Ranger[]:  DAGGER spe=1, BOW spe=1, ARROW spe=2,
-    #                     CLOAK_OF_DISPLACEMENT spe=2.
+    # Ran: dagger+1, bow+1, arrow+2 x50, arrow+0 x30..39, cloak+2, 4 cram rations.
+    # u_init.c Ranger[] (124-132):  DAGGER spe=1, BOW spe=1, ARROW spe=2 qty=50..59,
+    # ARROW spe=0 qty=30..39, CLOAK_OF_DISPLACEMENT spe=2, CRAM_RATION qty=4.
+    # Audit L #21: added missing CRAM_RATION×4 and the second arrow stack
+    # (spe=0).  Quantity uses the median of 30..39 (= 35) since per-init random
+    # range isn't wired through this static table.
     Role.RANGER: [
         _weapon(ObjType.DAGGER, enchant=1),
         _weapon(ObjType.BOW, enchant=1),
         _weapon(ObjType.ARROW, 50, enchant=2),
+        _weapon(ObjType.ARROW, 35, enchant=0),
         _armor(ObjType.CLOAK_OF_DISPLACEMENT, enchant=2),
+        _food(ObjType.CRAM_RATION, 4),
     ],
-    # Rog: short sword+0, daggers+0 x10, leather armor+1 (u_init.c Rogue[]).
+    # Rog: short sword+0, daggers+0 x10, leather armor+1, lock pick, sack,
+    #      1 potion of sickness (u_init.c Rogue[] 133-141).
+    # Audit L #22: added the missing POT_SICKNESS×1.  Vendor DAGGER qty is
+    # ``6..15`` random; we keep the static 10 (median = 10) since per-init
+    # random ranges aren't threaded through this static table.
     Role.ROGUE: [
         _weapon(ObjType.SHORT_SWORD),
         _weapon(ObjType.DAGGER, 10),
         _armor(ObjType.LEATHER_ARMOR, enchant=1),
         _tool(ObjType.LOCK_PICK),
         _tool(ObjType.SACK),
+        _potion(ObjType.POT_SICKNESS, 1),
     ],
     # Sam: katana+0, wakizashi(short sword)+0, yumi+0, ya+0 x26, splint mail+0
     # u_init.c Samurai[]: all spe=0, all trbless=UNDEF_BLESS → UNCURSED.
@@ -523,16 +610,23 @@ STARTING_INVENTORY: dict = {
         _tool(ObjType.EXPENSIVE_CAMERA),
         _tool(ObjType.CREDIT_CARD),
     ],
-    # Val: spear+1, dagger+0, small shield+3 (u_init.c Valkyrie[]).
-    #      trbless=UNDEF_BLESS for all → UNCURSED.
+    # Val: spear+1, dagger+0, small shield+3, 1 food ration
+    # (u_init.c Valkyrie[] 160-166).  trbless=UNDEF_BLESS for all → UNCURSED.
+    # Audit L #25: added the missing FOOD_RATION×1.
     Role.VALKYRIE: [
         _weapon(ObjType.SPEAR, enchant=1),
         _weapon(ObjType.DAGGER),
         _armor(ObjType.SMALL_SHIELD, enchant=3),
+        _food(ObjType.FOOD_RATION, 1),
     ],
     # Wiz: quarterstaff+1 (BLESSED — trbless=1), cloak of magic resistance+0,
-    #      wand, force-bolt spellbook (BLESSED), random potions/scrolls.
-    # u_init.c Wizard[]:  QUARTERSTAFF spe=1 trbless=1, SPE_FORCE_BOLT trbless=1.
+    #      wand, force-bolt spellbook (BLESSED), random potions/scrolls,
+    #      magic marker (spe = 18 + d4 ≈ 20).
+    # u_init.c Wizard[] (167-178): QUARTERSTAFF spe=1 trbless=1, SPE_FORCE_BOLT
+    # trbless=1, MAGIC_MARKER spe=18+d4.  Random RING ×2, POTION ×3, SCROLL ×3,
+    # SPBOOK ×1, WAND each pulled from UNDEF_TYP — we keep the existing
+    # POT_HEALING/SCR_IDENTIFY/WAN_SLEEP representatives until random-init is
+    # wired (Audit L #26 remaining).
     Role.WIZARD: [
         _weapon(ObjType.QUARTERSTAFF, enchant=1, buc=_BUC_BLESSED),
         _armor(ObjType.CLOAK_OF_MAGIC_RESISTANCE),
@@ -540,6 +634,8 @@ STARTING_INVENTORY: dict = {
         _spellbook(ObjType.SPE_FORCE_BOLT, buc=_BUC_BLESSED),
         _potion(ObjType.POT_HEALING, 3),   # representative random potions
         _scroll(ObjType.SCR_IDENTIFY, 3),  # representative random scrolls
+        # MAGIC_MARKER spe = 18 + d4 (median = 20).  Vendor u_init.c:177.
+        _tool(ObjType.MAGIC_MARKER),
     ],
 }
 
