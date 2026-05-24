@@ -163,30 +163,45 @@ def test_pet_flees_low_hp():
 # ---------------------------------------------------------------------------
 
 def test_pet_eats_floor_food():
-    """Hungry pet on a tile with FOOD eats it: HP increases, item removed."""
+    """Hungry pet on a tile with FOOD eats it: vendor dog_eat semantics.
+
+    Vendor dogmove.c:218-345 (dog_eat) does NOT heal HP directly.  It instead:
+      * edog->hungrytime += nutrit   (extends hungry counter)
+      * mtmp->mconf = 0
+      * mhpmax_penalty reset (if any)
+      * if mtame < 20: mtame++       (line 249-250)
+      * item consumed
+    """
     player_pos = (10, 20)
     pet_pos = (10, 19)
 
     state = _floor_state(player_pos=player_pos)
     # Pet is hungry (hunger <= 0) and damaged.
     state = _place_pet(state, slot=0, pos=pet_pos, hp=5, hp_max=20, hunger=0)
-    # Place food at same tile as pet; weight=40 → heal = 40//4 = 10.
+    # Place food at same tile as pet; weight=40 → nutrit = 40 ≥ 1.
     state = _place_food(state, row=pet_pos[0], col=pet_pos[1], weight=40)
 
-    hp_before = int(state.monster_ai.hp[0])
+    mtame_before = int(state.monster_ai.mtame[0])
+    hungrytime_before = int(state.monster_ai.hungrytime[0])
     food_cat_before = int(state.ground_items.category[0, 0, pet_pos[0], pet_pos[1], 0])
 
     state = pet_move(state, _RNG, jnp.int32(0))
 
-    hp_after = int(state.monster_ai.hp[0])
+    mtame_after = int(state.monster_ai.mtame[0])
+    hungrytime_after = int(state.monster_ai.hungrytime[0])
     food_cat_after = int(state.ground_items.category[0, 0, pet_pos[0], pet_pos[1], 0])
 
     assert food_cat_before == _CAT_FOOD, "Setup: food should be placed before test."
     assert food_cat_after == 0, (
         f"Food should be consumed (category=0) after pet eats it, got {food_cat_after}"
     )
-    assert hp_after > hp_before, (
-        f"Pet HP should increase after eating food: {hp_before} -> {hp_after}"
+    # vendor dogmove.c:249-250: mtame increments by 1 (cap 20).
+    assert mtame_after == mtame_before + 1, (
+        f"mtame should ++ on eat: {mtame_before} -> {mtame_after}"
+    )
+    # vendor dogmove.c:240: hungrytime extended by nutrit (>= 1).
+    assert hungrytime_after > hungrytime_before, (
+        f"hungrytime should extend on eat: {hungrytime_before} -> {hungrytime_after}"
     )
 
 

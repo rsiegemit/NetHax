@@ -441,21 +441,38 @@ def test_dog_prefers_meat():
 
 
 def test_pet_follows_within_leash():
-    """A pet's leash radius is apport-scaled.  High apport → small radius.
+    """Vendor pet leash check: ``mleashed && distu > 4``.
 
-    Vendor dogmove.c uses LEASH_LENGTH = 6; we model leash as
-    max(LEASH_BASE+5 - apport, 2).  apport=10 → leash=2; apport=1 → leash=10.
+    Cite: vendor/nethack/src/dogmove.c line 1093.
+    A non-leashed pet is always "within leash" (no restriction).  A leashed
+    pet is "within leash" iff distu (squared Euclidean) <= 4.
     """
     state = _floor_state().replace(player_pos=jnp.array([10, 10], dtype=jnp.int16))
-    # Pet very close (dist 1) at apport=10 → within leash.
-    state_close = _set_monster(state, 0, pos=(10, 11), tame=True,
-                               entry_idx=_KITTEN_ENTRY, apport=10)
+
+    # Non-leashed pet at any distance — always within leash.
+    state_unleashed = _set_monster(state, 0, pos=(10, 18), tame=True,
+                                   entry_idx=_KITTEN_ENTRY)
+    assert bool(pet_within_leash(state_unleashed, jnp.int32(0)))
+
+    # Leashed pet at distu=1 (adjacent col) → within leash.
+    mai = state.monster_ai.replace(
+        mleashed=state.monster_ai.mleashed.at[0].set(jnp.bool_(True))
+    )
+    state_close = _set_monster(state.replace(monster_ai=mai), 0, pos=(10, 11),
+                               tame=True, entry_idx=_KITTEN_ENTRY)
+    state_close = state_close.replace(
+        monster_ai=state_close.monster_ai.replace(
+            mleashed=state_close.monster_ai.mleashed.at[0].set(jnp.bool_(True))
+        )
+    )
     assert bool(pet_within_leash(state_close, jnp.int32(0)))
-    # Pet far (dist 8) at apport=10 → leash=2 → outside.
-    state_far = _set_monster(state, 0, pos=(10, 18), tame=True,
-                             entry_idx=_KITTEN_ENTRY, apport=10)
+
+    # Leashed pet at distu=64 (col 18 - 10 = 8 → 8² = 64 > 4) → outside.
+    state_far = _set_monster(state.replace(monster_ai=mai), 0, pos=(10, 18),
+                             tame=True, entry_idx=_KITTEN_ENTRY)
+    state_far = state_far.replace(
+        monster_ai=state_far.monster_ai.replace(
+            mleashed=state_far.monster_ai.mleashed.at[0].set(jnp.bool_(True))
+        )
+    )
     assert not bool(pet_within_leash(state_far, jnp.int32(0)))
-    # Pet at dist 8 with apport=1 → leash=10 → within leash again.
-    state_loose = _set_monster(state, 0, pos=(10, 18), tame=True,
-                               entry_idx=_KITTEN_ENTRY, apport=1)
-    assert bool(pet_within_leash(state_loose, jnp.int32(0)))
