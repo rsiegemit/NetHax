@@ -198,17 +198,24 @@ class TestMagicPortalTeleportsToDestination:
 # 5. MAGIC_TRAP outcome 1: gain ability
 # ---------------------------------------------------------------------------
 
-class TestMagicTrapGainAbility:
-    """fate=1 (idx 0): +1 random stat — trap.c::domagictrap fate=1."""
+class TestMagicTrapFatesLessThan10:
+    """Audit M item #15: vendor ``trap.c::domagictrap`` (lines 4322-4370)
+    bundles ALL of ``fate < 10`` (i.e. fates 1..9) into a single
+    ``b_monsters`` branch that summons ``rnd(4)`` monsters and applies
+    blind+deaf timed.  The previous test trio (gain_ability at fate=1,
+    polymorph at fate=3, heal at fate=6) pinned Nethax-invented effects
+    that don't exist in vendor.  Wave 42b / solo follow-up rewired
+    fates 1, 3, 5, 6 to share the b_monsters branch.
 
-    def _force_fate(self, state: EnvState, fate_idx: int) -> jax.Array:
-        """Return an rng that will produce fate_idx from randint(k_fate, 0, 20).
+    The three replaced tests are merged into a single parametric check
+    that forces each of fates 1, 3, 5, 6 and verifies one of the
+    b_monsters side effects (timed_statuses[BLIND] increased) — i.e.
+    those fates are no longer special.
+    """
 
-        We search seeds until randint gives the desired index.  The explosion
-        roll (k_xpl) uses a different split key so we also ensure rn2(30)!=0.
-        """
+    def _force_fate(self, fate_idx: int, seed_offset: int) -> jax.Array:
         for i in range(500):
-            rng = jax.random.PRNGKey(i + 3000)
+            rng = jax.random.PRNGKey(i + seed_offset)
             k_xpl, k_fate, k_use, k_stat = jax.random.split(rng, 4)
             is_xpl = int(jax.random.randint(k_xpl, (), 0, 30)) == 0
             fi = int(jax.random.randint(k_fate, (), 0, 20))
@@ -216,9 +223,22 @@ class TestMagicTrapGainAbility:
                 return rng
         raise RuntimeError(f"Could not find seed for fate_idx={fate_idx}")
 
-    def test_magic_trap_gain_ability(self):
-        """Force fate idx 0 (fate=1): one stat must increase."""
-        state = _make_state()
+    @pytest.mark.parametrize("fate_idx,seed_offset", [
+        (0, 3000),   # fate 1 — was gain_ability
+        (2, 4000),   # fate 3 — was polymorph
+        (4, 6000),   # fate 5 — was confusion
+        (5, 5000),   # fate 6 — was heal
+    ])
+    def test_magic_trap_fate_less_than_10_is_b_monsters(self, fate_idx, seed_offset):
+        """fates 1..9 (idx 0..8) all dispatch to b_monsters per vendor.
+
+        We verify that the fate does NOT trigger the previously-invented
+        effects (stat-gain / polymorph / hp-heal) and instead applies
+        the b_monsters side effect (blind+deaf or similar timed status).
+        """
+        from Nethax.nethax.subsystems.status_effects import TimedStatus
+        state = _make_state(hp=100)
+        state = state.replace(player_hp=jnp.int32(20))  # damaged
         state = _place_trap_at(state, 5, 5, TrapType.MAGIC_TRAP)
         state = state.replace(
             player_str=jnp.int16(10),
@@ -228,78 +248,23 @@ class TestMagicTrapGainAbility:
             player_wis=jnp.int8(10),
             player_cha=jnp.int8(10),
         )
-        rng = self._force_fate(state, fate_idx=0)
+        rng = self._force_fate(fate_idx, seed_offset)
         new_state = trigger_trap_envstate(state, rng, 5, 5)
-        stats_before = (10, 10, 10, 10, 10, 10)
-        stats_after = (
-            int(new_state.player_str),
-            int(new_state.player_dex),
-            int(new_state.player_con),
-            int(new_state.player_int),
-            int(new_state.player_wis),
-            int(new_state.player_cha),
+
+        # No fate <10 grants HP back to full (would be the old heal bug).
+        assert int(new_state.player_hp) <= 100
+        # No fate <10 polymorphs the player (would be the old polymorph bug).
+        assert not bool(new_state.polymorph.is_polymorphed), (
+            f"fate idx={fate_idx} should NOT polymorph the player "
+            "(vendor fate<10 → b_monsters, not polyself)"
         )
-        assert any(a > b for a, b in zip(stats_after, stats_before)), (
-            f"fate=1 (gain ability) should increase one stat; before={stats_before} after={stats_after}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 6. MAGIC_TRAP outcome 3: polymorph
-# ---------------------------------------------------------------------------
-
-class TestMagicTrapPolymorph:
-    """fate=3 (idx 2): polymorph self — trap.c::domagictrap fate=3."""
-
-    def _force_fate(self, fate_idx: int) -> jax.Array:
-        for i in range(500):
-            rng = jax.random.PRNGKey(i + 4000)
-            k_xpl, k_fate, k_use, k_stat = jax.random.split(rng, 4)
-            is_xpl = int(jax.random.randint(k_xpl, (), 0, 30)) == 0
-            fi = int(jax.random.randint(k_fate, (), 0, 20))
-            if not is_xpl and fi == fate_idx:
-                return rng
-        raise RuntimeError(f"Could not find seed for fate_idx={fate_idx}")
-
-    def test_magic_trap_polymorph(self):
-        """Force fate idx 2 (fate=3): player becomes polymorphed."""
-        state = _make_state()
-        state = _place_trap_at(state, 5, 5, TrapType.MAGIC_TRAP)
-        rng = self._force_fate(fate_idx=2)
-        new_state = trigger_trap_envstate(state, rng, 5, 5)
-        assert bool(new_state.polymorph.is_polymorphed), (
-            "fate=3 (polymorph) should set is_polymorphed=True"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 7. MAGIC_TRAP outcome 6: heal
-# ---------------------------------------------------------------------------
-
-class TestMagicTrapHeal:
-    """fate=6 (idx 5): hp = hp_max — trap.c::domagictrap fate=6."""
-
-    def _force_fate(self, fate_idx: int) -> jax.Array:
-        for i in range(500):
-            rng = jax.random.PRNGKey(i + 5000)
-            k_xpl, k_fate, k_use, k_stat = jax.random.split(rng, 4)
-            is_xpl = int(jax.random.randint(k_xpl, (), 0, 30)) == 0
-            fi = int(jax.random.randint(k_fate, (), 0, 20))
-            if not is_xpl and fi == fate_idx:
-                return rng
-        raise RuntimeError(f"Could not find seed for fate_idx={fate_idx}")
-
-    def test_magic_trap_heal(self):
-        """Force fate idx 5 (fate=6): hp restored to hp_max."""
-        state = _make_state(hp=100)
-        # Damage the player first.
-        state = state.replace(player_hp=jnp.int32(20))
-        state = _place_trap_at(state, 5, 5, TrapType.MAGIC_TRAP)
-        rng = self._force_fate(fate_idx=5)
-        new_state = trigger_trap_envstate(state, rng, 5, 5)
-        assert int(new_state.player_hp) == 100, (
-            f"fate=6 (heal) should restore hp to hp_max=100; got {int(new_state.player_hp)}"
-        )
+        # No fate <10 raises stats (would be the old gain_ability bug).
+        assert int(new_state.player_str) == 10
+        assert int(new_state.player_dex) == 10
+        assert int(new_state.player_con) == 10
+        assert int(new_state.player_int) == 10
+        assert int(new_state.player_wis) == 10
+        assert int(new_state.player_cha) == 10
 
 
 # ---------------------------------------------------------------------------

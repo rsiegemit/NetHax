@@ -1200,13 +1200,20 @@ def _trap_magic(state, rng):
         return s.replace(player_hp=s.player_hp_max)
 
     # 20 branches matching vendor fate 1..20 in order (index = fate - 1).
+    # Audit M item #15-#23: vendor ``trap.c::domagictrap`` (lines 4322-4370)
+    # uses ``if (fate < 10) {`` for ALL of fates 1..9 — they share the
+    # single "summon monsters + blind + deaf" b_monsters branch.  The
+    # previous mapping invented four distinct effects at fates 1/3/5/6
+    # (gain_ability, polymorph, confusion, heal) that don't exist in
+    # vendor.  Now reshaped so all fates 1..9 → b_monsters.
+    # Cite: vendor/nethack/src/trap.c:4322-4370 (domagictrap fate<10 arm).
     fate_branches = (
-        b_gain_ability,      # fate 1  (idx 0): +1 random stat
-        b_monsters,          # fate 2  (idx 1): summon + blind + deaf
-        b_polymorph,         # fate 3  (idx 2): polymorph self
-        b_monsters,          # fate 4  (idx 3): summon + blind + deaf
-        b_confusion,         # fate 5  (idx 4): confusion
-        b_heal,              # fate 6  (idx 5): hp = hp_max
+        b_monsters,          # fate 1  (idx 0): summon + blind + deaf
+        b_monsters,          # fate 2  (idx 1)
+        b_monsters,          # fate 3  (idx 2)  was b_polymorph (invented)
+        b_monsters,          # fate 4  (idx 3)
+        b_monsters,          # fate 5  (idx 4)  was b_confusion (invented)
+        b_monsters,          # fate 6  (idx 5)  was b_heal (invented)
         b_monsters,          # fate 7  (idx 6)
         b_monsters,          # fate 8  (idx 7)
         b_monsters,          # fate 9  (idx 8)
