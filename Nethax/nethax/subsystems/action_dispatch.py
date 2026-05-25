@@ -1926,14 +1926,14 @@ def _handle_chat(state, rng):
     """#chat — vendor/nethack/src/pray.c::dochat line 88.
 
     Talk to an adjacent monster.  Wave-46 minimum: if there is an
-    adjacent **priest** monster (symbol S_HUMAN with sound MS_PRIEST,
-    approximated here as any priest-class via the entry table), and
-    the player has player_align matching the priest's, restore HP by
-    +5 (priests bless / heal aligned worshipers in vendor pray.c via
+    adjacent priest monster (sound == MS_PRIEST per the MONSTERS table,
+    which is the vendor predicate from monst.h), restore the player's
+    HP by +5 (priests bless / heal worshipers in vendor pray.c via
     sit_pray etc.).  Otherwise no-op.
 
     Cite: vendor/nethack/src/pray.c::dochat line 88;
-          vendor/nethack/src/priest.c::priest_talk lines 372-510.
+          vendor/nethack/src/priest.c::priest_talk lines 372-510;
+          vendor/nethack/include/monst.h MS_PRIEST sound enum.
     """
     from Nethax.nethax.constants.monsters import MONSTERS as _MM, MS_PRIEST
     mai = state.monster_ai

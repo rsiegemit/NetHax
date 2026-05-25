@@ -21,10 +21,8 @@ the deterministic dryup.
 Design: all three functions are JIT-pure (no Python control flow on traced
 values).  They operate on the full EnvState and return a new EnvState.
 
-FeaturesState.fountain_uses int8[num_levels, MAP_H, MAP_W] counts how many
-times a fountain tile has been interacted with; when it reaches _DRY_THRESHOLD
-the tile converts to FLOOR (vendor dryup: ~1-in-3 chance per use, here modelled
-as a fixed threshold of 3 for parity simplicity).
+Dryup: byte-equal with vendor — ``_maybe_dry`` rolls ``rn2(3) == 0`` per
+use (fountain.c:229 ``if (!rn2(3)) ... set_levltyp(x, y, ROOM);``).
 
 Cite: vendor/nethack/src/fountain.c (all line references below).
 """
@@ -51,9 +49,10 @@ _LONG_SWORD_TYPE_ID: int = 37
 # of 1000 (int16 range 0..32767) which the test can check for.
 _EXCALIBUR_TYPE_ID: int = 1000  # sentinel distinct from all OBJECTS indices
 
-# After this many uses a fountain dries up (vendor dryup: rnd ~1-in-3 per use;
-# simplified to a fixed threshold for JIT-purity).
-# fountain.c:200-238 dryup() called after every drinkfountain/dipfountain.
+# Documentation-only: vendor dryup roll is `!rn2(3)` (1-in-3 per use)
+# so on average a fountain dries after ~3 calls.  Kept for test message
+# formatting in tests/test_fountain_parity.py — not consulted by the
+# byte-equal _maybe_dry implementation, which rolls the 1/3 directly.
 _DRY_THRESHOLD: int = 3
 
 # Alignment constants (prayer.py Alignment enum).
