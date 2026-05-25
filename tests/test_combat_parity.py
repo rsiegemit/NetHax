@@ -400,11 +400,22 @@ def test_to_hit_roll_uses_strict_greater_than():
     )
     # Bare-handed (skill tier 0 / UNSKILLED → -4 hit bonus, but martial-arts
     # path isn't invoked here because the weapon_skill table is zeroed).
-    # Set the weapon-skill slot 0 to BASIC so skill_bonus = 0.
+    # Set the weapon-skill slot 0 to BASIC so skill_bonus = 0 in BOTH the
+    # CombatState.weapon_skill table AND the SkillState.level table — the
+    # _skill_hit_bonus helper prefers SkillState when present.
+    # For an unwielded slot the skill_id resolved by combat._wielded_skill_id
+    # is MARTIAL_ARTS (SkillId.MARTIAL_ARTS == 34, vendor P_BARE_HANDED_COMBAT).
+    # We populate SkillState.level[34] to BASIC so _skill_hit_bonus returns 0
+    # (it reads SkillState first; CombatState.weapon_skill is a back-compat
+    # fallback).
+    _BARE_HAND_SKILL_ID = 34  # SkillId.MARTIAL_ARTS
     state = state.replace(
         combat=state.combat.replace(
             weapon_skill=state.combat.weapon_skill.at[0].set(jnp.int8(SKILL_BASIC)),
-        )
+        ),
+        skills=state.skills.replace(
+            level=state.skills.level.at[_BARE_HAND_SKILL_ID].set(jnp.int8(SKILL_BASIC)),
+        ),
     )
 
     # With XL=5, STR=8 (abon=0), target_ac=4, BASIC(0), enchant=0, luck=0:
@@ -431,17 +442,20 @@ def test_monster_to_hit_tmp_matches_vendor():
         tmp = AC_VALUE(u.uac) + 10 + mtmp->m_lev
         if (tmp <= 0) tmp = 1
 
-    For non-negative ``u.uac`` ``AC_VALUE`` is the identity, so the formula
-    becomes a deterministic ``uac + 10 + m_lev`` clamped at 1.
+    Vendor AC_VALUE (hack.h:1538) — ``AC>=0 ? AC : rnd(-AC)``.  The
+    trailing clamp is unreachable in normal play (AC_VALUE>=0,
+    m_lev>=0, +10 dominates) but kept for safety.
     """
     # Stripped hero (AC=10) vs a level-1 monster: tmp = 10 + 10 + 1 = 21.
     assert monster_to_hit_tmp(10, 1) == 21
     # Heavy armour (AC=0) vs level-5 monster: tmp = 0 + 10 + 5 = 15.
     assert monster_to_hit_tmp(0, 5) == 15
-    # Boundary clamp: extremely negative tmp clamps to 1.
-    # (uac is the deterministic positive-AC case so we hit the clamp via
-    #  unusual inputs; vendor still rounds up to 1.)
-    assert monster_to_hit_tmp(-15, 0) == 1
+    # Negative AC: AC_VALUE(-15) = rnd(15) ∈ [1, 15]; m_lev=0;
+    # tmp = rnd(15) + 10 ∈ [11, 25].
+    val = monster_to_hit_tmp(-15, 0)
+    assert 11 <= val <= 25, (
+        f"AC_VALUE(-15) + 10 + 0 must be in [11, 25]; got {val}"
+    )
     # Level-30 monster vs un-armoured (AC=10): tmp = 50 (still in range).
     assert monster_to_hit_tmp(10, 30) == 50
 
