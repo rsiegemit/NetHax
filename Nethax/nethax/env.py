@@ -225,6 +225,61 @@ def _spawn_starting_pet(state, role: Role):
     return state.replace(monster_ai=mai)
 
 
+def _tick_stinking_cloud(state):
+    """Per-turn stinking-cloud effect on the hero.
+
+    Cite: vendor/nethack/src/region.c::inside_gas_cloud (called from
+    run_regions when the player tile is inside the gas-cloud rectangle).
+    On each turn while ``cloud_turns > 0``:
+      * if hero is within Chebyshev radius of cloud_pos, apply 1 HP and
+        bump VOMITING timer by rnd(1, 3) (vendor inside_gas_cloud's
+        ``losehp(1, ...)`` + ``set_property(VOMITING, ...)``)
+      * decrement cloud_turns
+
+    Scroll of stinking cloud (items_scrolls SCR_STINKING_CLOUD) writes
+    the scalar fields directly; this is the matching tick that vendor's
+    region machinery would otherwise drive.
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS
+
+    turns = state.cloud_turns.astype(jnp.int32)
+    active = turns > jnp.int32(0)
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    cr = state.cloud_pos[0].astype(jnp.int32)
+    cc = state.cloud_pos[1].astype(jnp.int32)
+    dr = jnp.abs(pr - cr)
+    dc = jnp.abs(pc - cc)
+    cheby = jnp.maximum(dr, dc)
+    inside = active & (cheby <= state.cloud_radius.astype(jnp.int32))
+
+    new_hp = jnp.where(
+        inside,
+        jnp.maximum(state.player_hp - jnp.int32(1), jnp.int32(0)),
+        state.player_hp,
+    ).astype(state.player_hp.dtype)
+    new_done = state.done | (new_hp <= jnp.int32(0))
+
+    ts = state.status.timed_statuses
+    cur_vom = ts[int(_TS.VOMITING)].astype(jnp.int32)
+    new_vom = jnp.where(inside, cur_vom + jnp.int32(2), cur_vom)
+    new_ts = ts.at[int(_TS.VOMITING)].set(new_vom.astype(ts.dtype))
+    new_status = state.status.replace(timed_statuses=new_ts)
+
+    new_turns = jnp.where(
+        active,
+        (turns - jnp.int32(1)).astype(state.cloud_turns.dtype),
+        state.cloud_turns,
+    )
+
+    return state.replace(
+        player_hp=new_hp,
+        done=new_done,
+        status=new_status,
+        cloud_turns=new_turns,
+    )
+
+
 def _step_impl(state, action, rng):
     """JIT-compatible inner body of NethaxEnv.step.
 
@@ -263,6 +318,14 @@ def _step_impl(state, action, rng):
         #     (line 414).  Ages every active region by 1 and applies
         #     gas-cloud damage to the player when they stand inside one.
         ns = _run_regions(ns, rng_regions)
+
+        # 2c. Stinking-cloud tick — vendor/nethack/src/region.c::inside_gas_cloud
+        #     (called from run_regions when player tile is inside).  Scroll of
+        #     stinking cloud writes scalar cloud_pos/radius/turns directly to
+        #     EnvState (items_scrolls SCR_STINKING_CLOUD); decrement turns and
+        #     when the player is within Chebyshev radius, apply 1 HP damage +
+        #     extend VOMITING timer per vendor inside_gas_cloud (region.c:1100+).
+        ns = _tick_stinking_cloud(ns)
 
         # 3. Increment turn counter — allmain.c line 244 (svm.moves++).
         ns = ns.replace(timestep=ns.timestep + jnp.int32(1))
