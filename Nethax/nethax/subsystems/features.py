@@ -706,9 +706,15 @@ def handle_search(state, rng: jax.Array):
     """SEARCH action — vendor/nethack/src/detect.c::dosearch0 (lines 2016-2093).
 
     Scans the 3x3 region around the player.  For each adjacent SECRET door,
-    rolls rnl(7) (we use rn2(7) since Luck is not yet wired through); on a
-    roll of 0 the secret door is revealed (SECRET → CLOSED), mirroring
+    rolls rnl(7) (vendor luck-biased rnd, rnd.c:111-151); on a roll of 0
+    the secret door is revealed (SECRET → CLOSED), mirroring
     cvt_sdoor_to_door().
+
+    rnl(7) for x <= 15 (vendor rnd.c:124-148):
+        adjustment = (|Luck|+1)/3 * sgn(Luck)         (in [-4, +4])
+        i = rn2(7)
+        if adjustment != 0 AND rn2(37 + |adjustment|) != 0:
+            i = clip(i - adjustment, 0, 6)
 
     JIT-safe: no Python control flow on traced values; uses a static 3x3 sweep.
     """
@@ -718,8 +724,13 @@ def handle_search(state, rng: jax.Array):
     H = state.features.door_state.shape[1]
     W = state.features.door_state.shape[2]
 
+    luck = state.player_luck.astype(jnp.int32)
+    abs_luck = jnp.abs(luck)
+    sgn_luck = jnp.sign(luck)
+    adjustment = ((abs_luck + jnp.int32(1)) // jnp.int32(3)) * sgn_luck
+
     door_state = state.features.door_state
-    rngs = jax.random.split(rng, 9)
+    rngs = jax.random.split(rng, 9 * 2)  # 1 roll + 1 luck-gate per cell
     idx = 0
     for dr in (-1, 0, 1):
         for dc in (-1, 0, 1):
@@ -731,7 +742,15 @@ def handle_search(state, rng: jax.Array):
             is_self = (jnp.int32(dr) == 0) & (jnp.int32(dc) == 0)
             cur = door_state[flat_lv, rr_s, cc_s].astype(jnp.int32)
             is_secret = cur == jnp.int32(DoorState.SECRET)
-            roll = jax.random.randint(rngs[idx], (), 0, 7, dtype=jnp.int32)
+            i = jax.random.randint(rngs[idx * 2], (), 0, 7, dtype=jnp.int32)
+            # Luck gate: rn2(37 + |adjustment|) != 0 → apply adjustment.
+            luck_mod_bound = jnp.int32(37) + jnp.abs(adjustment)
+            luck_roll = jax.random.randint(
+                rngs[idx * 2 + 1], (), 0, luck_mod_bound, dtype=jnp.int32,
+            )
+            apply = (adjustment != jnp.int32(0)) & (luck_roll != jnp.int32(0))
+            i_adj = jnp.clip(i - adjustment, jnp.int32(0), jnp.int32(6))
+            roll = jnp.where(apply, i_adj, i)
             discover = in_bounds & ~is_self & is_secret & (roll == jnp.int32(0))
             new_val = jnp.where(
                 discover,
