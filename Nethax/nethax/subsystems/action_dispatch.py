@@ -1392,6 +1392,36 @@ def _handle_eat(state, rng):
     )
     new_state = new_state.replace(messages=new_messages)
 
+    # SATIATED-choke gate — vendor/nethack/src/eat.c:1980-1995 line
+    # ``if (u.uhs == SATIATED && !Slow_digestion && !rn2(3)) {
+    #       done(CHOKING); }``.
+    # uhs == SATIATED is HungerState.SATIATED == 0 in Nethax.
+    # SLOW_DIGESTION intrinsic suppresses choking.
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intr2
+    from Nethax.nethax.subsystems.scoring import DeathCause as _DC
+    rng_choke, _ = jax.random.split(rng)
+    is_satiated = state.status.hunger_state.astype(jnp.int32) == jnp.int32(0)
+    has_slow_dig = (
+        state.status.intrinsics[int(_Intr2.SLOW_DIGESTION)]
+        | (state.status.timed_intrinsics[int(_Intr2.SLOW_DIGESTION)] > jnp.int32(0))
+    )
+    choke_roll = jax.random.randint(rng_choke, (), 0, 3, dtype=jnp.int32)
+    chokes = found & is_satiated & ~has_slow_dig & (choke_roll == jnp.int32(0))
+    new_hp = jnp.where(chokes, jnp.int32(0), new_state.player_hp).astype(
+        new_state.player_hp.dtype
+    )
+    new_done = new_state.done | chokes
+    new_death_cause = jnp.where(
+        chokes,
+        jnp.int8(int(_DC.CHOKING)),
+        new_state.scoring.death_cause,
+    )
+    new_state = new_state.replace(
+        player_hp=new_hp,
+        done=new_done,
+        scoring=new_state.scoring.replace(death_cause=new_death_cause),
+    )
+
     return new_state
 
 

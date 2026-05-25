@@ -1,0 +1,451 @@
+============================= test session starts ==============================
+created: 4/4 workers
+4 workers [593 items]
+
+scheduling tests via WorkStealingScheduling
+
+tests/test_artifact_specials_parity.py::test_vorpal_blade_beheads_lich 
+tests/test_combat_polish2_parity.py::test_two_handed_str_scaling 
+tests/test_movement_with_doors_traps.py::test_trap_triggers_on_step 
+tests/test_death_messages.py::test_quit_message_mentions_level 
+[gw3] [  0%] PASSED tests/test_death_messages.py::test_quit_message_mentions_level 
+tests/test_identification_parity.py::TestPerClassShuffle::test_scroll_appearances_shuffled_deterministic_per_seed 
+[gw3] [  0%] PASSED tests/test_identification_parity.py::TestPerClassShuffle::test_scroll_appearances_shuffled_deterministic_per_seed 
+tests/test_identification_parity.py::TestPerClassShuffle::test_potion_colors_shuffled 
+[gw3] [  0%] PASSED tests/test_identification_parity.py::TestPerClassShuffle::test_potion_colors_shuffled 
+tests/test_identification_parity.py::TestPerClassShuffle::test_wand_materials_shuffled 
+[gw3] [  0%] PASSED tests/test_identification_parity.py::TestPerClassShuffle::test_wand_materials_shuffled 
+tests/test_identification_parity.py::TestPerClassShuffle::test_ring_stones_shuffled 
+[gw3] [  0%] PASSED tests/test_identification_parity.py::TestPerClassShuffle::test_ring_stones_shuffled 
+tests/test_identification_parity.py::TestPerClassShuffle::test_amulet_shapes_shuffled 
+[gw3] [  1%] PASSED tests/test_identification_parity.py::TestPerClassShuffle::test_amulet_shapes_shuffled 
+tests/test_identification_parity.py::TestPerClassShuffle::test_spellbook_covers_shuffled 
+[gw3] [  1%] PASSED tests/test_identification_parity.py::TestPerClassShuffle::test_spellbook_covers_shuffled 
+tests/test_identification_parity.py::TestSeedDeterminism::test_identical_seed_produces_identical_mapping 
+[gw3] [  1%] PASSED tests/test_identification_parity.py::TestSeedDeterminism::test_identical_seed_produces_identical_mapping 
+tests/test_identification_parity.py::TestSeedDeterminism::test_different_seeds_produce_different_mapping 
+[gw3] [  1%] PASSED tests/test_identification_parity.py::TestSeedDeterminism::test_different_seeds_produce_different_mapping 
+tests/test_identification_parity.py::TestIdentifyCorrectness::test_identify_marks_correct_object_per_appearance 
+[gw3] [  1%] PASSED tests/test_identification_parity.py::TestIdentifyCorrectness::test_identify_marks_correct_object_per_appearance 
+tests/test_identification_parity.py::TestIdentifyCorrectness::test_unidentified_appearance_uses_perm 
+[gw0] [  1%] PASSED tests/test_artifact_specials_parity.py::test_vorpal_blade_beheads_lich 
+tests/test_artifact_specials_parity.py::test_vorpal_blade_one_in_23_vs_non_lich 
+[gw3] [  2%] PASSED tests/test_identification_parity.py::TestIdentifyCorrectness::test_unidentified_appearance_uses_perm 
+tests/test_identification_parity.py::TestIdentifyCorrectness::test_unidentified_appearance_invalid_class_raises 
+[gw3] [  2%] PASSED tests/test_identification_parity.py::TestIdentifyCorrectness::test_unidentified_appearance_invalid_class_raises 
+tests/test_minihax_level_generator.py::test_empty_level_creates_valid_envstate 
+[gw3] [  2%] PASSED tests/test_minihax_level_generator.py::test_empty_level_creates_valid_envstate 
+tests/test_minihax_level_generator.py::test_add_room_writes_floor_tiles 
+[gw3] [  2%] PASSED tests/test_minihax_level_generator.py::test_add_room_writes_floor_tiles 
+tests/test_minihax_level_generator.py::test_add_monster_named 
+[gw3] [  2%] PASSED tests/test_minihax_level_generator.py::test_add_monster_named 
+tests/test_minihax_level_generator.py::test_add_object_named 
+[gw3] [  2%] PASSED tests/test_minihax_level_generator.py::test_add_object_named 
+tests/test_minihax_level_generator.py::test_add_trap_named 
+[gw3] [  3%] PASSED tests/test_minihax_level_generator.py::test_add_trap_named 
+tests/test_minihax_level_generator.py::test_fill_terrain_lava 
+[gw3] [  3%] PASSED tests/test_minihax_level_generator.py::test_fill_terrain_lava 
+tests/test_minihax_level_generator.py::test_start_pos_sets_player_pos 
+[gw3] [  3%] PASSED tests/test_minihax_level_generator.py::test_start_pos_sets_player_pos 
+tests/test_minihax_level_generator.py::test_reproducible_with_seed 
+[gw3] [  3%] PASSED tests/test_minihax_level_generator.py::test_reproducible_with_seed 
+tests/test_minihax_level_generator.py::test_goal_pos_marks_staircase_down 
+[gw3] [  3%] PASSED tests/test_minihax_level_generator.py::test_goal_pos_marks_staircase_down 
+tests/test_minihax_level_generator.py::test_unknown_monster_name_raises 
+[gw3] [  3%] PASSED tests/test_minihax_level_generator.py::test_unknown_monster_name_raises 
+tests/test_minihax_level_generator.py::test_corridor_carves_between_endpoints 
+[gw3] [  4%] PASSED tests/test_minihax_level_generator.py::test_corridor_carves_between_endpoints 
+tests/test_minihax_level_generator.py::test_trap_name_table_complete 
+[gw3] [  4%] PASSED tests/test_minihax_level_generator.py::test_trap_name_table_complete 
+tests/test_minihax_reward_manager.py::test_empty_manager_returns_zero 
+[gw3] [  4%] PASSED tests/test_minihax_reward_manager.py::test_empty_manager_returns_zero 
+tests/test_minihax_reward_manager.py::test_positional_event_fires_on_match 
+[gw3] [  4%] PASSED tests/test_minihax_reward_manager.py::test_positional_event_fires_on_match 
+tests/test_minihax_reward_manager.py::test_positional_event_not_repeatable_only_once 
+[gw3] [  4%] PASSED tests/test_minihax_reward_manager.py::test_positional_event_not_repeatable_only_once 
+tests/test_minihax_reward_manager.py::test_positional_event_repeatable_fires_every_visit 
+[gw3] [  4%] PASSED tests/test_minihax_reward_manager.py::test_positional_event_repeatable_fires_every_visit 
+tests/test_minihax_reward_manager.py::test_terminal_sufficient_event_sets_done 
+[gw3] [  5%] PASSED tests/test_minihax_reward_manager.py::test_terminal_sufficient_event_sets_done 
+tests/test_minihax_reward_manager.py::test_terminal_required_and_terminal_sufficient_combination 
+[gw3] [  5%] PASSED tests/test_minihax_reward_manager.py::test_terminal_required_and_terminal_sufficient_combination 
+tests/test_minihax_reward_manager.py::test_coordinate_event_fires_on_match 
+[gw3] [  5%] PASSED tests/test_minihax_reward_manager.py::test_coordinate_event_fires_on_match 
+tests/test_minihax_reward_manager.py::test_location_event_fires_on_stairs_down 
+[gw3] [  5%] PASSED tests/test_minihax_reward_manager.py::test_location_event_fires_on_stairs_down 
+tests/test_minihax_reward_manager.py::test_custom_reward_fn 
+[gw3] [  5%] PASSED tests/test_minihax_reward_manager.py::test_custom_reward_fn 
+tests/test_minihax_reward_manager.py::test_chained_events_sum 
+[gw3] [  5%] PASSED tests/test_minihax_reward_manager.py::test_chained_events_sum 
+tests/test_minihax_reward_manager.py::test_jit_compute_reward 
+[gw3] [  6%] PASSED tests/test_minihax_reward_manager.py::test_jit_compute_reward 
+tests/test_minihax_reward_manager.py::test_kill_event_registers_but_does_not_fire 
+[gw3] [  6%] FAILED tests/test_minihax_reward_manager.py::test_kill_event_registers_but_does_not_fire 
+tests/test_minihax_reward_manager.py::test_eat_event_registers_but_does_not_fire 
+[gw3] [  6%] FAILED tests/test_minihax_reward_manager.py::test_eat_event_registers_but_does_not_fire 
+tests/test_monster_actions_parity.py::test_nymph_steals_item_and_teleports 
+[gw1] [  6%] PASSED tests/test_combat_polish2_parity.py::test_two_handed_str_scaling 
+tests/test_combat_polish2_parity.py::test_sleeping_target_uses_sleep_timer 
+[gw3] [  6%] PASSED tests/test_monster_actions_parity.py::test_nymph_steals_item_and_teleports 
+tests/test_monster_actions_parity.py::test_leprechaun_steals_gold 
+[gw1] [  6%] PASSED tests/test_combat_polish2_parity.py::test_sleeping_target_uses_sleep_timer 
+tests/test_combat_polish2_parity.py::test_paralyzed_target_immobile_bonus 
+[gw3] [  7%] PASSED tests/test_monster_actions_parity.py::test_leprechaun_steals_gold 
+tests/test_monster_actions_parity.py::test_succubus_drains_pw 
+[gw3] [  7%] FAILED tests/test_monster_actions_parity.py::test_succubus_drains_pw 
+tests/test_monster_actions_parity.py::test_dragon_red_breathes_fire 
+[gw3] [  7%] PASSED tests/test_monster_actions_parity.py::test_dragon_red_breathes_fire 
+tests/test_monster_actions_parity.py::test_dragon_red_fire_resistance_blocks_damage 
+[gw3] [  7%] PASSED tests/test_monster_actions_parity.py::test_dragon_red_fire_resistance_blocks_damage 
+tests/test_monster_actions_parity.py::test_dragon_blue_lightning 
+[gw1] [  7%] PASSED tests/test_combat_polish2_parity.py::test_paralyzed_target_immobile_bonus 
+tests/test_combat_polish2_parity.py::test_status_timers_tick_down 
+[gw3] [  7%] PASSED tests/test_monster_actions_parity.py::test_dragon_blue_lightning 
+tests/test_monster_actions_parity.py::test_kraken_grabs_into_water 
+[gw3] [  8%] PASSED tests/test_monster_actions_parity.py::test_kraken_grabs_into_water 
+tests/test_monster_actions_parity.py::test_stalker_is_perminvis 
+[gw3] [  8%] PASSED tests/test_monster_actions_parity.py::test_stalker_is_perminvis 
+tests/test_monster_actions_parity.py::test_non_stalker_not_perminvis 
+[gw3] [  8%] PASSED tests/test_monster_actions_parity.py::test_non_stalker_not_perminvis 
+tests/test_monster_actions_parity.py::test_monster_is_perminvis_helper 
+[gw3] [  8%] PASSED tests/test_monster_actions_parity.py::test_monster_is_perminvis_helper 
+tests/test_monster_ai.py::test_sleeping_monster_does_not_move 
+[gw1] [  8%] PASSED tests/test_combat_polish2_parity.py::test_status_timers_tick_down 
+tests/test_combat_polish3_parity.py::test_player_in_trap_subtracts_3 
+[gw0] [  8%] PASSED tests/test_artifact_specials_parity.py::test_vorpal_blade_one_in_23_vs_non_lich 
+tests/test_artifact_specials_parity.py::test_magicbane_status_effect 
+[gw3] [  9%] PASSED tests/test_monster_ai.py::test_sleeping_monster_does_not_move 
+tests/test_monster_ai.py::test_sleeping_monster_does_not_attack 
+[gw0] [  9%] PASSED tests/test_artifact_specials_parity.py::test_magicbane_status_effect 
+tests/test_artifact_specials_parity.py::test_invoke_eye_of_aethiopica_runs 
+[gw3] [  9%] PASSED tests/test_monster_ai.py::test_sleeping_monster_does_not_attack 
+tests/test_monster_ai.py::test_peaceful_monster_does_not_move 
+[gw0] [  9%] PASSED tests/test_artifact_specials_parity.py::test_invoke_eye_of_aethiopica_runs 
+tests/test_artifact_specials_parity.py::test_invoke_cooldown 
+[gw3] [  9%] PASSED tests/test_monster_ai.py::test_peaceful_monster_does_not_move 
+tests/test_monster_ai.py::test_dead_monster_is_skipped 
+[gw0] [  9%] PASSED tests/test_artifact_specials_parity.py::test_invoke_cooldown 
+tests/test_artifact_specials_parity.py::test_excalibur_wielded_by_non_lawful_damages 
+[gw0] [ 10%] PASSED tests/test_artifact_specials_parity.py::test_excalibur_wielded_by_non_lawful_damages 
+tests/test_artifact_specials_parity.py::test_excalibur_wielded_by_lawful_no_damage 
+[gw0] [ 10%] PASSED tests/test_artifact_specials_parity.py::test_excalibur_wielded_by_lawful_no_damage 
+tests/test_ascension_nutrition_polish_parity.py::test_ascension_score_formula 
+[gw3] [ 10%] PASSED tests/test_monster_ai.py::test_dead_monster_is_skipped 
+tests/test_monster_ai.py::test_adjacent_monster_can_affect_player_hp 
+[gw0] [ 10%] PASSED tests/test_ascension_nutrition_polish_parity.py::test_ascension_score_formula 
+tests/test_ascension_nutrition_polish_parity.py::test_ascension_score_no_deep_bonus_below_20 
+[gw0] [ 10%] PASSED tests/test_ascension_nutrition_polish_parity.py::test_ascension_score_no_deep_bonus_below_20 
+tests/test_ascension_nutrition_polish_parity.py::test_food_nutrition_table_apple 
+[gw0] [ 10%] PASSED tests/test_ascension_nutrition_polish_parity.py::test_food_nutrition_table_apple 
+tests/test_ascension_nutrition_polish_parity.py::test_food_nutrition_table_lembas 
+[gw0] [ 11%] PASSED tests/test_ascension_nutrition_polish_parity.py::test_food_nutrition_table_lembas 
+tests/test_ascension_nutrition_polish_parity.py::test_food_nutrition_table_food_ration 
+[gw0] [ 11%] PASSED tests/test_ascension_nutrition_polish_parity.py::test_food_nutrition_table_food_ration 
+tests/test_ascension_nutrition_polish_parity.py::test_food_nutrition_lookup_apple 
+[gw3] [ 11%] PASSED tests/test_monster_ai.py::test_adjacent_monster_can_affect_player_hp 
+tests/test_monster_ai.py::test_adjacent_monster_strategy_becomes_hunt 
+[gw0] [ 11%] PASSED tests/test_ascension_nutrition_polish_parity.py::test_food_nutrition_lookup_apple 
+tests/test_ascension_nutrition_polish_parity.py::test_food_nutrition_lookup_lembas 
+[gw0] [ 11%] PASSED tests/test_ascension_nutrition_polish_parity.py::test_food_nutrition_lookup_lembas 
+tests/test_ascension_nutrition_polish_parity.py::test_corpse_nutrition_table_giant_ant 
+[gw0] [ 11%] PASSED tests/test_ascension_nutrition_polish_parity.py::test_corpse_nutrition_table_giant_ant 
+tests/test_ascension_nutrition_polish_parity.py::test_corpse_nutrition_per_monster 
+[gw0] [ 12%] PASSED tests/test_ascension_nutrition_polish_parity.py::test_corpse_nutrition_per_monster 
+tests/test_benchmark_smoke.py::test_benchmark_smoke 
+[gw0] [ 12%] SKIPPED tests/test_benchmark_smoke.py::test_benchmark_smoke 
+tests/test_blindness_fov_parity.py::test_normal_sight_radius 
+[gw3] [ 12%] PASSED tests/test_monster_ai.py::test_adjacent_monster_strategy_becomes_hunt 
+tests/test_monster_ai.py::test_monster_moves_toward_player 
+[gw0] [ 12%] PASSED tests/test_blindness_fov_parity.py::test_normal_sight_radius 
+tests/test_blindness_fov_parity.py::test_blind_sight_radius_1 
+[gw3] [ 12%] PASSED tests/test_monster_ai.py::test_monster_moves_toward_player 
+tests/test_monster_ai.py::test_monster_moves_one_step 
+[gw0] [ 12%] PASSED tests/test_blindness_fov_parity.py::test_blind_sight_radius_1 
+tests/test_blstats_layout.py::test_n_blstats_27 
+[gw0] [ 13%] PASSED tests/test_blstats_layout.py::test_n_blstats_27 
+tests/test_blstats_layout.py::test_bl_indices_unique_0_to_26 
+[gw0] [ 13%] PASSED tests/test_blstats_layout.py::test_bl_indices_unique_0_to_26 
+tests/test_blstats_layout.py::test_bl_hp_position 
+[gw0] [ 13%] PASSED tests/test_blstats_layout.py::test_bl_hp_position 
+tests/test_blstats_layout.py::test_bl_align_position 
+[gw0] [ 13%] PASSED tests/test_blstats_layout.py::test_bl_align_position 
+tests/test_boulders_sokoban_parity.py::test_push_boulder_into_open_succeeds 
+[gw0] [ 13%] PASSED tests/test_boulders_sokoban_parity.py::test_push_boulder_into_open_succeeds 
+tests/test_boulders_sokoban_parity.py::test_push_boulder_into_wall_blocks 
+[gw0] [ 13%] PASSED tests/test_boulders_sokoban_parity.py::test_push_boulder_into_wall_blocks 
+tests/test_boulders_sokoban_parity.py::test_push_into_pit_fills_it_sokoban 
+[gw3] [ 14%] PASSED tests/test_monster_ai.py::test_monster_moves_one_step 
+tests/test_monster_ai.py::test_monster_strategy_is_hunt_after_move 
+[gw0] [ 14%] PASSED tests/test_boulders_sokoban_parity.py::test_push_into_pit_fills_it_sokoban 
+tests/test_boulders_sokoban_parity.py::test_piercer_drops_in_corridor 
+[gw0] [ 14%] FAILED tests/test_boulders_sokoban_parity.py::test_piercer_drops_in_corridor 
+tests/test_boulders_sokoban_parity.py::test_shrieker_summons_monsters 
+[gw0] [ 14%] PASSED tests/test_boulders_sokoban_parity.py::test_shrieker_summons_monsters 
+tests/test_branches_parity.py::test_mine_town_has_temple 
+[gw0] [ 14%] PASSED tests/test_branches_parity.py::test_mine_town_has_temple 
+tests/test_branches_parity.py::test_mine_town_has_shop 
+[gw3] [ 15%] PASSED tests/test_monster_ai.py::test_monster_strategy_is_hunt_after_move 
+tests/test_monster_ai.py::test_wake_monsters_wakes_within_radius 
+[gw1] [ 15%] PASSED tests/test_combat_polish3_parity.py::test_player_in_trap_subtracts_3 
+tests/test_combat_polish3_parity.py::test_disarmed_monster_uses_bare_hands 
+[gw0] [ 15%] PASSED tests/test_branches_parity.py::test_mine_town_has_shop 
+tests/test_branches_parity.py::test_mine_town_has_throne 
+[gw0] [ 15%] PASSED tests/test_branches_parity.py::test_mine_town_has_throne 
+tests/test_branches_parity.py::test_sokoban_prize_at_top 
+[gw3] [ 15%] PASSED tests/test_monster_ai.py::test_wake_monsters_wakes_within_radius 
+tests/test_monster_ai.py::test_wake_monsters_leaves_far_ones_asleep 
+[gw3] [ 15%] PASSED tests/test_monster_ai.py::test_wake_monsters_leaves_far_ones_asleep 
+tests/test_monster_ai.py::test_monsters_step_all_runs 
+[gw0] [ 16%] PASSED tests/test_branches_parity.py::test_sokoban_prize_at_top 
+tests/test_bump_attack.py::test_player_attacks_adjacent_monster_via_move 
+[gw3] [ 16%] PASSED tests/test_monster_ai.py::test_monsters_step_all_runs 
+tests/test_monster_ai.py::test_monsters_step_all_skips_dead_slots 
+[gw3] [ 16%] PASSED tests/test_monster_ai.py::test_monsters_step_all_skips_dead_slots 
+tests/test_monster_ai_depth.py::test_monster_los_clear 
+[gw3] [ 16%] PASSED tests/test_monster_ai_depth.py::test_monster_los_clear 
+tests/test_monster_ai_depth.py::test_monster_los_blocked_by_wall 
+[gw3] [ 16%] PASSED tests/test_monster_ai_depth.py::test_monster_los_blocked_by_wall 
+tests/test_monster_ai_depth.py::test_pathfind_navigates_around_wall 
+[gw3] [ 16%] PASSED tests/test_monster_ai_depth.py::test_pathfind_navigates_around_wall 
+tests/test_monster_ai_depth.py::test_pathfind_fallback_when_unreachable 
+[gw3] [ 17%] PASSED tests/test_monster_ai_depth.py::test_pathfind_fallback_when_unreachable 
+tests/test_monster_ai_depth.py::test_retreat_when_low_hp 
+[gw3] [ 17%] PASSED tests/test_monster_ai_depth.py::test_retreat_when_low_hp 
+tests/test_monster_ai_depth.py::test_no_retreat_when_high_hp 
+[gw3] [ 17%] PASSED tests/test_monster_ai_depth.py::test_no_retreat_when_high_hp 
+tests/test_monster_ai_depth.py::test_mage_monster_casts_spell_at_player 
+[gw3] [ 17%] PASSED tests/test_monster_ai_depth.py::test_mage_monster_casts_spell_at_player 
+tests/test_monster_ai_depth.py::test_non_mage_does_not_cast_spell 
+[gw3] [ 17%] PASSED tests/test_monster_ai_depth.py::test_non_mage_does_not_cast_spell 
+tests/test_monster_ai_depth.py::test_pet_follows_player 
+[gw3] [ 17%] PASSED tests/test_monster_ai_depth.py::test_pet_follows_player 
+tests/test_monster_ai_depth.py::test_pet_attacks_hostile_monster 
+[gw3] [ 18%] PASSED tests/test_monster_ai_depth.py::test_pet_attacks_hostile_monster 
+tests/test_monster_ai_depth.py::test_sleeping_monster_wakes_on_player_seen 
+[gw3] [ 18%] PASSED tests/test_monster_ai_depth.py::test_sleeping_monster_wakes_on_player_seen 
+tests/test_monster_ai_depth.py::test_sleeping_monster_stays_asleep_behind_wall 
+[gw1] [ 18%] PASSED tests/test_combat_polish3_parity.py::test_disarmed_monster_uses_bare_hands 
+tests/test_combat_polish3_parity.py::test_negative_ac_softer 
+[gw3] [ 18%] PASSED tests/test_monster_ai_depth.py::test_sleeping_monster_stays_asleep_behind_wall 
+tests/test_monster_ai_depth.py::test_monster_use_item_runs 
+[gw3] [ 18%] PASSED tests/test_monster_ai_depth.py::test_monster_use_item_runs 
+tests/test_monster_ai_depth.py::test_monster_turn_with_pathfind_moves_toward_player 
+[gw3] [ 18%] PASSED tests/test_monster_ai_depth.py::test_monster_turn_with_pathfind_moves_toward_player 
+tests/test_monster_ai_depth.py::test_monster_turn_retreats_at_low_hp 
+[gw3] [ 19%] PASSED tests/test_monster_ai_depth.py::test_monster_turn_retreats_at_low_hp 
+tests/test_monster_ai_parity.py::test_los_blocked_by_boulder 
+[gw3] [ 19%] PASSED tests/test_monster_ai_parity.py::test_los_blocked_by_boulder 
+tests/test_monster_ai_parity.py::test_los_blocked_by_closed_door_without_see_thru 
+[gw3] [ 19%] PASSED tests/test_monster_ai_parity.py::test_los_blocked_by_closed_door_without_see_thru 
+tests/test_monster_ai_parity.py::test_los_open_door_does_not_block 
+[gw3] [ 19%] PASSED tests/test_monster_ai_parity.py::test_los_open_door_does_not_block 
+tests/test_monster_ai_parity.py::test_invisible_monster_not_seen_without_see_invis 
+[gw3] [ 19%] PASSED tests/test_monster_ai_parity.py::test_invisible_monster_not_seen_without_see_invis 
+tests/test_monster_ai_parity.py::test_pathfind_avoids_lava_without_flying 
+[gw3] [ 19%] PASSED tests/test_monster_ai_parity.py::test_pathfind_avoids_lava_without_flying 
+tests/test_monster_ai_parity.py::test_pathfind_swims_in_water_with_swim_flag 
+[gw3] [ 20%] PASSED tests/test_monster_ai_parity.py::test_pathfind_swims_in_water_with_swim_flag 
+tests/test_monster_ai_parity.py::test_pathfind_avoids_peaceful_monster_with_mm_peaceful 
+[gw3] [ 20%] PASSED tests/test_monster_ai_parity.py::test_pathfind_avoids_peaceful_monster_with_mm_peaceful 
+tests/test_monster_ai_parity.py::test_mage_zaps_wand_when_in_los 
+[gw3] [ 20%] PASSED tests/test_monster_ai_parity.py::test_mage_zaps_wand_when_in_los 
+tests/test_monster_ai_parity.py::test_low_hp_monster_quaffs_healing_potion 
+[gw3] [ 20%] PASSED tests/test_monster_ai_parity.py::test_low_hp_monster_quaffs_healing_potion 
+tests/test_monster_ai_parity.py::test_uses_items_flag_gates_muse 
+[gw3] [ 20%] PASSED tests/test_monster_ai_parity.py::test_uses_items_flag_gates_muse 
+tests/test_monster_ai_parity.py::test_wizard_psi_bolt_damage_formula 
+[gw3] [ 20%] PASSED tests/test_monster_ai_parity.py::test_wizard_psi_bolt_damage_formula 
+tests/test_monster_ai_parity.py::test_cleric_spell_damage_formula_by_level 
+[gw3] [ 21%] PASSED tests/test_monster_ai_parity.py::test_cleric_spell_damage_formula_by_level 
+tests/test_monster_ai_parity.py::test_fire_pillar_damage_d8_6 
+[gw3] [ 21%] PASSED tests/test_monster_ai_parity.py::test_fire_pillar_damage_d8_6 
+tests/test_monster_ai_parity.py::test_geyser_and_lightning_damage_d8_6 
+[gw3] [ 21%] PASSED tests/test_monster_ai_parity.py::test_geyser_and_lightning_damage_d8_6 
+tests/test_monster_ai_parity.py::test_demon_never_flees 
+[gw3] [ 21%] PASSED tests/test_monster_ai_parity.py::test_demon_never_flees 
+tests/test_monster_ai_parity.py::test_undead_never_flees 
+[gw3] [ 21%] PASSED tests/test_monster_ai_parity.py::test_undead_never_flees 
+tests/test_monster_ai_parity.py::test_low_level_monster_flees_at_1_hp 
+[gw3] [ 21%] PASSED tests/test_monster_ai_parity.py::test_low_level_monster_flees_at_1_hp 
+tests/test_monster_ai_parity.py::test_cat_prefers_fish 
+[gw3] [ 22%] PASSED tests/test_monster_ai_parity.py::test_cat_prefers_fish 
+tests/test_monster_ai_parity.py::test_dog_prefers_meat 
+[gw3] [ 22%] PASSED tests/test_monster_ai_parity.py::test_dog_prefers_meat 
+tests/test_monster_ai_parity.py::test_pet_follows_within_leash 
+[gw3] [ 22%] PASSED tests/test_monster_ai_parity.py::test_pet_follows_within_leash 
+tests/test_monster_inventory.py::test_monster_inventory_state_shape_400_8 
+[gw3] [ 22%] PASSED tests/test_monster_inventory.py::test_monster_inventory_state_shape_400_8 
+tests/test_monster_inventory.py::test_monster_inventory_dtypes_correct 
+[gw3] [ 22%] PASSED tests/test_monster_inventory.py::test_monster_inventory_dtypes_correct 
+tests/test_monster_inventory.py::test_monster_inventory_defaults_empty 
+[gw3] [ 22%] PASSED tests/test_monster_inventory.py::test_monster_inventory_defaults_empty 
+tests/test_monster_inventory.py::test_kit_lookup_assigns_mage_to_titan 
+[gw3] [ 23%] PASSED tests/test_monster_inventory.py::test_kit_lookup_assigns_mage_to_titan 
+tests/test_monster_inventory.py::test_kit_lookup_assigns_priest_to_aligned_priest 
+[gw3] [ 23%] PASSED tests/test_monster_inventory.py::test_kit_lookup_assigns_priest_to_aligned_priest 
+tests/test_monster_inventory.py::test_kit_lookup_assigns_soldier_kit 
+[gw3] [ 23%] PASSED tests/test_monster_inventory.py::test_kit_lookup_assigns_soldier_kit 
+tests/test_monster_inventory.py::test_kit_lookup_assigns_animal_to_none 
+[gw3] [ 23%] PASSED tests/test_monster_inventory.py::test_kit_lookup_assigns_animal_to_none 
+tests/test_monster_inventory.py::test_mage_monster_spawns_with_wand 
+[gw3] [ 23%] PASSED tests/test_monster_inventory.py::test_mage_monster_spawns_with_wand 
+tests/test_monster_inventory.py::test_priest_monster_spawns_with_holy_water 
+[gw3] [ 23%] PASSED tests/test_monster_inventory.py::test_priest_monster_spawns_with_holy_water 
+tests/test_monster_inventory.py::test_soldier_monster_spawns_with_weapon 
+[gw3] [ 24%] PASSED tests/test_monster_inventory.py::test_soldier_monster_spawns_with_weapon 
+tests/test_monster_inventory.py::test_shopkeeper_spawns_with_gold 
+[gw3] [ 24%] PASSED tests/test_monster_inventory.py::test_shopkeeper_spawns_with_gold 
+tests/test_monster_inventory.py::test_animal_monster_spawns_with_no_inventory 
+[gw3] [ 24%] PASSED tests/test_monster_inventory.py::test_animal_monster_spawns_with_no_inventory 
+tests/test_monster_inventory.py::test_populate_level_writes_entry_idx_and_inventory 
+[gw3] [ 24%] PASSED tests/test_monster_inventory.py::test_populate_level_writes_entry_idx_and_inventory 
+tests/test_monsters_full_parity.py::test_monsters_count_is_381 
+[gw3] [ 24%] PASSED tests/test_monsters_full_parity.py::test_monsters_count_is_381 
+tests/test_monsters_full_parity.py::test_giant_ant_full_fidelity 
+[gw3] [ 24%] PASSED tests/test_monsters_full_parity.py::test_giant_ant_full_fidelity 
+tests/test_monsters_full_parity.py::test_killer_bee_full_fidelity 
+[gw3] [ 25%] PASSED tests/test_monsters_full_parity.py::test_killer_bee_full_fidelity 
+tests/test_monsters_full_parity.py::test_giant_beetle_weight_nutrition_fix 
+[gw3] [ 25%] PASSED tests/test_monsters_full_parity.py::test_giant_beetle_weight_nutrition_fix 
+tests/test_monsters_full_parity.py::test_pyrolisk_single_attack_fix 
+[gw3] [ 25%] PASSED tests/test_monsters_full_parity.py::test_pyrolisk_single_attack_fix 
+tests/test_monsters_full_parity.py::test_wolf_color_fix 
+[gw3] [ 25%] PASSED tests/test_monsters_full_parity.py::test_wolf_color_fix 
+tests/test_monsters_full_parity.py::test_kitten_flags3_no_infravision 
+[gw3] [ 25%] PASSED tests/test_monsters_full_parity.py::test_kitten_flags3_no_infravision 
+tests/test_monsters_full_parity.py::test_dwarf_flags2_has_nopoly 
+[gw3] [ 25%] PASSED tests/test_monsters_full_parity.py::test_dwarf_flags2_has_nopoly 
+tests/test_monsters_full_parity.py::test_dwarf_lord_male 
+[gw3] [ 26%] PASSED tests/test_monsters_full_parity.py::test_dwarf_lord_male 
+tests/test_monsters_full_parity.py::test_mind_flayer_color_magenta 
+[gw3] [ 26%] PASSED tests/test_monsters_full_parity.py::test_mind_flayer_color_magenta 
+tests/test_monsters_full_parity.py::test_acid_blob_conveys_stone_only 
+[gw3] [ 26%] PASSED tests/test_monsters_full_parity.py::test_acid_blob_conveys_stone_only 
+tests/test_monsters_full_parity.py::test_orc_no_poison_resist 
+[gw3] [ 26%] PASSED tests/test_monsters_full_parity.py::test_orc_no_poison_resist 
+tests/test_monsters_full_parity.py::test_orc_shaman_strong 
+[gw3] [ 26%] PASSED tests/test_monsters_full_parity.py::test_orc_shaman_strong 
+tests/test_monsters_full_parity.py::test_lurker_above_single_engulf 
+[gw3] [ 26%] PASSED tests/test_monsters_full_parity.py::test_lurker_above_single_engulf 
+tests/test_monsters_full_parity.py::test_ki_rin_animal_no_poison_resist 
+[gw3] [ 27%] PASSED tests/test_monsters_full_parity.py::test_ki_rin_animal_no_poison_resist 
+tests/test_monsters_full_parity.py::test_gnome_nopoly 
+[gw3] [ 27%] PASSED tests/test_monsters_full_parity.py::test_gnome_nopoly 
+tests/test_monsters_full_parity.py::test_guardian_naga_attacks 
+[gw3] [ 27%] PASSED tests/test_monsters_full_parity.py::test_guardian_naga_attacks 
+tests/test_monsters_full_parity.py::test_elf_level_10_strong 
+[gw3] [ 27%] PASSED tests/test_monsters_full_parity.py::test_elf_level_10_strong 
+tests/test_monsters_full_parity.py::test_piranha_single_attack 
+[gw3] [ 27%] PASSED tests/test_monsters_full_parity.py::test_piranha_single_attack 
+tests/test_monsters_full_parity.py::test_shark_slithy 
+[gw3] [ 27%] PASSED tests/test_monsters_full_parity.py::test_shark_slithy 
+tests/test_monsters_full_parity.py::test_lord_carnarvon_quest_leader_stats 
+[gw3] [ 28%] PASSED tests/test_monsters_full_parity.py::test_lord_carnarvon_quest_leader_stats 
+tests/test_monsters_full_parity.py::test_grand_master_mmove_12 
+[gw3] [ 28%] PASSED tests/test_monsters_full_parity.py::test_grand_master_mmove_12 
+tests/test_monsters_full_parity.py::test_riders_color_lord 
+[gw3] [ 28%] PASSED tests/test_monsters_full_parity.py::test_riders_color_lord 
+tests/test_monsters_full_parity.py::test_wizard_of_yendor_color_magenta 
+[gw3] [ 28%] PASSED tests/test_monsters_full_parity.py::test_wizard_of_yendor_color_magenta 
+tests/test_monsters_full_parity.py::test_chromatic_dragon_no_acid_convey 
+[gw3] [ 28%] PASSED tests/test_monsters_full_parity.py::test_chromatic_dragon_no_acid_convey 
+tests/test_monsters_full_parity.py::test_minion_of_huhetotl_color_red 
+[gw3] [ 29%] PASSED tests/test_monsters_full_parity.py::test_minion_of_huhetotl_color_red 
+tests/test_monsters_full_parity.py::test_valkyrie_chaotic 
+[gw3] [ 29%] PASSED tests/test_monsters_full_parity.py::test_valkyrie_chaotic 
+tests/test_monsters_full_parity.py::test_garter_snake_tiny 
+[gw3] [ 29%] PASSED tests/test_monsters_full_parity.py::test_garter_snake_tiny 
+tests/test_monsters_full_parity.py::test_zombie_silent_sounds 
+[gw3] [ 29%] PASSED tests/test_monsters_full_parity.py::test_zombie_silent_sounds 
+tests/test_monsters_full_parity.py::test_full_per_entry_compare_against_vendor_dump 
+[gw3] [ 29%] SKIPPED tests/test_monsters_full_parity.py::test_full_per_entry_compare_against_vendor_dump 
+tests/test_monstr.py::test_monstr_low_level_monsters_low_difficulty 
+[gw3] [ 29%] PASSED tests/test_monstr.py::test_monstr_low_level_monsters_low_difficulty 
+tests/test_monstr.py::test_monstr_dragon_has_high_difficulty_with_breath 
+[gw3] [ 30%] PASSED tests/test_monstr.py::test_monstr_dragon_has_high_difficulty_with_breath 
+tests/test_monstr.py::test_monstr_cockatrice_has_petrify_bonus 
+[gw3] [ 30%] PASSED tests/test_monstr.py::test_monstr_cockatrice_has_petrify_bonus 
+tests/test_monstr.py::test_monstr_table_size_matches_monsters_table 
+[gw3] [ 30%] PASSED tests/test_monstr.py::test_monstr_table_size_matches_monsters_table 
+tests/test_monstr.py::test_monstr_consistent_increases_with_level 
+[gw3] [ 30%] PASSED tests/test_monstr.py::test_monstr_consistent_increases_with_level 
+tests/test_movement.py::test_move_into_wall_blocks 
+[gw1] [ 30%] PASSED tests/test_combat_polish3_parity.py::test_negative_ac_softer 
+tests/test_combat_polish_parity.py::test_rogue_backstab_sleeping_target 
+[gw1] [ 30%] PASSED tests/test_combat_polish_parity.py::test_rogue_backstab_sleeping_target 
+tests/test_combat_polish_parity.py::test_non_rogue_no_backstab 
+[gw1] [ 31%] PASSED tests/test_combat_polish_parity.py::test_non_rogue_no_backstab 
+tests/test_combat_polish_parity.py::test_kill_drops_corpse 
+[gw1] [ 31%] PASSED tests/test_combat_polish_parity.py::test_kill_drops_corpse 
+tests/test_combat_polish_parity.py::test_kill_no_corpse_for_ghosts 
+[gw1] [ 31%] PASSED tests/test_combat_polish_parity.py::test_kill_no_corpse_for_ghosts 
+tests/test_combat_polish_parity.py::test_encumbrance_penalty_burdened 
+[gw1] [ 31%] PASSED tests/test_combat_polish_parity.py::test_encumbrance_penalty_burdened 
+tests/test_combat_polish_parity.py::test_confusion_penalty 
+[gw1] [ 31%] PASSED tests/test_combat_polish_parity.py::test_confusion_penalty 
+tests/test_combat_polish_parity.py::test_stun_penalty 
+[gw1] [ 31%] PASSED tests/test_combat_polish_parity.py::test_stun_penalty 
+tests/test_combat_stubs_resolved_parity.py::test_player_in_trap_penalty 
+[gw3] [ 32%] PASSED tests/test_movement.py::test_move_into_wall_blocks 
+tests/test_movement.py::test_move_onto_floor_succeeds 
+[gw3] [ 32%] PASSED tests/test_movement.py::test_move_onto_floor_succeeds 
+tests/test_movement.py::test_move_out_of_bounds_blocks 
+[gw3] [ 32%] PASSED tests/test_movement.py::test_move_out_of_bounds_blocks 
+tests/test_movement.py::test_wait_is_noop_except_timestep 
+[gw3] [ 32%] PASSED tests/test_movement.py::test_wait_is_noop_except_timestep 
+tests/test_movement_with_doors_traps.py::test_walk_through_door 
+[gw1] [ 32%] XFAIL tests/test_combat_stubs_resolved_parity.py::test_player_in_trap_penalty 
+tests/test_combat_stubs_resolved_parity.py::test_paralyzed_target_bonus 
+[gw2] [ 32%] PASSED tests/test_movement_with_doors_traps.py::test_trap_triggers_on_step 
+tests/test_movement_with_doors_traps.py::test_revealed_trap_visible 
+[gw2] [ 33%] PASSED tests/test_movement_with_doors_traps.py::test_revealed_trap_visible 
+tests/test_nle_compat.py::test_nle_compat_reset_returns_obs_info_tuple 
+[gw2] [ 33%] PASSED tests/test_nle_compat.py::test_nle_compat_reset_returns_obs_info_tuple 
+tests/test_nle_compat.py::test_nle_compat_step_returns_5_tuple 
+[gw2] [ 33%] PASSED tests/test_nle_compat.py::test_nle_compat_step_returns_5_tuple 
+tests/test_nle_compat.py::test_nle_compat_action_set_matches_nle 
+[gw2] [ 33%] PASSED tests/test_nle_compat.py::test_nle_compat_action_set_matches_nle 
+tests/test_nle_compat.py::test_nle_compat_glyph_to_char_printable 
+[gw2] [ 33%] PASSED tests/test_nle_compat.py::test_nle_compat_glyph_to_char_printable 
+tests/test_pet_ai_polish_parity.py::test_pet_hunger_decrements_per_turn 
+[gw2] [ 33%] PASSED tests/test_pet_ai_polish_parity.py::test_pet_hunger_decrements_per_turn 
+tests/test_pet_ai_polish_parity.py::test_pet_starves_at_minus_50 
+[gw2] [ 34%] PASSED tests/test_pet_ai_polish_parity.py::test_pet_starves_at_minus_50 
+tests/test_pet_ai_polish_parity.py::test_pet_flees_low_hp 
+[gw2] [ 34%] PASSED tests/test_pet_ai_polish_parity.py::test_pet_flees_low_hp 
+tests/test_pet_ai_polish_parity.py::test_pet_eats_floor_food 
+[gw2] [ 34%] PASSED tests/test_pet_ai_polish_parity.py::test_pet_eats_floor_food 
+tests/test_pet_ai_polish_parity.py::test_pet_uses_pathfind_around_wall 
+[gw2] [ 34%] PASSED tests/test_pet_ai_polish_parity.py::test_pet_uses_pathfind_around_wall 
+tests/test_pet_ai_polish_parity.py::test_pet_attacks_adjacent_hostile 
+[gw2] [ 34%] PASSED tests/test_pet_ai_polish_parity.py::test_pet_attacks_adjacent_hostile 
+tests/test_pixel_obs.py::test_pixel_shape 
+[gw2] [ 34%] PASSED tests/test_pixel_obs.py::test_pixel_shape 
+tests/test_pixel_obs.py::test_pixel_shape_values 
+[gw2] [ 35%] PASSED tests/test_pixel_obs.py::test_pixel_shape_values 
+tests/test_pixel_obs.py::test_pixel_jits 
+[gw2] [ 35%] PASSED tests/test_pixel_obs.py::test_pixel_jits 
+tests/test_pixel_obs.py::test_pixel_non_zero_when_terrain_present 
+[gw2] [ 35%] PASSED tests/test_pixel_obs.py::test_pixel_non_zero_when_terrain_present 
+tests/test_pixel_obs_parity.py::test_pixel_obs_shape_matches_nle_tile_grid 
+[gw2] [ 35%] PASSED tests/test_pixel_obs_parity.py::test_pixel_obs_shape_matches_nle_tile_grid 
+tests/test_pixel_obs_parity.py::test_pixel_obs_dtype_is_uint8 /Users/rsiegelmann/Downloads/Projects/nethax/.venv/lib/python3.12/site-packages/_pytest/main.py:353: PluggyTeardownRaisedWarning: A plugin raised an exception during an old-style hookwrapper teardown.
+Plugin: 4361325408, Hook: pytest_sessionfinish
+OSError: cannot send (already closed?)
+For more information see https://pluggy.readthedocs.io/en/stable/api_reference.html#pluggy.PluggyTeardownRaisedWarning
+  config.hook.pytest_sessionfinish(
+/Users/rsiegelmann/Downloads/Projects/nethax/.venv/lib/python3.12/site-packages/_pytest/main.py:353: PluggyTeardownRaisedWarning: A plugin raised an exception during an old-style hookwrapper teardown.
+Plugin: 4387540384, Hook: pytest_sessionfinish
+OSError: cannot send (already closed?)
+For more information see https://pluggy.readthedocs.io/en/stable/api_reference.html#pluggy.PluggyTeardownRaisedWarning
+  config.hook.pytest_sessionfinish(
+/Users/rsiegelmann/Downloads/Projects/nethax/.venv/lib/python3.12/site-packages/_pytest/main.py:353: PluggyTeardownRaisedWarning: A plugin raised an exception during an old-style hookwrapper teardown.
+Plugin: 4372262848, Hook: pytest_sessionfinish
+OSError: cannot send (already closed?)
+For more information see https://pluggy.readthedocs.io/en/stable/api_reference.html#pluggy.PluggyTeardownRaisedWarning
+  config.hook.pytest_sessionfinish(
+/Users/rsiegelmann/Downloads/Projects/nethax/.venv/lib/python3.12/site-packages/_pytest/main.py:353: PluggyTeardownRaisedWarning: A plugin raised an exception during an old-style hookwrapper teardown.
+Plugin: 4389511264, Hook: pytest_sessionfinish
+OSError: cannot send (already closed?)
+For more information see https://pluggy.readthedocs.io/en/stable/api_reference.html#pluggy.PluggyTeardownRaisedWarning
+  config.hook.pytest_sessionfinish(

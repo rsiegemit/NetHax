@@ -1,0 +1,40 @@
+# Category A: Real code divergences (fixable)
+tests/test_choke_parity.py::test_choke_at_satiated
+tests/test_choke_parity.py::test_choke_records_choking_cause
+tests/test_combat.py::test_to_hit_low_str_vs_ac_minus_10_is_hard
+tests/test_engraving_polish2_parity.py::test_partial_erosion_truncates_2_chars
+tests/test_prayer_parity.py::test_angry_drain_level_decrements_xl
+tests/test_prayer_parity.py::test_sacrifice_mighty_monster_grants_wish
+tests/test_amulet_full_parity.py::test_reflection_bounces_ray
+tests/test_underwater_parity.py::test_step_into_pool_sets_in_water
+tests/test_doors_parity.py::test_open_closed_becomes_isopen
+tests/test_doors_parity.py::test_open_locked_fails
+tests/test_doors_parity.py::test_open_broken_unchanged
+tests/test_endgame.py::TestAscensionCondition::test_ascend_sets_done_flag
+tests/test_endgame_parity.py::TestAstralAscension::test_astral_drop_amulet_coaligned_ascends
+tests/test_wand_dig_down_parity.py::test_dig_down_sets_hole_at_player_pos
+tests/test_wand_dig_down_parity.py::test_dig_horizontal_unaffected_by_down_branch
+tests/test_env_pipeline_parity.py::test_pipeline_order_player_before_monsters
+tests/test_env_pipeline_parity.py::test_pipeline_order_status_after_monsters
+tests/test_env_pipeline_parity.py::test_endgame_check_last
+tests/test_hunger_loop.py::test_eat_restores_nutrition
+tests/test_monster_actions_parity.py::test_succubus_drains_pw
+tests/test_boulders_sokoban_parity.py::test_piercer_drops_in_corridor
+tests/test_combat_polish.py::test_two_weapon_toggle_via_command
+
+# Category B: JIT compile timeouts (environmental — try longer timeout / sequential)
+tests/test_minihax_envs.py::test_minihack_room_5x5_step
+tests/test_minihax_envs.py::test_minihack_room_5x5_terminal_on_goal
+tests/test_no_op_step.py::test_status_effects_step_noop
+tests/test_compile_time.py::test_step_impl_vmap_compile_within_5min
+tests/test_compile_time.py::test_step_impl_scan_compile_within_5min
+tests/test_items_effects_parity.py::test_scroll_teleportation_moves_player
+tests/test_items_effects_parity.py::test_wand_digging_carves_wall
+tests/test_combat_flow.py::test_armor_reduces_damage
+tests/test_combat_stubs_resolved_parity.py::test_player_in_trap_penalty
+
+# Category C: Stub/deferred Wave-N (intentional)
+tests/test_minihax_reward_manager.py::test_kill_event_registers_but_does_not_fire
+tests/test_minihax_reward_manager.py::test_eat_event_registers_but_does_not_fire
+tests/test_deferred_spells.py::test_flame_sphere_spawns_fire_elemental
+tests/test_deferred_spells.py::test_freeze_sphere_spawns_freezing_sphere

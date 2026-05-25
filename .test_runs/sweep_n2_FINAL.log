@@ -1,0 +1,522 @@
+============================= test session starts ==============================
+created: 2/2 workers
+2 workers [245 items]
+
+scheduling tests via WorkStealingScheduling
+
+tests/test_benchmark_smoke.py::test_benchmark_smoke 
+tests/test_polymorph.py::TestPolymorphPlayerSaveOriginals::test_orig_str_dex_con_saved 
+[gw0] [  0%] SKIPPED tests/test_benchmark_smoke.py::test_benchmark_smoke 
+tests/test_combat_stubs_resolved_parity.py::test_paralyzed_target_bonus 
+[gw1] [  0%] PASSED tests/test_polymorph.py::TestPolymorphPlayerSaveOriginals::test_orig_str_dex_con_saved 
+tests/test_polymorph.py::TestPolymorphPlayerSaveOriginals::test_orig_hp_max_and_ac_saved 
+[gw1] [  1%] PASSED tests/test_polymorph.py::TestPolymorphPlayerSaveOriginals::test_orig_hp_max_and_ac_saved 
+tests/test_polymorph.py::TestPolymorphChangeForm::test_current_form_idx_set 
+[gw1] [  1%] PASSED tests/test_polymorph.py::TestPolymorphChangeForm::test_current_form_idx_set 
+tests/test_polymorph.py::TestPolymorphChangeForm::test_attack_set_swapped 
+[gw1] [  2%] PASSED tests/test_polymorph.py::TestPolymorphChangeForm::test_attack_set_swapped 
+tests/test_polymorph.py::TestPolymorphRecomputeAC::test_ac_matches_form_base 
+[gw1] [  2%] PASSED tests/test_polymorph.py::TestPolymorphRecomputeAC::test_ac_matches_form_base 
+tests/test_polymorph.py::TestPolymorphArmorDrop::test_drops_when_no_hands 
+[gw1] [  2%] PASSED tests/test_polymorph.py::TestPolymorphArmorDrop::test_drops_when_no_hands 
+tests/test_polymorph.py::TestPolymorphArmorDrop::test_keeps_armor_when_humanoid_with_hands 
+[gw1] [  3%] PASSED tests/test_polymorph.py::TestPolymorphArmorDrop::test_keeps_armor_when_humanoid_with_hands 
+tests/test_polymorph.py::TestPolyTimerRange::test_timer_in_expected_range 
+[gw1] [  3%] PASSED tests/test_polymorph.py::TestPolyTimerRange::test_timer_in_expected_range 
+tests/test_polymorph.py::TestRevertOnExpiry::test_revert_restores_originals 
+[gw1] [  4%] PASSED tests/test_polymorph.py::TestRevertOnExpiry::test_revert_restores_originals 
+tests/test_polymorph.py::TestRevertOnExpiry::test_direct_revert_clears_form 
+[gw1] [  4%] PASSED tests/test_polymorph.py::TestRevertOnExpiry::test_direct_revert_clears_form 
+tests/test_polymorph.py::TestMonsterPolymorph::test_entry_idx_changes 
+[gw1] [  4%] PASSED tests/test_polymorph.py::TestMonsterPolymorph::test_entry_idx_changes 
+tests/test_polymorph.py::TestMonsterPolymorph::test_orig_entry_idx_saved 
+[gw1] [  5%] PASSED tests/test_polymorph.py::TestMonsterPolymorph::test_orig_entry_idx_saved 
+tests/test_polymorph.py::TestMonsterPolymorph::test_hp_scaled_proportionally 
+[gw1] [  5%] PASSED tests/test_polymorph.py::TestMonsterPolymorph::test_hp_scaled_proportionally 
+tests/test_polymorph.py::TestConductPolyselfless::test_violated_on_player_poly 
+[gw1] [  6%] PASSED tests/test_polymorph.py::TestConductPolyselfless::test_violated_on_player_poly 
+tests/test_polymorph.py::TestControlledPoly::test_controlled_flag_and_count 
+[gw1] [  6%] PASSED tests/test_polymorph.py::TestControlledPoly::test_controlled_flag_and_count 
+tests/test_polymorph.py::TestControlledPoly::test_controlled_picks_specified_target 
+[gw1] [  6%] PASSED tests/test_polymorph.py::TestControlledPoly::test_controlled_picks_specified_target 
+tests/test_polymorph.py::TestStepTimerDecrement::test_timer_decrements 
+[gw1] [  7%] PASSED tests/test_polymorph.py::TestStepTimerDecrement::test_timer_decrements 
+tests/test_polymorph.py::TestStepTimerDecrement::test_lycanthropy_timer_decrements 
+[gw1] [  7%] PASSED tests/test_polymorph.py::TestStepTimerDecrement::test_lycanthropy_timer_decrements 
+tests/test_polymorph.py::TestPolymorphJIT::test_polymorph_player_jits 
+[gw1] [  8%] PASSED tests/test_polymorph.py::TestPolymorphJIT::test_polymorph_player_jits 
+tests/test_polymorph.py::TestPolymorphJIT::test_step_jits 
+[gw1] [  8%] PASSED tests/test_polymorph.py::TestPolymorphJIT::test_step_jits 
+tests/test_polymorph_parity.py::test_polymorph_into_dragon_copies_breath_attack 
+[gw1] [  8%] PASSED tests/test_polymorph_parity.py::test_polymorph_into_dragon_copies_breath_attack 
+tests/test_polymorph_parity.py::test_polymorph_into_cockatrice_copies_petrify_attack 
+[gw1] [  9%] PASSED tests/test_polymorph_parity.py::test_polymorph_into_cockatrice_copies_petrify_attack 
+tests/test_polymorph_parity.py::test_polymorph_into_human_copies_punch_attack 
+[gw1] [  9%] PASSED tests/test_polymorph_parity.py::test_polymorph_into_human_copies_punch_attack 
+tests/test_polymorph_parity.py::test_polymorph_into_acid_blob_copies_acid_attack 
+[gw1] [ 10%] PASSED tests/test_polymorph_parity.py::test_polymorph_into_acid_blob_copies_acid_attack 
+tests/test_polymorph_parity.py::test_polymorph_into_lich_copies_magic_attack 
+[gw1] [ 10%] PASSED tests/test_polymorph_parity.py::test_polymorph_into_lich_copies_magic_attack 
+tests/test_polymorph_parity.py::test_polymorph_attack_dice_match_vendor_table 
+[gw1] [ 11%] PASSED tests/test_polymorph_parity.py::test_polymorph_attack_dice_match_vendor_table 
+tests/test_polymorph_parity.py::test_polymorph_resets_attacks_on_revert 
+[gw1] [ 11%] PASSED tests/test_polymorph_parity.py::test_polymorph_resets_attacks_on_revert 
+tests/test_polymorph_parity.py::test_polymorph_into_20_sample_forms_attack_set_parity 
+[gw1] [ 11%] PASSED tests/test_polymorph_parity.py::test_polymorph_into_20_sample_forms_attack_set_parity 
+tests/test_polymorph_parity.py::test_polymorph_attack_set_size_is_nattk 
+[gw1] [ 12%] PASSED tests/test_polymorph_parity.py::test_polymorph_attack_set_size_is_nattk 
+tests/test_polymorph_polish2_parity.py::test_poly_while_riding_dismounts 
+[gw1] [ 12%] PASSED tests/test_polymorph_polish2_parity.py::test_poly_while_riding_dismounts 
+tests/test_polymorph_polish2_parity.py::test_silver_armor_drops_on_vampire_poly 
+[gw1] [ 13%] PASSED tests/test_polymorph_polish2_parity.py::test_silver_armor_drops_on_vampire_poly 
+tests/test_polymorph_polish2_parity.py::test_genocide_self_kills_on_revert 
+[gw1] [ 13%] PASSED tests/test_polymorph_polish2_parity.py::test_genocide_self_kills_on_revert 
+tests/test_polymorph_polish2_parity.py::test_newman_resets_hunger 
+[gw1] [ 13%] PASSED tests/test_polymorph_polish2_parity.py::test_newman_resets_hunger 
+tests/test_polymorph_polish2_parity.py::test_poly_clamps_pw 
+[gw1] [ 14%] PASSED tests/test_polymorph_polish2_parity.py::test_poly_clamps_pw 
+tests/test_polymorph_polish_parity.py::test_choose_form_excludes_unique 
+[gw1] [ 14%] PASSED tests/test_polymorph_polish_parity.py::test_choose_form_excludes_unique 
+tests/test_polymorph_polish_parity.py::test_choose_form_excludes_nopoly 
+[gw1] [ 15%] PASSED tests/test_polymorph_polish_parity.py::test_choose_form_excludes_nopoly 
+tests/test_polymorph_polish_parity.py::test_newman_rerolls_xl 
+[gw1] [ 15%] PASSED tests/test_polymorph_polish_parity.py::test_newman_rerolls_xl 
+tests/test_polymorph_polish_parity.py::test_newman_cures_sick 
+[gw1] [ 15%] PASSED tests/test_polymorph_polish_parity.py::test_newman_cures_sick 
+tests/test_polymorph_polish_parity.py::test_break_armor_per_slot 
+[gw1] [ 16%] PASSED tests/test_polymorph_polish_parity.py::test_break_armor_per_slot 
+tests/test_polymorph_polish_parity.py::test_rehumanize_unchanging_kills 
+[gw1] [ 16%] PASSED tests/test_polymorph_polish_parity.py::test_rehumanize_unchanging_kills 
+tests/test_polymorph_polish_parity.py::test_potion_polymorph_changes_form 
+[gw1] [ 17%] PASSED tests/test_polymorph_polish_parity.py::test_potion_polymorph_changes_form 
+tests/test_polymorph_polish_parity.py::test_wand_polymorph_self_zap 
+[gw1] [ 17%] PASSED tests/test_polymorph_polish_parity.py::test_wand_polymorph_self_zap 
+tests/test_polymorph_quest_parity.py::TestPolymorphStateSwap::test_polymorph_player_saves_orig_stats 
+[gw1] [ 17%] PASSED tests/test_polymorph_quest_parity.py::TestPolymorphStateSwap::test_polymorph_player_saves_orig_stats 
+tests/test_polymorph_quest_parity.py::TestPolymorphStateSwap::test_polymorph_player_restores_armor_on_revert 
+[gw1] [ 18%] PASSED tests/test_polymorph_quest_parity.py::TestPolymorphStateSwap::test_polymorph_player_restores_armor_on_revert 
+tests/test_polymorph_quest_parity.py::TestPolymorphStateSwap::test_revert_polymorph_restores_attacks_from_orig 
+[gw1] [ 18%] PASSED tests/test_polymorph_quest_parity.py::TestPolymorphStateSwap::test_revert_polymorph_restores_attacks_from_orig 
+tests/test_polymorph_quest_parity.py::TestLycanthropy::test_lycanthropy_timer_triggers_were_form_at_zero 
+[gw1] [ 19%] PASSED tests/test_polymorph_quest_parity.py::TestLycanthropy::test_lycanthropy_timer_triggers_were_form_at_zero 
+tests/test_polymorph_quest_parity.py::TestLycanthropy::test_trigger_lycanthropy_sets_form_and_timer 
+[gw1] [ 19%] PASSED tests/test_polymorph_quest_parity.py::TestLycanthropy::test_trigger_lycanthropy_sets_form_and_timer 
+tests/test_polymorph_quest_parity.py::TestQuestStateFlags::test_quest_state_has_met_leader_flag 
+[gw1] [ 20%] PASSED tests/test_polymorph_quest_parity.py::TestQuestStateFlags::test_quest_state_has_met_leader_flag 
+tests/test_polymorph_quest_parity.py::TestQuestStateFlags::test_quest_state_has_killed_nemesis_flag 
+[gw1] [ 20%] PASSED tests/test_polymorph_quest_parity.py::TestQuestStateFlags::test_quest_state_has_killed_nemesis_flag 
+tests/test_polymorph_quest_parity.py::TestQuestStateFlags::test_quest_state_has_touched_artifact_flag 
+[gw1] [ 20%] PASSED tests/test_polymorph_quest_parity.py::TestQuestStateFlags::test_quest_state_has_touched_artifact_flag 
+tests/test_polymorph_quest_parity.py::TestQuestStateFlags::test_quest_state_has_qexpelled_flag 
+[gw1] [ 21%] PASSED tests/test_polymorph_quest_parity.py::TestQuestStateFlags::test_quest_state_has_qexpelled_flag 
+tests/test_polymorph_quest_parity.py::TestCheckQuestComplete::test_check_quest_complete_requires_all_three 
+[gw1] [ 21%] PASSED tests/test_polymorph_quest_parity.py::TestCheckQuestComplete::test_check_quest_complete_requires_all_three 
+tests/test_role_race_parity.py::test_roles_table_has_13_entries 
+[gw1] [ 22%] PASSED tests/test_role_race_parity.py::test_roles_table_has_13_entries 
+tests/test_role_race_parity.py::test_races_table_has_5_entries 
+[gw1] [ 22%] PASSED tests/test_role_race_parity.py::test_races_table_has_5_entries 
+tests/test_role_race_parity.py::test_all_roles_have_required_fields 
+[gw1] [ 22%] PASSED tests/test_role_race_parity.py::test_all_roles_have_required_fields 
+tests/test_role_race_parity.py::test_valkyrie_attrbase_str_18_dex_16_con_16_int_8_wis_10_cha_10 
+[gw1] [ 23%] PASSED tests/test_role_race_parity.py::test_valkyrie_attrbase_str_18_dex_16_con_16_int_8_wis_10_cha_10 
+tests/test_role_race_parity.py::test_wizard_attrbase_str_7_int_18_wis_10_dex_10_con_10_cha_8 
+[gw1] [ 23%] PASSED tests/test_role_race_parity.py::test_wizard_attrbase_str_7_int_18_wis_10_dex_10_con_10_cha_8 
+tests/test_role_race_parity.py::test_archeologist_attrbase_and_dist 
+[gw1] [ 24%] PASSED tests/test_role_race_parity.py::test_archeologist_attrbase_and_dist 
+tests/test_role_race_parity.py::test_barbarian_attrbase_high_str_and_con 
+[gw1] [ 24%] PASSED tests/test_role_race_parity.py::test_barbarian_attrbase_high_str_and_con 
+tests/test_role_race_parity.py::test_samurai_attrbase_con_17_str_10 
+[gw1] [ 24%] PASSED tests/test_role_race_parity.py::test_samurai_attrbase_con_17_str_10 
+tests/test_role_race_parity.py::test_healer_attrbase_high_cha 
+[gw1] [ 25%] PASSED tests/test_role_race_parity.py::test_healer_attrbase_high_cha 
+tests/test_role_race_parity.py::test_priest_initrec_alignment_record_starts_at_5 
+[gw1] [ 25%] PASSED tests/test_role_race_parity.py::test_priest_initrec_alignment_record_starts_at_5 
+tests/test_role_race_parity.py::test_role_pet_assignments 
+[gw1] [ 26%] PASSED tests/test_role_race_parity.py::test_role_pet_assignments 
+tests/test_role_race_parity.py::test_valkyrie_is_female_only 
+[gw1] [ 26%] PASSED tests/test_role_race_parity.py::test_valkyrie_is_female_only 
+tests/test_role_race_parity.py::test_knight_lawful_only_human_only 
+[gw1] [ 26%] PASSED tests/test_role_race_parity.py::test_knight_lawful_only_human_only 
+tests/test_role_race_parity.py::test_wizard_multi_race_multi_align 
+[gw1] [ 27%] PASSED tests/test_role_race_parity.py::test_wizard_multi_race_multi_align 
+tests/test_role_race_parity.py::test_valkyrie_hpadv 
+[gw1] [ 27%] PASSED tests/test_role_race_parity.py::test_valkyrie_hpadv 
+tests/test_role_race_parity.py::test_wizard_enadv_high_energy_gain 
+[gw1] [ 28%] PASSED tests/test_role_race_parity.py::test_wizard_enadv_high_energy_gain 
+tests/test_role_race_parity.py::test_human_attrmin_3_3_3_3_3_3_attrmax_18_18_18_18_18_18 
+[gw1] [ 28%] PASSED tests/test_role_race_parity.py::test_human_attrmin_3_3_3_3_3_3_attrmax_18_18_18_18_18_18 
+tests/test_role_race_parity.py::test_elf_attrmin_higher_int_and_dex 
+[gw1] [ 28%] PASSED tests/test_role_race_parity.py::test_elf_attrmin_higher_int_and_dex 
+tests/test_role_race_parity.py::test_dwarf_higher_con 
+[gw1] [ 29%] PASSED tests/test_role_race_parity.py::test_dwarf_higher_con 
+tests/test_role_race_parity.py::test_gnome_lower_str 
+[gw1] [ 29%] PASSED tests/test_role_race_parity.py::test_gnome_lower_str 
+tests/test_role_race_parity.py::test_orc_higher_str_lower_wis 
+[gw1] [ 30%] PASSED tests/test_role_race_parity.py::test_orc_higher_str_lower_wis 
+tests/test_role_race_parity.py::test_human_allows_all_three_alignments 
+[gw1] [ 30%] PASSED tests/test_role_race_parity.py::test_human_allows_all_three_alignments 
+tests/test_role_race_parity.py::test_elf_chaotic_only 
+[gw1] [ 31%] PASSED tests/test_role_race_parity.py::test_elf_chaotic_only 
+tests/test_role_race_parity.py::test_dwarf_lawful_only 
+[gw1] [ 31%] PASSED tests/test_role_race_parity.py::test_dwarf_lawful_only 
+tests/test_role_race_parity.py::test_role_quest_data 
+[gw1] [ 31%] PASSED tests/test_role_race_parity.py::test_role_quest_data 
+tests/test_role_race_parity.py::test_role_starting_skills 
+[gw1] [ 32%] PASSED tests/test_role_race_parity.py::test_role_starting_skills 
+tests/test_role_race_parity.py::test_role_filecode_parity[0-Arc] 
+[gw1] [ 32%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[0-Arc] 
+tests/test_role_race_parity.py::test_role_filecode_parity[1-Bar] 
+[gw1] [ 33%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[1-Bar] 
+tests/test_role_race_parity.py::test_role_filecode_parity[2-Cav] 
+[gw1] [ 33%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[2-Cav] 
+tests/test_role_race_parity.py::test_role_filecode_parity[3-Hea] 
+[gw1] [ 33%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[3-Hea] 
+tests/test_role_race_parity.py::test_role_filecode_parity[4-Kni] 
+[gw1] [ 34%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[4-Kni] 
+tests/test_role_race_parity.py::test_role_filecode_parity[5-Mon] 
+[gw1] [ 34%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[5-Mon] 
+tests/test_role_race_parity.py::test_role_filecode_parity[6-Pri] 
+[gw1] [ 35%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[6-Pri] 
+tests/test_role_race_parity.py::test_role_filecode_parity[7-Ran] 
+[gw1] [ 35%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[7-Ran] 
+tests/test_role_race_parity.py::test_role_filecode_parity[8-Rog] 
+[gw1] [ 35%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[8-Rog] 
+tests/test_role_race_parity.py::test_role_filecode_parity[9-Sam] 
+[gw1] [ 36%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[9-Sam] 
+tests/test_role_race_parity.py::test_role_filecode_parity[10-Tou] 
+[gw1] [ 36%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[10-Tou] 
+tests/test_role_race_parity.py::test_role_filecode_parity[11-Val] 
+[gw1] [ 37%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[11-Val] 
+tests/test_role_race_parity.py::test_role_filecode_parity[12-Wiz] 
+[gw1] [ 37%] PASSED tests/test_role_race_parity.py::test_role_filecode_parity[12-Wiz] 
+tests/test_role_race_parity.py::test_race_filecode_parity[0-Hum] 
+[gw1] [ 37%] PASSED tests/test_role_race_parity.py::test_race_filecode_parity[0-Hum] 
+tests/test_role_race_parity.py::test_race_filecode_parity[1-Elf] 
+[gw1] [ 38%] PASSED tests/test_role_race_parity.py::test_race_filecode_parity[1-Elf] 
+tests/test_role_race_parity.py::test_race_filecode_parity[2-Dwa] 
+[gw1] [ 38%] PASSED tests/test_role_race_parity.py::test_race_filecode_parity[2-Dwa] 
+tests/test_role_race_parity.py::test_race_filecode_parity[3-Gno] 
+[gw1] [ 39%] PASSED tests/test_role_race_parity.py::test_race_filecode_parity[3-Gno] 
+tests/test_role_race_parity.py::test_race_filecode_parity[4-Orc] 
+[gw1] [ 39%] PASSED tests/test_role_race_parity.py::test_race_filecode_parity[4-Orc] 
+tests/test_role_race_parity.py::test_normalize_ranges_helper_is_gone 
+[gw1] [ 40%] PASSED tests/test_role_race_parity.py::test_normalize_ranges_helper_is_gone 
+tests/test_role_race_parity.py::test_starting_stats_ranges_are_well_formed 
+[gw1] [ 40%] PASSED tests/test_role_race_parity.py::test_starting_stats_ranges_are_well_formed 
+tests/test_role_race_parity.py::test_starting_stats_lo_equals_role_attrbase 
+[gw1] [ 40%] PASSED tests/test_role_race_parity.py::test_starting_stats_lo_equals_role_attrbase 
+tests/test_save_load.py::test_save_load_round_trip_default_state 
+[gw1] [ 41%] PASSED tests/test_save_load.py::test_save_load_round_trip_default_state 
+tests/test_save_load.py::test_save_load_round_trip_after_steps 
+[gw1] [ 41%] PASSED tests/test_save_load.py::test_save_load_round_trip_after_steps 
+tests/test_save_load.py::test_save_load_preserves_dtypes 
+[gw1] [ 42%] PASSED tests/test_save_load.py::test_save_load_preserves_dtypes 
+tests/test_save_load.py::test_save_load_preserves_shapes 
+[gw1] [ 42%] PASSED tests/test_save_load.py::test_save_load_preserves_shapes 
+tests/test_save_load.py::test_save_load_compressed_file_smaller_than_raw 
+[gw1] [ 42%] PASSED tests/test_save_load.py::test_save_load_compressed_file_smaller_than_raw 
+tests/test_save_load.py::test_load_wrong_version_raises 
+[gw1] [ 43%] PASSED tests/test_save_load.py::test_load_wrong_version_raises 
+tests/test_save_load.py::test_check_version_without_full_load 
+[gw1] [ 43%] PASSED tests/test_save_load.py::test_check_version_without_full_load 
+tests/test_save_load.py::test_load_corrupted_file_raises 
+[gw1] [ 44%] PASSED tests/test_save_load.py::test_load_corrupted_file_raises 
+tests/test_save_load.py::test_save_load_preserves_player_pos 
+[gw1] [ 44%] PASSED tests/test_save_load.py::test_save_load_preserves_player_pos 
+tests/test_save_load.py::test_save_load_preserves_inventory_items 
+[gw1] [ 44%] PASSED tests/test_save_load.py::test_save_load_preserves_inventory_items 
+tests/test_save_load.py::test_save_load_accepts_str_and_path 
+[gw1] [ 45%] PASSED tests/test_save_load.py::test_save_load_accepts_str_and_path 
+tests/test_save_load_full.py::test_save_load_polymorph_state_fully_preserved 
+[gw1] [ 45%] PASSED tests/test_save_load_full.py::test_save_load_polymorph_state_fully_preserved 
+tests/test_save_load_full.py::test_save_load_monster_ai_inventory_preserved 
+[gw1] [ 46%] PASSED tests/test_save_load_full.py::test_save_load_monster_ai_inventory_preserved 
+tests/test_save_load_full.py::test_save_load_containers_preserved 
+[gw1] [ 46%] PASSED tests/test_save_load_full.py::test_save_load_containers_preserved 
+tests/test_save_load_full.py::test_save_load_engrave_preserved 
+[gw1] [ 46%] PASSED tests/test_save_load_full.py::test_save_load_engrave_preserved 
+tests/test_save_load_full.py::test_save_load_prayer_state_all_fields 
+[gw1] [ 47%] PASSED tests/test_save_load_full.py::test_save_load_prayer_state_all_fields 
+tests/test_save_load_full.py::test_save_load_identification_detect_flags 
+[gw1] [ 47%] PASSED tests/test_save_load_full.py::test_save_load_identification_detect_flags 
+tests/test_save_load_full.py::test_save_load_dungeon_vibrating_square 
+[gw1] [ 48%] PASSED tests/test_save_load_full.py::test_save_load_dungeon_vibrating_square 
+tests/test_save_load_full.py::test_save_load_inventory_user_names 
+[gw1] [ 48%] PASSED tests/test_save_load_full.py::test_save_load_inventory_user_names 
+tests/test_save_load_full.py::test_save_load_combat_two_weapon 
+[gw1] [ 48%] PASSED tests/test_save_load_full.py::test_save_load_combat_two_weapon 
+tests/test_save_load_full.py::test_save_load_conduct_all_13_violations 
+[gw1] [ 49%] PASSED tests/test_save_load_full.py::test_save_load_conduct_all_13_violations 
+tests/test_save_load_full.py::test_save_load_magic_pw_regen_and_spells 
+[gw1] [ 49%] PASSED tests/test_save_load_full.py::test_save_load_magic_pw_regen_and_spells 
+tests/test_save_load_full.py::test_save_load_full_state_after_100_steps 
+[gw1] [ 50%] PASSED tests/test_save_load_full.py::test_save_load_full_state_after_100_steps 
+tests/test_save_load_full.py::test_save_load_version_mismatch_raises 
+[gw1] [ 50%] PASSED tests/test_save_load_full.py::test_save_load_version_mismatch_raises 
+tests/test_corpse_side_effects_parity.py::test_old_corpse_vomits 
+[gw1] [ 51%] PASSED tests/test_corpse_side_effects_parity.py::test_old_corpse_vomits 
+tests/test_corpse_side_effects_parity.py::test_cannibalism_align_hit 
+[gw1] [ 51%] PASSED tests/test_corpse_side_effects_parity.py::test_cannibalism_align_hit 
+tests/test_corpse_side_effects_parity.py::test_cannibalism_no_hit_other_race 
+[gw1] [ 51%] PASSED tests/test_corpse_side_effects_parity.py::test_cannibalism_no_hit_other_race 
+tests/test_corpse_side_effects_parity.py::test_tin_opening_counter_uncursed 
+[gw1] [ 52%] PASSED tests/test_corpse_side_effects_parity.py::test_tin_opening_counter_uncursed 
+tests/test_corpse_side_effects_parity.py::test_tin_opening_counter_blessed 
+[gw1] [ 52%] PASSED tests/test_corpse_side_effects_parity.py::test_tin_opening_counter_blessed 
+tests/test_corpse_side_effects_parity.py::test_tin_opens_after_n_turns 
+[gw1] [ 53%] PASSED tests/test_corpse_side_effects_parity.py::test_tin_opens_after_n_turns 
+tests/test_corpse_side_effects_parity.py::test_tin_blessed_opens_after_30_turns 
+[gw1] [ 53%] PASSED tests/test_corpse_side_effects_parity.py::test_tin_blessed_opens_after_30_turns 
+tests/test_crown_gcrownu.py::test_gcrownu_grants_six_intrinsics 
+[gw1] [ 53%] PASSED tests/test_crown_gcrownu.py::test_gcrownu_grants_six_intrinsics 
+tests/test_crown_gcrownu.py::test_gcrownu_knight_lawful_gets_excalibur 
+[gw1] [ 54%] PASSED tests/test_crown_gcrownu.py::test_gcrownu_knight_lawful_gets_excalibur 
+tests/test_crown_gcrownu.py::test_gcrownu_wizard_gets_magicbane 
+[gw1] [ 54%] PASSED tests/test_crown_gcrownu.py::test_gcrownu_wizard_gets_magicbane 
+tests/test_crown_gcrownu.py::test_gcrownu_valkyrie_lawful_gets_mjollnir 
+[gw1] [ 55%] PASSED tests/test_crown_gcrownu.py::test_gcrownu_valkyrie_lawful_gets_mjollnir 
+tests/test_crown_gcrownu.py::test_gcrownu_valkyrie_chaotic_gets_frost_brand 
+[gw1] [ 55%] PASSED tests/test_crown_gcrownu.py::test_gcrownu_valkyrie_chaotic_gets_frost_brand 
+tests/test_crown_gcrownu.py::test_gcrownu_priest_neutral_gets_sceptre 
+[gw1] [ 55%] PASSED tests/test_crown_gcrownu.py::test_gcrownu_priest_neutral_gets_sceptre 
+tests/test_crown_gcrownu.py::test_gcrownu_priest_lawful_or_chaotic_gets_mjollnir 
+[gw1] [ 56%] PASSED tests/test_crown_gcrownu.py::test_gcrownu_priest_lawful_or_chaotic_gets_mjollnir 
+tests/test_crown_gcrownu.py::test_gcrownu_samurai_gets_snickersnee 
+[gw1] [ 56%] PASSED tests/test_crown_gcrownu.py::test_gcrownu_samurai_gets_snickersnee 
+tests/test_crown_gcrownu.py::test_gcrownu_other_role_artifacts 
+[gw1] [ 57%] PASSED tests/test_crown_gcrownu.py::test_gcrownu_other_role_artifacts 
+tests/test_crown_gcrownu.py::test_gcrownu_jit_safe 
+[gw1] [ 57%] PASSED tests/test_crown_gcrownu.py::test_gcrownu_jit_safe 
+tests/test_cursed_book_full_parity.py::test_cursed_teleport_branch 
+[gw1] [ 57%] PASSED tests/test_cursed_book_full_parity.py::test_cursed_teleport_branch 
+tests/test_cursed_book_full_parity.py::test_cursed_aggravate_branch 
+[gw1] [ 58%] PASSED tests/test_cursed_book_full_parity.py::test_cursed_aggravate_branch 
+tests/test_cursed_book_full_parity.py::test_cursed_blind_branch 
+[gw1] [ 58%] PASSED tests/test_cursed_book_full_parity.py::test_cursed_blind_branch 
+tests/test_cursed_book_full_parity.py::test_cursed_take_gold_branch 
+[gw1] [ 59%] PASSED tests/test_cursed_book_full_parity.py::test_cursed_take_gold_branch 
+tests/test_cursed_book_full_parity.py::test_cursed_confuse_branch 
+[gw1] [ 59%] PASSED tests/test_cursed_book_full_parity.py::test_cursed_confuse_branch 
+tests/test_cursed_book_full_parity.py::test_cursed_poison_branch 
+[gw1] [ 60%] PASSED tests/test_cursed_book_full_parity.py::test_cursed_poison_branch 
+tests/test_cursed_book_full_parity.py::test_cursed_explode_branch 
+[gw1] [ 60%] PASSED tests/test_cursed_book_full_parity.py::test_cursed_explode_branch 
+tests/test_cursed_book_full_parity.py::test_cursed_book_never_learns_spell 
+[gw1] [ 60%] PASSED tests/test_cursed_book_full_parity.py::test_cursed_book_never_learns_spell 
+tests/test_cursed_book_parity.py::test_cursed_book_no_learn 
+[gw1] [ 61%] PASSED tests/test_cursed_book_parity.py::test_cursed_book_no_learn 
+tests/test_cursed_book_parity.py::test_cursed_book_some_branch_triggers 
+[gw1] [ 61%] PASSED tests/test_cursed_book_parity.py::test_cursed_book_some_branch_triggers 
+tests/test_cursed_book_parity.py::test_cursed_book_damages 
+[gw1] [ 62%] PASSED tests/test_cursed_book_parity.py::test_cursed_book_damages 
+tests/test_cursed_book_parity.py::test_blessed_book_succeeds_more_than_uncursed 
+[gw1] [ 62%] PASSED tests/test_cursed_book_parity.py::test_blessed_book_succeeds_more_than_uncursed 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_features_dip_fountain_stub_gone 
+[gw1] [ 62%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_features_dip_fountain_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_features_sit_throne_stub_gone 
+[gw1] [ 63%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_features_sit_throne_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_combat_ranged_attack_stub_gone 
+[gw1] [ 63%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_combat_ranged_attack_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_combat_passive_attack_stub_gone 
+[gw1] [ 64%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_combat_passive_attack_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_shop_enter_shop_stub_gone 
+[gw1] [ 64%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_shop_enter_shop_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_shop_pickup_in_shop_stub_gone 
+[gw1] [ 64%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_shop_pickup_in_shop_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_shop_pay_bill_stub_gone 
+[gw1] [ 65%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_shop_pay_bill_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_shop_attack_shopkeeper_stub_gone 
+[gw1] [ 65%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_shop_attack_shopkeeper_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_inventory_put_on_ring_stub_gone 
+[gw1] [ 66%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_inventory_put_on_ring_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_items_apply_blessing_stub_gone 
+[gw1] [ 66%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_items_apply_blessing_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_items_apply_curse_stub_gone 
+[gw1] [ 66%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_items_apply_curse_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_items_erode_stub_gone 
+[gw1] [ 67%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_items_erode_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_items_enchant_stub_gone 
+[gw1] [ 67%] PASSED tests/test_dead_code_cleanup_parity.py::TestDeletedStubsNotImportable::test_items_enchant_stub_gone 
+tests/test_dead_code_cleanup_parity.py::TestPartialIdIdentifiesCntItems::test_identifies_exactly_cnt_items_from_zero 
+[gw1] [ 68%] PASSED tests/test_dead_code_cleanup_parity.py::TestPartialIdIdentifiesCntItems::test_identifies_exactly_cnt_items_from_zero 
+tests/test_dead_code_cleanup_parity.py::TestPartialIdIdentifiesCntItems::test_identifies_exactly_cnt_additional_items 
+[gw1] [ 68%] PASSED tests/test_dead_code_cleanup_parity.py::TestPartialIdIdentifiesCntItems::test_identifies_exactly_cnt_additional_items 
+tests/test_dead_code_cleanup_parity.py::TestPartialIdIdentifiesCntItems::test_does_not_exceed_total_slots 
+[gw1] [ 68%] PASSED tests/test_dead_code_cleanup_parity.py::TestPartialIdIdentifiesCntItems::test_does_not_exceed_total_slots 
+tests/test_dead_code_cleanup_parity.py::TestPartialIdIdentifiesCntItems::test_cnt_zero_changes_nothing 
+[gw1] [ 69%] PASSED tests/test_dead_code_cleanup_parity.py::TestPartialIdIdentifiesCntItems::test_cnt_zero_changes_nothing 
+tests/test_dead_code_cleanup_parity.py::TestPartialIdIdentifiesCntItems::test_different_rngs_pick_different_slots 
+[gw1] [ 69%] PASSED tests/test_dead_code_cleanup_parity.py::TestPartialIdIdentifiesCntItems::test_different_rngs_pick_different_slots 
+tests/test_dead_code_cleanup_parity.py::TestMessagesEmitAppendsToHistory::test_emit_increments_history_index 
+[gw1] [ 70%] PASSED tests/test_dead_code_cleanup_parity.py::TestMessagesEmitAppendsToHistory::test_emit_increments_history_index 
+tests/test_dead_code_cleanup_parity.py::TestMessagesEmitAppendsToHistory::test_emit_saves_old_buffer_to_history 
+[gw1] [ 70%] PASSED tests/test_dead_code_cleanup_parity.py::TestMessagesEmitAppendsToHistory::test_emit_saves_old_buffer_to_history 
+tests/test_dead_code_cleanup_parity.py::TestMessagesEmitAppendsToHistory::test_emit_writes_msg_id_to_new_buffer 
+[gw1] [ 71%] PASSED tests/test_dead_code_cleanup_parity.py::TestMessagesEmitAppendsToHistory::test_emit_writes_msg_id_to_new_buffer 
+tests/test_dead_code_cleanup_parity.py::TestMessagesEmitAppendsToHistory::test_emit_ring_wraps_at_history_len 
+[gw1] [ 71%] PASSED tests/test_dead_code_cleanup_parity.py::TestMessagesEmitAppendsToHistory::test_emit_ring_wraps_at_history_len 
+tests/test_dead_code_cleanup_parity.py::TestMessagesEmitAppendsToHistory::test_emit_multiple_messages_accumulate 
+[gw1] [ 71%] PASSED tests/test_dead_code_cleanup_parity.py::TestMessagesEmitAppendsToHistory::test_emit_multiple_messages_accumulate 
+tests/test_dead_code_cleanup_parity.py::TestDlaMazeHasFloorTiles::test_dla_maze_has_floor_tiles 
+[gw1] [ 72%] PASSED tests/test_dead_code_cleanup_parity.py::TestDlaMazeHasFloorTiles::test_dla_maze_has_floor_tiles 
+tests/test_dead_code_cleanup_parity.py::TestDlaMazeHasFloorTiles::test_dla_maze_shape 
+[gw1] [ 72%] PASSED tests/test_dead_code_cleanup_parity.py::TestDlaMazeHasFloorTiles::test_dla_maze_shape 
+tests/test_dead_code_cleanup_parity.py::TestDlaMazeHasFloorTiles::test_dla_maze_boundary_is_wall 
+[gw1] [ 73%] PASSED tests/test_dead_code_cleanup_parity.py::TestDlaMazeHasFloorTiles::test_dla_maze_boundary_is_wall 
+tests/test_dead_code_cleanup_parity.py::TestDlaMazeHasFloorTiles::test_dla_maze_different_seeds_differ 
+[gw0] [ 73%] XFAIL tests/test_combat_stubs_resolved_parity.py::test_paralyzed_target_bonus 
+tests/test_combat_stubs_resolved_parity.py::test_negative_ac_softer 
+[gw1] [ 73%] PASSED tests/test_dead_code_cleanup_parity.py::TestDlaMazeHasFloorTiles::test_dla_maze_different_seeds_differ 
+tests/test_polish_remaining_parity.py::test_amax_restored 
+[gw1] [ 74%] PASSED tests/test_polish_remaining_parity.py::test_amax_restored 
+tests/test_polish_remaining_parity.py::test_amax_doesnt_restore_above 
+[gw1] [ 74%] PASSED tests/test_polish_remaining_parity.py::test_amax_doesnt_restore_above 
+tests/test_polish_remaining_parity.py::test_cursed_book_explode_destroys_book_and_damages_hp 
+[gw1] [ 75%] PASSED tests/test_polish_remaining_parity.py::test_cursed_book_explode_destroys_book_and_damages_hp 
+tests/test_polish_remaining_parity.py::test_lock_pick_opens_chest 
+[gw1] [ 75%] PASSED tests/test_polish_remaining_parity.py::test_lock_pick_opens_chest 
+tests/test_constants_parity.py::test_tiletype_drawbridge_up_present 
+[gw1] [ 75%] PASSED tests/test_constants_parity.py::test_tiletype_drawbridge_up_present 
+tests/test_constants_parity.py::test_tiletype_count_matches_vendor 
+[gw1] [ 76%] PASSED tests/test_constants_parity.py::test_tiletype_count_matches_vendor 
+tests/test_constants_parity.py::test_tiletype_vendor_specific_entries 
+[gw1] [ 76%] PASSED tests/test_constants_parity.py::test_tiletype_vendor_specific_entries 
+tests/test_constants_parity.py::test_command_eat_value_lowercase_e 
+[gw1] [ 77%] PASSED tests/test_constants_parity.py::test_command_eat_value_lowercase_e 
+tests/test_constants_parity.py::test_command_pray_value_meta_p 
+[gw1] [ 77%] PASSED tests/test_constants_parity.py::test_command_pray_value_meta_p 
+tests/test_constants_parity.py::test_command_count_121 
+[gw1] [ 77%] PASSED tests/test_constants_parity.py::test_command_count_121 
+tests/test_constants_parity.py::test_command_spot_check_keystrokes 
+[gw1] [ 78%] PASSED tests/test_constants_parity.py::test_command_spot_check_keystrokes 
+tests/test_containers.py::test_container_state_initial_empty 
+[gw1] [ 78%] PASSED tests/test_containers.py::test_container_state_initial_empty 
+tests/test_containers.py::test_open_bag_marks_open 
+[gw1] [ 79%] PASSED tests/test_containers.py::test_open_bag_marks_open 
+tests/test_containers.py::test_put_item_in_bag 
+[gw1] [ 79%] PASSED tests/test_containers.py::test_put_item_in_bag 
+tests/test_containers.py::test_take_item_from_bag 
+[gw1] [ 80%] PASSED tests/test_containers.py::test_take_item_from_bag 
+tests/test_containers.py::test_bag_of_holding_reduces_weight 
+[gw1] [ 80%] PASSED tests/test_containers.py::test_bag_of_holding_reduces_weight 
+tests/test_containers.py::test_blessed_bag_of_holding_quarter_weight 
+[gw1] [ 80%] PASSED tests/test_containers.py::test_blessed_bag_of_holding_quarter_weight 
+tests/test_containers.py::test_cursed_bag_of_holding_double_weight 
+[gw1] [ 81%] PASSED tests/test_containers.py::test_cursed_bag_of_holding_double_weight 
+tests/test_containers.py::test_cursed_bag_of_tricks_explodes_on_open 
+[gw1] [ 81%] PASSED tests/test_containers.py::test_cursed_bag_of_tricks_explodes_on_open 
+tests/test_containers.py::test_put_too_many_items_caps_at_max 
+[gw1] [ 82%] PASSED tests/test_containers.py::test_put_too_many_items_caps_at_max 
+tests/test_containers.py::test_take_from_empty_container_noop 
+[gw1] [ 82%] PASSED tests/test_containers.py::test_take_from_empty_container_noop 
+tests/test_containers_polish_parity.py::test_uncursed_boh_reduces_weight 
+[gw1] [ 82%] PASSED tests/test_containers_polish_parity.py::test_uncursed_boh_reduces_weight 
+tests/test_containers_polish_parity.py::test_blessed_boh_reduces_more 
+[gw1] [ 83%] PASSED tests/test_containers_polish_parity.py::test_blessed_boh_reduces_more 
+tests/test_containers_polish_parity.py::test_cursed_bag_eats 
+[gw1] [ 83%] PASSED tests/test_containers_polish_parity.py::test_cursed_bag_eats 
+tests/test_containers_polish_parity.py::test_bag_of_tricks_spawns 
+[gw1] [ 84%] PASSED tests/test_containers_polish_parity.py::test_bag_of_tricks_spawns 
+tests/test_containers_polish_parity.py::test_container_trap_on_open 
+[gw1] [ 84%] PASSED tests/test_containers_polish_parity.py::test_container_trap_on_open 
+tests/test_corpse_intrinsics_parity.py::test_floating_eye_grants_telepathy 
+[gw1] [ 84%] PASSED tests/test_corpse_intrinsics_parity.py::test_floating_eye_grants_telepathy 
+tests/test_corpse_intrinsics_parity.py::test_tengu_grants_teleport 
+[gw1] [ 85%] PASSED tests/test_corpse_intrinsics_parity.py::test_tengu_grants_teleport 
+tests/test_corpse_intrinsics_parity.py::test_newt_pw_bonus 
+[gw1] [ 85%] PASSED tests/test_corpse_intrinsics_parity.py::test_newt_pw_bonus 
+tests/test_corpse_intrinsics_parity.py::test_poisonous_corpse_damages 
+[gw1] [ 86%] PASSED tests/test_corpse_intrinsics_parity.py::test_poisonous_corpse_damages 
+tests/test_corpse_intrinsics_parity.py::test_poison_resist_blocks_damage 
+[gw1] [ 86%] PASSED tests/test_corpse_intrinsics_parity.py::test_poison_resist_blocks_damage 
+tests/test_corpse_side_effects_parity.py::test_poisonous_corpse_damages 
+[gw1] [ 86%] PASSED tests/test_corpse_side_effects_parity.py::test_poisonous_corpse_damages 
+tests/test_corpse_side_effects_parity.py::test_poison_resist_blocks_damage 
+[gw1] [ 87%] PASSED tests/test_corpse_side_effects_parity.py::test_poison_resist_blocks_damage 
+tests/test_corpse_side_effects_parity.py::test_acidic_corpse_damages 
+[gw1] [ 87%] PASSED tests/test_corpse_side_effects_parity.py::test_acidic_corpse_damages 
+tests/test_conduct_scoreboard.py::test_scoreboard_bytes_violated_row_is_zero 
+[gw1] [ 88%] PASSED tests/test_conduct_scoreboard.py::test_scoreboard_bytes_violated_row_is_zero 
+tests/test_conduct_scoreboard.py::test_score_bonus_all_preserved 
+[gw1] [ 88%] PASSED tests/test_conduct_scoreboard.py::test_score_bonus_all_preserved 
+tests/test_conduct_scoreboard.py::test_score_bonus_after_eat 
+[gw1] [ 88%] PASSED tests/test_conduct_scoreboard.py::test_score_bonus_after_eat 
+tests/test_conduct_scoreboard.py::test_score_bonus_zero_if_all_violated 
+[gw1] [ 89%] PASSED tests/test_conduct_scoreboard.py::test_score_bonus_zero_if_all_violated 
+tests/test_conduct_scoreboard.py::test_score_bonus_pacifist_largest_value 
+[gw1] [ 89%] PASSED tests/test_conduct_scoreboard.py::test_score_bonus_pacifist_largest_value 
+tests/test_conduct_scoreboard.py::test_score_bonus_dtype_is_int32 
+[gw1] [ 90%] PASSED tests/test_conduct_scoreboard.py::test_score_bonus_dtype_is_int32 
+tests/test_conduct_scoreboard.py::test_score_bonus_jit_safe 
+[gw1] [ 90%] PASSED tests/test_conduct_scoreboard.py::test_score_bonus_jit_safe 
+tests/test_constants_parity.py::test_message_history_ring_buffer_20_entries 
+[gw1] [ 91%] PASSED tests/test_constants_parity.py::test_message_history_ring_buffer_20_entries 
+tests/test_constants_parity.py::test_message_max_bufsz_256 
+[gw1] [ 91%] PASSED tests/test_constants_parity.py::test_message_max_bufsz_256 
+tests/test_constants_parity.py::test_state_has_player_hp_uhp_equivalent 
+[gw1] [ 91%] PASSED tests/test_constants_parity.py::test_state_has_player_hp_uhp_equivalent 
+tests/test_constants_parity.py::test_state_has_uconduct_equivalent 
+[gw1] [ 92%] PASSED tests/test_constants_parity.py::test_state_has_uconduct_equivalent 
+tests/test_constants_parity.py::test_state_has_uluck_and_moreluck 
+[gw1] [ 92%] PASSED tests/test_constants_parity.py::test_state_has_uluck_and_moreluck 
+tests/test_constants_parity.py::test_state_has_in_water_and_buried 
+[gw1] [ 93%] PASSED tests/test_constants_parity.py::test_state_has_in_water_and_buried 
+tests/test_constants_parity.py::test_state_has_mortality_counter 
+[gw1] [ 93%] PASSED tests/test_constants_parity.py::test_state_has_mortality_counter 
+tests/test_constants_parity.py::test_tiletype_stone_zero 
+[gw1] [ 93%] PASSED tests/test_constants_parity.py::test_tiletype_stone_zero 
+tests/test_conduct_parity.py::test_kept_conducts_award_bonus 
+[gw1] [ 94%] PASSED tests/test_conduct_parity.py::test_kept_conducts_award_bonus 
+tests/test_conduct_scoreboard.py::test_scoreboard_all_preserved 
+[gw1] [ 94%] PASSED tests/test_conduct_scoreboard.py::test_scoreboard_all_preserved 
+tests/test_conduct_scoreboard.py::test_scoreboard_after_eat 
+[gw1] [ 95%] PASSED tests/test_conduct_scoreboard.py::test_scoreboard_after_eat 
+tests/test_conduct_scoreboard.py::test_scoreboard_after_pray 
+[gw1] [ 95%] PASSED tests/test_conduct_scoreboard.py::test_scoreboard_after_pray 
+tests/test_conduct_scoreboard.py::test_scoreboard_order_matches_list_conducts 
+[gw1] [ 95%] PASSED tests/test_conduct_scoreboard.py::test_scoreboard_order_matches_list_conducts 
+tests/test_conduct_scoreboard.py::test_scoreboard_bytes_shape 
+[gw1] [ 96%] PASSED tests/test_conduct_scoreboard.py::test_scoreboard_bytes_shape 
+tests/test_conduct_scoreboard.py::test_scoreboard_bytes_preserved_decodes 
+[gw1] [ 96%] PASSED tests/test_conduct_scoreboard.py::test_scoreboard_bytes_preserved_decodes 
+tests/test_conduct_parity.py::test_atheist_violated_on_pray 
+[gw1] [ 97%] PASSED tests/test_conduct_parity.py::test_atheist_violated_on_pray 
+tests/test_conduct_parity.py::test_illiterate_violated_on_read 
+[gw1] [ 97%] PASSED tests/test_conduct_parity.py::test_illiterate_violated_on_read 
+tests/test_conduct_parity.py::test_wish_free_violated_on_wand_of_wishing 
+[gw1] [ 97%] PASSED tests/test_conduct_parity.py::test_wish_free_violated_on_wand_of_wishing 
+tests/test_conduct_parity.py::test_polyselfless_violated_on_poly_potion 
+[gw1] [ 98%] PASSED tests/test_conduct_parity.py::test_polyselfless_violated_on_poly_potion 
+tests/test_conduct_parity.py::test_pacifist_violated_on_kill 
+[gw1] [ 98%] PASSED tests/test_conduct_parity.py::test_pacifist_violated_on_kill 
+tests/test_conduct_parity.py::test_foodless_violated_on_eat 
+[gw1] [ 99%] PASSED tests/test_conduct_parity.py::test_foodless_violated_on_eat 
+[gw0] [ 99%] XFAIL tests/test_combat_stubs_resolved_parity.py::test_negative_ac_softer 
+tests/test_combat_stubs_resolved_parity.py::test_disarmed_monster_lower_damage 
+[gw0] [100%] XFAIL tests/test_combat_stubs_resolved_parity.py::test_disarmed_monster_lower_damage 
+
+=============================== warnings summary ===============================
+tests/test_save_load.py: 10 warnings
+tests/test_save_load_full.py: 13 warnings
+tests/test_containers_polish_parity.py: 5 warnings
+tests/test_constants_parity.py: 5 warnings
+  /Users/rsiegelmann/Downloads/Projects/nethax/.venv/lib/python3.12/site-packages/jax/_src/ops/scatter.py:103: FutureWarning: scatter inputs have incompatible types: cannot safely cast value from dtype=int16 to dtype=int8 with jax_numpy_dtype_promotion=standard. In future JAX releases this will result in an error.
+    warnings.warn(
+
+tests/test_save_load.py::test_save_load_round_trip_after_steps
+  /Users/rsiegelmann/Downloads/Projects/nethax/.venv/lib/python3.12/site-packages/jax/_src/ops/scatter.py:103: FutureWarning: scatter inputs have incompatible types: cannot safely cast value from dtype=int64 to dtype=int32 with jax_numpy_dtype_promotion=standard. In future JAX releases this will result in an error.
+    warnings.warn(
+
+tests/test_save_load.py::test_save_load_round_trip_after_steps
+tests/test_conduct_parity.py::test_pacifist_violated_on_kill
+  /Users/rsiegelmann/Downloads/Projects/nethax/.venv/lib/python3.12/site-packages/jax/_src/ops/scatter.py:103: FutureWarning: scatter inputs have incompatible types: cannot safely cast value from dtype=int32 to dtype=int8 with jax_numpy_dtype_promotion=standard. In future JAX releases this will result in an error.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_hypothesis_full.py:71: Skipped: set RUN_HYPOTHESIS_FULL=1 to run the deep Hypothesis suite.
+SKIPPED [1] tests/test_benchmark_smoke.py:27: set BENCH_SMOKE=1 to run the benchmark smoke test (~80 s subprocess)
+XFAIL tests/test_combat_stubs_resolved_parity.py::test_paralyzed_target_bonus - wave16c combat changes (random to-hit / damage rolls) broke this test's deterministic-rate assumption AND inflated JAX compile time past the 180s timeout (single melee_attack call is now too expensive to re-trace 800x). Real perf+statistical regression tracked for future wave.
+XFAIL tests/test_combat_stubs_resolved_parity.py::test_negative_ac_softer - wave16c combat changes (random to-hit / damage rolls) broke this test's deterministic-rate assumption AND inflated JAX compile time past the 180s timeout (single melee_attack call is now too expensive to re-trace 800x). Real perf+statistical regression tracked for future wave.
+XFAIL tests/test_combat_stubs_resolved_parity.py::test_disarmed_monster_lower_damage - wave16c combat changes (random to-hit / damage rolls) broke this test's deterministic-rate assumption AND inflated JAX compile time past the 180s timeout (single melee_attack call is now too expensive to re-trace 800x). Real perf+statistical regression tracked for future wave.
+====== 241 passed, 2 skipped, 3 xfailed, 36 warnings in 553.08s (0:09:13) ======

@@ -48,6 +48,13 @@ class TileType(IntEnum):
                        # Created by WAN_DIGGING down-zap and pickaxe down-dig.
                        # Citation: vendor/nethack/src/dig.c::digactualhole line 640;
                        #            vendor/nethack/src/dig.c::zap_dig line 1548.
+    SINK = 22          # Sink ({) — kicking and applying rings have effects.
+                       # Citation: vendor/nethack/include/rm.h line 81 (SINK = 30);
+                       #            vendor/nethack/src/dokick.c::kick_sink;
+                       #            vendor/nethack/src/do_wear.c::dosinkring.
+                       # We use local index 22 to stay contiguous with the
+                       # other TileType entries; VendorTileType.SINK (line
+                       # 102 below) preserves the vendor 30.
 
 
 NUM_TILE_TYPES: int = len(TileType)

@@ -80,7 +80,7 @@ _LOCATION_TILE = {
     "closed_door": int(TileType.CLOSED_DOOR),
     "lava": int(TileType.LAVA),
     "water": int(TileType.WATER),
-    "sink": int(TileType.FOUNTAIN),  # closest analogue; Wave 5: add SINK tile
+    "sink": int(TileType.SINK),
 }
 
 
