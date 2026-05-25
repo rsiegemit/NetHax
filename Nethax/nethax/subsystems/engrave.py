@@ -184,10 +184,15 @@ _IS_BLADE_OTYP = _build_is_blade_lut()
 class EngraveState:
     """Engravings on the current level.
 
-    Wave 5 simplification: we only track engravings on the *current* level
-    (one MAP_H x MAP_W grid).  Multi-level engravings would shape this as
-    [N_BRANCHES * MAX_LEVELS, MAP_H, MAP_W, ENGRAVE_TEXT_LEN]; deferred to
-    Wave 6 since no current test exercises level transitions.
+    JAX-required schema deficit: engravings are tracked only on the
+    *current* level (one MAP_H x MAP_W grid).  Vendor stores engravings
+    in a linked-list rooted at ``g.engravings`` indexed by level via
+    ``level.engravings``; full multi-level parity would shape this as
+    [N_BRANCHES * MAX_LEVELS, MAP_H, MAP_W, ENGRAVE_TEXT_LEN] which
+    would grow EnvState by ~70 MB.  Level snapshot/restore in
+    ``level_memory.snapshot_engravings`` (save.c:548 mirror) is the
+    workaround: engravings are serialised on level-exit and restored
+    on level-enter, so cross-level persistence works correctly.
 
     Fields
     ------

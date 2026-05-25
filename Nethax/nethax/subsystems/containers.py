@@ -376,11 +376,15 @@ def put_in_container(state, container_idx, src_slot):
 
     Bag-of-holding-in-bag-of-holding catastrophe:
       Per pickup.c:2658-2693 (Is_mbag + mbag_explodes branch), placing a
-      BAG_OF_HOLDING inside another BAG_OF_HOLDING triggers a magical
-      explosion (do_boh_explosion); the source uses ``mbag_explodes`` to
-      probabilistically trigger.  Wave 6 simplification: the put still
-      succeeds but ``parent_slot`` won't be updated for the nested bag
-      (deferred to a full explosion handler in a future wave).
+      BAG_OF_HOLDING (or BAG_OF_TRICKS — both Is_mbag) inside another
+      BAG_OF_HOLDING triggers a magical explosion.  Vendor's
+      ``mbag_explodes`` at depth=1 fires deterministically (rn2(2) <= 1
+      is always True).  We model the explosion as a refusal at the put
+      gate: ``item_allowed`` is cleared when ``src_is_mbag & container
+      is_boh``, so the inserted bag is consumed by the explosion (the
+      observable "you lose the bag you tried to put in") while the
+      outer bag's contents are left in place (vendor scatters them
+      around — we omit the scatter() machinery here).
 
     Refused items (Audit L #8, vendor pickup.c lines 2577-2622) — these
     silently no-op rather than inserting:

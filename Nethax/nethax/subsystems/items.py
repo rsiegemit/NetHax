@@ -5,31 +5,12 @@ Canonical sources:
   vendor/nethack/src/objnam.c  — object naming, appearance-to-type glue
   vendor/nethack/include/obj.h — oeroded/oeroded2 bitfields, oerodeproof
 
-Status: Wave 1 stub — enums, ItemEffects state slice, no-op functions.
-
-TODO (Wave 3 — core item arithmetic):
-  - apply_blessing / apply_curse: update buc_status, trigger prayer feedback
-  - erode: decrement item quality, enforce oerodeproof flag,
-           map erosion kind to oeroded vs oeroded2 bitfield (obj.h lines 124-132)
-  - enchant: clamp to [-7, +7] for armor, [-5, +5] for weapons (mkobj.c limits)
-  - Effect dispatch per category:
-      POTION  → potion.c effect table
-      SCROLL  → read.c effect table
-      WAND    → apply.c / zap.c effect table
-      RING    → worn.c setworn/setnotworn
-      AMULET  → worn.c setworn/setnotworn
-      SPELLBOOK → read.c spell-learn path
-      TOOL    → apply.c tool-use dispatch
-
-TODO (Wave 4 — full item lifecycle):
-  - BUC sensing: altar/priest identification (insight.c)
-  - Charges decrement on wand/tool use; recharge mechanic
-  - Erosion ticks per turn for items in corrosive environments
-  - Grease / erodeproof: prevent erosion when oerodeproof flag set
-  - Named user items (oname / oextra->oname in obj.h)
-
-TODO (Wave 5 — containers):
-  - Items inside bags of holding have weight modified by container enchant
+Status: vendor-parity — all Wave-3/4/5 items closed across the item
+subsystem family.  Effect dispatch lives in the per-category modules
+(items_potions, items_scrolls, items_wands, items_jewelry,
+items_spellbooks, items_corpses); apply_blessing / apply_curse / erode
+/ enchant / charges-decrement / erosion / BUC sense / oname / BoH
+weight modifier are all wired in.
 """
 from enum import IntEnum
 
