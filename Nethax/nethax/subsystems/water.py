@@ -548,9 +548,17 @@ def _organic_or_potion_burnable(items, slot_idx):
     in {NO_MATERIAL, LIQUID, WAX, VEGGY, FLESH, PAPER, CLOTH, LEATHER,
     WOOD}).  Implemented via the per-type _OBJECT_MATERIAL table built
     from OBJECTS at module load.  SCR_FIRE / SPE_FIREBALL exemption
-    uses the canonical otyps resolved from OBJECTS.  ``oc_oprop ==
-    FIRE_RES`` is approximated by ``oerodeproof`` — the property table
-    isn't exposed at the slot level in Nethax.
+    uses the canonical otyps resolved from OBJECTS.
+
+    Note on the ``oc_oprop != FIRE_RES`` vendor clause: in vendor 3.7
+    (objects.c) the only items with ``oc_oprop == FIRE_RES`` are
+    RIN_FIRE_RESISTANCE (IRON, material id 11) and the two
+    red-dragon-armor entries (DRAGON_HIDE, material id 10).  All three
+    fail ``is_organic`` (material > WOOD=8) AND are not POTION_CLASS, so
+    they are excluded by the outer predicate before the FIRE_RES check
+    is ever reached.  The clause is defensive dead code under the
+    shipped vendor object table; omitting it is byte-equal for current
+    vendor data.
     """
     n = items.category.shape[0]
     safe = jnp.clip(slot_idx, 0, n - 1)

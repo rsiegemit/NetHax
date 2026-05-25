@@ -1235,20 +1235,88 @@ _ARTIFACT_SPFX: tuple[int, ...] = tuple([
 
 _ARTIFACT_SPFX_ARR: jnp.ndarray = jnp.array(_ARTIFACT_SPFX, dtype=jnp.int32)
 
-# Per-artifact alignment (A_NONE=-1, A_CHAOTIC=0, A_NEUTRAL=1, A_LAWFUL=2;
-# Nethax uses Alignment(CHAOTIC=0, NEUTRAL=1, LAWFUL=2, UNALIGNED=3)).
-# Cite: vendor artilist.h "al" column per row.
+# Per-artifact alignment.  Vendor align.h: A_CHAOTIC=-1, A_NEUTRAL=0,
+# A_LAWFUL=1, A_NONE=-128.  Nethax Alignment: CHAOTIC=0, NEUTRAL=1, LAWFUL=2,
+# UNALIGNED=3.  Conversion: CHAOTIC→0, NEUTRAL→1, LAWFUL→2, NONE→3.
+# Cite: vendor/nethack/include/artilist.h "al" column per row, indices keyed
+# to wish.py _ARTIFACTS positions 0..32.
 _ARTIFACT_ALIGN_TABLE: tuple[int, ...] = tuple([
-    2, 2, 0, 1, 1, 0, 0, 2, 1, 2, 2, 1, 2, 1, 1, 1, 2, 0, 0, 1, 1, 1,
-    3, 3, 3, 2, 3, 3, 0, 1, 1, 3, 2,                                  # 22..32
+    2,  # 0  Excalibur                  A_LAWFUL   (artilist.h:87)
+    2,  # 1  Snickersnee                A_LAWFUL   (artilist.h:204)
+    0,  # 2  Stormbringer               A_CHAOTIC  (artilist.h:95)
+    1,  # 3  Mjollnir                   A_NEUTRAL  (artilist.h:111)
+    1,  # 4  Cleaver                    A_NEUTRAL  (artilist.h:115)
+    0,  # 5  Sting                      A_CHAOTIC  (artilist.h:139)
+    0,  # 6  Orcrist                    A_CHAOTIC  (artilist.h:135)
+    2,  # 7  Grayswandir                A_LAWFUL   (artilist.h:171)
+    1,  # 8  Vorpal Blade               A_NEUTRAL  (artilist.h:192)
+    2,  # 9  Sceptre of Might           A_LAWFUL   (artilist.h:234)
+    2,  # 10 Tsurugi of Muramasa        A_LAWFUL   (artilist.h:288)
+    2,  # 11 Magic Mirror of Merlin     A_LAWFUL   (artilist.h:257)
+    2,  # 12 Orb of Detection           A_LAWFUL   (artilist.h:221)
+    1,  # 13 Heart of Ahriman           A_NEUTRAL  (artilist.h:228)
+    1,  # 14 Staff of Aesculapius       A_NEUTRAL  (artilist.h:251)
+    1,  # 15 Eyes of the Overworld      A_NEUTRAL  (artilist.h:262)
+    2,  # 16 Mitre of Holiness          A_LAWFUL   (artilist.h:267)
+    0,  # 17 Longbow of Diana           A_CHAOTIC  (artilist.h:273)
+    0,  # 18 Master Key of Thievery     A_CHAOTIC  (artilist.h:282)
+    1,  # 19 Yendorian Express Card     A_NEUTRAL  (artilist.h:294)
+    1,  # 20 Orb of Fate                A_NEUTRAL  (artilist.h:300)
+    1,  # 21 Eye of the Aethiopica      A_NEUTRAL  (artilist.h:305)
+    3,  # 22 Frost Brand                A_NONE     (artilist.h:149)
+    3,  # 23 Fire Brand                 A_NONE     (artilist.h:153)
+    3,  # 24 Dragonbane                 A_NONE     (artilist.h:159)
+    2,  # 25 Demonbane                  A_LAWFUL   (artilist.h:163)
+    3,  # 26 Werebane                   A_NONE     (artilist.h:167)
+    3,  # 27 Trollsbane                 A_NONE     (artilist.h:183)
+    0,  # 28 Grimtooth                  A_CHAOTIC  (artilist.h:125)
+    1,  # 29 Magicbane                  A_NEUTRAL  (artilist.h:146)
+    1,  # 30 Giantslayer                A_NEUTRAL  (artilist.h:175)
+    3,  # 31 Ogresmasher                A_NONE     (artilist.h:179)
+    2,  # 32 Sunsword                   A_LAWFUL   (artilist.h:210)
 ])
 _ARTIFACT_ALIGN_ARR: jnp.ndarray = jnp.array(_ARTIFACT_ALIGN_TABLE, dtype=jnp.int8)
 
-# Per-artifact role gate (PM_* mapping; we encode by Nethax Role index, or -1
-# for NON_PM "any role").  Used by touch_artifact badclass check (P0 #11).
-# We approximate by listing only artifacts that gate by role.  For artifacts
-# with NON_PM role, we use sentinel -1 meaning "no role restriction".
-_ARTIFACT_ROLE_TABLE: tuple[int, ...] = tuple([-1] * 33)
+# Per-artifact role gate.  Vendor PM_* role → Nethax Role index, or -1 for
+# NON_PM ("no role restriction").  Used by touch_artifact badclass check
+# (artifact.c::touch_artifact line 924-931).  Vendor lookups use art->role.
+# Cite: vendor/nethack/include/artilist.h "role" column per row, mapped
+# through Nethax constants/roles.py Role enum.
+_ARTIFACT_ROLE_TABLE: tuple[int, ...] = tuple([
+     4,  # 0  Excalibur                  PM_KNIGHT       → KNIGHT
+     9,  # 1  Snickersnee                PM_SAMURAI      → SAMURAI
+    -1,  # 2  Stormbringer               NON_PM
+    11,  # 3  Mjollnir                   PM_VALKYRIE     → VALKYRIE
+     1,  # 4  Cleaver                    PM_BARBARIAN    → BARBARIAN
+    -1,  # 5  Sting                      NON_PM
+    -1,  # 6  Orcrist                    NON_PM
+    -1,  # 7  Grayswandir                NON_PM
+    -1,  # 8  Vorpal Blade               NON_PM
+     2,  # 9  Sceptre of Might           PM_CAVE_DWELLER → CAVEMAN
+     9,  # 10 Tsurugi of Muramasa        PM_SAMURAI      → SAMURAI
+     4,  # 11 Magic Mirror of Merlin     PM_KNIGHT       → KNIGHT
+     0,  # 12 Orb of Detection           PM_ARCHEOLOGIST → ARCHEOLOGIST
+     1,  # 13 Heart of Ahriman           PM_BARBARIAN    → BARBARIAN
+     3,  # 14 Staff of Aesculapius       PM_HEALER       → HEALER
+     5,  # 15 Eyes of the Overworld      PM_MONK         → MONK
+     6,  # 16 Mitre of Holiness          PM_CLERIC       → PRIEST
+     7,  # 17 Longbow of Diana           PM_RANGER       → RANGER
+     8,  # 18 Master Key of Thievery     PM_ROGUE        → ROGUE
+    10,  # 19 Yendorian Express Card     PM_TOURIST      → TOURIST
+    11,  # 20 Orb of Fate                PM_VALKYRIE     → VALKYRIE
+    12,  # 21 Eye of the Aethiopica      PM_WIZARD       → WIZARD
+    -1,  # 22 Frost Brand                NON_PM
+    -1,  # 23 Fire Brand                 NON_PM
+    -1,  # 24 Dragonbane                 NON_PM
+     6,  # 25 Demonbane                  PM_CLERIC       → PRIEST
+    -1,  # 26 Werebane                   NON_PM
+    -1,  # 27 Trollsbane                 NON_PM
+    -1,  # 28 Grimtooth                  NON_PM
+    12,  # 29 Magicbane                  PM_WIZARD       → WIZARD
+    -1,  # 30 Giantslayer                NON_PM
+    -1,  # 31 Ogresmasher                NON_PM
+    -1,  # 32 Sunsword                   NON_PM
+])
 _ARTIFACT_ROLE_ARR: jnp.ndarray = jnp.array(_ARTIFACT_ROLE_TABLE, dtype=jnp.int8)
 
 _N_ARTI_SLOTS: int = 33  # 0..32 inclusive — total artilist entries in Nethax.
@@ -1324,9 +1392,17 @@ def touch_artifact_blast(state, art_idx: jnp.ndarray, rng) -> tuple:
     player_align = state.player_align.astype(jnp.int32)
     self_willed = (spfx & jnp.int32(_SPFX_INTEL)) != jnp.int32(0)
 
-    # badclass: self_willed && role mismatch — Nethax has no role gate per
-    # artifact yet, so we conservatively use False (matches NON_PM rows).
-    badclass = jnp.bool_(False)
+    # badclass: artifact->role != NON_PM && artifact->role != player_role.
+    # Cite: vendor/nethack/src/artifact.c::touch_artifact lines 924-931 —
+    #   if (oart->role != NON_PM && !Role_if(oart->role)) badclass = TRUE;
+    # Nethax encodes NON_PM as sentinel -1; otherwise art_role is the Nethax
+    # Role index (constants/roles.py).
+    safe_arti = jnp.clip(arti, 0, _N_ARTI_SLOTS - 1)
+    art_role = _ARTIFACT_ROLE_ARR[safe_arti].astype(jnp.int32)
+    art_role = jnp.where(arti >= jnp.int32(0), art_role, jnp.int32(-1))
+    player_role = state.player_role.astype(jnp.int32)
+    has_role_gate = art_role != jnp.int32(-1)
+    badclass = has_role_gate & (art_role != player_role)
 
     # badalign: SPFX_RESTR && alignment != A_NONE && (alignment != player).
     # Alignment.UNALIGNED == 3 maps to artilist A_NONE.
