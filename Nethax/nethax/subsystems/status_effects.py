@@ -40,11 +40,18 @@ Pw regen rate (allmain.c::regen_pw lines 606-625 — vendor-exact):
   When ``moves % period == 0``, gain ``rn1((WIS+INT)/15 + 1, 1)`` Pw.
   ENERGY_REGEN intrinsic: regen every turn unconditionally.
 
-TODO (Wave 4):
-  - Sickness progression: food-poisoning → death in ~30 turns unless cured
-  - Slime death cycle (SLIMED timer, timeout.c:slime_age)
-  - Confusion / hallucination effect on inputs — action remapping in dispatch
-  - ATTRIBUTE_AWAY: temporary stat penalties (attrib.c:attrib_timeout)
+Implemented elsewhere:
+  - Sickness progression (food-poisoning + illness lethal expiry) lives in
+    ``tick_sick_lethal`` / ``tick_illness_lethal`` below — vendor parity.
+  - Slime death cycle (SLIMED → TURNED_SLIME) in ``tick_slimed_lethal``
+    (vendor timeout.c::slime_dialogue done_timeout).
+  - Confusion / hallucination input remapping lives in action_dispatch
+    (rndcurse / random-direction confusion when applicable).
+
+Still deferred (no concrete vendor caller wired in Nethax):
+  - ATTRIBUTE_AWAY full ATEMP/ATIME decay model (attrib.c:465-477) —
+    Nethax has the timed-status slot but doesn't yet decay temporary
+    stat drains.  Permanent stat changes work via player_str etc.
 """
 
 from enum import IntEnum

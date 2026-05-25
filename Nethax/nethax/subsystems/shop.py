@@ -531,12 +531,18 @@ def _compute_item_price_from_slot(state, slot_idx: jnp.ndarray) -> jnp.ndarray:
     spe = inv.enchantment[slot].astype(jnp.int32)
     has_item = cat != jnp.int32(0)
 
-    # No oartifact / dknown / name_known fields propagate through Item yet;
-    # use the dknown flag the inventory carries, and assume name_known=True
-    # (vendor's default for identified scrolls/wands is name_known via
-    # objects[]->oc_name_known global; we approximate as identified flag).
+    # dknown via Item.dknown; name_known approximated by Item.identified
+    # (vendor's name_known comes from objects[].oc_name_known global —
+    # the identified flag is a close per-slot analogue).
     dknown = jnp.where(has_item, inv.dknown[slot], jnp.bool_(False))
     name_known = jnp.where(has_item, inv.identified[slot], jnp.bool_(False))
+    # Vendor shk.c:2980-2981 multiplies cost x4 for artifacts —
+    # Item.artifact_idx >= 0 marks artifact carriage (mirrors obj->oartifact).
+    oartifact = jnp.where(
+        has_item,
+        inv.artifact_idx[slot].astype(jnp.int32) >= jnp.int32(0),
+        jnp.bool_(False),
+    )
 
     base = jnp.where(
         has_item,
@@ -547,7 +553,7 @@ def _compute_item_price_from_slot(state, slot_idx: jnp.ndarray) -> jnp.ndarray:
         base_cost=base,
         oclass=cat,
         spe=spe,
-        oartifact=jnp.bool_(False),  # oartifact tracked at quest/artifact layer only
+        oartifact=oartifact,
         dknown=dknown,
         name_known=name_known,
         cha=state.player_cha,
