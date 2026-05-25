@@ -409,6 +409,12 @@ _TILE_LAVA: int        = 9
 _TILE_TREE: int        = 20  # blocks LoS per vendor vision.c:166.
 _TILE_IRONBARS: int    = 22  # IRONBARS — vendor mon.c:2225 ALLOW_BARS gate.
 
+# BOULDER object type_id — used by LoS predicate to gate boulders on the
+# ground.  Vendor vision.c:182 is_clear rejects tiles with a boulder.
+# Cite: vendor/nethack/include/objects.h BOULDER otyp; matches
+# Nethax.nethax.subsystems.containers._BOULDER_TYPE_ID = 447.
+_BOULDER_TYPE_ID_VISION: int = 447
+
 # Trap-type codes (mirror constants/TrapType) that are "always avoided" in vendor —
 # pets/hostiles never path into a known fall/hole/lava-trap.  vendor mon.c:2353-2368
 # routes trap avoidance through mon_knows_traps; we treat these specific types as
@@ -920,6 +926,17 @@ def monster_can_see_player(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
     ppos = state.player_pos.astype(jnp.int32)
     terrain = _current_level_terrain(state)
 
+    # Per-tile boulder presence on the current level (vision.c:182 is_clear
+    # also rejects tiles with a boulder).  We scan the ground-items stack
+    # at each tile for type_id == _BOULDER_TYPE_ID.
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    gi = state.ground_items
+    boulder_here = jnp.any(
+        gi.type_id[b, lv].astype(jnp.int32) == jnp.int32(_BOULDER_TYPE_ID_VISION),
+        axis=-1,
+    )
+
     r0, c0 = mpos[0], mpos[1]
     r1, c1 = ppos[0], ppos[1]
 
@@ -954,13 +971,13 @@ def monster_can_see_player(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
         tile = terrain[safe_r, safe_c].astype(jnp.int32)
         # Vendor vision.c::is_clear (line 165): IS_OBSTRUCTED || TREE ||
         # (IS_DOOR && door is closed/locked/trapped).  Open doors pass.
-        # Boulders also block (line 182) — we don't yet model boulders as a
-        # separate object layer, so this is approximated by CLOSED_DOOR /
-        # WALL gating.
+        # Boulders also block (line 182) — gated on ground_items presence.
+        has_boulder = boulder_here[safe_r, safe_c]
         blocked = (
             (tile == _TILE_WALL)
             | (tile == _TILE_CLOSED_DOOR)
             | (tile == _TILE_TREE)
+            | has_boulder
         )
         return jnp.where(active & blocked, jnp.bool_(False), clear)
 
@@ -1400,21 +1417,65 @@ def _try_scroll_teleport(state, rng: jax.Array, monster_idx: jnp.ndarray):
     """Read a scroll of teleportation if one is in inventory.
 
     Vendor reference: muse.c::find_misc case MUSE_SCR_TELEPORTATION +
-    muse.c::use_misc.  Effect: monster relocates to a random tile.
-    We pick a random in-bounds tile on the current level; passability
-    refinement is deferred — vendor mnexto() can also fail and stays put.
+    muse.c::use_misc → teleport.c::mnexto, which rejection-samples a
+    walkable tile.  We do the same with a bounded 40-try lax.scan
+    (mirrors safe_teleds' fixed tcnt loop).  If no walkable cell is
+    found, the monster stays put — same observable outcome as vendor's
+    mnexto returning FALSE.
+
+    Walkable predicate matches detect._teleds: ROOM / CORR / OPEN_DOOR /
+    STAIRCASE_UP / STAIRCASE_DOWN / ALTAR / FOUNTAIN / THRONE / GRAVE /
+    SHOP_FLOOR / ICE_FLOOR (vendor ``accessible`` per monmove.c:2190).
     """
+    from Nethax.nethax.constants.tiles import TileType as _TT
     idx = monster_idx.astype(jnp.int32)
     mai = state.monster_ai
     found, slot = _find_inv_slot(mai, idx, _CAT_SCROLL, _SCR_TELEPORT)
 
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    terrain_2d = state.terrain[b, lv]
+    h, w = terrain_2d.shape
+
+    MAX_TRIES = 40
     rng_r, rng_c = jax.random.split(rng, 2)
-    new_r = jax.random.randint(rng_r, (), 0, _MAP_H, dtype=jnp.int32).astype(jnp.int16)
-    new_c = jax.random.randint(rng_c, (), 0, _MAP_W, dtype=jnp.int32).astype(jnp.int16)
-    target_pos = jnp.stack([new_r, new_c]).astype(jnp.int16)
+    rrows = jax.random.randint(rng_r, (MAX_TRIES,), 0, h, dtype=jnp.int32)
+    rcols = jax.random.randint(rng_c, (MAX_TRIES,), 0, w, dtype=jnp.int32)
+
+    def _walkable(r, c):
+        t = terrain_2d[r, c]
+        return (
+            (t == jnp.int8(_TT.FLOOR))
+            | (t == jnp.int8(_TT.CORRIDOR))
+            | (t == jnp.int8(_TT.OPEN_DOOR))
+            | (t == jnp.int8(_TT.STAIRCASE_UP))
+            | (t == jnp.int8(_TT.STAIRCASE_DOWN))
+            | (t == jnp.int8(_TT.ALTAR))
+            | (t == jnp.int8(_TT.FOUNTAIN))
+            | (t == jnp.int8(_TT.THRONE))
+            | (t == jnp.int8(_TT.GRAVE))
+            | (t == jnp.int8(_TT.SHOP_FLOOR))
+            | (t == jnp.int8(_TT.ICE_FLOOR))
+        )
+
+    def _pick(carry, i):
+        cr, cc, ok = carry
+        r = rrows[i]; c = rcols[i]
+        is_ok = _walkable(r, c) & ~ok
+        new_r = jnp.where(is_ok, r, cr).astype(jnp.int32)
+        new_c = jnp.where(is_ok, c, cc).astype(jnp.int32)
+        return (new_r, new_c, ok | _walkable(r, c)), None
 
     cur_pos = mai.pos[idx]
-    chosen = jnp.where(found, target_pos, cur_pos)
+    (final_r, final_c, found_ok), _ = jax.lax.scan(
+        _pick,
+        (jnp.int32(cur_pos[0]), jnp.int32(cur_pos[1]), jnp.bool_(False)),
+        jnp.arange(MAX_TRIES),
+    )
+    target_pos = jnp.stack([
+        final_r.astype(jnp.int16), final_c.astype(jnp.int16)
+    ])
+    chosen = jnp.where(found & found_ok, target_pos, cur_pos)
 
     # Scrolls are consumed entirely (qty -= 1).
     old_qty = mai.inv_quantity[idx, slot].astype(jnp.int32)

@@ -2056,13 +2056,13 @@ def thrown_attack(
     )
 
     def _apply_breathe(s):
-        # Per-effect player timer bumps.  Bumps are small (vendor rnd(5)
-        # via itimeout_incr); we use a fixed +5 add as a JIT-stable
-        # approximation.  Effects mapped:
-        #   CONFUSION (2) / BOOZE (20) → CONFUSION timer
-        #   SLEEPING  (17)             → SLEEP timer
-        #   BLINDNESS (16)             → BLIND timer
-        #   HALLU     (7)              → HALLUCINATION timer
+        # Per-effect player timer bumps.  Vendor potion.c:1932-2107 uses
+        # ``itimeout_incr(rnd(5))`` for CONFUSION/BLIND/HALLU branches and
+        # ``inc_timeout(SLEEPING, rnd(5))`` for the sleep arm.  Effects:
+        #   CONFUSION (2) / BOOZE (20) → CONFUSION timer (rnd(5))
+        #   SLEEPING  (17)             → SLEEP timer (rnd(5))
+        #   BLINDNESS (16)             → BLIND timer (rnd(5))
+        #   HALLU     (7)              → HALLUCINATION timer (rnd(5))
         # All others are no-ops (matches vendor's empty switch arms).
         from Nethax.nethax.subsystems.status_effects import TimedStatus
         ts = s.status.timed_statuses
@@ -2072,7 +2072,12 @@ def thrown_attack(
         is_blind = breathe_effect == jnp.int32(16)
         is_hallu = breathe_effect == jnp.int32(7)
 
-        bump = jnp.int32(5)
+        # rnd(5) ∈ [1, 5] — one shared draw, mirroring vendor's per-branch
+        # itimeout_incr call (each arm fires at most one of the four, so a
+        # single shared roll matches the per-arm rnd(5) outcome).
+        bump = jax.random.randint(
+            key_breathe, (), jnp.int32(1), jnp.int32(6), dtype=jnp.int32
+        )
         ts = jnp.where(
             is_conf,
             ts.at[int(TimedStatus.CONFUSION)].add(bump),
