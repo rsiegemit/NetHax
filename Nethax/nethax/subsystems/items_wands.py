@@ -269,6 +269,9 @@ class WandState:
     mon_resists:   jax.Array   # int32[N]
     mon_speed_mod: jax.Array   # int8[N]
     mon_cancelled: jax.Array   # bool[N]
+    # mon_paralyzed_timer mirrors MonsterAIState.paralyzed_timer; used by
+    # WAN_SLEEP / WAN_STRIKING etc. to set vendor mfrozen duration.
+    mon_paralyzed_timer: jax.Array  # int16[N]
 
     terrain:       jax.Array   # int8[MAP_H, MAP_W]
     explored:      jax.Array   # bool[MAP_H, MAP_W]
@@ -317,6 +320,7 @@ class WandState:
             mon_resists=jnp.zeros(n, dtype=jnp.int32),
             mon_speed_mod=jnp.zeros(n, dtype=jnp.int8),
             mon_cancelled=jnp.zeros(n, dtype=bool),
+            mon_paralyzed_timer=jnp.zeros(n, dtype=jnp.int16),
             terrain=jnp.zeros((map_h, map_w), dtype=jnp.int8),
             explored=jnp.zeros((map_h, map_w), dtype=bool),
             inventory=InventoryState.empty(),
@@ -943,14 +947,31 @@ def _effect_death(
 def _effect_sleep(
     state: WandState, rng: jax.Array, direction: int | jax.Array = 2
 ) -> tuple[WandState, jax.Array]:
-    """WAN_SLEEP — RAY, put target to sleep (mon_asleep = True).
+    """WAN_SLEEP — RAY, sleep target for d(1, 12) turns.
 
-    vendor/nethack/src/zap.c: sleep_monst() / slept_monst().
-    Sleep duration (d10 turns) is not tracked yet; Wave 4 adds a timer array.
+    Vendor: zap.c:483-486 calls ``sleep_monst(mtmp, d(1 + otmp->spe, 12),
+    WAND_CLASS)`` then ``slept_monst(mtmp)``.  We don't propagate the wand
+    spe into the on_hit context, so we use the spe=0 baseline d(1, 12) ∈
+    [1, 12].  Duration is written to mon_paralyzed_timer (vendor mfrozen)
+    so the monster can't act until the timer expires; mon_asleep is also
+    set so an unbumped wake-check uses the same "sleeping" status.
+
+    Cite: vendor/nethack/src/zap.c::buzz line 483, ZT_SLEEP at line 4296.
     """
     def on_hit(s, r, mon_idx):
+        # d(1, 12) = randint [1, 12].
+        r, key = jax.random.split(r)
+        duration = jax.random.randint(
+            key, (), jnp.int32(1), jnp.int32(13), dtype=jnp.int32
+        ).astype(s.mon_paralyzed_timer.dtype)
         new_asleep = s.mon_asleep.at[mon_idx].set(jnp.bool_(True))
-        return s.replace(mon_asleep=new_asleep), r
+        cur = s.mon_paralyzed_timer[mon_idx]
+        new_timer = jnp.maximum(cur, duration)
+        new_paralyzed = s.mon_paralyzed_timer.at[mon_idx].set(new_timer)
+        return s.replace(
+            mon_asleep=new_asleep,
+            mon_paralyzed_timer=new_paralyzed,
+        ), r
 
     return cast_ray(state, rng, state.player_pos, direction,
                     on_hit_fn=on_hit, stop_on_hit=False)

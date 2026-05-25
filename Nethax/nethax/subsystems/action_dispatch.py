@@ -1443,6 +1443,7 @@ def _handle_zap(state, rng):
         mon_resists   = mai.resists,
         mon_speed_mod = mai.speed_mod,
         mon_cancelled = mai.cancelled,
+        mon_paralyzed_timer = mai.paralyzed_timer,
         terrain       = terrain_2d,
         explored      = explored_2d,
         inventory     = state.inventory,
@@ -1467,6 +1468,7 @@ def _handle_zap(state, rng):
         invisible = new_wand.mon_invisible,
         speed_mod = new_wand.mon_speed_mod,
         cancelled = new_wand.mon_cancelled,
+        paralyzed_timer = new_wand.mon_paralyzed_timer,
     )
     new_terrain  = state.terrain.at[b, lv].set(new_wand.terrain)
     new_explored = state.explored.at[b, lv].set(new_wand.explored)
