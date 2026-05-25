@@ -272,6 +272,9 @@ class WandState:
     # mon_paralyzed_timer mirrors MonsterAIState.paralyzed_timer; used by
     # WAN_SLEEP / WAN_STRIKING etc. to set vendor mfrozen duration.
     mon_paralyzed_timer: jax.Array  # int16[N]
+    # mon_sleep_timer mirrors MonsterAIState.sleep_timer (vendor msleeping
+    # counter).  Kept in sync with mon_asleep bool.
+    mon_sleep_timer: jax.Array  # int16[N]
 
     terrain:       jax.Array   # int8[MAP_H, MAP_W]
     explored:      jax.Array   # bool[MAP_H, MAP_W]
@@ -321,6 +324,7 @@ class WandState:
             mon_speed_mod=jnp.zeros(n, dtype=jnp.int8),
             mon_cancelled=jnp.zeros(n, dtype=bool),
             mon_paralyzed_timer=jnp.zeros(n, dtype=jnp.int16),
+            mon_sleep_timer=jnp.zeros(n, dtype=jnp.int16),
             terrain=jnp.zeros((map_h, map_w), dtype=jnp.int8),
             explored=jnp.zeros((map_h, map_w), dtype=bool),
             inventory=InventoryState.empty(),
@@ -965,12 +969,18 @@ def _effect_sleep(
             key, (), jnp.int32(1), jnp.int32(13), dtype=jnp.int32
         ).astype(s.mon_paralyzed_timer.dtype)
         new_asleep = s.mon_asleep.at[mon_idx].set(jnp.bool_(True))
-        cur = s.mon_paralyzed_timer[mon_idx]
-        new_timer = jnp.maximum(cur, duration)
-        new_paralyzed = s.mon_paralyzed_timer.at[mon_idx].set(new_timer)
+        cur_p = s.mon_paralyzed_timer[mon_idx]
+        new_paralyzed = s.mon_paralyzed_timer.at[mon_idx].set(
+            jnp.maximum(cur_p, duration)
+        )
+        cur_s = s.mon_sleep_timer[mon_idx]
+        new_sleep = s.mon_sleep_timer.at[mon_idx].set(
+            jnp.maximum(cur_s, duration)
+        )
         return s.replace(
             mon_asleep=new_asleep,
             mon_paralyzed_timer=new_paralyzed,
+            mon_sleep_timer=new_sleep,
         ), r
 
     return cast_ray(state, rng, state.player_pos, direction,
