@@ -826,14 +826,13 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
     # Vendor:
     #   b_effect = obj->blessed && role_match
     #   recharge(otmp, b_effect ? 1 : obj->cursed ? -1 : 0)
-    # recharge() (read.c:729) for WAND_CLASS:
-    #   lim = (otyp == WAN_WISHING) ? 1 : oc_dir != NODIR ? 8 : 15
-    #   blessed:  spe = max(spe, rn1(5, lim+1-5)) else spe++
-    #   uncursed: spe = max(spe, rnd(rn1(5, lim+1-5))) else spe++
-    #   cursed:   stripspe(obj)  (sets spe to 0)
-    # We approximate at the +1/-1/0 increment level (no rn1 draw) but cap
-    # spe at lim=15 and clamp at 0 minimum.  buc_status encoding is
-    # 1=cursed, 2=uncursed, 3=blessed (not signed) — convert explicitly.
+    # recharge() (read.c:729-799) for WAND_CLASS with lim=15 (non-NODIR
+    # non-wishing default — the targeting branch the Express Card hits):
+    #   n = rn1(5, lim+1-5) ∈ [lim-4, lim] = [11, 15]
+    #   if not blessed: n = rnd(n) ∈ [1, n]
+    #   if spe < n: spe = n  else: spe++
+    # Cursed: stripspe(obj) sets spe to 0.
+    # Nethax BUC encoding: 1=cursed, 2=uncursed, 3=blessed.
     # Cite: vendor/nethack/src/artifact.c:1847-1864;
     #       vendor/nethack/src/read.c::recharge lines 729-799.
     def _h_charge_obj(s):
@@ -843,20 +842,28 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
                     & (items.quantity > jnp.int16(0))
         any_wand = jnp.any(wand_mask)
         target = jnp.argmax(wand_mask.astype(jnp.int32))
-        # Convert artifact BUC enum (1=cursed, 2=uncursed, 3=blessed) to
-        # signed delta as vendor's recharge() expects.
         buc = items.buc_status[wielded_slot].astype(jnp.int32)
-        delta = jnp.where(buc == jnp.int32(3), jnp.int32(1),
-                  jnp.where(buc == jnp.int32(1), jnp.int32(-1), jnp.int32(0)))
+        is_blessed = buc == jnp.int32(3)
+        is_cursed  = buc == jnp.int32(1)
         cur_ch = items.charges[target].astype(jnp.int32)
-        # Cursed: stripspe (vendor recharge:771) sets spe to 0.
-        # Blessed/uncursed: increment spe.  Cap at 15 (default wand lim).
-        WAND_MAX_CHARGES = jnp.int32(15)
-        new_ch = jnp.where(
-            delta == jnp.int32(-1),
-            jnp.int32(0),
-            jnp.minimum(cur_ch + delta, WAND_MAX_CHARGES),
+        WAND_LIM = jnp.int32(15)
+        # rn1(5, lim+1-5) ∈ [lim-4, lim] = [11, 15] (5 outcomes uniform).
+        k_blessed, k_rnd = jax.random.split(k_handler, 2)
+        n_blessed = jax.random.randint(
+            k_blessed, (), WAND_LIM - jnp.int32(4),
+            WAND_LIM + jnp.int32(1), dtype=jnp.int32,
         )
+        # rnd(n_blessed) ∈ [1, n_blessed].
+        n_uncursed = jax.random.randint(
+            k_rnd, (), jnp.int32(1),
+            n_blessed + jnp.int32(1), dtype=jnp.int32,
+        )
+        n = jnp.where(is_blessed, n_blessed, n_uncursed)
+        # spe = max(spe, n) if spe < n else spe + 1.
+        bumped = jnp.where(cur_ch < n, n, cur_ch + jnp.int32(1))
+        # Cursed: stripspe → 0.  Cap at WAND_LIM.
+        new_ch = jnp.where(is_cursed, jnp.int32(0),
+                  jnp.minimum(bumped, WAND_LIM))
         new_ch = jnp.maximum(new_ch, jnp.int32(0))
         new_ch = jnp.where(any_wand, new_ch, cur_ch).astype(items.charges.dtype)
         # Bump recharged counter (vendor line 767).
