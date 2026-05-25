@@ -817,7 +817,7 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     new_traps, trap_dmg, trap_se = jax.lax.cond(
         on_trap,
         lambda ts: trigger_trap(ts, trap_rng, trap_pos),
-        lambda ts: (ts, jnp.int32(0), jnp.zeros(5, dtype=jnp.int32)),
+        lambda ts: (ts, jnp.int32(0), jnp.zeros(6, dtype=jnp.int32)),
         state_mid.traps,
     )
 
@@ -878,9 +878,28 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     _new_deepest = jnp.maximum(
         state_final.scoring.deepest_level, _new_level.astype(jnp.int8)
     )
+    # LEVEL_TELEP / MAGIC_PORTAL — random cross-level transport.
+    # Vendor trap.c::dotrap LEVEL_TELEP calls level_tele() →
+    # random_teleport_level() which picks a level in [1, max_depth] and
+    # goto_level()s there.  MAGIC_PORTAL uses ``trap->dst`` (a fixed
+    # destination encoded in the trap struct) — JAX-required: we don't
+    # carry per-trap ``dst`` so MAGIC_PORTAL routes through the same
+    # random pick as LEVEL_TELEP.  Folded into the dungeon.replace chain
+    # below to avoid an extra state.replace JIT step.
+    from Nethax.nethax.subsystems.traps import _SE_LEVEL_TELE
+    level_tele_flag = trap_se[_SE_LEVEL_TELE] > jnp.int32(0)
+    rng_lt, _new_rng2 = jax.random.split(state_final.rng)
+    rand_lvl = jax.random.randint(
+        rng_lt, (), 1, jnp.maximum(_max_level_branch.astype(jnp.int32) + 1, 2),
+        dtype=jnp.int32,
+    ).astype(jnp.int8)
+    _new_level = jnp.where(level_tele_flag, rand_lvl, _new_level)
+    _new_deepest = jnp.maximum(_new_deepest, _new_level.astype(jnp.int8))
+
     state_final = state_final.replace(
         dungeon=state_final.dungeon.replace(current_level=_new_level),
         scoring=state_final.scoring.replace(deepest_level=_new_deepest),
+        rng=_new_rng2,
     )
 
     # Elbereth dust wipe when player steps over an engraved tile.

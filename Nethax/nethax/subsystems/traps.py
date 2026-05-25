@@ -71,6 +71,10 @@ _SE_SLEEP          = 1
 _SE_TELE           = 2
 _SE_WAKE           = 3
 _SE_LEVEL_DESCEND  = 4
+# Index 5: random-level teleport flag (1 = LEVEL_TELEP fires).
+# Vendor trap.c::dotrap LEVEL_TELEP calls level_tele() →
+# random_teleport_level() → goto_level(random_level).
+_SE_LEVEL_TELE     = 5
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +120,7 @@ def _d(rng: jax.Array, sides: int) -> jnp.ndarray:
 
 
 def _no_se() -> jnp.ndarray:
-    return jnp.zeros(5, dtype=jnp.int32)
+    return jnp.zeros(6, dtype=jnp.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +225,14 @@ def trigger_trap(
     se_pit = se_zeros.at[_SE_FREEZE].set(freeze_pit)
     se_spiked_pit = se_zeros.at[_SE_FREEZE].set(freeze_pit)
 
-    # TELEP_TRAP / LEVEL_TELEP: request teleport
+    # TELEP_TRAP: request same-level random teleport.
     se_tele = se_zeros.at[_SE_TELE].set(1)
+    # LEVEL_TELEP / MAGIC_PORTAL: request cross-level transport.
+    # Vendor trap.c::dotrap LEVEL_TELEP → level_tele() →
+    # random_teleport_level() → goto_level(random_level).
+    # MAGIC_PORTAL → goto_level(trap->dst) — fixed destination encoded in
+    # the trap; without a per-trap dst slice we fall back to random_level.
+    se_level_tele = se_zeros.at[_SE_LEVEL_TELE].set(1)
 
     # HOLE / TRAPDOOR: request descend one dungeon level.
     # vendor/nethack/src/trap.c::dotrap TT_HOLE / TT_TRAPDOOR cases
@@ -299,9 +309,9 @@ def trigger_trap(
         se_spiked_pit,  # SPIKED_PIT
         se_descend,     # HOLE — descend one level (vendor trap.c::dotrap TT_HOLE)
         se_descend,     # TRAPDOOR — descend one level (vendor trap.c::dotrap TT_TRAPDOOR)
-        se_tele,        # TELEP_TRAP
-        se_tele,        # LEVEL_TELEP (stub: same-level tele)
-        se_tele,        # MAGIC_PORTAL (stub)
+        se_tele,            # TELEP_TRAP (same-level random tele)
+        se_level_tele,      # LEVEL_TELEP — random level on current branch
+        se_level_tele,      # MAGIC_PORTAL — vendor: fixed dst; we use random
         se_web,         # WEB
         se_zeros,       # STATUE_TRAP (Wave 4: spawn monster)
         se_magic,       # MAGIC_TRAP
