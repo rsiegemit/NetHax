@@ -109,6 +109,9 @@ def test_item_field_count_full():
         # Per-item description-known / rustproofing-known (vendor obj.h
         # lines 109-114).
         "dknown", "rknown",
+        # Vendor obj.h: ``age`` cooldown timestamp (reused by arti_invoke
+        # tired-gate) and ``oartifact`` index → Item.artifact_idx.
+        "age", "artifact_idx",
     }
     assert fields == expected, (
         f"Item field-set drift:\n"
