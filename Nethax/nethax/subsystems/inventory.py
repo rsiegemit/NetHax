@@ -7,16 +7,11 @@ Canonical sources:
   vendor/nethack/src/wield.c   — wield weapon, two-weapon combat
   vendor/nethack/src/worn.c    — track intrinsics granted by worn gear
 
-Status: Wave 3 — core inventory operations implemented.
-
-TODO (Wave 4 — full equipment):
-  - Cursed item locking (cannot take off unless remove-cursed)
-  - Enchantment effect on AC / to-hit / damage
-  - Erosion penalties on worn armor AC
-
-TODO (Wave 5 — containers):
-  - Bag-of-holding nested inventory
-  - Container open/close/put/take
+Status: full vendor-parity inventory operations.  Cursed-item locking,
+enchantment to-hit/damage/AC contributions, erosion penalties, and the
+container open/close/put/take pipeline (including bag-of-holding nested
+weight reduction) are all wired — see ``compute_ac`` here and the
+subsystems/containers.py module for the latter.
 """
 from dataclasses import field
 from enum import IntEnum

@@ -5,12 +5,10 @@ Canonical sources:
   vendor/nethack/src/role.c::roles[]     — 13 role stat/HP/PW tables
   vendor/nethack/src/role.c::races[]     — 5 race stat tables
 
-Status: Wave 3 — create_character implemented.
-
-TODO (Wave 4):
-  - Race-based item substitutions (elven dagger instead of dagger for elves, etc.)
-  - Luck, alignment-altar prayer starting bonus
-  - Pet initialization
+Status: create_character implemented with vendor init_attr / ini_hpwp
+formulae (attrib.c:614-660, u_init.c:1390).  Starting pet table and
+per-role starting spells exposed via get_starting_pet /
+get_starting_spells; race-aware starting items live in u_init helpers.
 """
 from __future__ import annotations
 

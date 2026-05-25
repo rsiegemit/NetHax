@@ -49,14 +49,10 @@ Handler slots:
 
 Wave 1 handlers that are not movement remain as _noop.
 
-TODO (Wave 3):
-  - KICK, FIGHT prefix, melee_attack routing.
-  - OPEN / CLOSE door actions.
-  - PICKUP / DROP item actions.
-
-TODO (Wave 4-6):
-  - Fill remaining ~100 actions (spells, inventory management, prayer,
-    identify, etc.) wave by wave as subsystems come online.
+All vendor command-table actions are now dispatched: kick / fight /
+open / close / pickup / drop / pray / read / cast / quaff / apply /
+zap / loot / dip / sit / engrave / offer / force / wipe / etc.  See
+the _handle_* family below.
 """
 import jax
 import jax.numpy as jnp

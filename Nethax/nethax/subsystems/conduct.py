@@ -8,9 +8,9 @@ Canonical sources:
                                     .polypiles, .polyselfs, .wishes, .wisharti,
                                     .sokocheat — insight.c lines ~2079-2230)
 
-Status: Wave 4 — Conduct enum + violations array + violation helpers + wired
-triggers.  Eleven of thirteen conducts are wired at the action-trigger sites
-listed below; the remaining three are TODO until their owning subsystem lands.
+Status: All 13 conducts are wired at the action-trigger sites listed
+below.  Conduct enum + violations array + violation helpers all live in
+this module; per-conduct triggers fire from their owning subsystems.
 
 Wired (Wave 4):
     FOODLESS      — action_dispatch._handle_eat (any eat marks)
