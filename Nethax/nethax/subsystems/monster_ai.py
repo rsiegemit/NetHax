@@ -2195,9 +2195,13 @@ def _spell_useless(spellnum: jnp.ndarray, mai: MonsterAIState,
     useless_heal = (sn == jnp.int32(MCAST_CURE_SELF)) \
                    & (mai.hp[i] >= mai.hp_max[i])
     # MCAST_CLONE_WIZ — only the Wizard of Yendor can clone (mcastu.c:941-945).
-    # We approximate by allowing only entry_idx==NUMMONS-1 (a sentinel; the
-    # caller can refine).  Without the iswiz flag, treat as useless.
-    useless_clone = sn == jnp.int32(MCAST_CLONE_WIZ)
+    # Vendor: ``if (!iswiz(mtmp)) return TRUE``.  Nethax doesn't carry the
+    # iswiz flag, but PM_WIZARD_OF_YENDOR is at entry 281 (verified against
+    # vendor monst.c order).  Gate on the entry index directly.
+    _PM_WIZARD_OF_YENDOR = jnp.int32(281)
+    useless_clone = (sn == jnp.int32(MCAST_CLONE_WIZ)) & (
+        mai.entry_idx[i].astype(jnp.int32) != _PM_WIZARD_OF_YENDOR
+    )
     return useless_invis | useless_heal | useless_clone
 
 
