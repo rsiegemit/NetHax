@@ -133,39 +133,35 @@ def test_frost_brand_adds_cold_damage():
     assert len(bonuses) >= 4, f"Expected d6 spread, got: {sorted(bonuses)}"
 
 
-def test_excalibur_vs_undead():
-    """Excalibur adds +1..4 damage against undead targets.
+def test_excalibur_bonus_always_applies():
+    """Excalibur adds +1..10 PHYS damage against any target.
 
-    Cite: artilist.h line 85-88 PHYS(5,10) + DRLI(0,0) dfns;
-          spec_applies SPFX_DFLAG2+M2_UNDEAD (artifact.c line 1026-1027);
-          artifact_idx=0.
+    Vendor: Excalibur's spfx is (SPFX_NOGEN|SPFX_RESTR|SPFX_SEEK|SPFX_DEFN
+    |SPFX_INTEL|SPFX_SEARCH) — none of {SPFX_DBONUS, SPFX_ATTK}, so the
+    first branch of spec_applies returns ``weap->attk.adtyp == AD_PHYS``
+    which is TRUE for any target.  The PHYS(5, 10) attack bonus
+    therefore applies as +d10 against every monster.
+    Cite: vendor/nethack/src/artifact.c::spec_applies lines 1014-1015;
+          vendor/nethack/include/artilist.h:85-88 (PHYS(5, 10)).
     """
     from Nethax.nethax.subsystems.artifact_powers import artifact_bonus_damage
 
     undead_idx = _first_undead_entry_idx()
-    rng = jax.random.PRNGKey(2)
-    bonuses = set()
-    for i in range(60):
-        sub = jax.random.fold_in(rng, jnp.uint32(i))
-        bonus = int(artifact_bonus_damage(jnp.int32(0), jnp.int32(undead_idx), sub))
-        assert 1 <= bonus <= 4, f"Excalibur vs undead bonus out of range: {bonus}"
-        bonuses.add(bonus)
-    assert len(bonuses) >= 3, f"Expected d4 spread, got: {sorted(bonuses)}"
-
-
-def test_excalibur_vs_non_undead_no_bonus():
-    """Excalibur gives no bonus against non-undead targets.
-
-    Cite: spec_applies returns False when M2_UNDEAD not set (artifact.c:1026).
-    """
-    from Nethax.nethax.subsystems.artifact_powers import artifact_bonus_damage
-
     non_undead_idx = _first_non_orc_entry_idx()
-    rng = jax.random.PRNGKey(3)
-    for i in range(20):
-        sub = jax.random.fold_in(rng, jnp.uint32(i))
-        bonus = int(artifact_bonus_damage(jnp.int32(0), jnp.int32(non_undead_idx), sub))
-        assert bonus == 0, f"Excalibur should give 0 bonus vs non-undead, got {bonus}"
+    rng = jax.random.PRNGKey(2)
+    for target_idx, name in ((undead_idx, "undead"), (non_undead_idx, "non-undead")):
+        bonuses = set()
+        for i in range(60):
+            sub = jax.random.fold_in(rng, jnp.uint32(i))
+            bonus = int(artifact_bonus_damage(jnp.int32(0), jnp.int32(target_idx), sub))
+            assert 1 <= bonus <= 10, (
+                f"Excalibur vs {name} bonus out of d10 range: {bonus}"
+            )
+            bonuses.add(bonus)
+        # d10 spread — at least 6 distinct outcomes over 60 rolls.
+        assert len(bonuses) >= 6, (
+            f"Expected d10 spread vs {name}, got: {sorted(bonuses)}"
+        )
 
 
 def test_sting_vs_orc():
