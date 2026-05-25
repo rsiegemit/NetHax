@@ -969,81 +969,129 @@ def _retouch_equipment_silver(state, form_idx: jnp.ndarray, rng: jax.Array):
 def newman(state, rng: jax.Array):
     """Re-roll player stats when they polymorph into their own race form.
 
-    vendor/nethack/src/polyself.c:336 — newman():
-      - Re-roll player XL ± 2 (clamped 1..30).
-      - Recompute HP_max via the byte-equal vendor formula at
-        polyself.c:386-394:
-            hpmax = u.uhpmax
-            for i in [0, oldlvl): hpmax -= u.uhpinc[i]
-            hpmax = rounddiv(hpmax * rn1(4,8), 10)     # retain 80-110%
-            for i in [0, newlvl): hpmax += newhp()     # ~rnd(8)+1 ≈ 5.5 mean
-            hpmax = max(hpmax, ulevel)                 # floor at 1 HP/level
-        Nethax stores the per-level increment history at
-        ``state.player_uhpinc[0..30]`` (added in earlier wave) so we can
-        subtract the exact ladder.  ``newhp()`` per-class roll for the
-        added levels is approximated as ``newlvl * 8`` (mean of the
-        per-class rnd(8)+1 distribution); class-specific dice tables are
-        in ``character.py`` but are not threaded through here yet.
-      - Recompute PW_max with the matching ueninc[] ladder + mean 4/lvl.
-      - Cure SICK and STONED status effects.
+    Byte-equal port of vendor/nethack/src/polyself.c::newman (lines 336-430).
+    HP/Pw consume the per-level history arrays
+    ``state.player_uhpinc[]`` / ``state.player_ueninc[]`` and re-roll the
+    new ladder via ``experience.newhp`` / ``experience.newpw``::
+
+        hpmax = u.uhpmax;
+        for (i = 0; i < oldlvl; i++) hpmax -= u.uhpinc[i];
+        hpmax = rounddiv(hpmax * rn1(4,8), 10);
+        for (i = 0; (u.ulevel = i) < newlvl; i++) hpmax += newhp();
+        if (hpmax < u.ulevel) hpmax = u.ulevel;
+
+    Identical block for ``u.uenmax`` / ``u.ueninc`` / ``newpw()``
+    (polyself.c:401-411).  The ``newhp()`` / ``newpw()`` calls update
+    ``player_uhpinc[i]`` / ``player_ueninc[i]`` in-place so the new history
+    matches what a fresh character at the post-newman ulevel would have.
+
+    Also:
+      - Re-roll player XL ± 2, clamped to [1, MAXULEV] (polyself.c:351
+        rn2(5) + u.ulevel - 2 == old_xl + rn2(5) - 2).
+      - Proportional carry of current HP / Pw.
+      - Cure SICK and STONED (polyself.c:415-418).
+      - Reset hunger via rn1(500, 500) (polyself.c:414).
 
     Returns
     -------
     EnvState — updated state (does NOT set is_polymorphed; caller handles that).
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus
+    from Nethax.nethax.subsystems.experience import (
+        newhp as _newhp,
+        newpw as _newpw,
+    )
 
-    rng, sub, sub_hp, sub_pw = jax.random.split(rng, 4)
-    xl_delta  = jax.random.randint(sub, (), -2, 3).astype(jnp.int32)  # [-2,+2]
+    MAXULEV = 30
+    HISTORY_LEN = int(state.player_uhpinc.shape[0])  # 31 (MAXULEV + 1)
+
+    rng, sub_xl, sub_hp, sub_pw, sub_h, sub_loop = jax.random.split(rng, 6)
+    # polyself.c:351 — newlvl = rn2(5) + u.ulevel - 2;  i.e. ±2 around old.
+    xl_delta  = jax.random.randint(sub_xl, (), -2, 3).astype(jnp.int32)
     old_xl    = state.player_xl.astype(jnp.int32)
-    new_xl    = jnp.clip(old_xl + xl_delta, jnp.int32(1), jnp.int32(30))
+    new_xl    = jnp.clip(old_xl + xl_delta, jnp.int32(1), jnp.int32(MAXULEV))
     old_hp_max = state.player_hp_max.astype(jnp.int32)
     old_pw_max = state.player_pw_max.astype(jnp.int32)
 
-    # Vendor polyself.c:386-397 byte-equal:
-    # Step 1: subtract the per-level history of HP/Pw increments.
-    uhpinc = state.player_uhpinc.astype(jnp.int32)  # [31]
-    ueninc = state.player_ueninc.astype(jnp.int32)  # [31]
-    idx_arr = jnp.arange(uhpinc.shape[0], dtype=jnp.int32)
-    take_old = idx_arr < old_xl
-    hp_history_sum = jnp.sum(jnp.where(take_old, uhpinc, jnp.int32(0)))
-    pw_history_sum = jnp.sum(jnp.where(take_old, ueninc, jnp.int32(0)))
-    hpmax_minus_history = old_hp_max - hp_history_sum
-    pwmax_minus_history = old_pw_max - pw_history_sum
+    # polyself.c:386-388 / 401-403 — subtract the per-level history of
+    # HP/Pw increments for indices [0, oldlvl).  Bounded static reduce so
+    # this stays JIT-traceable; the mask gates which slots contribute.
+    idx        = jnp.arange(HISTORY_LEN, dtype=jnp.int32)
+    hp_history = state.player_uhpinc.astype(jnp.int32)
+    en_history = state.player_ueninc.astype(jnp.int32)
+    old_mask   = (idx < old_xl).astype(jnp.int32)
+    hp_subtract = jnp.sum(hp_history * old_mask)
+    en_subtract = jnp.sum(en_history * old_mask)
+    hpmax_base = old_hp_max - hp_subtract
+    enmax_base = old_pw_max - en_subtract
 
-    # Step 2: retain factor rn1(4,8) = rn2(4)+8 ∈ [8,11].  Vendor uses
-    # `rounddiv(... * rn1(4,8), 10)` which is integer ceil-div.
+    # polyself.c:389-390 / 404 — hpmax = rounddiv(hpmax * rn1(4,8), 10).
+    # rn1(x, y) := rn2(x) + y, so rn1(4,8) ∈ [8, 11] inclusive.
+    # ``rounddiv(a, b)`` for b=10 is ``(a + 5) / 10`` (round half away from 0
+    # for positives — which is what we expect after the retain multiply).
     hp_retain = jax.random.randint(sub_hp, (), 8, 12, dtype=jnp.int32)
     pw_retain = jax.random.randint(sub_pw, (), 8, 12, dtype=jnp.int32)
-    hp_retained = (hpmax_minus_history * hp_retain + jnp.int32(5)) // jnp.int32(10)
-    pw_retained = (pwmax_minus_history * pw_retain + jnp.int32(5)) // jnp.int32(10)
+    hp_retained = (hpmax_base * hp_retain + jnp.int32(5)) // jnp.int32(10)
+    pw_retained = (enmax_base * pw_retain + jnp.int32(5)) // jnp.int32(10)
 
-    # Step 3: add newhp() / newpw() for each new level.  Approximated as
-    # the per-class mean (8 HP, 4 PW per level) since class dice aren't
-    # threaded here.  JAX-required divergence: per-class newhp() roll table
-    # lives in character.py STARTING_HP_PW and isn't wired in.
-    new_hp_max = hp_retained + new_xl * jnp.int32(8)
-    new_pw_max = pw_retained + new_xl * jnp.int32(4)
+    # polyself.c:391-392 / 405-406 — for (i = 0; (u.ulevel = i) < newlvl; i++)
+    # hpmax += newhp();  enmax += newpw();
+    # ``newhp()`` / ``newpw()`` read ``state.player_xl`` (used here as the
+    # transient ``i``) and record ``uhpinc[i]`` / ``ueninc[i]``, so by the
+    # end of the loop the history matches a fresh character at level newlvl.
+    # We use a bounded ``lax.scan`` over [0, HISTORY_LEN) and mask additions
+    # / writes for i >= newlvl to keep the structure static under JIT.
+    def _grow_one(carry, i):
+        s, hp_acc, en_acc, rng_c = carry
+        rng_c, k_hp, k_pw = jax.random.split(rng_c, 3)
+        # Temporarily set player_xl=i so newhp/newpw write uhpinc[i]/ueninc[i]
+        # and pick the correct lo/hi advance recurrence (xlev < role.xlev).
+        s_i = s.replace(player_xl=i.astype(s.player_xl.dtype))
+        hp_i, s_i = _newhp(s_i, k_hp)
+        en_i, s_i = _newpw(s_i, k_pw)
+        active_b = i < new_xl
+        active_i = active_b.astype(jnp.int32)
+        new_acc_hp = hp_acc + hp_i * active_i
+        new_acc_en = en_acc + en_i * active_i
+        # Revert uhpinc/ueninc writes for the inactive tail (i >= newlvl).
+        new_uhpinc = jnp.where(active_b, s_i.player_uhpinc, s.player_uhpinc)
+        new_ueninc = jnp.where(active_b, s_i.player_ueninc, s.player_ueninc)
+        s_out = s_i.replace(
+            player_uhpinc=new_uhpinc,
+            player_ueninc=new_ueninc,
+        )
+        return (s_out, new_acc_hp, new_acc_en, rng_c), None
+
+    (state, hp_add, en_add, _), _ = jax.lax.scan(
+        _grow_one,
+        (state, jnp.int32(0), jnp.int32(0), sub_loop),
+        jnp.arange(HISTORY_LEN, dtype=jnp.int32),
+    )
+    new_hp_max = hp_retained + hp_add
+    new_pw_max = pw_retained + en_add
+
+    # polyself.c:393-394 / 407-408 — hpmax = max(hpmax, ulevel) (1 HP / level).
     new_hp_max = jnp.maximum(new_hp_max, new_xl)
     new_pw_max = jnp.maximum(new_pw_max, new_xl)
 
-    # Step 4: current HP/Pw scale proportionally (polyself.c:396, 409).
-    safe_old_hp_max = jnp.maximum(old_hp_max, jnp.int32(1))
-    safe_old_pw_max = jnp.maximum(old_pw_max, jnp.int32(1))
-    new_hp = (state.player_hp.astype(jnp.int32) * new_hp_max) // safe_old_hp_max
-    new_pw = (state.player_pw.astype(jnp.int32) * new_pw_max) // safe_old_pw_max
+    # polyself.c:395-396 / 409-410 — current HP/Pw retain the same proportion:
+    # u.uhp = rounddiv(u.uhp * hpmax, u.uhpmax)
+    safe_old_hp = jnp.maximum(old_hp_max, jnp.int32(1))
+    safe_old_pw = jnp.maximum(old_pw_max, jnp.int32(1))
+    new_hp = (state.player_hp.astype(jnp.int32) * new_hp_max
+              + safe_old_hp // jnp.int32(2)) // safe_old_hp
+    new_pw = (state.player_pw.astype(jnp.int32) * new_pw_max
+              + safe_old_pw // jnp.int32(2)) // safe_old_pw
     new_hp = jnp.minimum(new_hp, new_hp_max)
     new_pw = jnp.minimum(new_pw, new_pw_max)
 
-    # Cure SICK and STONED.
+    # Cure SICK and STONED (polyself.c:415-418).
     ts = state.status.timed_statuses
     ts = ts.at[int(TimedStatus.SICK)].set(jnp.int32(0))
     ts = ts.at[int(TimedStatus.STONED)].set(jnp.int32(0))
     new_status = state.status.replace(timed_statuses=ts)
 
-    # vendor/nethack/src/polyself.c:414 — u.uhunger = rn1(500, 500);
-    # rn1(x, y) := rn2(x) + y, so nutrition resets to [500, 999] inclusive.
-    rng, sub_h = jax.random.split(rng)
+    # polyself.c:414 — u.uhunger = rn1(500, 500); → nutrition ∈ [500, 999].
     new_status = new_status.replace(
         nutrition=jnp.int32(500)
         + jax.random.randint(sub_h, (), 0, 500, dtype=jnp.int32)

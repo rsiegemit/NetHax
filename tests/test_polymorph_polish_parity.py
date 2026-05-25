@@ -118,7 +118,15 @@ def test_choose_form_excludes_nopoly():
 # ---------------------------------------------------------------------------
 
 def test_newman_rerolls_xl():
-    """Human polymorphs to human: xl changes by at most 2."""
+    """Human polymorphs to human: xl changes by at most 2, HP/Pw recomputed.
+
+    Vendor polyself.c:351 sets ``newlvl = old_xl + (rn2(5) - 2)`` and clamps
+    to [1, MAXULEV].  HP_max / Pw_max are then re-derived from the per-level
+    uhpinc[]/ueninc[] history plus fresh newhp()/newpw() rolls
+    (polyself.c:386-408), so we only assert the bounds vendor guarantees:
+        hpmax >= ulevel  (1 HP per level floor, polyself.c:393)
+        enmax >= ulevel  (1 Pw per level floor, polyself.c:407)
+    """
     state = _base_state()
     original_xl = int(state.player_xl)
     new_state = newman(state, _RNG)
@@ -126,9 +134,12 @@ def test_newman_rerolls_xl():
     assert abs(new_xl - original_xl) <= 2, (
         f"XL delta {new_xl - original_xl} exceeds ±2"
     )
-    # HP_max and PW_max should be recomputed from new XL.
-    assert int(new_state.player_hp_max) == max(new_xl * 8, 1)
-    assert int(new_state.player_pw_max) == max(new_xl * 4, 0)
+    # Vendor floor: HP_max >= ulevel, Pw_max >= ulevel.
+    assert int(new_state.player_hp_max) >= new_xl
+    assert int(new_state.player_pw_max) >= new_xl
+    # HP / Pw should remain proportional to their new max (current <= max).
+    assert int(new_state.player_hp) <= int(new_state.player_hp_max)
+    assert int(new_state.player_pw) <= int(new_state.player_pw_max)
 
 
 # ---------------------------------------------------------------------------

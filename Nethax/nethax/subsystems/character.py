@@ -1034,6 +1034,20 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int):
     amax_vals = [min(int(race_entry.attrmax[i]), 18) for i in range(6)]
     player_amax = jnp.array(amax_vals, dtype=jnp.int8)
 
+    # --- uhpinc[0] / ueninc[0]: record the initial HP/Pw grant so that the
+    # ulevel==0 -> ulevel==1 transition is part of the per-level history that
+    # newman()/losexp() consume.  Vendor attrib.c::newhp lines 1129-1131 and
+    # exper.c::newpw lines 68-70 both write ``uhpinc[u.ulevel] = hp`` (resp.
+    # ``ueninc[u.ulevel] = en``); during ini_hpwp the value of u.ulevel is 0
+    # so the slot written is index 0.  Cite: vendor/nethack/src/u_init.c
+    # ini_hpwp; attrib.c:1129-1131; exper.c:68-70.
+    player_uhpinc = jnp.zeros((31,), dtype=jnp.int16).at[0].set(
+        hp.astype(jnp.int16)
+    )
+    player_ueninc = jnp.zeros((31,), dtype=jnp.int16).at[0].set(
+        pw.astype(jnp.int16)
+    )
+
     return dict(
         player_role=jnp.int8(int(role)),
         player_race=jnp.int8(int(race)),
@@ -1049,6 +1063,8 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int):
         player_hp_max=hp,
         player_pw=pw,
         player_pw_max=pw,
+        player_uhpinc=player_uhpinc,
+        player_ueninc=player_ueninc,
         player_ac=player_ac,
         # Vendor default: luck starts at 0 (you.h::u.uluck), no birth opt.
         player_luck=jnp.int8(0),
