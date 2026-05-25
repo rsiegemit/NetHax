@@ -717,6 +717,19 @@ STARTING_HP_PW: dict = {
 }
 
 
+# JIT-side per-role HP/PW per-level lookups.  Used by polymorph::newman
+# to consume the per-class ``newhp() = d(hp_per_level)`` and
+# ``newpw() = d(pw_per_level)`` dice when adding levels post-poly.
+_N_ROLES_HP_PW = max(int(r) for r in STARTING_HP_PW.keys()) + 1
+_HP_PER_LEVEL_ARR: list = [8] * _N_ROLES_HP_PW
+_PW_PER_LEVEL_ARR: list = [1] * _N_ROLES_HP_PW
+for _r, (_hb, _hpl, _pb, _pwl) in STARTING_HP_PW.items():
+    _HP_PER_LEVEL_ARR[int(_r)] = int(_hpl)
+    _PW_PER_LEVEL_ARR[int(_r)] = int(_pwl)
+HP_PER_LEVEL_TABLE = jnp.array(_HP_PER_LEVEL_ARR, dtype=jnp.int32)
+PW_PER_LEVEL_TABLE = jnp.array(_PW_PER_LEVEL_ARR, dtype=jnp.int32)
+
+
 # ---------------------------------------------------------------------------
 # Wield / wear helpers
 # ---------------------------------------------------------------------------
