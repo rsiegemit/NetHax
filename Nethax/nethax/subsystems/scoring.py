@@ -238,10 +238,17 @@ class ScoringState:
     ascended:          jnp.ndarray  # scalar bool
     final_score:       jnp.ndarray  # scalar int32
     death_cause:       jnp.ndarray  # scalar int8  (DeathCause enum value)
+    monsters_died_per_pm: jnp.ndarray  # [NUM_MONSTERS] int32
+    # Per-PM kill counter — vendor ``svm.mvitals[i].died`` (decl.c).
+    # Consumed by exper.c::experience as the ``nk`` parameter that drives
+    # the repeated-kill XP halving for cloned / revived monsters.
+    # Cite: vendor/nethack/include/decl.h ``struct mvitals``;
+    #       vendor/nethack/src/exper.c::experience lines 83-166.
 
     @classmethod
     def default(cls) -> "ScoringState":
         """Return a zeroed ScoringState for a new game."""
+        from Nethax.nethax.constants.monsters import MONSTERS
         return cls(
             score=jnp.int32(0),
             monsters_killed=jnp.int32(0),
@@ -252,6 +259,7 @@ class ScoringState:
             ascended=jnp.bool_(False),
             final_score=jnp.int32(0),
             death_cause=jnp.int8(0),
+            monsters_died_per_pm=jnp.zeros((len(MONSTERS),), dtype=jnp.int32),
         )
 
 
@@ -294,6 +302,25 @@ def record_kill(state: ScoringState, mon_xp: jnp.int32) -> ScoringState:
         score=new_score,
         experience_points=new_xp,
     )
+
+
+def record_kill_pm(state: ScoringState, entry_idx: jnp.ndarray) -> ScoringState:
+    """Increment the per-PM died counter (``svm.mvitals[pm].died``).
+
+    Cite: vendor/nethack/include/decl.h ``struct mvitals`` and
+    vendor/nethack/src/mondead.c::xkilled (sets mvitals.died on kill).
+    """
+    n = state.monsters_died_per_pm.shape[0]
+    safe = jnp.clip(entry_idx.astype(jnp.int32), 0, n - 1)
+    bumped = state.monsters_died_per_pm.at[safe].add(jnp.int32(1))
+    return state.replace(monsters_died_per_pm=bumped)
+
+
+def died_for_pm(state: ScoringState, entry_idx: jnp.ndarray) -> jnp.ndarray:
+    """Return the current ``mvitals[pm].died`` count for ``entry_idx``."""
+    n = state.monsters_died_per_pm.shape[0]
+    safe = jnp.clip(entry_idx.astype(jnp.int32), 0, n - 1)
+    return state.monsters_died_per_pm[safe].astype(jnp.int32)
 
 
 def record_achievement(state: ScoringState, achievement_id: int) -> ScoringState:

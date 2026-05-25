@@ -32,7 +32,11 @@ from Nethax.nethax.subsystems.inventory import (
     compute_ac as _inv_compute_ac,
 )
 from Nethax.nethax.subsystems.items_potions import apply_potion_to_monster
-from Nethax.nethax.subsystems.scoring import record_kill as _scoring_record_kill
+from Nethax.nethax.subsystems.scoring import (
+    record_kill as _scoring_record_kill,
+    record_kill_pm as _scoring_record_kill_pm,
+    died_for_pm as _scoring_died_for_pm,
+)
 from Nethax.nethax.subsystems.experience import (
     experience as _xp_experience,
     more_experienced as _xp_more_experienced,
@@ -177,7 +181,10 @@ from Nethax.nethax.subsystems.swallow import _IS_ENGULFER as _ENGULFER_TABLE, tr
 # Immobile-monster mask — vendor/nethack/src/uhitm.c:393-394:
 #   if (!mtmp->mcanmove) tmp += 4;
 # Structural immobility: move_speed == 0 (e.g. brown mold, blue jelly).
-# TODO: runtime paralysis (!mcanmove) not modelled — no mcanmove field yet.
+# Runtime paralysis is handled at the use site via
+# ``mai.paralyzed_timer[idx] > 0`` (see ``compute_to_hit`` below), which
+# is byte-equal with vendor ``!mtmp->mcanmove`` (mcanmove flips false
+# only while the FROZEN / paralysis timer is active).
 # Built once at module load; never traced inside JIT.
 # ---------------------------------------------------------------------------
 def _build_is_immobile_table() -> jnp.ndarray:
@@ -1339,17 +1346,13 @@ def _single_melee_strike(
     # vendor exper.c:143-163 halves XP via ``nk`` only when the slain monster
     # is mrevived or mcloned; vendor's ``nk`` comes from
     # ``svm.mvitals[mtmp->data - mons].died`` (a per-PM kill counter).
-    #
-    # JAX-required divergence: Nethax does not maintain a per-PM kill counter
-    # (no ``mvitals.died`` analog).  When mcloned is False the halving is a
-    # no-op and the XP value is bit-equal to vendor; when mcloned is True we
-    # fall back to ``scoring.monsters_killed`` (total kill counter) as the
-    # closest available proxy.
+    # The per-PM counter is tracked in ScoringState.monsters_died_per_pm
+    # (vendor decl.h ``struct mvitals`` mirror).
     entry = jnp.clip(
         mai.entry_idx[idx].astype(jnp.int32),
         0, _MONSTER_XP_TABLE.shape[0] - 1,
     )
-    kill_count = new_state.scoring.monsters_killed
+    kill_count = _scoring_died_for_pm(new_state.scoring, entry)
     mcloned = new_state.monster_ai.mcloned[idx]
     xp_award = _xp_experience(entry, kill_count, mcloned=mcloned)
     new_state = jax.lax.cond(
@@ -1362,10 +1365,13 @@ def _single_melee_strike(
     # only touches u.uexp / u.urexp.  Kill-counter and running-score side
     # effects (vendor end.c::done records per-genus/per-class kill counts;
     # u.urexp drives the score via topten.c:675) are bumped here via
-    # scoring.record_kill, gated on the same ``killed`` flag.
+    # scoring.record_kill, gated on the same ``killed`` flag.  The per-PM
+    # mvitals.died counter is also bumped (vendor mondead.c::xkilled).
     new_state = jax.lax.cond(
         killed,
-        lambda s: s.replace(scoring=_scoring_record_kill(s.scoring, xp_award)),
+        lambda s: s.replace(scoring=_scoring_record_kill_pm(
+            _scoring_record_kill(s.scoring, xp_award), entry
+        )),
         lambda s: s,
         new_state,
     )

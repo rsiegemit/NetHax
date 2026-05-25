@@ -131,6 +131,10 @@ class ContainerState:
     # Cite: vendor/nethack/src/lock.c::pick_lock — locked chests can be picked
     # by a lock pick, skeleton key, or credit card.
     is_locked:        jnp.ndarray
+    # is_trapped: bool[N_CONTAINERS] — True when the container is rigged
+    # to fire on opening.  Cite: vendor/nethack/include/obj.h ``otrapped``
+    # bitfield (distinct from olocked and oeaten/oerodeproof/etc.).
+    is_trapped:       jnp.ndarray
 
     @classmethod
     def empty(cls) -> "ContainerState":
@@ -150,6 +154,7 @@ class ContainerState:
             is_open          = jnp.zeros((n,),   dtype=jnp.bool_),
             container_buc    = jnp.zeros((n,),   dtype=jnp.int8),
             is_locked        = jnp.zeros((n,),   dtype=jnp.bool_),
+            is_trapped       = jnp.zeros((n,),   dtype=jnp.bool_),
         )
 
 
@@ -203,17 +208,13 @@ def fire_container_trap(state, container_idx: int):
     """Fire the trap on a trapped container when it is opened.
 
     Canonical: vendor/nethack/src/pickup.c::container_trap (~line 2460).
-    NetHack checks obj->otrapped; on True it applies one of several effects
-    (explosion, alarm, etc.).  Here we model the common case: a trapped
+    Vendor reads obj->otrapped (a separate bitfield from olocked / the
+    BUC bits) and on True applies one of several effects (explosion,
+    alarm, sleep gas, etc.).  Here we model the common case: a trapped
     container deals 1d10 damage to the player and clears its trapped flag.
 
-    The ``olocked`` field in the Item struct is reused as the otrapped flag
-    for simplicity (both are boolean container-state bits; in the vendor they
-    are separate bitfields in the same obj.  We diverge by using ``olocked``
-    as a "trapped" sentinel on ground items when the category is TOOL/CHEST).
-
-    buc_status == 4 is used as the "trapped" sentinel (distinct from
-    BUCStatus 0-3).
+    Trap-state lives in the dedicated ``ContainerState.is_trapped`` bool
+    array — independent of BUC, mirrors vendor obj->otrapped bitfield.
 
     Parameters
     ----------
@@ -229,8 +230,7 @@ def fire_container_trap(state, container_idx: int):
     c_idx = jnp.int32(container_idx)
 
     has_container = cs.container_type[c_idx] != jnp.int8(ContainerType.NONE)
-    _TRAPPED_SENTINEL = jnp.int8(4)
-    is_trapped = has_container & (cs.container_buc[c_idx] == _TRAPPED_SENTINEL)
+    is_trapped = has_container & cs.is_trapped[c_idx]
 
     rng_trap, new_rng = jax.random.split(state.rng)
     dmg = jax.random.randint(rng_trap, (), minval=1, maxval=11, dtype=jnp.int32)
@@ -241,14 +241,10 @@ def fire_container_trap(state, container_idx: int):
         state.player_hp.astype(jnp.int32),
     ).astype(state.player_hp.dtype)
 
-    new_container_buc = cs.container_buc.at[c_idx].set(
-        jnp.where(
-            is_trapped,
-            jnp.int8(int(BUCStatus.UNCURSED)),
-            cs.container_buc[c_idx],
-        )
+    new_is_trapped = cs.is_trapped.at[c_idx].set(
+        jnp.where(is_trapped, jnp.bool_(False), cs.is_trapped[c_idx])
     )
-    new_cs = cs.replace(container_buc=new_container_buc)
+    new_cs = cs.replace(is_trapped=new_is_trapped)
     return state.replace(player_hp=new_hp, containers=new_cs, rng=new_rng), is_trapped
 
 
@@ -827,6 +823,7 @@ def install_container(
     container_type: ContainerType,
     parent_slot: int = -1,
     buc: int = int(BUCStatus.UNCURSED),
+    trapped: bool = False,
 ):
     """Place a fresh container of the given type into slot ``container_idx``.
 
@@ -839,6 +836,7 @@ def install_container(
         parent_slot    = cs.parent_slot.at[c].set(jnp.int8(int(parent_slot))),
         container_buc  = cs.container_buc.at[c].set(jnp.int8(int(buc))),
         is_open        = cs.is_open.at[c].set(jnp.bool_(False)),
+        is_trapped     = cs.is_trapped.at[c].set(jnp.bool_(bool(trapped))),
     )
     return state.replace(containers=new_cs)
 

@@ -190,21 +190,18 @@ def test_bag_of_tricks_spawns():
 # ---------------------------------------------------------------------------
 
 def test_container_trap_on_open():
-    """Opening a trapped container (buc sentinel=4) deals 1d10 HP damage.
+    """Opening a trapped container deals 1d10 HP damage and clears the flag.
 
-    Canonical: pickup.c::container_trap — otrapped flag triggers explosion on
-    open; modelled here as buc_status sentinel value 4.
+    Canonical: pickup.c::container_trap — vendor obj->otrapped (a bitfield
+    distinct from olocked / BUC) triggers a trap effect on open.  Nethax
+    mirrors this with the dedicated ContainerState.is_trapped bool.
     """
     from Nethax.nethax.subsystems.containers import (
         install_container, open_container, ContainerType,
     )
 
-    _TRAPPED_SENTINEL = 4
-
     state = _base_state()
-    # Install a large box with the trapped sentinel as its buc value.
-    state = install_container(state, 0, ContainerType.LARGE_BOX,
-                               buc=_TRAPPED_SENTINEL)
+    state = install_container(state, 0, ContainerType.LARGE_BOX, trapped=True)
 
     hp_before = int(state.player_hp)
     state = open_container(state, slot_idx=0)
@@ -214,9 +211,7 @@ def test_container_trap_on_open():
         f"Expected HP to decrease after opening trapped container; "
         f"before={hp_before} after={hp_after}"
     )
-    # Trap sentinel should be cleared after firing.
-    from Nethax.nethax.subsystems.containers import BUCStatus
-    buc_after = int(state.containers.container_buc[0])
-    assert buc_after != _TRAPPED_SENTINEL, (
-        f"Trapped sentinel should be cleared after trap fires, got buc={buc_after}"
+    # Trapped flag should be cleared after firing.
+    assert not bool(state.containers.is_trapped[0]), (
+        "is_trapped should be cleared after trap fires"
     )
