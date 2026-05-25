@@ -265,10 +265,34 @@ def dip_fountain(state, rng: jax.Array, slot_idx: int) -> object:
 
         # --- WATER_DEMON (fountain.c:476 case 21) ---
         def _demon(st):
-            # Spawn demon: damage player (simplified — 1d6 HP loss).
-            # Vendor: fountain.c:63-89 dowaterdemon().
-            new_hp = jnp.maximum(st.player_hp - jnp.int32(4), jnp.int32(0))
-            return st.replace(player_hp=new_hp)
+            # Spawn an actual water demon (PM_WATER_DEMON = entry_idx 297
+            # in MONSTERS table; cite chunk5.py:727) in a free slot
+            # adjacent to the player.  Vendor fountain.c:63-89 dowaterdemon
+            # calls makemon(&mons[PM_WATER_DEMON], u.ux, u.uy, MM_NOMSG).
+            from Nethax.nethax.subsystems.monster_ai import _newmonhp_roll
+            _PM_WATER_DEMON = 297
+            mai = st.monster_ai
+            # Find first dead slot (skip sentinel slot 0).
+            dead_mask = ~mai.alive
+            dead_mask = dead_mask.at[0].set(False)
+            slot = jnp.argmax(dead_mask).astype(jnp.int32)
+            any_dead = jnp.any(dead_mask)
+            # Water demon is m_lev 8 per chunk5.
+            mlev = jnp.int32(8)
+            new_hp = _newmonhp_roll(rng, mlev)
+            ppos = st.player_pos.astype(jnp.int16)
+            def _spawn(s):
+                m = s.monster_ai
+                return s.replace(monster_ai=m.replace(
+                    alive=m.alive.at[slot].set(jnp.bool_(True)),
+                    entry_idx=m.entry_idx.at[slot].set(jnp.int16(_PM_WATER_DEMON)),
+                    pos=m.pos.at[slot].set(ppos),
+                    hp=m.hp.at[slot].set(new_hp),
+                    hp_max=m.hp_max.at[slot].set(new_hp),
+                    m_lev=m.m_lev.at[slot].set(mlev.astype(jnp.int16)),
+                    peaceful=m.peaceful.at[slot].set(jnp.bool_(False)),
+                ))
+            return jax.lax.cond(any_dead, _spawn, lambda s: s, st)
 
         # --- WATER_NYMPH (fountain.c:479 case 22) — steal an item ---
         def _nymph(st):

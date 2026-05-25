@@ -1990,22 +1990,47 @@ def _handle_force(state, rng):
     """#force — vendor/nethack/src/lock.c::doforce line 1116.
 
     Bashes open a locked carried container using the wielded weapon.
-    Wave-44 minimum: clears `is_locked` on the lowest-index carried
-    container with prob ``min(2*str + 25, 99)`` per rn2(100).  Vendor
-    weapon-class also matters (blunt heavier weapons are better) — we
-    approximate with str-based chance only.
+    Vendor doforce_help formula (lock.c:1135-1148):
+        if blunt weapon:  roll += weapon_weight
+        if sharp weapon:  roll += -1 * effort_to_pry  (slower)
+        success iff rn2(100) < roll
+    Vendor also requires a wielded weapon to attempt force.
 
-    Cite: vendor/nethack/src/lock.c::doforce line 1116.
+    Nethax port: roll = ``2*str + 25 + weapon_weight_bonus`` where the
+    bonus is the wielded item's weight when it's a blunt weapon
+    (approximated as "any wielded item with weight > 30"), capped at
+    99 per rn2(100).  Without wielded weapon the attempt is refused.
+
+    Cite: vendor/nethack/src/lock.c::doforce / doforce_help line 1135.
     """
     cs = state.containers
+    inv = state.inventory
     locked = cs.is_locked
     candidate = locked
     first = jnp.argmax(candidate.astype(jnp.int32)).astype(jnp.int32)
     any_locked = jnp.any(candidate)
     strv = state.player_str.astype(jnp.int32)
-    chance = jnp.minimum(jnp.int32(2) * strv + jnp.int32(25), jnp.int32(99))
+
+    # Wielded weapon weight (vendor uses obj->owt for blunt weapons).
+    wielded = inv.wielded.astype(jnp.int32)
+    has_wielded = wielded >= jnp.int32(0)
+    safe_w = jnp.clip(wielded, 0, inv.items.type_id.shape[0] - 1)
+    wep_wt = jnp.where(
+        has_wielded,
+        inv.items.weight[safe_w].astype(jnp.int32),
+        jnp.int32(0),
+    )
+    # Blunt-weapon proxy: heavy weapon (weight > 30) treated as blunt.
+    # Vendor distinguishes by oc_skill; we approximate by weight class.
+    is_blunt = has_wielded & (wep_wt > jnp.int32(30))
+    weapon_bonus = jnp.where(is_blunt, wep_wt, jnp.int32(0))
+    chance = jnp.minimum(
+        jnp.int32(2) * strv + jnp.int32(25) + weapon_bonus,
+        jnp.int32(99),
+    )
     roll = jax.random.randint(rng, (), 0, 100, dtype=jnp.int32)
-    success = any_locked & (roll < chance)
+    # Vendor requires a wielded weapon to attempt #force at all.
+    success = any_locked & has_wielded & (roll < chance)
     new_locked = jnp.where(success,
                            locked.at[first].set(jnp.bool_(False)),
                            locked)
