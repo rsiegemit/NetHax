@@ -250,6 +250,7 @@ def test_reflection_bounces_ray():
     mon_alive = mon_alive.at[MON_SLOT].set(True)
 
     from Nethax.nethax.subsystems.inventory import InventoryState
+    from Nethax.nethax.subsystems.traps import TrapState
     state = WandState(
         mon_pos=mon_pos,
         mon_hp=mon_hp,
@@ -270,6 +271,9 @@ def test_reflection_bounces_ray():
         probed_hp=jnp.int32(0),
         probed_idx=jnp.int32(0),
         player_reflecting=jnp.bool_(True),
+        branch=jnp.int8(0),
+        traps=TrapState.default(num_levels=1, map_h=MAP_H, map_w=MAP_W),
+        wall_info=jnp.zeros((1, MAP_H, MAP_W), dtype=jnp.bool_),
     )
 
     # on_hit_fn: deal 15 damage (enough to kill the 10-HP monster).

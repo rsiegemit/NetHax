@@ -326,14 +326,24 @@ def _is_maze_level(state) -> jnp.ndarray:
 
 
 def _is_cavernous_level(state) -> jnp.ndarray:
-    """Best-effort proxy for ``svl.level.flags.is_cavernous_lev``.
+    """Read ``svl.level.flags.is_cavernous_lev`` for the current level.
 
-    Vendor flags individual levels as cavernous; we approximate with the
-    Gnomish Mines branch (branch 1).
+    Wave 48b: replaced the Mines-branch proxy with a direct read of the
+    per-level ``features.is_cavernous_lev`` bit, mirroring vendor/
+    nethack/include/rm.h line 454 (``Bitfield(is_cavernous_lev, 1)``).
+    The flag is set at level generation by mkmap.c line 483 (cave-shaped
+    levels) and consumed by dig.c lines 495-497 to carve walls into
+    CORR rather than D_NODOOR.
 
-    Cite: vendor/nethack/src/dig.c lines 495-497 (is_cavernous_lev check).
+    Cite: vendor/nethack/src/dig.c lines 495-497 (is_cavernous_lev check);
+          vendor/nethack/include/rm.h line 454 (levelflags bitfield);
+          vendor/nethack/src/mkmap.c line 483 (cavernous setter).
     """
-    return state.dungeon.current_branch.astype(jnp.int32) == jnp.int32(1)
+    max_levels = state.terrain.shape[1]  # MAX_LEVELS_PER_BRANCH
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    flat_lv = b * jnp.int32(max_levels) + lv
+    return state.features.is_cavernous_lev[flat_lv]
 
 
 def _complete_dig(state):

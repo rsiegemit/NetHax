@@ -23,6 +23,7 @@ from Nethax.nethax.state import EnvState
 from Nethax.nethax.subsystems.items_wands import _effect_digging, WandState
 from Nethax.nethax.subsystems.monster_ai import MAX_MONSTERS_PER_LEVEL
 from Nethax.nethax.subsystems.inventory import InventoryState
+from Nethax.nethax.subsystems.traps import TrapState
 from Nethax.nethax.subsystems.action_dispatch import (
     dispatch_action, _SLOT_TIP_DOWN, _M_byte, _ACTION_TO_HANDLER_IDX,
 )
@@ -53,6 +54,9 @@ def _make_wand_state(player_pos=(5, 5), map_h=21, map_w=80):
         probed_hp     = jnp.int32(0),
         probed_idx    = jnp.int32(-1),
         player_reflecting = jnp.bool_(False),
+        branch        = jnp.int8(0),
+        traps         = TrapState.default(num_levels=1, map_h=map_h, map_w=map_w),
+        wall_info     = jnp.zeros((1, map_h, map_w), dtype=jnp.bool_),
     )
 
 

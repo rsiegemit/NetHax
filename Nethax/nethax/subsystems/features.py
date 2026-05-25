@@ -190,6 +190,23 @@ class FeaturesState:
                        rm.h line 166 — ``Bitfield(waslit, 1)``).  Used by
                        vision/redraw logic to remember which tiles were lit
                        between visits (vendor display.c, vision.c).
+    rememberedlit    : bool [num_levels, map_h, map_w]
+                       True once the player has perceived this tile as lit
+                       and has committed it to memory.  Semantic analog of
+                       vendor display.c memory-glyph logic that tracks
+                       previously-lit tiles for redraw between visits
+                       (companion to ``waslit`` at vendor/nethack/include/
+                       rm.h lines 165-166).  Set via :func:`mark_remembered`
+                       when the player sees a lit tile.
+    is_cavernous_lev : bool [num_levels]
+                       Per-level flag — True iff this level is a "cavernous"
+                       level (Gnomish Mines / random caves).  Mirrors
+                       vendor ``svl.level.flags.is_cavernous_lev`` (vendor/
+                       nethack/include/rm.h line 454 — ``Bitfield(
+                       is_cavernous_lev, 1)``).  Set by vendor mkmap.c::
+                       mkmap line 483 ``svl.level.flags.is_cavernous_lev =
+                       TRUE`` after a walled+joined cave-build.  Gates
+                       wall→corridor carving in vendor dig.c lines 495-497.
     """
 
     fountains_used:  jnp.ndarray   # [num_levels, map_h, map_w]  bool
@@ -207,6 +224,8 @@ class FeaturesState:
     guard_escort_active: jnp.ndarray   # scalar                   bool
     lit:             jnp.ndarray   # [num_levels, map_h, map_w]  bool
     waslit:          jnp.ndarray   # [num_levels, map_h, map_w]  bool
+    rememberedlit:   jnp.ndarray   # [num_levels, map_h, map_w]  bool
+    is_cavernous_lev: jnp.ndarray  # [num_levels]                bool
 
     @classmethod
     def default(cls, num_levels: int, map_h: int, map_w: int) -> "FeaturesState":
@@ -231,6 +250,16 @@ class FeaturesState:
             # for tiles inside lit rooms (vendor mklev.c lines 249-255).
             lit=jnp.zeros(shape, dtype=jnp.bool_),
             waslit=jnp.zeros(shape, dtype=jnp.bool_),
+            # Per-tile remembered-lit (Wave 48b) — set when the player sees
+            # a lit tile; persisted across visits for display redraw.
+            # Companion to vendor waslit (rm.h line 166).
+            rememberedlit=jnp.zeros(shape, dtype=jnp.bool_),
+            # Per-level cavernous flag (vendor rm.h line 454:
+            # ``Bitfield(is_cavernous_lev, 1)``).  Zero-init: cave-shaped
+            # levels (Gnomish Mines) flip this True at generation time
+            # (vendor mkmap.c line 483).  Used by dig.c lines 495-497 to
+            # carve walls into CORR rather than D_NODOOR.
+            is_cavernous_lev=jnp.zeros((num_levels,), dtype=jnp.bool_),
         )
 
 
@@ -771,6 +800,36 @@ def litroom_at(
             new_val = jnp.where(in_bounds, jnp.bool_(True), cur)
             lit = lit.at[flv, rr_s, cc_s].set(new_val)
     return features.replace(lit=lit)
+
+
+def mark_remembered(
+    features: FeaturesState,
+    flat_lv,
+    row,
+    col,
+) -> FeaturesState:
+    """Set ``rememberedlit=True`` at (flat_lv, row, col).
+
+    Called when the player perceives a lit tile so that future redraws
+    treat it as remembered-lit even after the actual ``lit`` bit is
+    cleared (e.g. light source moves away).  Companion to vendor
+    ``waslit`` (vendor/nethack/include/rm.h line 166); mirrors the
+    display-memory glyph path that records previously-lit tiles for
+    between-visit redraw.
+
+    Args:
+        features: FeaturesState pytree.
+        flat_lv:  Flattened level index (int / scalar).
+        row, col: Target tile (int / scalar).
+
+    Returns:
+        Updated FeaturesState with ``rememberedlit`` set True at the tile.
+    """
+    flv = jnp.asarray(flat_lv, dtype=jnp.int32)
+    r   = jnp.asarray(row,     dtype=jnp.int32)
+    c   = jnp.asarray(col,     dtype=jnp.int32)
+    new_rl = features.rememberedlit.at[flv, r, c].set(jnp.bool_(True))
+    return features.replace(rememberedlit=new_rl)
 
 
 # ---------------------------------------------------------------------------

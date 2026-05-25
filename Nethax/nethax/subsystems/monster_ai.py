@@ -821,6 +821,50 @@ def _monster_level(entry_idx: jnp.ndarray) -> jnp.ndarray:
     return _MONSTER_LEVEL_TABLE[safe].astype(jnp.int32)
 
 
+# Wave 48c: per-spawn vendor newmonhp() roll.
+# Cite: vendor/nethack/src/makemon.c::newmonhp lines 1037-1053.
+#   if (!mon->m_lev)  mhpmax = rnd(4);            // level-0 monsters
+#   else               mhpmax = d((int)m_lev, 8); // sum of m_lev d8 rolls
+#   if (mhpmax == basehp) mhpmax += 1;            // all-ones boost
+# Special cases (golems, riders, mlevel>49 fixed-HP, adult dragons,
+# home-elementals) are not modeled at the two summon spawn sites in this
+# file — neither create_monster nor shrieker_summon picks those species,
+# so the common d(m_lev, 8) / rnd(4) path is sufficient.
+_NEWMONHP_MAX_LEV: int = 32
+
+
+def _newmonhp_roll(rng: jax.Array, m_lev: jnp.ndarray) -> jnp.ndarray:
+    """Return mhpmax for a freshly spawned monster of level ``m_lev``.
+
+    Mirrors vendor makemon.c::newmonhp common branch:
+        m_lev == 0  ->  rnd(4)            (1..4 uniform)
+        m_lev >  0  ->  d(m_lev, 8)       (sum of m_lev rolls in 1..8)
+    Then applies the "all-ones boost": if the roll equals basehp (i.e. the
+    minimum possible), add 1 so the lowest-level monsters always have at
+    least 2 HP — see makemon.c:1047-1053.
+    """
+    lev = jnp.maximum(m_lev.astype(jnp.int32), jnp.int32(0))
+    key_d8, key_r4 = jax.random.split(rng)
+
+    # d(m_lev, 8): sum of up to _NEWMONHP_MAX_LEV d8 rolls, masked by lev.
+    d8_keys = jax.random.split(key_d8, _NEWMONHP_MAX_LEV)
+    d8_rolls = jax.vmap(lambda k: jax.random.randint(k, (), 1, 9))(d8_keys)
+    take = jnp.arange(_NEWMONHP_MAX_LEV, dtype=jnp.int32) < lev
+    d_mlev_8 = jnp.sum(jnp.where(take, d8_rolls, 0)).astype(jnp.int32)
+
+    # rnd(4) for level-0 monsters.
+    rnd_4 = jax.random.randint(key_r4, (), 1, 5).astype(jnp.int32)
+
+    # basehp = m_lev (or 1 when m_lev == 0; vendor sets basehp=1 then mhp=rnd(4)).
+    is_lev0 = lev == jnp.int32(0)
+    base = jnp.where(is_lev0, jnp.int32(1), lev)
+    mhpmax = jnp.where(is_lev0, rnd_4, d_mlev_8)
+
+    # "all-ones boost": if mhpmax == basehp, bump by +1 (makemon.c:1050-1052).
+    boost = (mhpmax == base).astype(jnp.int32)
+    return mhpmax + boost
+
+
 def _player_is_invisible(state) -> jnp.ndarray:
     """True iff the player has an active timed invisibility status.
 
@@ -1552,14 +1596,20 @@ def _try_wand_create_monster(state, rng: jax.Array, monster_idx: jnp.ndarray):
     spawn_c = jnp.clip(mpos[1], 0, _MAP_W - 1).astype(jnp.int16)
     spawn_pos = jnp.stack([spawn_r, spawn_c])
 
+    # Wave 48c: vendor newmonhp() per-spawn HP roll (makemon.c:1037-1053).
+    # The summoned slot inherits its preserved entry_idx; derive m_lev from
+    # MONSTERS[entry_idx].level and roll d(m_lev, 8) / rnd(4).
+    spawn_lev = _monster_level(mai.entry_idx[dead_idx])
+    rolled_hp = _newmonhp_roll(rng, spawn_lev)
+
     new_alive = mai.alive.at[dead_idx].set(
         jnp.where(should, jnp.bool_(True), mai.alive[dead_idx]))
     new_pos = mai.pos.at[dead_idx].set(
         jnp.where(should, spawn_pos, mai.pos[dead_idx]))
     new_hp = mai.hp.at[dead_idx].set(
-        jnp.where(should, jnp.int32(4), mai.hp[dead_idx]))
+        jnp.where(should, rolled_hp, mai.hp[dead_idx]))
     new_hp_max = mai.hp_max.at[dead_idx].set(
-        jnp.where(should, jnp.int32(4), mai.hp_max[dead_idx]))
+        jnp.where(should, rolled_hp, mai.hp_max[dead_idx]))
     new_charges_arr = mai.inv_charges.at[idx, slot].set(
         jnp.where(can_zap, charges - jnp.int32(1), charges).astype(jnp.int8))
 
@@ -4202,7 +4252,7 @@ def shrieker_summon(state, rng: jax.Array) -> object:
     is_deaf = state.status.timed_statuses[int(_TS_SE.DEAF)] > jnp.int32(0)
     any_shrieker = any_shrieker & ~is_deaf
 
-    rng_roll, _ = jax.random.split(rng)
+    rng_roll, rng_hp = jax.random.split(rng)
     do_summon = any_shrieker & (jax.random.uniform(rng_roll) < jnp.float32(_SHRIEK_PROB))
 
     dead_mask = ~mai.alive
@@ -4217,16 +4267,21 @@ def shrieker_summon(state, rng: jax.Array) -> object:
 
     should = do_summon & has_dead
 
+    # Wave 48c: vendor newmonhp() per-spawn HP roll (makemon.c:1037-1053).
+    # Shrieker summons a killer bee (entry_idx=1, m_lev=1); roll d(1, 8).
+    summon_lev_i32 = _MONSTER_LEVEL_TABLE[jnp.int32(1)].astype(jnp.int32)
+    rolled_hp      = _newmonhp_roll(rng_hp, summon_lev_i32)
+
     new_alive    = mai.alive.at[dead_idx].set(jnp.where(should, jnp.bool_(True),  mai.alive[dead_idx]))
     new_pos      = mai.pos.at[dead_idx].set(jnp.where(should, spawn_pos,           mai.pos[dead_idx]))
-    new_hp       = mai.hp.at[dead_idx].set(jnp.where(should, jnp.int32(4),         mai.hp[dead_idx]))
-    new_hp_max   = mai.hp_max.at[dead_idx].set(jnp.where(should, jnp.int32(4),     mai.hp_max[dead_idx]))
+    new_hp       = mai.hp.at[dead_idx].set(jnp.where(should, rolled_hp,            mai.hp[dead_idx]))
+    new_hp_max   = mai.hp_max.at[dead_idx].set(jnp.where(should, rolled_hp,        mai.hp_max[dead_idx]))
     new_peaceful = mai.peaceful.at[dead_idx].set(jnp.where(should, jnp.bool_(False), mai.peaceful[dead_idx]))
     new_asleep   = mai.asleep.at[dead_idx].set(jnp.where(should, jnp.bool_(False),  mai.asleep[dead_idx]))
     new_entry    = mai.entry_idx.at[dead_idx].set(jnp.where(should, jnp.int16(1),   mai.entry_idx[dead_idx]))
     # Populate per-monster level from MONSTERS[entry_idx].level.
     # Cite: vendor/nethack/include/monst.h::struct monst::m_lev (set at makemon).
-    summon_lev   = _MONSTER_LEVEL_TABLE[jnp.int32(1)].astype(mai.m_lev.dtype)
+    summon_lev   = summon_lev_i32.astype(mai.m_lev.dtype)
     new_m_lev    = mai.m_lev.at[dead_idx].set(jnp.where(should, summon_lev, mai.m_lev[dead_idx]))
 
     new_mai = mai.replace(

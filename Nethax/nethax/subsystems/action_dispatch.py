@@ -1403,6 +1403,13 @@ def _handle_zap(state, rng):
     explored_2d = state.explored[b, lv]
 
     mai = state.monster_ai
+    # Wave 48e: project branch + traps + wall_info into the WandState so
+    # _effect_digging can apply the full vendor dig_check fail-code list
+    # (vendor/nethack/src/dig.c::dig_check 207-260).  EnvState does not
+    # yet expose a per-tile wall_info slice; default to all-False so the
+    # W_NONDIGGABLE check never fires in real gameplay (which matches
+    # current EnvState fidelity — no permanent diggable walls modeled).
+    _wall_info_default = jnp.zeros(state.traps.trap_type.shape, dtype=jnp.bool_)
     wand_state = WandState(
         mon_pos       = mai.pos,
         mon_hp        = mai.hp,
@@ -1423,6 +1430,9 @@ def _handle_zap(state, rng):
         probed_hp     = jnp.int32(0),
         probed_idx    = jnp.int32(-1),
         player_reflecting = state.status.intrinsics[int(_ZapIntrinsic.REFLECTING)],
+        branch        = state.dungeon.current_branch.astype(jnp.int8),
+        traps         = state.traps,
+        wall_info     = _wall_info_default,
     )
 
     new_wand = _wands_handle_zap(wand_state, rng)

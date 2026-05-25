@@ -1031,6 +1031,41 @@ def _is_minetown_level(branch_idx: int, level_num: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# mark_mines_levels_cavernous — populate FeaturesState.is_cavernous_lev for
+# the Gnomish Mines branch.
+# ---------------------------------------------------------------------------
+
+def mark_mines_levels_cavernous(features):
+    """Set ``features.is_cavernous_lev[lv] = True`` for every Mines level.
+
+    Vendor cite: vendor/nethack/src/mklev.c::mklev (line 1577 — per-level
+    generation entry) dispatches cave generation to
+    vendor/nethack/src/mkmap.c::mkmap, which at line 483 sets
+    ``svl.level.flags.is_cavernous_lev = TRUE`` after a walled+joined
+    cave-build.  Gnomish Mines levels are generated via this path
+    (vendor/nethack/dat/dungeon.def line 71: ``DUNGEON: "The Gnomish
+    Mines" "K" (8, 2)``), so every Mines level carries the cavernous
+    flag.  The cavernous bit is then consumed by dig.c lines 495-497.
+
+    Flat index layout: features arrays are shaped
+    ``[N_BRANCHES * MAX_LEVELS_PER_BRANCH]`` with
+    ``flat_lv = branch * MAX_LEVELS_PER_BRANCH + (level - 1)``.
+
+    Args:
+        features: FeaturesState — full state slice.
+
+    Returns:
+        Updated FeaturesState with cavernous bit set for all Mines slots.
+    """
+    icl = features.is_cavernous_lev
+    mines_b = int(Branch.GNOMISH_MINES)
+    start = mines_b * MAX_LEVELS_PER_BRANCH
+    end   = start + MAX_LEVELS_PER_BRANCH
+    new_icl = icl.at[start:end].set(jnp.bool_(True))
+    return features.replace(is_cavernous_lev=new_icl)
+
+
+# ---------------------------------------------------------------------------
 # generate_mines_level — cellular-automata caves + small rooms
 # ---------------------------------------------------------------------------
 

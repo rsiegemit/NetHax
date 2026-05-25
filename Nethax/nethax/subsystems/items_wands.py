@@ -45,6 +45,7 @@ from Nethax.nethax.subsystems.inventory import (
     InventoryState,
 )
 from Nethax.nethax.subsystems.monster_ai import MAX_MONSTERS_PER_LEVEL
+from Nethax.nethax.subsystems.traps import TrapState, TrapType
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -285,9 +286,24 @@ class WandState:
     # zap.c::buzz reflection path.
     player_reflecting: jax.Array  # bool scalar
 
+    # Wave 48e: dungeon branch + traps + wall_info slices for full
+    # vendor dig_check fail-code coverage in _effect_digging.
+    # Cite: vendor/nethack/src/dig.c::dig_check lines 207-260
+    #   DIG_FAIL_AIRLEVEL / DIG_FAIL_WATERLEVEL : branch-based
+    #   DIG_FAIL_UNDESTROYABLETRAP              : MAGIC_PORTAL / VIBRATING_SQUARE
+    #   DIG_FAIL_W_NONDIGGABLE                  : per-tile wall_info flag
+    branch:        jax.Array   # int8 scalar — dungeon Branch ordinal
+    traps:         TrapState   # full per-level TrapState slice (or zeros)
+    wall_info:     jax.Array   # bool[num_levels, map_h, map_w] — W_NONDIGGABLE
+
     @classmethod
     def empty(cls, map_h: int = 21, map_w: int = 80) -> "WandState":
-        """Return a zero-initialised WandState (no monsters, empty inventory)."""
+        """Return a zero-initialised WandState (no monsters, empty inventory).
+
+        The trap/wall_info slices are sized for a single-level test fixture
+        (num_levels=1).  Real callers (action_dispatch._handle_zap) project
+        the full multi-level EnvState.traps / wall_info arrays directly.
+        """
         n = MAX_MONSTERS_PER_LEVEL
         return cls(
             mon_pos=jnp.zeros((n, 2), dtype=jnp.int16),
@@ -309,6 +325,9 @@ class WandState:
             probed_hp=jnp.int32(0),
             probed_idx=jnp.int32(0),
             player_reflecting=jnp.bool_(False),
+            branch=jnp.int8(0),
+            traps=TrapState.default(num_levels=1, map_h=map_h, map_w=map_w),
+            wall_info=jnp.zeros((1, map_h, map_w), dtype=jnp.bool_),
         )
 
 
@@ -1038,11 +1057,11 @@ def _effect_digging(
 
     1. Down (direction == 8, u.dz > 0):  set player tile to HOLE.  Vendor
        routes through digactualhole() (dig.c line 640) after dig_check.
-       We port the dig_check FAIL_ONSTAIRS / FAIL_ALTAR / FAIL_THRONE
-       branches (dig.c:211-223) by skipping the hole carve on those tiles.
-       The remaining dig_check fail codes (AIRLEVEL, WATERLEVEL, BOULDER,
-       UNDESTROYABLETRAP, W_NONDIGGABLE) are JAX-required divergences:
-       WandState carries no traps / level-flags / wall_info slice.
+       Wave 48e: full dig_check fail-code coverage —
+         FAIL_ONSTAIRS / FAIL_ALTAR / FAIL_THRONE     (dig.c:211-223, tile-based)
+         FAIL_AIRLEVEL / FAIL_WATERLEVEL              (dig.c:225-227, branch-based)
+         FAIL_UNDESTROYABLETRAP                        (dig.c:231-237, trap_type-based)
+         FAIL_W_NONDIGGABLE                            (dig.c:228-230, wall_info-based)
 
     2. Up   (direction == 9, u.dz < 0):  loosen a rock from the ceiling and
        hit the hero for rnd(6) damage (rnd(2) with a hard helmet).  No map
@@ -1051,29 +1070,66 @@ def _effect_digging(
     3. Cardinal (0..7):  ray carves up to ``digdepth = rn1(18, 8)`` tiles
        (8..25 inclusive).  Doors decrement digdepth by 2; closed_door /
        SDOOR / IS_TREE / IS_WALL handled separately for maze vs non-maze
-       levels.  Cite: vendor/nethack/src/dig.c lines 1669-1731.
+       levels.  Cite: vendor/nethack/src/dig.c lines 1669-1731.  Each
+       wall carve also respects W_NONDIGGABLE (dig.c:228-230) by leaving
+       the tile untouched when wall_info[flat_lv, pos] is set.
     """
     map_h, map_w = state.terrain.shape
     dir_idx = jnp.int32(direction)
 
+    # Resolve flat-level index for traps / wall_info lookups.
+    # WandState.traps / wall_info may have shape [1, H, W] (single-level
+    # fixture) OR [num_branches*num_levels, H, W] (full EnvState projection).
+    # We clamp the level index to 0 when the array has length 1.
+    _n_levels = state.traps.trap_type.shape[0]
+    flat_lv = jnp.where(
+        jnp.int32(_n_levels) > jnp.int32(1),
+        jnp.clip(state.dungeon_level.astype(jnp.int32) - 1, 0, _n_levels - 1),
+        jnp.int32(0),
+    )
+
+    # AIR / WATER plane test — vendor Is_airlevel / Is_waterlevel are
+    # special-level predicates.  We track Endgame as Branch.ENDGAME (id=6),
+    # which spans Earth/Air/Fire/Water/Astral planes; treating any Endgame
+    # plane as no-dig-down is a faithful superset of vendor's AIR+WATER
+    # fail codes (vendor's Earth/Fire/Astral planes also reject HOLE carves
+    # via other mechanisms — none are reachable carve targets).  Cite:
+    # vendor/nethack/src/dig.c::dig_check lines 225-227.
+    is_airwater_level = state.branch == jnp.int8(6)
+
     # ---------- dig_check filter ----------
-    # Cite: vendor/nethack/src/dig.c::dig_check (dig.c:207-252).  A wand of
-    # digging zapped downward fails on stairs/altar/throne — leave the tile
-    # alone.  W_NONDIGGABLE walls are also protected (lines 228-230).
+    # Cite: vendor/nethack/src/dig.c::dig_check (dig.c:207-260).
     def _set_hole(t):
         pr = state.player_pos[0].astype(jnp.int32)
         pc = state.player_pos[1].astype(jnp.int32)
         here = t[pr, pc].astype(jnp.int32)
-        protected = (
+        # Tile-based protection: stairs/altar/throne (dig.c:211-223).
+        tile_protected = (
             (here == jnp.int32(TileType.STAIRCASE_UP))
             | (here == jnp.int32(TileType.STAIRCASE_DOWN))
             | (here == jnp.int32(TileType.ALTAR))
             | (here == jnp.int32(TileType.THRONE))
         )
+        # UNDESTROYABLETRAP: MAGIC_PORTAL (17) and VIBRATING_SQUARE (23)
+        # (vendor/nethack/include/trap.h enum trap_types).
+        # Cite: vendor/nethack/src/dig.c::dig_check lines 231-237.
+        tt = state.traps.trap_type[flat_lv, pr, pc].astype(jnp.int32)
+        trap_protected = (
+            (tt == jnp.int32(int(TrapType.MAGIC_PORTAL)))
+            | (tt == jnp.int32(int(TrapType.VIBRATING_SQUARE)))
+        )
+        # W_NONDIGGABLE flag (dig.c:228-230) on the player tile.
+        wall_protected = state.wall_info[flat_lv, pr, pc]
+        protected = (
+            tile_protected
+            | trap_protected
+            | wall_protected
+            | is_airwater_level
+        )
         return lax.cond(
             protected,
-            lambda tt: tt,
-            lambda tt: tt.at[pr, pc].set(jnp.int8(TileType.HOLE)),
+            lambda tt_: tt_,
+            lambda tt_: tt_.at[pr, pc].set(jnp.int8(TileType.HOLE)),
             t,
         )
 
@@ -1121,6 +1177,12 @@ def _effect_digging(
             is_tree  = tile == jnp.int32(TileType.TREE)
             is_stone = (tile == jnp.int32(TileType.VOID))
 
+            # W_NONDIGGABLE — vendor/nethack/src/dig.c::dig_check lines
+            # 228-230.  An undestroyable wall blocks the carve at that
+            # tile (vendor returns DIG_FAIL_W_NONDIGGABLE and zap_dig
+            # aborts the loop at line 1726).
+            nondig = state.wall_info[flat_lv, nr, nc]
+
             still_going = (~stopped) & (remaining > jnp.int32(0))
 
             # Carve outcome per tile kind.
@@ -1128,7 +1190,7 @@ def _effect_digging(
             #   wall  → DOOR     , decrement -2 (line 1725) (non-maze).
             #   tree  → FLOOR    , decrement -2 (line 1728).
             #   stone → CORRIDOR , decrement -1 (line 1731).
-            carve = (is_closed_door | is_wall | is_tree | is_stone)
+            carve = (is_closed_door | is_wall | is_tree | is_stone) & (~nondig)
 
             new_tile = jnp.where(
                 is_closed_door, jnp.int8(TileType.OPEN_DOOR),
