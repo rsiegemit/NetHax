@@ -391,8 +391,8 @@ def put_in_container(state, container_idx, src_slot):
         don't track the leashed-monster bit)
       * BOULDER / large STATUE (line 2616-2617)
       * any physical box (LARGE_BOX / CHEST / ICE_BOX, line 2616 Is_box)
-    Welded uwep (pickup.c:2594-2599) — deferred; would need the wield-
-    slot welded bit propagated through to the inventory.Item record.
+      * welded uwep (pickup.c:2594-2599) — gated via InventoryState.welded
+        when the source slot is the currently wielded weapon
 
     Parameters
     ----------
@@ -460,9 +460,16 @@ def put_in_container(state, container_idx, src_slot):
         cs.container_type[c_idx] == jnp.int8(ContainerType.BAG_OF_HOLDING)
     )
     is_boh_in_boh = src_is_mbag & container_is_boh_check
+    # Vendor pickup.c:2594-2599 refuses to insert the currently wielded
+    # weapon when it's cursed-welded to the hero.
+    wielded_slot = state.inventory.wielded.astype(jnp.int32)
+    is_welded_uwep = (
+        (wielded_slot == s_idx) & state.inventory.welded
+    )
     item_allowed = ~(
         is_cursed_loadstone | is_quest_item | is_oversize
         | is_leash         | is_box_inside_box | is_boh_in_boh
+        | is_welded_uwep
     )
 
     found_pos, dst_pos = _find_first_empty_in_container(cs, c_idx)
