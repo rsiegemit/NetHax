@@ -361,25 +361,20 @@ def count_artifacts(state) -> jnp.ndarray:
 
     Vendor: end.c::really_done lines 1430-1452 walks the hero's invent
     chain and adds ``arti_cost(obj)`` for each artifact carried on
-    ESCAPED/ASCENDED.  Nethax approximates this as a flat
-    ARTIFACT_BONUS per artifact (50 pts; the per-artifact constant
-    cited at end.c:1452).
-
-    Nethax-specific note: the per-slot ``Item`` struct does not carry
-    an ``artifact_idx`` field; the only artifact tracking on
-    InventoryState is ``wielded_artifact_idx`` (scalar, -1 = none).
-    This helper returns 1 iff the wielded slot holds an artifact, else
-    0.  When per-slot artifact tracking lands, replace the body with a
-    full inventory walk that counts items where ``artifact_idx >= 0``.
+    ESCAPED/ASCENDED — Nethax applies a flat ARTIFACT_BONUS (50 pts)
+    per artifact (the constant cited at end.c:1452) and counts every
+    inventory slot whose ``Item.artifact_idx >= 0``.
 
     Cite: vendor/nethack/src/end.c::really_done lines 1430-1452.
 
     Returns
     -------
-    jnp.int32 scalar — number of artifacts carried (0 or 1).
+    jnp.int32 scalar — number of artifacts carried.
     """
-    art_idx = state.inventory.wielded_artifact_idx.astype(jnp.int32)
-    return jnp.int32(art_idx >= jnp.int32(0))
+    inv_items = state.inventory.items
+    has_art = inv_items.artifact_idx.astype(jnp.int32) >= jnp.int32(0)
+    occupied = inv_items.category.astype(jnp.int32) != jnp.int32(0)
+    return jnp.sum((has_art & occupied).astype(jnp.int32))
 
 
 def compute_alignment_bonus(state) -> jnp.ndarray:
