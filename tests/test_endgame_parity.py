@@ -188,7 +188,10 @@ class TestAstralAscension:
         assert bool(result.done) is True, "Coaligned Astral altar + Amulet must trigger ascension"
         achieved = result.scoring.achievements[int(Achievement.ASCENDED)]
         assert bool(achieved) is True, "ASCENDED achievement must be recorded"
-        assert int(result.scoring.score) >= 50000, "Ascension score bonus must be applied"
+        # Vendor end.c:1344-1351 doubles XP on coaligned ASCENDED, no flat
+        # bonus (Audit G #4 removed the legacy +50000 hack); verify the
+        # ``ascended`` flag is set so compute_final_score doubles urexp.
+        assert bool(result.scoring.ascended) is True, "ascended flag must be set"
 
     def test_astral_drop_amulet_cross_aligned_no_ascend(self):
         """Dropping Amulet on a cross-aligned altar must NOT trigger ascension.

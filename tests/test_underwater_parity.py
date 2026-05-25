@@ -73,11 +73,22 @@ def _set_player_water(state, in_water: bool):
 # ---------------------------------------------------------------------------
 
 def test_step_into_pool_sets_in_water():
-    """Stepping onto a POOL tile must set player_in_water=True.
+    """Stepping onto a POOL tile must set player_in_water=True (when safe).
 
-    Cite: vendor/nethack/src/hack.c::pooleffects line 3304.
+    Vendor drown() (trap.c:5106-5126) sets uinwater=TRUE only on the
+    safe-submerge branch (Swimming/Amphibious/Breathless).  Without one
+    of those, the player attempts to crawl out (trap.c:5152-5168),
+    which clears player_in_water.  Use the Amphibious intrinsic so the
+    submerge path fires deterministically.
+
+    Cite: vendor/nethack/src/hack.c::pooleffects line 3304 + trap.c
+    drown() branches.
     """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
     _env, state = _make_floor_state(player_pos=(10, 10))
+    # Grant Amphibious so drown's safe-submerge branch fires (line 365 in water.py).
+    intr = state.status.intrinsics.at[int(Intrinsic.AMPHIBIOUS)].set(True)
+    state = state.replace(status=state.status.replace(intrinsics=intr))
     # Place a POOL one step east.
     state = _place_tile(state, 10, 11, TileType.POOL)
     state = _set_player_water(state, False)
@@ -85,8 +96,7 @@ def test_step_into_pool_sets_in_water():
     new_state = _try_step(state, 0, 1, _RNG)
 
     assert bool(new_state.player_in_water), (
-        "Stepping onto POOL should set player_in_water=True "
-        "(hack.c::pooleffects line 3304)"
+        "Stepping onto POOL with Amphibious should set player_in_water=True"
     )
     assert tuple(new_state.player_pos.tolist()) == (10, 11), (
         "Player should have moved to the POOL tile."

@@ -327,8 +327,13 @@ class TestAscensionCondition:
 
 
 class TestEnvAscensionWiring:
+    @pytest.mark.timeout(600)
     def test_step_after_ascend_freezes_state(self):
-        """Once state.done=True via ascend(), env.step is a no-op."""
+        """Once state.done=True via ascend(), env.step is a no-op.
+
+        Marked timeout(600) — first env.step here triggers a full
+        _step_impl JIT compile which can take 5+ minutes on a cold cache.
+        """
         env = NethaxEnv(static=StaticParams())
         # Build an ascension-ready state.  Skip env.reset (it generates
         # Main L1 + monsters); we want a clean ascension scenario.

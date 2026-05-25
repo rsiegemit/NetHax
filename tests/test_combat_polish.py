@@ -110,16 +110,18 @@ def test_two_weapon_toggle_via_command():
     state, _obs = env.reset(rng)
     assert bool(state.combat.two_weapon) is False
 
-    rng, sub = jax.random.split(rng)
-    state, _obs, _r, _d, _info = env.step(state, jnp.int32(int(Command.TWOWEAPON)), sub)
-    assert bool(state.combat.two_weapon) is True, (
-        "TWOWEAPON command should toggle two_weapon flag to True"
-    )
+    # Force the flag on so we can verify the toggle-off path.  Vendor
+    # gate for toggle-ON (wield.c::can_twoweapon) requires two one-handed
+    # weapons wielded; a fresh reset has at most one wielded weapon and
+    # so always refuses the on-toggle.  Toggling OFF (always allowed per
+    # vendor wield.c:845-864) is the reliable observable for this test.
+    state = state.replace(combat=state.combat.replace(two_weapon=jnp.bool_(True)))
 
     rng, sub = jax.random.split(rng)
     state, _obs, _r, _d, _info = env.step(state, jnp.int32(int(Command.TWOWEAPON)), sub)
     assert bool(state.combat.two_weapon) is False, (
-        "TWOWEAPON should toggle back to False"
+        "TWOWEAPON should toggle the flag off (vendor wield.c:845-864 "
+        "allows OFF unconditionally)"
     )
 
 

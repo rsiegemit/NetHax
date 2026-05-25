@@ -12,6 +12,7 @@ Verifies:
     invokes the down-dig path, replacing the player-tile with HOLE.
 """
 import os
+import pytest
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
@@ -103,6 +104,7 @@ def test_mt_routes_to_tip_down_slot():
     assert int(_ACTION_TO_HANDLER_IDX[mt]) == _SLOT_TIP_DOWN
 
 
+@pytest.mark.timeout(900)
 def test_mt_dispatch_empties_carried_container_to_floor():
     """dispatch_action(M-T) empties a carried container onto the floor.
 
