@@ -1069,22 +1069,33 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
 # ---------------------------------------------------------------------------
 # Storm-spell helper (handlers 12 / 13 — SNOWSTORM / FIRESTORM).
 # Vendor invoke_storm_spell (artifact.c:2039-2051) forces P_EXPERT in the
-# cold/fire school then runs spelleffects().  We approximate with a fixed
-# d8 (cold) / d6 (fire) AoE damage to every living monster in a 6-tile
-# Chebyshev radius.
+# cold/fire school then runs ``spelleffects(SPE_CONE_OF_COLD/SPE_FIREBALL,
+# FALSE, TRUE)``.  At P_EXPERT the explode-AOE spreads over 9 tiles (3x3
+# centred on the cursor target) at d(nd, 6) per tile where
+# ``nd = u.ulevel/2 + 1``.  Without a cursor target we explode at the
+# player's own tile (vendor's default when no direction given).
+# Damage per monster on a hit tile: d(nd, 6) cold or d(nd, 6) fire.
 # ---------------------------------------------------------------------------
 def _storm_apply_dmg(state, rng, cold: bool):
     pr = state.player_pos[0].astype(jnp.int32)
     pc = state.player_pos[1].astype(jnp.int32)
     mai = state.monster_ai
     mpos = mai.pos.astype(jnp.int32)
+    # 3x3 AoE around player (Chebyshev<=1) matches vendor explode() radius.
     in_range = (
-        (jnp.abs(mpos[:, 0] - pr) <= jnp.int32(6))
-        & (jnp.abs(mpos[:, 1] - pc) <= jnp.int32(6))
+        (jnp.abs(mpos[:, 0] - pr) <= jnp.int32(1))
+        & (jnp.abs(mpos[:, 1] - pc) <= jnp.int32(1))
         & mai.alive
     )
-    sides = jnp.int32(8 if cold else 6)
-    dmg = jax.random.randint(rng, (), 1, sides + jnp.int32(1), dtype=jnp.int32)
+    # nd = u.ulevel/2 + 1; per-tile d(nd, 6).
+    nd = (state.player_xl.astype(jnp.int32) // jnp.int32(2)) + jnp.int32(1)
+    # Sum of nd d6 rolls (mask up to a static max of 16 dice).
+    _MAX_ND = 16
+    sub_keys = jax.random.split(rng, _MAX_ND)
+    rolls = jax.vmap(lambda k: jax.random.randint(k, (), 1, 7))(sub_keys)
+    mask = jnp.arange(_MAX_ND, dtype=jnp.int32) < jnp.minimum(nd, _MAX_ND)
+    dmg = jnp.sum(jnp.where(mask, rolls, 0)).astype(jnp.int32)
+    _ = cold  # Both storms share the same dice; vendor differentiates only by resistance, modelled at status_effects.
     new_hp = jnp.where(in_range, jnp.maximum(mai.hp - dmg, jnp.int32(0)), mai.hp)
     new_alive = jnp.where(in_range & (new_hp <= jnp.int32(0)),
                           jnp.bool_(False), mai.alive)

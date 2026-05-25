@@ -940,8 +940,26 @@ def _h_crystal_ball(state, rng: jax.Array) -> object:
                              jnp.int32(0)).astype(cur_ch.dtype)
     new_ch = jnp.where(decr_charge, new_ch_val, cur_ch)
 
-    # Success branch (no fail): preserve existing identify-wielded behavior.
+    # Success branch (no fail): vendor apply.c::do_crystal_ball shows the
+    # player a glimpse of nearby map/monster info.  Most observable in
+    # Nethax: reveal monsters with invisible=True in cansee LoS around
+    # the player.  We also identify the wielded item as a secondary
+    # "knowledge" effect (the prior Nethax behaviour, kept for back-compat
+    # so existing identify-on-crystal-ball tests still pass).
+    # Cite: vendor/nethack/src/apply.c::do_crystal_ball glimpse branch.
+    from Nethax.nethax.subsystems.vision import cansee as _cansee
     success = has_wield & ~fail
+    mai = state.monster_ai
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    mpos = mai.pos.astype(jnp.int32)
+    in_sight = jax.vmap(
+        lambda mr, mc: _cansee(state, pr, pc, mr, mc)
+    )(mpos[:, 0], mpos[:, 1]) & mai.alive
+    reveal_mask = jnp.where(success, in_sight, jnp.zeros_like(in_sight))
+    new_invis = jnp.where(reveal_mask, jnp.bool_(False), mai.invisible)
+    new_mai = mai.replace(invisible=new_invis)
+
     new_identified = jnp.where(
         success,
         inv.items.identified.at[safe_slot].set(jnp.bool_(True)),
@@ -958,6 +976,7 @@ def _h_crystal_ball(state, rng: jax.Array) -> object:
         inventory=inv.replace(items=new_items),
         status=state.status.replace(timed_statuses=ts),
         player_hp=new_player_hp,
+        monster_ai=new_mai,
     )
 
 
