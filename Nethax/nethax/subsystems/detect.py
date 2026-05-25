@@ -42,11 +42,18 @@ from Nethax.nethax.subsystems.vision import (  # noqa: F401  (public re-export)
 #       vendor/nethack/src/teleport.c::scrolltele   (line 914 — calls safe_teleds).
 #
 # The helper rejection-samples a walkable destination on the current level
-# and writes player_pos. Vendor safe_teleds tries 40 random uniform draws
-# (lines 736-743) accepting any tile that passes teleok().  We approximate
-# teleok by accepting FLOOR / CORRIDOR / OPEN_DOOR (the JAX TileTypes that
-# correspond to vendor's walkable non-trap goodpos tiles).  Used by
-# potion/scroll/wand teleport so the three subsystems do not diverge.
+# and writes player_pos.  Vendor safe_teleds tries 40 random uniform draws
+# (lines 736-743) accepting any tile that passes teleok() → goodpos() →
+# accessible().  Vendor accessible (monmove.c:2190) is
+# ``ACCESSIBLE(SURFACE_AT(x,y)) && !closed_door(x,y)``.  ACCESSIBLE is
+# ``typ >= DOOR`` (rm.h:125), i.e. any tile of type DOOR or higher:
+# ROOM/CORR/STAIRS/LADDER/FOUNTAIN/THRONE/SINK/GRAVE/ALTAR/ICE/DRAWBRIDGE_DOWN.
+# Closed doors and liquid (POOL/MOAT/LAVA) are excluded.
+#
+# We mirror the predicate by accepting every Nethax TileType that maps to
+# an ACCESSIBLE vendor type and is not currently liquid: FLOOR, CORRIDOR,
+# OPEN_DOOR, STAIRCASE_UP, STAIRCASE_DOWN, ALTAR, FOUNTAIN, THRONE, GRAVE,
+# SHOP_FLOOR, ICE_FLOOR.
 # ---------------------------------------------------------------------------
 
 def _teleds(state, rng):
@@ -74,6 +81,14 @@ def _teleds(state, rng):
             (t == jnp.int8(TileType.FLOOR))
             | (t == jnp.int8(TileType.CORRIDOR))
             | (t == jnp.int8(TileType.OPEN_DOOR))
+            | (t == jnp.int8(TileType.STAIRCASE_UP))
+            | (t == jnp.int8(TileType.STAIRCASE_DOWN))
+            | (t == jnp.int8(TileType.ALTAR))
+            | (t == jnp.int8(TileType.FOUNTAIN))
+            | (t == jnp.int8(TileType.THRONE))
+            | (t == jnp.int8(TileType.GRAVE))
+            | (t == jnp.int8(TileType.SHOP_FLOOR))
+            | (t == jnp.int8(TileType.ICE_FLOOR))
         )
 
     def _pick(carry, i):

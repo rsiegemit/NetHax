@@ -6,8 +6,12 @@ Canonical sources:
 
 Status: vendor-parity dispatch — every TrapType in TrapType has a real
 effect handler.  Documented JAX-required deviations:
-  LEVEL_TELEP / MAGIC_PORTAL — same-level tele instead of cross-level
-    (vendor goto_level cross-level transition not modelled mid-trap).
+  LEVEL_TELEP — random cross-level transport on current branch via the
+    _SE_LEVEL_TELE side-effect flag, processed in action_dispatch (vendor
+    trap.c::dotrap LEVEL_TELEP → level_tele → random_teleport_level).
+  MAGIC_PORTAL — same _SE_LEVEL_TELE path; vendor uses ``trap->dst`` for
+    a fixed destination, which Nethax does not carry per-trap (random
+    destination on the current branch).
   LANDMINE PIT conversion — recursive damage applied in-place rather
     than re-firing dotrap(trap, RECURSIVETRAP).
   HOLE / TRAPDOOR — d6 fall jolt proxy (vendor fall_through has no
@@ -244,8 +248,10 @@ def trigger_trap(
     freeze_web = _d(k3, 4) + jnp.int32(1)  # 2..5
     se_web = se_zeros.at[_SE_FREEZE].set(freeze_web)
 
-    # DART_TRAP poison: 1/3 chance — simplified as rn2(3)==0 → halve max HP (Wave 4)
-    # Wave 3: roll stored in side_effect[0] = 0 (no freeze), poison handled in caller
+    # DART_TRAP: damage is handled inline (DMG table dmg_dart); the poison
+    # branch (vendor trap.c:1273-1284, 1/6 via !rn2(6) → A_CON drain +
+    # rnd(10) HP) is dispatched in _trap_dart at action time, not as a
+    # pre-computed side-effect.  No SE flag needed here.
     se_dart = se_zeros
 
     # MAGIC_TRAP: d20 roll selects effect; implement 6 representative outcomes.

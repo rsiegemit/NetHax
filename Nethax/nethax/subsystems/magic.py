@@ -2584,18 +2584,33 @@ def cast_spell(state, rng: jax.Array, spell_id: int) -> tuple:
         if not is_detect_food:
             nutrition_cost = jnp.int32(lv * 5 * 2)
             is_wizard = jnp.int32(state.player_role) == jnp.int32(_ROLE_WIZARD)
-            # Vendor wizard reduction: INT >= 17 fully waives, 16 quarters,
-            # 15 halves.  For INT <= 14 wizard pays full cost.  In Nethax
-            # the long-standing tests pin ``max(0, cost - INT)`` for INT=18,
-            # which agrees with vendor (full waiver at INT >= 17), so we
-            # use ``max(0, cost - INT)`` for back-compat — it overshoots
-            # vendor for INT in {15, 16} (byte-stream divergence noted).
-            wiz_reduction = jnp.minimum(
-                nutrition_cost, state.player_int.astype(jnp.int32)
+            # Vendor wizard reduction (spell.c:1322-1358):
+            #   intell = (Role==Wizard) ? acurr(A_INT) : 10
+            #   intell >= 17 → cost = 0
+            #   intell == 16 → cost /= 4
+            #   intell == 15 → cost /= 2
+            #   intell <= 14 → cost (unchanged)
+            # Non-wizards always pay full cost (intell forced to 10 hits no
+            # case in the switch).
+            intell = jnp.where(
+                is_wizard,
+                state.player_int.astype(jnp.int32),
+                jnp.int32(10),
             )
-            nutrition_cost = jnp.where(
-                is_wizard, nutrition_cost - wiz_reduction, nutrition_cost
+            scaled_cost = jnp.where(
+                intell >= jnp.int32(17),
+                jnp.int32(0),
+                jnp.where(
+                    intell == jnp.int32(16),
+                    nutrition_cost // jnp.int32(4),
+                    jnp.where(
+                        intell == jnp.int32(15),
+                        nutrition_cost // jnp.int32(2),
+                        nutrition_cost,
+                    ),
+                ),
             )
+            nutrition_cost = scaled_cost
             old_nutrition = adapter["status"].nutrition
             new_nutrition = jnp.maximum(
                 old_nutrition - nutrition_cost, jnp.int32(0)

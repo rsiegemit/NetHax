@@ -676,9 +676,13 @@ def choose_random_polymorph_form(state, rng: jax.Array) -> jnp.ndarray:
 def _can_wear_armor(form_idx: jnp.ndarray) -> jnp.ndarray:
     """Return scalar bool: True iff MONSTERS[form_idx] can wear armor.
 
-    polyself.c uses ``humanoid(mptr)`` and ``has_horns(mptr)`` / hand checks.
-    We approximate with M1_HUMANOID and !M1_NOHANDS, matching the most
-    common armor-drop logic in NetHack.
+    Cite: vendor/nethack/include/mondata.h:65 ``humanoid(ptr) :=
+    ((ptr)->mflags1 & M1_HUMANOID) != 0L``.  Vendor's general armor-fit
+    test (do_wear.c) is ``humanoid(mdat)`` plus per-slot guards for hands
+    (gloves) and horns/headcrest (helm).  Here we keep ``humanoid`` AND
+    ``!M1_NOHANDS``, which is byte-equal for body armor / cloak / shield /
+    boots and a strict subset (slightly more conservative) for gloves —
+    no false positives.
 
     M1_HUMANOID = 0x00020000, M1_NOHANDS = 0x00002000 (see constants/monsters.py).
     """
@@ -1301,13 +1305,21 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool = 
 
     # --- 5c. newman(): if target form matches player's own race, re-roll XL/HP/PW
     # and cure sick/stoned.  (polyself.c:336)
-    # We approximate "same race" as M2_HUMAN flag in the form matching the
-    # player_race == human (race=0).  For simplicity: if flags2 & M2_HUMAN and
-    # player_race == 0 (Human), call newman.
+    # Vendor: ``your_race(mdat)`` (mondata.c) tests
+    #   (mdat->mflags2 & M2_<race-of-player>) for HUMAN/ELF/DWARF/GNOME/ORC.
+    # Cite: vendor/nethack/include/mondata.h ``your_race``;
+    #       vendor/nethack/src/polyself.c:336.
+    # M2_* bit values (constants/monsters.py):
+    #   M2_HUMAN=0x8  M2_ELF=0x10  M2_DWARF=0x20  M2_GNOME=0x40  M2_ORC=0x80
+    # Race enum (constants/races.py): HUMAN=0 ELF=1 DWARF=2 GNOME=3 ORC=4.
     form_flags2 = _FORM_FLAGS2[form_i16.astype(jnp.int32)]
-    form_is_human_race = (form_flags2 & jnp.uint32(0x00000008)) != jnp.uint32(0)  # M2_HUMAN=0x8
-    player_is_human    = state.player_race.astype(jnp.int32) == jnp.int32(0)
-    same_race          = form_is_human_race & player_is_human
+    player_race = state.player_race.astype(jnp.int32)
+    race_to_m2 = jnp.array(
+        [0x8, 0x10, 0x20, 0x40, 0x80], dtype=jnp.uint32
+    )
+    safe_race = jnp.clip(player_race, 0, 4)
+    player_race_m2 = race_to_m2[safe_race]
+    same_race = (form_flags2 & player_race_m2) != jnp.uint32(0)
 
     rng, sub_nm = jax.random.split(rng)
     state = jax.lax.cond(same_race,

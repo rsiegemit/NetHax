@@ -9,22 +9,22 @@ Canonical sources:
   vendor/nethack/src/dbridge.c   — drawbridge open/close mechanics
   vendor/nethack/include/rm.h    — D_NODOOR/D_BROKEN/D_ISOPEN/D_CLOSED/D_LOCKED
 
-Status: Wave 3 — door operations (open/close/kick/unlock/door_blocks_movement)
-        and action handlers implemented.
+Status: door operations (open/close/kick/unlock/door_blocks_movement)
+        and action handlers implemented in this module.
 
-TODO (later waves):
-  Wave 4 (feature effect tables):
-    - quaff_fountain: 30-outcome rnd(30) table from drinkfountain()
-    - dip_fountain: dipfountain() BUC detection, enchant/disenchant
-    - sit_throne: 13-outcome rnd(13) table from throne_sit_effect()
-    - kick_sink: 20-outcome rn2(20) table from drinksink()
-    - sacrifice_on_altar: BUC check, alignment conversion, sacrifice reward
-    - kick_door: monster-anger side effect on success
-    - unlock_door: real d20 roll vs lock difficulty
-  Wave 5 (advanced features):
-    - Vibrating square gateway: requires Amulet in inventory, endgame trigger
-    - Drawbridge open/close/collapse (dbridge.c)
-    - Secret door discovery via search command (detect.c:findit())
+Implemented elsewhere (see linked modules for full vendor citations):
+  - subsystems/fountain.py — drinkfountain / dipfountain / dryup
+  - subsystems/throne.py   — throne_sit_effect (13-outcome rn1 table)
+  - subsystems/water.py    — sink / drinksink (kick + quaff outcomes)
+  - subsystems/prayer.py + subsystems/priest.py — sacrifice_on_altar
+                              + alignment conversion + gcrownu reward
+
+Still deferred (no concrete vendor caller wired):
+  - kick_door: monster-anger side effect on a successful kick
+  - unlock_door: real d20 roll vs lock difficulty
+  - Vibrating square gateway end-game trigger (sounds.c)
+  - Drawbridge open/close/collapse (dbridge.c)
+  - Secret-door discovery via #search (detect.c::findit)
 """
 from enum import IntEnum
 

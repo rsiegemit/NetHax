@@ -1,8 +1,12 @@
 """Vendor-parity tests: hunger drain on spell cast.
 
-Cite: vendor/nethack/src/spell.c::spelleffects_check lines 1322-1367.
+Cite: vendor/nethack/src/spell.c::spelleffects_check lines 1322-1358.
 Vendor formula: morehungry(energy * 2) where energy = spelllev * 5.
-Wizard reduction: hunger cost -= ACURR(A_INT) for wizards (~line 1340).
+Wizard reduction (intell = wizard ? acurr(A_INT) : 10):
+    intell >= 17 → cost = 0
+    intell == 16 → cost /= 4
+    intell == 15 → cost /= 2
+    intell <= 14 → cost (unchanged)
 """
 import os
 
@@ -40,14 +44,13 @@ def _state_with_known_spell(spell_id: int, nutrition: int = 900,
 def test_cast_drains_nutrition():
     """Successful spell cast drains nutrition by spelllev * 5 * 2.
 
-    Cite: vendor/nethack/src/spell.c::spelleffects_check lines 1322-1367.
+    Cite: vendor/nethack/src/spell.c::spelleffects_check lines 1322-1358.
     MAGIC_MISSILE is level 2 → cost = 2*5*2 = 20 nutrition.
-    We use a Wizard with INT=18 at xl=10 to ensure near-certain success,
-    then verify nutrition dropped by exactly the expected amount.
+    We use a Wizard with INT=18 — vendor table says INT >= 17 fully waives,
+    so the expected drain is 0.
     """
     spell_id = int(SpellId.MAGIC_MISSILE)
     lv = int(_SPELL_LEVELS[spell_id])
-    expected_cost = lv * 5 * 2
 
     initial_nutrition = 900
     # Use Wizard with high INT for reliable success
@@ -62,17 +65,64 @@ def test_cast_drains_nutrition():
         new_state, success = cast_spell(state, rng, spell_id)
         if success:
             drain = initial_nutrition - int(new_state.status.nutrition)
-            # Wizard reduction: nutrition_cost -= min(nutrition_cost, INT)
-            # With INT=18, expected_cost=20: reduction=min(20,18)=18, net=2
-            # So wizard drain = max(0, expected_cost - INT) = 2
-            wizard_drain = max(0, expected_cost - 18)
-            assert drain == wizard_drain, (
-                f"Wizard nutrition drain {drain} != expected {wizard_drain} "
-                f"(spelllev={lv}, INT=18)"
+            # Vendor: INT 17+ → hungr = 0.  No drain.
+            assert drain == 0, (
+                f"Wizard INT=18 nutrition drain {drain} != expected 0 "
+                f"(spelllev={lv}; vendor spell.c:1340-1351 waives at INT>=17)"
             )
             return
 
     raise AssertionError("No successful cast in 50 tries — test inconclusive")
+
+
+def test_cast_wizard_int_16_quarter_cost():
+    """Wizard at INT=16 pays 1/4 cost (vendor spell.c:1352-1354).
+
+    Cite: vendor/nethack/src/spell.c::spelleffects_check line 1352
+    (``case 16: hungr /= 4;``).
+    MAGIC_MISSILE is level 2 → full cost = 20, /4 = 5.
+    """
+    spell_id = int(SpellId.MAGIC_MISSILE)
+    initial_nutrition = 900
+    state = _state_with_known_spell(
+        spell_id, nutrition=initial_nutrition,
+        player_int=16, player_role=_ROLE_WIZARD, player_pw=100
+    )
+    for seed in range(50):
+        rng = jax.random.PRNGKey(seed + 1)
+        new_state, success = cast_spell(state, rng, spell_id)
+        if success:
+            drain = initial_nutrition - int(new_state.status.nutrition)
+            assert drain == 5, (
+                f"Wizard INT=16 drain {drain} != 5 (vendor 20/4)"
+            )
+            return
+    raise AssertionError("No successful cast in 50 tries — test inconclusive")
+
+
+def test_cast_wizard_int_15_half_cost():
+    """Wizard at INT=15 pays 1/2 cost (vendor spell.c:1355-1357).
+
+    Cite: vendor/nethack/src/spell.c::spelleffects_check line 1355
+    (``case 15: hungr /= 2;``).
+    MAGIC_MISSILE is level 2 → full cost = 20, /2 = 10.
+    """
+    spell_id = int(SpellId.MAGIC_MISSILE)
+    initial_nutrition = 900
+    state = _state_with_known_spell(
+        spell_id, nutrition=initial_nutrition,
+        player_int=15, player_role=_ROLE_WIZARD, player_pw=100
+    )
+    for seed in range(80):
+        rng = jax.random.PRNGKey(seed + 1)
+        new_state, success = cast_spell(state, rng, spell_id)
+        if success:
+            drain = initial_nutrition - int(new_state.status.nutrition)
+            assert drain == 10, (
+                f"Wizard INT=15 drain {drain} != 10 (vendor 20/2)"
+            )
+            return
+    raise AssertionError("No successful cast in 80 tries — test inconclusive")
 
 
 def test_non_wizard_cast_drains_full_nutrition():
