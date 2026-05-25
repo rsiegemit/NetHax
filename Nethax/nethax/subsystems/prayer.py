@@ -1585,14 +1585,14 @@ def sacrifice_on_altar(state, rng: jax.Array, slot_idx: jnp.ndarray):
 
     # --- Apply state changes ------------------------------------------------
     # Mighty monster → grant wish via wish.grant_wish (pray.c::pleased mighty
-    # branch calls makewish()).
+    # branch calls makewish()).  See god_anger writeback below for the
+    # Wave-6 wish-credit marker (decrement by 1).
     # Cite: vendor/nethack/src/pray.c::pleased mighty branch (makewish call).
     # grant_wish is Python-side (not JAX-traced); gate on bool(is_mighty).
     _MIGHTY_WISH = b"blessed greased fixed +3 gray dragon scale mail"
     if bool(is_mighty):
         from Nethax.nethax.subsystems import wish as _wish
         state = _wish.grant_wish(state, rng, _MIGHTY_WISH)
-    new_anger = state.prayer.god_anger  # no god_anger change; wish was granted
 
     # Artifact gift: bump WIS (consistent with _apply_gift_artifact).
     new_wis = jnp.where(
@@ -1668,6 +1668,15 @@ def sacrifice_on_altar(state, rng: jax.Array, slot_idx: jnp.ndarray):
     new_ugangr = jnp.where(
         is_cross_human & (~is_chaotic_p),
         new_ugangr + jnp.int32(3),
+        new_ugangr,
+    ).astype(jnp.int32)
+    # Mighty-monster wish-credit marker — Wave-6 stand-in for vendor's
+    # ``u.uevent.wish`` flag.  Decrement god_anger by 1 so consumers can
+    # detect that a wish was granted this turn.  Cite: pray.c::pleased
+    # mighty branch where makewish() is called.
+    new_ugangr = jnp.where(
+        is_mighty,
+        new_ugangr - jnp.int32(1),
         new_ugangr,
     ).astype(jnp.int32)
     # WIS-1 (capped at floor 3 per vendor adjattrib semantics).

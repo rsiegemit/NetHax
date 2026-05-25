@@ -213,14 +213,20 @@ def test_angry_drain_level_decrements_xl():
     from Nethax.nethax.subsystems.prayer import _apply_drain_level
 
     _env, state, _rng = _fresh_env_state()
+    # Populate uhpinc/ueninc so losexp's vendor-formula HP/Pw shaving
+    # actually has values to subtract — vendor u_init.c::init_hpwp fills
+    # u.uhpinc[1..ulevel] at character creation; a fresh state has zeros,
+    # which would make losexp a no-op on HP_max.
+    uhpinc = state.player_uhpinc.at[6].set(jnp.int16(5))
     state = state.replace(
         player_xl=jnp.int32(7),
         player_hp_max=jnp.int32(40),
         player_hp=jnp.int32(40),
+        player_uhpinc=uhpinc,
     )
     new_state = _apply_drain_level(state)
     assert int(new_state.player_xl) == 6
-    # HP_max also drops.
+    # HP_max also drops (vendor losexp shaves by uhpinc[new_ulevel]=5).
     assert int(new_state.player_hp_max) < 40
     # Floor at XL=1 even with low input.
     state_low = state.replace(player_xl=jnp.int32(1))
@@ -323,6 +329,10 @@ def test_sacrifice_mighty_monster_grants_wish():
             jnp.int16(MIGHTY_TYPE_THRESHOLD + int(state.player_align))
         ),
         quantity=items.quantity.at[0].set(jnp.int16(1)),
+        # enchantment encodes monster_level for sacrifice scaling (prayer.py
+        # _scale(N) = N * (1 + level/10)); zero out so the +10 record bonus
+        # comes through cleanly without a level multiplier.
+        enchantment=items.enchantment.at[0].set(jnp.int8(0)),
     )
     starting_anger = int(state.prayer.god_anger)
     state = state.replace(
