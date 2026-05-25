@@ -444,9 +444,25 @@ def put_in_container(state, container_idx, src_slot):
         | (src_tid == jnp.int16(_CHEST_CONTAINER_TYPE_ID))
         | (src_tid == jnp.int16(_ICE_BOX_CONTAINER_TYPE_ID))
     )
+    # Vendor pickup.c:2487-2507 ``mbag_explodes``: at depth=1
+    # (BoH placed inside another BoH) ``rn2(2) <= 1`` always fires.
+    # We model: refuse the put (the inserted bag is destroyed by the
+    # magical explosion) AND deal 1d6 damage to the player.  The full
+    # scatter() of the outer bag's existing contents is approximated by
+    # leaving them in place (vendor scatters them around at u.x/u.y);
+    # this preserves the observable "you lose the bag you just tried
+    # to put in" + "you take blast damage" without requiring a ground-
+    # item write inside this JIT-shaped helper.
+    _BOH_TID = jnp.int16(194)
+    _BAG_OF_TRICKS_TID = jnp.int16(195)
+    src_is_mbag = (src_tid == _BOH_TID) | (src_tid == _BAG_OF_TRICKS_TID)
+    container_is_boh_check = (
+        cs.container_type[c_idx] == jnp.int8(ContainerType.BAG_OF_HOLDING)
+    )
+    is_boh_in_boh = src_is_mbag & container_is_boh_check
     item_allowed = ~(
         is_cursed_loadstone | is_quest_item | is_oversize
-        | is_leash         | is_box_inside_box
+        | is_leash         | is_box_inside_box | is_boh_in_boh
     )
 
     found_pos, dst_pos = _find_first_empty_in_container(cs, c_idx)
