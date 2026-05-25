@@ -1576,7 +1576,8 @@ def _try_quaff_potion(state, rng: jax.Array, monster_idx: jnp.ndarray,
 
 def _try_zap_offensive_wand(state, rng: jax.Array, monster_idx: jnp.ndarray,
                             wand_id: int, dice_n: int, dice_sides: int,
-                            resist_intrinsic: int = -1):
+                            resist_intrinsic: int = -1,
+                            is_death: bool = False):
     """Zap a damaging wand at the player.
 
     Cite: vendor/nethack/src/muse.c::use_offensive lines 1842-1900.
@@ -1585,8 +1586,9 @@ def _try_zap_offensive_wand(state, rng: jax.Array, monster_idx: jnp.ndarray,
 
     ``resist_intrinsic`` is the Intrinsic enum index of the matching
     resistance (RESIST_FIRE / RESIST_COLD / RESIST_SHOCK / RESIST_SLEEP),
-    or -1 for wands with no straightforward resist gate (STRIKING, DEATH
-    handled separately).
+    or -1 for wands with no straightforward resist gate.
+    ``is_death`` selects the WAN_DEATH semantics from vendor zap.c
+    ZT_DEATH: MAGIC_RESIST → no effect, otherwise instakill (player_hp=0).
     """
     from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intr
     idx = monster_idx.astype(jnp.int32)
@@ -1608,6 +1610,16 @@ def _try_zap_offensive_wand(state, rng: jax.Array, monster_idx: jnp.ndarray,
             | (state.status.timed_intrinsics[int(resist_intrinsic)] > jnp.int32(0))
         )
         dmg = jnp.where(has_resist, dmg // jnp.int32(2), dmg)
+
+    # WAN_DEATH (ZT_DEATH) — vendor zap.c::zhitu line 4292-4360.  Player
+    # with MAGIC_RESIST suffers 0 damage; otherwise instakill (set HP to 0
+    # directly, not a d999 roll which under-kills high-HP players).
+    if is_death:
+        has_magic_resist = (
+            state.status.intrinsics[int(_Intr.MAGIC_RESIST)]
+            | (state.status.timed_intrinsics[int(_Intr.MAGIC_RESIST)] > jnp.int32(0))
+        )
+        dmg = jnp.where(has_magic_resist, jnp.int32(0), state.player_hp.astype(jnp.int32))
 
     new_player_hp = jnp.where(
         can_zap,
@@ -1983,10 +1995,10 @@ def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
                 lambda st, k, i: _try_zap_offensive_wand(
                     st, k, i, _WAN_SLEEP, 1, 50, int(_Intr.RESIST_SLEEP)),
                 keys[12])
-    # (14) death — instakill (we approximate as 999 dmg, mod by resist below)
+    # (14) death — vendor ZT_DEATH instakill, gated by MAGIC_RESIST.
     s = _branch(s, can_attack,
                 lambda st, k, i: _try_zap_offensive_wand(
-                    st, k, i, _WAN_DEATH, 1, 999, -1),
+                    st, k, i, _WAN_DEATH, 1, 1, -1, is_death=True),
                 keys[13])
     # (15) slow monster / cancellation — apply status to player as 0 dmg
     s = _branch(s, can_attack,
