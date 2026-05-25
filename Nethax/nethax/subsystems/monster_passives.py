@@ -428,7 +428,13 @@ def apply_passive_to_player(state, attacker_slot: jnp.ndarray, rng: jax.Array):
     idx = attacker_slot.astype(jnp.int32)
     mai = state.monster_ai
     n_passive = _PASSIVE_TYPE.shape[0]
-    entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, n_passive - 1)
+    # Clip ``idx`` BEFORE indexing into entry_idx — vendor passes a valid
+    # monster slot, but JAX silently wraps negative scalar indices, so a
+    # sentinel of -1 (or any slot bumped past mai length) would read a
+    # bogus entry.  Defensive clip preserves byte-equal behavior for valid
+    # slots and produces a safe (slot-0 entry) for invalid sentinels.
+    safe_idx = jnp.clip(idx, 0, mai.entry_idx.shape[0] - 1)
+    entry = jnp.clip(mai.entry_idx[safe_idx].astype(jnp.int32), 0, n_passive - 1)
     ptype = _PASSIVE_TYPE[entry].astype(jnp.int32)
     ptype_safe = jnp.clip(ptype, 0, _N_PASSIVE_TYPES - 1)
 

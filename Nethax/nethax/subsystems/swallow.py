@@ -275,8 +275,16 @@ def digest_tick(state, rng: jax.Array):
         new_done = s.done | (new_hp <= jnp.int32(0))
 
         # Check whether engulfer died.
+        # ``engulfer_slot`` is -1 when idle (no engulfer); JAX silently
+        # wraps a -1 scalar index into the last array element, so clip
+        # first and treat the idle case as "not alive" → release.
         slot = sw.engulfer_slot.astype(jnp.int32)
-        engulfer_alive = s.monster_ai.alive[slot]
+        safe_slot = jnp.clip(slot, 0, s.monster_ai.alive.shape[0] - 1)
+        engulfer_alive = jnp.where(
+            slot >= jnp.int32(0),
+            s.monster_ai.alive[safe_slot],
+            jnp.bool_(False),
+        )
 
         should_release = (new_total <= jnp.int32(0)) | (~engulfer_alive)
 

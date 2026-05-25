@@ -1099,8 +1099,13 @@ def _single_melee_strike(
     # vendor/nethack/src/uhitm.c:376 — u.uhitinc (ring of increase accuracy).
     uhitinc = state.player_uhitinc.astype(jnp.int32)
     # vendor/nethack/src/uhitm.c:387-394 — target-state bonuses.
-    # +2 sleeping (sleep_timer > 0; asleep kept in sync for backward-compat).
-    sleeping_bonus = jnp.where(mai.sleep_timer[idx].astype(jnp.int32) > jnp.int32(0), jnp.int32(2), jnp.int32(0))
+    # +2 sleeping (vendor msleeping).  Match either the int16 sleep_timer
+    # countdown OR the asleep bool — they're kept in sync, but some
+    # spawn paths set only one of them.
+    sleeping_bonus = jnp.where(
+        (mai.sleep_timer[idx].astype(jnp.int32) > jnp.int32(0)) | mai.asleep[idx],
+        jnp.int32(2), jnp.int32(0),
+    )
     # +2 stunned target (stun_timer > 0).  vendor/nethack/src/uhitm.c:388.
     target_stun_bonus = jnp.where(mai.stun_timer[idx].astype(jnp.int32) > jnp.int32(0), jnp.int32(2), jnp.int32(0))
     # +2 fleeing (flee_until_turn > timestep OR mstrategy == FLEE).
