@@ -379,8 +379,11 @@ def take_off_ring(state, hand: int):
     Side-effects
     ------------
     - Sets inventory.worn_rings[hand] = -1
-    - Revokes the ring's intrinsic (unless the other hand also has the same
-      ring type — full dedup is Wave 4; Wave 3 simply clears the flag)
+    - Revokes the ring's intrinsic IF the other hand does not also hold a
+      ring of the same type (vendor do_wear.c::Ring_off_or_gone delegates
+      to setworn / EXTRINSIC bookkeeping which only clears the property
+      bit when no other source supplies it).  Two rings of fire-resistance
+      worn together: removing one keeps FIRE_RES intact.
     - Stat-adjusting rings reverse the stat modification
     """
     slot_idx = int(state.inventory.worn_rings[hand])
@@ -397,6 +400,19 @@ def take_off_ring(state, hand: int):
     ring_effect = int(type_raw[slot_idx]) if type_raw.ndim > 0 else int(type_raw)
     enchantment = int(enc_raw[slot_idx])  if enc_raw.ndim  > 0 else int(enc_raw)
 
+    # Is the other hand wearing a different ring of the same type?  If
+    # so, the intrinsic / stat bonus should remain — vendor uses EXTRINSIC
+    # source bookkeeping (setworn(NULL, mask) only clears the property
+    # when no other slot still confers it).  Same slot index in both
+    # hands is an invalid state (can't wear one ring instance on two
+    # hands); guard against it explicitly.
+    other_hand = 1 - int(hand)
+    other_slot = int(state.inventory.worn_rings[other_hand])
+    other_same_type = False
+    if other_slot >= 0 and other_slot != slot_idx:
+        other_type = int(type_raw[other_slot]) if type_raw.ndim > 0 else int(type_raw)
+        other_same_type = (other_type == ring_effect)
+
     # Clear worn slot and weld flag.
     new_worn_rings = state.inventory.worn_rings.at[hand].set(jnp.int8(-1))
     new_worn_rings_welded = state.inventory.worn_rings_welded.at[hand].set(jnp.bool_(False))
@@ -406,9 +422,9 @@ def take_off_ring(state, hand: int):
     )
     state = state.replace(inventory=new_inventory)
 
-    # Revoke intrinsic.
+    # Revoke intrinsic — but only if the other hand isn't also supplying it.
     intrinsic_id = _RING_TO_INTRINSIC.get(ring_effect)
-    if intrinsic_id is not None:
+    if intrinsic_id is not None and not other_same_type:
         state = state.replace(
             status=remove_intrinsic(state.status, intrinsic_id)
         )
