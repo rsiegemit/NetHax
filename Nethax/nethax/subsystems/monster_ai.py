@@ -109,6 +109,21 @@ _MONSTER_SOUND_TABLE: jnp.ndarray = _build_monster_sound_table()
  _MONSTER_FLAGS2_TABLE,
  _MONSTER_FLAGS3_TABLE,
  _MONSTER_LEVEL_TABLE) = _build_monster_flag_tables()
+
+
+def _build_monster_size_table() -> jnp.ndarray:
+    """Per-entry physical size (MZ_TINY=0..MZ_GIGANTIC=7).
+
+    Cite: vendor/nethack/include/permonst.h ``msize`` field, used by
+    ``verysmall(ptr) := ptr->msize < MZ_SMALL`` (mondata.h:11).
+    """
+    from Nethax.nethax.constants.monsters import MONSTERS
+    return jnp.array([int(m.size) for m in MONSTERS], dtype=jnp.int8)
+
+
+_MONSTER_SIZE_TABLE: jnp.ndarray = _build_monster_size_table()
+# vendor mondata.h MZ_* values — only MZ_SMALL=1 matters for verysmall.
+_MZ_SMALL: int = 1
 _MS_SPELL: int = 42   # vendor/nethack/include/monflag.h
 _MS_PRIEST: int = 41  # vendor/nethack/include/monflag.h
 _MS_RIDER: int = 35   # vendor/nethack/include/monflag.h
@@ -762,19 +777,19 @@ def _mover_can_open_door(entry_idx: jnp.ndarray) -> jnp.ndarray:
 
     Vendor mon.c:2067 ``boolean can_open = !(nohands(mtmp->data)
     || verysmall(mtmp->data));`` then 2100-2101 ``if (can_open)
-    allowflags |= OPENDOOR;``.
+    allowflags |= OPENDOOR;``.  Amorphous creatures additionally pass
+    under closed doors (vendor mon.c:2234) regardless of size/hands.
 
-    JAX approximation: a monster can open doors if it has hands
-    (~M1_NOHANDS) AND is at least roughly humanoid/intelligent — we use
-    M1_HUMANOID as a proxy for "not verysmall, has dexterous limbs",
-    plus humans / minotaurs via M2_HUMAN as a secondary proxy.  Amorphous
-    creatures also pass under closed doors (vendor mon.c:2234).
+    Byte-equal port: ``!nohands AND !verysmall`` where
+    ``verysmall := msize < MZ_SMALL`` (mondata.h:11).
     """
     nohands   = _has_flag1(entry_idx, _M1_NOHANDS)
-    humanoid  = _has_flag1(entry_idx, _M1_HUMANOID)
-    human     = _has_flag2(entry_idx, _M2_HUMAN)
+    safe = jnp.clip(entry_idx.astype(jnp.int32), 0,
+                    _MONSTER_SIZE_TABLE.shape[0] - 1)
+    msize = _MONSTER_SIZE_TABLE[safe].astype(jnp.int32)
+    verysmall = msize < jnp.int32(_MZ_SMALL)
     amorphous = _has_flag1(entry_idx, _M1_AMORPHOUS)
-    return ((~nohands) & (humanoid | human)) | amorphous
+    return ((~nohands) & (~verysmall)) | amorphous
 
 
 def _mover_can_bust_door(entry_idx: jnp.ndarray) -> jnp.ndarray:
@@ -1324,12 +1339,15 @@ def _try_heal(state, rng: jax.Array, monster_idx: jnp.ndarray):
     """Quaff a healing potion from monster's inventory if HP < hp_max and
     a potion of healing exists.
 
-    Vendor reference: muse.c::find_defensive case MUSE_POT_HEALING +
-    muse.c::use_defensive.  Vendor heal amount for monster quaff is the
-    same formula as hero peffect_healing (potions.c): healup(8 + d(4,4)),
-    so the heal is in [9..24] HP.  We use d(3,6)+8 → [11..26] as a
-    parity-tractable approximation (matches the task spec's "d6+1" hint
-    while staying close to vendor band).
+    Vendor formula (vendor/nethack/src/muse.c::use_defensive
+    MUSE_POT_HEALING line 1165):
+        i = d(6 + 2 * bcsign(otmp), 4)
+        healmon(mtmp, i, 1)
+    where bcsign is -1/0/+1 (cursed/uncursed/blessed).  inv_buc already
+    stores -1/0/+1 (per MonsterAIState comment line 531), so the cast is
+    direct.  healmon adds ``i`` to HP and ``+1`` to mhmax.
+
+    Byte-equal port: d(6+2*bcsign, 4) HP delta; hp_max += 1.
     """
     idx = monster_idx.astype(jnp.int32)
     mai = state.monster_ai
@@ -1340,9 +1358,19 @@ def _try_heal(state, rng: jax.Array, monster_idx: jnp.ndarray):
     hurt   = hp < hp_max
     can_quaff = found & hurt
 
-    # Heal amount: 1d6 + 1 + (existing hp).  Clamp to hp_max.
-    heal_roll = jax.random.randint(rng, (), 1, 7, dtype=jnp.int32) + jnp.int32(1)
-    new_hp = jnp.minimum(hp + heal_roll, hp_max)
+    # Vendor d(6 + 2*bcsign, 4) — JIT-stable masked dice roll: roll 8 d4s
+    # (max possible n_dice when blessed) and only sum the first ``n``.
+    bcsign = mai.inv_buc[idx, slot].astype(jnp.int32)
+    n_dice = jnp.int32(6) + jnp.int32(2) * bcsign  # 4, 6, or 8
+    MAX_N = 8
+    keys = jax.random.split(rng, MAX_N)
+    rolls = jax.vmap(
+        lambda k: jax.random.randint(k, (), 1, 5, dtype=jnp.int32)
+    )(keys)
+    mask = jnp.arange(MAX_N, dtype=jnp.int32) < n_dice
+    heal_roll = jnp.sum(jnp.where(mask, rolls, jnp.int32(0))).astype(jnp.int32)
+    new_hp_max = jnp.where(can_quaff, hp_max + jnp.int32(1), hp_max)
+    new_hp = jnp.minimum(hp + heal_roll, new_hp_max)
     new_hp = jnp.where(can_quaff, new_hp, hp)
 
     # Decrement potion quantity by 1; remove (set category=0) when zero.
@@ -1357,9 +1385,11 @@ def _try_heal(state, rng: jax.Array, monster_idx: jnp.ndarray):
     new_inv_qty = mai.inv_quantity.at[idx, slot].set(new_qty)
     new_inv_cat = mai.inv_category.at[idx, slot].set(cleared_cat)
     new_hp_arr  = mai.hp.at[idx].set(new_hp)
+    new_hp_max_arr = mai.hp_max.at[idx].set(new_hp_max.astype(mai.hp_max.dtype))
 
     new_mai = mai.replace(
         hp=new_hp_arr,
+        hp_max=new_hp_max_arr,
         inv_quantity=new_inv_qty,
         inv_category=new_inv_cat,
     )

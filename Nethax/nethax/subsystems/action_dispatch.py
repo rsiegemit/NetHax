@@ -857,14 +857,20 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     descend = trap_se[_SE_LEVEL_DESCEND] > jnp.int32(0)
     _max_level_branch = jnp.int8(state_final.terrain.shape[1])
     # Audit M #30: vendor ``Can_fall_thru(&u.uz)`` gate (trap.c:2013-2020).
-    # Vendor blocks the level-descend on bottoms of branches and in
-    # endgame branches.  We approximate ``Can_fall_thru`` as
-    # ``current_level < max_level_branch`` — if the player is already on
-    # the bottom-most level of the current branch, the fall-through is
-    # blocked.  Endgame branches (ENDGAME) have their own protections
-    # at the dungeon-traversal level; here we just refuse to bump past
-    # the bottom.  Cite: vendor/nethack/src/trap.c:2013-2020.
-    _can_fall_thru = state_final.dungeon.current_level < _max_level_branch
+    # Vendor blocks the level-descend when:
+    #   1. current depth equals dunlev_ureached (bottom of branch), OR
+    #   2. In_endgame(u.uz), OR
+    #   3. In_sokoban(u.uz)
+    # We translate to: refuse the fall when on the bottom of the current
+    # branch OR when current_branch is SOKOBAN or ENDGAME.  Cite:
+    # vendor/nethack/include/dungeon.h Can_fall_thru macro;
+    # vendor/nethack/src/trap.c:2013-2020.
+    from Nethax.nethax.dungeon.branches import Branch as _Branch
+    _br = state_final.dungeon.current_branch.astype(jnp.int32)
+    _is_sokoban = _br == jnp.int32(int(_Branch.SOKOBAN))
+    _is_endgame = _br == jnp.int32(int(_Branch.ENDGAME))
+    _not_branch_bottom = state_final.dungeon.current_level < _max_level_branch
+    _can_fall_thru = _not_branch_bottom & ~_is_sokoban & ~_is_endgame
     descend = descend & _can_fall_thru
     _bumped_level = jnp.minimum(
         state_final.dungeon.current_level + jnp.int8(1),
