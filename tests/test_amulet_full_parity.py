@@ -263,6 +263,8 @@ def test_reflection_bounces_ray():
         mon_resists=jnp.zeros(N, dtype=jnp.int32),
         mon_speed_mod=jnp.zeros(N, dtype=jnp.int8),
         mon_cancelled=jnp.zeros(N, dtype=jnp.bool_),
+        mon_paralyzed_timer=jnp.zeros(N, dtype=jnp.int16),
+        mon_sleep_timer=jnp.zeros(N, dtype=jnp.int16),
         terrain=terrain,
         explored=jnp.zeros((MAP_H, MAP_W), dtype=jnp.bool_),
         inventory=InventoryState.empty(),

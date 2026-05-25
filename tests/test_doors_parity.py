@@ -72,7 +72,7 @@ def test_open_closed_becomes_isopen():
     """vendor lock.c::doopen lines 903-913: CLOSED + open success → D_ISOPEN."""
     s = _make_state()
     s = _set_door(s, 4, 5, DoorState.CLOSED)
-    new_features = open_door(s.features, _door_pos(s, 4, 5))
+    new_features, _dmg = open_door(s.features, _door_pos(s, 4, 5))
     assert int(new_features.door_state[_flat_lv(s), 4, 5]) == int(DoorState.OPEN)
 
 
@@ -81,7 +81,7 @@ def test_open_locked_fails():
     doormask unchanged.  Our open_door must leave LOCKED intact."""
     s = _make_state()
     s = _set_door(s, 4, 5, DoorState.LOCKED)
-    new_features = open_door(s.features, _door_pos(s, 4, 5))
+    new_features, _dmg = open_door(s.features, _door_pos(s, 4, 5))
     assert int(new_features.door_state[_flat_lv(s), 4, 5]) == int(DoorState.LOCKED)
 
 
@@ -290,7 +290,7 @@ def test_open_broken_unchanged():
     no state change.  Our open_door must not touch BROKEN doors."""
     s = _make_state()
     s = _set_door(s, 4, 5, DoorState.BROKEN)
-    new_features = open_door(s.features, _door_pos(s, 4, 5))
+    new_features, _dmg = open_door(s.features, _door_pos(s, 4, 5))
     assert int(new_features.door_state[_flat_lv(s), 4, 5]) == int(DoorState.BROKEN)
 
 

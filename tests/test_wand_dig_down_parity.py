@@ -46,6 +46,8 @@ def _make_wand_state(player_pos=(5, 5), map_h=21, map_w=80):
         mon_resists   = jnp.zeros(n, dtype=jnp.int32),
         mon_speed_mod = jnp.zeros(n, dtype=jnp.int8),
         mon_cancelled = jnp.zeros(n, dtype=bool),
+        mon_paralyzed_timer = jnp.zeros(n, dtype=jnp.int16),
+        mon_sleep_timer = jnp.zeros(n, dtype=jnp.int16),
         terrain       = jnp.full((map_h, map_w), int(TileType.FLOOR), dtype=jnp.int8),
         explored      = jnp.zeros((map_h, map_w), dtype=bool),
         inventory     = InventoryState.empty(),

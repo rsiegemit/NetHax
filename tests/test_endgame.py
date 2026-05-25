@@ -320,8 +320,10 @@ class TestAscensionCondition:
         # Ascension achievement recorded.
         achieved = new_state.scoring.achievements[int(Achievement.ASCENDED)]
         assert bool(achieved) is True
-        # Score got the bonus.
-        assert int(new_state.scoring.score) >= 50000
+        # ``ascended`` flag is set so compute_final_score's ascension
+        # XP-doubling fires (vendor end.c:1344-1351).  Audit G #4 removed
+        # the legacy flat +50000 bonus that had no vendor analogue.
+        assert bool(new_state.scoring.ascended) is True
 
 
 class TestEnvAscensionWiring:
