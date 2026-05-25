@@ -683,15 +683,16 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
     # the player would otherwise have to infer.
     # Cite: vendor/nethack/src/artifact.c:2162-2165 (invoke ENLIGHTENING).
     def _h_enlightening(s):
+        from Nethax.nethax.subsystems.vision import cansee
         mai = s.monster_ai
         pr = s.player_pos[0].astype(jnp.int32)
         pc = s.player_pos[1].astype(jnp.int32)
         mpos = mai.pos.astype(jnp.int32)
-        # Chebyshev distance <= 10 as a coarse "in sight" proxy (vendor uses
-        # couldsee()/cansee() which depends on lit + LoS; we approximate).
-        d_row = jnp.abs(mpos[:, 0] - pr)
-        d_col = jnp.abs(mpos[:, 1] - pc)
-        in_sight = (d_row <= jnp.int32(10)) & (d_col <= jnp.int32(10)) & mai.alive
+        # Vendor cansee() — ray-cast LoS with wall/door/tree blockers.
+        # cite vendor/nethack/include/vision.h:28 cansee macro.
+        in_sight = jax.vmap(
+            lambda mr, mc: cansee(s, pr, pc, mr, mc)
+        )(mpos[:, 0], mpos[:, 1]) & mai.alive
         new_invis = jnp.where(in_sight, jnp.bool_(False), mai.invisible)
         return s.replace(monster_ai=mai.replace(invisible=new_invis))
 

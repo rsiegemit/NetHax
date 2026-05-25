@@ -293,10 +293,12 @@ def test_encumbrance_penalty_burdened():
     state_light = base
 
     # Heavy state: fill inventory items with weight to trigger enc_level >= 1.
-    # cap = 25 * 18 + 50 = 500; enc threshold = 500*2//5 = 200.
-    # So total weight > 200 triggers burdened (enc=1).
+    # Vendor (hack.c:4294-4346): carrcap = 25 * (ACURRSTR + ACURR(A_CON)) + 50.
+    # With STR=18 (ACURRSTR=18) and CON=10, carrcap = 25*(18+10) + 50 = 750.
+    # ``calc_capacity`` returns enc=1 when wt > 0 (wt = total - carrcap), so
+    # any total weight > 750 triggers burdened.
     items = base.inventory.items
-    heavy_weight = items.weight.at[0].set(jnp.int16(210))
+    heavy_weight = items.weight.at[0].set(jnp.int16(800))
     heavy_qty = items.quantity.at[0].set(jnp.int16(1))
     from Nethax.nethax.subsystems.inventory import ItemCategory
     heavy_cat = items.category.at[0].set(jnp.int8(int(ItemCategory.WEAPON)))

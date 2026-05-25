@@ -1934,22 +1934,30 @@ def _handle_chat(state, rng):
 def _handle_turn_undead(state, rng):
     """#turn — vendor/nethack/src/pray.c::doturn line 1820.
 
-    Cleric ability: deals d8 damage to every undead monster in a 5x5
-    Chebyshev radius around the player.  Wave-46 minimum: scan all
-    alive monsters with M2_UNDEAD in `flags2`, apply d8 damage if
-    Chebyshev ≤ 5.
+    Cleric ability: deals d8 damage to every undead monster the player
+    can see (cansee LoS) within a 5-tile Chebyshev radius around the
+    player.  Vendor doturn requires both ``cansee(mtmp->mx, mtmp->my)``
+    and a level check; we keep the level check elsewhere and gate
+    targeting on cansee + range.
 
     Cite: vendor/nethack/src/pray.c::doturn line 1820;
-          vendor/nethack/include/monflag.h M2_UNDEAD.
+          vendor/nethack/include/monflag.h M2_UNDEAD;
+          vendor/nethack/include/vision.h:28 cansee macro.
     """
     from Nethax.nethax.constants.monsters import MONSTERS as _MM, M2_UNDEAD
+    from Nethax.nethax.subsystems.vision import cansee
     mai = state.monster_ai
     pr = state.player_pos[0].astype(jnp.int32)
     pc = state.player_pos[1].astype(jnp.int32)
     mpos = mai.pos.astype(jnp.int32)
     d_row = jnp.abs(mpos[:, 0] - pr)
     d_col = jnp.abs(mpos[:, 1] - pc)
-    in_range = (d_row <= jnp.int32(5)) & (d_col <= jnp.int32(5)) & mai.alive
+    visible = jax.vmap(lambda mr, mc: cansee(state, pr, pc, mr, mc))(
+        mpos[:, 0], mpos[:, 1]
+    )
+    in_range = (
+        (d_row <= jnp.int32(5)) & (d_col <= jnp.int32(5)) & mai.alive & visible
+    )
     # Build undead-mask from MONSTERS at import time.
     undead_mask_arr = jnp.array(
         [int(bool(getattr(m, "flags2", 0) & int(M2_UNDEAD))) for m in _MM],
