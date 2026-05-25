@@ -192,7 +192,8 @@ class QuestState:
 
 
 # ---------------------------------------------------------------------------
-# Stage-transition stubs (Wave 4 hooks; Wave 5 keeps signatures stable)
+# Stage-transition wiring (vendor quest.c on_quest_level + leader_talk +
+# kill_nemesis + pickup_artifact + return_to_leader event chain).
 # ---------------------------------------------------------------------------
 def enter_quest_branch(state: QuestState, role: int) -> QuestState:
     """Player descended into the quest branch — advance stage to ENTERED_QUEST.

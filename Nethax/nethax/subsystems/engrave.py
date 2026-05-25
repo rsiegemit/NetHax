@@ -5,7 +5,8 @@ Canonical sources:
   vendor/nethack/src/engrave.c::write_engr_text  — per-tile write back / merge
   vendor/nethack/include/engrave.h               — engr struct fields
 
-Status: Wave 5 Phase 4 — minimal Elbereth-in-dust simplification.
+Status: Wave 46b — full vendor parity (DUST/BLOOD/ENGRAVE/BURN/MARK/HEADSTONE
++ is_elbereth + engrave_scares_monster + tick_engravings decay).
 
 The vendor flow lets the player pick a writing implement (finger, wand,
 athame, ...) and arbitrary text; the engraving kind controls whether the

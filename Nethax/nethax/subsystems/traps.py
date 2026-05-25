@@ -4,19 +4,14 @@ Canonical sources:
   vendor/nethack/include/trap.h     — enum trap_types, N_TRAP_TYPES (TRAPNUM=26)
   vendor/nethack/src/trap.c         — dotrap(), mintrap(), maketrap(), deltrap()
 
-Status: Wave 3 — trigger_trap implemented; place_trap / reveal_trap stubs remain.
-
-TODO (later waves):
-  Wave 4 (transport / magic traps):
-    TRAPDOOR     — delayed HOLE; same as HOLE but can be crawled out of
-    LEVEL_TELEP  — teleport victim to random dungeon level
-    MAGIC_PORTAL — fixed destination portal (Vibrating Square branch, etc.)
-    LANDMINE     — destroys items on tile (Wave 4 item layer)
-    RUST_TRAP    — ruin a random worn metal item (Wave 4 item layer)
-  Wave 5 (special / endgame):
-    VIBRATING_SQUARE — Castle / endgame gateway; requires Amulet logic
-    Drawbridge interactions (dbridge.c) — DRAWBRIDGE_UP/DOWN tile traps
-    Secret-door discovery via search command (detect.c)
+Status: vendor-parity dispatch — every TrapType in TrapType has a real
+effect handler.  Documented JAX-required deviations:
+  LEVEL_TELEP / MAGIC_PORTAL — same-level tele instead of cross-level
+    (vendor goto_level cross-level transition not modelled mid-trap).
+  LANDMINE PIT conversion — recursive damage applied in-place rather
+    than re-firing dotrap(trap, RECURSIVETRAP).
+  HOLE / TRAPDOOR — d6 fall jolt proxy (vendor fall_through has no
+    direct HP; the dungeon descent itself is the "damage").
 """
 from enum import IntEnum
 
@@ -1280,6 +1275,11 @@ def _trap_statue(state, rng):
     HP is derived from the species' ``mlevel`` via ``(level + 1) * 4``
     (vendor uses ``rnd((mlevel+1)*8)`` but we want a deterministic mean).
 
+    Reads the encoded species from ``ground.corpse_entry_idx`` (which
+    aliases vendor's ``obj->corpsenm`` for statues — vendor reuses the
+    same field name for corpses and statues).  Pre-wave-48 the impl
+    re-purposed ``Item.charges`` as a placeholder; that's now cleaned up.
+
     Citation: vendor/nethack/src/trap.c:907-936 (activate_statue_trap),
               vendor/nethack/src/mkobj.c (statue->corpsenm storage).
     """
@@ -1300,14 +1300,15 @@ def _trap_statue(state, rng):
     ground = state.ground_items
     # Stack of items at this tile: shape [MAX_GROUND_STACK].
     g_tids    = ground.type_id[b, lv, pr, pc]
-    g_charges = ground.charges[b, lv, pr, pc]
+    g_corpse_entry = ground.corpse_entry_idx[b, lv, pr, pc]
     # Find first STATUE in the stack.
     _STATUE_TYPE_ID = 448
     is_statue = g_tids == jnp.int16(_STATUE_TYPE_ID)
     has_statue = jnp.any(is_statue)
     statue_slot = jnp.argmax(is_statue.astype(jnp.int32)).astype(jnp.int32)
-    encoded_mon_idx = g_charges[statue_slot].astype(jnp.int32)
-    # Charges is int8 → 0..127 valid range; treat <=0 or >=N as "use random".
+    encoded_mon_idx = g_corpse_entry[statue_slot].astype(jnp.int32)
+    # corpse_entry_idx is int16 (-1=unset, 0..N-1=species).  Vendor's
+    # corpsenm uses 0..N for unset/0; here we treat <0 or >=N as "use random".
     n_mons = jnp.int32(_MONSTER_TABLES["n"])
     encoded_valid = (
         has_statue
