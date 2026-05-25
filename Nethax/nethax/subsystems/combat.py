@@ -814,12 +814,11 @@ def to_hit_roll(rng: jax.Array, attacker_state, target_ac: jnp.ndarray) -> jnp.n
     )
     skill_bonus = _skill_hit_bonus(attacker_state)
     enchant = _wielded_enchant(attacker_state)
-    # vendor/nethack/src/uhitm.c:380 — AC_VALUE: AC>=0 used directly;
-    # AC<0: rnd(-ac) softens difficulty for very-low-AC targets.
-    ac_raw = target_ac.astype(jnp.int32)
-    key_ac, rng = jax.random.split(rng)
-    ac_neg_roll = jax.random.randint(key_ac, (), 1, jnp.maximum(-ac_raw + 1, 2), dtype=jnp.int32)
-    target_ac_i32 = jnp.where(ac_raw >= 0, ac_raw, ac_neg_roll)
+    # Vendor uhitm.c:376 — ``tmp = 1 + abon() + find_mac(mtmp) + ...``
+    # No softening of negative AC; raw value used directly (heavily-armored
+    # monsters CAN be unhittable by low-XL players).  find_mac (worn.c:717)
+    # returns a signed AC that can be < 0.
+    target_ac_i32 = target_ac.astype(jnp.int32)
 
     # vendor/nethack/src/uhitm.c:378 — XL contribution (player level).
     xl_bonus = attacker_state.player_xl.astype(jnp.int32)
@@ -1071,12 +1070,12 @@ def _single_melee_strike(
     idx = target_monster_idx.astype(jnp.int32)
     mai = state.monster_ai
 
-    # vendor/nethack/src/uhitm.c:380 — AC_VALUE: AC>=0 used directly;
-    # AC<0: rnd(-AC) softens difficulty (very low AC enemies are harder to hit
-    # than the raw number implies). Cite: uhitm.c:380.
-    ac_raw = mai.ac[idx].astype(jnp.int32)
-    ac_neg_roll = jax.random.randint(key_ac, (), 1, jnp.maximum(-ac_raw + 1, 2), dtype=jnp.int32)
-    target_ac = jnp.where(ac_raw >= 0, ac_raw, ac_neg_roll)
+    # Vendor uhitm.c:376 — tmp = 1 + abon() + find_mac(mtmp) + ...
+    # find_mac (worn.c:717) returns the signed AC directly; negative
+    # values contribute negatively to ``tmp`` without softening
+    # (heavily-armored targets ARE genuinely harder for low-level
+    # attackers).  No rnd(-ac) gate.
+    target_ac = mai.ac[idx].astype(jnp.int32)
 
     target_large = mai.is_large[idx]
     target_alive = mai.alive[idx]
