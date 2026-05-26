@@ -997,6 +997,39 @@ def _vendor_traptype_rnd(rng, level_diff):
     return jnp.where(legal, kind, jnp.int32(1))  # ARROW_TRAP fallback
 
 
+def _isaac_legalise_trap_kind(kind, level_diff):
+    """ISAAC64-path twin of :func:`_vendor_traptype_rnd` — takes a pre-drawn
+    ``rnd(TRAPNUM-1)`` value instead of consuming a Threefry key.
+
+    Mirrors the same illegal/depth-gated filters and collapses rejected
+    draws to ARROW_TRAP (vendor retry loop approximation).  Used by the
+    NLE_BYTEPARITY path inside :func:`fill_ordinary_rooms` where the
+    underlying rn2 draw must come from the ISAAC64 stream.
+    """
+    kind = jnp.asarray(kind, dtype=jnp.int32)
+    lvl  = jnp.asarray(level_diff, dtype=jnp.int32)
+
+    is_trapped_door  = kind == jnp.int32(24)
+    is_trapped_chest = kind == jnp.int32(25)
+    is_portal        = kind == jnp.int32(17)
+    is_vibsquare     = kind == jnp.int32(23)
+    is_fire          = kind == jnp.int32(10)
+    illegal = is_trapped_door | is_trapped_chest | is_portal | is_vibsquare | is_fire
+
+    depth_too_low = (
+        ((kind == jnp.int32(7))  & (lvl < jnp.int32(2)))  |
+        ((kind == jnp.int32(8))  & (lvl < jnp.int32(2)))  |
+        ((kind == jnp.int32(16)) & (lvl < jnp.int32(5)))  |
+        ((kind == jnp.int32(12)) & (lvl < jnp.int32(5)))  |
+        ((kind == jnp.int32(6))  & (lvl < jnp.int32(6)))  |
+        ((kind == jnp.int32(18)) & (lvl < jnp.int32(7)))  |
+        ((kind == jnp.int32(19)) & (lvl < jnp.int32(8)))  |
+        ((kind == jnp.int32(22)) & (lvl < jnp.int32(8)))
+    )
+    legal = ~(illegal | depth_too_low)
+    return jnp.where(legal, kind, jnp.int32(1))
+
+
 def fill_ordinary_rooms(
     rng,
     rooms,
@@ -1007,6 +1040,7 @@ def fill_ordinary_rooms(
     flat_lv: int,
     depth,
     player_align: int = 1,
+    vendor_rng: Isaac64State | None = None,
 ):
     """Apply per-room independent feature rolls to every ordinary room.
 
@@ -1050,9 +1084,18 @@ def fill_ordinary_rooms(
         player_align: int — Alignment value (0/1/2) used for altar
                       placement (vendor mkaltar passes player align to
                       induced_align).
+        vendor_rng:   optional :class:`Isaac64State`.  When supplied
+                      (NLE_BYTEPARITY mode) every per-room rn2/somexy draw
+                      is routed through :func:`randint_jax` so the byte
+                      stream matches vendor C for a given seed.  When
+                      ``None`` the original Threefry-split path runs
+                      unchanged.
 
     Returns:
-        (terrain, features, traps) — updated in-place via functional ops.
+        ``(terrain, features, traps, vendor_rng_out)`` — updated in-place
+        via functional ops.  ``vendor_rng_out`` is the threaded
+        :class:`Isaac64State` when ``vendor_rng`` was supplied, otherwise
+        it is the input ``vendor_rng`` (``None``) passed through.
     """
     from Nethax.nethax.constants.tiles import TileType
     FLOOR    = jnp.int8(int(TileType.FLOOR))
@@ -1232,20 +1275,179 @@ def fill_ordinary_rooms(
 
         return (terrain_, features_aa, features_lit, traps_tt), None
 
-    init_state = (
-        terrain,
-        features.altar_alignment,
-        features.lit,
-        traps.trap_type,
-    )
-    (terrain_out, aa_out, lit_out, tt_out), _ = lax.scan(
-        fill_one,
-        init_state,
-        jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
-    )
+    # -----------------------------------------------------------------
+    # ISAAC64-threaded scan body (NLE_BYTEPARITY) — vendor cite mklev.c
+    # ::fill_ordinary_room lines 968-1006.  Per-room rn2/somexy draws are
+    # routed through randint_jax so the byte stream matches vendor C.
+    # The schedule below mirrors vendor's call order:
+    #   1. sleeping monster:  rn2(3),                    somexy (x,y)
+    #   2. traps loop:        for j in [0, MAX_TRAPS):
+    #                            rn2(trap_x),
+    #                            traptype_rnd → rnd(TRAPNUM-1),
+    #                            somexy (x,y)
+    #   3. gold:              rn2(3),                    somexy (x,y)
+    #   4. fountain:          rn2(10),                   somexy (x,y)
+    #   5. sink:              rn2(60),                   somexy (x,y)
+    #   6. altar:             rn2(60),                   somexy (x,y),
+    #                          induced_align rn2(100), rn2(3) for alt
+    #   7. grave:             rn2(grave_x),              somexy (x,y)
+    #   8. statue:            rn2(20),                   somexy (x,y)
+    # somexy draws X then Y (vendor mkroom.c::somexy → somex/somey).
+    # All draws fire unconditionally (placement still gated by mask) so
+    # the trace length is fixed; this matches our Threefry path which
+    # also fires every draw unconditionally.
+    def fill_one_isaac(state, i):
+        terrain_, features_aa, features_lit, traps_tt, vrng = state
+        y1 = rooms.y1[i].astype(jnp.int32)
+        x1 = rooms.x1[i].astype(jnp.int32)
+        y2 = rooms.y2[i].astype(jnp.int32)
+        x2 = rooms.x2[i].astype(jnp.int32)
+        rt = rooms.room_type[i].astype(jnp.int32)
+        act = active[i]
+
+        # Per-room lit stamp (unchanged — rooms.is_lit was rolled at
+        # generate_rooms time via the ISAAC64 stream when vendor_rng was
+        # supplied).
+        H = features_lit.shape[1]
+        W = features_lit.shape[2]
+        rows_idx = jnp.arange(H, dtype=jnp.int32).reshape(H, 1)
+        cols_idx = jnp.arange(W, dtype=jnp.int32).reshape(1, W)
+        in_room = (
+            (rows_idx >= y1) & (rows_idx <= y2)
+            & (cols_idx >= x1) & (cols_idx <= x2)
+        )
+        room_lit = rooms.is_lit[i] & act
+        cur_lit = features_lit[flat_lv]
+        new_lit = jnp.where(in_room & room_lit, jnp.bool_(True), cur_lit)
+        features_lit = features_lit.at[flat_lv].set(new_lit)
+
+        is_ordinary = act & (
+            (rt == jnp.int32(int(RoomType.ORDINARY))) |
+            (rt == jnp.int32(int(RoomType.THEMEROOM)))
+        )
+
+        h_max = jnp.int32(terrain_.shape[0] - 1)
+        w_max = jnp.int32(terrain_.shape[1] - 1)
+
+        def somexy(vrng_in):
+            # Vendor mkroom.c::somexy — X first, then Y (somex/somey).
+            vrng_in, cx = randint_jax(vrng_in, (), x1, x2 + jnp.int32(1))
+            vrng_in, ry = randint_jax(vrng_in, (), y1, y2 + jnp.int32(1))
+            ry = jnp.clip(ry, 0, h_max)
+            cx = jnp.clip(cx, 0, w_max)
+            return vrng_in, ry, cx
+
+        # --- Sleeping monster: !rn2(3) + somexy (vendor line 974) ---
+        vrng, _sleep_roll = randint_jax(vrng, (), 0, 3)
+        vrng, _rs, _cs = somexy(vrng)
+
+        # --- Traps: while (!rn2(trap_x)) — bounded loop ---
+        MAX_TRAPS_PER_ROOM = 4
+
+        def trap_step_isaac(carry, j):
+            terrain_in, traps_in, continue_, vrng_in = carry
+            vrng_in, roll = randint_jax(vrng_in, (), 0, trap_x)
+            hit = roll == jnp.int32(0)
+            # traptype_rnd: vendor mklev.c::traptype_rnd draws rnd(TRAPNUM-1)
+            # = uniform in [1, TRAPNUM-1] = randint(1, TRAPNUM).
+            vrng_in, kind_raw = randint_jax(vrng_in, (), 1, 26)
+            kind = _isaac_legalise_trap_kind(kind_raw, depth_i)
+            vrng_in, rt_r, rt_c = somexy(vrng_in)
+            should_place = continue_ & hit & is_ordinary
+            new_terrain = terrain_in.at[rt_r, rt_c].set(
+                jnp.where(should_place, TRAP_TILE, terrain_in[rt_r, rt_c])
+            )
+            new_traps = traps_in.at[flat_lv, rt_r, rt_c].set(
+                jnp.where(should_place, kind.astype(jnp.int8),
+                          traps_in[flat_lv, rt_r, rt_c])
+            )
+            return (new_terrain, new_traps, continue_ & hit, vrng_in), None
+
+        (terrain_, traps_tt, _, vrng), _ = lax.scan(
+            trap_step_isaac,
+            (terrain_, traps_tt, jnp.bool_(True), vrng),
+            jnp.arange(MAX_TRAPS_PER_ROOM, dtype=jnp.int32),
+        )
+
+        # --- Gold: !rn2(3) + somexy (vendor line 986-987) ---
+        vrng, _gold_roll = randint_jax(vrng, (), 0, 3)
+        vrng, _rg, _cg = somexy(vrng)
+
+        # --- Fountain: !rn2(10) + somexy (vendor line 990-991) ---
+        vrng, fount_roll_v = randint_jax(vrng, (), 0, 10)
+        fount_roll = fount_roll_v == jnp.int32(0)
+        vrng, rf, cf = somexy(vrng)
+        place_fount = is_ordinary & fount_roll
+        terrain_ = terrain_.at[rf, cf].set(
+            jnp.where(place_fount, FOUNTAIN, terrain_[rf, cf])
+        )
+
+        # --- Sink: !rn2(60) + somexy (vendor line 992-993) ---
+        vrng, _sink_roll = randint_jax(vrng, (), 0, 60)
+        vrng, _rsk, _csk = somexy(vrng)
+
+        # --- Altar: !rn2(60) + somexy + induced_align (vendor 994-995) ---
+        vrng, altar_roll_v = randint_jax(vrng, (), 0, 60)
+        altar_roll = altar_roll_v == jnp.int32(0)
+        vrng, ra, ca = somexy(vrng)
+        # induced_align(80): rn2(100) coin; if >=80, draw rn2(3) for alt.
+        vrng, coin = randint_jax(vrng, (), 0, 100)
+        vrng, alt_align = randint_jax(vrng, (), 0, 3)
+        induced = jnp.where(
+            coin < jnp.int32(80), jnp.int32(player_align), alt_align
+        ).astype(jnp.int8)
+        place_altar = is_ordinary & altar_roll
+        terrain_ = terrain_.at[ra, ca].set(
+            jnp.where(place_altar, ALTAR, terrain_[ra, ca])
+        )
+        features_aa = features_aa.at[flat_lv, ra, ca].set(
+            jnp.where(place_altar, induced, features_aa[flat_lv, ra, ca])
+        )
+
+        # --- Grave: !rn2(grave_x) + somexy (vendor 996-1000) ---
+        vrng, grave_roll_v = randint_jax(vrng, (), 0, grave_x)
+        grave_roll = grave_roll_v == jnp.int32(0)
+        vrng, rg2, cg2 = somexy(vrng)
+        place_grave = is_ordinary & grave_roll
+        terrain_ = terrain_.at[rg2, cg2].set(
+            jnp.where(place_grave, GRAVE, terrain_[rg2, cg2])
+        )
+
+        # --- Statue: !rn2(20) + somexy (vendor 1003-1006) ---
+        vrng, _statue_roll = randint_jax(vrng, (), 0, 20)
+        vrng, _rst, _cst = somexy(vrng)
+
+        return (terrain_, features_aa, features_lit, traps_tt, vrng), None
+
+    if vendor_rng is None:
+        init_state = (
+            terrain,
+            features.altar_alignment,
+            features.lit,
+            traps.trap_type,
+        )
+        (terrain_out, aa_out, lit_out, tt_out), _ = lax.scan(
+            fill_one,
+            init_state,
+            jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
+        )
+        vendor_rng_out = vendor_rng  # passthrough (still None)
+    else:
+        init_state = (
+            terrain,
+            features.altar_alignment,
+            features.lit,
+            traps.trap_type,
+            vendor_rng,
+        )
+        (terrain_out, aa_out, lit_out, tt_out, vendor_rng_out), _ = lax.scan(
+            fill_one_isaac,
+            init_state,
+            jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
+        )
     new_features = features.replace(altar_alignment=aa_out, lit=lit_out)
     new_traps    = traps.replace(trap_type=tt_out)
-    return terrain_out, new_features, new_traps
+    return terrain_out, new_features, new_traps, vendor_rng_out
 
 
 # ---------------------------------------------------------------------------

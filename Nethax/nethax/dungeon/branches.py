@@ -823,9 +823,12 @@ def generate_main_branch_l1_with_features(
 
     # vendor/nethack/src/mklev.c::fill_ordinary_room (line 939) — per-room
     # independent feature rolls applied to every ordinary / themeroom.
-    terrain, features, traps = fill_ordinary_rooms(
+    # Thread ``vendor_rng`` so per-room rn2/somexy draws come from the
+    # ISAAC64 stream under NLE_BYTEPARITY (byte-exact with vendor C).
+    terrain, features, traps, vendor_rng = fill_ordinary_rooms(
         k_fill, rooms, active, terrain, features, traps,
         flat_lv=flat_lv, depth=depth, player_align=player_align,
+        vendor_rng=vendor_rng,
     )
 
     # vendor/nethack/src/mklev.c lines 404-410 + 1316-1342 — 2x2 detached
