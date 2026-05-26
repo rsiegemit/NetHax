@@ -367,7 +367,7 @@ def sample_ludios_branch_info(rng) -> BranchInfo:
     )
 
 
-def _vendor_rn1(rng, rand: int, base: int) -> jnp.ndarray:
+def _vendor_rn1(rng, rand: int, base: int, vendor_rng=None) -> jnp.ndarray:
     """JAX-native vendor ``rn1`` — ``rn2(rand) + base``.
 
     Threefry/uniform sampling: when ``rand <= 1`` we return the constant
@@ -375,19 +375,34 @@ def _vendor_rn1(rng, rand: int, base: int) -> jnp.ndarray:
     dungeon.c line 379 ``if (randc) ...``.  When ``rand > 1`` we draw a
     single uniform int via jax.random.randint over ``[base, base+rand)``.
 
+    Byte-replay path: when ``vendor_rng`` (an Isaac64State) is supplied,
+    the draw is routed through :func:`vendor_rng.randint_jax`, which is
+    byte-exact with vendor C ``base + isaac64_next_uint64() % rand``.
+    Caller must thread the returned new state.  When ``vendor_rng`` is
+    None the original Threefry path runs unchanged.
+
     Citation: vendor/nle/include/hack.h line 497
     ``#define rn1(x, y) (rn2(x) + (y))``.
 
     Args:
-        rng:  jax.random.PRNGKey scalar.
-        rand: vendor ``lev.rand`` (the dispersion).
-        base: vendor ``lev.base`` (the floor).
+        rng:        jax.random.PRNGKey scalar (used when vendor_rng is None).
+        rand:       vendor ``lev.rand`` (the dispersion).
+        base:       vendor ``lev.base`` (the floor).
+        vendor_rng: optional Isaac64State; when supplied, returns
+                    ``(new_state, int8_value)`` for byte-exact replay.
 
     Returns:
-        int8 scalar.
+        int8 scalar, OR ``(new_vendor_rng, int8 scalar)`` if vendor_rng given.
     """
     if rand <= 0:
+        if vendor_rng is not None:
+            return vendor_rng, jnp.int8(base)
         return jnp.int8(base)
+    if vendor_rng is not None:
+        # Host-side trace-time selection — randint_jax consumes ISAAC64.
+        from Nethax.nethax.vendor_rng import randint_jax
+        new_vrng, sample = randint_jax(vendor_rng, (), base, base + rand)
+        return new_vrng, sample.astype(jnp.int8)
     # rn2(rand) ∈ [0, rand-1]; rn1 = rn2(rand) + base ∈ [base, base+rand-1].
     sample = jax.random.randint(rng, (), minval=base, maxval=base + rand)
     return sample.astype(jnp.int8)
@@ -619,6 +634,7 @@ def enter_branch(state: DungeonState, branch_id: int) -> DungeonState:
 def generate_main_branch_l1(
     rng: jnp.ndarray,
     static_params,  # StaticParams — imported lazily to avoid circular dep
+    n_rooms: int = 8,
 ) -> Tuple[jnp.ndarray, "Room", jnp.ndarray, jnp.ndarray]:  # noqa: F821
     """Generate the first level of the main branch.
 
@@ -659,7 +675,7 @@ def generate_main_branch_l1(
     rng, k_rooms, k_corridors = jax.random.split(rng, 3)
 
     # 1. Place rooms.
-    rooms, active = generate_rooms(k_rooms, h, w, n_rooms=8)
+    rooms, active = generate_rooms(k_rooms, h, w, n_rooms=n_rooms)
 
     # 2. Carve rooms into blank terrain.
     terrain = jnp.zeros((h, w), dtype=jnp.int8)
@@ -716,6 +732,7 @@ def generate_main_branch_l1_with_features(
     flat_lv: int = 0,
     depth: int = 1,
     player_align: int = 1,
+    n_rooms: int = 8,
 ):
     """Generate Main Dlvl 1 and apply per-room feature/trap rolls + vault.
 
@@ -760,7 +777,7 @@ def generate_main_branch_l1_with_features(
     k_level, k_fill, k_vault, k_niche = jax.random.split(rng, 4)
 
     terrain, rooms, active, up_pos, dn_pos = generate_main_branch_l1(
-        k_level, static_params
+        k_level, static_params, n_rooms=n_rooms,
     )
 
     # vendor/nethack/src/mklev.c::fill_ordinary_room (line 939) — per-room

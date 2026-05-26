@@ -109,6 +109,11 @@ class NethaxEnv:
         # call site; that requires a much larger refactor.  Cite:
         # vendor/nethack/src/rnd.c (rn2/rnd) under USE_ISAAC64 — every
         # vendor RNG draw bottoms out in ``isaac64_next_uint64() % x``.
+        # Vendor-RNG scalar pre-draws — set defaults so the dungeon-gen kwargs
+        # stay traceable on the non-vendor path.  These are overwritten below
+        # from ISAAC64 when ``use_vendor_rng()`` is active.
+        n_rooms_vendor: int = 8         # generate_rooms default
+        n_monsters_vendor: int = 5      # populate_level_with_monsters default
         if use_vendor_rng():
             key_u32 = jax.device_get(rng).astype(jnp.uint32)
             seed_int = (int(key_u32[0]) << 32) ^ int(key_u32[1])
@@ -116,6 +121,20 @@ class NethaxEnv:
             v_state, rng_level = _vendor_draw_prngkey(v_state)
             v_state, rng_char = _vendor_draw_prngkey(v_state)
             v_state, rng_monsters = _vendor_draw_prngkey(v_state)
+
+            # Byte-replay wire-up — pre-draw dungeon-gen scalars from ISAAC64
+            # so the room count and monster count match vendor C output for
+            # the same seed.  Vendor mklev.c::makerooms uses rn2(5)+5 (5..9)
+            # for the per-level room target; mklev.c:804 uses
+            # rnd((nroom >> 1) + 1) for monster count.  Both bottom out in
+            # ``isaac64_next_uint64() % x`` (rnd.c rn2/rnd, USE_ISAAC64 path).
+            v_state, room_target = _vendor_rng.rn2(v_state, 5)
+            n_rooms_vendor = int(room_target) + 5   # rn2(5)+5 → 5..9 inclusive
+            # rnd(N) == rn2(N) + 1; upper bound is ((n_rooms_vendor>>1)+1).
+            mc_upper = max((n_rooms_vendor >> 1) + 1, 1)
+            v_state, mc_roll = _vendor_rng.rn2(v_state, mc_upper)
+            n_monsters_vendor = max(min(int(mc_roll) + 1, 5), 1)
+
             state = state.replace(vendor_rng=v_state)
 
         # Apply character creation (stats, inventory, AC)
@@ -147,6 +166,7 @@ class NethaxEnv:
             flat_lv=0,
             depth=1,
             player_align=int(alignment),
+            n_rooms=n_rooms_vendor,
         )
         state = state.replace(
             terrain=state.terrain.at[0, 0].set(terrain),
@@ -156,7 +176,9 @@ class NethaxEnv:
         )
 
         # Populate level 1 with monsters after dungeon gen.
-        state = populate_level_with_monsters(state, rng_monsters, n_monsters=5)
+        state = populate_level_with_monsters(
+            state, rng_monsters, n_monsters=n_monsters_vendor,
+        )
 
         # Spawn starting pet adjacent to player — vendor/nethack/src/u_init.c::makedog.
         # Host-side (reset is not jit-compiled), so Python loops are fine.
