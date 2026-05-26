@@ -391,6 +391,31 @@ def _step_impl(state, action, rng):
         #    zero.  Wave 47g scaffolding.
         ns = _tick_occupation(ns)
 
+        # 4a3. Ball-as-trap-escape (vendor ball.c::drop_ball lines 882-961).
+        # When the hero is punished AND in a trap, vendor's drop_ball
+        # mechanic lets the iron ball "drop" forcefully and break the
+        # trap with a 1/4 chance per turn.  Per vendor:927-953 the ball
+        # can break a bear trap, dispel a web, or fill in a pit when it
+        # lands on the player's tile.
+        from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS_ball
+        rng_ball_esc, _rng_after = jax.random.split(jax.random.fold_in(rng_status, jnp.int32(0xBA77)), 2)
+        _ball_roll = jax.random.randint(rng_ball_esc, (), 0, 4, dtype=jnp.int32)
+        _can_drop_escape = ns.is_punished & ns.player_in_trap & (_ball_roll == jnp.int32(0))
+        # On successful drop-escape: clear trap; ball lands at player.
+        ns = ns.replace(
+            player_in_trap=jnp.where(_can_drop_escape, jnp.bool_(False), ns.player_in_trap),
+            player_trap_timer=jnp.where(_can_drop_escape, jnp.int16(0), ns.player_trap_timer),
+            ball_pos=jnp.where(_can_drop_escape, ns.player_pos, ns.ball_pos),
+            ball_thrown_pos=jnp.where(_can_drop_escape, ns.player_pos, ns.ball_thrown_pos),
+            ball_thrown_turns=jnp.where(_can_drop_escape, jnp.int8(1), ns.ball_thrown_turns),
+        )
+        # Decay the ball_thrown_turns counter for landed projectiles.
+        ns = ns.replace(
+            ball_thrown_turns=jnp.maximum(
+                ns.ball_thrown_turns - jnp.int8(1), jnp.int8(0)
+            ).astype(jnp.int8),
+        )
+
         # 4a. Experience-level check — vendor exper.c::newexplevel called from
         #    allmain.c (after nh_timeout / before the next turn).  Promotes
         #    ulevel when uexp crosses the next newuexp(ulevel) threshold.
