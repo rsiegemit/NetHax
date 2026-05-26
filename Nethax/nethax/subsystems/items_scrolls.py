@@ -1059,29 +1059,28 @@ def _effect_create_monster(state, rng, buc):
     ``1 + ((confused || scursed) ? 12 : 0)`` at line 1615).
 
     Monster type selected level-appropriately using _MONSTER_GEN_LEVEL
-    (same table as items_wands._effect_create_monster).  Each monster is
-    placed in the first dead MonsterAIState slot, at a position adjacent to
-    the player (clipped to map bounds).  hp = hp_max = level * 8 proxy.
+    (same table as items_wands._effect_create_monster).  Each spawn is routed
+    through ``dungeon.spawning.makemon`` (vendor mon.c::makemon lines 1147+)
+    so the new slot picks up the full per-species data fan-out (HP via
+    ``newmonhp``, AC, primary-attack dice, mongets inventory kit, peaceful
+    default) instead of the prior hp-proxy shortcut.
 
     JIT-pure via lax.fori_loop.
     """
     from Nethax.nethax.subsystems.items_wands import _MONSTER_GEN_LEVEL
+    from Nethax.nethax.dungeon.spawning import makemon as _makemon
 
     confused = state.status.timed_statuses[int(TimedStatus.CONFUSION)] > jnp.int32(0)
     cursed   = _is_cursed(buc)
     n_spawn  = jnp.where(confused | cursed, jnp.int32(13), jnp.int32(1))
 
-    mai     = state.monster_ai
-    n_slots = mai.alive.shape[0]
     map_h, map_w = state.terrain.shape[2], state.terrain.shape[3]
-    b   = state.dungeon.current_branch.astype(jnp.int32)
-    lv  = state.dungeon.current_level.astype(jnp.int32) - 1
     pr  = state.player_pos[0].astype(jnp.int32)
     pc  = state.player_pos[1].astype(jnp.int32)
     max_gen = state.dungeon.current_level.astype(jnp.int32) + jnp.int32(3)
 
     def _spawn_one(i, carry):
-        mai_c, rng_c = carry
+        st_c, rng_c = carry
 
         # Sample a level-appropriate monster type (rejection via lax.while_loop).
         def _bad_type(ws):
@@ -1099,33 +1098,21 @@ def _effect_create_monster(state, rng, buc):
         rng_c, _, mtype = lax.while_loop(_bad_type, _resample,
                                           (rng_c, jnp.int32(0), init_t))
 
-        # Find first dead slot (skip slot 0 sentinel).
-        dead_mask = (~mai_c.alive).at[0].set(False)
-        slot = jnp.argmax(dead_mask).astype(jnp.int32)
-
         # Random adjacent position.
         rng_c, sr, sc = jax.random.split(rng_c, 3)
         new_r = jnp.clip(pr + jax.random.randint(sr, (), -1, 2, dtype=jnp.int32),
-                         0, map_h - 1).astype(jnp.int16)
+                         0, map_h - 1).astype(jnp.int32)
         new_c = jnp.clip(pc + jax.random.randint(sc, (), -1, 2, dtype=jnp.int32),
-                         0, map_w - 1).astype(jnp.int16)
-        new_pos = jnp.array([new_r, new_c], dtype=jnp.int16)
+                         0, map_w - 1).astype(jnp.int32)
+        new_pos = jnp.array([new_r, new_c], dtype=jnp.int32)
 
-        # hp proxy: level * 8.
-        mon_level = _MONSTER_GEN_LEVEL[mtype].astype(jnp.int32)
-        hp_val    = jnp.maximum(mon_level * jnp.int32(8), jnp.int32(1))
+        # Route through vendor-parity makemon helper.
+        rng_c, sub_mk = jax.random.split(rng_c)
+        st_c, _slot, _ok = _makemon(st_c, sub_mk, mtype, new_pos)
+        return (st_c, rng_c)
 
-        new_mai = mai_c.replace(
-            alive=mai_c.alive.at[slot].set(jnp.bool_(True)),
-            pos=mai_c.pos.at[slot].set(new_pos),
-            entry_idx=mai_c.entry_idx.at[slot].set(mtype.astype(jnp.int16)),
-            hp=mai_c.hp.at[slot].set(hp_val.astype(jnp.int32)),
-            hp_max=mai_c.hp_max.at[slot].set(hp_val.astype(jnp.int32)),
-        )
-        return (new_mai, rng_c)
-
-    new_mai, _ = lax.fori_loop(0, n_spawn, _spawn_one, (mai, rng))
-    return state.replace(monster_ai=new_mai)
+    new_state, _ = lax.fori_loop(0, n_spawn, _spawn_one, (state, rng))
+    return new_state
 
 
 def _effect_taming(state, rng, buc):

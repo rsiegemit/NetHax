@@ -916,3 +916,148 @@ def populate_level_with_monsters(
         jnp.arange(n_monsters, dtype=jnp.int32),
     )
     return state_final
+
+
+# ---------------------------------------------------------------------------
+# makemon() — runtime monster spawn (vendor src/mon.c::makemon lines 1147+)
+# ---------------------------------------------------------------------------
+#
+# Vendor reference:
+#   vendor/nethack/src/makemon.c::makemon  (lines 1147-1400) — find a slot,
+#     allocate a struct monst, set_mon_data(), newmonhp(), place_monster(),
+#     mongets() per-class inventory.
+#   vendor/nethack/src/makemon.c::newmonhp (lines 1012-1054) — HP roll;
+#     d(m_lev, 8) with rnd(4) for m_lev==0 plus the "all-ones boost".
+#   vendor/nethack/src/makemon.c::mongets  (lines 2181-2230) — per-class
+#     starter inventory; here delegated to the per-entry kit table built at
+#     module load (_MONSTER_KIT_BY_ENTRY + _KIT_*).
+#
+# JAX-required divergence:
+#   * Slot lookup uses ``argmax(~alive)`` (first dead slot).  Vendor allocates
+#     a fresh ``struct monst`` from a free pool; we work over the fixed
+#     MAX_MONSTERS_PER_LEVEL array.  Slot 0 is the sentinel and is excluded.
+#   * No goodpos()/enexto_core() fallback — caller supplies a position that
+#     is already vetted (scroll/wand handlers clip to map bounds).  If the
+#     tile is occupied or out of bounds the spawn is suppressed and the
+#     returned ``success`` flag is False.
+#   * MM_* flags (MM_ANGRY, MM_ASLEEP, MM_FEMALE, MM_NOCOUNTBIRTH, etc.) are
+#     not modeled at this entry point — callers wanting non-default state
+#     should patch the returned slot manually (mirrors vendor postprocessing
+#     after the makemon() call returns).
+# ---------------------------------------------------------------------------
+
+def makemon(state, rng: jax.Array, entry_idx: jnp.ndarray,
+            pos: jnp.ndarray) -> tuple:
+    """Spawn one monster of species ``entry_idx`` at ``pos`` on the current level.
+
+    Parameters
+    ----------
+    state:     EnvState.
+    rng:       JAX PRNG key.
+    entry_idx: int — species index into the MONSTERS table.  Clipped to
+               [0, NUMMONS).  Caller is responsible for any G_NOGEN / G_UNIQ
+               / genocide filtering (vendor makemon.c lines 1202-1232).
+    pos:       int[2] (row, col) — where to place the spawn.
+
+    Returns
+    -------
+    (new_state, slot_idx, success)
+        new_state: EnvState with the chosen slot populated; identical to
+                   ``state`` when no dead slot is available.
+        slot_idx:  int32 — index of the populated slot (or 0 if !success).
+        success:   bool — False if no dead slot was found.
+
+    Vendor: mon.c::makemon lines 1147-1400; HP via newmonhp lines 1012-1054;
+    inventory via mongets lines 2181-2230 (delegated to _MONSTER_KIT_BY_ENTRY).
+    """
+    mai = state.monster_ai
+    eidx = jnp.clip(entry_idx.astype(jnp.int32), 0, NUMMONS - 1)
+
+    # Slot 0 is reserved as a sentinel by the level-fill path; exclude it
+    # so freshly-allocated runtime spawns don't clobber the empty-marker.
+    dead_mask = (~mai.alive).at[0].set(False)
+    has_dead = jnp.any(dead_mask)
+    slot = jnp.argmax(dead_mask.astype(jnp.int32)).astype(jnp.int32)
+
+    # ---- HP roll — vendor newmonhp (makemon.c:1012-1054) ----
+    # Uses MONSTR_DIFFICULTIES as m_lev proxy (vendor mons[i].difficulty
+    # tracks dungeon-curve hit dice; same field _roll_hp consumes).
+    m_lev = MONSTR_DIFFICULTIES[eidx].astype(jnp.int32)
+    new_hp = _roll_hp(rng, m_lev)
+
+    # ---- Per-class inventory — vendor mongets (makemon.c:2181-2230) ----
+    kit_id = _MONSTER_KIT_BY_ENTRY[eidx].astype(jnp.int32)
+    kit_cats = _KIT_CATS[kit_id]
+    kit_tids = _KIT_TIDS[kit_id]
+    kit_qtys = _KIT_QTYS[kit_id]
+    kit_chgs = _KIT_CHGS[kit_id]
+
+    row16 = pos[0].astype(jnp.int16)
+    col16 = pos[1].astype(jnp.int16)
+    new_pos = jnp.stack([row16, col16])
+
+    # Conditional writes gated on (has_dead AND in-bounds).  No goodpos()
+    # check; caller-supplied positions are trusted (see header note).
+    pr = pos[0].astype(jnp.int32)
+    pc = pos[1].astype(jnp.int32)
+    h = state.terrain.shape[2]
+    w = state.terrain.shape[3]
+    in_bounds = (pr >= 0) & (pr < h) & (pc >= 0) & (pc < w)
+    do_spawn = has_dead & in_bounds
+
+    def _apply(mai_in):
+        new_alive  = mai_in.alive.at[slot].set(jnp.bool_(True))
+        new_pos_a  = mai_in.pos.at[slot].set(new_pos)
+        new_hp_a   = mai_in.hp.at[slot].set(new_hp.astype(jnp.int32))
+        new_hpmx   = mai_in.hp_max.at[slot].set(new_hp.astype(jnp.int32))
+        new_entry  = mai_in.entry_idx.at[slot].set(eidx.astype(jnp.int16))
+        new_mlev   = mai_in.m_lev.at[slot].set(m_lev.astype(jnp.int16))
+        new_ac     = mai_in.ac.at[slot].set(_BASE_AC[eidx])
+        new_isl    = mai_in.is_large.at[slot].set(_IS_LARGE[eidx])
+        new_atkn   = mai_in.attack_dice_n.at[slot].set(_ATK_DICE_N[eidx].astype(jnp.int8))
+        new_atks   = mai_in.attack_dice_sides.at[slot].set(_ATK_DICE_S[eidx].astype(jnp.int8))
+        # peaceful defaults to False (vendor MM_ANGRY-style default for the
+        # runtime spawn path; scroll-of-create-monster + summons are hostile).
+        new_peace  = mai_in.peaceful.at[slot].set(jnp.bool_(False))
+        new_tame   = mai_in.tame.at[slot].set(jnp.bool_(False))
+        new_resists = mai_in.resists.at[slot].set(
+            jnp.take(_MONSTER_MRESISTS, eidx, axis=0).astype(jnp.int32))
+        new_undead = mai_in.undead.at[slot].set(
+            jnp.take(_MONSTER_UNDEAD, eidx, axis=0).astype(jnp.bool_))
+        new_nonliv = mai_in.nonliving.at[slot].set(
+            jnp.take(_MONSTER_NONLIVING, eidx, axis=0).astype(jnp.bool_))
+        new_mp     = mai_in.movement_points.at[slot].set(jnp.int16(12))
+        # Mongets inventory kit.
+        new_ic = mai_in.inv_category.at[slot].set(kit_cats)
+        new_it = mai_in.inv_type_id.at[slot].set(kit_tids)
+        new_iq = mai_in.inv_quantity.at[slot].set(kit_qtys)
+        new_ich = mai_in.inv_charges.at[slot].set(kit_chgs)
+        # Strategy resets so the new spawn picks a hunt target next tick.
+        new_strat = mai_in.mstrategy.at[slot].set(jnp.int8(0))
+        return mai_in.replace(
+            alive=new_alive,
+            pos=new_pos_a,
+            hp=new_hp_a,
+            hp_max=new_hpmx,
+            entry_idx=new_entry,
+            m_lev=new_mlev,
+            ac=new_ac,
+            is_large=new_isl,
+            attack_dice_n=new_atkn,
+            attack_dice_sides=new_atks,
+            peaceful=new_peace,
+            tame=new_tame,
+            resists=new_resists,
+            undead=new_undead,
+            nonliving=new_nonliv,
+            movement_points=new_mp,
+            inv_category=new_ic,
+            inv_type_id=new_it,
+            inv_quantity=new_iq,
+            inv_charges=new_ich,
+            mstrategy=new_strat,
+        )
+
+    new_mai = jax.lax.cond(do_spawn, _apply, lambda m: m, mai)
+    new_state = state.replace(monster_ai=new_mai)
+    return new_state, slot, do_spawn
