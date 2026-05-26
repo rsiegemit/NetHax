@@ -50,6 +50,173 @@ def _lava_avoid_reward_manager() -> RewardManager:
 
 
 # ---------------------------------------------------------------------------
+# Vendor-equivalent skill RewardManager factories.
+#
+# Each helper mirrors the RM constructed in
+# ``vendor/minihack/minihack/envs/skills_simple.py`` (etc.) for the same env.
+# These envs are *not* sparse stairs-down — vendor pays the +1 on the targeted
+# event (eat apple / wield dagger / amulet message / float-up message / ...).
+# Using the default sparse RM here means a pre-trained agent that learned the
+# correct skill behavior on vendor MiniHack would receive no reward in Minihax.
+# ---------------------------------------------------------------------------
+def _skill_eat_rm() -> RewardManager:
+    """Vendor: reward_manager.add_eat_event("apple")."""
+    rm = RewardManager()
+    rm.add_eat_event(
+        "apple",
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
+def _skill_wield_rm() -> RewardManager:
+    """Vendor: reward_manager.add_wield_event("dagger")."""
+    rm = RewardManager()
+    rm.add_wield_event(
+        "dagger",
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
+def _skill_wear_rm() -> RewardManager:
+    """Vendor: reward_manager.add_wear_event("robe")."""
+    rm = RewardManager()
+    rm.add_wear_event(
+        "robe",
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
+def _skill_amulet_rm() -> RewardManager:
+    """Vendor (PutOn): reward_manager.add_amulet_event()."""
+    rm = RewardManager()
+    rm.add_amulet_event(
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
+def _skill_zap_rm() -> RewardManager:
+    """Vendor: reward_manager.add_message_event(["The feeling subsides."])."""
+    rm = RewardManager()
+    rm.add_message_event(
+        ["The feeling subsides."],
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
+def _skill_read_rm() -> RewardManager:
+    """Vendor: reward_manager.add_message_event(["This scroll seems to be blank."])."""
+    rm = RewardManager()
+    rm.add_message_event(
+        ["This scroll seems to be blank."],
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
+def _skill_pray_rm() -> RewardManager:
+    """Vendor: reward_manager.add_positional_event("altar", "pray")."""
+    rm = RewardManager()
+    rm.add_positional_event(
+        "altar", "pray",
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
+def _skill_sink_rm() -> RewardManager:
+    """Vendor: reward_manager.add_positional_event("sink", "quaff")."""
+    rm = RewardManager()
+    rm.add_positional_event(
+        "sink", "quaff",
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
+# Vendor levitation message list (skills_levitate.py:7-13).
+_LEVITATION_MSGS = [
+    "You float up",
+    "You start to float in the air",
+    "Up, up, and awaaaay!",
+    "a ring of levitation (on left hand)",
+    "a ring of levitation (on right hand)",
+]
+
+
+def _skill_levitate_rm() -> RewardManager:
+    """Vendor: reward_manager.add_message_event(levitation_msg)."""
+    rm = RewardManager()
+    rm.add_message_event(
+        list(_LEVITATION_MSGS),
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
+# Vendor freeze message list (skills_freeze.py:6-8).
+_FREEZE_MSGS = ["The bolt of cold bounces!"]
+
+
+def _skill_freeze_rm() -> RewardManager:
+    """Vendor: reward_manager.add_message_event(freeze_msgs)."""
+    rm = RewardManager()
+    rm.add_message_event(
+        list(_FREEZE_MSGS),
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
+def _exploremaze_rm() -> RewardManager:
+    """Vendor ExploreMaze: shaping via add_eat_event("apple") plus stairs_down.
+
+    Vendor scatters apples and pays an eat-event each; the env still terminates
+    on stairs_down.  We mirror by registering both an apple-eat event
+    (repeatable, non-terminal) and the default stairs-down terminal.
+    """
+    rm = RewardManager()
+    rm.add_eat_event(
+        "apple",
+        reward=1.0,
+        repeatable=True,
+        terminal_required=False,
+        terminal_sufficient=False,
+    )
+    rm.add_location_event(
+        "stairs_down",
+        reward=1.0,
+        terminal_sufficient=True,
+        terminal_required=True,
+    )
+    return rm
+
+
+# ---------------------------------------------------------------------------
 # Builder helpers
 # ---------------------------------------------------------------------------
 def _make_factory(builder: Callable[[LevelGenerator], None],
@@ -807,16 +974,21 @@ def _skill_freeze_builder(source: str) -> Callable[[LevelGenerator], None]:
 
 
 def _register_skill_simple_envs(register_fn) -> None:
-    """Eat / Wield / Wear / PutOn / Zap / Read / Pray / Sink — 24 envs."""
+    """Eat / Wield / Wear / PutOn / Zap / Read / Pray / Sink — 24 envs.
+
+    RM per family mirrors vendor ``skills_simple.py``: each env pays its
+    targeted event (eat-apple, wield-dagger, amulet-message, ...), NOT
+    sparse stairs_down.
+    """
     item_specs = [
-        # (basename, item, symbol)
-        ("Wield", "dagger",           ")"),
-        ("Wear",  "leather armor",    "["),
-        ("PutOn", "amulet of life saving", '"'),
-        ("Zap",   "wand of striking", "/"),
-        ("Read",  "scroll of mail",   "?"),
+        # (basename, item, symbol, rm_factory)
+        ("Wield", "dagger",           ")", _skill_wield_rm),
+        ("Wear",  "leather armor",    "[", _skill_wear_rm),
+        ("PutOn", "amulet of life saving", '"', _skill_amulet_rm),
+        ("Zap",   "wand of striking", "/", _skill_zap_rm),
+        ("Read",  "scroll of mail",   "?", _skill_read_rm),
     ]
-    for base, item, symbol in item_specs:
+    for base, item, symbol, rm_factory in item_specs:
         for suffix, distr, fixed in [
             ("",       False, False),
             ("-Fixed", False, True),
@@ -825,7 +997,7 @@ def _register_skill_simple_envs(register_fn) -> None:
             env_id = f"MiniHack-{base}{suffix}-v0"
             builder = _skill_simple_builder(item, symbol, distr, fixed)
             factory = _make_factory(builder, w=5, h=5)
-            register_fn(env_id, factory, _default_goal_reward_manager(),
+            register_fn(env_id, factory, rm_factory(),
                         max_steps=50, category="Skill")
 
     # Eat variants
@@ -837,7 +1009,7 @@ def _register_skill_simple_envs(register_fn) -> None:
         env_id = f"MiniHack-Eat{suffix}-v0"
         builder = _skill_eat_builder(distr, fixed)
         factory = _make_factory(builder, w=5, h=5)
-        register_fn(env_id, factory, _default_goal_reward_manager(),
+        register_fn(env_id, factory, _skill_eat_rm(),
                     max_steps=50, category="Skill")
 
     # Pray variants
@@ -849,7 +1021,7 @@ def _register_skill_simple_envs(register_fn) -> None:
         env_id = f"MiniHack-Pray{suffix}-v0"
         builder = _skill_pray_builder(distr, fixed)
         factory = _make_factory(builder, w=5, h=5)
-        register_fn(env_id, factory, _default_goal_reward_manager(),
+        register_fn(env_id, factory, _skill_pray_rm(),
                     max_steps=50, category="Skill")
 
     # Sink variants
@@ -861,12 +1033,17 @@ def _register_skill_simple_envs(register_fn) -> None:
         env_id = f"MiniHack-Sink{suffix}-v0"
         builder = _skill_sink_builder(distr, fixed)
         factory = _make_factory(builder, w=5, h=5)
-        register_fn(env_id, factory, _default_goal_reward_manager(),
+        register_fn(env_id, factory, _skill_sink_rm(),
                     max_steps=50, category="Skill")
 
 
 def _register_skill_levitate_envs(register_fn) -> None:
-    """9 Levitate envs."""
+    """9 Levitate envs.
+
+    Vendor (``skills_levitate.py:16-19``): RM is
+    ``add_message_event(levitation_msg)`` — reward fires the moment the player
+    starts floating.
+    """
     item_specs = [
         ("Boots",   "levitation boots",      "["),
         ("Ring",    "ring of levitation",    "="),
@@ -878,24 +1055,32 @@ def _register_skill_levitate_envs(register_fn) -> None:
             builder = _skill_levitate_builder(item, symbol,
                                               fixed=(suffix == "-Fixed"))
             factory = _make_factory(builder, w=5, h=5)
-            register_fn(env_id, factory, _default_goal_reward_manager(),
+            register_fn(env_id, factory, _skill_levitate_rm(),
                         max_steps=50, category="Skill")
     # Levitate-Random
     builder = _skill_levitate_builder("random", "/", fixed=False)
     factory = _make_factory(builder, w=5, h=5)
     register_fn("MiniHack-Levitate-Random-Full-v0", factory,
-                _default_goal_reward_manager(),
+                _skill_levitate_rm(),
                 max_steps=50, category="Skill")
 
 
 def _register_skill_freeze_envs(register_fn) -> None:
-    """8 Freeze envs."""
+    """8 Freeze envs.
+
+    Vendor (``skills_freeze.py:11-18``): RM is ``add_message_event(freeze_msgs)``
+    for Wand/Horn/Random.  ``Freeze-Lava-*`` constructs ``MiniHackSkill``
+    without a RM (vendor default = sparse stairs_down), so keep the default
+    here for the Lava variants only.
+    """
     for source in ("Wand", "Horn", "Random", "Lava"):
         for suffix in ("-Full", "-Restricted"):
             env_id = f"MiniHack-Freeze-{source}{suffix}-v0"
             builder = _skill_freeze_builder(source.lower())
             factory = _make_factory(builder, w=5, h=5)
-            register_fn(env_id, factory, _default_goal_reward_manager(),
+            rm = (_default_goal_reward_manager()
+                  if source == "Lava" else _skill_freeze_rm())
+            register_fn(env_id, factory, rm,
                         max_steps=50, category="Skill")
 
 
@@ -958,7 +1143,7 @@ def _register_exploremaze_envs(register_fn) -> None:
     ]
     for env_id, hard in variants:
         factory = _make_factory(_exploremaze_builder(hard), w=22, h=14)
-        register_fn(env_id, factory, _default_goal_reward_manager(),
+        register_fn(env_id, factory, _exploremaze_rm(),
                     max_steps=500, category="ExploreMaze")
 
 
