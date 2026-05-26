@@ -74,12 +74,13 @@ def test_minihack_room_5x5_reset():
     assert info["step_count"] == 0
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(900)
 def test_minihack_room_5x5_step():
     """``env.step`` returns (state, reward, done, info).
 
     Wave34e: first eager call retraces full env.step graph (~200s); bump
     timeout so we aren't killed by the 120s default.
+    Wave43d: 300s→900s — uncached cold-trace can exceed 300s on slower CI.
     """
     env = MinihaxEnv("MiniHack-Room-5x5-v0")
     state, info = env.reset(_rng(1))
@@ -95,12 +96,13 @@ def test_minihack_room_5x5_step():
     assert new_info["step_count"] == 1
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(900)
 def test_minihack_room_5x5_terminal_on_goal():
     """Standing on the stairs_down tile yields reward=1.0 and done=True.
 
     Wave34e: first eager call retraces full env.step graph (~200s); bump
     timeout so we aren't killed by the 120s default.
+    Wave43d: 300s→900s — uncached cold-trace can exceed 300s on slower CI.
     """
     env = MinihaxEnv("MiniHack-Room-5x5-v0")
     state, info = env.reset(_rng(3))
