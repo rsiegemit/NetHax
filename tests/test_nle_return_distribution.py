@@ -50,18 +50,20 @@ if _REPO_ROOT not in sys.path:
 import numpy as np
 
 
-# Action mapping.  NLE's `env.step` takes an INDEX into `env.actions`.
-# Nethax's `env.step` takes the raw ASCII ord.  We keep two parallel
-# tuples so the same logical action draws the same per-step index.
+# Action mapping.  Both NLE and Nethax now accept INDEX-into-env.actions
+# semantics (Nethax via Nethax.nethax.nle_action_map.maybe_remap_action,
+# wired into NethaxEnv.step).  The two tuples remain because Nethax also
+# accepts a raw ASCII ord >= 86 — we still pass index for clarity.
 #
 # NLE action-tuple indices (verified at runtime against
 # nle.nethack.{CompassDirection,MiscDirection,Command}):
 #     N=0, E=1, S=2, W=3, WAIT=18, SEARCH=61
-# Nethax raw ords (vendor cmd.c char codes):
+# Equivalent ASCII ords (vendor cmd.c char codes):
 #     N=ord('k')=107, E=ord('l')=108, S=ord('j')=106, W=ord('h')=104,
 #     WAIT=ord('.')=46, SEARCH=ord('s')=115
+# Note: WAIT=46 (< 86) is ambiguous as ord-vs-index, so we send the index.
 _NLE_ACTION_INDICES = (0, 1, 2, 3, 61, 18)
-_NETHAX_ACTION_ORDS = (107, 108, 106, 104, 115, 46)
+_NETHAX_ACTION_ORDS = (0, 1, 2, 3, 61, 18)  # Same as NLE indices — remapped JIT-side.
 _ACTION_NAMES = ("N", "E", "S", "W", "SEARCH", "WAIT")
 
 

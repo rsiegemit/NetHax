@@ -53,6 +53,7 @@ from Nethax.nethax.subsystems.mplayer import (
 )
 from Nethax.nethax.parity_mode import use_vendor_rng
 from Nethax.nethax import vendor_rng as _vendor_rng
+from Nethax.nethax.nle_action_map import maybe_remap_action as _maybe_remap_action
 
 
 class NethaxEnv:
@@ -464,6 +465,14 @@ def _step_impl(state, action, rng):
         Cite: vendor/nethack/src/light.c::do_light_sources.
     """
     rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow, rng_explvl, rng_regions, rng_astral = jax.random.split(rng, 9)
+    # NLE-action-index → ASCII-ord remap.  An NLE-trained policy emits
+    # ``action`` as an index into ``env.actions`` (86-entry USEFUL_ACTIONS);
+    # Nethax's dispatch table expects the ASCII ord.  ``_maybe_remap_action``
+    # auto-detects: ``action < 86`` → gather from USEFUL_ACTIONS;
+    # ``action >= 86`` → pass through (caller already supplied an ord).
+    # JIT-pure via jnp.where, so it survives jax.jit / vmap.
+    # Cite: vendor/nle/nle/env/base.py:359 — same remap NLE does numpy-side.
+    action = _maybe_remap_action(action)
     already_done = state.done
 
     # Pre-step snapshot: was the Wizard of Yendor alive?  Used to fire
