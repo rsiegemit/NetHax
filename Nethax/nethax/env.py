@@ -216,6 +216,81 @@ class NethaxEnv:
         info: Dict[str, Any] = {}
         return new_state, obs, reward, done, info
 
+    # ----------------------------------------------------------------------
+    # Batched (vmap-parallel) API — Wave 7 RL-scale training entry points.
+    # ----------------------------------------------------------------------
+    # The single-env API (reset/step) operates on one PRNGKey at a time.
+    # ``reset_batched`` / ``step_batched`` wrap the per-env body in
+    # ``jax.vmap`` so 256+ envs can run in lock-step on a single device.
+    #
+    # Status:
+    #   * step_batched     — fully vmap-safe; wraps the JIT-compiled
+    #                        ``_step_impl`` which has no host-side branches.
+    #   * reset_batched    — NOT vmap-safe today.  ``reset`` contains
+    #                        host-side Python (``jax.device_get``,
+    #                        ``np.array``, ``int(...)``, Python ``for``
+    #                        loops in ``_spawn_starting_pet``) that block
+    #                        ``jax.vmap``.  See ``VMAP_GAPS.md`` for the
+    #                        per-site catalogue and the proposed migration
+    #                        path (pure-JAX reset, no .item()/no host loops).
+    #                        For now, ``reset_batched`` runs the per-env
+    #                        reset in a Python loop and stacks the results
+    #                        — correct semantics, but not GPU-parallel.
+    # ----------------------------------------------------------------------
+
+    def step_batched(
+        self,
+        states: EnvState,
+        actions: jax.Array,
+        rngs: jax.Array,
+    ) -> Tuple[EnvState, Dict[str, jax.Array], jax.Array, jax.Array]:
+        """Vectorised step over a leading batch dim B.
+
+        Parameters
+        ----------
+        states  : pytree where every leaf has a leading ``[B, ...]`` axis.
+        actions : int array ``[B]``.
+        rngs    : PRNGKey array ``[B, 2]``.
+
+        Returns
+        -------
+        (new_states, obs, reward, done) — all with a leading B-axis.
+        info is omitted (per-env Python dicts don't vmap; callers can
+        attach metadata after the call).
+        """
+        return jax.vmap(self._step_jit, in_axes=(0, 0, 0))(states, actions, rngs)
+
+    def reset_batched(
+        self,
+        rngs: jax.Array,
+        role: "Role | None" = None,
+        race: "Race | None" = None,
+        alignment: int = 0,
+    ) -> Tuple[EnvState, Dict[str, jax.Array]]:
+        """Batched reset over PRNGKeys ``[B, 2]``.
+
+        See class-level note: full vmap-parallel reset is blocked by
+        host-side code paths in :meth:`reset` (catalogued in
+        ``VMAP_GAPS.md``).  Until that migration lands this routine runs
+        a Python loop over the batch and stacks the results — semantics
+        are correct (every env gets an independent dungeon) but the work
+        is not parallelised across the device.
+        """
+        n = int(rngs.shape[0])
+        per_states = []
+        per_obs = []
+        for i in range(n):
+            s_i, o_i = self.reset(rngs[i], role=role, race=race, alignment=alignment)
+            per_states.append(s_i)
+            per_obs.append(o_i)
+        batched_state = jax.tree_util.tree_map(
+            lambda *xs: jnp.stack(xs, axis=0), *per_states
+        )
+        batched_obs = jax.tree_util.tree_map(
+            lambda *xs: jnp.stack(xs, axis=0), *per_obs
+        )
+        return batched_state, batched_obs
+
 
 def _vendor_draw_prngkey(v_state):
     """Draw a fresh ``jax.random.PRNGKey`` from the ISAAC64 stream.
