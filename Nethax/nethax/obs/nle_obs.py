@@ -1851,10 +1851,18 @@ def build_tty(env_state) -> dict[str, jnp.ndarray]:
 
     JIT-compatible: all operations use jnp.where / at[].set().
     """
-    tty = jnp.zeros((24, 80), dtype=jnp.uint8)
+    # NLE's libtmt virtual terminal initialises every cell to ASCII space
+    # (0x20) — see vendor/nle/src/nle.c::nle_vt_callback (TMT_MSG_UPDATE) and
+    # the TMT default cell init.  Using 0x00 here would make every unwritten
+    # cell byte-mismatch vs NLE.  Cite: TTY_LAYOUT_DIFF.md D1.
+    tty = jnp.full((24, 80), jnp.uint8(ord(' ')), dtype=jnp.uint8)
 
     # --- Row 0: message line ---
+    # message_buffer is zero-padded after the message text; vendor outputs
+    # ASCII space in the tail (terminal default), so rewrite NULs to space.
+    # Cite: TTY_LAYOUT_DIFF.md D2.
     msg = env_state.messages.message_buffer[:80].astype(jnp.uint8)
+    msg = jnp.where(msg == jnp.uint8(0), jnp.uint8(ord(' ')), msg)
     tty = tty.at[0, :].set(msg)
 
     # --- Rows 1-21: map area ---
