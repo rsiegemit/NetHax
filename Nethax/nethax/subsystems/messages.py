@@ -106,6 +106,16 @@ class MessageId(IntEnum):
     ALTAR_LUCK_LOSS      = 35  # pray.c::altar_wrath different-aligned penalty
     SPELL_FIZZLES        = 36  # spell.c:1373 "You fail to cast the spell correctly."
 
+    # Slime per-turn dialogue (vendor/nethack/src/timeout.c::slime_dialogue
+    # lines 380-443).  Five message ticks fire as Slimed counts down from 9
+    # to 1 (i = (Slimed & TIMEOUT) / 2, fires when timer is odd).
+    SLIME_TURNING_COLOR  = 37  # i=4 / t=9  "You are turning a little green."
+    SLIME_LIMBS_OOZY     = 38  # i=3 / t=7  "Your limbs are getting oozy."
+    SLIME_SKIN_PEEL      = 39  # i=2 / t=5  "Your skin begins to peel away."
+    SLIME_TURNING_INTO   = 40  # i=1 / t=3  "You are turning into green slime."
+    LEVI_FLOAT_LOWER     = 41  # timeout.c:348 "You float slightly lower."
+    LEVI_WOBBLE          = 42  # timeout.c:349 "You wobble unsteadily in the air."
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -206,6 +216,12 @@ _MESSAGE_TEMPLATES: tuple[str, ...] = (
     "You feel that you have transgressed.", # 34 ALTAR_WRATH  pray.c::altar_wrath
     "You feel your luck waver.",       # 35 ALTAR_LUCK_LOSS  pray.c::altar_wrath
     "You fail to cast the spell correctly.", # 36 SPELL_FIZZLES spell.c:1373
+    "You are turning a little green.",       # 37 SLIME_TURNING_COLOR timeout.c:381
+    "Your limbs are getting oozy.",          # 38 SLIME_LIMBS_OOZY    timeout.c:382
+    "Your skin begins to peel away.",        # 39 SLIME_SKIN_PEEL     timeout.c:383
+    "You are turning into green slime.",     # 40 SLIME_TURNING_INTO  timeout.c:384
+    "You float slightly lower.",             # 41 LEVI_FLOAT_LOWER    timeout.c:348
+    "You wobble unsteadily in the air.",     # 42 LEVI_WOBBLE         timeout.c:349
 )
 
 

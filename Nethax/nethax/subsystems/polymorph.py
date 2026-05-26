@@ -699,7 +699,8 @@ def _form_ac(form_idx: jnp.ndarray) -> jnp.ndarray:
     return tables["ac"][form_idx.astype(jnp.int32)].astype(jnp.int32)
 
 
-def _form_hp_max(form_idx: jnp.ndarray, rng: jax.Array) -> jnp.ndarray:
+def _form_hp_max(form_idx: jnp.ndarray, rng: jax.Array,
+                 in_endgame: jnp.ndarray = None) -> jnp.ndarray:
     """Return a fresh HP_max roll for the player polymorph form (byte-equal).
 
     vendor/nethack/src/polyself.c:860-870 — polymon u.mhmax computation::
@@ -743,8 +744,21 @@ def _form_hp_max(form_idx: jnp.ndarray, rng: jax.Array) -> jnp.ndarray:
 
     rng_dragon, rng_normal, rng_zero = jax.random.split(rng, 3)
 
-    # Dragon branch: 4*mlvl + d(mlvl, 4)
-    dragon_hp = jnp.int32(4) * mlvl + _dice_sum(rng_dragon, mlvl, jnp.int32(4))
+    # Dragon branch: vendor polyself.c:860-862 —
+    #   u.mhmax = In_endgame ? (8 * mlvl) : (4 * mlvl + d(mlvl, 4));
+    # When in_endgame is passed True (caller decoded from state.dungeon),
+    # dragons get the 8*mlvl deterministic HP; otherwise the random 4*mlvl
+    # + d(mlvl,4) roll.
+    dragon_normal = jnp.int32(4) * mlvl + _dice_sum(rng_dragon, mlvl, jnp.int32(4))
+    if in_endgame is None:
+        dragon_hp = dragon_normal
+    else:
+        endgame_flag = jnp.asarray(in_endgame, dtype=jnp.bool_)
+        dragon_hp = jnp.where(
+            endgame_flag,
+            jnp.int32(8) * mlvl,
+            dragon_normal,
+        )
 
     # Normal branch: mlvl==0 → rnd(4) = 1..4 ; mlvl>0 → d(mlvl, 8)
     rnd4 = (jax.random.randint(rng_zero, (), 0, jnp.int32(4), dtype=jnp.int32)
@@ -1182,7 +1196,9 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool = 
     types, dtyps, nd, ns = _form_attacks(form_i16)
     intr = _form_intrinsics(form_i16)
     rng, sub = jax.random.split(rng)
-    new_hp_max = _form_hp_max(form_i16, sub)
+    # Vendor In_endgame check (polyself.c:861) — Branch.ENDGAME id is 6.
+    in_endgame = state.dungeon.current_branch.astype(jnp.int32) == jnp.int32(6)
+    new_hp_max = _form_hp_max(form_i16, sub, in_endgame=in_endgame)
 
     # poly_timer = rn1(500, 500) → [500, 1000).
     rng, sub2 = jax.random.split(rng)

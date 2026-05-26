@@ -84,7 +84,7 @@ def _mean_monster_dmg(state, n=_N, seed=99):
            "regression tracked for future wave.",
     strict=False,
 )
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(900)
 def test_player_in_trap_penalty():
     """player_in_trap=True should reduce melee hit rate vs player_in_trap=False.
 

@@ -538,6 +538,10 @@ class MonsterAIState:
     inv_quantity:   jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] int16
     inv_charges:    jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] int8
     inv_identified: jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] bool
+    # Wave 47i: monster minvent corpsenm — mirrors Item.corpse_entry_idx.
+    # Used by timer-consumer agents (ROT_CORPSE, REVIVE_MON, ZOMBIFY_MON)
+    # to encode the corpse's source monster type.  -1 sentinel = not a corpse.
+    inv_corpse_entry_idx: jnp.ndarray  # [MAX_MONSTERS_PER_LEVEL, MAX_MONSTER_INV] int16
 
     # ---- Pet hunger counter (vendor dog.c:380 edog.hungrytime) ----
     # Per-slot hunger counter.  Starts at 1000; decrements 1 per turn for
@@ -701,6 +705,9 @@ def make_monster_ai_state() -> MonsterAIState:
         inv_quantity=jnp.zeros(inv_shape, dtype=jnp.int16),
         inv_charges=jnp.zeros(inv_shape, dtype=jnp.int8),
         inv_identified=jnp.zeros(inv_shape, dtype=bool),
+        # Wave 47i: minvent corpsenm sentinel (-1 = not a corpse).  Used
+        # by timer-consumer ROT_CORPSE/REVIVE_MON callbacks.
+        inv_corpse_entry_idx=jnp.full(inv_shape, -1, dtype=jnp.int16),
         pet_hunger=jnp.full(n, 1000, dtype=jnp.int16),
         # Vendor pet hunger model — dogmove.c:362-394
         hungrytime=jnp.full(n, 1000, dtype=jnp.int32),

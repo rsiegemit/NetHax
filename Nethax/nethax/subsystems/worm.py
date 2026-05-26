@@ -294,7 +294,26 @@ def grow_worm(state, slot: jnp.ndarray, current_turn: jnp.ndarray,
     new_worms = worms.replace(
         wgrowtime=worms.wgrowtime.at[s].set(new_grow.astype(jnp.int32)),
     )
-    return _replace_worms(state, new_worms), should_grow
+    state_with_worms = _replace_worms(state, new_worms)
+
+    # Vendor whplimit per-segment HP healing (worm.c:246-252).  Each
+    # growth bumps the worm-head monster's mhp by 1 and mhpmax by 1
+    # (capped at whplimit[count], here approximated by 2*count).  We
+    # use the worm's head_idx (the monster_ai slot of the worm head).
+    head = worms.head_idx[s].astype(jnp.int32)
+    mai = state_with_worms.monster_ai
+    seg_count = worms.seg_count[s].astype(jnp.int32)
+    cap = seg_count * jnp.int32(2)
+    cur_hp = mai.hp[head].astype(jnp.int32)
+    cur_hpmax = mai.hp_max[head].astype(jnp.int32)
+    new_hpmax = jnp.where(should_grow, jnp.minimum(cur_hpmax + jnp.int32(1), cur_hpmax + cap), cur_hpmax)
+    new_hp    = jnp.where(should_grow, jnp.minimum(cur_hp + jnp.int32(1), new_hpmax), cur_hp)
+    new_mai = mai.replace(
+        hp=mai.hp.at[head].set(new_hp.astype(mai.hp.dtype)),
+        hp_max=mai.hp_max.at[head].set(new_hpmax.astype(mai.hp_max.dtype)),
+    )
+    state_with_worms = state_with_worms.replace(monster_ai=new_mai)
+    return state_with_worms, should_grow
 
 
 # ---------------------------------------------------------------------------

@@ -1324,42 +1324,58 @@ def tick_slimed_lethal(env_state):
 
 
 def tick_slime_cancels_stoning(env_state):
-    """Slime-dialogue per-turn side effects: cancel STONED at i==1 and
-    clear intrinsic FAST at i==3.
+    """Slime-dialogue per-turn side effects across the full i={4,3,2,1} ladder.
 
-    Vendor cite: timeout.c::slime_dialogue lines 424-441 —
-        switch (i) {
-        case 3L:  /* limbs becoming oozy */
-            HFast = 0L; /* lose intrinsic speed */
-            ...
-            break;
-        ...
-        case 1L:  /* turning into slime */
-            if (Stoned)
-                make_stoned(0L, (char *) 0, KILLED_BY_AN, (char *) 0);
-            break;
-        }
+    Vendor cite: timeout.c::slime_dialogue lines 380-443.
+      Per-turn message ticks (fire when ``(Slimed & TIMEOUT) % 2 != 0`` and
+      ``i = (Slimed & TIMEOUT) / 2``):
+        i==4 (t==9)  "You are turning a little green."          (no gameplay)
+        i==3 (t==7)  "Your limbs are getting oozy."             + HFast = 0
+        i==2 (t==5)  "Your skin begins to peel away."           + HDeaf = 5
+        i==1 (t==3)  "You are turning into green slime."        + cancel STONED
+      i==0 (t==1) is handled separately by tick_slimed_lethal (done_timeout).
 
-    Vendor's ``i = (Slimed & TIMEOUT) / 2L`` so:
-      i==3 fires when pre-decrement SLIMED ∈ {6, 7}  → clear HFast.
-      i==1 fires when pre-decrement SLIMED ∈ {2, 3}  → cancel stoning.
+    Vendor switch (lines 424-441):
+        case 3L:  HFast = 0L;                            /* lose intrinsic speed */
+        case 2L:  if (0 < HDeaf < 5) set_itimeout(&HDeaf, 5L);
+        case 1L:  if (Stoned) make_stoned(0L, ...);      /* silently cancel */
 
     Runs BEFORE the per-turn timer decrement (i.e. before
     ``_status_step``) so we read the pre-decrement SLIMED value.
     """
+    from Nethax.nethax.subsystems.messages import emit, MessageId
     timers = env_state.status.timed_statuses
     slimed_t = timers[TimedStatus.SLIMED].astype(jnp.int32)
     stoned_t = timers[TimedStatus.STONED].astype(jnp.int32)
+    deaf_t   = timers[TimedStatus.DEAF].astype(jnp.int32)
 
-    # i==1 (slimed t ∈ {2,3}): clear stoning.
+    # i==4 (slimed t ∈ {8,9}): "turning green" message only.
+    slime_at_i4 = (slimed_t == jnp.int32(8)) | (slimed_t == jnp.int32(9))
+    # i==3 (slimed t ∈ {6,7}): "limbs oozy" + clear HFast.
+    slime_at_i3 = (slimed_t == jnp.int32(6)) | (slimed_t == jnp.int32(7))
+    # i==2 (slimed t ∈ {4,5}): "skin peel" + bump HDeaf to 5 when 0<HDeaf<5.
+    slime_at_i2 = (slimed_t == jnp.int32(4)) | (slimed_t == jnp.int32(5))
+    # i==1 (slimed t ∈ {2,3}): "turning into slime" + cancel stoning.
     slime_at_i1 = (slimed_t == jnp.int32(2)) | (slimed_t == jnp.int32(3))
+
+    # Vendor ``i % 2 != 0`` (message fires) maps to ``slimed_t`` being odd.
+    msg_at_i4 = slime_at_i4 & (slimed_t == jnp.int32(9))
+    msg_at_i3 = slime_at_i3 & (slimed_t == jnp.int32(7))
+    msg_at_i2 = slime_at_i2 & (slimed_t == jnp.int32(5))
+    msg_at_i1 = slime_at_i1 & (slimed_t == jnp.int32(3))
+
+    # ---- i==1: cancel stoning ----
     cancel_stone = slime_at_i1 & (stoned_t > jnp.int32(0))
     new_stoned = jnp.where(cancel_stone, jnp.int32(0), stoned_t)
 
-    # i==3 (slimed t ∈ {6,7}): lose intrinsic Fast.  Vendor's
-    # ``HFast = 0L;`` zeros BOTH the timed bits AND the permanent flag;
-    # mirror by clearing intrinsics[FAST] and timed_intrinsics[FAST].
-    slime_at_i3 = (slimed_t == jnp.int32(6)) | (slimed_t == jnp.int32(7))
+    # ---- i==2: bump HDeaf timer to 5 if 0 < HDeaf < 5 ----
+    # Vendor: ``if ((HDeaf & TIMEOUT) > 0L && (HDeaf & TIMEOUT) < 5L)
+    #             set_itimeout(&HDeaf, 5L);``  — extends near-end deafness
+    # so Hear_again's "Your hearing returns." doesn't fire while slime-dying.
+    bump_deaf = slime_at_i2 & (deaf_t > jnp.int32(0)) & (deaf_t < jnp.int32(5))
+    new_deaf = jnp.where(bump_deaf, jnp.int32(5), deaf_t)
+
+    # ---- i==3: clear intrinsic Fast (both flag and timed slot) ----
     clear_fast = slime_at_i3
     intrinsics = env_state.status.intrinsics
     timed_intr = env_state.status.timed_intrinsics
@@ -1375,12 +1391,39 @@ def tick_slime_cancels_stoning(env_state):
     )
 
     new_timers = timers.at[TimedStatus.STONED].set(new_stoned)
+    new_timers = new_timers.at[TimedStatus.DEAF].set(new_deaf.astype(new_timers.dtype))
+
+    # ---- Per-tick messages.  Pick the highest-priority message this turn
+    # (only one of msg_at_i{4,3,2,1} can be true since they're mutually
+    # exclusive on slimed_t).
+    msg_id = jnp.where(
+        msg_at_i4, jnp.int32(int(MessageId.SLIME_TURNING_COLOR)),
+        jnp.where(
+            msg_at_i3, jnp.int32(int(MessageId.SLIME_LIMBS_OOZY)),
+            jnp.where(
+                msg_at_i2, jnp.int32(int(MessageId.SLIME_SKIN_PEEL)),
+                jnp.where(
+                    msg_at_i1, jnp.int32(int(MessageId.SLIME_TURNING_INTO)),
+                    jnp.int32(int(MessageId.NONE)),
+                ),
+            ),
+        ),
+    )
+    any_msg = msg_at_i4 | msg_at_i3 | msg_at_i2 | msg_at_i1
+    new_messages = emit(env_state.messages, msg_id)
+    final_messages = jax.tree.map(
+        lambda new, old: jnp.where(any_msg, new, old),
+        new_messages,
+        env_state.messages,
+    )
+
     return env_state.replace(
         status=env_state.status.replace(
             timed_statuses=new_timers,
             intrinsics=new_intr,
             timed_intrinsics=new_timed_intr,
-        )
+        ),
+        messages=final_messages,
     )
 
 

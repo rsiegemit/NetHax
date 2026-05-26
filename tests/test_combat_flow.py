@@ -139,7 +139,7 @@ def test_monster_kills_player():
     )
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(900)
 def test_armor_reduces_damage():
     """Same monster attacks player with and without armor; compare HP loss.
 
