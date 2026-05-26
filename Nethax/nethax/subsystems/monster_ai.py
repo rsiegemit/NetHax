@@ -129,6 +129,45 @@ _MS_PRIEST: int = 41  # vendor/nethack/include/monflag.h
 _MS_RIDER: int = 35   # vendor/nethack/include/monflag.h
 
 
+def _build_dog_size_nutrit_multiplier_table() -> jnp.ndarray:
+    """Vendor dog_nutrition size→nutrit-multiplier (dogmove.c:172-191).
+
+    msize index → multiplier:
+      MZ_TINY=0   → 8
+      MZ_SMALL=1  → 6
+      MZ_MEDIUM=2 → 5  (also default for unknown sizes)
+      MZ_HUMAN=3  → 5  (treated as MEDIUM via switch fallthrough)
+      MZ_LARGE=4  → 4
+      MZ_HUGE=5   → 3
+      MZ_GIGANTIC=7→ 2
+    Note: vendor MZ enum has MZ_HUMAN=3 between MEDIUM and LARGE in some
+    versions; we treat MZ_HUMAN as MEDIUM (mult=5).  Slot 6 (unused) → 5
+    for safety.
+    Cite: vendor/nethack/src/dogmove.c lines 172-191.
+    """
+    return jnp.array([8, 6, 5, 5, 4, 3, 5, 2], dtype=jnp.int32)
+
+
+_DOG_SIZE_NUTRIT_MULT_TABLE: jnp.ndarray = _build_dog_size_nutrit_multiplier_table()
+
+
+def _build_obj_nutrition_table() -> jnp.ndarray:
+    """Per-otyp oc_nutrition lookup; mirrors objects[otyp].oc_nutrition.
+
+    Used by ``pet_move`` dog_eat path to compute base nutrit before the
+    msize multiplier (vendor dogmove.c:170).
+    Cite: vendor/nethack/include/objects.h FOOD() macros.
+    """
+    from Nethax.nethax.constants.objects import OBJECTS, NUM_OBJECTS
+    vals = [0] * NUM_OBJECTS
+    for i, obj in enumerate(OBJECTS):
+        vals[i] = int(getattr(obj, "nutrition", 0) or 0)
+    return jnp.array(vals, dtype=jnp.int32)
+
+
+_OBJ_NUTRITION_TABLE: jnp.ndarray = _build_obj_nutrition_table()
+
+
 def _build_monster_resists_table() -> jnp.ndarray:
     """Precompute MONSTERS[i].resists_mask as int32[NUMMONS].
 
@@ -3992,6 +4031,17 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
 
     is_weak    = is_pet & (elapsed > jnp.int32(_DOG_WEAK))
     is_starved = is_pet & (elapsed > jnp.int32(_DOG_STARVE))
+    # Vendor dog.c lines 702-708: pet that "would have died as a pet" goes wild
+    # instead of dying.  Condition:
+    #     (svm.moves > edog->hungrytime + 500 && mhp < 3)
+    #  || (svm.moves > edog->hungrytime + 750)   <- covered by is_starved
+    # We model the first clause as ``mhp_starve_revert``: untame the pet
+    # (tame = peaceful = 0) when starving low-HP threshold is crossed.
+    # The vendor "goes wild" semantic = tame=False & peaceful=False; the
+    # next dog_move treats the (formerly tame) slot as a hostile.
+    # Cite: vendor/nethack/src/dog.c::mon_arrive lines 702-708.
+    cur_hp_starve = mai.hp[idx].astype(jnp.int32)
+    mhp_starve_revert = is_pet & (elapsed > jnp.int32(500)) & (cur_hp_starve < jnp.int32(3))
 
     # Apply mhpmax penalty once per transition to WEAK: cut mhpmax to ~1/3,
     # store the diff in mhpmax_penalty, set mconf=1 (cite dogmove.c:370-373).
@@ -4016,6 +4066,11 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
     legacy_starved = is_pet & (new_hunger_val <= jnp.int32(-50))
     final_alive = jnp.where(legacy_starved, jnp.bool_(False), final_alive)
 
+    # Apply mhp<3 starvation untame (vendor dog.c:702-708).  Pet goes wild
+    # (tame=False, peaceful=False) instead of dying.
+    new_tame_starve     = jnp.where(mhp_starve_revert, jnp.bool_(False), mai.tame[idx])
+    new_peaceful_starve = jnp.where(mhp_starve_revert, jnp.bool_(False), mai.peaceful[idx])
+
     mai_h = mai.replace(
         pet_hunger=mai.pet_hunger.at[idx].set(new_hunger),
         hp_max=mai.hp_max.at[idx].set(new_mhpmax),
@@ -4025,6 +4080,8 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
         confuse_timer=mai.confuse_timer.at[idx].set(
             jnp.where(do_weak_apply, jnp.int16(1), mai.confuse_timer[idx])
         ),
+        tame=mai.tame.at[idx].set(new_tame_starve),
+        peaceful=mai.peaceful.at[idx].set(new_peaceful_starve),
     )
     state = state.replace(monster_ai=mai_h)
 
@@ -4057,10 +4114,20 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
     # otyp not exposed cleanly here).
     can_eat = is_pet & is_hungry_legacy & has_food
 
-    # vendor dog_nutrition (dogmove.c:172-213): for FOOD_CLASS,
-    #   nutrit = objects[otyp].oc_nutrition (approx ≈ weight here).
-    food_weight = state.ground_items.weight[b, lv, pr, pc, 0].astype(jnp.int32)
-    nutrit = jnp.maximum(food_weight, jnp.int32(1))
+    # vendor dog_nutrition (dogmove.c:164-192): for FOOD_CLASS,
+    #   nutrit = objects[otyp].oc_nutrition;
+    #   switch (msize) { TINY*=8, SMALL*=6, MEDIUM*=5, LARGE*=4,
+    #                    HUGE*=3, GIGANTIC*=2 }
+    # Cite: vendor/nethack/src/dogmove.c::dog_nutrition lines 164-192.
+    food_tid = state.ground_items.type_id[b, lv, pr, pc, 0].astype(jnp.int32)
+    safe_tid = jnp.clip(food_tid, 0, _OBJ_NUTRITION_TABLE.shape[0] - 1)
+    base_nutrit = _OBJ_NUTRITION_TABLE[safe_tid]
+    pet_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32),
+                         0, _MONSTER_SIZE_TABLE.shape[0] - 1)
+    pet_msize = jnp.clip(_MONSTER_SIZE_TABLE[pet_entry].astype(jnp.int32),
+                         0, _DOG_SIZE_NUTRIT_MULT_TABLE.shape[0] - 1)
+    size_mult = _DOG_SIZE_NUTRIT_MULT_TABLE[pet_msize]
+    nutrit = jnp.maximum(base_nutrit * size_mult, jnp.int32(1))
 
     # vendor dogmove.c:230-231 — clamp hungrytime up to moves first.
     cur_hungrytime = mai.hungrytime[idx].astype(jnp.int32)
@@ -4091,6 +4158,36 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
     # Reset legacy pet_hunger to 1000 on eat (back-compat).
     new_hunger_after_eat = jnp.where(can_eat, jnp.int16(1000), mai.pet_hunger[idx])
 
+    # Apport credit for DOGFOOD reward — vendor dog_eat lines 313-330:
+    #     if (dogfood(mtmp, obj) == DOGFOOD && obj->invlet) {
+    #         edog->apport += (int) (200L / (dropdist + moves - droptime));
+    #         if (edog->apport <= 0) edog->apport = 1;
+    #     }
+    # The ``obj->invlet`` test requires the item to have been in player's
+    # inventory (i.e. dropped/thrown by hero); we approximate via
+    # ``last_drop_turn > 0`` — that flag is set in ``pet_record_drop`` when
+    # the pet drops something near the hero.  For the food-reward case the
+    # hero drops the food, but we wire on the same recorded-drop flag.
+    # Cite: vendor/nethack/src/dogmove.c::dog_eat lines 316-320.
+    has_drop = mai.last_drop_turn[idx] > jnp.int32(0)
+    drop_r = mai.last_drop_pos[idx, 0].astype(jnp.int32)
+    drop_c = mai.last_drop_pos[idx, 1].astype(jnp.int32)
+    ppos_e = state.player_pos.astype(jnp.int32)
+    e_dr = jnp.abs(drop_r - ppos_e[0])
+    e_dc = jnp.abs(drop_c - ppos_e[1])
+    dropdist_e = jnp.maximum(e_dr, e_dc)
+    elapsed_e = jnp.maximum(
+        state.timestep.astype(jnp.int32)
+        - mai.last_drop_turn[idx].astype(jnp.int32),
+        jnp.int32(0),
+    )
+    denom_e = jnp.maximum(dropdist_e + elapsed_e, jnp.int32(1))
+    apport_credit = jnp.int32(200) // denom_e
+    do_apport_credit = can_eat & has_drop
+    cur_apport_e = mai.apport[idx].astype(jnp.int32)
+    bumped_apport = jnp.clip(cur_apport_e + apport_credit, jnp.int32(1), jnp.int32(127))
+    new_apport_e = jnp.where(do_apport_credit, bumped_apport, cur_apport_e).astype(jnp.int8)
+
     mai_e = mai.replace(
         hungrytime=mai.hungrytime.at[idx].set(new_hungrytime),
         hp_max=mai.hp_max.at[idx].set(new_mhpmax_eat),
@@ -4098,6 +4195,7 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
         mtame=mai.mtame.at[idx].set(new_mtame),
         confuse_timer=mai.confuse_timer.at[idx].set(new_confuse_eat),
         pet_hunger=mai.pet_hunger.at[idx].set(new_hunger_after_eat),
+        apport=mai.apport.at[idx].set(new_apport_e),
     )
     new_ground = state.ground_items.replace(category=new_ground_cat)
     state = state.replace(monster_ai=mai_e, ground_items=new_ground)
