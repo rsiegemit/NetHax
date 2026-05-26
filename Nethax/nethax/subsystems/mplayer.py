@@ -32,7 +32,10 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.nethax.rng import rn1, rn2
-from Nethax.nethax.subsystems.monster_ai import MAX_MONSTERS_PER_LEVEL
+from Nethax.nethax.subsystems.monster_ai import (
+    MAX_MONSTER_INV,
+    MAX_MONSTERS_PER_LEVEL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +82,175 @@ _MPLAYER_ENTRIES = jnp.array(
     [pair[0] for pair in MPLAYER_ROLES], dtype=jnp.int16
 )
 _MPLAYER_ALIGNS = jnp.array(_ROLE_ALIGNMENTS, dtype=jnp.int8)
+
+
+# ---------------------------------------------------------------------------
+# Per-role equipment table.  Vendor mk_mplayer (mplayer.c lines 159-313) gives
+# each role a class-typical weapon + armor + occasional tool/potion.  This
+# port uses a fixed deterministic kit per role rather than the vendor's
+# stochastic ``rnd_class`` / ``rn2(N)`` branches: vendor builds a sample then
+# optionally overrides via ``mk_mplayer_armor`` (BUC + enchantment + erosion),
+# but the *categories* of items are deterministic for each role.
+#
+# Categories are ItemCategory values (subsystems/inventory.ItemCategory):
+#   WEAPON = 2, ARMOR = 3, POTION = 8, TOOL = 6.
+# type_ids are OBJECTS-table indices (constants/objects.py) except for POTION
+# slots which use the PotionEffect enum (items_potions.PotionEffect —
+# HEALING=10, WATER=25) so they merge with existing _find_inv_slot lookups
+# in monster_ai.
+#
+# Cite: vendor/nethack/src/mplayer.c lines 159-249 (case PM_*).
+# ---------------------------------------------------------------------------
+_CAT_WEAPON = 2
+_CAT_ARMOR  = 3
+_CAT_TOOL   = 6
+_CAT_POTION = 8
+
+# OBJECTS-table indices (constants/objects.py).
+_OBJ_ARROW              = 1
+_OBJ_YA                 = 5
+_OBJ_DAGGER             = 17
+_OBJ_SCALPEL            = 22
+_OBJ_BATTLE_AXE         = 28
+_OBJ_SHORT_SWORD        = 29   # samurai's wakizashi
+_OBJ_LONG_SWORD         = 37
+_OBJ_TWO_HANDED_SWORD   = 38
+_OBJ_KATANA             = 39
+_OBJ_LANCE              = 46
+_OBJ_MACE               = 56
+_OBJ_CLUB               = 59
+_OBJ_QUARTERSTAFF       = 61
+_OBJ_BULLWHIP           = 64
+_OBJ_BOW                = 65
+_OBJ_YUMI               = 68
+_OBJ_SLING              = 69
+_OBJ_SPLINT_MAIL        = 103
+_OBJ_DWARVISH_MITHRIL   = 105
+_OBJ_STUDDED_LEATHER    = 110
+_OBJ_RING_MAIL          = 111
+_OBJ_LEATHER_ARMOR      = 113
+_OBJ_LEATHER_JACKET     = 114
+_OBJ_HAWAIIAN_SHIRT     = 115
+_OBJ_ROBE               = 122
+_OBJ_CLOAK_OF_MAGIC_RES = 127
+_OBJ_SMALL_SHIELD       = 129
+_OBJ_LOCK_PICK          = 197
+_OBJ_EXPENSIVE_CAMERA   = 204
+_OBJ_TINNING_KIT        = 213
+_OBJ_MAGIC_MARKER       = 217
+_OBJ_PICK_AXE           = 234
+_OBJ_UNICORN_HORN       = 236
+
+# PotionEffect enum values (items_potions.PotionEffect).
+_POT_HEALING = 10
+_POT_WATER   = 25  # holy water variant per vendor priest gear
+
+# Each row is up to MAX_MONSTER_INV (cat, type_id) pairs.  Empty trailing
+# slots have cat == 0 (ItemCategory.NONE).  Index parallel to MPLAYER_ROLES.
+#   archeologist : bullwhip + pick-axe + leather jacket + tinning kit  (4)
+#   barbarian    : two-handed sword + battle-axe + studded leather     (3)
+#   caveman      : club + sling + small shield                          (3)
+#   healer       : unicorn horn + scalpel + potion of healing           (3)
+#   knight       : long sword + lance + ring mail + small shield        (4)
+#   monk         : robe                                                 (1)
+#   priest       : mace + small shield + holy water                     (3)
+#   ranger       : bow + arrow stack + leather armor                    (3)
+#   rogue        : dagger + leather armor + lock pick                   (3)
+#   samurai      : katana + wakizashi + yumi + ya + splint mail         (5)
+#   tourist      : magic marker + expensive camera + Hawaiian shirt     (3)
+#   valkyrie     : long sword + small shield + dwarvish mithril-coat    (3)
+#   wizard       : quarterstaff + cloak of magic resistance + heal pot  (3)
+_ROLE_KITS: tuple[tuple[tuple[int, int], ...], ...] = (
+    # 0 archeologist
+    ((_CAT_WEAPON, _OBJ_BULLWHIP),
+     (_CAT_WEAPON, _OBJ_PICK_AXE),
+     (_CAT_ARMOR,  _OBJ_LEATHER_JACKET),
+     (_CAT_TOOL,   _OBJ_TINNING_KIT)),
+    # 1 barbarian
+    ((_CAT_WEAPON, _OBJ_TWO_HANDED_SWORD),
+     (_CAT_WEAPON, _OBJ_BATTLE_AXE),
+     (_CAT_ARMOR,  _OBJ_STUDDED_LEATHER)),
+    # 2 caveman
+    ((_CAT_WEAPON, _OBJ_CLUB),
+     (_CAT_WEAPON, _OBJ_SLING),
+     (_CAT_ARMOR,  _OBJ_SMALL_SHIELD)),
+    # 3 healer
+    ((_CAT_WEAPON, _OBJ_UNICORN_HORN),
+     (_CAT_WEAPON, _OBJ_SCALPEL),
+     (_CAT_POTION, _POT_HEALING)),
+    # 4 knight
+    ((_CAT_WEAPON, _OBJ_LONG_SWORD),
+     (_CAT_WEAPON, _OBJ_LANCE),
+     (_CAT_ARMOR,  _OBJ_RING_MAIL),
+     (_CAT_ARMOR,  _OBJ_SMALL_SHIELD)),
+    # 5 monk (vendor: robe only; no weapon — martial-arts class)
+    ((_CAT_ARMOR,  _OBJ_ROBE),),
+    # 6 priest
+    ((_CAT_WEAPON, _OBJ_MACE),
+     (_CAT_ARMOR,  _OBJ_SMALL_SHIELD),
+     (_CAT_POTION, _POT_WATER)),
+    # 7 ranger
+    ((_CAT_WEAPON, _OBJ_BOW),
+     (_CAT_WEAPON, _OBJ_ARROW),
+     (_CAT_ARMOR,  _OBJ_LEATHER_ARMOR)),
+    # 8 rogue
+    ((_CAT_WEAPON, _OBJ_DAGGER),
+     (_CAT_ARMOR,  _OBJ_LEATHER_ARMOR),
+     (_CAT_TOOL,   _OBJ_LOCK_PICK)),
+    # 9 samurai
+    ((_CAT_WEAPON, _OBJ_KATANA),
+     (_CAT_WEAPON, _OBJ_SHORT_SWORD),
+     (_CAT_WEAPON, _OBJ_YUMI),
+     (_CAT_WEAPON, _OBJ_YA),
+     (_CAT_ARMOR,  _OBJ_SPLINT_MAIL)),
+    # 10 tourist
+    ((_CAT_TOOL,   _OBJ_MAGIC_MARKER),
+     (_CAT_TOOL,   _OBJ_EXPENSIVE_CAMERA),
+     (_CAT_ARMOR,  _OBJ_HAWAIIAN_SHIRT)),
+    # 11 valkyrie
+    ((_CAT_WEAPON, _OBJ_LONG_SWORD),
+     (_CAT_ARMOR,  _OBJ_SMALL_SHIELD),
+     (_CAT_ARMOR,  _OBJ_DWARVISH_MITHRIL)),
+    # 12 wizard
+    ((_CAT_WEAPON, _OBJ_QUARTERSTAFF),
+     (_CAT_ARMOR,  _OBJ_CLOAK_OF_MAGIC_RES),
+     (_CAT_POTION, _POT_HEALING)),
+)
+
+
+def _build_kit_arrays() -> tuple:
+    """Pack _ROLE_KITS into fixed [N_ROLES, MAX_MONSTER_INV] arrays.
+
+    Returns (cats, type_ids, quantities) where:
+        cats      : int8  [13, MAX_MONSTER_INV]  ItemCategory per slot
+        type_ids  : int16 [13, MAX_MONSTER_INV]  OBJECTS index OR PotionEffect
+        qty       : int16 [13, MAX_MONSTER_INV]  per-slot stack size
+                    (5 for arrows / ya; 1 otherwise — matches vendor's
+                    ``otmp->quan += rn2(8)`` for stackables, capped at the
+                    deterministic mean.)
+    Trailing unused slots are zero-filled (cat=0 ItemCategory.NONE).
+    """
+    n_roles = len(_ROLE_KITS)
+    cats = [[0] * MAX_MONSTER_INV for _ in range(n_roles)]
+    tids = [[0] * MAX_MONSTER_INV for _ in range(n_roles)]
+    qtys = [[0] * MAX_MONSTER_INV for _ in range(n_roles)]
+    for r, kit in enumerate(_ROLE_KITS):
+        for s, (cat, tid) in enumerate(kit):
+            cats[r][s] = cat
+            tids[r][s] = tid
+            # Stack size: arrow/ya = 5 (vendor mean of rn2(8) for projectiles).
+            if cat == _CAT_WEAPON and tid in (_OBJ_ARROW, _OBJ_YA):
+                qtys[r][s] = 5
+            else:
+                qtys[r][s] = 1
+    return (
+        jnp.array(cats, dtype=jnp.int8),
+        jnp.array(tids, dtype=jnp.int16),
+        jnp.array(qtys, dtype=jnp.int16),
+    )
+
+
+_KIT_CATS, _KIT_TIDS, _KIT_QTYS = _build_kit_arrays()
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +323,25 @@ def mk_mplayer(state, rng: jax.Array, role_idx: int, pos: jnp.ndarray):
     new_tame    = mai.tame.at[dead_idx].set(
         jnp.where(should, jnp.bool_(False), mai.tame[dead_idx]))
 
+    # ---- Role-specific equipment (vendor mplayer.c lines 159-313).
+    # Look up the deterministic kit (cat, type_id, quantity) for this role
+    # and write it into the dead slot's inventory row.  When ``should`` is
+    # False (level full), the new row equals the old row.
+    kit_cats = _KIT_CATS[r]   # [MAX_MONSTER_INV] int8
+    kit_tids = _KIT_TIDS[r]   # [MAX_MONSTER_INV] int16
+    kit_qtys = _KIT_QTYS[r]   # [MAX_MONSTER_INV] int16
+
+    old_cats = mai.inv_category[dead_idx]
+    old_tids = mai.inv_type_id[dead_idx]
+    old_qtys = mai.inv_quantity[dead_idx]
+    write_cats = jnp.where(should, kit_cats, old_cats).astype(mai.inv_category.dtype)
+    write_tids = jnp.where(should, kit_tids, old_tids).astype(mai.inv_type_id.dtype)
+    write_qtys = jnp.where(should, kit_qtys, old_qtys).astype(mai.inv_quantity.dtype)
+
+    new_invc = mai.inv_category.at[dead_idx].set(write_cats)
+    new_invt = mai.inv_type_id.at[dead_idx].set(write_tids)
+    new_invq = mai.inv_quantity.at[dead_idx].set(write_qtys)
+
     new_mai = mai.replace(
         alive=new_alive,
         entry_idx=new_entry,
@@ -160,6 +351,9 @@ def mk_mplayer(state, rng: jax.Array, role_idx: int, pos: jnp.ndarray):
         m_lev=new_m_lev,
         peaceful=new_peace,
         tame=new_tame,
+        inv_category=new_invc,
+        inv_type_id=new_invt,
+        inv_quantity=new_invq,
     )
     return state.replace(monster_ai=new_mai)
 

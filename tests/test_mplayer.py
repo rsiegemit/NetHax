@@ -93,6 +93,55 @@ def test_create_mplayers_spawns_three_npcs_with_player_class_entries():
         assert 15 <= int(mai.hp[s]) <= 30
 
 
+def test_mk_mplayer_populates_role_equipment():
+    """Each of the 13 roles spawns with at least one item in its kit.
+
+    Vendor mk_mplayer (mplayer.c lines 159-249) gives each role a class-
+    typical weapon/armor/tool bundle.  This smoke verifies the deterministic
+    core of the kit lands in monster_ai.inv_* arrays.
+    """
+    env = NethaxEnv()
+    state, _ = env.reset(jax.random.PRNGKey(99))
+
+    for role_idx, (entry_idx, name) in enumerate(MPLAYER_ROLES):
+        pos = jnp.array([3, 5], dtype=jnp.int16)
+        s = mk_mplayer(state, jax.random.PRNGKey(100 + role_idx), role_idx, pos)
+        mai = s.monster_ai
+        # Find the slot we just wrote (first slot newly-alive vs original).
+        new_alive = mai.alive & ~state.monster_ai.alive
+        new_slots = jnp.where(new_alive)[0]
+        assert int(new_slots.shape[0]) == 1
+        slot = int(new_slots[0])
+        # At least one inventory slot has a non-NONE category.
+        cats = mai.inv_category[slot]
+        nonempty = int(jnp.sum((cats != 0).astype(jnp.int32)))
+        assert nonempty >= 1, (
+            f"role {name} (idx {role_idx}) spawned with empty inventory"
+        )
+        # Item count bounded by MAX_MONSTER_INV (= 8 in MonsterAIState).
+        assert nonempty <= 8
+
+
+def test_create_mplayers_smoke_three_have_nonempty_inventory():
+    """Spawn 3 random NPCs; each must have a non-empty inventory row.
+
+    Per the task spec smoke test:
+      spawn 3 random NPCs; check they have non-zero inventory.
+    """
+    env = NethaxEnv()
+    state, _ = env.reset(jax.random.PRNGKey(2026))
+    state2 = create_mplayers(state, jax.random.PRNGKey(7), 3)
+    mai = state2.monster_ai
+
+    new_alive = mai.alive & ~state.monster_ai.alive
+    new_slots = jnp.where(new_alive)[0]
+    assert int(new_slots.shape[0]) == 3
+    for s in new_slots.tolist():
+        cats = mai.inv_category[s]
+        nonempty = int(jnp.sum((cats != 0).astype(jnp.int32)))
+        assert nonempty >= 1, f"new mplayer slot {s} has empty inventory"
+
+
 def test_create_mplayers_jit():
     """create_mplayers traces under jit — JIT-purity smoke."""
     env = NethaxEnv()
