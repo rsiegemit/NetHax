@@ -848,12 +848,55 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         state.ball_pos,
     )
 
+    # --- Pool/pit pull-back (vendor ball.c::drag_ball lines 783-826) ---
+    # When the dragged ball lands on POOL/WATER or on a PIT trap, vendor
+    # "jerks the hero back" to the ball's tile and triggers the terrain
+    # effect (drown / fall into pit).  We model this by setting
+    # player_in_water / player_in_trap on the hero (the hero stays at the
+    # new_pos; vendor moves them back, but the in_water/in_trap flag is the
+    # observable consequence).
+    _bp_r = jnp.clip(new_ball_pos[0].astype(jnp.int32), 0, map_h - 1)
+    _bp_c = jnp.clip(new_ball_pos[1].astype(jnp.int32), 0, map_w - 1)
+    _ball_tile = jnp.clip(
+        terrain_2d[_bp_r, _bp_c].astype(jnp.int32),
+        0, _NUM_TILE_TYPES - 1,
+    )
+    _ball_on_water = (
+        (_ball_tile == jnp.int32(int(TileType.WATER)))
+        | (_ball_tile == jnp.int32(int(TileType.POOL)))
+    )
+    _ball_on_trap_tile = (
+        (_ball_tile == jnp.int32(int(TileType.TRAP)))
+        | (_ball_tile == jnp.int32(int(TileType.HIDDEN_TRAP)))
+    )
+    _ball_trap_kind = state.traps.trap_type[flat_lv, _bp_r, _bp_c].astype(jnp.int32)
+    _ball_on_pit = _ball_on_trap_tile & (
+        (_ball_trap_kind == jnp.int32(int(TrapType.PIT)))
+        | (_ball_trap_kind == jnp.int32(int(TrapType.SPIKED_PIT)))
+    )
+    _pullback_active = state.is_punished & moved
+    _pull_water = _pullback_active & _ball_on_water
+    _pull_pit = _pullback_active & _ball_on_pit
+    new_in_water = state.player_in_water | _pull_water
+    new_in_trap = state.player_in_trap | _pull_pit
+    new_trap_type = jnp.where(
+        _pull_pit, jnp.int8(int(TrapType.PIT)), state.player_trap_type
+    )
+    # rn1(4,2) = 2..5 turns held; user spec asks for 4 → use the literal 4.
+    new_trap_timer = jnp.where(
+        _pull_pit, jnp.int16(4), state.player_trap_timer
+    )
+
     state_mid = state.replace(
         player_pos=new_pos,
         features=new_features,
         terrain=new_terrain,
         player_hp=bump_hp,
         ball_pos=new_ball_pos,
+        player_in_water=new_in_water,
+        player_in_trap=new_in_trap,
+        player_trap_type=new_trap_type,
+        player_trap_timer=new_trap_timer,
     )
 
     # --- Trap triggering (trap.c dotrap) ---
