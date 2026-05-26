@@ -2935,8 +2935,19 @@ def handle_throw(state, rng):
     first_weap = jnp.argmax(valid_weap).astype(jnp.int32)
     has_weap = jnp.any(valid_weap)
 
-    slot = jnp.where(has_quiver, quiver, first_weap)
+    fallback_slot = jnp.where(has_quiver, quiver, first_weap)
     can_throw = has_quiver | has_weap
+
+    # NLE multi-key: prefer agent-chosen slot if it's a valid weapon stock.
+    # Cite: vendor/nethack/src/dothrow.c::dothrow calls getobj() for letter.
+    # The direction follow-up (state.pending_action_kind ==
+    # AWAIT_DIRECTION_THEN) is not yet wired here; for now the throw uses
+    # the default east direction even after a multi-key letter consumption.
+    from Nethax.nethax.subsystems.pending_action import resolve_slot
+    chosen = resolve_slot(state, fallback_slot)
+    safe_chosen = jnp.clip(chosen, 0, valid_weap.shape[0] - 1)
+    chosen_is_thrown = valid_weap[safe_chosen]
+    slot = jnp.where(chosen_is_thrown, safe_chosen, fallback_slot).astype(jnp.int32)
 
     def _do_throw(_):
         return thrown_attack(
