@@ -3603,7 +3603,6 @@ def dispatch_action(state, action: jnp.int32, rng: jax.Array):
         action_opens_letter_then_dir_prompt,
         letter_to_slot,
         is_pending,
-        clear_prompt,
     )
 
     action_val = jnp.clip(jnp.int32(action), 0, 255)
@@ -3617,10 +3616,15 @@ def dispatch_action(state, action: jnp.int32, rng: jax.Array):
     # no-op turn that opens the prompt; step 2 carries the slot value.
     pending = is_pending(state)
     slot_from_letter = letter_to_slot(action_val).astype(jnp.int8)
+    # Clear pending_kind/_root but PRESERVE the freshly-decoded slot — the
+    # next handler invocation may want to consult pending_action_slot.
+    # (clear_prompt() unconditionally resets slot=-1, which would overwrite
+    # the value we just stored.)
     state_after_followup = state.replace(
+        pending_action_kind=jnp.int8(0),
+        pending_action_root=jnp.int8(0),
         pending_action_slot=slot_from_letter,
     )
-    state_after_followup = clear_prompt(state_after_followup)
 
     # --- Step B: does this action open a new prompt? ---------------------
     opens_inv = action_opens_inv_letter_prompt(action_val)
