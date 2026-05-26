@@ -96,10 +96,27 @@ class NethaxEnv:
         # long.  We collapse the two PRNGKey words via XOR so a 64-bit seed
         # round-trips deterministically.  Cite: vendor/nle/src/rnd.c
         # ``init_isaac64`` (lines 42-58) and hacklib.c::set_random (854-868).
+        #
+        # Once seeded, re-derive the dungeon-gen / character / monster sub-keys
+        # from the ISAAC64 stream itself rather than from Threefry ``split``.
+        # This is the SHIM step toward byte parity: the downstream consumers
+        # still use ``jax.random.randint`` (so the dungeon-gen call graph and
+        # JIT shape stay intact), but the PRNGKey they read is now a function
+        # of the ISAAC64 output — so the layout, monster placement, and
+        # character rolls become deterministic with respect to the vendor RNG
+        # rather than Threefry.  A truly byte-exact path would replace each
+        # ``randint`` with ``rn2`` and thread ``Isaac64State`` through every
+        # call site; that requires a much larger refactor.  Cite:
+        # vendor/nethack/src/rnd.c (rn2/rnd) under USE_ISAAC64 — every
+        # vendor RNG draw bottoms out in ``isaac64_next_uint64() % x``.
         if use_vendor_rng():
             key_u32 = jax.device_get(rng).astype(jnp.uint32)
             seed_int = (int(key_u32[0]) << 32) ^ int(key_u32[1])
-            state = state.replace(vendor_rng=_vendor_rng.init(seed_int))
+            v_state = _vendor_rng.init(seed_int)
+            v_state, rng_level = _vendor_draw_prngkey(v_state)
+            v_state, rng_char = _vendor_draw_prngkey(v_state)
+            v_state, rng_monsters = _vendor_draw_prngkey(v_state)
+            state = state.replace(vendor_rng=v_state)
 
         # Apply character creation (stats, inventory, AC)
         char_fields = create_character(rng_char, role, race, alignment)
@@ -176,6 +193,30 @@ class NethaxEnv:
         new_state, obs, reward, done = self._step_jit(state, action, rng)
         info: Dict[str, Any] = {}
         return new_state, obs, reward, done, info
+
+
+def _vendor_draw_prngkey(v_state):
+    """Draw a fresh ``jax.random.PRNGKey`` from the ISAAC64 stream.
+
+    Pulls one uint64 via :func:`vendor_rng.next_uint64` and repacks it as the
+    uint32[2] layout JAX's Threefry keys use.  Returns ``(new_v_state, key)``.
+
+    This is the shim glue that lets the existing Threefry-based dungeon-gen
+    consume an ISAAC64-derived seed without rewriting every ``randint``
+    call site.  The downstream PRNG sequence is still Threefry, but its
+    starting point is now a function of the ISAAC64 stream — so the same
+    ISAAC64 seed always produces the same level layout / monster placement,
+    independent of how many Threefry splits happen above the call site.
+
+    Cite: vendor/nethack/src/rnd.c (USE_ISAAC64 path) — every vendor RNG
+    draw bottoms out in ``isaac64_next_uint64()``; we consume one such
+    word per sub-key.
+    """
+    v_state, val = _vendor_rng.next_uint64(v_state)
+    hi = jnp.uint32((int(val) >> 32) & 0xFFFFFFFF)
+    lo = jnp.uint32(int(val) & 0xFFFFFFFF)
+    key = jnp.stack([hi, lo]).astype(jnp.uint32)
+    return v_state, key
 
 
 def _spawn_starting_pet(state, role: Role):
