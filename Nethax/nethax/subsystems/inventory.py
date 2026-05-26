@@ -1390,3 +1390,38 @@ def handle_name(state, rng, slot_idx, name_bytes) -> "object":
     new_user_names = state.inventory.user_names.at[safe_slot].set(name_row)
     new_inv = state.inventory.replace(user_names=new_user_names)
     return state.replace(inventory=new_inv)
+
+
+# ---------------------------------------------------------------------------
+# Helmet classification (vendor do_wear.c::hard_helmet)
+# ---------------------------------------------------------------------------
+# Vendor:  hard_helmet := is_metallic(obj) || is_crackable(obj)
+# Soft (non-protective vs ballfall / digging debris):
+#   71 elven leather helm  (leather)
+#   74 fedora              (cloth)
+#   75 cornuthaum          (cloth, conical hat)
+#   76 dunce cap           (cloth)
+# Hard (protective):
+#   72 orcish helm         (iron)
+#   73 dwarvish iron helm  (iron)
+#   77 dented pot          (metal)
+#   78 helmet              (plumed metal)
+#   79 helm of brilliance  (crystal — crackable)
+#   80 helm of opposite alignment (metal)
+#   81 helm of telepathy   (metal)
+# Cite: vendor/nethack/src/do_wear.c::hard_helmet,
+#       vendor/nethack/include/objects.h HELM() entries 71-81.
+_HARD_HELM_TIDS: tuple = (72, 73, 77, 78, 79, 80, 81)
+
+
+def is_hard_helmet(type_id: jnp.ndarray) -> jnp.ndarray:
+    """Return True if the helmet type_id is metallic/crackable (hard).
+
+    JIT-pure; bool scalar.  Type IDs outside the helmet range return False.
+    """
+    tid = type_id.astype(jnp.int32)
+    result = jnp.bool_(False)
+    for hid in _HARD_HELM_TIDS:
+        result = result | (tid == jnp.int32(hid))
+    return result
+

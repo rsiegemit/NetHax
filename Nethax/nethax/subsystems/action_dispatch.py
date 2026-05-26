@@ -927,6 +927,7 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     # descent while Punished.  Without ball wield/weld tracking, take the
     # safe upper-rate path (no welded-bypass).
     from Nethax.nethax.subsystems.inventory import ArmorSlot as _ArmorSlot
+    from Nethax.nethax.subsystems.inventory import is_hard_helmet as _is_hard_helmet
     descended_punished = descend & state_final.is_punished
     _bf_rng_hit, _bf_rng_dmg, _new_rng3 = jax.random.split(state_final.rng, 3)
     _bf_hit_roll = jax.random.randint(_bf_rng_hit, (), 0, 5, dtype=jnp.int32)
@@ -934,8 +935,15 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     _bf_dmg = (
         jax.random.randint(_bf_rng_dmg, (), 0, 7, dtype=jnp.int32) + jnp.int32(25)
     )  # rn1(7, 25) = uniform[25, 31]
-    _wearing_helm = state_final.inventory.worn_armor[int(_ArmorSlot.HELM)] >= jnp.int8(0)
-    _bf_dmg = jnp.where(_wearing_helm, jnp.int32(3), _bf_dmg)
+    # Vendor: only "hard" helmets (metallic / crackable) reduce dmg to 3.
+    # Leather hats, fedoras, conical hats (cornuthaum / dunce cap) do not
+    # protect.  Per do_wear.c::hard_helmet.
+    _helm_slot = state_final.inventory.worn_armor[int(_ArmorSlot.HELM)]
+    _has_helm = _helm_slot >= jnp.int8(0)
+    _safe_slot = jnp.clip(_helm_slot.astype(jnp.int32), 0, state_final.inventory.items.type_id.shape[0] - 1)
+    _helm_tid = state_final.inventory.items.type_id[_safe_slot]
+    _hard_helm = _has_helm & _is_hard_helmet(_helm_tid)
+    _bf_dmg = jnp.where(_hard_helm, jnp.int32(3), _bf_dmg)
     _bf_dmg = jnp.where(_bf_hits, _bf_dmg, jnp.int32(0))
     _new_hp = jnp.maximum(
         state_final.player_hp - _bf_dmg, jnp.int32(0)
