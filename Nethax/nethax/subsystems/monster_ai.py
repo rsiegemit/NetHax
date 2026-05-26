@@ -4943,7 +4943,10 @@ def _were_change_all(mai, rng: jax.Array):
       * swap ``entry_idx`` to the counterpart (counter_were);
       * heal 1/4 of lost HP (new_were line 127 ``healmon(...)``);
       * if helpless (sleeping / paralyzed), wake immediately and zero the
-        sleep / paralyze timers (new_were lines 120-125).
+        sleep / paralyze timers (new_were lines 120-125);
+      * wake every alive monster within Chebyshev distance 4 of the
+        transformed were's tile — vendor were.c lines 35-38
+        ``wake_nearto(mon->mx, mon->my, 4*4)`` (the were-howl).
     """
     entry = mai.entry_idx.astype(jnp.int32)
     counterpart = jax.vmap(_were_counterpart)(entry)
@@ -4968,6 +4971,23 @@ def _were_change_all(mai, rng: jax.Array):
     new_asleep = jnp.where(transforms, jnp.bool_(False), mai.asleep)
     new_sleep_t = jnp.where(transforms, jnp.int16(0), mai.sleep_timer)
     new_paral_t = jnp.where(transforms, jnp.int16(0), mai.paralyzed_timer)
+
+    # ---- were-howl: wake_nearto(mx, my, 4*4) — vendor were.c lines 35-38 ----
+    # Each transformation wakes every alive monster within Chebyshev
+    # distance 4 of the transforming were's tile.  Pairwise distance
+    # matrix (N x N) keeps the trace shape-static.
+    pos = mai.pos.astype(jnp.int32)                       # (N,2)
+    src_pos = pos[:, None, :]                              # (N,1,2)
+    tgt_pos = pos[None, :, :]                              # (1,N,2)
+    d_rows = jnp.abs(src_pos[..., 0] - tgt_pos[..., 0])
+    d_cols = jnp.abs(src_pos[..., 1] - tgt_pos[..., 1])
+    cheb = jnp.maximum(d_rows, d_cols)                     # (N,N)
+    src_active = transforms[:, None]                       # (N,1)
+    pair_wake = src_active & (cheb <= jnp.int32(4))        # (N,N)
+    woken = jnp.any(pair_wake, axis=0) & mai.alive         # (N,)
+
+    new_asleep  = jnp.where(woken, jnp.bool_(False), new_asleep)
+    new_sleep_t = jnp.where(woken, jnp.int16(0),     new_sleep_t)
 
     return mai.replace(
         entry_idx=new_entry,
