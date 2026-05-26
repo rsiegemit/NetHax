@@ -356,9 +356,17 @@ def _try_step(state, dy: int, dx: int, rng: jax.Array):
     Cite: vendor/nethack/src/hack.c WOUNDED_LEGS movement penalty.
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS
+    from Nethax.nethax.subsystems.occupation import is_occupied as _is_occupied
 
     # VOMITING no-op gate.
     is_vomiting = state.status.timed_statuses[int(_TS.VOMITING)] > jnp.int32(0)
+
+    # Wave 47g: occupation gate.  When the hero is busy with a multi-
+    # turn task (e.g. STEAL_ARM armor undress), all player actions
+    # become no-ops until the occupation completes.  The per-turn
+    # occupation tick (env.py) advances the timer regardless.
+    # Cite: vendor/nethack/src/cmd.c — gm.multi > 0 blocks command input.
+    is_busy = _is_occupied(state)
 
     # WOUNDED_LEGS limp: 30% chance to NOOP the move.
     rng, rng_wl = jax.random.split(rng)
@@ -446,7 +454,7 @@ def _try_step(state, dy: int, dx: int, rng: jax.Array):
     # Any no-op gate → skip movement entirely.
     noop_gate = (
         state.swallow.swallowed | is_vomiting | do_limp
-        | blocked_underwater | blocked_trap
+        | blocked_underwater | blocked_trap | is_busy
     )
 
     # When the trap-escape resolves, clear player_in_trap & trap fields.
