@@ -4398,6 +4398,166 @@ def _were_change_all(mai, rng: jax.Array):
     )
 
 
+# ---------------------------------------------------------------------------
+# were_summon — were-monster summons 1-5 helpers (vendor were.c:140-189)
+# ---------------------------------------------------------------------------
+# Species mapping (MONSTERS table indices verified):
+#   werewolf (21) / human (271)  → wolf=20, warg=23, winter wolf=24
+#   werejackal (15) / human (270) → jackal=12, coyote=14, fox=13
+#   wererat (95) / human (269)    → sewer rat=92, giant rat=93, rabid rat=94
+# Vendor probability per helper:
+#   wolves:    rn2(5) ? WOLF       : (rn2(2) ? WARG       : WINTER_WOLF)
+#   jackals:   rn2(7) ? JACKAL     : (rn2(3) ? COYOTE     : FOX)
+#   rats:      rn2(3) ? SEWER_RAT  : (rn2(3) ? GIANT_RAT  : RABID_RAT)
+
+
+def _pick_were_summon_species(entry: jnp.ndarray, rng: jax.Array) -> jnp.ndarray:
+    """Return the spawned helper's MONSTERS entry index for a were-monster.
+
+    JAX-pure dispatch on ``entry`` (the parent were-monster's entry_idx).
+    """
+    e = entry.astype(jnp.int32)
+    is_werewolf  = (e == jnp.int32(21))  | (e == jnp.int32(271))
+    is_werejack  = (e == jnp.int32(15))  | (e == jnp.int32(270))
+    is_wererat   = (e == jnp.int32(95))  | (e == jnp.int32(269))
+
+    rng_a, rng_b = jax.random.split(rng, 2)
+
+    # Wolves: rn2(5) ? WOLF : (rn2(2) ? WARG : WINTER_WOLF)
+    wolf_pick = jnp.where(
+        jax.random.randint(rng_a, (), 0, 5, dtype=jnp.int32) != jnp.int32(0),
+        jnp.int32(20),  # WOLF
+        jnp.where(
+            jax.random.randint(rng_b, (), 0, 2, dtype=jnp.int32) != jnp.int32(0),
+            jnp.int32(23),  # WARG
+            jnp.int32(24),  # WINTER_WOLF
+        ),
+    )
+    # Jackals: rn2(7) ? JACKAL : (rn2(3) ? COYOTE : FOX)
+    jack_pick = jnp.where(
+        jax.random.randint(rng_a, (), 0, 7, dtype=jnp.int32) != jnp.int32(0),
+        jnp.int32(12),  # JACKAL
+        jnp.where(
+            jax.random.randint(rng_b, (), 0, 3, dtype=jnp.int32) != jnp.int32(0),
+            jnp.int32(14),  # COYOTE
+            jnp.int32(13),  # FOX
+        ),
+    )
+    # Rats: rn2(3) ? SEWER_RAT : (rn2(3) ? GIANT_RAT : RABID_RAT)
+    rat_pick = jnp.where(
+        jax.random.randint(rng_a, (), 0, 3, dtype=jnp.int32) != jnp.int32(0),
+        jnp.int32(92),  # SEWER_RAT
+        jnp.where(
+            jax.random.randint(rng_b, (), 0, 3, dtype=jnp.int32) != jnp.int32(0),
+            jnp.int32(93),  # GIANT_RAT
+            jnp.int32(94),  # RABID_RAT
+        ),
+    )
+    return jnp.where(is_werewolf, wolf_pick,
+           jnp.where(is_werejack, jack_pick,
+           jnp.where(is_wererat,  rat_pick, e)))
+
+
+def _were_summon_attempt(state, rng: jax.Array):
+    """Each adjacent were-monster has a 1/10 chance per turn to summon
+    1..5 species-specific helpers at empty adjacent tiles to the player.
+
+    Vendor cite: mhitu.c lines 987-1015 (1/10 gate) +
+                 were.c::were_summon lines 140-189 (species dispatch).
+    Simplification:
+      - Spawn count = 1..5 (rnd(5)).  Successful placement only if a
+        free slot exists in monster_ai.alive and an adjacent player tile
+        is walkable.  Up to 5 attempts per summon.
+      - No tame/peaceful inheritance (vendor: only when ``yours=True``,
+        which is the player-polymorphed case we don't reach via the
+        monster turn loop).
+      - Spawns share the parent's slot HP and hp_max defaults (vendor
+        makemon randomized; mocked here as 4 to be safe).
+    """
+    mai = state.monster_ai
+    n = mai.pos.shape[0]
+
+    entry = mai.entry_idx.astype(jnp.int32)
+    is_were = (
+        (entry == jnp.int32(15)) | (entry == jnp.int32(21))
+        | (entry == jnp.int32(95)) | (entry == jnp.int32(269))
+        | (entry == jnp.int32(270)) | (entry == jnp.int32(271))
+    )
+    ppos = state.player_pos.astype(jnp.int32)
+    mpos = mai.pos.astype(jnp.int32)
+    dr = jnp.abs(mpos[:, 0] - ppos[0])
+    dc = jnp.abs(mpos[:, 1] - ppos[1])
+    adjacent = jnp.maximum(dr, dc) <= jnp.int32(1)
+
+    keys = jax.random.split(rng, n + 1)
+    gate_keys = keys[:n]
+    spawn_key = keys[n]
+
+    gate_rolls = jax.vmap(
+        lambda k: jax.random.randint(k, (), 0, 10, dtype=jnp.int32)
+    )(gate_keys)
+    triggers = mai.alive & is_were & adjacent & (gate_rolls == jnp.int32(0))
+
+    # Pick the FIRST triggering were-monster this turn (caps to ≤1 summon).
+    any_trigger = jnp.any(triggers)
+    trig_idx = jnp.argmax(triggers.astype(jnp.int32)).astype(jnp.int32)
+    parent_entry = mai.entry_idx[trig_idx].astype(jnp.int32)
+
+    # Determine count of helpers (rnd(5) = 1..5).
+    k1, k2 = jax.random.split(spawn_key, 2)
+    count = jax.random.randint(k1, (), 1, 6, dtype=jnp.int32)
+
+    # Find up to 5 dead slots to spawn into.
+    dead_mask = ~mai.alive
+    # argpartition-style: pick first 5 dead indices.
+    dead_idx_arr = jnp.argsort(jnp.where(dead_mask, jnp.arange(n), jnp.int32(n) + jnp.arange(n)))[:5]
+
+    helper_keys = jax.random.split(k2, 5)
+
+    def _spawn_one(carry, slot_args):
+        st, i = carry
+        helper_slot_idx, key = slot_args
+        will_spawn = any_trigger & (i < count) & dead_mask[helper_slot_idx]
+        species = _pick_were_summon_species(parent_entry, key)
+
+        m = st.monster_ai
+        # Pick a tile adjacent to the player.  Use a static 8-pattern offset
+        # selected by helper-index modulo 8.
+        offsets = jnp.array(
+            [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]],
+            dtype=jnp.int32,
+        )
+        off = offsets[i % jnp.int32(8)]
+        spawn_r = (ppos[0] + off[0]).astype(jnp.int16)
+        spawn_c = (ppos[1] + off[1]).astype(jnp.int16)
+
+        new_pos = jnp.where(
+            will_spawn,
+            jnp.stack([spawn_r, spawn_c]),
+            m.pos[helper_slot_idx],
+        )
+        new_alive = jnp.where(will_spawn, jnp.bool_(True), m.alive[helper_slot_idx])
+        new_entry_v = jnp.where(will_spawn, species.astype(jnp.int16), m.entry_idx[helper_slot_idx])
+        new_hp = jnp.where(will_spawn, jnp.int32(4), m.hp[helper_slot_idx])
+        new_hpmax = jnp.where(will_spawn, jnp.int32(4), m.hp_max[helper_slot_idx])
+
+        new_m = m.replace(
+            pos=m.pos.at[helper_slot_idx].set(new_pos),
+            alive=m.alive.at[helper_slot_idx].set(new_alive),
+            entry_idx=m.entry_idx.at[helper_slot_idx].set(new_entry_v),
+            hp=m.hp.at[helper_slot_idx].set(new_hp),
+            hp_max=m.hp_max.at[helper_slot_idx].set(new_hpmax),
+        )
+        return (st.replace(monster_ai=new_m), i + jnp.int32(1)), None
+
+    (final_state, _), _ = jax.lax.scan(
+        _spawn_one,
+        (state, jnp.int32(0)),
+        (dead_idx_arr, helper_keys),
+    )
+    return final_state
+
+
 def monsters_step_all(state, rng: jax.Array) -> object:
     """Advance all monster slots by one game tick.
 
@@ -4427,6 +4587,12 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     rng, rng_were = jax.random.split(rng)
     mai = _were_change_all(mai, rng_were)
     state = state.replace(monster_ai=mai)
+
+    # ---- Were-summon: 1/10 chance for any adjacent were-monster to call
+    # 1..5 species-specific helpers (vendor mhitu.c:987 + were.c:140-189).
+    rng, rng_summon = jax.random.split(rng)
+    state = _were_summon_attempt(state, rng_summon)
+    mai = state.monster_ai
 
     # ---- Speed-energy accumulation (vendor mon.c::mcalcmove lines 1126-1167) ----
     # Vendor piecewise speed adjust:
