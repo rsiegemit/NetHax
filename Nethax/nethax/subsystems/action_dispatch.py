@@ -1022,7 +1022,105 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     # safe upper-rate path (no welded-bypass).
     from Nethax.nethax.subsystems.inventory import ArmorSlot as _ArmorSlot
     from Nethax.nethax.subsystems.inventory import is_hard_helmet as _is_hard_helmet
+    from Nethax.nethax.subsystems.inventory import (
+        MAX_INVENTORY_SLOTS as _LIT_MAX_INV,
+        MAX_GROUND_STACK as _LIT_MAX_GS,
+    )
     descended_punished = descend & state_final.is_punished
+
+    # --- drag_down inventory litter (vendor ball.c::drag_down lines 986-1031) ---
+    # When the hero descends a HOLE/TRAPDOOR while Punished, vendor calls
+    # litter() (lines 963-983) which loops over the inventory and drops a
+    # subset of items at the descent tile.  Vendor gates each drop on
+    # ``rnd(capacity) <= otmp->owt`` (heavier items more likely to fall).
+    # Simplification (per task spec): 1/4 chance per occupied slot, ball
+    # excluded by virtue of being a phantom slot (state.ball_pos, not in
+    # inventory).  Items land on the descent-tile ground stack, scanning
+    # for the first empty ground slot.
+    _lit_br = state_final.dungeon.current_branch.astype(jnp.int32)
+    _lit_lv = (state_final.dungeon.current_level - jnp.int8(1)).astype(jnp.int32)
+    _lit_r = jnp.clip(state_final.player_pos[0].astype(jnp.int32), 0, map_h - 1)
+    _lit_c = jnp.clip(state_final.player_pos[1].astype(jnp.int32), 0, map_w - 1)
+    _lit_rng_base, _new_rng_lit = jax.random.split(state_final.rng)
+
+    def _litter_body(carry, slot_idx):
+        gi, inv_items = carry
+        # Per-slot roll: 1/4 chance to drop.
+        slot_rng = jax.random.fold_in(_lit_rng_base, slot_idx)
+        roll = jax.random.randint(slot_rng, (), 0, 4, dtype=jnp.int32)
+        slot_occupied = inv_items.category[slot_idx] != jnp.int8(0)
+        do_drop = descended_punished & slot_occupied & (roll == jnp.int32(0))
+
+        # Find first empty ground-stack index on the descent tile.
+        def _find_empty(c, s):
+            found, pos = c
+            cat = gi.category[_lit_br, _lit_lv, _lit_r, _lit_c, s]
+            empty = (cat == jnp.int8(0))
+            pos = jnp.where(~found & empty, s, pos)
+            found = found | empty
+            return (found, pos), None
+        (gs_found, gs_pos), _ = jax.lax.scan(
+            _find_empty,
+            (jnp.bool_(False), jnp.int32(0)),
+            jnp.arange(_LIT_MAX_GS, dtype=jnp.int32),
+        )
+        write = do_drop & gs_found
+        gs_safe = jnp.clip(gs_pos, 0, _LIT_MAX_GS - 1)
+
+        # Copy inventory slot fields into ground stack slot.
+        def _w(g_arr, inv_arr):
+            cur = g_arr[_lit_br, _lit_lv, _lit_r, _lit_c, gs_safe]
+            return g_arr.at[_lit_br, _lit_lv, _lit_r, _lit_c, gs_safe].set(
+                jnp.where(write, inv_arr[slot_idx], cur)
+            )
+
+        new_gi = gi.replace(
+            category    = _w(gi.category,    inv_items.category),
+            type_id     = _w(gi.type_id,     inv_items.type_id),
+            buc_status  = _w(gi.buc_status,  inv_items.buc_status),
+            enchantment = _w(gi.enchantment, inv_items.enchantment),
+            charges     = _w(gi.charges,     inv_items.charges),
+            identified  = _w(gi.identified,  inv_items.identified),
+            quantity    = _w(gi.quantity,    inv_items.quantity),
+            weight      = _w(gi.weight,      inv_items.weight),
+            ac_bonus    = _w(gi.ac_bonus,    inv_items.ac_bonus),
+            is_two_handed = _w(gi.is_two_handed, inv_items.is_two_handed),
+            artifact_idx  = _w(gi.artifact_idx,  inv_items.artifact_idx),
+        )
+
+        # Clear the inventory slot if dropped.
+        def _z(inv_arr, zero_val):
+            return inv_arr.at[slot_idx].set(
+                jnp.where(write, zero_val, inv_arr[slot_idx])
+            )
+        new_inv_items = inv_items.replace(
+            category   = _z(inv_items.category,    jnp.int8(0)),
+            type_id    = _z(inv_items.type_id,     jnp.int16(0)),
+            buc_status = _z(inv_items.buc_status,  jnp.int8(0)),
+            enchantment= _z(inv_items.enchantment, jnp.int8(0)),
+            charges    = _z(inv_items.charges,     jnp.int8(0)),
+            identified = _z(inv_items.identified,  jnp.bool_(False)),
+            quantity   = _z(inv_items.quantity,    jnp.int16(0)),
+            weight     = _z(inv_items.weight,      jnp.int32(0)),
+            ac_bonus   = _z(inv_items.ac_bonus,    jnp.int8(0)),
+            is_two_handed = _z(inv_items.is_two_handed, jnp.bool_(False)),
+            artifact_idx  = _z(inv_items.artifact_idx,  jnp.int8(-1)),
+        )
+
+        return (new_gi, new_inv_items), None
+
+    (_lit_gi, _lit_inv_items), _ = jax.lax.scan(
+        _litter_body,
+        (state_final.ground_items, state_final.inventory.items),
+        jnp.arange(_LIT_MAX_INV, dtype=jnp.int32),
+    )
+    state_final = state_final.replace(
+        ground_items=_lit_gi,
+        inventory=state_final.inventory.replace(items=_lit_inv_items),
+        rng=_new_rng_lit,
+    )
+
+
     _bf_rng_hit, _bf_rng_dmg, _new_rng3 = jax.random.split(state_final.rng, 3)
     _bf_hit_roll = jax.random.randint(_bf_rng_hit, (), 0, 5, dtype=jnp.int32)
     _bf_hits = descended_punished & (_bf_hit_roll != jnp.int32(0))
