@@ -1063,25 +1063,41 @@ def _spit_attack(state, slot: jnp.ndarray, rng: jax.Array):
                   (vendor mksobj BLINDING_VENOM → does_blind path,
                   potion.c::peffects PR_BLINDED branch ~ 25-49 turns)
 
-    Vendor cite: mthrowu.c::spitmm:1016-1077 — venom mksobj + m_throw.
-    Range gate uses Euclidean² (vendor mdistu, hack.h:1531-1532;
-    hacklib.c:672-678) with BOLT_LIM=8 (hack.h:49) → BOLT_LIM*BOLT_LIM=64.
-    See mhitu.c:1795 for the same Euclidean² <= BOLT_LIM*BOLT_LIM idiom on
-    the AD_BLND gaze sibling path.
+    Projectile model: vendor spitmm (mthrowu.c:1016-1077) calls m_throw()
+    along sgn(tbx),sgn(tby) for ``distmin(...)`` steps; m_throw then walks
+    one tile per loop iteration (mthrowu.c:673-826) and is blocked by
+    walls / closed doors via MT_FLIGHTCHECK.  We model the same step walk
+    via _m_throw_ray so that a WALL or CLOSED_DOOR between monster and
+    player absorbs the venom.
+
+    Vendor cite: mthrowu.c::spitmm:1016-1077 — venom mksobj + m_throw;
+                 mthrowu.c::m_throw:572-849 — per-tile walk + flight check.
+    Line-up gate matches vendor m_lined_up / linedup (mthrowu.c:1376-1392,
+    hacklib.c::linedup): same row, same col, or 45-degree diagonal.
     """
     from Nethax.nethax.subsystems.status_effects import Intrinsic, TimedStatus
     mai = state.monster_ai
     idx = slot.astype(jnp.int32)
     mpos = mai.pos[idx].astype(jnp.int32)
     ppos = state.player_pos.astype(jnp.int32)
-    # Euclidean² per vendor mdistu (hack.h:1531-1532, hacklib.c:672-678).
-    dx = mpos[0].astype(jnp.int32) - ppos[0].astype(jnp.int32)
-    dy = mpos[1].astype(jnp.int32) - ppos[1].astype(jnp.int32)
-    dist2 = dx * dx + dy * dy
-    # range2: !monnear ⇔ dist2 >= 3 (mon.c:2476-2483).
-    # Upper bound: BOLT_LIM*BOLT_LIM = 64 (mhitu.c:1795 uses this idiom).
+
+    # Vendor sgn(tbx)/sgn(tby): unit direction toward target.
+    # ppos/mpos use (row, col); col → vendor x-axis, row → vendor y-axis.
+    drow = ppos[0] - mpos[0]
+    dcol = ppos[1] - mpos[1]
+    dx = jnp.sign(dcol).astype(jnp.int32)   # vendor x  (col delta)
+    dy = jnp.sign(drow).astype(jnp.int32)   # vendor y  (row delta)
+
+    # Line-up: along same row, same col, or 45° diagonal.  (Matches
+    # hacklib.c::linedup — tx==x || ty==y || abs(dx)==abs(dy).)
+    abs_row = jnp.abs(drow)
+    abs_col = jnp.abs(dcol)
+    lined_up = (drow == jnp.int32(0)) | (dcol == jnp.int32(0)) | (abs_row == abs_col)
+
+    # Not adjacent (range2 ≡ !monnear), still within spit max range.
+    dist2 = drow * drow + dcol * dcol
     _BOLT_LIM_SQ = jnp.int32(_SPIT_RANGE * _SPIT_RANGE)
-    in_range = (dist2 >= jnp.int32(3)) & (dist2 <= _BOLT_LIM_SQ)
+    in_range = (dist2 >= jnp.int32(3)) & (dist2 <= _BOLT_LIM_SQ) & lined_up
 
     safe_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32), 0, _NUMMONS - 1)
     damn  = _SPIT_DAMN[safe_entry].astype(jnp.int32)
@@ -1112,22 +1128,32 @@ def _spit_attack(state, slot: jnp.ndarray, rng: jax.Array):
             raw_dmg,
         )
 
-        new_hp = jnp.maximum(jnp.int32(0), s.player_hp - gated_dmg)
-        s = s.replace(player_hp=new_hp, done=s.done | (new_hp <= jnp.int32(0)))
-
-        # AD_BLND: apply BLIND timer (rnd(25)+25 per vendor potion.c
-        # PR_BLINDED on blinding venom hit ~lines 1280-1320 in spitmm path).
+        # AD_BLND: blind duration (rnd(25)+25 per vendor potion.c PR_BLINDED
+        # on blinding venom hit ~lines 1280-1320 in spitmm path).
         blind_dur = jax.random.randint(rng_blind, (), 25, 50)
-        timed = s.status.timed_statuses
-        cur_blind = timed[int(TimedStatus.BLIND)]
-        new_blind = jnp.where(
-            is_blnd,
-            jnp.maximum(cur_blind, blind_dur.astype(cur_blind.dtype)),
-            cur_blind,
+
+        def _on_hit(s2):
+            new_hp = jnp.maximum(jnp.int32(0), s2.player_hp - gated_dmg)
+            s2 = s2.replace(
+                player_hp=new_hp,
+                done=s2.done | (new_hp <= jnp.int32(0)),
+            )
+            timed = s2.status.timed_statuses
+            cur_blind = timed[int(TimedStatus.BLIND)]
+            new_blind = jnp.where(
+                is_blnd,
+                jnp.maximum(cur_blind, blind_dur.astype(cur_blind.dtype)),
+                cur_blind,
+            )
+            new_timed = timed.at[int(TimedStatus.BLIND)].set(new_blind)
+            return s2.replace(status=s2.status.replace(timed_statuses=new_timed))
+
+        # Step the venom along (dx, dy) up to _SPIT_RANGE tiles.  The walk
+        # halts on WALL/CLOSED_DOOR so an intervening wall absorbs the spit.
+        new_s, _final_pos, _hit = _m_throw_ray(
+            s, mpos, dx, dy, _SPIT_RANGE, _on_hit,
         )
-        new_timed = timed.at[int(TimedStatus.BLIND)].set(new_blind)
-        new_status = s.status.replace(timed_statuses=new_timed)
-        return s.replace(status=new_status)
+        return new_s
 
     return jax.lax.cond(in_range, _apply, lambda s: s, state)
 
