@@ -116,8 +116,12 @@ def test_status_conditions_burdened(env_and_state):
 
 
 def test_status_conditions_multiple(env_and_state):
-    """Multiple active -> keywords appear in vendor order (Conf, Stun, Hallu,
-    Blind, FoodPois, Ill, Slime, Strngl, Burdened, Stressed, ...)."""
+    """Multiple active -> keywords appear in vendor order.
+
+    Vendor (botl.c::do_statusline2 lines 173-205) emits:
+      Stone, Slime, Strngl, FoodPois, TermIll, <Hunger>, <Encumbrance>,
+      Blind, Deaf, Stun, Conf, Hallu, Lev, Fly, Ride.
+    """
     _, state, _ = env_and_state
     ts = state.status.timed_statuses
     ts = ts.at[int(TimedStatus.CONFUSION)].set(10)
@@ -130,11 +134,11 @@ def test_status_conditions_multiple(env_and_state):
         )
     )
     text = bytes(np.array(build_status_conditions(state2))).decode("ascii").rstrip()
-    # Vendor order: Conf < Hallu < Blind (Stun not active) < Burdened
+    # Vendor order: Burdened (Encumbrance) < Blind < Conf < Hallu.
+    burd_at  = text.find("Burdened")
+    blind_at = text.find("Blind")
     conf_at  = text.find("Conf")
     hallu_at = text.find("Hallu")
-    blind_at = text.find("Blind")
-    burd_at  = text.find("Burdened")
-    assert 0 <= conf_at < hallu_at < blind_at < burd_at, (
+    assert 0 <= burd_at < blind_at < conf_at < hallu_at, (
         f"vendor keyword order broken: {text!r}"
     )

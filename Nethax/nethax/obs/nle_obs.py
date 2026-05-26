@@ -1133,6 +1133,57 @@ def _uint_to_bytes(value, width):
     return jnp.concatenate(chars).astype(jnp.uint8)
 
 
+def _uint_to_bytes_left(value, max_w: int):
+    """Return a uint8[max_w] array of LEFT-aligned digit bytes for ``value``.
+
+    Mirrors vendor printf ``%d`` semantics: writes the integer's decimal digits
+    starting at position 0 (MSB-first), then pads the remainder with ASCII
+    spaces (0x20).  Caller chooses ``max_w`` large enough for the worst-case
+    digit count; trailing spaces emulate vendor ``%-Nd`` width padding.
+
+    Implementation is JIT-safe: digits are extracted MSB-first via a static
+    Python loop bound by ``max_w``; the "right-shift to leading position"
+    step uses a static permutation table built at trace time.
+
+    For ``value == 0`` we emit a single ``'0'`` at position 0 followed by
+    spaces.
+
+    Citation: vendor/nethack/src/botl.c::do_statusline2 uses ``%d`` / ``%-2d``
+    for every numeric field on row 23 — see lines 130, 143, 152, 159.
+    """
+    v = jnp.maximum(jnp.int32(value), jnp.int32(0))
+    # Extract digits LSB-first, then reverse to MSB-first.
+    digit_arrs = []
+    for _ in range(max_w):
+        digit_arrs.append((v % 10).astype(jnp.int32))
+        v = v // 10
+    digit_arrs = digit_arrs[::-1]                          # MSB-first, len=max_w
+    digits = jnp.stack(digit_arrs)                         # int32[max_w]
+
+    # Count leading zero positions (each one becomes a space in MSB-first
+    # right-aligned form).  ``digit_count`` = number of significant digits;
+    # always >= 1 (we always show the units digit for value=0).
+    is_zero = digits == 0
+    # cumulative AND from the left: True while we've only seen zeros so far.
+    leading_zero_mask = jnp.cumprod(is_zero.astype(jnp.int32)) > 0
+    leading_zero_count = jnp.sum(leading_zero_mask.astype(jnp.int32))
+    # If every digit is zero, value==0 → show one digit.
+    digit_count = jnp.maximum(jnp.int32(max_w) - leading_zero_count, jnp.int32(1))
+    # Position of the first significant digit in MSB-first form:
+    first_digit_pos = jnp.int32(max_w) - digit_count       # in [0, max_w-1]
+
+    # Left-shift: for output index i, take digit at index (first_digit_pos + i)
+    # when i < digit_count, else emit space.
+    positions = jnp.arange(max_w, dtype=jnp.int32)
+    src_idx = jnp.clip(first_digit_pos + positions, 0, max_w - 1)
+    shifted_digits = digits[src_idx]
+    is_digit = positions < digit_count
+    chars = jnp.where(is_digit,
+                      _DIGITS[shifted_digits],
+                      jnp.uint8(ord(' ')))
+    return chars.astype(jnp.uint8)
+
+
 # Precomputed static byte sequences for status rows (module-load).
 # Legacy "Player the Adventurer" header — retained as a fallback when the
 # (role, xlevel) -> rank lookup yields no usable title.  Cite: vendor
@@ -1233,10 +1284,17 @@ def _pad_to(arr: jnp.ndarray, n: int) -> jnp.ndarray:
     return jnp.concatenate([arr, jnp.full((n - arr.shape[0],), ord(' '), dtype=jnp.uint8)])
 
 
+_S_SP_S = _str_to_bytes(" S:")
+
+
 def _build_status_row1(env_state, blstats) -> jnp.ndarray:
     """Render row 22 of tty_chars — vendor do_statusline1 format.
 
-    Format: "Player the Adventurer    St:NN Dx:NN Co:NN In:NN Wi:NN Ch:NN  <Align>"
+    Format: "Player the Adventurer    St:NN Dx:NN Co:NN In:NN Wi:NN Ch:NN  <Align>[ S:<score>]"
+
+    The trailing ``" S:<score>"`` field is emitted only when the running
+    score is > 0 — mirrors vendor botl.c lines 93-96 (``#ifdef SCORE_ON_BOTL``
+    + ``if (flags.showscore)``).  See TTY_LAYOUT_DIFF.md D4.
 
     Citation: vendor/nethack/src/botl.c::do_statusline1 (lines 48-98).
     """
@@ -1259,6 +1317,19 @@ def _build_status_row1(env_state, blstats) -> jnp.ndarray:
     # (see Nethax.nethax.obs.strength_format) — fixed 5-byte field so
     # downstream column offsets stay deterministic across the [3..125] range.
     from Nethax.nethax.obs.strength_format import render_strength_bytes
+    # Score-on-botl tail: " S:%ld" gated on score > 0.  Width 7 covers the
+    # vanilla scoring range comfortably; trailing spaces pad the buffer when
+    # the score is shorter or when the score is zero (entire field becomes
+    # spaces).
+    score = blstats[BL_SCORE]
+    score_active = score > jnp.int64(0)
+    score_field = jnp.concatenate([
+        _S_SP_S,
+        _uint_to_bytes_left(score, 7),
+    ])
+    score_blank = jnp.full(score_field.shape, jnp.uint8(ord(' ')), dtype=jnp.uint8)
+    score_bytes = jnp.where(score_active, score_field, score_blank)
+
     parts = [
         header,
         _S_ST,                                       # 3
@@ -1274,6 +1345,7 @@ def _build_status_row1(env_state, blstats) -> jnp.ndarray:
         _S_SP_CH,
         _uint_to_bytes(blstats[BL_CHA], 2),
         align_bytes,
+        score_bytes,
     ]
     row = jnp.concatenate(parts)
     return _pad_to(row, 80)
@@ -1296,47 +1368,82 @@ def _kw_bytes(s: str, width: int) -> jnp.ndarray:
 
 
 # Keywords with leading space; widths chosen to be just long enough.
-_KW_CONF      = _kw_bytes(" Conf",       5)
-_KW_STUN      = _kw_bytes(" Stun",       5)
-_KW_HALLU     = _kw_bytes(" Hallu",      6)
-_KW_BLIND     = _kw_bytes(" Blind",      6)
-_KW_FOODPOIS  = _kw_bytes(" FoodPois",   9)
-_KW_ILL       = _kw_bytes(" Ill",        4)
+_KW_STONE     = _kw_bytes(" Stone",      6)
 _KW_SLIME     = _kw_bytes(" Slime",      6)
 _KW_STRNGL    = _kw_bytes(" Strngl",     7)
+_KW_FOODPOIS  = _kw_bytes(" FoodPois",   9)
+_KW_TERMILL   = _kw_bytes(" TermIll",    8)
+# Hunger keywords — vendor eat.c::hu_stat lines 70-73 (8-char padded names,
+# but printed via ``" %s"`` then ``mungspaces`` collapses trailing pad).  We
+# emit the trimmed names with a leading space to match the post-mungspaces
+# vendor output.
+_KW_HUNGRY    = _kw_bytes(" Hungry",     7)
+_KW_WEAK      = _kw_bytes(" Weak",       5)
+_KW_FAINTING  = _kw_bytes(" Fainting",   9)
+_KW_FAINTED   = _kw_bytes(" Fainted",    8)
+_KW_STARVED   = _kw_bytes(" Starved",    8)
 _KW_BURDENED  = _kw_bytes(" Burdened",   9)
 _KW_STRESSED  = _kw_bytes(" Stressed",   9)
 _KW_STRAINED  = _kw_bytes(" Strained",   9)
 _KW_OVERTAX   = _kw_bytes(" Overtaxed", 10)
 _KW_OVERLOAD  = _kw_bytes(" Overloaded",11)
+_KW_BLIND     = _kw_bytes(" Blind",      6)
+_KW_DEAF      = _kw_bytes(" Deaf",       5)
+_KW_STUN      = _kw_bytes(" Stun",       5)
+_KW_CONF      = _kw_bytes(" Conf",       5)
+_KW_HALLU     = _kw_bytes(" Hallu",      6)
+_KW_LEV       = _kw_bytes(" Lev",        4)
+_KW_FLY       = _kw_bytes(" Fly",        4)
+_KW_RIDE      = _kw_bytes(" Ride",       5)
 
 
 def build_status_conditions(env_state) -> jnp.ndarray:
-    """Vendor-format status-condition keyword tail as a 32-byte uint8 vector.
+    """Vendor-format status-condition keyword tail as a uint8 vector.
 
-    Reads ``env_state.status.timed_statuses`` (TimedStatus enum indices) and
-    ``env_state.status.encumbrance`` (Encumbrance enum value), masks each
-    keyword's bytes to spaces when inactive, concatenates and pads to 32
-    bytes.  Designed to be appended to the row-23 tail in build_tty.
+    Reads ``env_state.status`` (TimedStatus enum, hunger_state, encumbrance,
+    sick_kind) plus ``env_state.player_steed_mid`` for the riding flag, then
+    masks each keyword's bytes to spaces when inactive, concatenates in
+    vendor emit order (botl.c::do_statusline2 lines 173-205):
 
-    Citation: vendor/nethack/src/botl.c::do_statusline2 (lines ~220-249)
+        Stone, Slime, Strngl, FoodPois, TermIll, <Hunger>, <Encumbrance>,
+        Blind, Deaf, Stun, Conf, Hallu, Lev, Fly, Ride.
+
+    Citation: vendor/nethack/src/botl.c::do_statusline2 (lines 173-205)
               where each ``Strcpy(nb = eos(nb), " <KW>")`` is gated by the
-              corresponding ``HConfusion``, ``Blind``, ``Stunned`` ... flag.
+              corresponding ``Stoned``, ``Slimed``, ``Blind`` ... flag.
     """
     # TimedStatus indices (must match status_effects.TimedStatus enum order).
     ts = env_state.status.timed_statuses                         # int32[N]
     is_stun       = ts[0]  > 0   # STUNNED
     is_conf       = ts[1]  > 0   # CONFUSION
     is_blind      = ts[2]  > 0   # BLIND
+    is_deaf       = ts[3]  > 0   # DEAF
     is_sick       = ts[4]  > 0   # SICK
+    is_stone      = ts[5]  > 0   # STONED
     is_strngl     = ts[6]  > 0   # STRANGLED
     is_slime      = ts[9]  > 0   # SLIMED
     is_hallu      = ts[10] > 0   # HALLUCINATION
+    # Levitation / Flying — TimedStatus.LEVITATION_TMP=18, FLYING_TMP=19.
+    is_lev        = ts[18] > 0   # LEVITATION_TMP
+    is_fly        = ts[19] > 0   # FLYING_TMP
 
-    # SICK splits into FoodPois vs Ill based on status.sick_kind.
+    # SICK splits into FoodPois vs TermIll based on status.sick_kind.  Vendor
+    # botl.c lines 180-183 uses ``u.usick_type & SICK_VOMITABLE`` /
+    # ``SICK_NONVOMITABLE``; we model the same split via sick_kind == 1 / 2.
     sick_kind = jnp.int32(env_state.status.sick_kind)
     is_foodpois = is_sick & (sick_kind == 1)
-    is_ill      = is_sick & (sick_kind == 2)
+    is_termill  = is_sick & (sick_kind == 2)
+
+    # Hunger — vendor eat.c::hu_stat (lines 70-73) keyed by u.uhs;
+    # NOT_HUNGRY (1) is the "no condition" sentinel and is skipped per
+    # ``if (u.uhs != NOT_HUNGRY)`` (botl.c:185).
+    hs = jnp.int32(env_state.status.hunger_state)
+    is_satiated = hs == 0
+    is_hungry   = hs == 2
+    is_weak     = hs == 3
+    is_fainting = hs == 4
+    is_fainted  = hs == 5
+    is_starved  = hs == 6
 
     # Encumbrance (Encumbrance enum: 0=UN, 1=BURDENED, 2=STRESSED, 3=STRAINED,
     # 4=OVERTAXED, 5=OVERLOADED).  See status_effects.Encumbrance.
@@ -1347,25 +1454,46 @@ def build_status_conditions(env_state) -> jnp.ndarray:
     is_overtaxed = enc == 4
     is_overload  = enc == 5
 
+    # Riding — vendor botl.c:204 ``if (u.usteed)``.  Nethax stores the
+    # mounted-steed monster id in ``player_steed_mid`` (0 when not riding).
+    is_ride = env_state.player_steed_mid > jnp.uint32(0)
+
     def _mask(kw: jnp.ndarray, active: jnp.ndarray) -> jnp.ndarray:
         """Return kw bytes if active else all spaces, same length as kw."""
         spaces = jnp.full(kw.shape, jnp.uint8(ord(' ')), dtype=jnp.uint8)
         return jnp.where(active, kw, spaces)
 
+    # Vendor order (botl.c::do_statusline2 lines 173-205):
+    #   Stone, Slime, Strngl, FoodPois, TermIll, <Hunger>, <Encumbrance>,
+    #   Blind, Deaf, Stun, Conf, Hallu, Lev, Fly, Ride.
     chunks = [
-        _mask(_KW_CONF,     is_conf),
-        _mask(_KW_STUN,     is_stun),
-        _mask(_KW_HALLU,    is_hallu),
-        _mask(_KW_BLIND,    is_blind),
-        _mask(_KW_FOODPOIS, is_foodpois),
-        _mask(_KW_ILL,      is_ill),
+        _mask(_KW_STONE,    is_stone),
         _mask(_KW_SLIME,    is_slime),
         _mask(_KW_STRNGL,   is_strngl),
+        _mask(_KW_FOODPOIS, is_foodpois),
+        _mask(_KW_TERMILL,  is_termill),
+        # Hunger group — only one active at a time.
+        _mask(_KW_HUNGRY,   is_hungry),
+        _mask(_KW_WEAK,     is_weak),
+        _mask(_KW_FAINTING, is_fainting),
+        _mask(_KW_FAINTED,  is_fainted),
+        _mask(_KW_STARVED,  is_starved),
+        # SATIATED is also emitted by vendor via hu_stat[0]="Satiated".
+        _mask(_kw_bytes(" Satiated", 9), is_satiated),
+        # Encumbrance group — only one active at a time.
         _mask(_KW_BURDENED, is_burdened),
         _mask(_KW_STRESSED, is_stressed),
         _mask(_KW_STRAINED, is_strained),
         _mask(_KW_OVERTAX,  is_overtaxed),
         _mask(_KW_OVERLOAD, is_overload),
+        _mask(_KW_BLIND,    is_blind),
+        _mask(_KW_DEAF,     is_deaf),
+        _mask(_KW_STUN,     is_stun),
+        _mask(_KW_CONF,     is_conf),
+        _mask(_KW_HALLU,    is_hallu),
+        _mask(_KW_LEV,      is_lev),
+        _mask(_KW_FLY,      is_fly),
+        _mask(_KW_RIDE,     is_ride),
     ]
     return jnp.concatenate(chunks)
 
@@ -1373,40 +1501,53 @@ def build_status_conditions(env_state) -> jnp.ndarray:
 def _build_status_row2(env_state, blstats) -> jnp.ndarray:
     """Render row 23 of tty_chars — vendor do_statusline2 format.
 
-    Format: "Dlvl:N $:M HP:H(Hmax) Pw:P(Pmax) AC:A Xp:X T:T <conditions>"
+    Format (botl.c::do_statusline2 lines 130, 143, 152-159):
+        "Dlvl:%-2d $:%-2ld HP:%d(%d) Pw:%d(%d) AC:%-2d Xp:%d T:%ld <conds>"
+
+    Every numeric field is LEFT-aligned (vendor uses ``%d`` / ``%-Nd``) — see
+    TTY_LAYOUT_DIFF.md D3 for the rationale.  ``_uint_to_bytes_left`` writes
+    digits at position 0 and pads the tail with ASCII spaces; the per-field
+    ``max_w`` accommodates the worst-case digit count.
 
     The ``<conditions>`` suffix is the keyword tail produced by
-    ``build_status_conditions`` (e.g., " Conf Blind Burdened").
+    ``build_status_conditions``.
 
-    Citation: vendor/nethack/src/botl.c::do_statusline2 (lines 100-249)
-    where ``Strcpy(nb = eos(nb), " Conf")`` etc. append each active
-    condition keyword to the status line tail.
+    Citation: vendor/nethack/src/botl.c::do_statusline2 (lines 100-249).
     """
     ac = blstats[BL_AC]
     neg = ac < 0
     abs_ac = jnp.abs(ac)
     sign_byte = jnp.where(neg, jnp.uint8(ord('-')), jnp.uint8(ord(' '))).reshape(1)
 
+    # Per-field max widths chosen to bound the worst-case digit count while
+    # keeping the row <= 80 bytes once the conditions tail is appended:
+    #   Dlvl: max 2 digits (depth ≤ 60 in vanilla)             → 2
+    #   $:    max 6 digits (vendor caps gold at 999999)        → 6
+    #   HP:   max 4 digits (vendor caps at 9999)               → 4
+    #   Pw:   max 4 digits (vendor caps at 9999)               → 4
+    #   AC:   max 2 digits (range roughly [-128, 127])         → 2 + sign
+    #   Xp:   max 2 digits (xlevel 1..30)                      → 2
+    #   T:    max 7 digits (turn counter — vendor uses %ld)    → 7
     parts = [
-        _S_DLVL,
-        _uint_to_bytes(blstats[BL_DEPTH], 2),
-        _S_SP_DOLLAR,
-        _uint_to_bytes(blstats[BL_GOLD], 4),
-        _S_SP_HP,
-        _uint_to_bytes(blstats[BL_HP], 4),
-        _S_OPEN,
-        _uint_to_bytes(blstats[BL_HPMAX], 4),
-        _S_CLOSE_SP_PW,
-        _uint_to_bytes(blstats[BL_ENE], 3),
-        _S_OPEN,
-        _uint_to_bytes(blstats[BL_ENEMAX], 3),
-        _S_CLOSE_SP_AC,
+        _S_DLVL,                                                # "Dlvl:"
+        _uint_to_bytes_left(blstats[BL_DEPTH], 2),
+        _S_SP_DOLLAR,                                           # " $:"
+        _uint_to_bytes_left(blstats[BL_GOLD], 6),
+        _S_SP_HP,                                               # " HP:"
+        _uint_to_bytes_left(blstats[BL_HP], 4),
+        _S_OPEN,                                                # "("
+        _uint_to_bytes_left(blstats[BL_HPMAX], 4),
+        _S_CLOSE_SP_PW,                                         # ") Pw:"
+        _uint_to_bytes_left(blstats[BL_ENE], 4),
+        _S_OPEN,                                                # "("
+        _uint_to_bytes_left(blstats[BL_ENEMAX], 4),
+        _S_CLOSE_SP_AC,                                         # ") AC:"
         sign_byte,
-        _uint_to_bytes(abs_ac, 2),
-        _S_SP_XP,
-        _uint_to_bytes(blstats[BL_XP], 2),
-        _S_SP_T,
-        _uint_to_bytes(blstats[BL_TIME], 5),
+        _uint_to_bytes_left(abs_ac, 2),
+        _S_SP_XP,                                               # " Xp:"
+        _uint_to_bytes_left(blstats[BL_XP], 2),
+        _S_SP_T,                                                # " T:"
+        _uint_to_bytes_left(blstats[BL_TIME], 7),
         build_status_conditions(env_state),
     ]
     row = jnp.concatenate(parts)
