@@ -120,6 +120,16 @@ class EnvState:
                          # (timeout.c::run_timers infrastructure;
                          # consumer callbacks in timer_queue.TIMER_CALLBACKS)
 
+    # ---- Wave 47g: multi-turn occupation (vendor ga.afternmv) ----------
+    # When occupation_kind > 0, the hero is busy with a multi-turn task
+    # (e.g. doffing armor while a nymph steals).  Action dispatch checks
+    # ``occupation.is_occupied(state)`` and may no-op.  When
+    # ``occupation_remaining`` ticks to 0, the matching callback fires.
+    # Cite: vendor/nethack/src/steal.c::stealarm + unstolenarm.
+    occupation_kind: jax.Array       # int8   OccupationKind enum
+    occupation_target: jax.Array     # int32  monster slot / item idx
+    occupation_remaining: jax.Array  # int8   turns left
+
     # ---- Player core (kept here for fast access; not part of any subsystem) ----
     player_pos: jax.Array       # int16[2]  (row, col)
     player_hp: jax.Array        # int32
@@ -288,6 +298,9 @@ class EnvState:
             region_state=make_region_state(),
             worm_state=make_worm_state(),
             timers=TimerState.default(),
+            occupation_kind=jnp.int8(0),
+            occupation_target=jnp.int32(-1),
+            occupation_remaining=jnp.int8(0),
             # player core
             player_pos=jnp.zeros((2,), dtype=jnp.int16),
             player_hp=jnp.int32(10),

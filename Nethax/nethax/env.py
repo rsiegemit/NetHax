@@ -28,6 +28,7 @@ from Nethax.nethax.subsystems.status_effects import (
     tick_slime_cancels_stoning as _tick_slime_cancels_stoning,
 )
 from Nethax.nethax.subsystems.timer_queue import tick_timers as _tick_timer_queue
+from Nethax.nethax.subsystems.occupation import tick_occupation as _tick_occupation
 from Nethax.nethax.subsystems.ascension import maybe_ascend
 from Nethax.nethax.subsystems.polymorph import step as _polymorph_step
 from Nethax.nethax.subsystems.shop import shop_step as _shop_step
@@ -375,6 +376,12 @@ def _step_impl(state, action, rng):
         #    timestep, then clears the slot.  Wave 47f scaffolding —
         #    callbacks are currently no-ops awaiting per-consumer wiring.
         ns = _tick_timer_queue(ns)
+
+        # 4a2. Multi-turn occupation tick (vendor ga.afternmv invocation
+        #    when gm.multi reaches 0).  Decrements occupation_remaining;
+        #    fires the matching callback (e.g. STEAL_ARM) when it hits
+        #    zero.  Wave 47g scaffolding.
+        ns = _tick_occupation(ns)
 
         # 4a. Experience-level check — vendor exper.c::newexplevel called from
         #    allmain.c (after nh_timeout / before the next turn).  Promotes
