@@ -46,6 +46,9 @@ from Nethax.nethax.subsystems.digging import dig_tick as _dig_tick
 from Nethax.nethax.subsystems.swallow import digest_tick as _digest_tick
 from Nethax.nethax.subsystems.experience import newexplevel as _newexplevel
 from Nethax.nethax.subsystems.regions import run_regions as _run_regions
+from Nethax.nethax.subsystems.mplayer import (
+    maybe_seed_astral_mplayers as _maybe_seed_astral_mplayers,
+)
 
 
 class NethaxEnv:
@@ -307,7 +310,7 @@ def _step_impl(state, action, rng):
         timestep increases; no separate decrement call is needed here.
         Cite: vendor/nethack/src/light.c::do_light_sources.
     """
-    rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow, rng_explvl, rng_regions = jax.random.split(rng, 8)
+    rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow, rng_explvl, rng_regions, rng_astral = jax.random.split(rng, 9)
     already_done = state.done
 
     # Pre-step snapshot: was the Wizard of Yendor alive?  Used to fire
@@ -318,9 +321,20 @@ def _step_impl(state, action, rng):
         & (state.monster_ai.entry_idx.astype(jnp.int32) == _PM_WIZARD_ENTRY)
     )
 
+    # Pre-step (branch, level) snapshot — used by the Astral-Plane mplayer
+    # seeder (vendor mplayer.c::create_mplayers).  Edge-triggered: spawn 3
+    # mplayers when the player transitions onto (Branch.ENDGAME, level 5).
+    prev_branch = state.dungeon.current_branch.astype(jnp.int32)
+    prev_level  = state.dungeon.current_level.astype(jnp.int32)
+
     def _do_step(_):
         # 1. Player action — allmain.c line 203 (svc.context.move).
         ns = dispatch_action(state, action, rng_act)
+
+        # 1a. Astral-Plane mplayer trigger — vendor mplayer.c::create_mplayers
+        #     (lines 327-355) called from astral.lua MAP section on level
+        #     entry.  Edge-triggered on (prev != Astral) → (curr == Astral).
+        ns = _maybe_seed_astral_mplayers(ns, rng_astral, prev_branch, prev_level)
 
         # 1b. Digging tick — advance multi-turn pickaxe dig (dig.c::dodig).
         ns = _dig_tick(ns, rng_act)
