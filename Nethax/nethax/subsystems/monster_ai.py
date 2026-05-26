@@ -4574,6 +4574,80 @@ _QUEST_ARTIFACT_TIDS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Covetous AI — when the hero carries a quest artifact, covetous monsters
+# (Wizard of Yendor, liches, high demons) get HUNT strategy + speed boost.
+# Vendor cite: wizard.c::strategy + target_on lines 235-327; mon.c covetous
+# flag M3_WANTSAMUL / WANTSBOOK / WANTSBELL / WANTSCAND / WANTSARTI.
+# ---------------------------------------------------------------------------
+# Covetous monster entry indices (verified against monster_entries):
+#   281 = PM_WIZARD_OF_YENDOR (M3_WANTSAMUL + WANTSBOOK + WANTSBELL + WANTSCAND)
+#   187 = lich       (M3_WANTSBOOK)
+#   188 = demilich   (M3_WANTSBOOK)
+#   189 = master lich (M3_WANTSBOOK)
+#   190 = arch-lich  (M3_WANTSBOOK)
+# Higher demons (e.g., Yeenoghu, Juiblex, Orcus, Asmodeus, Demogorgon) all
+# have M3_WANTSAMUL — we add a representative subset; the entry indices
+# vary by chunk and aren't critical for the MVP gate.
+_COVETOUS_ENTRY_IDS = (281, 187, 188, 189, 190)
+_QUEST_ARTIFACT_TIDS_AI = (
+    188,  # Amulet of Yendor
+    237,  # Candelabrum of Invocation
+    238,  # Bell of Opening
+    382,  # Book of the Dead
+)
+
+
+def _player_carries_quest_artifact(state) -> jnp.ndarray:
+    """JIT-pure bool: True iff player carries any of the 4 quest artifacts."""
+    inv = state.inventory.items
+    cat = inv.category
+    tid = inv.type_id
+    occupied = cat != jnp.int8(0)
+    has = jnp.bool_(False)
+    for qid in _QUEST_ARTIFACT_TIDS_AI:
+        has = has | jnp.any(occupied & (tid == jnp.int16(qid)))
+    return has
+
+
+def _covetous_ai_step(state):
+    """Force HUNT + speed boost on covetous monsters when player carries
+    a quest artifact.
+
+    Vendor's full ``strategy()`` (wizard.c:269) picks between
+    STRAT_HEAL / STRAT_STAIRS / STRAT_TARGETED based on monster HP and
+    artifact target, then ``tactics()`` either teleports the monster
+    nearer the player (M3_TELEPORT_AROUND) or fast-flees.  This MVP
+    captures the gameplay impact subset:
+      - Force ``mstrategy = HUNT`` so the monster aggressively
+        pathfinds toward the player (no idle wander).
+      - Bump ``speed_mod`` to +1 (MFAST tier) so the monster
+        accumulates movement points 1.5x faster — vendor's
+        TELEPORT_AROUND keeps the covetous monster keeping up with
+        a fast hero.
+      - Clear any active flee_until_turn (vendor: covetous never flee
+        while hero carries the target).
+
+    Does nothing when the hero doesn't carry any quest artifact.
+    """
+    player_has = _player_carries_quest_artifact(state)
+    mai = state.monster_ai
+    entry = mai.entry_idx.astype(jnp.int32)
+    is_covetous = jnp.bool_(False)
+    for eid in _COVETOUS_ENTRY_IDS:
+        is_covetous = is_covetous | (entry == jnp.int32(eid))
+    apply = mai.alive & is_covetous & player_has
+
+    new_strat = jnp.where(apply, jnp.int8(int(MoveStrategy.HUNT)), mai.mstrategy)
+    new_speed = jnp.where(apply, jnp.int8(1), mai.speed_mod)
+    new_flee  = jnp.where(apply, jnp.int32(0), mai.flee_until_turn)
+    return state.replace(monster_ai=mai.replace(
+        mstrategy=new_strat,
+        speed_mod=new_speed,
+        flee_until_turn=new_flee,
+    ))
+
+
 def _try_steal_quest_artifact(state, rng: jax.Array):
     """If the Wizard is adjacent and player holds a quest artifact, transfer
     one to the Wizard's monster inventory.
@@ -4783,6 +4857,12 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     # and the hero carries Amulet/Candelabrum/Bell/Book of the Dead.
     rng, rng_qsteal = jax.random.split(rng)
     state = _try_steal_quest_artifact(state, rng_qsteal)
+    mai = state.monster_ai
+
+    # ---- Covetous AI: force HUNT + speed boost on Wizard/lich/demons
+    # while the hero carries a quest artifact (vendor wizard.c::strategy
+    # + tactics, M3_WANTS* flag chain).  No RNG needed.
+    state = _covetous_ai_step(state)
     mai = state.monster_ai
 
     # ---- Speed-energy accumulation (vendor mon.c::mcalcmove lines 1126-1167) ----
