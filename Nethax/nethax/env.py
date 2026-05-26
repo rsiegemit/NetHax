@@ -116,9 +116,21 @@ class NethaxEnv:
         n_rooms_vendor: int = 8         # generate_rooms default
         n_monsters_vendor: int = 5      # populate_level_with_monsters default
         if use_vendor_rng():
-            key_u32 = jax.device_get(rng).astype(jnp.uint32)
-            seed_int = (int(key_u32[0]) << 32) ^ int(key_u32[1])
-            v_state = _vendor_rng.init(seed_int)
+            # Derive a uint64 seed from the incoming PRNGKey using pure-JAX
+            # ops so this branch does not force a host transfer of the key.
+            # ``jax.random.bits(rng, (), dtype=jnp.uint64)`` returns a traced
+            # uint64 scalar (when JAX_ENABLE_X64=1).  Under default x32 mode
+            # the result is truncated to uint32, which is still vendor-equiv
+            # for ISAAC64 seeding (NLE packs to ``sizeof(unsigned long)``
+            # bytes little-endian; the low 32 bits dominate when the seed is
+            # ``unsigned int`` -- vendor/nle/src/hacklib.c:854-868).
+            # NOTE: ``_vendor_rng.init`` still runs reference Python ISAAC64
+            # math, so this branch is not yet ``jax.vmap``-safe; under vmap
+            # the ``int(seed_arr)`` below would raise ConcretizationTypeError.
+            # The non-vendor default path (ParityMode.NLE) skips this branch
+            # entirely and vmaps cleanly.
+            seed_arr = jax.random.bits(rng, (), dtype=jnp.uint64)
+            v_state = _vendor_rng.init(int(seed_arr))
             v_state, rng_level = _vendor_draw_prngkey(v_state)
             v_state, rng_char = _vendor_draw_prngkey(v_state)
             v_state, rng_monsters = _vendor_draw_prngkey(v_state)
@@ -151,6 +163,10 @@ class NethaxEnv:
         # vendor/nethack/src/mklev.c::mklev (line 1577) which calls
         # fill_ordinary_room (line 939) for every OROOM/THEMEROOM and the
         # vault gate at lines 404-410 / 1316-1342.
+        # Pass the ISAAC64 state (or None) into dungeon-gen.  Under
+        # NLE_BYTEPARITY the per-room y/x/h/w/lit draws consume the same
+        # stream as vendor C; in default Threefry mode this is a no-op.
+        vendor_rng_for_gen = state.vendor_rng if use_vendor_rng() else None
         (
             terrain,
             _rooms,
@@ -159,6 +175,7 @@ class NethaxEnv:
             down_pos,
             new_features,
             new_traps,
+            vendor_rng_after_gen,
         ) = generate_main_branch_l1_with_features(
             rng_level,
             self.static,
@@ -168,6 +185,7 @@ class NethaxEnv:
             depth=1,
             player_align=int(alignment),
             n_rooms=n_rooms_vendor,
+            vendor_rng=vendor_rng_for_gen,
         )
         state = state.replace(
             terrain=state.terrain.at[0, 0].set(terrain),
@@ -175,11 +193,23 @@ class NethaxEnv:
             features=new_features,
             traps=new_traps,
         )
+        # When dungeon-gen consumed ISAAC64, commit the threaded state back.
+        if use_vendor_rng() and vendor_rng_after_gen is not None:
+            state = state.replace(vendor_rng=vendor_rng_after_gen)
 
-        # Populate level 1 with monsters after dungeon gen.
-        state = populate_level_with_monsters(
-            state, rng_monsters, n_monsters=n_monsters_vendor,
-        )
+        # Populate level 1 with monsters after dungeon gen.  Under
+        # NLE_BYTEPARITY, thread the Isaac64State so per-monster HP rolls
+        # (newmonhp d(mlvl,8)) consume from the ISAAC64 stream and the
+        # updated state is written back into ``state.vendor_rng``.
+        if use_vendor_rng():
+            state = populate_level_with_monsters(
+                state, rng_monsters, n_monsters=n_monsters_vendor,
+                vendor_rng=state.vendor_rng,
+            )
+        else:
+            state = populate_level_with_monsters(
+                state, rng_monsters, n_monsters=n_monsters_vendor,
+            )
 
         # Spawn starting pet adjacent to player — vendor/nethack/src/u_init.c::makedog.
         # Host-side (reset is not jit-compiled), so Python loops are fine.
@@ -311,56 +341,86 @@ def _vendor_draw_prngkey(v_state):
     word per sub-key.
     """
     v_state, val = _vendor_rng.next_uint64(v_state)
-    hi = jnp.uint32((int(val) >> 32) & 0xFFFFFFFF)
-    lo = jnp.uint32(int(val) & 0xFFFFFFFF)
+    # Repack uint64 → uint32[2] via pure-JAX bit ops (no host int() shifts).
+    # ``next_uint64`` already returns a host-side Python int today, so we
+    # box it as a uint64 scalar before slicing.  When the vendor RNG path
+    # is itself made traceable, ``val`` will already be a uint64 jnp scalar
+    # and this code keeps working unchanged.
+    val_u64 = jnp.asarray(val, dtype=jnp.uint64)
+    hi = jnp.right_shift(val_u64, jnp.uint64(32)).astype(jnp.uint32)
+    lo = jnp.bitwise_and(val_u64, jnp.uint64(0xFFFFFFFF)).astype(jnp.uint32)
     key = jnp.stack([hi, lo]).astype(jnp.uint32)
     return v_state, key
+
+
+_PET_NEIGHBOUR_OFFSETS = jnp.array(
+    [
+        [-1, -1], [-1, 0], [-1, 1],
+        [ 0, -1],          [ 0, 1],
+        [ 1, -1], [ 1, 0], [ 1, 1],
+    ],
+    dtype=jnp.int32,
+)  # [8, 2] — vendor u_init.c::makedog scans the 8 adjacent tiles.
 
 
 def _spawn_starting_pet(state, role: Role):
     """Spawn the role's starting pet adjacent to the player.
 
     Vendor: vendor/nethack/src/u_init.c::makedog (called from u_init()).
-    Host-side only — reset() is not jit-compiled.
+    Pure-JAX so this routine is ``jax.vmap``-safe — the 8-neighbour scan is
+    a static-shape ``jnp.where`` selection over the precomputed offsets.
     Pet is placed in slot 5 (after the 5 wild monsters in slots 0-4).
     """
     from Nethax.nethax.constants.monsters import MONSTERS
     from Nethax.nethax.dungeon.spawning import (
         _BASE_AC, _ATK_DICE_N, _ATK_DICE_S, _IS_LARGE, _roll_hp,
     )
-    import numpy as np
     import jax.random as jr
 
-    # Resolve pet monster name → MONSTERS index (host-side name lookup).
+    # Resolve pet monster name → MONSTERS index.  ``role`` is a Python
+    # hyperparameter (not a traced value), so this Python lookup is fine
+    # under ``jax.vmap`` over the rng axis.
     pet_name = get_starting_pet(role)
     pet_pm = next(
         (i for i, m in enumerate(MONSTERS) if m.name == pet_name),
         32,  # fallback: kitten (index 32)
     )
+    pet_level = max(1, int(MONSTERS[pet_pm].level))  # also a static int.
 
     # Find an adjacent FLOOR or CORRIDOR tile (Chebyshev distance == 1).
-    terrain = np.array(state.terrain[0, 0])   # host numpy copy
-    pr = int(state.player_pos[0])
-    pc = int(state.player_pos[1])
+    # Static-shape: 8 candidate offsets, pure-JAX gather + argmax.
+    player_pos_i32 = state.player_pos.astype(jnp.int32)              # [2]
+    cands = player_pos_i32[None, :] + _PET_NEIGHBOUR_OFFSETS          # [8, 2]
+    terrain = state.terrain[0, 0]                                     # [H, W]
     H, W = terrain.shape
-    pet_pos = (pr, pc)  # fallback: same tile as player (vendor fallback)
-    for dr in (-1, 0, 1):
-        for dc in (-1, 0, 1):
-            if dr == 0 and dc == 0:
-                continue
-            rr, cc = pr + dr, pc + dc
-            if 0 <= rr < H and 0 <= cc < W:
-                t = int(terrain[rr, cc])
-                if t in (int(TileType.FLOOR), int(TileType.CORRIDOR)):
-                    pet_pos = (rr, cc)
-                    break
-        else:
-            continue
-        break
+    rr = cands[:, 0]
+    cc = cands[:, 1]
+    in_bounds = (rr >= 0) & (rr < H) & (cc >= 0) & (cc < W)
+    # Clamp before indexing so out-of-bounds rows don't error (their mask
+    # bit is False anyway and they're discarded).
+    rr_safe = jnp.clip(rr, 0, H - 1)
+    cc_safe = jnp.clip(cc, 0, W - 1)
+    tiles = terrain[rr_safe, cc_safe]
+    walkable = (
+        (tiles == jnp.int8(TileType.FLOOR))
+        | (tiles == jnp.int8(TileType.CORRIDOR))
+    )
+    ok = in_bounds & walkable                                         # [8]
+    # First-True argmax — when no neighbour is walkable, fall back to the
+    # player's own tile (vendor fallback in makedog when no slot is free).
+    any_ok = jnp.any(ok)
+    pick = jnp.argmax(ok.astype(jnp.int32))
+    pet_pos = jnp.where(
+        any_ok,
+        cands[pick],
+        player_pos_i32,
+    ).astype(jnp.int16)                                               # [2]
 
     # Roll HP using the same formula as wild monsters (makemon.c::newmonhp).
+    # ``_roll_hp`` is pure-JAX; store the traced scalar directly (no int()
+    # cast — that would force concretisation and break vmap).
     dummy_rng = jr.PRNGKey(0)
-    hp_val = int(_roll_hp(dummy_rng, jnp.int32(max(1, int(MONSTERS[pet_pm].level)))))
+    hp_val = _roll_hp(dummy_rng, jnp.int32(pet_level))
 
     # Write pet into slot 5 (first slot after the 5 wild monsters).
     PET_SLOT = 5
@@ -371,11 +431,9 @@ def _spawn_starting_pet(state, role: Role):
         peaceful=state.monster_ai.peaceful.at[PET_SLOT].set(True),
         mtame=state.monster_ai.mtame.at[PET_SLOT].set(jnp.int8(10)),
         entry_idx=state.monster_ai.entry_idx.at[PET_SLOT].set(pm_i16),
-        pos=state.monster_ai.pos.at[PET_SLOT].set(
-            jnp.array(pet_pos, dtype=jnp.int16)
-        ),
-        hp=state.monster_ai.hp.at[PET_SLOT].set(jnp.int32(hp_val)),
-        hp_max=state.monster_ai.hp_max.at[PET_SLOT].set(jnp.int32(hp_val)),
+        pos=state.monster_ai.pos.at[PET_SLOT].set(pet_pos),
+        hp=state.monster_ai.hp.at[PET_SLOT].set(hp_val.astype(jnp.int32)),
+        hp_max=state.monster_ai.hp_max.at[PET_SLOT].set(hp_val.astype(jnp.int32)),
         ac=state.monster_ai.ac.at[PET_SLOT].set(_BASE_AC[pet_pm]),
         is_large=state.monster_ai.is_large.at[PET_SLOT].set(_IS_LARGE[pet_pm]),
         attack_dice_n=state.monster_ai.attack_dice_n.at[PET_SLOT].set(

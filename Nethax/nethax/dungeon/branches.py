@@ -344,20 +344,34 @@ LUDIOS_BRANCH_INFO_STATIC: BranchInfo = BranchInfo(
 )
 
 
-def sample_ludios_branch_info(rng) -> BranchInfo:
+def sample_ludios_branch_info(rng, vendor_rng=None):
     """Sample Fort Ludios's BranchInfo via the vendor (mean, dev) spec.
 
     Vendor: ``BRANCH: "Fort Ludios" @ (18, 4) portal`` (dungeon.def line 27)
     and ``DUNGEON: "Fort Ludios" "K" (1, 0)`` (dungeon.def line 106).
 
+    Byte-replay path: when ``vendor_rng`` (Isaac64State) is supplied, the
+    rn1 draw is routed through :func:`vendor_rng.randint_jax` and the
+    return becomes ``(new_vendor_rng, BranchInfo)``.
+
     Args:
         rng: jax.random.PRNGKey scalar.
+        vendor_rng: optional Isaac64State.
 
     Returns:
-        BranchInfo with first_level ∈ [18, 21], num_levels = 1,
-        connection_type = BR_PORTAL.
+        BranchInfo with first_level in [18, 21], num_levels = 1,
+        connection_type = BR_PORTAL.  ``(new_vendor_rng, BranchInfo)``
+        when ``vendor_rng`` is supplied.
     """
     k_fl, _k_nl = jax.random.split(rng, 2)
+    if vendor_rng is not None:
+        vendor_rng, first_level = _vendor_rn1(k_fl, 4, 18, vendor_rng=vendor_rng)
+        return vendor_rng, BranchInfo(
+            branch_id=jnp.int8(Branch.LUDIOS),
+            first_level=first_level,
+            num_levels=jnp.int8(1),
+            connection_type=jnp.int8(BranchConnectionType.PORTAL),
+        )
     first_level = _vendor_rn1(k_fl, 4, 18)  # acouple in Main
     return BranchInfo(
         branch_id=jnp.int8(Branch.LUDIOS),
@@ -408,7 +422,7 @@ def _vendor_rn1(rng, rand: int, base: int, vendor_rng=None) -> jnp.ndarray:
     return sample.astype(jnp.int8)
 
 
-def sample_branch_table(rng) -> Tuple[BranchInfo, ...]:
+def sample_branch_table(rng, vendor_rng=None):
     """Vendor-faithful sampler for ``BRANCH_TABLE``.
 
     Reproduces vendor/nle/src/dungeon.c::init_dungeons lines 796-800 by
@@ -422,14 +436,20 @@ def sample_branch_table(rng) -> Tuple[BranchInfo, ...]:
     so no PRNG key is reused.  It is not itself JIT'd (it runs once per
     game at init), but the per-branch ``_vendor_rn1`` calls are.
 
+    Byte-replay path: when ``vendor_rng`` (Isaac64State) is supplied, all
+    per-branch rn1 draws are routed through :func:`vendor_rng.randint_jax`
+    and the return becomes ``(new_vendor_rng, tuple_of_BranchInfo)``.
+
     Citation: vendor/nle/src/dungeon.c::init_dungeons lines 796-800,
               vendor/nle/dat/dungeon.def lines 17-143.
 
     Args:
-        rng: jax.random.PRNGKey scalar.
+        rng:        jax.random.PRNGKey scalar.
+        vendor_rng: optional Isaac64State.
 
     Returns:
-        Tuple of ``BranchInfo`` records, ordered by Branch enum.
+        Tuple of ``BranchInfo`` records, ordered by Branch enum.  When
+        ``vendor_rng`` is supplied, returns ``(new_vendor_rng, tuple)``.
     """
     # Split one key per branch, then split each branch-key into three sub-keys
     # (one for num_levels, one for first_level acouple, one for chain
@@ -438,6 +458,15 @@ def sample_branch_table(rng) -> Tuple[BranchInfo, ...]:
     # always split to keep the rng schedule deterministic even when an
     # individual branch falls back to the static value.
     branch_keys = jax.random.split(rng, N_BRANCHES)
+
+    def _rn1(key, rand, base):
+        # Local helper: route through randint_jax when vendor_rng is active,
+        # else fall through to the Threefry _vendor_rn1 path.
+        nonlocal vendor_rng
+        if vendor_rng is not None:
+            vendor_rng, v = _vendor_rn1(key, rand, base, vendor_rng=vendor_rng)
+            return v
+        return _vendor_rn1(key, rand, base)
 
     out = []
     for b in range(N_BRANCHES):
@@ -448,7 +477,7 @@ def sample_branch_table(rng) -> Tuple[BranchInfo, ...]:
         nl_spec = _DUNGEON_NUM_LEVELS_VENDOR_SPEC.get(b)
         if nl_spec is not None:
             nl_base, nl_rand = nl_spec
-            num_levels_sampled = _vendor_rn1(k_nl, nl_rand, nl_base)
+            num_levels_sampled = _rn1(k_nl, nl_rand, nl_base)
         else:
             num_levels_sampled = static.num_levels
 
@@ -461,13 +490,13 @@ def sample_branch_table(rng) -> Tuple[BranchInfo, ...]:
             anchor_base, anchor_rand = anchor_lvl_spec
             off_base, off_rand = offset_spec
             k_anchor, k_off = jax.random.split(k_chain, 2)
-            anchor_lvl = _vendor_rn1(k_anchor, anchor_rand, anchor_base)
-            off_lvl    = _vendor_rn1(k_off,    off_rand,    off_base)
+            anchor_lvl = _rn1(k_anchor, anchor_rand, anchor_base)
+            off_lvl    = _rn1(k_off,    off_rand,    off_base)
             first_level_sampled = (anchor_lvl.astype(jnp.int16)
                                    + off_lvl.astype(jnp.int16)).astype(jnp.int8)
         elif fl_spec is not None:
             fl_base, fl_rand = fl_spec
-            first_level_sampled = _vendor_rn1(k_fl, fl_rand, fl_base)
+            first_level_sampled = _rn1(k_fl, fl_rand, fl_base)
         else:
             first_level_sampled = static.first_level
 
@@ -484,7 +513,10 @@ def sample_branch_table(rng) -> Tuple[BranchInfo, ...]:
             num_levels=num_levels_sampled,
             connection_type=connection_type,
         ))
-    return tuple(out)
+    result = tuple(out)
+    if vendor_rng is not None:
+        return vendor_rng, result
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +667,7 @@ def generate_main_branch_l1(
     rng: jnp.ndarray,
     static_params,  # StaticParams — imported lazily to avoid circular dep
     n_rooms: int = 8,
+    vendor_rng=None,
 ) -> Tuple[jnp.ndarray, "Room", jnp.ndarray, jnp.ndarray]:  # noqa: F821
     """Generate the first level of the main branch.
 
@@ -674,8 +707,12 @@ def generate_main_branch_l1(
 
     rng, k_rooms, k_corridors = jax.random.split(rng, 3)
 
-    # 1. Place rooms.
-    rooms, active = generate_rooms(k_rooms, h, w, n_rooms=n_rooms)
+    # 1. Place rooms.  When vendor_rng is supplied (NLE_BYTEPARITY) the
+    #    per-room y/x/h/w/lit draws come from the ISAAC64 stream so the
+    #    layout byte-matches vendor C; otherwise the original Threefry path.
+    rooms, active, vendor_rng = generate_rooms(
+        k_rooms, h, w, n_rooms=n_rooms, vendor_rng=vendor_rng,
+    )
 
     # 2. Carve rooms into blank terrain.
     terrain = jnp.zeros((h, w), dtype=jnp.int8)
@@ -721,7 +758,7 @@ def generate_main_branch_l1(
     up_stair_pos   = jnp.stack([up_r, up_c]).astype(jnp.int16)
     down_stair_pos = jnp.stack([dn_r, dn_c]).astype(jnp.int16)
 
-    return terrain, rooms, active, up_stair_pos, down_stair_pos
+    return terrain, rooms, active, up_stair_pos, down_stair_pos, vendor_rng
 
 
 def generate_main_branch_l1_with_features(
@@ -733,6 +770,7 @@ def generate_main_branch_l1_with_features(
     depth: int = 1,
     player_align: int = 1,
     n_rooms: int = 8,
+    vendor_rng=None,
 ):
     """Generate Main Dlvl 1 and apply per-room feature/trap rolls + vault.
 
@@ -765,7 +803,10 @@ def generate_main_branch_l1_with_features(
 
     Returns:
         (terrain, rooms, active, up_stair_pos, down_stair_pos,
-         features_out, traps_out)
+         features_out, traps_out, vendor_rng_out)
+
+        ``vendor_rng_out`` is the threaded :class:`Isaac64State` when
+        ``vendor_rng`` was supplied; otherwise it's ``None`` (passthrough).
     """
     # Import here to avoid circular dependency at module load time.
     from Nethax.nethax.dungeon.rooms import (
@@ -776,8 +817,8 @@ def generate_main_branch_l1_with_features(
 
     k_level, k_fill, k_vault, k_niche = jax.random.split(rng, 4)
 
-    terrain, rooms, active, up_pos, dn_pos = generate_main_branch_l1(
-        k_level, static_params, n_rooms=n_rooms,
+    terrain, rooms, active, up_pos, dn_pos, vendor_rng = generate_main_branch_l1(
+        k_level, static_params, n_rooms=n_rooms, vendor_rng=vendor_rng,
     )
 
     # vendor/nethack/src/mklev.c::fill_ordinary_room (line 939) — per-room
@@ -799,7 +840,7 @@ def generate_main_branch_l1_with_features(
     # tiles only land on plain FLOOR cells the per-room roll didn't claim.
     terrain = _place_niches(terrain, rooms, active, k_niche, n=2)
 
-    return terrain, rooms, active, up_pos, dn_pos, features, traps
+    return terrain, rooms, active, up_pos, dn_pos, features, traps, vendor_rng
 
 
 # ===========================================================================

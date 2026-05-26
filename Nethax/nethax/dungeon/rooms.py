@@ -29,6 +29,7 @@ import jax.lax as lax
 from flax import struct
 
 from Nethax.nethax.dungeon.branches import MAP_H, MAP_W
+from Nethax.nethax.vendor_rng import Isaac64State, randint_jax
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -170,6 +171,70 @@ def _check_any_overlap(new_y1: jnp.ndarray, new_x1: jnp.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# ISAAC64-threaded helpers — used when env runs under NLE_BYTEPARITY mode.
+#
+# The default Threefry path pre-samples one big array per dim with
+# ``jax.random.randint``.  ISAAC64 is a stateful stream, so we must draw
+# scalars sequentially and thread :class:`Isaac64State` through every
+# call.  These helpers do that via :func:`jax.lax.scan`, which is
+# vmap/jit-friendly and pure (no Python control flow on traced values).
+#
+# Cite: vendor/nle/include/config.h:584 ``#define USE_ISAAC64`` —
+#       vendor C bottoms out in ``isaac64_next_uint64() % x`` for every
+#       rn2/rnd draw.  ``randint_jax`` is byte-exact with that operation.
+# ---------------------------------------------------------------------------
+
+def _isaac_draw_xywh(vendor_rng: Isaac64State,
+                     total_samples: int,
+                     y_range: int,
+                     x_range: int):
+    """Sequentially draw (y, x, h, w) per slot via ISAAC64.
+
+    Mirrors the four Threefry pre-samples in :func:`generate_rooms`
+    but consumes the ISAAC64 stream so the output bytes are exact with
+    vendor C.  Returns ``(new_state, y_off, x_off, heights, widths)``,
+    each output an int16 array of length ``total_samples``.
+
+    Vendor sp_lev.c::create_room (lines 1548-1551) draws ``rn2``/``rnd``
+    in width-then-height order; we mirror that ordering so the byte
+    sequence matches a vendor run with the same seed.
+    """
+    def body(state, _):
+        state, y = randint_jax(state, (), 1, 1 + y_range)
+        state, x = randint_jax(state, (), 1, 1 + x_range)
+        state, hh = randint_jax(state, (), _MIN_ROOM_H, _MAX_ROOM_H + 1)
+        state, ww = randint_jax(state, (), _MIN_ROOM_W, _MAX_ROOM_W + 1)
+        return state, (y.astype(jnp.int16),
+                       x.astype(jnp.int16),
+                       hh.astype(jnp.int16),
+                       ww.astype(jnp.int16))
+
+    final_state, (ys, xs, hs, ws) = lax.scan(
+        body, vendor_rng, xs=None, length=total_samples
+    )
+    return final_state, ys, xs, hs, ws
+
+
+def _isaac_draw_lit(vendor_rng: Isaac64State,
+                    n_slots: int,
+                    abs_depth: int):
+    """Per-slot lit rolls (rnd(1+|depth|) and rn2(77)) via ISAAC64.
+
+    Vendor mkmap.c::litstate_rnd (line 446):
+        is_lit = (rnd(1+abs(depth)) < 11) && (rn2(77) == 0)
+    """
+    def body(state, _):
+        state, a = randint_jax(state, (), 1, 2 + abs_depth)
+        state, b = randint_jax(state, (), 0, 77)
+        return state, (a, b)
+
+    final_state, (lit_a, lit_b) = lax.scan(
+        body, vendor_rng, xs=None, length=n_slots
+    )
+    return final_state, lit_a, lit_b
+
+
+# ---------------------------------------------------------------------------
 # Public functions
 # ---------------------------------------------------------------------------
 
@@ -179,6 +244,7 @@ def generate_rooms(
     w: int = MAP_W,
     n_rooms: int = 8,
     depth: int = 1,
+    vendor_rng: Isaac64State | None = None,
 ) -> Room:
     """Place rooms on an h×w grid via rejection-sampling.
 
@@ -205,16 +271,22 @@ def generate_rooms(
     and the dy-cap.
 
     Args:
-        rng:     JAX PRNG key.
-        h:       map height in cells (default MAP_H = 21).
-        w:       map width in cells (default MAP_W = 80).
-        n_rooms: target room count.  Pass -1 to draw a vendor-style random
-                 count in [5, 9].  Default 8 preserves Wave 2 behaviour.
-        depth:   current dungeon depth (1..30+).  Used for lit-room formula.
+        rng:        JAX PRNG key (Threefry path).
+        h:          map height in cells (default MAP_H = 21).
+        w:          map width in cells (default MAP_W = 80).
+        n_rooms:    target room count.  Pass -1 to draw a vendor-style random
+                    count in [5, 9].  Default 8 preserves Wave 2 behaviour.
+        depth:      current dungeon depth (1..30+).  Used for lit-room formula.
+        vendor_rng: optional :class:`Isaac64State`.  When supplied (NLE_BYTEPARITY
+                    mode), the per-slot y/x/h/w/lit draws are routed through
+                    :func:`vendor_rng.randint_jax` so the byte stream matches
+                    vendor C for a given seed.  When ``None`` the original
+                    Threefry pre-sample path runs unchanged.
 
     Returns:
-        Room pytree with arrays shaped [MAX_ROOMS_PER_LEVEL].
-        active slots have room_type=ORDINARY; inactive slots have coords=-1.
+        ``(room, active, vendor_rng_out)`` tuple.  ``vendor_rng_out`` is the
+        post-draw :class:`Isaac64State` when ``vendor_rng`` was supplied, or
+        the input ``vendor_rng`` itself (untouched) otherwise.
     """
     # Pre-sample all random values: for each room attempt we need 4 values
     # (y_offset, x_offset, height, width).  We also allow up to _MAX_RETRIES
@@ -239,23 +311,42 @@ def generate_rooms(
     y_range = max(y_range, 1)
     x_range = max(x_range, 1)
 
-    all_y_off = jax.random.randint(key_y, (total_samples,), 1, 1 + y_range, dtype=jnp.int16)
-    all_x_off = jax.random.randint(key_x, (total_samples,), 1, 1 + x_range, dtype=jnp.int16)
-    all_heights = jax.random.randint(key_h, (total_samples,), _MIN_ROOM_H, _MAX_ROOM_H + 1, dtype=jnp.int16)
-    all_widths  = jax.random.randint(key_w, (total_samples,), _MIN_ROOM_W, _MAX_ROOM_W + 1, dtype=jnp.int16)
-
-    # Audit-N #1: vendor litstate_rnd (mkmap.c:446):
-    #   is_lit = (rnd(1+abs(depth)) < 11) & (rn2(77) == 0)
-    # rnd(N) returns [1, N]; we sample from [1, 1+abs(depth)] as
-    # jax.random.randint(min=1, max=2+abs(depth)).
     abs_depth = abs(int(depth))
-    key_lit_a, key_lit_b = jax.random.split(key_lit, 2)
-    lit_roll_a = jax.random.randint(
-        key_lit_a, (MAX_ROOMS_PER_LEVEL,), 1, 2 + abs_depth, dtype=jnp.int32
-    )
-    lit_roll_b = jax.random.randint(
-        key_lit_b, (MAX_ROOMS_PER_LEVEL,), 0, 77, dtype=jnp.int32
-    )
+
+    # Host-side trace-time branch — pick which RNG path produces the
+    # per-attempt y/x/h/w sample arrays.  Threefry (vendor_rng is None) =>
+    # original parallel pre-sample.  ISAAC64 (vendor_rng supplied) =>
+    # sequential per-slot draws via lax.scan threaded through Isaac64State.
+    if vendor_rng is None:
+        all_y_off   = jax.random.randint(key_y, (total_samples,), 1, 1 + y_range,         dtype=jnp.int16)
+        all_x_off   = jax.random.randint(key_x, (total_samples,), 1, 1 + x_range,         dtype=jnp.int16)
+        all_heights = jax.random.randint(key_h, (total_samples,), _MIN_ROOM_H, _MAX_ROOM_H + 1, dtype=jnp.int16)
+        all_widths  = jax.random.randint(key_w, (total_samples,), _MIN_ROOM_W, _MAX_ROOM_W + 1, dtype=jnp.int16)
+
+        # Audit-N #1: vendor litstate_rnd (mkmap.c:446):
+        #   is_lit = (rnd(1+abs(depth)) < 11) & (rn2(77) == 0)
+        # rnd(N) returns [1, N]; we sample from [1, 1+abs(depth)] as
+        # jax.random.randint(min=1, max=2+abs(depth)).
+        key_lit_a, key_lit_b = jax.random.split(key_lit, 2)
+        lit_roll_a = jax.random.randint(
+            key_lit_a, (MAX_ROOMS_PER_LEVEL,), 1, 2 + abs_depth, dtype=jnp.int32
+        )
+        lit_roll_b = jax.random.randint(
+            key_lit_b, (MAX_ROOMS_PER_LEVEL,), 0, 77, dtype=jnp.int32
+        )
+        vendor_rng_out = vendor_rng  # passthrough (still None)
+    else:
+        # ISAAC64 stream — draw (y, x, h, w) sequentially per slot, then lit
+        # rolls per active room.  randint_jax is byte-exact with vendor C.
+        vrng = vendor_rng
+        vrng, all_y_off, all_x_off, all_heights, all_widths = _isaac_draw_xywh(
+            vrng, total_samples, y_range, x_range,
+        )
+        vrng, lit_roll_a, lit_roll_b = _isaac_draw_lit(
+            vrng, MAX_ROOMS_PER_LEVEL, abs_depth,
+        )
+        vendor_rng_out = vrng
+
     all_lit = ((lit_roll_a < 11) & (lit_roll_b == 0)).astype(jnp.int8)
 
     # Audit-N #2: dx*dy <= 50 cap.  Apply after width/height sample —
@@ -335,7 +426,7 @@ def generate_rooms(
         x2=x2_f,
         room_type=room_type,
         is_lit=all_lit.astype(bool),
-    ), active_f
+    ), active_f, vendor_rng_out
 
 
 # ---------------------------------------------------------------------------

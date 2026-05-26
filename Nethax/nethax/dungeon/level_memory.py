@@ -250,7 +250,7 @@ def enter_level(
     already = state.generated[b, lv]
 
     # --- Generate branch: produce new terrain ---
-    terrain_new, _rooms, _active, _up, _dn = generate_main_branch_l1(rng, static_params)
+    terrain_new, _rooms, _active, _up, _dn, _vrng = generate_main_branch_l1(rng, static_params)
 
     # Store a uint32 seed derived from the rng key.
     # Use fold_in to produce a stable uint32 regardless of key format.
@@ -461,7 +461,7 @@ def traverse_stair_cross_branch(
             # Default: main / unknown branch → use main generator.
             from Nethax.nethax.state import StaticParams
             sp = StaticParams()
-            dst_terrain, _r, _a, _u, _d = generate_main_branch_l1(rng, sp)
+            dst_terrain, _r, _a, _u, _d, _vrng = generate_main_branch_l1(rng, sp)
 
         # Write into level_memory cache.
         new_level_mem = LevelMemoryState(
@@ -571,7 +571,7 @@ def traverse_portal(
         else:
             from Nethax.nethax.state import StaticParams
             sp = StaticParams()
-            dst_terrain, _r, _a, _u, _d = generate_main_branch_l1(rng, sp)
+            dst_terrain, _r, _a, _u, _d, _vrng = generate_main_branch_l1(rng, sp)
 
         new_level_mem = LevelMemoryState(
             generated=new_level_mem.generated.at[dst_branch, dst_level - 1].set(True),
