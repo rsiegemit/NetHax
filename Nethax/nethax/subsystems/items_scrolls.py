@@ -527,13 +527,31 @@ def _effect_charging(state, rng, buc):
     vendor/nethack/src/read.c::seffect_charging (~1788) + recharge (~726).
       blessed : rnd(2*nchg); uncursed: rnd(nchg); cursed: -rnd(2).
     Increments recharged counter; wand explodes (destroyed) when recharged>=7.
+
+    When the wand explodes (overcharge retributive strike), we additionally
+    route a 3x3 AoE through ``subsystems.explode.explode`` at the player's
+    tile.  Vendor's ``read.c::wand_explode`` (line 2414) only damages the
+    hero via ``losehp``; the AoE upgrade here matches the task spec and the
+    spirit of ``vendor/nethack/src/zap.c`` retributive strikes which call
+    ``explode(WAND_CLASS, -wand_otyp)`` for wand-class explosions (cf.
+    zap.c::buzz / zhitm path).
     """
-    rng1, rng2, rng3 = jax.random.split(rng, 3)
+    from Nethax.nethax.subsystems.explode import (
+        explode as _explode,
+        AD_FIRE, AD_COLD, AD_ELEC, AD_MAGIC,
+    )
+    # Vendor wand otyp -> damage adtyp mapping (read.c::wand_explode +
+    # zap.c::buzz adtyp routing).  Type ids match
+    # Nethax.nethax.subsystems.items_wands.WandEffect.
+    from Nethax.nethax.subsystems.items_wands import WandEffect as _WE
+
+    rng1, rng2, rng3, rng_expl = jax.random.split(rng, 4)
     blessed  = _is_blessed(buc)
     cursed   = _is_cursed(buc)
     categories = state.inventory.items.category
     charges    = state.inventory.items.charges
     recharged  = state.inventory.items.recharged
+    type_ids   = state.inventory.items.type_id
     is_wand   = categories == jnp.int8(ObjectClass.WAND_CLASS)
     found_any = jnp.any(is_wand)
     first_wand = jnp.argmax(is_wand).astype(jnp.int32)
@@ -573,7 +591,82 @@ def _effect_charging(state, rng, buc):
         charges=new_charges, recharged=new_recharged,
         quantity=new_qty, category=new_cat,
     )
-    return state.replace(inventory=state.inventory.replace(items=new_items))
+    state_after_inv = state.replace(
+        inventory=state.inventory.replace(items=new_items)
+    )
+
+    # ---- Wand-backfire AoE (only when ``explodes`` is True) -------------
+    # Vendor wand_explode damage formula (read.c:2420-2450):
+    #   n = obj->spe + 2  (clamped >= 2);  k depends on otyp (see switch).
+    # We use a fixed (n_dice=6, n_sides=8) — middle of the vendor table for
+    # elemental wands (WAN_FIRE/COLD/LIGHTNING/MAGIC_MISSILE → k=8) at an
+    # average rechargeable spe value.  ``n_dice``/``n_sides`` must be static
+    # Python ints to satisfy the explode() API.
+    wand_otyp = type_ids[first_wand].astype(jnp.int32)
+    is_fire  = wand_otyp == jnp.int32(int(_WE.FIRE))
+    is_cold  = wand_otyp == jnp.int32(int(_WE.COLD))
+    is_elec  = wand_otyp == jnp.int32(int(_WE.LIGHTNING))
+    # Route resistance: fire/cold/lightning use their own adtyp; everything
+    # else falls back to AD_MAGIC (vendor: wand_explode's losehp uses
+    # "exploding wand" generic killer; we model the AoE as magical so that
+    # MAGIC_RESIST gates it).
+    dmg_type = jnp.where(
+        is_fire, jnp.int32(AD_FIRE),
+        jnp.where(is_cold, jnp.int32(AD_COLD),
+                  jnp.where(is_elec, jnp.int32(AD_ELEC),
+                            jnp.int32(AD_MAGIC))),
+    )
+    # ``explode`` requires a Python int for dmg_type — so we evaluate it on
+    # a *concrete-traced* basis by calling 4 explode variants and selecting
+    # the right one via jnp.where on the resulting state fields.  Cheaper
+    # alternative: roll damage manually here and apply to mai + hero with
+    # the dmg_type-aware resist mask, mirroring explode() internals.
+    #
+    # We use the cheaper alternative — pass dmg_type as a traced jnp.int32
+    # is not supported by explode() since it indexes dict-of-Python-ints.
+    # So inline the AoE here with a tiny helper that *does* take a traced
+    # dmg_type via the dispatch ladder below:
+    state_after_expl = _explode_dispatch(
+        state_after_inv, rng_expl, state_after_inv.player_pos,
+        is_fire, is_cold, is_elec,
+        n_dice=6, n_sides=8,
+    )
+
+    # Merge: when ``explodes`` is True keep AoE-applied state, else keep
+    # the inventory-only state.  Both branches share an identical pytree
+    # structure so jax.tree.map is safe.
+    return jax.tree.map(
+        lambda a, b: jnp.where(explodes, a, b),
+        state_after_expl,
+        state_after_inv,
+    )
+
+
+def _explode_dispatch(state, rng, center, is_fire, is_cold, is_elec,
+                      n_dice: int, n_sides: int):
+    """Dispatch to the four explode adtyp variants and select by mask.
+
+    Each call shares the same RNG so the damage roll is identical across
+    variants (vendor: same wand, same blast, same dam).  The variant
+    selected is the one whose ``is_*`` flag is True; default (no flag set)
+    routes to AD_MAGIC.
+    """
+    from Nethax.nethax.subsystems.explode import (
+        explode as _explode,
+        AD_FIRE, AD_COLD, AD_ELEC, AD_MAGIC,
+    )
+    s_fire = _explode(state, rng, center, AD_FIRE,  n_dice, n_sides)
+    s_cold = _explode(state, rng, center, AD_COLD,  n_dice, n_sides)
+    s_elec = _explode(state, rng, center, AD_ELEC,  n_dice, n_sides)
+    s_mag  = _explode(state, rng, center, AD_MAGIC, n_dice, n_sides)
+
+    def pick(f, c, e, m):
+        # broadcasting select: is_fire / is_cold / is_elec are scalar bool.
+        out = jnp.where(is_fire, f, jnp.where(is_cold, c,
+                                              jnp.where(is_elec, e, m)))
+        return out
+
+    return jax.tree.map(pick, s_fire, s_cold, s_elec, s_mag)
 
 
 # ---- curse/bless ----------------------------------------------------------

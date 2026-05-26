@@ -186,3 +186,87 @@ def test_explode_jit():
 
     out = _run(state, _RNG)
     assert int(out.monster_ai.hp[1]) < 100
+
+
+# ---------------------------------------------------------------------------
+# Wand-backfire wiring: scroll-of-charging on a wand whose ``recharged``
+# counter is already >=7 triggers a 3x3 AoE through ``_effect_charging``.
+# Cite: vendor/nethack/src/read.c::wand_explode (line 2414);
+#       vendor/nethack/src/zap.c retributive strike notes (lines 224-263).
+# ---------------------------------------------------------------------------
+
+def test_wand_backfire_aoe_damages_neighbour():
+    """Scroll-of-charging on an overcharged WAN_FIRE: AoE hits a neighbour.
+
+    Setup:
+      * player at (10, 10)
+      * neighbour monster at (10, 11) (Chebyshev=1 — inside the AoE)
+      * far monster at (10, 15)      (outside the AoE)
+      * inventory: scroll of charging + WAN_FIRE with recharged=7
+        (next attempt overcharges and explodes)
+    Expectation:
+      * neighbour takes damage
+      * far monster is untouched
+      * the wand slot is cleared (category == 0)
+    """
+    from Nethax.nethax.subsystems.inventory import (
+        InventoryState, make_item, ItemCategory,
+    )
+    from Nethax.nethax.subsystems.items_scrolls import (
+        ScrollEffect, _SCROLL_BASE_ID, read_scroll,
+    )
+    from Nethax.nethax.subsystems.items_wands import WandEffect, ITEM_CATEGORY_WAND
+
+    state = EnvState.default(_RNG)
+    state = state.replace(
+        player_pos=jnp.array([10, 10], dtype=jnp.int16),
+        player_hp=jnp.int32(200),
+        player_hp_max=jnp.int32(200),
+    )
+    state = _place_monster(state, slot=1, row=10, col=11, hp=200)  # adjacent
+    state = _place_monster(state, slot=2, row=10, col=15, hp=200)  # far
+
+    # Inventory: slot 0 = scroll of charging, slot 1 = WAN_FIRE (recharged=7).
+    scroll_item = make_item(
+        category=int(ItemCategory.SCROLL),
+        type_id=_SCROLL_BASE_ID + int(ScrollEffect.CHARGING),
+        quantity=1,
+        buc_status=2,
+    )
+    # The wand item: we need recharged=7 so the next charge overcharges.
+    # ``make_item`` doesn't expose ``recharged`` directly; build the item then
+    # post-edit the inventory.
+    wand_item = make_item(
+        category=int(ItemCategory.WAND),
+        type_id=int(WandEffect.FIRE),
+        quantity=1,
+        buc_status=2,
+    )
+    state = state.replace(
+        inventory=InventoryState.from_items([scroll_item, wand_item])
+    )
+    # Bump the wand slot's ``recharged`` field to 7 and give it 5 charges.
+    items = state.inventory.items
+    new_recharged = items.recharged.at[1].set(jnp.int8(7))
+    new_charges   = items.charges.at[1].set(jnp.int8(5))
+    state = state.replace(
+        inventory=state.inventory.replace(
+            items=items.replace(recharged=new_recharged, charges=new_charges),
+        )
+    )
+
+    # Read the scroll (slot 0).
+    out = read_scroll(state, _RNG, 0)
+
+    # Adjacent monster must take damage; far monster untouched.
+    assert int(out.monster_ai.hp[1]) < 200, (
+        f"adjacent monster should be damaged by wand backfire AoE; "
+        f"hp={int(out.monster_ai.hp[1])}"
+    )
+    assert int(out.monster_ai.hp[2]) == 200, (
+        f"far monster must be untouched; hp={int(out.monster_ai.hp[2])}"
+    )
+    # Wand slot was cleared (category==0).
+    assert int(out.inventory.items.category[1]) == 0, (
+        "wand slot must be cleared after overcharge explosion"
+    )
