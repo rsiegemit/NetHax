@@ -1076,15 +1076,39 @@ def handle_apply_container(state, rng):
     ``parent_slot >= 0`` so it never opens a floor container (those go
     through ``#loot`` → ``handle_loot_floor`` instead).
 
+    NLE multi-key: when the agent emits ``APPLY -> letter b`` the
+    dispatcher stashes inventory slot 1 in ``state.pending_action_slot``.
+    We look for a carried container whose ``parent_slot`` equals that
+    chosen inventory slot; if found, that container is opened.  Otherwise
+    we fall back to the legacy "first carried container" auto-pick.
+    Cite: vendor/nethack/src/apply.c::doapply -> getobj() returns the
+    player's chosen letter.
+
     Cite: vendor/nethack/src/apply.c::doapply (container branch);
           vendor/nethack/src/pickup.c::use_container.
     """
+    from Nethax.nethax.subsystems.pending_action import resolve_slot
+
     cs = state.containers
     has_container = cs.container_type != jnp.int8(ContainerType.NONE)
     is_carried    = cs.parent_slot >= jnp.int8(0)
     usable        = has_container & is_carried
-    first_idx     = jnp.argmax(usable).astype(jnp.int32)
+    fallback_idx  = jnp.argmax(usable).astype(jnp.int32)
     any_present   = jnp.any(usable)
+
+    # Resolve agent-chosen inv slot (or -1 fallback signalling auto-pick).
+    chosen_inv_slot = resolve_slot(state, jnp.int32(-1)).astype(jnp.int32)
+    have_choice = chosen_inv_slot >= jnp.int32(0)
+
+    # Find first container whose parent_slot matches the chosen inv slot.
+    matches_choice = usable & (
+        cs.parent_slot.astype(jnp.int32) == chosen_inv_slot
+    )
+    any_match  = jnp.any(matches_choice)
+    match_idx  = jnp.argmax(matches_choice).astype(jnp.int32)
+
+    use_choice = have_choice & any_match
+    first_idx  = jnp.where(use_choice, match_idx, fallback_idx)
 
     def _open(s):
         return open_container(s, first_idx)

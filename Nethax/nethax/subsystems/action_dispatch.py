@@ -1806,17 +1806,12 @@ def _handle_zap(state, rng):
         wall_info     = _wall_info_default,
     )
 
-    # Two-step ZAP direction follow-up: if the agent supplied a direction
-    # via the AWAIT_LETTER_THEN_DIR → AWAIT_DIRECTION sequence, decode the
-    # stored (dy, dx) into the 8-dir index used by items_wands (_DIR_DY/
-    # _DIR_DX).  Default 2 (East) preserves legacy behavior when the dir
-    # is (0, 0) — meaning no direction was supplied.  Cite: vendor
-    # nethack/src/cmd.c::dozap calls getdir(); items_wands.handle_zap now
-    # accepts that direction.
+    # Two-step ZAP direction follow-up: decode (dy, dx) from pending_action_dir
+    # into the 8-dir index used by items_wands (default 2=East for legacy).
+    # Cite: vendor/nethack/src/cmd.c::dozap calls getdir().
     pdir = state.pending_action_dir.astype(jnp.int32)
     pdy = pdir[0]
     pdx = pdir[1]
-    # Map (dy, dx) → 0..7 index (N=0, NE=1, E=2, SE=3, S=4, SW=5, W=6, NW=7).
     is_n  = (pdy == -1) & (pdx ==  0)
     is_ne = (pdy == -1) & (pdx ==  1)
     is_e  = (pdy ==  0) & (pdx ==  1)
@@ -1827,8 +1822,7 @@ def _handle_zap(state, rng):
     is_nw = (pdy == -1) & (pdx == -1)
     has_dir = (pdy != 0) | (pdx != 0)
     dir_from_pending = (
-        jnp.where(is_n,  jnp.int32(0), jnp.int32(0))
-        + jnp.where(is_ne, jnp.int32(1), jnp.int32(0))
+        jnp.where(is_ne, jnp.int32(1), jnp.int32(0))
         + jnp.where(is_e,  jnp.int32(2), jnp.int32(0))
         + jnp.where(is_se, jnp.int32(3), jnp.int32(0))
         + jnp.where(is_s,  jnp.int32(4), jnp.int32(0))
@@ -1838,7 +1832,13 @@ def _handle_zap(state, rng):
     )
     zap_direction = jnp.where(has_dir, dir_from_pending, jnp.int32(2))
 
-    new_wand = _wands_handle_zap(wand_state, rng, zap_direction)
+    # NLE multi-key: resolve the chosen wand slot before delegating.
+    # Cite: vendor/nethack/src/zap.c::dozap calls getobj() for the letter.
+    from Nethax.nethax.subsystems.pending_action import resolve_slot
+    _wand_cat_mask = state.inventory.items.category == jnp.int8(ITEM_CATEGORY_WAND)
+    _wand_fallback = jnp.argmax(_wand_cat_mask).astype(jnp.int32)
+    _wand_chosen   = resolve_slot(state, _wand_fallback)
+    new_wand = _wands_handle_zap(wand_state, rng, zap_direction, _wand_chosen)
 
     # Write back the mutated slices into EnvState.
     new_monster_ai = mai.replace(

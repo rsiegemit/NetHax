@@ -1793,21 +1793,52 @@ def zap_wand(
 # Action handler export (Wave 3 entry point)
 # ---------------------------------------------------------------------------
 
-def handle_zap(state: WandState, rng: jax.Array) -> WandState:
+def handle_zap(
+    state: WandState,
+    rng: jax.Array,
+    chosen_direction: jax.Array | None = None,
+    chosen_slot: jax.Array | None = None,
+) -> WandState:
     """Zap the first wand found in inventory toward the player's last direction.
 
     Wave 4 will add a directional selection menu; for now we:
       - Find the first inventory slot with category == ITEM_CATEGORY_WAND.
       - Use direction = 2 (East) as a default stand-in for "last move".
 
+    NLE multi-key: when an agent emits ``ZAP -> letter b``, the caller
+    pre-resolves the chosen slot from ``state.pending_action_slot`` and
+    passes it here as ``chosen_slot``.  If ``chosen_slot`` points at a
+    valid wand we use it; otherwise we fall back to the argmax-first-wand
+    auto-pick.  ``WandState`` itself does not carry the EnvState's
+    pending_action_slot field, so the resolution must happen in the
+    wrapper (see ``action_dispatch._handle_zap``).
+
+    Cite: vendor/nethack/src/zap.c::dozap calls getobj() to get the
+    player's chosen letter; mirrored via ``pending_action.resolve_slot``.
+
     This function is the exported entry point consumed by action_dispatch.py.
     """
     categories = state.inventory.items.category
     is_wand    = categories == jnp.int8(ITEM_CATEGORY_WAND)
-    slot_idx   = jnp.argmax(is_wand).astype(jnp.int32)  # 0 if none found
+    fallback_slot = jnp.argmax(is_wand).astype(jnp.int32)  # 0 if none found
 
-    # Default direction: East (index 2).  Wave 4 will read state.player_direction.
-    direction = jnp.int32(2)
+    if chosen_slot is None:
+        slot_idx = fallback_slot
+    else:
+        safe_chosen = jnp.clip(
+            chosen_slot.astype(jnp.int32), 0, is_wand.shape[0] - 1
+        )
+        chosen_is_wand = is_wand[safe_chosen]
+        slot_idx = jnp.where(chosen_is_wand, safe_chosen, fallback_slot).astype(
+            jnp.int32
+        )
+
+    # Direction: prefer agent-supplied (from pending_action_dir follow-up),
+    # else default to East (index 2) for legacy callers.
+    if chosen_direction is None:
+        direction = jnp.int32(2)
+    else:
+        direction = jnp.int32(chosen_direction)
 
     return zap_wand(state, rng, slot_idx, direction)
 
