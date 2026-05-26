@@ -5183,6 +5183,40 @@ def _player_carries_quest_artifact(state) -> jnp.ndarray:
     return has
 
 
+def _find_nearest_upstair(state, src_pos: jnp.ndarray) -> tuple:
+    """Scan the player's current-level terrain for the STAIRCASE_UP tile
+    closest (Chebyshev) to ``src_pos`` and return ``(found, row, col)``.
+
+    Cite: vendor/nethack/src/wizard.c::choose_stairs (lines 329-364) +
+    ``tactics`` STRAT_HEAL branch (lines 378-415) — covetous monsters at
+    low HP teleport / shuffle toward an upstair to block hero progress.
+    Nethax simplification: pick the nearest STAIRCASE_UP tile (no ladder
+    / branch-stair fallback).
+    """
+    from Nethax.nethax.constants import TileType as _TT
+    b = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    terrain_2d = state.terrain[b, lv]
+    is_up = terrain_2d == jnp.int8(int(_TT.STAIRCASE_UP))
+    h, w = terrain_2d.shape
+
+    rows = jnp.arange(h, dtype=jnp.int32)[:, None]
+    cols = jnp.arange(w, dtype=jnp.int32)[None, :]
+    d_rows = jnp.abs(rows - src_pos[0].astype(jnp.int32))
+    d_cols = jnp.abs(cols - src_pos[1].astype(jnp.int32))
+    cheb = jnp.maximum(d_rows, d_cols)
+
+    # Sentinel distance for non-stair tiles so argmin only picks STAIRCASE_UP.
+    SENT = jnp.int32(h * w + 1)
+    dist = jnp.where(is_up, cheb, SENT)
+    flat = dist.flatten()
+    flat_idx = jnp.argmin(flat)
+    found = jnp.any(is_up)
+    row = (flat_idx // jnp.int32(w)).astype(jnp.int32)
+    col = (flat_idx %  jnp.int32(w)).astype(jnp.int32)
+    return found, row, col
+
+
 def _find_ground_quest_artifact(state) -> tuple:
     """Scan ground_items on the player's current level for a quest artifact.
 
@@ -5271,6 +5305,47 @@ def _covetous_ai_step(state):
         set_target[:, None],                       # [n, 1] -> broadcasts to [n, 2]
         jnp.broadcast_to(art_tile, (n, 2)),
         mai.target_pos,
+    )
+
+    # ----- STRAT_HEAL retreat override --------------------------------------
+    # Vendor wizard.c::tactics lines 378-415: when a covetous monster's HP
+    # is below hp_max/3 ((mtmp->mhp * 3) / mtmp->mhpmax == 0), strategy()
+    # returns STRAT_HEAL and tactics() shuffles the monster toward an
+    # upstair to hide and recover (calling choose_stairs).  In Nethax we
+    # model this by:
+    #   * mstrategy <- RETREAT (existing tag for the low-HP recover state)
+    #   * clearing the +1 speed boost (vendor heal-mode doesn't grant MFAST)
+    #   * target_pos <- nearest STAIRCASE_UP tile
+    hp_i32     = mai.hp.astype(jnp.int32)
+    hp_max_i32 = mai.hp_max.astype(jnp.int32)
+    # ``hp * 3 < hp_max`` mirrors vendor's ``(mhp*3)/mhpmax == 0`` truncation.
+    low_hp = hp_i32 * jnp.int32(3) < hp_max_i32
+    retreat = mai.alive & is_covetous & low_hp
+
+    new_strat = jnp.where(
+        retreat,
+        jnp.int8(int(MoveStrategy.RETREAT)),
+        new_strat,
+    )
+    # Clear the +1 speed bump in retreat (vendor heal mode is not MFAST).
+    new_speed = jnp.where(retreat, jnp.int8(0), new_speed)
+
+    # Per-monster nearest upstair lookup.  vmap over monster slots.
+    pos_int32 = mai.pos.astype(jnp.int32)             # [n, 2]
+    def _stair_for_slot(p):
+        f, r, c = _find_nearest_upstair(state, p)
+        return f, r, c
+    stair_found, stair_r, stair_c = jax.vmap(_stair_for_slot)(pos_int32)
+
+    set_stair = retreat & stair_found
+    stair_tile = jnp.stack(
+        [stair_r.astype(jnp.int16), stair_c.astype(jnp.int16)],
+        axis=-1,
+    )  # [n, 2]
+    new_target = jnp.where(
+        set_stair[:, None],
+        stair_tile,
+        new_target,
     )
 
     return state.replace(monster_ai=mai.replace(
