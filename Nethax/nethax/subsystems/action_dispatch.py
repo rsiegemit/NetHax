@@ -920,6 +920,32 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         rng=_new_rng2,
     )
 
+    # --- ballfall: iron ball drops on hero's head on level descent ---
+    # Vendor: ball.c::ballfall lines 43-67.  Hit chance 4/5 (vendor:
+    # ``rn2(5)`` is "non-zero ⇒ hit"); damage rn1(7,25) = 25..31; if hero
+    # wears a hard helmet, damage drops to 3.  Only fires on actual
+    # descent while Punished.  Without ball wield/weld tracking, take the
+    # safe upper-rate path (no welded-bypass).
+    from Nethax.nethax.subsystems.inventory import ArmorSlot as _ArmorSlot
+    descended_punished = descend & state_final.is_punished
+    _bf_rng_hit, _bf_rng_dmg, _new_rng3 = jax.random.split(state_final.rng, 3)
+    _bf_hit_roll = jax.random.randint(_bf_rng_hit, (), 0, 5, dtype=jnp.int32)
+    _bf_hits = descended_punished & (_bf_hit_roll != jnp.int32(0))
+    _bf_dmg = (
+        jax.random.randint(_bf_rng_dmg, (), 0, 7, dtype=jnp.int32) + jnp.int32(25)
+    )  # rn1(7, 25) = uniform[25, 31]
+    _wearing_helm = state_final.inventory.worn_armor[int(_ArmorSlot.HELM)] >= jnp.int8(0)
+    _bf_dmg = jnp.where(_wearing_helm, jnp.int32(3), _bf_dmg)
+    _bf_dmg = jnp.where(_bf_hits, _bf_dmg, jnp.int32(0))
+    _new_hp = jnp.maximum(
+        state_final.player_hp - _bf_dmg, jnp.int32(0)
+    ).astype(state_final.player_hp.dtype)
+    state_final = state_final.replace(
+        player_hp=_new_hp,
+        done=state_final.done | (_new_hp == jnp.int32(0)),
+        rng=_new_rng3,
+    )
+
     # Elbereth dust wipe when player steps over an engraved tile.
     # Cite: vendor/nethack/src/engrave.c::wipe_engr_at lines 270-290.
     # Dust Elbereth has a 1/4 chance of erasure per step (vendor rn2(4)).
