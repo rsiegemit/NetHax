@@ -368,7 +368,10 @@ def put_on_ring(state, rng: jax.Array, slot_idx: int, hand: int):
             ),
         )
 
-    return state
+    # Wave 50w: worn.c::setworn extrinsic + recalc_telepat_range bookkeeping.
+    # cite: vendor/nethack/src/worn.c lines 73-145 (setworn), 50-69 (recalc).
+    from Nethax.nethax.subsystems.armor_effects import recalc_worn_props
+    return recalc_worn_props(state)
 
 
 def take_off_ring(state, hand: int):
@@ -451,7 +454,10 @@ def take_off_ring(state, hand: int):
             status=state.status.replace(timed_statuses=new_statuses)
         )
 
-    return state
+    # Wave 50w: worn.c::setworn extrinsic + recalc_telepat_range bookkeeping.
+    # cite: vendor/nethack/src/worn.c lines 73-145 (setworn), 50-69 (recalc).
+    from Nethax.nethax.subsystems.armor_effects import recalc_worn_props
+    return recalc_worn_props(state)
 
 
 def ring_tick(state, rng: jax.Array):
@@ -605,7 +611,11 @@ def wear_amulet(state, rng: jax.Array, slot_idx: int):
         new_ts = state.status.timed_statuses.at[sleepy_idx].set(new_timeout)
         state = state.replace(status=state.status.replace(timed_statuses=new_ts))
 
-    return state
+    # Wave 50w: worn.c::setworn extrinsic + recalc_telepat_range bookkeeping
+    # (AMULET_OF_ESP grants TELEPAT and contributes to nobjs).
+    # cite: vendor/nethack/src/worn.c lines 73-145 (setworn), 50-69 (recalc).
+    from Nethax.nethax.subsystems.armor_effects import recalc_worn_props
+    return recalc_worn_props(state)
 
 
 def take_off_amulet(state):
@@ -649,7 +659,10 @@ def take_off_amulet(state):
             status=remove_intrinsic(state.status, intrinsic_id)
         )
 
-    return state
+    # Wave 50w: worn.c::setworn extrinsic + recalc_telepat_range bookkeeping.
+    # cite: vendor/nethack/src/worn.c lines 73-145 (setworn), 50-69 (recalc).
+    from Nethax.nethax.subsystems.armor_effects import recalc_worn_props
+    return recalc_worn_props(state)
 
 
 # ---------------------------------------------------------------------------

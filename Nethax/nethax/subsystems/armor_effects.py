@@ -40,8 +40,30 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 
-from Nethax.nethax.subsystems.status_effects import Intrinsic, TimedStatus
+from Nethax.nethax.subsystems.status_effects import Intrinsic, TimedStatus, N_INTRINSICS
 from Nethax.nethax.subsystems.character import ObjType
+
+
+# ---------------------------------------------------------------------------
+# Worn-slot W_xxx bit-masks (vendor/nethack/include/prop.h lines 101-122).
+# Used to populate ``status.extrinsic`` / ``status.blocked`` per-prop
+# bitmasks in vendor-parity form (one bit per worn slot granting / blocking
+# the prop).
+# ---------------------------------------------------------------------------
+W_ARM   = 0x00000001  # body armor
+W_ARMC  = 0x00000002  # cloak
+W_ARMH  = 0x00000004  # helmet
+W_ARMS  = 0x00000008  # shield
+W_ARMG  = 0x00000010  # gloves
+W_ARMF  = 0x00000020  # boots
+W_ARMU  = 0x00000040  # undershirt
+W_AMUL  = 0x00010000  # amulet
+W_RINGL = 0x00020000  # left ring
+W_RINGR = 0x00040000  # right ring
+
+# Vendor BOLT_LIM (vendor/nethack/include/hack.h:49).  Telepathy range is
+# (BOLT_LIM * BOLT_LIM) * nobjs per worn.c::recalc_telepat_range:66.
+_BOLT_LIM = 8
 
 
 # ---------------------------------------------------------------------------
@@ -480,8 +502,241 @@ def apply_armor_effects(state) -> object:
     new_inv = state.inventory.replace(
         armor_stat_bonus=bonus,
     )
-    return state.replace(
+    new_state = state.replace(
         status=new_status,
         inventory=new_inv,
         player_align=new_align,
     )
+    # Wave 50w: vendor worn.c::setworn extrinsic + blocked bitfield bookkeeping
+    # and ::recalc_telepat_range.  Re-derived from all worn slots after every
+    # armor / ring / amulet wear or take-off.
+    # cite: vendor/nethack/src/worn.c lines 73-145 (setworn), 38-44 (w_blocks),
+    #       50-69 (recalc_telepat_range).
+    return recalc_worn_props(new_state)
+
+
+# ---------------------------------------------------------------------------
+# Worn-slot property bookkeeping — vendor worn.c::setworn extrinsic +
+# blocked bitfield and recalc_telepat_range.
+#
+# Mirrors three vendor mechanisms in one idempotent JIT-pure pass:
+#
+#   1. ``u.uprops[p].extrinsic`` per-prop OR of W_xxx masks for worn items
+#      whose ``objects[otyp].oc_oprop == p`` (worn.c:96-98, 122-125).
+#   2. ``u.uprops[p].blocked``   per-prop OR of W_xxx masks from
+#      ``w_blocks(o, m)`` (worn.c:38-44): MUMMY_WRAPPING blocks INVIS in cloak
+#      slot, CORNUTHAUM blocks CLAIRVOYANT in helm slot for non-wizard role.
+#      (BLINDED via ART_EYES_OF_THE_OVERWORLD eyewear slot is punted —
+#      Nethax has no worn-eyewear slot yet.)
+#   3. ``u.unblind_telepat_range`` set to ``BOLT_LIM^2 * nobjs`` where
+#      ``nobjs`` is the count of worn items granting TELEPAT (worn.c:50-69);
+#      sentinel ``-1`` when no source.
+#
+# Per-armor-type → (W_mask, oc_oprop) mapping is encoded inline below so
+# the table stays vendor-cited and matches the explicit per-type branches
+# already used in ``apply_armor_effects`` above.
+# ---------------------------------------------------------------------------
+
+def _slot_type_id(items_type_id: jnp.ndarray, slot: jnp.ndarray) -> jnp.ndarray:
+    """Read items.type_id[slot] safely, returning 0 when slot < 0."""
+    safe = jnp.clip(slot.astype(jnp.int32), 0, items_type_id.shape[0] - 1)
+    return jnp.where(
+        slot.astype(jnp.int32) >= 0,
+        items_type_id[safe].astype(jnp.int32),
+        jnp.int32(0),
+    )
+
+
+# (type_id, oc_oprop) — armor types currently modelled by Nethax that confer
+# a single Intrinsic via vendor's setworn extrinsic mechanism.  Each entry's
+# W_mask is supplied by the slot it occupies (see callers below).
+#
+# cite: vendor/nethack/include/objects.h:447-708 — HELM/CLOAK/GLOVES/BOOTS/
+# DRGN_ARMR entries with oc_oprop != 0.
+_BODY_PROP_TABLE = [
+    (int(_GRAY_DSM),   int(Intrinsic.MAGIC_RESIST)),
+    (int(_GRAY_DS),    int(Intrinsic.MAGIC_RESIST)),
+    (int(_SILVER_DSM), int(Intrinsic.REFLECTING)),
+    (int(_SILVER_DS),  int(Intrinsic.REFLECTING)),
+    (int(_RED_DSM),    int(Intrinsic.RESIST_FIRE)),
+    (int(_RED_DS),     int(Intrinsic.RESIST_FIRE)),
+    (int(_WHITE_DSM),  int(Intrinsic.RESIST_COLD)),
+    (int(_WHITE_DS),   int(Intrinsic.RESIST_COLD)),
+    (int(_ORANGE_DSM), int(Intrinsic.RESIST_SLEEP)),
+    (int(_ORANGE_DS),  int(Intrinsic.RESIST_SLEEP)),
+    (int(_BLACK_DSM),  int(Intrinsic.RESIST_DISINT)),
+    (int(_BLACK_DS),   int(Intrinsic.RESIST_DISINT)),
+    (int(_BLUE_DSM),   int(Intrinsic.RESIST_SHOCK)),
+    (int(_BLUE_DS),    int(Intrinsic.RESIST_SHOCK)),
+    (int(_GREEN_DSM),  int(Intrinsic.RESIST_POISON)),
+    (int(_GREEN_DS),   int(Intrinsic.RESIST_POISON)),
+    (int(_YELLOW_DSM), int(Intrinsic.RESIST_ACID)),
+    (int(_YELLOW_DS),  int(Intrinsic.RESIST_ACID)),
+]
+_CLOAK_PROP_TABLE = [
+    (int(_CLOAK_OF_MAGIC_RES),     int(Intrinsic.MAGIC_RESIST)),
+    (int(_CLOAK_OF_INVISIBILITY),  int(Intrinsic.INVIS)),
+    (int(_CLOAK_OF_DISPLACEMENT),  int(Intrinsic.DISPLACED)),
+    (int(_ELVEN_CLOAK),            int(Intrinsic.STEALTH)),
+]
+_HELM_PROP_TABLE = [
+    (int(_HELM_OF_TELEPATHY), int(Intrinsic.TELEPATHY)),
+    (int(_TINFOIL_HAT),       int(Intrinsic.TELEPATHY)),
+    (int(_HELM_OF_CAUTION),   int(Intrinsic.WARNING)),
+    (int(_CORNUTHAUM),        int(Intrinsic.CLAIRVOYANT)),
+]
+_GLOVE_PROP_TABLE: list = []   # no glove type currently sets a flat extrinsic
+                               # via the setworn path (GoP / fumbling / dex
+                               # bonus are handled inline above).
+_BOOT_PROP_TABLE = [
+    (int(_LEVITATION_BOOTS),    int(Intrinsic.LEVITATION)),
+    (int(_WATER_WALKING_BOOTS), int(Intrinsic.WWALKING)),
+    (int(_JUMPING_BOOTS),       int(Intrinsic.JUMPING)),
+    (int(_ELVEN_BOOTS),         int(Intrinsic.STEALTH)),
+    (int(_SPEED_BOOTS),         int(Intrinsic.FAST)),
+]
+
+
+def _grant_mask(type_id: jnp.ndarray, table, w_mask: int) -> jnp.ndarray:
+    """Build the per-prop OR-of-W_masks contributed by a single worn slot.
+
+    Returns int32[N_INTRINSICS]: for every (otyp, prop) in ``table`` whose
+    type_id matches the worn item, OR in ``w_mask`` at index ``prop``.
+    Empty slot (type_id == 0) yields the zero vector.
+    """
+    contrib = jnp.zeros((N_INTRINSICS,), dtype=jnp.int32)
+    if not table:
+        return contrib
+    for otyp, prop in table:
+        match = type_id == jnp.int32(int(otyp))
+        contrib = contrib.at[int(prop)].set(
+            contrib[int(prop)] | jnp.where(match, jnp.int32(w_mask), jnp.int32(0))
+        )
+    return contrib
+
+
+# Ring effect index → Intrinsic — duplicated locally from
+# items_jewelry._RING_TO_INTRINSIC to avoid an import cycle.  Kept in sync
+# by inspection: any change to the jewelry table needs a mirror here.
+# cite: vendor/nethack/include/objects.h:741-827 (RING() oc_oprop).
+_RING_OPROP_TABLE_VALS = [
+    (6,  int(Intrinsic.REGEN)),                  # REGENERATION
+    (7,  int(Intrinsic.SEARCHING)),
+    (8,  int(Intrinsic.STEALTH)),
+    (9,  int(Intrinsic.FIXED_ABIL)),             # SUSTAIN_ABILITY
+    (10, int(Intrinsic.LEVITATION)),
+    (12, int(Intrinsic.AGGRAVATE)),              # AGGRAVATE_MONSTER
+    (13, int(Intrinsic.CONFLICT)),
+    (14, int(Intrinsic.WARNING)),
+    (15, int(Intrinsic.RESIST_POISON)),
+    (16, int(Intrinsic.RESIST_FIRE)),
+    (17, int(Intrinsic.RESIST_COLD)),
+    (18, int(Intrinsic.RESIST_SHOCK)),
+    (19, int(Intrinsic.FREE_ACTION)),
+    (20, int(Intrinsic.SLOW_DIGESTION)),
+    (21, int(Intrinsic.TELEPORT)),
+    (22, int(Intrinsic.TELEPORT_CONTROL)),
+    (23, int(Intrinsic.POLYMORPH)),
+    (24, int(Intrinsic.POLYMORPH_CONTROL)),
+    (25, int(Intrinsic.INVIS)),
+    (26, int(Intrinsic.SEE_INVIS)),
+    (27, int(Intrinsic.PROT_FROM_SHAPE_CHANGERS)),
+]
+
+# Amulet effect index → Intrinsic — local mirror of
+# items_jewelry._AMULET_TO_INTRINSIC.  cite: vendor/nethack/include/objects.h
+# :835-875 (AMULET() oc_oprop) — ESP→TELEPAT, etc.
+_AMULET_OPROP_TABLE_VALS = [
+    (0,  int(Intrinsic.TELEPATHY)),       # ESP
+    (1,  int(Intrinsic.LIFESAVED)),       # LIFE_SAVING
+    (4,  int(Intrinsic.RESIST_POISON)),   # VERSUS_POISON
+    (6,  int(Intrinsic.UNCHANGING)),
+    (7,  int(Intrinsic.REFLECTING)),
+    (8,  int(Intrinsic.BREATHLESS)),      # MAGICAL_BREATHING
+    (9,  int(Intrinsic.PROTECTION)),      # GUARDING
+    (10, int(Intrinsic.FLYING)),
+]
+
+
+def recalc_worn_props(state) -> object:
+    """Re-derive ``status.extrinsic`` / ``status.blocked`` / ``unblind_telepat_range``
+    from all currently-worn slots.
+
+    Mirrors vendor ``setworn`` (worn.c:73-145) extrinsic + blocked bookkeeping
+    and ``recalc_telepat_range`` (worn.c:50-69) in a single idempotent pass.
+    Idempotent and JIT-pure; safe to call after any wear / take-off.
+
+    Cite: vendor/nethack/src/worn.c lines 73 (setworn), 38 (w_blocks),
+          50 (recalc_telepat_range).
+    """
+    from Nethax.nethax.subsystems.inventory import ArmorSlot
+
+    items_tid = state.inventory.items.type_id
+
+    # ---- Worn type_ids per slot -------------------------------------------
+    body_tid  = _slot_type_id(items_tid, state.inventory.worn_armor[int(ArmorSlot.BODY)])
+    cloak_tid = _slot_type_id(items_tid, state.inventory.worn_armor[int(ArmorSlot.CLOAK)])
+    helm_tid  = _slot_type_id(items_tid, state.inventory.worn_armor[int(ArmorSlot.HELM)])
+    glove_tid = _slot_type_id(items_tid, state.inventory.worn_armor[int(ArmorSlot.GLOVES)])
+    boot_tid  = _slot_type_id(items_tid, state.inventory.worn_armor[int(ArmorSlot.BOOTS)])
+
+    ring_l_tid = _slot_type_id(items_tid, state.inventory.worn_rings[0])
+    ring_r_tid = _slot_type_id(items_tid, state.inventory.worn_rings[1])
+    amul_tid   = _slot_type_id(items_tid, state.inventory.worn_amulet)
+
+    # ---- Per-slot extrinsic contribution ----------------------------------
+    extr = jnp.zeros((N_INTRINSICS,), dtype=jnp.int32)
+    extr = extr | _grant_mask(body_tid,  _BODY_PROP_TABLE,  W_ARM)
+    extr = extr | _grant_mask(cloak_tid, _CLOAK_PROP_TABLE, W_ARMC)
+    extr = extr | _grant_mask(helm_tid,  _HELM_PROP_TABLE,  W_ARMH)
+    extr = extr | _grant_mask(glove_tid, _GLOVE_PROP_TABLE, W_ARMG)
+    extr = extr | _grant_mask(boot_tid,  _BOOT_PROP_TABLE,  W_ARMF)
+    extr = extr | _grant_mask(ring_l_tid, _RING_OPROP_TABLE_VALS, W_RINGL)
+    extr = extr | _grant_mask(ring_r_tid, _RING_OPROP_TABLE_VALS, W_RINGR)
+    extr = extr | _grant_mask(amul_tid,   _AMULET_OPROP_TABLE_VALS, W_AMUL)
+
+    # ---- w_blocks (worn.c:38-44) ------------------------------------------
+    # MUMMY_WRAPPING in cloak slot blocks INVIS.
+    is_mummy = cloak_tid == jnp.int32(int(_MUMMY_WRAPPING))
+    blocked = jnp.zeros((N_INTRINSICS,), dtype=jnp.int32)
+    blocked = blocked.at[int(Intrinsic.INVIS)].set(
+        jnp.where(is_mummy, jnp.int32(W_ARMC), jnp.int32(0))
+    )
+    # CORNUTHAUM in helm slot blocks CLAIRVOYANT for non-wizards.
+    is_cornu     = helm_tid == jnp.int32(int(_CORNUTHAUM))
+    is_nonwizard = state.player_role != jnp.int8(_ROLE_WIZARD)
+    cornu_blocks = is_cornu & is_nonwizard
+    blocked = blocked.at[int(Intrinsic.CLAIRVOYANT)].set(
+        jnp.where(cornu_blocks, jnp.int32(W_ARMH), jnp.int32(0))
+    )
+    # NOTE: ART_EYES_OF_THE_OVERWORLD blocks BLINDED via W_TOOL slot — Nethax
+    # has no worn-eyewear (W_TOOL) slot yet, so that branch is punted.
+    # cite: vendor/nethack/src/worn.c lines 42-43.
+
+    # ---- recalc_telepat_range (worn.c:50-69) ------------------------------
+    # Count worn slots (armor + rings + amulet) whose oc_oprop == TELEPAT.
+    def _grants_telep(tid: jnp.ndarray, table) -> jnp.ndarray:
+        if not table:
+            return jnp.bool_(False)
+        m = jnp.bool_(False)
+        for otyp, prop in table:
+            if int(prop) == int(Intrinsic.TELEPATHY):
+                m = m | (tid == jnp.int32(int(otyp)))
+        return m
+
+    n_telep = (
+        _grants_telep(helm_tid,  _HELM_PROP_TABLE).astype(jnp.int32)
+        + _grants_telep(amul_tid, _AMULET_OPROP_TABLE_VALS).astype(jnp.int32)
+        + _grants_telep(ring_l_tid, _RING_OPROP_TABLE_VALS).astype(jnp.int32)
+        + _grants_telep(ring_r_tid, _RING_OPROP_TABLE_VALS).astype(jnp.int32)
+    )
+    # Vendor sentinel: -1 when nobjs == 0, else BOLT_LIM² * nobjs.
+    # cite: vendor/nethack/src/worn.c lines 65-68.
+    telep_range = jnp.where(
+        n_telep > jnp.int32(0),
+        jnp.int32(_BOLT_LIM * _BOLT_LIM) * n_telep,
+        jnp.int32(-1),
+    )
+
+    new_status = state.status.replace(extrinsic=extr, blocked=blocked)
+    return state.replace(status=new_status, unblind_telepat_range=telep_range)
