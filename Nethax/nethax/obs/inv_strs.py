@@ -863,12 +863,19 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     def render_nonempty(args):
         b, c = args
 
-        # 1. Letter prefix: "a - "
-        letter = _LETTERS[slot_idx]
-        b, c = _write_byte(b, c, letter)
-        b, c = _write_byte(b, c, jnp.uint8(ord(' ')))
-        b, c = _write_byte(b, c, jnp.uint8(ord('-')))
-        b, c = _write_byte(b, c, jnp.uint8(ord(' ')))
+        # 1. NLE byte-parity: NLE inv_strs does NOT include a letter prefix.
+        # Vendor: vendor/nle/win/rl/winrl.cc:459 writes `item.str` which is
+        # the result of vendor `doname(otmp)` — that does NOT include a
+        # leading "<letter> - " (the letter is conveyed via inv_letters[i]).
+        # NetHack/Nethax mode keeps the legacy prefix for human-readable
+        # tty output; NLE mode omits it.  Cite: docs/INV_STRS_FORMAT_DIFF.md.
+        from Nethax.nethax.parity_mode import is_nle_mode as _is_nle
+        if not _is_nle():
+            letter = _LETTERS[slot_idx]
+            b, c = _write_byte(b, c, letter)
+            b, c = _write_byte(b, c, jnp.uint8(ord(' ')))
+            b, c = _write_byte(b, c, jnp.uint8(ord('-')))
+            b, c = _write_byte(b, c, jnp.uint8(ord(' ')))
 
         # 2. Quantity word: "<N> " for stacks, "a "/"an " for singletons.
         # Full just_an() exceptions via _OBJECT_USE_AN/_APP_USE_AN tables.
