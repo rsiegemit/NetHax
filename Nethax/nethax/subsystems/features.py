@@ -791,7 +791,74 @@ def process_bridge_entities_on_close(state, pos: jnp.ndarray, rng: jax.Array | N
     new_alive = jnp.where(crushed, jnp.bool_(False), mai.alive)
     new_hp = jnp.where(crushed, jnp.int32(0), mai.hp)
     new_mai = mai.replace(alive=new_alive, hp=new_hp, pos=new_pos)
-    return state.replace(monster_ai=new_mai)
+    state = state.replace(monster_ai=new_mai)
+
+    # --- Hero-side crush (dbridge.c::do_entity hero branch + e_died) ------
+    # If the hero is on the bridge tile or the paired-wall set, take crush
+    # damage ``2d4 + ulevel/2``.  Passes_walls intrinsic / phasing bypasses
+    # the damage (vendor automiss — dbridge.c:486-490).  Lethal damage sets
+    # scoring.death_cause = CRUSHING and done = True.
+    #
+    # Note: vendor also runs the e_jumped / e_missed rolls for the hero
+    # (rnd(20) + dx > 18 / rnd(10) jump), but those require interactive
+    # jump input — left as a deferred item.  In the JAX port the hero
+    # always eats the crush damage when standing on the affected tiles
+    # unless Passes_walls.
+    #
+    # Cite: vendor/nethack/src/dbridge.c::do_entity (hero branch);
+    #       vendor/nethack/src/dbridge.c::e_died lines 405-435.
+    from Nethax.nethax.subsystems.status_effects import Intrinsic as _Intr
+    from Nethax.nethax.subsystems.scoring import DeathCause
+
+    p_r = state.player_pos[0].astype(jnp.int32)
+    p_c = state.player_pos[1].astype(jnp.int32)
+    hero_on_bridge = (p_r == row) & (p_c == col)
+    hero_on_n = (p_r == row - jnp.int32(1)) & (p_c == col)
+    hero_on_s = (p_r == row + jnp.int32(1)) & (p_c == col)
+    hero_on_w = (p_r == row) & (p_c == col - jnp.int32(1))
+    hero_on_e = (p_r == row) & (p_c == col + jnp.int32(1))
+    hero_affected = hero_on_bridge | hero_on_n | hero_on_s | hero_on_w | hero_on_e
+
+    passes_walls = (
+        state.status.intrinsics[int(_Intr.PASSES_WALLS)]
+        | (state.status.timed_intrinsics[int(_Intr.PASSES_WALLS)] > jnp.int32(0))
+    )
+    hero_crushed = hero_affected & (~passes_walls)
+
+    # Damage roll: 2d4 + ulevel/2.  Deterministic 0 when no rng available
+    # (legacy callers don't roll); when rng is provided, fold a fresh
+    # subkey for the hero damage so it's independent of monster rolls.
+    if rng is None:
+        # Conservative: with no rng, apply mean damage (5) deterministically
+        # to keep the hero-crush hazard meaningful even on legacy callers.
+        # (2d4 mean = 5; integer.)
+        dmg_dice = jnp.int32(5)
+    else:
+        rng_hero = jax.random.fold_in(rng, jnp.int32(0x0DB1D5E0))  # arbitrary tag
+        d1 = jax.random.randint(rng_hero, (), 1, 5, dtype=jnp.int32)
+        rng_hero2 = jax.random.fold_in(rng_hero, jnp.int32(1))
+        d2 = jax.random.randint(rng_hero2, (), 1, 5, dtype=jnp.int32)
+        dmg_dice = d1 + d2
+
+    ulevel = state.player_xl.astype(jnp.int32)
+    dmg = (dmg_dice + ulevel // jnp.int32(2)).astype(jnp.int32)
+    dmg = jnp.where(hero_crushed, dmg, jnp.int32(0))
+
+    new_hp_hero = jnp.maximum(state.player_hp - dmg, jnp.int32(0))
+    lethal = hero_crushed & (new_hp_hero == jnp.int32(0))
+
+    new_done = state.done | lethal
+    new_cause = jnp.where(
+        lethal,
+        jnp.int8(int(DeathCause.CRUSHING)),
+        state.scoring.death_cause,
+    )
+    new_scoring = state.scoring.replace(death_cause=new_cause)
+    return state.replace(
+        player_hp=new_hp_hero,
+        done=new_done,
+        scoring=new_scoring,
+    )
 
 
 def open_drawbridge(
