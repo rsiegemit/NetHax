@@ -67,10 +67,14 @@ _MAGIC_MARKER_TYPE_ID   = 217
 _TIN_WHISTLE_TYPE_ID    = 220
 _MAGIC_WHISTLE_TYPE_ID  = 221
 _MAGIC_FLUTE_TYPE_ID    = 223
+_TOOLED_HORN_TYPE_ID    = 224
 _FROST_HORN_TYPE_ID     = 225
 _FIRE_HORN_TYPE_ID      = 226
 _HORN_OF_PLENTY_TYPE_ID = 227
+_WOODEN_HARP_TYPE_ID    = 228
+_MAGIC_HARP_TYPE_ID     = 229
 _BUGLE_TYPE_ID          = 231
+_DRUM_OF_EARTHQUAKE_TID = 233
 
 # Food type IDs (vendor/nethack/include/objects.h)
 _TRIPE_RATION_TYPE_ID = 239
@@ -146,10 +150,14 @@ def _handler_for_type_id(type_id: jnp.ndarray) -> jnp.ndarray:
         _eq(_STETHOSCOPE_TYPE_ID,       _H_STETHOSCOPE),
         _eq(_TOWEL_TYPE_ID,             _H_TOWEL),
         _eq(_MAGIC_FLUTE_TYPE_ID,       _H_INSTRUMENT),
+        _eq(_TOOLED_HORN_TYPE_ID,       _H_INSTRUMENT),
         _eq(_FROST_HORN_TYPE_ID,        _H_INSTRUMENT),
         _eq(_FIRE_HORN_TYPE_ID,         _H_INSTRUMENT),
         _eq(_HORN_OF_PLENTY_TYPE_ID,    _H_INSTRUMENT),
+        _eq(_WOODEN_HARP_TYPE_ID,       _H_INSTRUMENT),
+        _eq(_MAGIC_HARP_TYPE_ID,        _H_INSTRUMENT),
         _eq(_BUGLE_TYPE_ID,             _H_INSTRUMENT),
+        _eq(_DRUM_OF_EARTHQUAKE_TID,    _H_INSTRUMENT),
         _eq(_TINNING_KIT_TYPE_ID,       _H_TINNING_KIT),
         _eq(_EXPENSIVE_CAMERA_TYPE_ID,  _H_EXPENSIVE_CAMERA),
         _eq(_LOCK_PICK_TYPE_ID,         _H_LOCK_PICK),
@@ -661,10 +669,72 @@ def _h_instrument(state, rng: jax.Array) -> object:
         quantity=new_qty_hop,
     )
 
+    # TOOLED_HORN: wake all sleeping monsters within 10 + scare those past
+    # dist/3 boundary (vendor music.c:639-648 — distance-based dispatch).
+    # We model "scare" as setting flee_until_turn = timestep + 20 on the
+    # affected slots.
+    is_tooled = tid == jnp.int32(_TOOLED_HORN_TYPE_ID)
+    tooled_wake = mai.alive & mai.asleep & (dist <= jnp.int32(3))
+    tooled_scare = mai.alive & (dist > jnp.int32(3)) & (dist <= jnp.int32(10))
+    new_asleep_tooled = jnp.where(
+        jnp.broadcast_to(is_tooled, (MAX_MONSTERS_PER_LEVEL,)),
+        jnp.where(tooled_wake, jnp.zeros(MAX_MONSTERS_PER_LEVEL, dtype=bool), new_asleep_bugle),
+        new_asleep_bugle,
+    )
+    flee_target_turn = state.timestep.astype(jnp.int32) + jnp.int32(20)
+    new_flee_tooled = jnp.where(
+        jnp.broadcast_to(is_tooled, (MAX_MONSTERS_PER_LEVEL,)),
+        jnp.where(tooled_scare,
+                  jnp.full((MAX_MONSTERS_PER_LEVEL,), flee_target_turn, dtype=jnp.int32),
+                  mai.flee_until_turn),
+        mai.flee_until_turn,
+    )
+
+    # WOODEN_HARP: calm nymphs — clear flee_until_turn on adjacent hostile
+    # monsters within 5 (vendor music.c:672-687 dex-check on calm_nymphs).
+    is_wooden_harp = tid == jnp.int32(_WOODEN_HARP_TYPE_ID)
+    harp_targets = mai.alive & ~mai.tame & (dist <= jnp.int32(5))
+    # Vendor gates calm on `rn2(ACURR(A_DEX)) + u.ulevel > 25`; we collapse
+    # to a single roll: success when rn2(dex+ulevel) < 6.
+    rng, sub_harp = jax.random.split(rng)
+    dex_i32 = state.player_dex.astype(jnp.int32)
+    ulvl_i32 = state.player_xl.astype(jnp.int32)
+    harp_threshold = jnp.maximum(dex_i32 + ulvl_i32, jnp.int32(1))
+    harp_roll = jax.random.randint(sub_harp, (), 0, harp_threshold, dtype=jnp.int32)
+    harp_success = harp_roll > jnp.int32(25)
+    new_flee_harp = jnp.where(
+        jnp.broadcast_to(is_wooden_harp & harp_success, (MAX_MONSTERS_PER_LEVEL,)),
+        jnp.where(harp_targets, jnp.zeros(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32), new_flee_tooled),
+        new_flee_tooled,
+    )
+
+    # MAGIC_HARP: charm all monsters within 5 (vendor music.c:659-670 —
+    # makes them peaceful).  Set peaceful=True on alive non-tame in range.
+    is_magic_harp = tid == jnp.int32(_MAGIC_HARP_TYPE_ID)
+    charm_targets = mai.alive & ~mai.tame & (dist <= jnp.int32(5))
+    new_peaceful = jnp.where(
+        jnp.broadcast_to(is_magic_harp, (MAX_MONSTERS_PER_LEVEL,)),
+        jnp.where(charm_targets, jnp.ones(MAX_MONSTERS_PER_LEVEL, dtype=bool), mai.peaceful),
+        mai.peaceful,
+    )
+
+    # DRUM_OF_EARTHQUAKE: wake every sleeping monster within force radius
+    # 9 (vendor music.c:344-475 — also creates pits, but Nethax doesn't
+    # model dynamic pit creation here; emit the wake-cascade only).
+    is_drum = tid == jnp.int32(_DRUM_OF_EARTHQUAKE_TID)
+    drum_targets = mai.alive & mai.asleep & (dist <= jnp.int32(9))
+    new_asleep_drum = jnp.where(
+        jnp.broadcast_to(is_drum, (MAX_MONSTERS_PER_LEVEL,)),
+        jnp.where(drum_targets, jnp.zeros(MAX_MONSTERS_PER_LEVEL, dtype=bool), new_asleep_tooled),
+        new_asleep_tooled,
+    )
+
     mai_out = mai.replace(
-        asleep=new_asleep_bugle,
+        asleep=new_asleep_drum,
         hp=new_hp_horn,
         alive=new_alive_horn,
+        peaceful=new_peaceful,
+        flee_until_turn=new_flee_harp,
     )
     return state.replace(
         monster_ai=mai_out,
