@@ -173,10 +173,15 @@ def test_dry_after_many_uses():
 # ---------------------------------------------------------------------------
 
 def test_excalibur_for_lawful_knight():
-    """Knight XL=5, Lawful, wielding long sword → Excalibur granted.
+    """Knight XL=5, Lawful, wielding long sword → Excalibur granted on a
+    winning roll of the 1-in-6 vendor gate.
 
     Vendor fountain.c:404-447 dipfountain(): if long sword + Knight + Lawful
-    + XL>=5, the Lady of the Lake grants Excalibur and the fountain dries.
+    + XL>=5 + quan==1 + !oartifact + Excalibur-doesn't-already-exist + the
+    role-conditioned ``!rn2(6)`` (Knight) random gate, the Lady of the Lake
+    grants Excalibur and the fountain dries.  We sweep up to 60 RNG seeds
+    looking for at least one grant — under vendor's 1/6 rate roughly 10
+    of those should succeed.
 
     Cite: vendor/nethack/src/fountain.c:404-447 dipfountain() Excalibur path.
     """
@@ -189,19 +194,23 @@ def test_excalibur_for_lawful_knight():
         player_align=jnp.int8(int(Alignment.LAWFUL)),
     )
 
-    rng = jax.random.PRNGKey(0)
-    result = dip_fountain(state, rng, slot_idx=0)
+    granted = False
+    for i in range(60):
+        rng = jax.random.PRNGKey(i)
+        result = dip_fountain(state, rng, slot_idx=0)
+        new_type_id = int(result.inventory.items.type_id[0])
+        if new_type_id == _EXCALIBUR_TYPE_ID:
+            granted = True
+            r = int(state.player_pos[0])
+            c = int(state.player_pos[1])
+            tile = int(result.terrain[0, 0, r, c])
+            assert tile == int(TileType.FLOOR), (
+                f"Expected fountain to dry on Excalibur grant "
+                f"(FLOOR={int(TileType.FLOOR)}), got {tile}"
+            )
+            break
 
-    # Sword in slot 0 should now be Excalibur.
-    new_type_id = int(result.inventory.items.type_id[0])
-    assert new_type_id == _EXCALIBUR_TYPE_ID, (
-        f"Expected Excalibur type_id={_EXCALIBUR_TYPE_ID}, got {new_type_id}"
-    )
-
-    # Fountain should have dried (tile = FLOOR).
-    r = int(state.player_pos[0])
-    c = int(state.player_pos[1])
-    tile = int(result.terrain[0, 0, r, c])
-    assert tile == int(TileType.FLOOR), (
-        f"Expected fountain to dry (FLOOR={int(TileType.FLOOR)}), got {tile}"
+    assert granted, (
+        "Expected at least one Excalibur grant across 60 seeds for a "
+        "Lawful Knight XL=5 with a single non-artifact long sword."
     )
