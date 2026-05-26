@@ -130,6 +130,15 @@ class EnvState:
     occupation_target: jax.Array     # int32  monster slot / item idx
     occupation_remaining: jax.Array  # int8   turns left
 
+    # ---- Wave 47h: ball-as-projectile state (vendor ball.c::drop_ball) -
+    # Tracks when the hero throws the ball at a trap to escape (vendor
+    # drop_ball lines 882-961).  Once thrown, the ball is in flight for
+    # ``ball_thrown_turns`` turns; on landing it can free the hero from
+    # a bear trap / web / pit.
+    # Cite: vendor/nethack/src/ball.c::drop_ball lines 882-961.
+    ball_thrown_pos: jax.Array       # int16[2] (row, col) target tile
+    ball_thrown_turns: jax.Array     # int8     turns left in flight
+
     # ---- Player core (kept here for fast access; not part of any subsystem) ----
     player_pos: jax.Array       # int16[2]  (row, col)
     player_hp: jax.Array        # int32
@@ -301,6 +310,8 @@ class EnvState:
             occupation_kind=jnp.int8(0),
             occupation_target=jnp.int32(-1),
             occupation_remaining=jnp.int8(0),
+            ball_thrown_pos=jnp.array([-1, -1], dtype=jnp.int16),
+            ball_thrown_turns=jnp.int8(0),
             # player core
             player_pos=jnp.zeros((2,), dtype=jnp.int16),
             player_hp=jnp.int32(10),

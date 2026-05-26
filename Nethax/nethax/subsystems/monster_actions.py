@@ -122,6 +122,16 @@ def _build_special_action_table() -> jnp.ndarray:
     # Nymphs (wood/water/mountain): AD_SITM steal+tele, mhitu.c ~1972
     for i in range(_IDX_NYMPH_FIRST, _IDX_NYMPH_LAST + 1):
         tbl[i] = _ACT_NYMPH
+    # Wave 47h: also route animal-class thieves (monkey/ape/lemure) to the
+    # same dispatch.  They share the AD_SITM attack but vendor adds a
+    # cursed-worn-item gate (steal.c:457-489) — see _nymph_steal for the
+    # curse check.  MONSTERS entry indices verified against chunk1/4.
+    _IDX_LEMURE_HERE = 53
+    _IDX_MONKEY_HERE = 240
+    _IDX_APE_HERE    = 241
+    tbl[_IDX_LEMURE_HERE] = _ACT_NYMPH
+    tbl[_IDX_MONKEY_HERE] = _ACT_NYMPH
+    tbl[_IDX_APE_HERE]    = _ACT_NYMPH
     # Leprechaun: AD_SGLD gold-steal+tele, mhitu.c ~2269
     tbl[_IDX_LEPRECHAUN] = _ACT_LEPREC
     # Succubus / incubus: AD_SEDU drain, mhitu.c::doseduce ~2182
@@ -357,17 +367,39 @@ def _nymph_steal(state, slot: jnp.ndarray, rng: jax.Array):
         steal_slot = slot_seq[pick]
         any_item = jnp.any(has_item)
 
+        # Wave 47h: cursed-worn gate (vendor steal.c:457-489).  Animals
+        # (monkey/ape/lemure) fail to steal cursed worn items.  Nymphs
+        # break the curse and proceed.
+        is_animal_thief = (
+            (mai.entry_idx[idx].astype(jnp.int32) == jnp.int32(53))   # lemure
+            | (mai.entry_idx[idx].astype(jnp.int32) == jnp.int32(240))  # monkey
+            | (mai.entry_idx[idx].astype(jnp.int32) == jnp.int32(241))  # ape
+        )
+        # "Worn" detection: scan worn_armor / wielded.  Conservative —
+        # treat the picked slot as "worn" if it matches any worn pointer.
+        wa = s.inventory.worn_armor.astype(jnp.int32)
+        worn_match = jnp.any(wa == steal_slot.astype(jnp.int32))
+        wielded_match = s.inventory.wielded.astype(jnp.int32) == steal_slot.astype(jnp.int32)
+        is_worn = worn_match | wielded_match
+        is_cursed_buc = items.buc_status[steal_slot].astype(jnp.int32) == jnp.int32(1)
+        animal_blocked = is_animal_thief & is_worn & is_cursed_buc
+        steal_allowed = any_item & ~animal_blocked
+
         def _do_steal(s2):
-            # Zero out the stolen slot (category=0 marks it empty).
             old_items = s2.inventory.items
+            # Nymph branch (or animal stealing non-worn/non-cursed): zero
+            # out the stolen slot AND uncurse it (vendor 469-470).
+            uncurse = is_worn & is_cursed_buc & ~is_animal_thief
+            new_buc = jnp.where(uncurse, jnp.int8(2), old_items.buc_status[steal_slot])
             new_items = old_items.replace(
                 category=old_items.category.at[steal_slot].set(jnp.int8(0)),
                 quantity=old_items.quantity.at[steal_slot].set(jnp.int16(0)),
+                buc_status=old_items.buc_status.at[steal_slot].set(new_buc),
             )
             new_inv = s2.inventory.replace(items=new_items)
             return s2.replace(inventory=new_inv)
 
-        s = jax.lax.cond(any_item, _do_steal, lambda s2: s2, s)
+        s = jax.lax.cond(steal_allowed, _do_steal, lambda s2: s2, s)
 
         # Teleport nymph to random valid tile.
         raw_tele = jax.random.randint(rng_tele, (), 0, _N_TELE_TILES)

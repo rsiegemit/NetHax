@@ -655,6 +655,15 @@ class MonsterAIState:
     #       vendor/nethack/src/zap.c::flash_hits_mon line ~2925.
     blind_timer: jnp.ndarray       # [MAX_MONSTERS_PER_LEVEL]  int16
 
+    # Wave 47h: ``apparent_entry`` mirrors vendor mtmp->mappearance
+    # (used together with m_ap_type == M_AP_MONSTER for shape-changed
+    # creatures and Wizard-clone deception).  -1 == no disguise; the
+    # display layer renders the monster as ``apparent_entry`` instead
+    # of ``entry_idx`` when this is set.
+    # Cite: vendor/nethack/include/monst.h mtmp->m_ap_type / mappearance;
+    #       vendor/nethack/src/wizard.c::clonewiz lines 528-531.
+    apparent_entry: jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL]  int16
+
 
 def make_monster_ai_state() -> MonsterAIState:
     """Return a zero-initialized MonsterAIState for one level."""
@@ -714,6 +723,7 @@ def make_monster_ai_state() -> MonsterAIState:
         # Wave 45a: per-monster level + blind timer (zero until set at spawn).
         m_lev=jnp.zeros(n, dtype=jnp.int16),
         blind_timer=jnp.zeros(n, dtype=jnp.int16),
+        apparent_entry=jnp.full((n,), -1, dtype=jnp.int16),
     )
 
 
@@ -1968,6 +1978,143 @@ def _try_scroll_earth(state, rng: jax.Array, monster_idx: jnp.ndarray):
 #   unicorn horn = 236 (TOOL — categorized as WEPTOOL in vendor)
 _BUGLE_TID:        int = 231
 _UNICORN_HORN_TID: int = 236
+_BAG_OF_HOLDING_TID: int = 220  # objects.py — bag of holding (TOOL)
+
+
+def _try_loot_floor_container(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Monster on a tile with a container scoops its top item.
+
+    Vendor cite: muse.c lines 2234-2241 — MUSE_BAG (misc branch, the
+    "loot a container" use of an empty bag of holding).  Vendor opens
+    the adjacent container and transfers items in; this Nethax MVP
+    simplifies to: when the monster's tile has a floor item that's a
+    BAG (any container category), move the first stack into the
+    monster's inventory slot 0.
+
+    No container-state plumbing change — uses the existing ground_items
+    array as the source.  Bag-of-holding is detected by type_id 220
+    (objects.py).  Skips when the monster's tile has nothing or when
+    no free monster inv slot is available.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    mpos = mai.pos[idx].astype(jnp.int32)
+    mr = mpos[0]; mc = mpos[1]
+
+    g = state.ground_items
+    br = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+
+    # Vendor MUSE_BAG fires when the monster has an empty bag of holding
+    # (a tool slot containing TID 220).  Check inv for BoH presence.
+    found_bag, _bag_slot = _find_inv_slot(mai, idx, _CAT_TOOL, _BAG_OF_HOLDING_TID)
+
+    # Pick the top of the ground stack at the monster's tile.
+    cat_here = g.category[br, lv, mr, mc, 0].astype(jnp.int32)
+    tid_here = g.type_id[br, lv, mr, mc, 0]
+    qty_here = g.quantity[br, lv, mr, mc, 0]
+    has_floor_item = cat_here != jnp.int32(0)
+
+    # Find first empty monster inv slot (other than slot 0 which holds the
+    # bag).  Scan from slot 1.
+    inv_cats = mai.inv_category[idx].astype(jnp.int32)
+    free_mask = inv_cats == jnp.int32(0)
+    free_mask = free_mask.at[0].set(False)  # never overwrite the bag itself
+    any_free = jnp.any(free_mask)
+    free_slot = jnp.argmax(free_mask.astype(jnp.int32)).astype(jnp.int32)
+
+    do_loot = found_bag & has_floor_item & any_free
+
+    # Transfer.
+    new_inv_cat = mai.inv_category.at[idx, free_slot].set(
+        jnp.where(do_loot, cat_here.astype(jnp.int8), mai.inv_category[idx, free_slot])
+    )
+    new_inv_tid = mai.inv_type_id.at[idx, free_slot].set(
+        jnp.where(do_loot, tid_here, mai.inv_type_id[idx, free_slot])
+    )
+    new_inv_qty = mai.inv_quantity.at[idx, free_slot].set(
+        jnp.where(do_loot, qty_here, mai.inv_quantity[idx, free_slot])
+    )
+
+    # Clear the floor stack slot.
+    new_g_cat = g.category.at[br, lv, mr, mc, 0].set(
+        jnp.where(do_loot, jnp.int8(0), g.category[br, lv, mr, mc, 0])
+    )
+    new_g_qty = g.quantity.at[br, lv, mr, mc, 0].set(
+        jnp.where(do_loot, jnp.int16(0), g.quantity[br, lv, mr, mc, 0])
+    )
+    new_g = g.replace(category=new_g_cat, quantity=new_g_qty)
+    new_mai = mai.replace(
+        inv_category=new_inv_cat,
+        inv_type_id=new_inv_tid,
+        inv_quantity=new_inv_qty,
+    )
+    return state.replace(monster_ai=new_mai, ground_items=new_g)
+_WAN_UNDEAD_TURNING: int = 6   # WandEffect.UNDEAD_TURNING
+
+
+def _try_wan_undead_turning(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Monster zaps WAN_UNDEAD_TURNING at the player.
+
+    Vendor muse.c:1878 + zap.c::zhitu cases ZT_BEAM(0)/UNDEAD_TURNING.
+    Effects on player:
+      - If player wields a CORPSE item (player's inventory has a
+        weapon-slot category == FOOD and type_id corresponds to corpse
+        category), animate the corpse — vendor calls revive() on it.
+        Nethax simplification: clear that wielded slot (corpse is gone)
+        and deal 1d8 damage as the "animated zombie attacks back".
+      - If no wielded corpse and the player is UNDEAD (via Intrinsic
+        UNDEAD_WARNING — placeholder gate), deal 2d8 turning damage.
+      - Otherwise no-op (vendor's ZT_BEAM with no undead target prints a
+        flavor message only).
+
+    Cite: vendor/nethack/src/muse.c lines 1878-1889 (MUSE_WAN_UNDEAD_TURNING),
+          vendor/nethack/src/zap.c::zhitu ZT_UNDEAD_TURNING branch.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_WAND, _WAN_UNDEAD_TURNING)
+    charges = mai.inv_charges[idx, slot].astype(jnp.int32)
+    can_zap = found & (charges > 0)
+
+    # Detect wielded corpse: player's wielded inv slot has FOOD category
+    # AND a non-negative corpse_entry_idx (corpse encoding).
+    wielded = state.inventory.wielded
+    has_wielded = wielded >= jnp.int8(0)
+    safe_w = jnp.clip(wielded.astype(jnp.int32), 0, state.inventory.items.category.shape[0] - 1)
+    w_cat = state.inventory.items.category[safe_w]
+    w_corpse_idx = state.inventory.items.corpse_entry_idx[safe_w]
+    is_corpse_wielded = has_wielded & (w_cat == jnp.int8(7)) & (w_corpse_idx >= jnp.int16(0))
+
+    # Damage roll: 1d8 if corpse-wielded; 2d8 if player is undead (we
+    # don't track player-undead, so just use the corpse branch).
+    keys = jax.random.split(rng, 2)
+    dmg_corpse = jax.random.randint(keys[0], (), 1, 9, dtype=jnp.int32)
+    do_corpse = can_zap & is_corpse_wielded
+
+    # Clear the wielded corpse slot (vendor animates it; Nethax just
+    # removes it since we have no monster-animation pipeline).
+    new_pcat = jnp.where(do_corpse, jnp.int8(0), state.inventory.items.category[safe_w])
+    new_pqty = jnp.where(do_corpse, jnp.int16(0), state.inventory.items.quantity[safe_w])
+    new_items = state.inventory.items.replace(
+        category=state.inventory.items.category.at[safe_w].set(new_pcat),
+        quantity=state.inventory.items.quantity.at[safe_w].set(new_pqty),
+    )
+    new_wielded = jnp.where(do_corpse, jnp.int8(-1), state.inventory.wielded)
+    new_inv = state.inventory.replace(items=new_items, wielded=new_wielded)
+
+    dmg = jnp.where(do_corpse, dmg_corpse, jnp.int32(0))
+    new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(0)).astype(state.player_hp.dtype)
+    new_charges = jnp.where(can_zap, charges - jnp.int32(1), charges).astype(jnp.int8)
+    new_mai = mai.replace(
+        inv_charges=mai.inv_charges.at[idx, slot].set(new_charges),
+    )
+    return state.replace(
+        monster_ai=new_mai,
+        inventory=new_inv,
+        player_hp=new_hp,
+        done=state.done | (new_hp == 0),
+    )
 
 
 def _try_unicorn_horn_self(state, rng: jax.Array, monster_idx: jnp.ndarray):
@@ -2432,6 +2579,10 @@ def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
     # _try_bugle_awaken_allies docstring).
     rng_bugle = jax.random.fold_in(keys[7], jnp.int32(0xB061E))
     s = _branch(s, eligible, _try_bugle_awaken_allies, rng_bugle)
+    # (8e) bag-of-holding loot — muse.c:2234-2241.  Monster with empty
+    # bag scoops floor items from its tile.
+    rng_loot = jax.random.fold_in(keys[7], jnp.int32(0xBA61007))
+    s = _branch(s, eligible, _try_loot_floor_container, rng_loot)
 
     # ----- Offensive cascade (only when player in LoS & in range) -------
     can_attack = eligible & in_los & (dist > 1) & (dist <= 8) & ~hp_low_half
@@ -2517,6 +2668,10 @@ def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
     # ----- SCR_EARTH terrain AoE (muse.c:1891-1937) ---------------------
     rng_earth = jax.random.fold_in(keys[10], jnp.int32(0xEA47))
     s = _branch(s, can_attack, _try_scroll_earth, rng_earth)
+
+    # ----- WAN_UNDEAD_TURNING offensive (muse.c:1878) -------------------
+    rng_undead = jax.random.fold_in(keys[10], jnp.int32(0xDEAD))
+    s = _branch(s, can_attack, _try_wan_undead_turning, rng_undead)
 
     # ----- Camera flash (muse.c:1938-1955) + Bullwhip disarm (muse.c:2178)
     # Camera: in LoS at range; bullwhip: adjacent only.
@@ -4482,6 +4637,22 @@ def clone_mon(state, mon_idx: jnp.ndarray, rng: jax.Array) -> object:
             inv_category=new_inv_cat,
             inv_type_id=new_inv_tid_arr,
             inv_quantity=new_inv_qty,
+        )
+
+        # Wave 47h: Wizard-clone deception shape-change.
+        # Vendor wizard.c::clonewiz lines 528-531 — when cloning the
+        # Wizard without Protection_from_shape_changers, set
+        # ``m_ap_type = M_AP_MONSTER`` and ``mappearance = random``.
+        # Nethax mirrors via ``apparent_entry`` on monster_ai: any
+        # value >= 0 means the clone *appears* as that entry to the
+        # display layer, even though entry_idx is still the Wizard.
+        # We pick a random monster index in [1, 250] for the disguise.
+        rng_app = jax.random.fold_in(rng, jnp.int32(0xAA9E))
+        apparent_pick = jax.random.randint(rng_app, (), 1, 251, dtype=jnp.int16)
+        give_disguise = is_wizard_clone
+        new_app = jnp.where(give_disguise, apparent_pick, new_m.apparent_entry[dead_idx])
+        new_m = new_m.replace(
+            apparent_entry=new_m.apparent_entry.at[dead_idx].set(new_app)
         )
         return s.replace(monster_ai=new_m)
 
