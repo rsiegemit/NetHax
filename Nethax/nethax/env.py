@@ -23,6 +23,7 @@ from Nethax.nethax.subsystems.action_dispatch import dispatch_action
 from Nethax.nethax.subsystems.monster_ai import step as _monster_ai_step
 from Nethax.nethax.subsystems.status_effects import step as _status_step
 from Nethax.nethax.subsystems.status_effects import tick_hallu_expiry as _tick_hallu_expiry
+from Nethax.nethax.subsystems.status_effects import tick_luck_drift as _tick_luck_drift
 from Nethax.nethax.subsystems.ascension import maybe_ascend
 from Nethax.nethax.subsystems.polymorph import step as _polymorph_step
 from Nethax.nethax.subsystems.shop import shop_step as _shop_step
@@ -353,6 +354,12 @@ def _step_impl(state, action, rng):
             player_pw=new_pw,
             done=new_done,
         )
+
+        # 4a0. Luck drift toward baseluck=0 every 300/600 moves (300 if the
+        #    hero is carrying the Amulet of Yendor or god_anger>0, else 600).
+        #    Cite: vendor/nethack/src/timeout.c lines 606-620 — nh_timeout
+        #    luck-decay block.  No-op when |Luck|==baseluck or off-cadence.
+        ns = _tick_luck_drift(ns)
 
         # 4a. Experience-level check — vendor exper.c::newexplevel called from
         #    allmain.c (after nh_timeout / before the next turn).  Promotes

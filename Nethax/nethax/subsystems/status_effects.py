@@ -1381,3 +1381,83 @@ def tick_glib(env_state, rng):
     new_wielded = jnp.where(drops, jnp.int8(-1), env_state.inventory.wielded)
     new_inv = env_state.inventory.replace(wielded=new_wielded)
     return env_state.replace(inventory=new_inv)
+
+
+# ---------------------------------------------------------------------------
+# Luck drift toward baseluck (vendor timeout.c::nh_timeout lines 606-620)
+# ---------------------------------------------------------------------------
+
+_LUCKSTONE_TYPE_ID:  int = 442  # objects.py — luckstone
+_AMULET_YENDOR_TID:  int = 188  # objects.h AMULET_OF_YENDOR
+
+
+def tick_luck_drift(env_state):
+    """Drift ``player_luck`` toward baseluck every 300/600 moves.
+
+    Vendor cite: timeout.c::nh_timeout lines 606-620.
+        if (u.uluck != baseluck
+            && svm.moves % ((u.uhave.amulet || u.ugangr) ? 300 : 600) == 0) {
+            int time_luck = stone_luck(FALSE);
+            boolean nostone = !carrying(LUCKSTONE) && !stone_luck(TRUE);
+            if (u.uluck > baseluck && (nostone || time_luck < 0)) u.uluck--;
+            else if (u.uluck < baseluck && (nostone || time_luck > 0)) u.uluck++;
+        }
+
+    Simplifications (Nethax has no calendar/quest-leader-killed tracking):
+      - baseluck = 0  (no FULL_MOON / friday13 / killed_leader / FEDORA bonus).
+      - time_luck (stone_luck(FALSE) = sum of luckstone curse signs) collapses
+        to 0 here since calendar bonuses aren't modeled; the BUC sign of a
+        carried LUCKSTONE in inventory drives the gate.  Cursed luckstone
+        blocks bad-luck timeout (luck > 0 stays); blessed luckstone blocks
+        good-luck timeout (luck < 0 stays); uncursed blocks both.
+
+    JIT-stable; runs every turn but mostly no-ops.
+    """
+    moves   = env_state.timestep.astype(jnp.int32)
+    luck    = env_state.player_luck.astype(jnp.int32)
+    baseluck = jnp.int32(0)
+
+    # u.uhave.amulet || u.ugangr → 300-turn cadence; else 600.
+    inv = env_state.inventory
+    cat = inv.items.category
+    tid = inv.items.type_id
+    have_amulet = jnp.any((cat != jnp.int8(0)) & (tid == jnp.int16(_AMULET_YENDOR_TID)))
+    ugangr = env_state.prayer.god_anger.astype(jnp.int32)
+    fast_drift = have_amulet | (ugangr > jnp.int32(0))
+    period = jnp.where(fast_drift, jnp.int32(300), jnp.int32(600))
+
+    # Vendor uses `svm.moves % period == 0`; svm.moves starts at 1 and we want
+    # to skip turn 0 (no drift on episode start).
+    on_period = (moves > jnp.int32(0)) & (moves % period == jnp.int32(0))
+    luck_differs = luck != baseluck
+
+    # carrying(LUCKSTONE) — scan inventory for type_id 442.
+    has_luckstone = jnp.any(
+        (cat != jnp.int8(0)) & (tid == jnp.int16(_LUCKSTONE_TYPE_ID))
+    )
+    # BUC of (first) luckstone: -1 (cursed) | 0 (blessed) | 2 (uncursed); use
+    # explicit BUC enum: 1=cursed, 0=blessed, 2=uncursed (inventory.py BUCStatus).
+    # stone_luck(FALSE) sign:
+    #   blessed  → +1
+    #   cursed   → -1
+    #   uncursed → 0  (NB: vendor stone_luck(TRUE) returns nonzero for all)
+    luck_mask = (cat != jnp.int8(0)) & (tid == jnp.int16(_LUCKSTONE_TYPE_ID))
+    safe_idx = jnp.argmax(luck_mask.astype(jnp.int32))
+    buc = jnp.where(has_luckstone, inv.items.buc_status[safe_idx], jnp.int8(2)).astype(jnp.int32)
+    # buc: 1=cursed, 0=blessed, 2=uncursed (BUCStatus).
+    time_luck = jnp.where(
+        buc == jnp.int32(0), jnp.int32(1),
+        jnp.where(buc == jnp.int32(1), jnp.int32(-1), jnp.int32(0)),
+    )
+    # nostone == !carrying(LUCKSTONE) && !stone_luck(TRUE).  stone_luck(TRUE)
+    # is nonzero for any BUC, so any carried luckstone (B/U/C) → nostone=False.
+    nostone = ~has_luckstone
+
+    drift_down = (luck > baseluck) & (nostone | (time_luck < jnp.int32(0)))
+    drift_up   = (luck < baseluck) & (nostone | (time_luck > jnp.int32(0)))
+
+    apply = on_period & luck_differs
+    delta = jnp.where(apply & drift_down, jnp.int32(-1),
+            jnp.where(apply & drift_up,   jnp.int32(1), jnp.int32(0)))
+    new_luck = (luck + delta).astype(jnp.int8)
+    return env_state.replace(player_luck=new_luck)
