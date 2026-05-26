@@ -1610,8 +1610,16 @@ def _handle_eat(state, rng):
     has_stock = quantities > jnp.int16(0)
     valid     = is_food & has_stock
 
-    slot_idx  = jnp.argmax(valid).astype(jnp.int32)
+    fallback_slot = jnp.argmax(valid).astype(jnp.int32)
     found     = jnp.any(valid)
+
+    # NLE multi-key: prefer agent-chosen letter if it's a valid food.
+    # Cite: vendor/nethack/src/eat.c::doeat calls getobj() for the letter.
+    from Nethax.nethax.subsystems.pending_action import resolve_slot
+    chosen_slot = resolve_slot(state, fallback_slot)
+    safe_chosen = jnp.clip(chosen_slot, 0, valid.shape[0] - 1)
+    chosen_is_food = valid[safe_chosen]
+    slot_idx = jnp.where(chosen_is_food, safe_chosen, fallback_slot).astype(jnp.int32)
 
     # Nutrition lookup via per-type table (vendor/nethack/include/objects.h FOOD()
     # macros, nutrition column; cite objects.py OBJECTS[type_id].nutrition).
@@ -2007,10 +2015,20 @@ def _handle_put_on(state, rng):
     ring_mask   = is_ring & in_stock
     amulet_mask = is_amulet & in_stock
 
-    ring_slot   = jnp.argmax(ring_mask).astype(jnp.int32)
-    amulet_slot = jnp.argmax(amulet_mask).astype(jnp.int32)
+    fallback_ring   = jnp.argmax(ring_mask).astype(jnp.int32)
+    fallback_amulet = jnp.argmax(amulet_mask).astype(jnp.int32)
     has_ring    = jnp.any(ring_mask)
     has_amulet  = jnp.any(amulet_mask)
+
+    # NLE multi-key: prefer agent-chosen slot if it's a ring or amulet.
+    # Cite: vendor/nethack/src/do_wear.c::doputon calls getobj().
+    from Nethax.nethax.subsystems.pending_action import resolve_slot
+    chosen_slot = resolve_slot(state, fallback_ring)
+    safe_chosen = jnp.clip(chosen_slot, 0, ring_mask.shape[0] - 1)
+    chosen_is_ring = ring_mask[safe_chosen]
+    chosen_is_amulet = amulet_mask[safe_chosen]
+    ring_slot   = jnp.where(chosen_is_ring,   safe_chosen, fallback_ring).astype(jnp.int32)
+    amulet_slot = jnp.where(chosen_is_amulet, safe_chosen, fallback_amulet).astype(jnp.int32)
 
     worn_rings = state.inventory.worn_rings
     left_free  = worn_rings[0] < jnp.int8(0)
