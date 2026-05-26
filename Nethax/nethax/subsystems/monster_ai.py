@@ -5183,6 +5183,38 @@ def _player_carries_quest_artifact(state) -> jnp.ndarray:
     return has
 
 
+def _find_ground_quest_artifact(state) -> tuple:
+    """Scan ground_items on the player's current level for a quest artifact.
+
+    Mirrors vendor wizard.c::target_on lines 251-254 ``on_ground(otyp)``
+    branch — when the hero does NOT carry the artifact but it is present
+    on the floor, covetous monsters target the artifact's tile.
+
+    Returns ``(found, row, col)`` — all 0-D JIT-traceable values.  When
+    no artifact is found, ``found`` is False and ``row, col`` are 0.
+    """
+    b = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    cat = state.ground_items.category[b, lv]        # [H, W, STACK]
+    tid = state.ground_items.type_id[b, lv]         # [H, W, STACK]
+    occupied = cat != jnp.int8(0)
+
+    is_qa = jnp.zeros_like(occupied)
+    for qid in _QUEST_ARTIFACT_TIDS_AI:
+        is_qa = is_qa | (tid == jnp.int16(qid))
+    mask = occupied & is_qa                          # [H, W, STACK]
+    found = jnp.any(mask)
+
+    # Reduce stack dim — True if any stack entry on tile is a quest artifact.
+    tile_mask = jnp.any(mask, axis=-1)              # [H, W]
+    h, w = tile_mask.shape
+    flat = tile_mask.astype(jnp.int32).flatten()
+    flat_idx = jnp.argmax(flat)
+    row = (flat_idx // jnp.int32(w)).astype(jnp.int32)
+    col = (flat_idx %  jnp.int32(w)).astype(jnp.int32)
+    return found, row, col
+
+
 def _covetous_ai_step(state):
     """Force HUNT + speed boost on covetous monsters when player carries
     a quest artifact.
@@ -5201,23 +5233,51 @@ def _covetous_ai_step(state):
       - Clear any active flee_until_turn (vendor: covetous never flee
         while hero carries the target).
 
-    Does nothing when the hero doesn't carry any quest artifact.
+    Wave 47s: also fires when the artifact is on the FLOOR (vendor
+    wizard.c::target_on lines 251-254 ``on_ground(otyp)`` branch); in
+    that case the covetous monster gets HUNT + speed boost AND its
+    ``target_pos`` is set to the artifact's tile (vendor sets
+    ``mtmp->mgoal``), so the existing pathfinder navigates to pick it up.
     """
     player_has = _player_carries_quest_artifact(state)
+    ground_has, art_r, art_c = _find_ground_quest_artifact(state)
+
+    # Vendor priority (target_on lines 246-263): player-carry checked
+    # first; floor scan runs only when no player-carry path exists.
+    floor_only = ground_has & ~player_has
+    any_target = player_has | floor_only
+
     mai = state.monster_ai
     entry = mai.entry_idx.astype(jnp.int32)
     is_covetous = jnp.bool_(False)
     for eid in _COVETOUS_ENTRY_IDS:
         is_covetous = is_covetous | (entry == jnp.int32(eid))
-    apply = mai.alive & is_covetous & player_has
+    apply = mai.alive & is_covetous & any_target
 
     new_strat = jnp.where(apply, jnp.int8(int(MoveStrategy.HUNT)), mai.mstrategy)
     new_speed = jnp.where(apply, jnp.int8(1), mai.speed_mod)
     new_flee  = jnp.where(apply, jnp.int32(0), mai.flee_until_turn)
+
+    # When the artifact is on the floor (and player isn't carrying any),
+    # steer covetous monsters' target_pos to the artifact tile.  Vendor:
+    # ``mtmp->mgoal.x = otmp->ox; mtmp->mgoal.y = otmp->oy`` (target_on
+    # line 252-253).
+    set_target = apply & floor_only
+    art_tile = jnp.stack(
+        [art_r.astype(jnp.int16), art_c.astype(jnp.int16)]
+    )  # shape [2]
+    n = mai.target_pos.shape[0]
+    new_target = jnp.where(
+        set_target[:, None],                       # [n, 1] -> broadcasts to [n, 2]
+        jnp.broadcast_to(art_tile, (n, 2)),
+        mai.target_pos,
+    )
+
     return state.replace(monster_ai=mai.replace(
         mstrategy=new_strat,
         speed_mod=new_speed,
         flee_until_turn=new_flee,
+        target_pos=new_target,
     ))
 
 
