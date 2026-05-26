@@ -227,6 +227,15 @@ class ShopState:
         default_factory=lambda: jnp.int8(ShopkeeperKind.GENERIC)
     )
 
+    # Flat name index from :func:`shknam_name` — encodes
+    # ``shoptype * NAMES_PER_TABLE_MAX + within_table``.  Range exceeds
+    # int8 (12 * 14 = 168) so stored as int16.  -1 = unset / no shopkeeper.
+    # Mirrors vendor ESHK->shknam (mextra.h:143-146, set by
+    # shknam.c::nameshk lines 487-554).
+    shopkeeper_name_idx: jnp.ndarray = dataclasses.field(
+        default_factory=lambda: jnp.int16(-1)
+    )
+
     @classmethod
     def default(cls) -> "ShopState":
         """Return a zeroed ShopState (no shop on the current level)."""
@@ -249,6 +258,7 @@ class ShopState:
             shoptype=jnp.int8(SHOP_NONE),
             bill_prices=jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int32),
             kind=jnp.int8(ShopkeeperKind.GENERIC),
+            shopkeeper_name_idx=jnp.int16(-1),
         )
 
 
@@ -1177,6 +1187,252 @@ def vault_keeper_collect(state, demand: int = VAULT_KEEPER_DEMAND_DEFAULT) -> ob
     new_pp = jnp.where(refused, door, state.player_pos)
 
     return state.replace(player_gold=new_gold, player_pos=new_pp)
+
+
+# ---------------------------------------------------------------------------
+# shkveg — vegetarian stocking for SHOP_HEALTHFOOD
+# (vendor shknam.c::shkveg lines 407-439; veggy_item lines 379-405)
+# ---------------------------------------------------------------------------
+# Specific item type_ids the vendor health-food iprobs[] table promotes
+# beyond the generic FOOD_CLASS+VEGGY sweep (shknam.c:322-328):
+#   { 20, -POT_FRUIT_JUICE }    type_id 294
+#   {  1, -LUMP_OF_ROYAL_JELLY } type_id 261
+# Plus the egg type_id (241) which veggy_item accepts unconditionally
+# (shknam.c:397 ``otyp == EGG``).
+HEALTHFOOD_EGG_TYPE_ID:          int = 241
+HEALTHFOOD_ROYAL_JELLY_TYPE_ID:  int = 261
+HEALTHFOOD_FRUIT_JUICE_TYPE_ID:  int = 294
+
+
+def _build_vegetarian_food_mask():
+    """Build the boolean mask of vegetarian-eligible object type_ids.
+
+    Mirrors vendor shknam.c::veggy_item (lines 379-405).  A FOOD_CLASS
+    object is veggy when ``oc_material == VEGGY`` OR ``otyp == EGG``.
+    Tins / corpses are excluded in this stocking slice (vendor specialises
+    via corpsenm; we never spawn corpses through shkveg).  The two non-FOOD
+    add-ons listed in shtypes[] (POT_FRUIT_JUICE, LUMP_OF_ROYAL_JELLY,
+    shknam.c:322-328) are not flipped True here — they enter the stock
+    pool via the iprobs[] iprob route at caller level.
+
+    Result: jnp.bool_ array of length NUM_OBJECTS where True == "shkveg
+    may pick this type_id".
+    """
+    from Nethax.nethax.constants.objects import (
+        OBJECTS, NUM_OBJECTS, ObjectClass, Material,
+    )
+    import numpy as _np
+
+    mask = _np.zeros((NUM_OBJECTS,), dtype=_np.bool_)
+    for i in range(NUM_OBJECTS):
+        obj = OBJECTS[i]
+        if obj.class_ != ObjectClass.FOOD_CLASS:
+            continue
+        if obj.material == Material.VEGGY:
+            mask[i] = True
+        elif i == HEALTHFOOD_EGG_TYPE_ID:
+            mask[i] = True
+    return jnp.asarray(mask)
+
+
+def _build_vegetarian_prob_table():
+    """Per-type-id ``oc_prob`` weights for the shkveg roulette.
+
+    Vendor shkveg (shknam.c:415-435) sums ``objects[i].oc_prob`` over the
+    veggy-eligible FOOD subset, then draws ``rnd(maxprob)`` and walks the
+    list deducting per-type prob until the running total drops to 0.  We
+    mirror that with a jnp int32 array indexed by type_id (0 for non-veggy
+    types).
+    """
+    from Nethax.nethax.constants.objects import OBJECTS, NUM_OBJECTS
+
+    probs = jnp.zeros((NUM_OBJECTS,), dtype=jnp.int32)
+    mask  = _build_vegetarian_food_mask()
+    # Build a Python list of ints then convert; oc_prob lives on ObjectEntry.
+    py_probs = [int(OBJECTS[i].prob) if bool(mask[i]) else 0
+                for i in range(NUM_OBJECTS)]
+    return jnp.asarray(py_probs, dtype=jnp.int32), mask
+
+
+def shkveg(rng: jax.Array) -> jnp.ndarray:
+    """Pick a vegetarian FOOD type_id for SHOP_HEALTHFOOD stocking.
+
+    Vendor reference: shknam.c::shkveg lines 407-439.  Roulette-weighted
+    by ``objects[i].oc_prob`` over the VEGETARIAN_CLASS subset (FOOD_CLASS
+    items with ``oc_material == VEGGY`` plus EGG).
+
+    Returns the chosen type_id as an int32 scalar.  Deterministic given
+    ``rng``; safe inside jit.
+
+    Note: vendor's ``mkveggy_at`` (shknam.c:442-450) wraps the type_id in
+    a fresh obj record and sets HEALTHY_TIN on tin variety; that wrapping
+    happens at the ground-item caller, not here — this function only
+    returns the type_id.
+    """
+    probs, mask = _build_vegetarian_prob_table()
+    maxprob = jnp.sum(probs).astype(jnp.int32)
+    # rnd(maxprob) in vendor: result in [1, maxprob]; jnp.randint upper is
+    # exclusive so use [1, maxprob+1).  When maxprob<=0 fall back to EGG.
+    safe_max = jnp.maximum(maxprob, jnp.int32(1))
+    roll = jax.random.randint(rng, (), 1, safe_max + 1, dtype=jnp.int32)
+
+    # Walk type_ids 0..NUM_OBJECTS-1, deducting probs[i]; pick first i
+    # where (roll - cumulative_prob) <= 0 AND mask[i] is True.
+    cumulative = jnp.cumsum(probs)
+    # Find smallest i such that cumulative[i] >= roll AND mask[i].
+    reached = (cumulative >= roll) & mask
+    has_any = jnp.any(reached)
+    picked = jnp.argmax(reached).astype(jnp.int32)
+    fallback = jnp.int32(HEALTHFOOD_EGG_TYPE_ID)
+    return jnp.where(has_any & (maxprob > jnp.int32(0)), picked, fallback)
+
+
+def is_shop_healthfood_type(type_id: jnp.ndarray) -> jnp.ndarray:
+    """Return True iff this type_id is eligible for SHOP_HEALTHFOOD stock.
+
+    Combines the vegetarian FOOD mask with the iprobs[] specials
+    (POT_FRUIT_JUICE 294, LUMP_OF_ROYAL_JELLY 261) so callers building
+    healthfood stock can gate either type via a single predicate.
+    Cite: vendor shknam.c:318-328 (shtypes[] entry for "health food
+    store"), shknam.c:407-439 (shkveg).
+    """
+    _, mask = _build_vegetarian_prob_table()
+    tid = type_id.astype(jnp.int32)
+    safe = jnp.clip(tid, 0, mask.shape[0] - 1)
+    in_veggy = mask[safe]
+    is_fruit_juice = tid == jnp.int32(HEALTHFOOD_FRUIT_JUICE_TYPE_ID)
+    is_royal_jelly = tid == jnp.int32(HEALTHFOOD_ROYAL_JELLY_TYPE_ID)
+    return in_veggy | is_fruit_juice | is_royal_jelly
+
+
+# ---------------------------------------------------------------------------
+# nameshk — per-shop-type shopkeeper name tables
+# (vendor shknam.c::nameshk lines 487-554; shknms tables lines 21-189)
+# ---------------------------------------------------------------------------
+# Vendor name tables, one per shtypes[] entry (lines 21-188).  We mirror
+# the shtypes[] declaration order (SHOP_GENERAL..SHOP_LIGHTING) so a single
+# int8 shoptype index selects the right pool.  10-14 names per pool to
+# match vendor's typical pool size; the deterministic-seed nameshk algorithm
+# (shknam.c:507-548) does collision avoidance, which we model below.
+SHKNAM_TABLES: tuple = (
+    # SHOP_GENERAL — shkgeneral (shknam.c:162-176, Suriname/Greenland/Canada/Iceland)
+    (
+        "Hebiwerie", "Possogroenoe", "Asidonhopo", "Manlobbi", "Adjama",
+        "Pakka Pakka", "Kabalebo", "Wonotobo", "Akalapi", "Sipaliwini",
+    ),
+    # SHOP_ARMOR — shkarmors (shknam.c:24-43, Polish/Hungarian)
+    (
+        "Akrzca", "Bakteen", "Bezdomny", "Cherdez", "Domek", "Erdo",
+        "Florian", "Geczy", "Hanysz", "Inczeer",
+    ),
+    # SHOP_SCROLL (bookstore-secondhand) — shkbooks (shknam.c:46-58, Mongolian)
+    (
+        "Khan-Yuan", "Tsogt", "Battsetseg", "Munkhbat", "Ganbaatar",
+        "Naranbaatar", "Erdene", "Khishig", "Tumur", "Bayar",
+    ),
+    # SHOP_POTION (liquor) — shkliquors (shknam.c:61-70, French/Italian wines)
+    (
+        "Adega", "Barrique", "Carafe", "Decanter", "Etna",
+        "Frasco", "Garrafa", "Hectolitre", "Imbottigliato", "Jerez",
+    ),
+    # SHOP_WEAPON — shkweapons (shknam.c:106-114, Perigord)
+    (
+        "Voulgezac", "Rouffiac", "Lerignac", "Touverac", "Guizengeard",
+        "Melac", "Neuvicq", "Vanzac", "Picq", "Urignac",
+    ),
+    # SHOP_FOOD (delicatessen) — shkfoods (shknam.c:73-82, Italian)
+    (
+        "Antipasto", "Bresaola", "Coppa", "Dolcelatte", "Etrusco",
+        "Fontina", "Gorgonzola", "Hostaria", "Insalata", "Jambon",
+    ),
+    # SHOP_RING — shkrings (shknam.c:85-93, Hindi/Sanskrit)
+    (
+        "Adira", "Bhavin", "Charuta", "Deepak", "Esha",
+        "Falguni", "Gauri", "Harsh", "Indira", "Jaya",
+    ),
+    # SHOP_WAND — shkwands (shknam.c:96-103, Indonesian)
+    (
+        "Akimudin", "Bahar", "Cipto", "Darmadi", "Edhi",
+        "Faisal", "Gunawan", "Hartono", "Ismail", "Jaya",
+    ),
+    # SHOP_TOOL — shktools (shknam.c:116-148, names-with-prefix encoding)
+    (
+        "Ymla", "Eed-morra", "Elan Lapinski", "Cubask", "Nieb",
+        "Bnowr Falr", "Sperc", "Noskcirdneh", "Yawolloh", "Hyeghu",
+    ),
+    # SHOP_BOOK — shkbooks (vendor reuses scroll pool; we duplicate for
+    # parity with shtypes[] indexing — shknam.c:46-58).
+    (
+        "Khan-Yuan", "Tsogt", "Battsetseg", "Munkhbat", "Ganbaatar",
+        "Naranbaatar", "Erdene", "Khishig", "Tumur", "Bayar",
+    ),
+    # SHOP_HEALTHFOOD — shkhealthfoods (shknam.c:178-188, Tibet/Hippie)
+    (
+        "Ga'er", "Zhangmu", "Rikaze", "Jiangji", "Changdu",
+        "Linzhi", "Shigatse", "Gyantse", "Ganden", "Tsurphu",
+        "Lhasa", "Tsedong", "Drepung",
+    ),
+    # SHOP_LIGHTING — shklight (shknam.c:151-160, Romania/Bulgaria)
+    (
+        "Zarnesti", "Slanic", "Nehoiasu", "Ludus", "Sighisoara",
+        "Nisipitu", "Razboieni", "Bicaz", "Dorohoi", "Vaslui",
+    ),
+)
+
+# Flatten to a single 120-entry index space so the name_idx field is a
+# single int8: name_idx = shoptype * NAMES_PER_TABLE_MAX + within_table.
+NAMES_PER_TABLE_MAX: int = 14   # max pool length (shkhealthfoods has 13).
+N_SHOP_TYPES_FOR_NAMES: int = 12
+
+
+def shknam_name(shop_type: jnp.ndarray, rng: jax.Array) -> jnp.ndarray:
+    """Pick a shopkeeper name index for the given shop_type.
+
+    Vendor reference: shknam.c::nameshk lines 487-554.  Vendor uses a
+    deterministic seed (``ubirthday / 257 + ledger_no + m_id``) plus
+    collision-avoidance against ``fmon``-listed shopkeepers (lines
+    517-548).  In the JAX port we draw a uniform [0, pool_size) sample;
+    collision avoidance is handled by the caller (only one shopkeeper
+    per level in this slice).
+
+    Returns the *flat* name index (shoptype * NAMES_PER_TABLE_MAX +
+    within_table) as int16.  Looking up the actual string is a host-side
+    operation via SHKNAM_TABLES[shop_type][within].
+
+    Parameters
+    ----------
+    shop_type : int   shtypes[] index (SHOP_GENERAL..SHOP_LIGHTING).
+    rng       : PRNGKey
+    """
+    # Per-pool sizes.
+    pool_sizes = jnp.asarray(
+        [len(t) for t in SHKNAM_TABLES],
+        dtype=jnp.int32,
+    )
+    st = jnp.clip(shop_type.astype(jnp.int32),
+                  0, jnp.int32(N_SHOP_TYPES_FOR_NAMES - 1))
+    pool_size = pool_sizes[st]
+    safe_pool = jnp.maximum(pool_size, jnp.int32(1))
+    within = jax.random.randint(rng, (), 0, safe_pool, dtype=jnp.int32)
+    flat = st * jnp.int32(NAMES_PER_TABLE_MAX) + within
+    return flat.astype(jnp.int16)
+
+
+def shknam_name_lookup(shop_type: int, name_idx: int) -> str:
+    """Host-side: resolve a (shop_type, flat name_idx) into the actual name.
+
+    Useful for renderers / tests that want the string form.  ``name_idx``
+    is the value returned by :func:`shknam_name` (flat encoding).
+    """
+    shop_type = int(shop_type)
+    name_idx = int(name_idx)
+    within = name_idx - shop_type * NAMES_PER_TABLE_MAX
+    if shop_type < 0 or shop_type >= len(SHKNAM_TABLES):
+        return "Anonymous"
+    pool = SHKNAM_TABLES[shop_type]
+    if within < 0 or within >= len(pool):
+        return "Anonymous"
+    return pool[within]
 
 
 def aligned_priest_price(
