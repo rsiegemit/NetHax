@@ -310,6 +310,14 @@ def _step_impl(state, action, rng):
     rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow, rng_explvl, rng_regions = jax.random.split(rng, 8)
     already_done = state.done
 
+    # Pre-step snapshot: was the Wizard of Yendor alive?  Used to fire
+    # intervene() once on Wizard kill (vendor wizard.c::intervene 784-810).
+    _PM_WIZARD_ENTRY = jnp.int32(281)
+    prev_wizard_alive = jnp.any(
+        state.monster_ai.alive
+        & (state.monster_ai.entry_idx.astype(jnp.int32) == _PM_WIZARD_ENTRY)
+    )
+
     def _do_step(_):
         # 1. Player action — allmain.c line 203 (svc.context.move).
         ns = dispatch_action(state, action, rng_act)
@@ -409,6 +417,47 @@ def _step_impl(state, action, rng):
 
         # 8. Ascension / endgame check — vendor allmain.c done() paths.
         ns = maybe_ascend(ns)
+
+        # 8a. intervene() — post-Wizard-kill harassment.
+        # Vendor wizard.c::intervene lines 784-810 picks rn2(6):
+        #   0,1 → "You feel vaguely nervous."  (no gameplay effect)
+        #   2   → rndcurse — random curse on player items
+        #   3   → aggravate — wake all sleeping monsters
+        #   4   → nasty — summon a high-difficulty monster (placeholder)
+        #   5   → resurrect — re-spawn the Wizard (placeholder)
+        # Fires once when the Wizard transitions alive → dead this turn.
+        wiz_now = jnp.any(
+            ns.monster_ai.alive
+            & (ns.monster_ai.entry_idx.astype(jnp.int32) == _PM_WIZARD_ENTRY)
+        )
+        wiz_just_died = prev_wizard_alive & ~wiz_now
+
+        rng_iv, rng_iv2 = jax.random.split(rng_status, 2)
+        which = jax.random.randint(rng_iv, (), 0, 6, dtype=jnp.int32)
+
+        # Effect 2: rndcurse — flip BUC on one random inventory slot to cursed(1).
+        is_curse = wiz_just_died & (which == jnp.int32(2))
+        items = ns.inventory.items
+        n_slots = items.category.shape[0]
+        cur_slot = jax.random.randint(rng_iv2, (), 0, n_slots, dtype=jnp.int32)
+        occupied = items.category[cur_slot] != jnp.int8(0)
+        new_buc = jnp.where(is_curse & occupied, jnp.int8(1), items.buc_status[cur_slot])
+        new_items = items.replace(buc_status=items.buc_status.at[cur_slot].set(new_buc))
+
+        # Effect 3: aggravate — wake all sleeping monsters.
+        is_aggr = wiz_just_died & (which == jnp.int32(3))
+        mai = ns.monster_ai
+        new_asleep = jnp.where(is_aggr, jnp.zeros_like(mai.asleep), mai.asleep)
+        new_sleep_t = jnp.where(
+            is_aggr, jnp.zeros_like(mai.sleep_timer), mai.sleep_timer
+        )
+
+        ns = ns.replace(
+            inventory=ns.inventory.replace(items=new_items),
+            monster_ai=mai.replace(asleep=new_asleep, sleep_timer=new_sleep_t),
+        )
+        # Effects 0/1/4/5 are no-ops in this MVP (nasty + resurrect need
+        # additional plumbing — see deferred-doc).
         return ns
 
     new_state = jax.lax.cond(already_done, lambda _: state, _do_step, operand=None)
