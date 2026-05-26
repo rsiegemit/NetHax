@@ -544,13 +544,176 @@ def generate_maze_dla(
 
 
 # ---------------------------------------------------------------------------
+# maze_remove_deadends — post-walkfrom polish pass
+# ---------------------------------------------------------------------------
+#
+# Vendor cite: vendor/nethack/src/mkmaze.c::maze_remove_deadends lines 904-943.
+#
+#   for x = 2..x_maze_max, y = 2..y_maze_max:
+#     if ACCESSIBLE(levl[x][y].typ) and (x%2) and (y%2):
+#       idx = 0; idx2 = 0;
+#       for dir in 0..3:
+#         step one in dir → if OOB: idx2++; continue
+#         step another → if OOB: idx2++; continue
+#         if !ACCESSIBLE(one-step) and ACCESSIBLE(two-step):
+#           dirok[idx++] = dir; idx2++;
+#       if idx2 >= 3 and idx > 0:
+#         dir = dirok[rn2(idx)];
+#         step one in dir; levl[step].typ = typ;     /* carve the wall */
+#
+# Intuition: at every odd-coord interior cell, count directions where the
+# one-step neighbour is a wall but the two-step neighbour is reachable.
+# If the cell is "almost a dead end" (3+ directions blocked by boundary or
+# wall) and at least one such wall conceals a reachable corridor, carve
+# through that wall to create a loop.  Vendor applies this unconditionally;
+# our JAX port adds a per-cell 50 % coin-flip so half of qualifying dead
+# ends are sealed and half are opened — matches the spirit of the vendor's
+# "rmdeadends" toggle while staying scan-friendly.
+# ---------------------------------------------------------------------------
+
+
+def maze_remove_deadends(
+    rng: jnp.ndarray,
+    terrain: jnp.ndarray,
+) -> jnp.ndarray:
+    """Carve through walls at half of all dead-end cells in ``terrain``.
+
+    Vendor citation: vendor/nethack/src/mkmaze.c::maze_remove_deadends
+        lines 904-943.  Vendor unconditionally carves; we add a per-cell
+        ``rn2(2)`` gate so roughly half the candidates are processed.
+
+    The pass walks every odd-coord interior cell.  A cell is a dead-end
+    candidate when:
+      - it is currently FLOOR/accessible, and
+      - in three or four of the cardinal directions, the one-step
+        neighbour is either out of bounds or a wall whose two-step
+        neighbour is reachable.
+
+    For each surviving candidate (after the coin flip), one of the wall
+    directions concealing a reachable cell is selected uniformly and the
+    intervening wall is carved to FLOOR — opening a loop into the maze.
+
+    Args:
+        rng:     JAX PRNG key.
+        terrain: int8[H, W] terrain map (TILE_WALL=0, TILE_FLOOR=1).
+
+    Returns:
+        Updated terrain with selected dead ends opened.
+    """
+    h, w = terrain.shape
+
+    # Vectorise the per-cell vendor probe across the full odd-odd grid.
+    # We process cells at every (y, x) where 1 <= y <= h-2, 1 <= x <= w-2,
+    # y%2 == 1, x%2 == 1.  Vendor uses (x, y) but our terrain is [row, col]
+    # so we map vendor y → row and vendor x → col.
+    rows = jnp.arange(h, dtype=jnp.int32)
+    cols = jnp.arange(w, dtype=jnp.int32)
+    rr, cc = jnp.meshgrid(rows, cols, indexing="ij")
+    interior = (
+        (rr >= 1) & (rr <= h - 2) & (cc >= 1) & (cc <= w - 2)
+        & ((rr % 2) == 1) & ((cc % 2) == 1)
+    )
+    is_floor = terrain == jnp.int8(TILE_FLOOR)
+    candidate = interior & is_floor  # [h, w] bool
+
+    # For each of the four directions, compute one-step + two-step
+    # neighbour conditions (vendor mz_move chain).
+    # Direction order matches walkfrom_vendor: 0=N, 1=E, 2=S, 3=W.
+    def neighbour_stats(dy, dx):
+        ny1 = rr + dy
+        nx1 = cc + dx
+        ny2 = rr + 2 * dy
+        nx2 = cc + 2 * dx
+        in1 = (ny1 >= 0) & (ny1 < h) & (nx1 >= 0) & (nx1 < w)
+        in2 = (ny2 >= 0) & (ny2 < h) & (nx2 >= 0) & (nx2 < w)
+        ny1c = jnp.clip(ny1, 0, h - 1)
+        nx1c = jnp.clip(nx1, 0, w - 1)
+        ny2c = jnp.clip(ny2, 0, h - 1)
+        nx2c = jnp.clip(nx2, 0, w - 1)
+        tile1 = terrain[ny1c, nx1c]
+        tile2 = terrain[ny2c, nx2c]
+        wall1 = in1 & (tile1 == jnp.int8(TILE_WALL))
+        reachable2 = in2 & (tile2 == jnp.int8(TILE_FLOOR))
+        # Vendor idx2 increments when: 1-step OOB, OR 2-step OOB, OR
+        # (1-step wall AND 2-step reachable).  We collapse OOB on either
+        # step into "blocked2".
+        blocked2 = ~in1 | ~in2 | (wall1 & reachable2)
+        # idx (valid carve dir): 1-step in bounds AND wall AND 2-step
+        # reachable.
+        valid_carve = in1 & wall1 & reachable2
+        return blocked2, valid_carve
+
+    dirs = ((-1, 0), (0, 1), (1, 0), (0, -1))  # N, E, S, W
+    blocked2_all = []
+    valid_all = []
+    for dy, dx in dirs:
+        b, v = neighbour_stats(jnp.int32(dy), jnp.int32(dx))
+        blocked2_all.append(b)
+        valid_all.append(v)
+    blocked2_stack = jnp.stack(blocked2_all, axis=-1)  # [h, w, 4] bool
+    valid_stack = jnp.stack(valid_all, axis=-1)        # [h, w, 4] bool
+
+    idx2 = jnp.sum(blocked2_stack.astype(jnp.int32), axis=-1)  # [h, w]
+    idx  = jnp.sum(valid_stack.astype(jnp.int32), axis=-1)     # [h, w]
+
+    deadend_mask = candidate & (idx2 >= jnp.int32(3)) & (idx > jnp.int32(0))
+
+    # Coin flip per candidate — vendor processes every match; we keep half
+    # to mirror the "run on half of all dead ends" task semantics.
+    rng_coin, rng_dir = jax.random.split(rng)
+    coin = jax.random.bernoulli(rng_coin, p=0.5, shape=(h, w))
+    process_mask = deadend_mask & coin  # [h, w]
+
+    # For each candidate cell, pick a uniformly random valid carve dir.
+    # Implemented as: compute prefix sum of valid_stack, draw r ~ [0, idx),
+    # select the dir whose write_pos == r.  Done over [h, w] in parallel.
+    write_pos = jnp.cumsum(valid_stack.astype(jnp.int32), axis=-1) - 1  # [h, w, 4]
+    # Per-cell uniform pick in [0, idx).  When idx == 0 we still need a
+    # well-defined value; we clamp to 0 (the cell is masked out anyway).
+    safe_idx = jnp.maximum(idx, jnp.int32(1))
+    # Use a stable per-cell sub-key derived from (row, col) so different
+    # cells get independent draws without an O(h*w) split chain.
+    cell_keys = jax.random.split(rng_dir, h * w).reshape(h, w, 2)
+    pick = jax.vmap(jax.vmap(
+        lambda k, n: jax.random.randint(k, (), 0, n, dtype=jnp.int32)
+    ))(cell_keys, safe_idx)  # [h, w]
+
+    chosen_mask = (write_pos == pick[..., None]) & valid_stack  # [h, w, 4]
+
+    # Carve wall tile: for each cell, sum dy/dx contributions from the
+    # chosen direction.  At most one of the 4 channels is True per cell.
+    dy_arr = jnp.array([-1, 0, 1, 0], dtype=jnp.int32)
+    dx_arr = jnp.array([0, 1, 0, -1], dtype=jnp.int32)
+    cdy = jnp.sum(chosen_mask.astype(jnp.int32) * dy_arr, axis=-1)  # [h, w]
+    cdx = jnp.sum(chosen_mask.astype(jnp.int32) * dx_arr, axis=-1)
+
+    # Wall positions to carve: (rr + cdy, cc + cdx) for every cell where
+    # process_mask is True.  Build an output mask and scatter via where.
+    target_rows = jnp.clip(rr + cdy, 0, h - 1)
+    target_cols = jnp.clip(cc + cdx, 0, w - 1)
+
+    carve_grid = jnp.zeros((h, w), dtype=jnp.bool_)
+    # For each source cell where process_mask, mark the target wall.  Use
+    # segment_sum-style scatter via .at[].max() on a flat index.
+    flat_targets = target_rows * w + target_cols
+    flat_grid = jnp.zeros((h * w,), dtype=jnp.bool_)
+    flat_grid = flat_grid.at[flat_targets.reshape(-1)].max(
+        process_mask.reshape(-1)
+    )
+    carve_grid = flat_grid.reshape(h, w)
+
+    terrain_out = jnp.where(carve_grid, jnp.int8(TILE_FLOOR), terrain)
+    return terrain_out
+
+
+# ---------------------------------------------------------------------------
 # Remaining TODO blocks (documented divergences from vendor mkmaze.c)
 # ---------------------------------------------------------------------------
 # Wave 4 (done): generate_maze_perfect via vendor walkfrom DFS; DLA caves.
+# Wave 4 polish (done): maze_remove_deadends post-walkfrom pass.
 # Wave 5+ (open):
 #   - Add wallification pass: ensure all boundary cells are walls; fill
 #     isolated single-cell wall pockets (mkmaze.c wallification()).
-#   - Add dead-end removal pass (optional: increases loop density).
 #   - Gnomish Mines lower half: forced maze with extra room carvings for
 #     mineend special level (mineend-*.lua).
 #   - Quest filler levels: Kruskal maze with role-specific theme overlaid.
