@@ -4540,6 +4540,95 @@ def _pick_were_summon_species(entry: jnp.ndarray, rng: jax.Array) -> jnp.ndarray
            jnp.where(is_wererat,  rat_pick, e)))
 
 
+# ---------------------------------------------------------------------------
+# stealamulet — Wizard/quest-nemesis steals quest artifacts (steal.c:689,
+# wizard.c integration).  When the Wizard (entry 281) is adjacent to the
+# hero and the hero carries the Amulet of Yendor, Candelabrum of Invocation,
+# Bell of Opening, or Book of the Dead, transfer it to the Wizard's
+# inventory.  Vendor steal.c::stealamulet iterates per-item with a multi-
+# step undress chain (cloak/shirt/etc.).  Simplification: instant transfer
+# of the first matching item.
+# ---------------------------------------------------------------------------
+_AMULET_OF_YENDOR_T:  int = 188
+_CANDELABRUM_T:       int = 237
+_BELL_OF_OPENING_T:   int = 238
+_BOOK_OF_THE_DEAD_T:  int = 382
+_QUEST_ARTIFACT_TIDS = (
+    _AMULET_OF_YENDOR_T,
+    _CANDELABRUM_T,
+    _BELL_OF_OPENING_T,
+    _BOOK_OF_THE_DEAD_T,
+)
+
+
+def _try_steal_quest_artifact(state, rng: jax.Array):
+    """If the Wizard is adjacent and player holds a quest artifact, transfer
+    one to the Wizard's monster inventory.
+
+    Vendor cite: steal.c::stealamulet lines 689-766;
+                 wizard.c::strategy + target_on lines 235-327 (artifact-
+                 hunting motivation that drives stealamulet calls).
+
+    Simplification: a single transfer per turn (vendor iterates).  Targets
+    only the Wizard of Yendor (entry 281) — quest-nemesis variants
+    (PM_RIDER, etc.) not yet supported.
+    """
+    mai = state.monster_ai
+
+    # Find an alive adjacent Wizard.
+    entry = mai.entry_idx.astype(jnp.int32)
+    is_wiz = entry == jnp.int32(281)
+    ppos = state.player_pos.astype(jnp.int32)
+    mpos = mai.pos.astype(jnp.int32)
+    dr = jnp.abs(mpos[:, 0] - ppos[0])
+    dc = jnp.abs(mpos[:, 1] - ppos[1])
+    adj = jnp.maximum(dr, dc) <= jnp.int32(1)
+    eligible = mai.alive & is_wiz & adj
+    any_eligible = jnp.any(eligible)
+    wiz_idx = jnp.argmax(eligible.astype(jnp.int32)).astype(jnp.int32)
+
+    # Find the first quest artifact in the player's inventory.
+    inv = state.inventory.items
+    cat = inv.category
+    tid = inv.type_id
+    occupied = cat != jnp.int8(0)
+    is_qa = jnp.zeros_like(occupied)
+    for qid in _QUEST_ARTIFACT_TIDS:
+        is_qa = is_qa | (tid == jnp.int16(qid))
+    targets = occupied & is_qa
+    any_target = jnp.any(targets)
+    art_slot = jnp.argmax(targets.astype(jnp.int32)).astype(jnp.int32)
+
+    do_steal = any_eligible & any_target
+
+    # Capture the artifact's data before we zero it out.
+    art_cat = inv.category[art_slot]
+    art_tid = inv.type_id[art_slot]
+
+    # Zero the player's inventory slot (idempotent if do_steal=False).
+    new_pcat = jnp.where(do_steal, jnp.int8(0), inv.category[art_slot])
+    new_pqty = jnp.where(do_steal, jnp.int16(0), inv.quantity[art_slot])
+    new_items = inv.replace(
+        category=inv.category.at[art_slot].set(new_pcat),
+        quantity=inv.quantity.at[art_slot].set(new_pqty),
+    )
+
+    # Add the artifact to the Wizard's monster inventory slot 0.  Existing
+    # slot-0 contents are clobbered (acceptable for the deception-amulet
+    # already placed at clone time — vendor steal.c does similar).
+    new_mcat = jnp.where(do_steal, art_cat, mai.inv_category[wiz_idx, 0])
+    new_mtid = jnp.where(do_steal, art_tid, mai.inv_type_id[wiz_idx, 0])
+    new_mqty = jnp.where(do_steal, jnp.int16(1), mai.inv_quantity[wiz_idx, 0])
+    new_mai = mai.replace(
+        inv_category=mai.inv_category.at[wiz_idx, 0].set(new_mcat),
+        inv_type_id=mai.inv_type_id.at[wiz_idx, 0].set(new_mtid),
+        inv_quantity=mai.inv_quantity.at[wiz_idx, 0].set(new_mqty),
+    )
+
+    new_inv = state.inventory.replace(items=new_items)
+    return state.replace(inventory=new_inv, monster_ai=new_mai)
+
+
 def _were_summon_attempt(state, rng: jax.Array):
     """Each adjacent were-monster has a 1/10 chance per turn to summon
     1..5 species-specific helpers at empty adjacent tiles to the player.
@@ -4674,6 +4763,13 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     # 1..5 species-specific helpers (vendor mhitu.c:987 + were.c:140-189).
     rng, rng_summon = jax.random.split(rng)
     state = _were_summon_attempt(state, rng_summon)
+    mai = state.monster_ai
+
+    # ---- Wizard steals quest artifacts (vendor steal.c::stealamulet 689).
+    # Fires once per turn if the Wizard of Yendor is adjacent to the hero
+    # and the hero carries Amulet/Candelabrum/Bell/Book of the Dead.
+    rng, rng_qsteal = jax.random.split(rng)
+    state = _try_steal_quest_artifact(state, rng_qsteal)
     mai = state.monster_ai
 
     # ---- Speed-energy accumulation (vendor mon.c::mcalcmove lines 1126-1167) ----
