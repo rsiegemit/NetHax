@@ -653,13 +653,19 @@ def process_bridge_entities_on_close(state, pos: jnp.ndarray, rng: jax.Array | N
     a drawbridge closes (vendor dbridge.c::do_entity lines 554-759 — entities
     on the bridge are processed for crush / drown / lava-burn).
 
-    For each affected monster, vendor ``e_jumps`` (dbridge.c:530-551) gives a
-    chance to ``jump clear`` to an adjacent square — vendor formula ``tmp=4
-    out of 10``; the task spec collapses this to ``rn2(5)`` for the JAX port
-    (1/5 chance to succeed).  On success, relocate the monster to the first
-    walkable 8-neighbour tile (FLOOR / CORRIDOR / OPEN_DOOR / ...).  On
-    failure (no walkable neighbour, or roll missed), the monster is crushed
-    in place (HP → 0, alive → False).
+    Two survival paths run before the crush kills a monster:
+
+      1. ``e_missed`` dodge (dbridge.c::e_missed lines 495-525) — high
+         luck/dex creatures can dodge the falling portcullis entirely.
+         Vendor formula for a monster is ``rn2(20) > 12`` (~35% pass);
+         survivors stay in place untouched.
+      2. ``e_jumps`` jump-clear (dbridge.c::e_jumps lines 530-551) — those
+         that don't dodge get a ``rn2(5)`` (1/5) chance to relocate to the
+         first walkable 8-neighbour tile (FLOOR / CORRIDOR / OPEN_DOOR /
+         ...).
+
+    If both fail (no dodge AND (no jump roll OR no walkable neighbour)),
+    the monster is crushed in place (HP → 0, alive → False).
 
     The hero is not processed here (vendor handles hero separately —
     hero-side crush damage is wired in a follow-up commit).
@@ -668,7 +674,8 @@ def process_bridge_entities_on_close(state, pos: jnp.ndarray, rng: jax.Array | N
     (vendor lev2 in close_drawbridge).
 
     Cite: vendor/nethack/src/dbridge.c::do_entity lines 554-759;
-          vendor/nethack/src/dbridge.c::e_jumps lines 530-551.
+          vendor/nethack/src/dbridge.c::e_missed lines 495-525;
+          vendor/nethack/src/dbridge.c::e_jumps  lines 530-551.
     """
     from Nethax.nethax.constants.tiles import TileType
     b, lv, row, col = pos[0], pos[1], pos[2], pos[3]
@@ -730,19 +737,26 @@ def process_bridge_entities_on_close(state, pos: jnp.ndarray, rng: jax.Array | N
     )
 
     if rng is None:
-        # Back-compat path: no jump roll, behaviour matches legacy
+        # Back-compat path: no dodge/jump roll, behaviour matches legacy
         # implementation (everyone in the crush mask dies).
         crushed = affected
         new_pos = mai.pos
     else:
-        # Build per-monster RNG vector (one subkey per slot).
-        keys = jax.random.split(rng, n_slots)
+        # Two subkeys per monster: dodge roll + jump roll.
+        rng_dodge, rng_jump = jax.random.split(rng, 2)
+        keys_dodge = jax.random.split(rng_dodge, n_slots)
+        keys_jump = jax.random.split(rng_jump, n_slots)
 
         def _per_monster(carry, args):
-            key, m_r, m_c, is_affected = args
-            # rn2(5): 1/5 chance to jump.
-            roll = jax.random.randint(key, (), 0, 5, dtype=jnp.int32)
-            jumps = is_affected & (roll == jnp.int32(0))
+            k_dodge, k_jump, m_r, m_c, is_affected = args
+            # --- e_missed dodge: rn2(20) > 12 (~35% pass) -----------------
+            dodge_roll = jax.random.randint(k_dodge, (), 0, 20, dtype=jnp.int32)
+            dodged = is_affected & (dodge_roll > jnp.int32(12))
+            # --- e_jumps: rn2(5) == 0 (~20% pass) -------------------------
+            # Only roll for monsters that didn't dodge — vendor runs jump
+            # after e_missed in do_entity (dbridge.c lines 579-633).
+            jump_roll = jax.random.randint(k_jump, (), 0, 5, dtype=jnp.int32)
+            jumps = is_affected & (~dodged) & (jump_roll == jnp.int32(0))
             # Scan 8 neighbours; pick the first walkable one.
             def _find_target(carry2, off):
                 tgt_r, tgt_c, found = carry2
@@ -762,13 +776,14 @@ def process_bridge_entities_on_close(state, pos: jnp.ndarray, rng: jax.Array | N
             relocates = jumps & found
             out_r = jnp.where(relocates, tgt_r, m_r).astype(jnp.int16)
             out_c = jnp.where(relocates, tgt_c, m_c).astype(jnp.int16)
-            survives = relocates
+            # Survives if dodged (in place) or jumped clear (relocated).
+            survives = dodged | relocates
             return None, (out_r, out_c, survives)
 
         _, (out_rs, out_cs, survives) = jax.lax.scan(
             _per_monster,
             None,
-            (keys, mr, mc, affected),
+            (keys_dodge, keys_jump, mr, mc, affected),
         )
         crushed = affected & (~survives)
         new_pos = jnp.stack([out_rs, out_cs], axis=-1)
