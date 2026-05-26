@@ -1892,6 +1892,80 @@ def _try_throw_potion(state, rng: jax.Array, monster_idx: jnp.ndarray,
     )
 
 
+# ---------------------------------------------------------------------------
+# Expensive camera flash blind (vendor muse.c:1938-1955)
+# ---------------------------------------------------------------------------
+# Vendor: monster with EXPENSIVE_CAMERA (TOOL type_id 204) flashes the player;
+# if no BLIND resist, adds rnd(50)+50 = 51-100 turns of BLIND.  Uses 1 charge.
+_EXPENSIVE_CAMERA_TID: int = 204
+
+
+def _try_camera_flash(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Monster flashes expensive camera at player; adds blindness if no resist.
+
+    Vendor cite: muse.c lines 1938-1955 — MUSE_EXPENSIVE_CAMERA branch.
+    Damage formula: rnd(50)+50 = 51..100 BLIND turns.  Resistances:
+    BLIND_RES intrinsic (in vendor BLINDED via eyewear).  Nethax has no
+    BLIND_RES intrinsic, so the gate is purely "monster has camera with
+    charges & in LoS & not already blind from this attack".
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS3
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_TOOL, _EXPENSIVE_CAMERA_TID)
+    charges = mai.inv_charges[idx, slot].astype(jnp.int32)
+    can_flash = found & (charges > 0)
+
+    dur = jax.random.randint(rng, (), 51, 101, dtype=jnp.int32)  # rnd(50)+50
+    timers = state.status.timed_statuses
+    add = jnp.where(can_flash, dur, jnp.int32(0))
+    new_timers = timers.at[int(_TS3.BLIND)].add(add)
+
+    new_charges = jnp.where(can_flash, charges - jnp.int32(1), charges).astype(jnp.int8)
+    new_mai = mai.replace(
+        inv_charges=mai.inv_charges.at[idx, slot].set(new_charges),
+    )
+    return state.replace(
+        monster_ai=new_mai,
+        status=state.status.replace(timed_statuses=new_timers),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bullwhip disarm (vendor muse.c:2178-2193)
+# ---------------------------------------------------------------------------
+# Vendor: monster wielding BULLWHIP (WEAPON type_id 64) at adjacent range
+# pulls hero's wielded weapon to the floor (or monster).  Simplification:
+# unwield the player's weapon (set wielded = -1).
+_BULLWHIP_TID: int = 64
+
+
+def _try_bullwhip_disarm(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Monster wielding bullwhip at adjacent range disarms the player.
+
+    Vendor cite: muse.c lines 2178-2193 — MUSE_BULLWHIP.  Range gate:
+    adjacent (dist ≤ 1).  Effect: hero's wielded weapon snaps to the
+    monster's tile (vendor relobj path).  Nethax simplifies to
+    ``wielded = -1`` — the weapon remains in inventory but is no longer
+    wielded (no floor drop / pickup-by-monster modelling).
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    # Monster must HAVE a bullwhip in inv (vendor: wielded by mtmp).
+    _CAT_WEAPON = jnp.int8(2)
+    found, _slot = _find_inv_slot(mai, idx, int(_CAT_WEAPON), _BULLWHIP_TID)
+    # Range: Chebyshev distance ≤ 1.
+    mpos = mai.pos[idx].astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+    adj = (jnp.maximum(jnp.abs(mpos[0] - ppos[0]), jnp.abs(mpos[1] - ppos[1]))
+           <= jnp.int32(1))
+    has_wielded = state.inventory.wielded >= jnp.int8(0)
+    can_disarm = found & adj & has_wielded
+    new_wielded = jnp.where(can_disarm, jnp.int8(-1), state.inventory.wielded)
+    new_inv = state.inventory.replace(wielded=new_wielded)
+    return state.replace(inventory=new_inv)
+
+
 def _try_blow_horn(state, rng: jax.Array, monster_idx: jnp.ndarray,
                    horn_tid: int, resist_intrinsic: int):
     """Blow a horn at the player, dealing 6d6 with optional resistance.
@@ -2221,6 +2295,14 @@ def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
     s = _branch(s, can_attack,
                 lambda st, k, i: _try_throw_potion(st, k, i, _POT_ACID_TID, 4),
                 rng_pots[4])
+
+    # ----- Camera flash (muse.c:1938-1955) + Bullwhip disarm (muse.c:2178)
+    # Camera: in LoS at range; bullwhip: adjacent only.
+    rng_camera, rng_whip = jax.random.split(keys[10], 2)
+    s = _branch(s, can_attack, _try_camera_flash, rng_camera)
+    # Bullwhip: adjacent (Chebyshev ≤ 1); reuse `eligible` (not gated by dist).
+    is_adjacent = (dist <= jnp.int32(1)) & (dist > jnp.int32(0))
+    s = _branch(s, eligible & is_adjacent, _try_bullwhip_disarm, rng_whip)
 
     return s
 
