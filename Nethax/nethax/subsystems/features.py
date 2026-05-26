@@ -599,6 +599,55 @@ def destroy_drawbridge(
     return state, new_terrain
 
 
+def scatter_iron_chain_debris(state, pos: jnp.ndarray, rng: jax.Array):
+    """Scatter IRON_CHAIN ground items in a 2-cell ring around the
+    destroyed drawbridge tile.
+
+    Vendor cite: dbridge.c::destroy_drawbridge lines 949-958 — when the
+    bridge collapses, ``rn2(6)`` IRON_CHAIN chunks are scattered in the
+    immediate vicinity.  Prior Nethax port lacked this (silent leak per
+    the dbridge.c audit).
+
+    pos : int array [4] = (branch, level, row, col)
+    """
+    _OBJ_IRON_CHAIN_TID = 450
+    _CAT_CHAIN = 16  # ItemCategory.CHAIN
+
+    b, lv, row, col = pos[0], pos[1], pos[2], pos[3]
+    g = state.ground_items
+
+    # rn2(6) debris count = 0..5.  Drop into the 8-ring around pos.
+    count = jax.random.randint(rng, (), 0, 6, dtype=jnp.int32)
+    offsets = jnp.array(
+        [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]],
+        dtype=jnp.int32,
+    )
+    map_h = g.category.shape[2]
+    map_w = g.category.shape[3]
+
+    def _place(carry, args):
+        gg, i = carry
+        off = args
+        will_place = i < count
+        r = row + off[0]; c = col + off[1]
+        in_bounds = (r >= 0) & (r < map_h) & (c >= 0) & (c < map_w)
+        rs = jnp.clip(r, 0, map_h - 1); cs = jnp.clip(c, 0, map_w - 1)
+        slot0_empty = gg.category[b, lv, rs, cs, 0] == jnp.int8(0)
+        do_place = will_place & in_bounds & slot0_empty
+        new_cat = jnp.where(do_place, jnp.int8(_CAT_CHAIN), gg.category[b, lv, rs, cs, 0])
+        new_tid = jnp.where(do_place, jnp.int16(_OBJ_IRON_CHAIN_TID), gg.type_id[b, lv, rs, cs, 0])
+        new_qty = jnp.where(do_place, jnp.int16(1), gg.quantity[b, lv, rs, cs, 0])
+        new_gg = gg.replace(
+            category=gg.category.at[b, lv, rs, cs, 0].set(new_cat),
+            type_id=gg.type_id.at[b, lv, rs, cs, 0].set(new_tid),
+            quantity=gg.quantity.at[b, lv, rs, cs, 0].set(new_qty),
+        )
+        return (new_gg, i + jnp.int32(1)), None
+
+    (new_g, _), _ = jax.lax.scan(_place, (g, jnp.int32(0)), offsets)
+    return state.replace(ground_items=new_g)
+
+
 def process_bridge_entities_on_close(state, pos: jnp.ndarray):
     """Crush any monsters standing on the bridge tile + paired wall tile when
     a drawbridge closes (vendor dbridge.c::do_entity lines 554-759 — entities
