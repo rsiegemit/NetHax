@@ -897,11 +897,42 @@ def _effect_teleportation(state, rng, buc):
     """
     from Nethax.nethax.rng import rn2, rnd
     from Nethax.nethax.subsystems.detect import _teleds
+    from Nethax.nethax.subsystems.teleport import (
+        is_noteleport_level as _is_noteleport_level,
+    )
 
     cursed = _is_cursed(buc)
 
+    # ---- Vendor scrolltele gate 1 (teleport.c:854): noteleport_level ----
+    # "A mysterious force prevents you from teleporting!" — abort entirely.
+    blocked = _is_noteleport_level(
+        state.dungeon.current_branch,
+        state.dungeon.current_level,
+    )
+
+    # ---- Vendor scrolltele gate 2 (teleport.c:865): u.uhave.amulet 1/3 ----
+    # Amulet of Yendor (real one) disorients 1/3 of the time even before the
+    # destination roll.  We mirror by inv-scan + rn2(3) == 0.  The scroll is
+    # consumed but the teleport is suppressed.
+    inv = state.inventory
+    cat = inv.items.category
+    tid = inv.items.type_id
+    _AMULET_OF_YENDOR_TYPE_ID = 188   # vendor objects.h
+    has_yendor = jnp.any(
+        (cat != jnp.int8(0)) & (tid == jnp.int16(_AMULET_OF_YENDOR_TYPE_ID))
+    )
+    rng_amulet, rng = jax.random.split(rng, 2)
+    amulet_fail = has_yendor & (rn2(rng_amulet, 3) == jnp.int32(0))
+
+    abort_all = blocked | amulet_fail
+
     rng_t, rng_lv = jax.random.split(rng, 2)
     new_state = _teleds(state, rng_t)
+    # When the noteleport / amulet gate fires, scroll teleport produces no
+    # movement — both on-level and cross-level paths are suppressed.
+    new_state = jax.lax.cond(
+        abort_all, lambda _: state, lambda _: new_state, None
+    )
 
     # --- Cursed: invoke level_tele() → random_teleport_level() → goto_level.
     # Vendor port: random_teleport_level() (teleport.c:2191-2258).
@@ -938,7 +969,11 @@ def _effect_teleportation(state, rng, buc):
     target_lvl = jnp.where(stay_put, cur_lvl, pick)
 
     new_lvl_state = _goto_level(new_state, target_lvl)
-    return jax.lax.cond(cursed, lambda _: new_lvl_state, lambda _: new_state, None)
+    # When noteleport / Yendor 1/3 gate fired, ``abort_all`` suppresses the
+    # cursed cross-level branch too (vendor early-return at teleport.c:854,
+    # 865 fires before scroll-effect dispatch reaches level_tele).
+    result = jax.lax.cond(cursed, lambda _: new_lvl_state, lambda _: new_state, None)
+    return jax.lax.cond(abort_all, lambda _: state, lambda _: result, None)
 
 
 def _goto_level(state, target_lvl):

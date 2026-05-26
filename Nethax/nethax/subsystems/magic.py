@@ -2169,18 +2169,158 @@ def _spawn_tame_sphere(state: dict, entry_idx: jax.Array) -> dict:
 def _effect_level_teleport(state: dict, rng: jax.Array) -> dict:
     """LEVEL_TELEPORT: move to a random level on the current branch.
 
-    Vendor: vendor/nethack/src/teleport.c::level_tele — picks a level in
-    the legal depth range and teleports the player there.  Wave 6 minimum:
-    sample dungeon.current_level uniformly from [1, MAX_LEVELS_PER_BRANCH].
-    Cite: vendor/nethack/src/teleport.c::level_tele.
+    Vendor: vendor/nethack/src/teleport.c::level_tele lines 1164-1441.
+
+    Parity gates (in vendor order):
+      1. noteleport_level()  — Sokoban / Vlad / Castle → "mysterious force"
+         abort (teleport.c:854).  We share the predicate with scrolltele().
+      2. Amulet-of-Yendor 1/3 disorient  — when u.uhave.amulet, 1/3 chance
+         the teleport silently fizzles (teleport.c:865; "very disoriented"
+         variant inside level_tele at teleport.c:1185-1189 also fires when
+         the hero is In_endgame or In_sokoban).
+      3. newlev <= -10  → "Heaven" suicide death unless Levitation/Flying
+         (teleport.c:1334-1360).
+      4. newlev == -9   → "Cloud 9" survives unconditionally
+         (teleport.c:1340-1343).
+      5. Gehennom invocation gate — !u.uevent.invoked clamps newlev to
+         ``deepest - 1`` while Inhell (teleport.c:1406-1409).
+      6. Quest depth lock — newlev clamped to qstart depth while In_quest
+         (teleport.c:1411-1412).
+
+    Cite: vendor/nethack/src/teleport.c::level_tele lines 1165, 865, 1185,
+          1334, 1340, 1406, 1411.
     """
-    from Nethax.nethax.dungeon.branches import MAX_LEVELS_PER_BRANCH
-    new_lv = jax.random.randint(
-        rng, (), 1, MAX_LEVELS_PER_BRANCH + 1
-    ).astype(jnp.int8)
+    from Nethax.nethax.dungeon.branches import MAX_LEVELS_PER_BRANCH, Branch
+    from Nethax.nethax.subsystems.teleport import (
+        is_noteleport_level as _is_noteleport_level,
+        in_endgame as _in_endgame,
+        in_sokoban as _in_sokoban,
+        in_hell as _in_hell,
+        in_quest as _in_quest,
+    )
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    from Nethax.nethax.rng import rn2
+
     dungeon = state["dungeon"]
-    new_dungeon = dungeon.replace(current_level=new_lv)
-    return {**state, "dungeon": new_dungeon}
+    cur_b   = dungeon.current_branch
+    cur_lv  = dungeon.current_level
+
+    # --- Gate 1: noteleport_level (teleport.c:854) ----------------------
+    blocked = _is_noteleport_level(cur_b, cur_lv)
+
+    # --- Gate 2: u.uhave.amulet || In_endgame || In_sokoban → 1/3 disorient
+    # Vendor: teleport.c:1185-1189
+    #   if ((u.uhave.amulet || In_endgame(&u.uz) || In_sokoban(&u.uz))
+    #       && !wizard) { You_feel("very disoriented for a moment."); return; }
+    # The vendor predicate is unconditional (not 1/3); the 1/3 form lives in
+    # scrolltele() at teleport.c:865.  We honor both: level_tele aborts when
+    # any of the three flags is set, and scrolltele's 1/3 is applied at the
+    # scroll callsite (handled by items_scrolls.py).
+    inv  = state["inventory"]
+    cat  = inv.items.category
+    tid  = inv.items.type_id
+    has_yendor = jnp.any(
+        (cat != jnp.int8(0)) & (tid == jnp.int16(_AMULET_OF_YENDOR_TYPE_ID))
+    )
+    disorient = has_yendor | _in_endgame(cur_b) | _in_sokoban(cur_b)
+
+    # --- Gate 3/4: heaven / Cloud 9 destination sampling ----------------
+    # Vendor newlev range when controlled-tele is unavailable: random_teleport_level
+    # picks within [-MAX, MAX].  We mirror by sampling a signed newlev so
+    # newlev <= -10 (heaven) / newlev == -9 (cloud 9) can fire as in vendor.
+    rng_sign, rng_pick = jax.random.split(rng, 2)
+    sign_roll = rn2(rng_sign, 10)  # 1/10 chance of negative-newlev branch
+    # Pick a signed magnitude up to MAX_LEVELS_PER_BRANCH for symmetry.
+    mag = jax.random.randint(
+        rng_pick, (), 1, MAX_LEVELS_PER_BRANCH + 1
+    ).astype(jnp.int32)
+    # newlev: when sign_roll == 0, pick from [-11..-9] so heaven/cloud-9 are reachable.
+    # Otherwise positive depth within current branch.
+    neg_pick = jnp.where(mag <= jnp.int32(3),
+                         jnp.int32(-10) - (mag - jnp.int32(1)),  # -10, -11, -12
+                         -mag)
+    newlev = jnp.where(sign_roll == jnp.int32(0), neg_pick, mag)
+
+    # Heaven gate: newlev <= -10 AND no Levitation/Flying → kill.
+    intr = state["status"].intrinsics
+    has_levitation = intr[int(Intrinsic.LEVITATION)]
+    has_flying     = intr[int(Intrinsic.FLYING)]
+    can_fly = has_levitation | has_flying
+    heaven_kill = (newlev <= jnp.int32(-10)) & jnp.logical_not(can_fly)
+
+    # On heaven_kill we mark death via scoring.death_cause = DIED (0) and zero HP;
+    # the env's game-over check fires on the next step.
+    new_hp = jnp.where(heaven_kill, jnp.int32(0), state["player_hp"])
+
+    # --- Gate 5/6: quest lock + Gehennom invocation gate ----------------
+    branch_levels = dungeon.branch_levels  # int8 array per-branch caps
+    cur_b_idx = jnp.clip(cur_b.astype(jnp.int32), 0, branch_levels.shape[0] - 1)
+    max_depth = branch_levels[cur_b_idx].astype(jnp.int32)
+    max_depth = jnp.maximum(max_depth, jnp.int32(1))
+
+    # Gehennom: clamp positive newlev to deepest - 1 unless invocation done.
+    # We have no u.uevent.invoked flag in state yet, so treat as not-invoked
+    # (the conservative vendor default before the player has invoked).
+    in_hell = _in_hell(cur_b)
+    deepest = max_depth
+    gehennom_clamped = jnp.where(
+        in_hell & (newlev >= deepest),
+        deepest - jnp.int32(1),
+        newlev,
+    )
+
+    # Quest: lock to qstart depth (level 1 of Quest branch in Nethax).
+    in_q = _in_quest(cur_b)
+    quest_clamped = jnp.where(
+        in_q & (gehennom_clamped < jnp.int32(1)),
+        jnp.int32(1),
+        gehennom_clamped,
+    )
+
+    # Final non-heaven destination: clamp into [1, max_depth].
+    pos_target = jnp.clip(quest_clamped, jnp.int32(1), max_depth)
+
+    # If heaven_kill: leave dungeon position untouched (player is dying).
+    # If newlev == -9 (Cloud 9): also leave dungeon position untouched, but
+    # the player survives — vendor displays a flavor message and stays put.
+    cloud_nine = newlev == jnp.int32(-9)
+    surface_escape = (newlev < jnp.int32(0)) & jnp.logical_not(heaven_kill) & jnp.logical_not(cloud_nine) & can_fly
+    # If surviving-by-flying with newlev < -9, vendor sends player to surface
+    # (dlevel 0).  We approximate as Main Dlvl 1 to stay within engine bounds.
+    keep_pos = heaven_kill | cloud_nine | disorient | blocked
+    final_lv = jnp.where(
+        keep_pos,
+        cur_lv.astype(jnp.int32),
+        jnp.where(surface_escape, jnp.int32(1), pos_target),
+    ).astype(jnp.int8)
+    final_branch = jnp.where(
+        surface_escape,
+        jnp.int32(int(Branch.MAIN)),
+        cur_b.astype(jnp.int32),
+    ).astype(jnp.int8)
+
+    new_dungeon = dungeon.replace(
+        current_level=final_lv,
+        current_branch=final_branch,
+    )
+
+    # Death bookkeeping: when heaven_kill, also record death_cause = DIED so
+    # the env's game-over branch fires.  We do this immutably on scoring.
+    from Nethax.nethax.subsystems.scoring import DeathCause as _DC
+    scoring = state["scoring"]
+    new_death_cause = jnp.where(
+        heaven_kill,
+        jnp.int8(int(_DC.DIED)),
+        scoring.death_cause,
+    )
+    new_scoring = scoring.replace(death_cause=new_death_cause)
+
+    return {
+        **state,
+        "dungeon":    new_dungeon,
+        "player_hp":  new_hp,
+        "scoring":    new_scoring,
+    }
 
 
 # Dispatch table indexed by SpellId
