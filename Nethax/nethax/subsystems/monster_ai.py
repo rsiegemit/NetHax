@@ -1893,6 +1893,73 @@ def _try_throw_potion(state, rng: jax.Array, monster_idx: jnp.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# SCR_EARTH terrain AoE (vendor muse.c:1891-1937)
+# ---------------------------------------------------------------------------
+# Vendor: monster reads scroll of earth, dropping BOULDER objects on the
+# 8 tiles adjacent to the hero (vendor uses a 2-tile radius pattern; we
+# use the 8-cell ring for simplicity).
+_SCR_EARTH_TID:  int = 111    # _SCROLL_BASE_ID (94) + ScrollEffect.EARTH (17)
+_OBJ_BOULDER_TID: int = 447   # objects.py boulder
+_CAT_ROCK: int = 14           # ItemCategory.ROCK
+
+
+def _try_scroll_earth(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Monster reads SCR_EARTH; boulders drop on 8 tiles around the hero.
+
+    Cite: vendor/nethack/src/muse.c lines 1891-1937 — MUSE_SCR_EARTH.
+    Vendor places boulders in a 2-tile-radius cluster; we simplify to
+    the 8 cardinal+diagonal tiles around the player.  Each placement
+    writes to ground_items stack slot 0 if free; non-free tiles are
+    silently skipped (matches vendor's "no boulder over existing
+    boulder" behavior).
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_SCROLL, _SCR_EARTH_TID)
+    qty = mai.inv_quantity[idx, slot].astype(jnp.int32)
+    can_read = found & (qty > 0)
+
+    g = state.ground_items
+    br = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    map_h = g.category.shape[2]
+    map_w = g.category.shape[3]
+
+    offsets = jnp.array(
+        [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]],
+        dtype=jnp.int32,
+    )
+
+    def _place(carry_g, off):
+        gg = carry_g
+        r = pr + off[0]; c = pc + off[1]
+        in_bounds = (r >= 0) & (r < map_h) & (c >= 0) & (c < map_w)
+        rs = jnp.clip(r, 0, map_h - 1); cs = jnp.clip(c, 0, map_w - 1)
+        slot0_empty = gg.category[br, lv, rs, cs, 0] == jnp.int8(0)
+        do_place = can_read & in_bounds & slot0_empty
+        new_cat = jnp.where(do_place, jnp.int8(_CAT_ROCK), gg.category[br, lv, rs, cs, 0])
+        new_tid = jnp.where(do_place, jnp.int16(_OBJ_BOULDER_TID), gg.type_id[br, lv, rs, cs, 0])
+        new_qty = jnp.where(do_place, jnp.int16(1), gg.quantity[br, lv, rs, cs, 0])
+        new_gg = gg.replace(
+            category=gg.category.at[br, lv, rs, cs, 0].set(new_cat),
+            type_id=gg.type_id.at[br, lv, rs, cs, 0].set(new_tid),
+            quantity=gg.quantity.at[br, lv, rs, cs, 0].set(new_qty),
+        )
+        return new_gg, None
+
+    new_g, _ = jax.lax.scan(_place, g, offsets)
+
+    # Consume one scroll.
+    new_qty_scroll = jnp.where(can_read, qty - jnp.int32(1), qty).astype(jnp.int16)
+    new_mai = mai.replace(
+        inv_quantity=mai.inv_quantity.at[idx, slot].set(new_qty_scroll),
+    )
+    return state.replace(ground_items=new_g, monster_ai=new_mai)
+
+
+# ---------------------------------------------------------------------------
 # Unicorn horn self-cure (vendor muse.c:820-837) and Bugle awaken-soldiers
 # (vendor muse.c:838-848)
 # ---------------------------------------------------------------------------
@@ -2446,6 +2513,10 @@ def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
     s = _branch(s, can_attack,
                 lambda st, k, i: _try_throw_potion(st, k, i, _POT_ACID_TID, 4),
                 rng_pots[4])
+
+    # ----- SCR_EARTH terrain AoE (muse.c:1891-1937) ---------------------
+    rng_earth = jax.random.fold_in(keys[10], jnp.int32(0xEA47))
+    s = _branch(s, can_attack, _try_scroll_earth, rng_earth)
 
     # ----- Camera flash (muse.c:1938-1955) + Bullwhip disarm (muse.c:2178)
     # Camera: in LoS at range; bullwhip: adjacent only.
