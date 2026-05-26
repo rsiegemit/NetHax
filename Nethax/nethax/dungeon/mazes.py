@@ -707,6 +707,83 @@ def maze_remove_deadends(
 
 
 # ---------------------------------------------------------------------------
+# maze_carve_wall_deadends — frontier-wall polish pass
+# ---------------------------------------------------------------------------
+#
+# Vendor cite: vendor/nethack/src/mkmaze.c::maze_remove_deadends lines 904-943.
+#
+# Unlike :func:`maze_remove_deadends` above (which inspects accessible
+# odd-coord cells from inside the maze), this pass walks the wall side of
+# the maze: any WALL cell with **exactly one** walkable (FLOOR) orthogonal
+# neighbour is a 1-deep pocket sticking into the floor.  Carving it to
+# FLOOR opens that pocket into the corridor, producing a less-claustrophobic
+# maze without breaking connectivity (we never remove a wall that would
+# bridge two previously-disconnected components, because a WALL with only
+# one FLOOR neighbour is by definition adjacent to a single connected
+# region — turning it into FLOOR just extends that region by one cell).
+#
+# The vendor's rn2(10) < 5 coin is preserved verbatim — implemented here
+# via a per-cell uniform draw in [0, 10) and a < 5 comparison.
+# ---------------------------------------------------------------------------
+
+
+def maze_carve_wall_deadends(
+    rng: jnp.ndarray,
+    terrain: jnp.ndarray,
+) -> jnp.ndarray:
+    """Carve frontier WALL cells with exactly 1 walkable neighbour to FLOOR.
+
+    Vendor citation: vendor/nethack/src/mkmaze.c::maze_remove_deadends
+        lines 904-943.  Task spec: "find maze WALL tiles with exactly 1
+        walkable neighbour AND with rn2(10) < 5 carve the dead-end cell to
+        FLOOR".
+
+    For every interior cell:
+      1. If the cell is WALL and exactly one of its four orthogonal
+         neighbours is FLOOR, it qualifies as a 1-deep wall pocket.
+      2. A per-cell ``rn2(10) < 5`` draw decides whether to carve it.
+
+    Args:
+        rng:     JAX PRNG key.
+        terrain: int8[H, W] terrain map (TILE_WALL=0, TILE_FLOOR=1).
+
+    Returns:
+        Updated terrain with selected pocket-walls carved to FLOOR.
+    """
+    h, w = terrain.shape
+
+    is_wall  = terrain == jnp.int8(TILE_WALL)
+    is_floor = terrain == jnp.int8(TILE_FLOOR)
+
+    # Pad-and-slice 4-neighbour count of FLOOR cells (false outside bounds
+    # so boundary pockets are still well-defined).
+    padded = jnp.pad(is_floor, ((1, 1), (1, 1)), constant_values=False)
+    n_n = padded[:-2, 1:-1]   # north
+    n_s = padded[2:,  1:-1]   # south
+    n_w = padded[1:-1, :-2]   # west
+    n_e = padded[1:-1, 2:]    # east
+    floor_count = (
+        n_n.astype(jnp.int32) + n_s.astype(jnp.int32)
+        + n_w.astype(jnp.int32) + n_e.astype(jnp.int32)
+    )
+
+    # Restrict to strictly interior cells; boundary walls are kept solid so
+    # the maze remains enclosed.
+    rows = jnp.arange(h, dtype=jnp.int32)[:, None]
+    cols = jnp.arange(w, dtype=jnp.int32)[None, :]
+    interior = (rows >= 1) & (rows <= h - 2) & (cols >= 1) & (cols <= w - 2)
+
+    candidate = is_wall & interior & (floor_count == jnp.int32(1))
+
+    # Per-cell rn2(10) < 5 coin — vendor's coin via jax.random.randint.
+    coin_vals = jax.random.randint(rng, (h, w), minval=0, maxval=10, dtype=jnp.int32)
+    coin = coin_vals < jnp.int32(5)
+
+    carve = candidate & coin
+    return jnp.where(carve, jnp.int8(TILE_FLOOR), terrain)
+
+
+# ---------------------------------------------------------------------------
 # Remaining TODO blocks (documented divergences from vendor mkmaze.c)
 # ---------------------------------------------------------------------------
 # Wave 4 (done): generate_maze_perfect via vendor walkfrom DFS; DLA caves.
