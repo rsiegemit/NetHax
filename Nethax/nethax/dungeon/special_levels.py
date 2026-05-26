@@ -40,6 +40,7 @@ from __future__ import annotations
 from enum import IntEnum
 
 import jax
+import jax.lax as lax
 import jax.numpy as jnp
 
 from Nethax.nethax.dungeon.branches import MAP_H, MAP_W
@@ -118,77 +119,78 @@ class SpecialLevel(IntEnum):
 
 def generate_special_level(
     rng: jnp.ndarray,
-    level_id: SpecialLevel,
+    level_id,
 ) -> jnp.ndarray:
     """Return the terrain map for the given fixed special level.
 
-    Wave 1 stub: returns int8[MAP_H, MAP_W] of zeros (all walls) for every
-    level_id.  Each level will eventually be handled by its own Python
-    factory function that replicates the layout from the corresponding
-    vendor/nethack/dat/*.lua file.
+    Dispatches via ``jax.lax.switch`` over the 27-member ``SpecialLevel``
+    enum.  Each branch invokes the corresponding per-level factory (which
+    returns ``(terrain, monsters, items)``) and yields just the terrain
+    grid.  Unimplemented levels (e.g. the four elemental planes and the
+    three quest slots) fall through to an all-walls stub.
 
     Args:
-        rng:      JAX PRNG key (used for variant selection where a level has
-                  multiple variants, e.g. minetn-1 through minetn-7).
-        level_id: SpecialLevel enum value identifying which level to build.
+        rng:      JAX PRNG key (used for variant selection where a level
+                  has multiple variants, e.g. minetn-1 through minetn-7).
+        level_id: ``SpecialLevel`` enum value, Python int, or traced
+                  ``jnp.int32`` scalar in ``[0, 27]``.
 
     Returns:
         int8[MAP_H, MAP_W] terrain array; 0 = wall, 1 = floor.
 
-    TODO Wave 5 (Phase 1 — core progression):
-        Implement factories for:
-            ORACLE        — oracle.lua fixed map + random monster/item fill
-            MINETOWN      — randomly select one of minetn-1..7; parse layout
-            MINES_END     — mineend layout with luckstone guaranteed
-            SOKO_FLOOR_1..4 — parse soko{1-4}-{a,b}.lua puzzle layouts
-            CASTLE        — castle.lua with drawbridge, trumpet, soldiers
-            VALLEY        — valley.lua with many undead, no teleport
-            SANCTUM        — sanctum.lua with Wizard of Yendor, vibrating square
-
-    TODO Wave 5 (Phase 2 — Gehennom fixed levels):
-        ASMODEUS, BAALZEBUB, JUIBLEX, ORCUS, VLAD_TOWER_TOP,
-        FAKE_WIZARD_1, FAKE_WIZARD_2, FAKE_WIZARD_3, WIZARD_TOWER
-
-    TODO Wave 6 (Ascension levels):
-        ASTRAL_PLANE (astral.lua), EARTH_PLANE, AIR_PLANE (air.lua),
-        FIRE_PLANE, WATER_PLANE — each with unique terrain and altar layouts.
-
-    Implementation note:
-        We deliberately skip Lua.  Each factory will hard-code the tile
-        grid parsed by hand from the .lua source, then use JAX ops to
-        place monsters / items / traps stochastically on top of the fixed
-        terrain.  Variant selection (e.g. minetn-1 vs minetn-7) uses
-        jax.random.randint on the rng key.
+    Citation: vendor/nethack/src/sp_lev.c — the vendor Lua dispatcher;
+        we replace it with a static Python switch keyed off the
+        SpecialLevel enum.  Per-level factories below are byte-compatible
+        ports of the corresponding vendor/nethack/dat/*.lua layouts.
     """
-    # Dispatch to per-level factory; return terrain grid only.
-    _FACTORIES = {
-        SpecialLevel.ORACLE:        lambda r: generate_oracle_level(r)[0],
-        SpecialLevel.MINETOWN:      lambda r: generate_mine_town(r)[0],
-        SpecialLevel.MINES_END:     lambda r: generate_mines_end(r)[0],
-        SpecialLevel.BIG_ROOM:      lambda r: generate_big_room(r)[0],
-        SpecialLevel.SOKO_FLOOR_1:  lambda r: generate_sokoban_floor_1(r)[0],
-        SpecialLevel.SOKO_FLOOR_2:  lambda r: generate_sokoban_floor_2(r)[0],
-        SpecialLevel.SOKO_FLOOR_3:  lambda r: generate_sokoban_floor_3(r)[0],
-        SpecialLevel.SOKO_FLOOR_4:  lambda r: generate_sokoban_floor_4(r)[0],
-        SpecialLevel.CASTLE:        lambda r: generate_castle_level(r)[0],
-        SpecialLevel.VALLEY:        lambda r: generate_valley_level(r)[0],
-        SpecialLevel.SANCTUM:       lambda r: generate_sanctum_level(r)[0],
-        SpecialLevel.ASMODEUS:      lambda r: generate_asmodeus_lair(r)[0],
-        SpecialLevel.BAALZEBUB:     lambda r: generate_baalzebub_lair(r)[0],
-        SpecialLevel.JUIBLEX:       lambda r: generate_juiblex_lair(r)[0],
-        SpecialLevel.ORCUS:         lambda r: generate_orcus_town(r)[0],
-        SpecialLevel.VLAD_TOWER_TOP: lambda r: generate_vlads_tower(r, floor=3)[0],
-        SpecialLevel.FAKE_WIZARD_1: lambda r: generate_wizards_tower(r, fake_idx=1)[0],
-        SpecialLevel.FAKE_WIZARD_2: lambda r: generate_wizards_tower(r, fake_idx=2)[0],
-        SpecialLevel.FAKE_WIZARD_3: lambda r: generate_wizards_tower(r, fake_idx=3)[0],
-        SpecialLevel.WIZARD_TOWER:  lambda r: generate_wizards_tower(r, fake_idx=0)[0],
-        SpecialLevel.ASTRAL_PLANE:  lambda r: generate_astral_plane(r)[0],
-    }
-    factory = _FACTORIES.get(level_id)
-    if factory is not None:
-        return factory(rng)
-    # Remaining levels (elemental planes, quest levels) — all-wall stub.
-    return jnp.zeros((MAP_H, MAP_W), dtype=jnp.int8)
+    # ``lax.switch`` requires every branch to return an identically-shaped
+    # pytree.  All factories already return (terrain, monsters, items) with
+    # terrain shape [MAP_H, MAP_W], so we wrap each in a terrain-only
+    # adapter and add an all-walls default for unimplemented levels.
+    def _all_walls(r):
+        return jnp.zeros((MAP_H, MAP_W), dtype=jnp.int8)
+
+    # Branch table — index = SpecialLevel ordinal (0..27 inclusive).
+    # Order MUST match the SpecialLevel enum.  Wrap factories with the
+    # default rng signature; lax.switch evaluates a single branch.
+    _BRANCHES = (
+        lambda r: generate_oracle_level(r)[0],         # 0  ORACLE
+        lambda r: generate_big_room(r)[0],             # 1  BIG_ROOM
+        lambda r: generate_mine_town(r)[0],            # 2  MINETOWN
+        lambda r: generate_mines_end(r)[0],            # 3  MINES_END
+        lambda r: generate_sokoban_floor_1(r)[0],      # 4  SOKO_FLOOR_1
+        lambda r: generate_sokoban_floor_2(r)[0],      # 5  SOKO_FLOOR_2
+        lambda r: generate_sokoban_floor_3(r)[0],      # 6  SOKO_FLOOR_3
+        lambda r: generate_sokoban_floor_4(r)[0],      # 7  SOKO_FLOOR_4
+        _all_walls,                                    # 8  QUEST_START   (TODO)
+        _all_walls,                                    # 9  QUEST_LOCATE  (TODO)
+        _all_walls,                                    # 10 QUEST_GOAL    (TODO)
+        lambda r: generate_castle_level(r)[0],         # 11 CASTLE
+        lambda r: generate_valley_level(r)[0],         # 12 VALLEY
+        lambda r: generate_asmodeus_lair(r)[0],        # 13 ASMODEUS
+        lambda r: generate_baalzebub_lair(r)[0],       # 14 BAALZEBUB
+        lambda r: generate_juiblex_lair(r)[0],         # 15 JUIBLEX
+        lambda r: generate_orcus_town(r)[0],           # 16 ORCUS
+        lambda r: generate_vlads_tower(r, floor=3)[0], # 17 VLAD_TOWER_TOP
+        lambda r: generate_wizards_tower(r, fake_idx=1)[0],  # 18 FAKE_WIZARD_1
+        lambda r: generate_wizards_tower(r, fake_idx=2)[0],  # 19 FAKE_WIZARD_2
+        lambda r: generate_wizards_tower(r, fake_idx=3)[0],  # 20 FAKE_WIZARD_3
+        lambda r: generate_wizards_tower(r, fake_idx=0)[0],  # 21 WIZARD_TOWER
+        lambda r: generate_sanctum_level(r)[0],        # 22 SANCTUM
+        lambda r: generate_astral_plane(r)[0],         # 23 ASTRAL_PLANE
+        _all_walls,                                    # 24 EARTH_PLANE   (TODO)
+        _all_walls,                                    # 25 AIR_PLANE     (TODO)
+        _all_walls,                                    # 26 FIRE_PLANE    (TODO)
+        _all_walls,                                    # 27 WATER_PLANE   (TODO)
+    )
+
+    # Normalise level_id to int32 scalar; clamp out-of-range to the last
+    # default branch (an all-walls stub) so lax.switch never indexes past
+    # the end of _BRANCHES (vendor: invalid level_id is treated as empty).
+    idx = jnp.asarray(int(level_id) if isinstance(level_id, SpecialLevel)
+                      else level_id, dtype=jnp.int32)
+    idx = jnp.clip(idx, 0, len(_BRANCHES) - 1)
+    return lax.switch(idx, _BRANCHES, rng)
 
 
 # ---------------------------------------------------------------------------
@@ -1078,11 +1080,14 @@ def generate_big_room(rng):
         maxval=left_pad + W_INNER + 1,
         dtype=jnp.int32,
     )
-    triples_m = [
-        (int(mon_rows[i]), int(mon_cols[i]), _MON_GNOME)
-        for i in range(n_monsters)
-    ]
-    monsters = _pack_placements(triples_m, capacity=64)
+    # Build the monster placements array directly via jnp ops — avoids the
+    # per-element ``int(traced)`` Python cast that breaks JIT tracing inside
+    # ``generate_special_level``'s ``lax.switch`` dispatch.
+    monsters = jnp.full((64, 3), -1, dtype=jnp.int16)
+    mon_types = jnp.full((n_monsters,), _MON_GNOME, dtype=jnp.int16)
+    monsters = monsters.at[:n_monsters, 0].set(mon_rows.astype(jnp.int16))
+    monsters = monsters.at[:n_monsters, 1].set(mon_cols.astype(jnp.int16))
+    monsters = monsters.at[:n_monsters, 2].set(mon_types)
 
     item_rows = jax.random.randint(
         key_i, (n_items,),
@@ -1097,11 +1102,11 @@ def generate_big_room(rng):
         maxval=left_pad + W_INNER + 1,
         dtype=jnp.int32,
     )
-    triples_i = [
-        (int(item_rows[i]), int(item_cols[i]), _ITEM_GOLD)
-        for i in range(n_items)
-    ]
-    items = _pack_placements(triples_i, capacity=64)
+    items = jnp.full((64, 3), -1, dtype=jnp.int16)
+    item_types = jnp.full((n_items,), _ITEM_GOLD, dtype=jnp.int16)
+    items = items.at[:n_items, 0].set(item_rows.astype(jnp.int16))
+    items = items.at[:n_items, 1].set(item_cols.astype(jnp.int16))
+    items = items.at[:n_items, 2].set(item_types)
 
     return terrain, monsters, items
 
@@ -1265,19 +1270,19 @@ def generate_castle_level(rng):
     # in one of the four corner towers containing the wand of wishing
     # (castle.lua lines 142-149).  Use rng to pick which of the four towers
     # holds the wishing chest.
-    tower_corners = [(2, 4), (2, 58), (14, 4), (14, 58)]
+    # Trace-pure tower selection: build items as a jnp array so that the
+    # rng-selected wishing-chest position survives ``lax.switch`` tracing.
+    tower_rows = jnp.array([2, 2, 14, 14], dtype=jnp.int16)
+    tower_cols = jnp.array([4, 58, 4, 58], dtype=jnp.int16)
     key = jax.random.fold_in(rng, 0xCA571E)
-    wishing_idx = int(jax.random.randint(key, (), minval=0, maxval=4))
-    wishing_pos = tower_corners[wishing_idx]
+    wishing_idx = jax.random.randint(key, (), minval=0, maxval=4, dtype=jnp.int32)
+    wishing_row = tower_rows[wishing_idx]
+    wishing_col = tower_cols[wishing_idx]
 
+    # Fixed-coordinate placements that don't depend on rng.
     items = _pack_placements([
         # Throne treasure chest — line 154: des.object("chest",37,08)
         (8, 37, _ITEM_CHEST),
-        # The wishing chest — locked, in one of the four towers.
-        (wishing_pos[0], wishing_pos[1], _ITEM_CHEST),
-        # The wand of wishing itself (the chest's contents — flat-placed
-        # for now; Wave 6 nests it inside the chest).
-        (wishing_pos[0], wishing_pos[1], _ITEM_WAND_WISHING),
         # Magic markers scattered in the storerooms.
         (5, 40, _ITEM_MAGIC_MARKER),
         (10, 50, _ITEM_MAGIC_MARKER),
@@ -1285,6 +1290,15 @@ def generate_castle_level(rng):
         (5, 42, _ITEM_GOLD),
         (10, 42, _ITEM_GOLD),
     ])
+    # The wishing chest + wand at the rng-selected tower.  Writes go to
+    # the first two trailing -1 slots (indices 5 and 6 in the 64-row
+    # placement table, since 5 entries were packed above).
+    items = items.at[5, 0].set(wishing_row)
+    items = items.at[5, 1].set(wishing_col)
+    items = items.at[5, 2].set(jnp.int16(_ITEM_CHEST))
+    items = items.at[6, 0].set(wishing_row)
+    items = items.at[6, 1].set(wishing_col)
+    items = items.at[6, 2].set(jnp.int16(_ITEM_WAND_WISHING))
 
     return terrain, monsters, items
 
@@ -1619,16 +1633,19 @@ def generate_wizards_tower(rng, fake_idx: int = 0):
         terrain = terrain.at[1, 12].set(jnp.int8(_T_STAIR_UP))
         terrain = terrain.at[11, 14].set(jnp.int8(_T_STAIR_DOWN))
         key = jax.random.fold_in(rng, 0xFA1E3)
-        gold_col = int(jax.random.randint(key, (), minval=3, maxval=24))
+        gold_col = jax.random.randint(key, (), minval=3, maxval=24, dtype=jnp.int32)
         monsters = _pack_placements([
             (3, 5,  _MON_GHOUL),
             (5, 12, _MON_GHOUL),
             (8, 18, _MON_GHOUL),
         ])
+        # Trace-pure rng-driven loot position — write into the placement table
+        # so this branch survives ``lax.switch`` tracing.
         items = _pack_placements([
-            (5, gold_col, _ITEM_GOLD),
+            (5, 0,  _ITEM_GOLD),  # col overwritten below with traced gold_col
             (8, 20, _ITEM_GEM),
         ])
+        items = items.at[0, 1].set(gold_col.astype(jnp.int16))
     else:
         raise ValueError(
             f"Wizard's Tower fake_idx must be 0..3 (got {fake_idx})"
