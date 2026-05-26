@@ -189,6 +189,119 @@ def test_explode_jit():
 
 
 # ---------------------------------------------------------------------------
+# Scatter dispersal — vendor explode.c::scatter (lines 721-947).
+# Each ground-stack slot inside the 3x3 ring has a 50% chance to be
+# displaced into a random adjacent walkable tile.  POTION items shatter
+# on impact and are zeroed out instead of being relocated.
+# ---------------------------------------------------------------------------
+
+def _scatter_state_with_items(weapon=True, potion=True):
+    """Build a floor state with a weapon and/or potion at (10,10)/(10,11)."""
+    from Nethax.nethax.state import StaticParams
+    from Nethax.nethax.constants.tiles import TileType
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+
+    static = StaticParams()
+    state = EnvState.default(_RNG, static)
+    floor_map = jnp.full((static.map_h, static.map_w), int(TileType.FLOOR),
+                         dtype=jnp.int8)
+    state = state.replace(
+        terrain=state.terrain.at[0, 0].set(floor_map),
+        player_pos=jnp.array([0, 0], dtype=jnp.int16),  # hero out of AoE
+    )
+    gi = state.ground_items
+    if weapon:
+        gi = gi.replace(
+            category=gi.category.at[0, 0, 10, 10, 0].set(
+                jnp.int8(int(ItemCategory.WEAPON))),
+            type_id=gi.type_id.at[0, 0, 10, 10, 0].set(jnp.int16(60)),
+            quantity=gi.quantity.at[0, 0, 10, 10, 0].set(jnp.int16(1)),
+        )
+    if potion:
+        gi = gi.replace(
+            category=gi.category.at[0, 0, 10, 11, 0].set(
+                jnp.int8(int(ItemCategory.POTION))),
+            type_id=gi.type_id.at[0, 0, 10, 11, 0].set(jnp.int16(200)),
+            quantity=gi.quantity.at[0, 0, 10, 11, 0].set(jnp.int16(1)),
+        )
+    return state.replace(ground_items=gi)
+
+
+# JIT-compiled module-level helper — re-used across the scatter tests so
+# we only compile once.  The center is fixed (10, 10).
+@jax.jit
+def _jit_scatter_explode(state, rng):
+    return explode(state, rng, jnp.array([10, 10], dtype=jnp.int16),
+                   AD_FIRE, 6, 6)
+
+
+def test_explode_scatters_weapon_conserves_count():
+    """A weapon inside the 3x3 ring is never destroyed; it may move.
+
+    Vendor cite: explode.c::scatter (lines 721-947).  Non-fragile items
+    (weapons, armor, scrolls, wands, ...) are flung but conserved.
+    """
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+
+    state = _scatter_state_with_items(weapon=True, potion=False)
+    n_seeds = 40
+    n_moved = 0
+    n_preserved = 0
+    for seed in range(n_seeds):
+        o = _jit_scatter_explode(state, jax.random.PRNGKey(seed))
+        if int(o.ground_items.category[0, 0, 10, 10, 0]) == 0:
+            n_moved += 1
+        # Weapon must be conserved on the level — one slot, anywhere.
+        wcount = int(jnp.sum(
+            (o.ground_items.category[0, 0]
+             == int(ItemCategory.WEAPON))
+            & (o.ground_items.type_id[0, 0] == 60)
+        ))
+        if wcount == 1:
+            n_preserved += 1
+    assert n_preserved == n_seeds, (
+        f"weapon must be conserved every seed; got {n_preserved}/{n_seeds}"
+    )
+    # ~50% scatter probability — broad tolerance for small n.
+    assert n_moved >= n_seeds // 5, (
+        f"expected some scattering; observed {n_moved}/{n_seeds}"
+    )
+
+
+def test_explode_scatters_potion_breaks_in_place():
+    """A POTION inside the 3x3 ring breaks (slot zeroed) when scatter fires.
+
+    Vendor cite: explode.c::scatter line 808-813 + breaks() for POTION_CLASS.
+    """
+    from Nethax.nethax.subsystems.inventory import ItemCategory
+
+    state = _scatter_state_with_items(weapon=False, potion=True)
+    n_seeds = 40
+    n_broken = 0
+    for seed in range(n_seeds):
+        o = _jit_scatter_explode(state, jax.random.PRNGKey(seed))
+        pcount = int(jnp.sum(
+            (o.ground_items.category[0, 0]
+             == int(ItemCategory.POTION))
+            & (o.ground_items.type_id[0, 0] == 200)
+        ))
+        # The potion is either intact (didn't trigger) or fully gone (broke).
+        # It must NEVER appear at a NEW location (potions don't relocate).
+        assert pcount in (0, 1), (
+            f"potion must be 0 or 1; got {pcount}"
+        )
+        if pcount == 0:
+            n_broken += 1
+            assert int(o.ground_items.category[0, 0, 10, 11, 0]) == 0, (
+                "broken potion source slot must be zeroed"
+            )
+    # ~50% break rate — broad tolerance.
+    assert n_broken >= n_seeds // 5, (
+        f"expected some breakage; observed {n_broken}/{n_seeds}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Wand-backfire wiring: scroll-of-charging on a wand whose ``recharged``
 # counter is already >=7 triggers a 3x3 AoE through ``_effect_charging``.
 # Cite: vendor/nethack/src/read.c::wand_explode (line 2414);

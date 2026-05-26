@@ -48,9 +48,15 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import jax.lax as lax
 from flax import struct
 
 from Nethax.nethax.subsystems.inventory import MAX_INVENTORY_SLOTS, ItemCategory
+from Nethax.nethax.subsystems.containers import (
+    ContainerType,
+    MAX_ITEMS_PER_CONTAINER,
+    N_CONTAINERS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -423,23 +429,29 @@ def _lookup_object_cost(type_id: jnp.ndarray) -> jnp.ndarray:
     """Look up ``OBJECTS[type_id].cost`` as a JAX int32.
 
     Built lazily — the OBJECTS table is a python tuple, so we materialise a
-    jnp array on first use and rely on jit caching for subsequent calls.
+    numpy array on first use (outside any trace) and convert at lookup
+    time.  Using a numpy cache avoids the UnexpectedTracerError that would
+    occur if the first call landed inside a ``lax.scan`` (a cached ``jnp``
+    array created mid-trace would escape the scan scope).
     """
+    import numpy as _np
     from Nethax.nethax.constants.objects import OBJECTS, NUM_OBJECTS
 
-    # Module-level cache to avoid rebuilding the array on every call.
-    global _OBJECT_COST_TABLE
+    # Module-level numpy cache — trace-safe.
+    global _OBJECT_COST_TABLE_NP
     try:
-        table = _OBJECT_COST_TABLE
+        table_np = _OBJECT_COST_TABLE_NP
     except NameError:
-        table = None
-    if table is None:
-        costs = [int(OBJECTS[i].cost) for i in range(NUM_OBJECTS)]
-        table = jnp.array(costs, dtype=jnp.int32)
-        _OBJECT_COST_TABLE = table
+        table_np = None
+    if table_np is None:
+        table_np = _np.array(
+            [int(OBJECTS[i].cost) for i in range(NUM_OBJECTS)],
+            dtype=_np.int32,
+        )
+        _OBJECT_COST_TABLE_NP = table_np
 
     idx = jnp.clip(type_id.astype(jnp.int32), 0, NUM_OBJECTS - 1)
-    return table[idx]
+    return jnp.asarray(table_np)[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -567,17 +579,217 @@ def _compute_item_price_from_slot(state, slot_idx: jnp.ndarray) -> jnp.ndarray:
     return jnp.where(has_item, price, jnp.int32(DEFAULT_ITEM_PRICE))
 
 
+# ---------------------------------------------------------------------------
+# Container-aware helpers  (vendor shk.c::contained_gold lines 3046-3061,
+#                          shk.c::contained_cost lines 2995-3041,
+#                          shk.c::bill_box_content lines 3387-3407)
+# ---------------------------------------------------------------------------
+def _find_container_for_slot(containers, slot: jnp.ndarray) -> tuple:
+    """Return (has_container, c_idx) for the container whose parent_slot == slot.
+
+    The JAX container model holds at most one container per inventory slot
+    (containers cannot be nested — see containers.py line 442
+    ``is_box_inside_box`` refusal), so a linear scan over N_CONTAINERS
+    suffices.  Empty / floor containers (parent_slot == -1) are skipped.
+    """
+    parent = containers.parent_slot.astype(jnp.int32)
+    ctype = containers.container_type
+    slot_i32 = slot.astype(jnp.int32)
+
+    def _scan(carry, c_idx):
+        found, idx = carry
+        match = (
+            (parent[c_idx] == slot_i32)
+            & (ctype[c_idx] != jnp.int8(ContainerType.NONE))
+        )
+        new_found = found | match
+        new_idx = jnp.where((~found) & match, c_idx, idx)
+        return (new_found, new_idx), None
+
+    (found, c_idx), _ = lax.scan(
+        _scan,
+        (jnp.bool_(False), jnp.int32(0)),
+        jnp.arange(N_CONTAINERS, dtype=jnp.int32),
+    )
+    return found, c_idx
+
+
+def contained_gold(state, slot_idx) -> jnp.ndarray:
+    """Vendor ``contained_gold`` (shk.c:3046-3061).
+
+        long
+        contained_gold(struct obj *obj, boolean even_if_unknown) {
+            for (otmp = obj->cobj; otmp; otmp = otmp->nobj)
+                if (otmp->oclass == COIN_CLASS)
+                    value += otmp->quan;
+                else if (Has_contents(otmp) && (otmp->cknown || even_if_unknown))
+                    value += contained_gold(otmp, even_if_unknown);
+            return value;
+        }
+
+    Sums the gold quantity inside the container held at inventory ``slot_idx``.
+    Returns 0 when the slot has no container attached.
+
+    The JAX container model is single-level (boxes-in-boxes refused — see
+    containers.py::put_in_container ``is_box_inside_box`` gate at line 442),
+    so the vendor recursion collapses to a single ``lax.scan`` over the
+    container's ``MAX_ITEMS_PER_CONTAINER`` slots.  Vendor's
+    ``even_if_unknown`` flag (T at call site shk.c:3528) is implicit here:
+    we always sum all gold (cknown is not modelled per slot).
+
+    JIT-safe.  Returns int32.
+    """
+    cs = state.containers
+    slot = jnp.asarray(slot_idx, dtype=jnp.int32)
+    has_container, c_idx = _find_container_for_slot(cs, slot)
+
+    cats = cs.items_category[c_idx]
+    qtys = cs.items_quantity[c_idx].astype(jnp.int32)
+    is_coin = cats == jnp.int8(ItemCategory.COIN)
+    gold = jnp.where(is_coin, qtys, jnp.int32(0))
+    total = jnp.sum(gold)
+    return jnp.where(has_container, total.astype(jnp.int32), jnp.int32(0))
+
+
+def _container_item_price(state, c_idx: jnp.ndarray, pos: jnp.ndarray) -> jnp.ndarray:
+    """Vendor ``get_cost`` for the item at container ``c_idx`` position ``pos``.
+
+    Mirrors ``_compute_item_price_from_slot`` but reads from ContainerState
+    arrays instead of InventoryState.items.  Returns 0 for empty slots /
+    coin slots (vendor ``contained_cost`` shk.c:3018-3019 skips COIN_CLASS
+    explicitly).
+    """
+    cs = state.containers
+    cat = cs.items_category[c_idx, pos].astype(jnp.int32)
+    type_id = cs.items_type_id[c_idx, pos]
+    spe = cs.items_enchant[c_idx, pos].astype(jnp.int32)
+    has_item = cat != jnp.int32(0)
+    is_coin = cat == jnp.int32(ItemCategory.COIN)
+    billable_item = has_item & ~is_coin
+
+    # ContainerState doesn't carry per-slot dknown / artifact_idx — vendor's
+    # contained_cost branch at shk.c:3032-3034 falls through to get_cost which
+    # respects obj->dknown / oc_name_known.  In this slice we approximate
+    # both as ``identified`` (closest analogue exposed on container slots).
+    name_known = cs.items_identified[c_idx, pos]
+    dknown = name_known
+    oartifact = jnp.bool_(False)  # container slots don't carry artifact_idx
+
+    base = jnp.where(billable_item, _lookup_object_cost(type_id), jnp.int32(0))
+    price = get_cost(
+        base_cost=base,
+        oclass=cat,
+        spe=spe,
+        oartifact=oartifact,
+        dknown=dknown,
+        name_known=name_known,
+        cha=state.player_cha,
+        is_tourist=jnp.bool_(False),
+        has_dunce_cap=jnp.bool_(False),
+        has_tshirt_visible=jnp.bool_(False),
+        xp_level=state.player_xl,
+        surcharge=state.shop.surcharge,
+    )
+    # Multiply by quantity to match vendor's ``get_pricing_units`` factor at
+    # shk.c:3034 (``price += get_cost(otmp, shkp) * get_pricing_units(otmp)``).
+    qty = cs.items_quantity[c_idx, pos].astype(jnp.int32)
+    qty = jnp.maximum(qty, jnp.int32(1))
+    return jnp.where(billable_item, price * qty, jnp.int32(0))
+
+
+def _contained_cost(state, slot_idx) -> jnp.ndarray:
+    """Vendor ``contained_cost`` (shk.c:2995-3041) — buy-side, non-recursive.
+
+    Computes the cumulative price of every non-coin item inside the
+    container held at inventory ``slot_idx``.  Used by ``addtobill``
+    (shk.c:3527) and by the recursive ``bill_box_content`` walker
+    (shk.c:3387-3407) — combined here because the JAX model is single-level.
+
+    JIT-safe.  Returns int32 (0 when no container at the slot).
+    """
+    cs = state.containers
+    slot = jnp.asarray(slot_idx, dtype=jnp.int32)
+    has_container, c_idx = _find_container_for_slot(cs, slot)
+
+    # Prime the OBJECTS cost cache outside the scan (eager numpy build) so
+    # the first call inside ``_scan`` doesn't leak a tracer-shaped jnp array.
+    _ = _lookup_object_cost(jnp.int32(0))
+
+    def _scan(carry, pos):
+        total = carry
+        price = _container_item_price(state, c_idx, pos)
+        return total + price, None
+
+    total, _ = lax.scan(
+        _scan,
+        jnp.int32(0),
+        jnp.arange(MAX_ITEMS_PER_CONTAINER, dtype=jnp.int32),
+    )
+    return jnp.where(has_container, total, jnp.int32(0))
+
+
+def _apply_costly_gold(shop: "ShopState", amount: jnp.ndarray, active: jnp.ndarray) -> "ShopState":
+    """Vendor ``costly_gold`` (shk.c:5744-5786) credit/debit ledger update.
+
+    Vendor flow:
+        if (credit >= amount):  credit -= amount
+        else:                    debit += amount - credit
+                                 loan  += amount - credit
+                                 credit  = 0
+
+    Applied unconditionally when ``active`` is True; otherwise pass-through.
+    Used by container-billing (addtobill shk.c:3538-3540) to route the gold
+    contained inside a picked-up container through the shopkeeper's debit
+    ledger instead of an item-level bill row.
+    """
+    amt = amount.astype(jnp.int32)
+    credit = shop.credit.astype(jnp.int32)
+
+    has_credit_cover = credit >= amt
+    delta = amt - credit  # only meaningful when credit < amt
+
+    new_credit_cover = credit - amt
+    new_credit_no_cover = jnp.int32(0)
+    new_credit = jnp.where(has_credit_cover, new_credit_cover, new_credit_no_cover)
+
+    new_debit_no_cover = shop.debit + delta
+    new_loan_no_cover = shop.loan + delta
+    new_debit = jnp.where(has_credit_cover, shop.debit, new_debit_no_cover)
+    new_loan = jnp.where(has_credit_cover, shop.loan, new_loan_no_cover)
+
+    final_credit = jnp.where(active, new_credit, shop.credit)
+    final_debit = jnp.where(active, new_debit, shop.debit)
+    final_loan = jnp.where(active, new_loan, shop.loan)
+    return shop.replace(credit=final_credit, debit=final_debit, loan=final_loan)
+
+
 def accrue_bill(state, slot_idx) -> object:
     """Player picks up an item inside the shop while not invisible.
 
     Vendor refs:
-        shk.c::addtobill (shk.c:3489-3550) — billable gate then add_one_tobill.
-        shk.c::get_cost  (shk.c:2877-2988) — the per-item price added.
+        shk.c::addtobill          (shk.c:3489-3550) — billable gate then
+                                                       add_one_tobill, plus
+                                                       container content roll-in.
+        shk.c::get_cost           (shk.c:2877-2988) — per-item price.
+        shk.c::contained_cost     (shk.c:2995-3041) — sum of contained prices.
+        shk.c::contained_gold     (shk.c:3046-3061) — sum of contained gold.
+        shk.c::bill_box_content   (shk.c:3387-3407) — recursive content billing.
+        shk.c::costly_gold        (shk.c:5744-5786) — credit/debit ledger update.
 
     Side-effects (only when ``billable`` returns True):
-        - shop.bill_prices[slot_idx] = get_cost(item at slot)
-        - shop.bill                  += that price
+        - shop.bill_prices[slot_idx] = get_cost(item at slot) + contained_cost
+        - shop.bill                  += that combined price
         - shop.items_owned_by_shop[slot_idx] = True
+        - shop.{credit, debit, loan} updated via ``_apply_costly_gold`` when the
+          picked-up container holds gold (vendor shk.c:3538-3539).
+
+    Container-contents semantics (this commit, vendor shk.c:3526-3550):
+        Vendor recursively bills every non-coin object in the container
+        (``bill_box_content``) and routes contained gold through
+        ``costly_gold``.  The JAX model is single-level (containers cannot
+        be nested — see containers.py::put_in_container ``is_box_inside_box``
+        guard at line 442), so the recursion collapses to a flat scan over
+        ``MAX_ITEMS_PER_CONTAINER``.
 
     JIT-safe; no Python branching on traced values.
     """
@@ -591,7 +803,13 @@ def accrue_bill(state, slot_idx) -> object:
     item_oclass = inv.category[slot].astype(jnp.int32)
     eligible = billable(state, slot, item_oclass)
 
-    price = _compute_item_price_from_slot(state, slot)
+    top_price = _compute_item_price_from_slot(state, slot)
+    # Container content roll-in (vendor shk.c:3526-3537).  When the picked-up
+    # slot holds a container, sum get_cost over every non-coin contained item
+    # and add it to the bill row.  ``_contained_cost`` returns 0 when the slot
+    # has no container attached, so this is a no-op for non-container items.
+    cltmp = _contained_cost(state, slot)
+    price = top_price + cltmp
     prev_price = shop.bill_prices[slot]
 
     new_price_at_slot = jnp.where(eligible, price, prev_price)
@@ -611,6 +829,15 @@ def accrue_bill(state, slot_idx) -> object:
         bill_prices=new_prices,
         items_owned_by_shop=new_owned,
     )
+
+    # Contained-gold debit (vendor shk.c:3528 + 3538-3539):
+    #   gltmp = contained_gold(obj, TRUE);
+    #   if (gltmp) costly_gold(obj->ox, obj->oy, gltmp, silent);
+    # ``costly_gold`` updates credit/debit/loan; route only when the pickup
+    # was billable (so non-shop pickups don't accidentally accrue debt).
+    gltmp = contained_gold(state, slot)
+    gold_active = eligible & (gltmp > jnp.int32(0))
+    new_shop = _apply_costly_gold(new_shop, gltmp, gold_active)
     return state.replace(shop=new_shop)
 
 
@@ -654,16 +881,31 @@ def pay_at_exit(state) -> object:
     """Called when the player crosses the shop door tile leaving the shop.
 
     Vendor refs:
-        shk.c::dopayobj (shk.c:2220-2299) — itemised pay loop.
+        shk.c::dopayobj      (shk.c:2220-2299) — itemised pay loop.
+        shk.c::setpaid       (shk.c:399-434)   — global object-list sweep
+                                                  clearing unpaid flags + zeroing
+                                                  billct / credit / debit / loan.
         shk.c::make_angry_shk (shk.c:1469-1489) — PAY_CANT path.
-        shk.c::hot_pursuit (shk.c:1449-1463) — sets ``following = 1``.
+        shk.c::hot_pursuit    (shk.c:1449-1463) — sets ``following = 1``.
 
     Behaviour:
         - bill == 0: no-op.
-        - player gold >= bill: deduct gold, zero bill, clear ownership,
-          zero per-slot prices.
+        - player gold >= bill: deduct gold, run setpaid() sweep (zero bill,
+          clear ownership, zero per-slot prices, zero credit/debit/loan).
         - player gold <  bill: PAY_CANT → set angry, set following, set
           surcharge.  Bill stays on the books; ownership flags persist.
+
+    setpaid() global object-list sweep (vendor shk.c:400-419):
+        Vendor clears ``unpaid`` on every object reachable from invent /
+        fobj / svl.level.buriedobjlist / gt.thrownobj / gk.kickedobj and
+        every monster's minvent.  In this JAX port the only place that
+        tracks "unpaid" state is ``shop.items_owned_by_shop`` (per
+        inventory slot — see ShopState docstring at module top); no
+        per-Item ``unpaid`` bit exists on ``state.ground_items``,
+        ``state.containers.items_*``, or ``state.monster_ai.inv_*``.
+        Consequently the sweep over those lists is a no-op by construction
+        in this slice; clearing ``items_owned_by_shop`` (below) covers the
+        entirety of the observable unpaid state.
 
     JIT-safe.
     """
@@ -686,6 +928,12 @@ def pay_at_exit(state) -> object:
     new_bill = jnp.where(paid, jnp.int32(0), shop.bill)
     new_owned = jnp.where(paid, cleared_owned, shop.items_owned_by_shop)
     new_prices = jnp.where(paid, cleared_prices, shop.bill_prices)
+    # Vendor shk.c:428-432 — setpaid() also zeros credit/debit/loan on the
+    # paid branch.  This was previously omitted; clear them now to match
+    # byte-equal vendor semantics.
+    new_credit = jnp.where(paid, jnp.int32(0), shop.credit)
+    new_debit = jnp.where(paid, jnp.int32(0), shop.debit)
+    new_loan = jnp.where(paid, jnp.int32(0), shop.loan)
     new_angry = jnp.where(angered, jnp.bool_(True), shop.angry)
     # vendor shk.c:1456 — hot_pursuit sets following=1; shk.c:1364 sets surcharge.
     new_following = jnp.where(angered, jnp.bool_(True), shop.following)
@@ -695,6 +943,9 @@ def pay_at_exit(state) -> object:
         bill=new_bill,
         items_owned_by_shop=new_owned,
         bill_prices=new_prices,
+        credit=new_credit,
+        debit=new_debit,
+        loan=new_loan,
         angry=new_angry,
         following=new_following,
         surcharge=new_surcharge,
@@ -776,6 +1027,17 @@ def kill_shopkeeper(state) -> object:
           remains visible to test code.  ``following`` and ``surcharge``
           clear because *this* shk is gone (shk.c:262).
 
+    setpaid() global object-list sweep (vendor shk.c:400-419):
+        Vendor's setpaid sweeps ``unpaid`` flags across invent, fobj,
+        buriedobjlist, thrownobj, kickedobj, and every monster's minvent.
+        This JAX port carries the unpaid bit only on
+        ``shop.items_owned_by_shop`` (inventory-slot indexed); no per-Item
+        ``unpaid`` flag exists on ``state.ground_items``,
+        ``state.containers.items_*``, or ``state.monster_ai.inv_*``.  The
+        sweep is therefore a no-op by construction on those lists; the
+        ``items_owned_by_shop`` clear below covers the observable unpaid
+        state.  Per vendor shk.c:428-432 we also zero credit/debit/loan.
+
     JIT-safe.
     """
     shop = state.shop
@@ -804,6 +1066,10 @@ def kill_shopkeeper(state) -> object:
         bill=jnp.where(will_kill, jnp.int32(0), shop.bill),
         items_owned_by_shop=jnp.where(will_kill, cleared_owned, shop.items_owned_by_shop),
         bill_prices=jnp.where(will_kill, cleared_prices, shop.bill_prices),
+        # Vendor shk.c:428-432 — setpaid() zeros credit/debit/loan too.
+        credit=jnp.where(will_kill, jnp.int32(0), shop.credit),
+        debit=jnp.where(will_kill, jnp.int32(0), shop.debit),
+        loan=jnp.where(will_kill, jnp.int32(0), shop.loan),
         # Keep `angry` True per the comment above (tests expect it).
         angry=jnp.where(will_kill, jnp.bool_(True), shop.angry),
         following=jnp.where(will_kill, jnp.bool_(False), shop.following),
