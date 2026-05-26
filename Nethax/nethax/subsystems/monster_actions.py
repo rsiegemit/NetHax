@@ -336,6 +336,115 @@ def _cheby(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     return jnp.maximum(d[0], d[1])
 
 
+# ---------------------------------------------------------------------------
+# Helper: vendor-equivalent m_throw() ray-trace.
+#
+# Vendor cite: vendor/nethack/src/mthrowu.c::m_throw lines 572-849.  The
+# vendor loop (lines 673-826) walks one tile per step along (dx, dy),
+# advancing ``bhitpos`` BEFORE checking the destination tile.  At each
+# step it checks whether the hero (u_at) is at that tile and invokes the
+# hit-effect path; the beam also halts on terrain blockers (walls,
+# closed doors, iron bars) and at end of range via MT_FLIGHTCHECK.
+#
+# This helper models the same step-by-step projectile behaviour:
+#   - Advance by (dx, dy) each step.
+#   - If the player is on the new tile, call ``hit_fn(state)`` and stop.
+#   - If the tile is WALL or CLOSED_DOOR, stop without hitting.
+#   - Otherwise continue until ``range`` is exhausted.
+#
+# JIT-pure: implemented via ``jax.lax.scan`` over a static ``range``.
+# ---------------------------------------------------------------------------
+
+def _m_throw_ray(
+    state,
+    src_pos: jnp.ndarray,
+    dx: jnp.ndarray,
+    dy: jnp.ndarray,
+    range_: int,
+    hit_fn,
+):
+    """Step-by-step projectile ray from ``src_pos`` along (dx, dy).
+
+    Parameters
+    ----------
+    state    : EnvState
+    src_pos  : int32[2] launcher tile (row, col); ray starts ONE step away.
+    dx       : col-delta in {-1, 0, 1}  (vendor x-axis / sgn(gt.tbx))
+    dy       : row-delta in {-1, 0, 1}  (vendor y-axis / sgn(gt.tby))
+    range_   : maximum number of steps (Python int, static for jit).
+    hit_fn   : callable(state) -> state, invoked AT MOST ONCE when the
+               beam reaches the player tile.
+
+    Returns
+    -------
+    (final_state, final_pos, hit_player) where ``final_pos`` is the last
+    tile the projectile reached (int32[2]) and ``hit_player`` is a bool
+    scalar.
+
+    Vendor cite: vendor/nethack/src/mthrowu.c::m_throw lines 572-849
+        — see while(range-- > 0) loop at line 673 and MT_FLIGHTCHECK
+        blocker at line 799.  Wall / closed-door blocking matches
+        IS_DOOR (closed) and IS_ROCK tile types in vendor rm.h.
+    """
+    from Nethax.nethax.constants.tiles import TileType
+
+    src_pos_i32 = src_pos.astype(jnp.int32)
+    dx_i32 = dx.astype(jnp.int32)
+    dy_i32 = dy.astype(jnp.int32)
+    ppos = state.player_pos.astype(jnp.int32)
+
+    # Current branch/level for terrain lookup.
+    br = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    terrain_lv = state.terrain[br, lv]  # int8[MAP_H, MAP_W]
+
+    wall_t = jnp.int8(int(TileType.WALL))
+    cdoor_t = jnp.int8(int(TileType.CLOSED_DOOR))
+
+    def _step(carry, i):
+        s, pos, stopped, hit = carry
+        # Advance one tile (vendor m_throw: bhitpos += dx,dy BEFORE check).
+        # i is 0-indexed step number.
+        next_row = (src_pos_i32[0] + dy_i32 * (i + jnp.int32(1)))
+        next_col = (src_pos_i32[1] + dx_i32 * (i + jnp.int32(1)))
+
+        # Clip to map bounds; OOB also halts.
+        h = jnp.int32(_MAP_H)
+        w = jnp.int32(_MAP_W)
+        oob = (next_row < jnp.int32(0)) | (next_row >= h) | \
+              (next_col < jnp.int32(0)) | (next_col >= w)
+        safe_row = jnp.clip(next_row, 0, h - 1)
+        safe_col = jnp.clip(next_col, 0, w - 1)
+
+        tile = terrain_lv[safe_row, safe_col]
+        is_blocker = (tile == wall_t) | (tile == cdoor_t)
+
+        # Does this tile contain the player?
+        is_player_tile = (safe_row == ppos[0]) & (safe_col == ppos[1])
+
+        # Apply hit_fn only when: not yet stopped, not OOB/blocker, on player.
+        do_hit = (~stopped) & (~oob) & (~is_blocker) & is_player_tile
+
+        s = jax.lax.cond(do_hit, hit_fn, lambda x: x, s)
+
+        new_hit = hit | do_hit
+        # Beam halts on: blocker, OOB, or after hitting the player.
+        new_stopped = stopped | oob | is_blocker | do_hit
+        new_pos = jnp.where(
+            stopped,
+            pos,
+            jnp.stack([safe_row, safe_col]),
+        )
+        return (s, new_pos, new_stopped, new_hit), None
+
+    init_pos = src_pos_i32
+    init_carry = (state, init_pos, jnp.bool_(False), jnp.bool_(False))
+    (final_state, final_pos, _stopped, hit_player), _ = jax.lax.scan(
+        _step, init_carry, jnp.arange(range_, dtype=jnp.int32)
+    )
+    return final_state, final_pos, hit_player
+
+
 def _clear_shop_bill_for_slot(state, steal_slot: jnp.ndarray, do_clear: jnp.ndarray):
     """Clear the shop bill row for ``steal_slot`` when the slot was unpaid.
 
