@@ -2184,6 +2184,70 @@ def _try_unicorn_horn_self(state, rng: jax.Array, monster_idx: jnp.ndarray):
     return state.replace(monster_ai=new_mai)
 
 
+# ---------------------------------------------------------------------------
+# Lizard corpse stun/confusion cure (vendor muse.c:1204-1217 + 2964-2969)
+# ---------------------------------------------------------------------------
+# Vendor: find_defensive (muse.c:489-507) selects MUSE_LIZARD_CORPSE when
+# the monster is mconf || mstun and carries a CORPSE whose corpsenm is
+# PM_LIZARD; use_defensive (1204-1209) calls mon_consume_unstone, which
+# at lines 2964-2966 zeroes mconf and mstun.
+#
+# Lizard sits at MONSTERS index 322 (S_LIZARD chunk6 ~line 263) — used as
+# inv_corpse_entry_idx sentinel for a lizard corpse stack.
+_CAT_FOOD: int = 7
+_PM_LIZARD: int = 322
+
+
+def _try_lizard_corpse_cure(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Monster eats a lizard corpse to cure its own stun + confusion.
+
+    Cite: vendor/nethack/src/muse.c lines 1204-1217 (MUSE_LIZARD_CORPSE
+    use_defensive branch) + lines 489-507 (find_defensive selection gate)
+    + lines 2964-2969 (mon_consume_unstone lizard side-effect that
+    zeroes mconf / mstun).
+
+    Gate: monster has a FOOD-class inventory entry tagged with
+    ``inv_corpse_entry_idx == PM_LIZARD`` AND is currently
+    ``stun_timer > 0`` or ``confuse_timer > 0``.
+
+    Effect (JIT-pure):
+      - decrement that inv slot's quantity by 1
+      - clear stun_timer and confuse_timer
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    cats   = mai.inv_category[idx].astype(jnp.int32)
+    qtys   = mai.inv_quantity[idx].astype(jnp.int32)
+    corpse = mai.inv_corpse_entry_idx[idx].astype(jnp.int32)
+
+    is_lizard_corpse = (
+        (cats == jnp.int32(_CAT_FOOD))
+        & (qtys > jnp.int32(0))
+        & (corpse == jnp.int32(_PM_LIZARD))
+    )
+    found = jnp.any(is_lizard_corpse)
+    slot = jnp.argmax(is_lizard_corpse.astype(jnp.int32)).astype(jnp.int32)
+
+    afflicted = (
+        (mai.stun_timer[idx]    > jnp.int16(0))
+        | (mai.confuse_timer[idx] > jnp.int16(0))
+    )
+    can_eat = found & afflicted
+
+    cur_qty = mai.inv_quantity[idx, slot].astype(jnp.int32)
+    new_qty = jnp.where(can_eat, cur_qty - jnp.int32(1), cur_qty).astype(jnp.int16)
+    new_stun = jnp.where(can_eat, jnp.int16(0), mai.stun_timer[idx])
+    new_conf = jnp.where(can_eat, jnp.int16(0), mai.confuse_timer[idx])
+
+    new_mai = mai.replace(
+        inv_quantity=mai.inv_quantity.at[idx, slot].set(new_qty),
+        stun_timer=mai.stun_timer.at[idx].set(new_stun),
+        confuse_timer=mai.confuse_timer.at[idx].set(new_conf),
+    )
+    return state.replace(monster_ai=new_mai)
+
+
 def _try_bugle_awaken_allies(state, rng: jax.Array, monster_idx: jnp.ndarray):
     """Mercenary-class monster blows bugle, waking nearby soldier allies.
 
@@ -2666,6 +2730,10 @@ def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
     # blind/confused/stunned timers when monster has the horn.
     rng_unicorn = jax.random.fold_in(keys[7], jnp.int32(0xC07E))
     s = _branch(s, eligible, _try_unicorn_horn_self, rng_unicorn)
+    # (8c2) lizard corpse stun/confusion cure — muse.c:1204-1217 +
+    # 489-507.  Defensive fallback when stunned/confused with no horn.
+    rng_lizard = jax.random.fold_in(keys[7], jnp.int32(0x112A2D))
+    s = _branch(s, eligible, _try_lizard_corpse_cure, rng_lizard)
     # (8d) bugle awaken soldiers — muse.c:838-848.  Mercenary-class
     # monster wakes sleeping allies (gating is broader here — see
     # _try_bugle_awaken_allies docstring).
