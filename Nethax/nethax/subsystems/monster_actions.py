@@ -336,6 +336,41 @@ def _cheby(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     return jnp.maximum(d[0], d[1])
 
 
+def _clear_shop_bill_for_slot(state, steal_slot: jnp.ndarray, do_clear: jnp.ndarray):
+    """Clear the shop bill row for ``steal_slot`` when the slot was unpaid.
+
+    Vendor cite: ``steal.c::mpickobj`` lines 639-643 — ``if (otmp->unpaid ...)
+    subfrombill(otmp, ...)``.  Mirrors ``subfrombill`` (shk.c) which removes a
+    single bill_p entry and decrements the running total.
+
+    JIT-pure.  ``do_clear`` gates the update so callers can pass a guarded
+    branch (e.g. only clear when a steal actually happened).
+    """
+    shop = state.shop
+    n = shop.items_owned_by_shop.shape[0]
+    s_idx = jnp.clip(steal_slot.astype(jnp.int32), 0, n - 1)
+    was_owned = shop.items_owned_by_shop[s_idx]
+    effective = do_clear & was_owned
+    slot_price = shop.bill_prices[s_idx]
+    new_bill = jnp.where(
+        effective,
+        jnp.maximum(jnp.int32(0), shop.bill - slot_price),
+        shop.bill,
+    )
+    new_owned = shop.items_owned_by_shop.at[s_idx].set(
+        jnp.where(effective, jnp.bool_(False), was_owned)
+    )
+    new_prices = shop.bill_prices.at[s_idx].set(
+        jnp.where(effective, jnp.int32(0), slot_price)
+    )
+    new_shop = shop.replace(
+        bill=new_bill,
+        items_owned_by_shop=new_owned,
+        bill_prices=new_prices,
+    )
+    return state.replace(shop=new_shop)
+
+
 # ---------------------------------------------------------------------------
 # 1. Nymph steal-and-teleport  (vendor/nethack/src/mhitu.c::could_seduce ~1972,
 #    mhitu_AD_SITM handling; rloc teleport via monmove.c pattern)
@@ -355,7 +390,7 @@ def _nymph_steal(state, slot: jnp.ndarray, rng: jax.Array):
     adjacent = _cheby(mpos, ppos) <= jnp.int32(1)
 
     def _apply(s):
-        rng_item, rng_tele = jax.random.split(rng)
+        rng_item, rng_tele, rng_punish = jax.random.split(rng, 3)
         items = s.inventory.items
         # Pick a random occupied slot: sample index 0..N_SLOTS-1.
         n_slots = items.category.shape[0]
@@ -364,7 +399,7 @@ def _nymph_steal(state, slot: jnp.ndarray, rng: jax.Array):
         slot_seq = jnp.mod(jnp.arange(n_slots) + raw, n_slots)
         has_item = items.category[slot_seq] != jnp.int8(0)
         pick = jnp.argmax(has_item)   # first occupied slot in rotation
-        steal_slot = slot_seq[pick]
+        picked_slot = slot_seq[pick]
         any_item = jnp.any(has_item)
 
         # Wave 47h: cursed-worn gate (vendor steal.c:457-489).  Animals
@@ -375,6 +410,35 @@ def _nymph_steal(state, slot: jnp.ndarray, rng: jax.Array):
             | (mai.entry_idx[idx].astype(jnp.int32) == jnp.int32(240))  # monkey
             | (mai.entry_idx[idx].astype(jnp.int32) == jnp.int32(241))  # ape
         )
+
+        # ---- Wave 47i Item-substitution theft (vendor steal.c:433-446) ----
+        # "can't steal ring(s) while wearing gloves -> steal gloves instead"
+        # "can't steal shirt while wearing cloak or suit -> steal cloak/suit"
+        # Animals skip these substitutions (vendor monkey_business branch
+        # at steal.c:403-404 short-circuits the ring/shirt substitution).
+        from Nethax.nethax.subsystems.inventory import (
+            ItemCategory as _IC, ArmorSlot as _AS,
+        )
+        wa_i32 = s.inventory.worn_armor.astype(jnp.int32)
+        gloves_slot = wa_i32[int(_AS.GLOVES)]
+        body_slot   = wa_i32[int(_AS.BODY)]
+        has_gloves  = gloves_slot >= jnp.int32(0)
+        has_body    = body_slot >= jnp.int32(0)
+        picked_cat  = items.category[picked_slot].astype(jnp.int32)
+        is_ring     = picked_cat == jnp.int32(int(_IC.RING))
+        # SHIRT subtype: armor item in the SHIRT armor slot
+        shirt_slot_idx = wa_i32[int(_AS.SHIRT)]
+        is_shirt    = (picked_slot.astype(jnp.int32) == shirt_slot_idx) & (shirt_slot_idx >= 0)
+
+        sub_to_gloves = (~is_animal_thief) & is_ring & has_gloves
+        sub_to_body   = (~is_animal_thief) & is_shirt & has_body & (~sub_to_gloves)
+        steal_slot = jnp.where(
+            sub_to_gloves, gloves_slot.astype(picked_slot.dtype),
+            jnp.where(
+                sub_to_body, body_slot.astype(picked_slot.dtype), picked_slot
+            ),
+        )
+
         # "Worn" detection: scan worn_armor / wielded.  Conservative —
         # treat the picked slot as "worn" if it matches any worn pointer.
         wa = s.inventory.worn_armor.astype(jnp.int32)
@@ -397,9 +461,36 @@ def _nymph_steal(state, slot: jnp.ndarray, rng: jax.Array):
                 buc_status=old_items.buc_status.at[steal_slot].set(new_buc),
             )
             new_inv = s2.inventory.replace(items=new_items)
-            return s2.replace(inventory=new_inv)
+            # If the stolen slot also pointed at a worn-armor pointer, clear
+            # that pointer so subsequent AC / wear-state checks stay coherent.
+            # Vendor steal.c:498-505 calls worn_item_removal which clears the
+            # owornmask before extracting the obj.
+            new_wa = new_inv.worn_armor
+            stolen_i32 = steal_slot.astype(jnp.int32)
+            clear_mask = new_wa.astype(jnp.int32) == stolen_i32
+            new_wa = jnp.where(clear_mask, jnp.int8(-1), new_wa)
+            new_inv = new_inv.replace(worn_armor=new_wa)
+            s3 = s2.replace(inventory=new_inv)
+            # Wave 47i Item #1 — clear shop bill row for unpaid stolen item
+            # (vendor steal.c::mpickobj lines 639-643 → subfrombill).
+            return _clear_shop_bill_for_slot(s3, steal_slot, jnp.bool_(True))
+
+        # Wave 47i Item #4 — Punished ball-and-chain target (vendor steal.c:379-382)
+        # When the hero has no inventory items to steal AND is Punished, a
+        # non-animal thief has a 75% chance to remove the chain (vendor uses
+        # rn2(4) which is non-zero 3/4 of the time).
+        inv_empty   = ~any_item
+        is_punished = s.is_punished
+        punish_target = inv_empty & is_punished & (~is_animal_thief)
+        # rn2(4) != 0  →  3/4 chance
+        punish_roll = jax.random.randint(rng_punish, (), 0, 4)
+        do_unpunish = punish_target & (punish_roll != jnp.int32(0))
+
+        def _do_unpunish(s2):
+            return s2.replace(is_punished=jnp.bool_(False))
 
         s = jax.lax.cond(steal_allowed, _do_steal, lambda s2: s2, s)
+        s = jax.lax.cond(do_unpunish, _do_unpunish, lambda s2: s2, s)
 
         # Teleport nymph to random valid tile.
         raw_tele = jax.random.randint(rng_tele, (), 0, _N_TELE_TILES)
