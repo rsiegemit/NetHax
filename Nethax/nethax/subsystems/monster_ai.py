@@ -1777,6 +1777,121 @@ _FROST_HORN_TID: int = 225
 _FIRE_HORN_TID:  int = 226
 
 
+# ---------------------------------------------------------------------------
+# Monster throws offensive potions at the player (vendor muse.c:2005-2023)
+# ---------------------------------------------------------------------------
+# Vendor m_throw() implements full projectile trajectory.  Simplification
+# here: assume the throw connects on the same turn (mirrors how
+# _spit_attack treats venom).  The player-side effect applies via the
+# already-implemented apply_* helpers in status_effects.
+#
+# Potion type_ids (_POTION_BASE_ID = 68 + PotionEffect):
+#   POT_CONFUSION = 68 + 2 = 70
+#   POT_BLINDNESS = 68 + 3 = 71
+#   POT_PARALYSIS = 68 + 4 = 72
+#   POT_SLEEPING  = 68 + 17 = 85
+#   POT_ACID      = 68 + 23 = 91
+_POT_CONFUSION_TID: int = 70
+_POT_BLINDNESS_TID: int = 71
+_POT_PARALYSIS_TID: int = 72
+_POT_SLEEPING_TID:  int = 85
+_POT_ACID_TID:      int = 91
+
+
+def _try_throw_potion(state, rng: jax.Array, monster_idx: jnp.ndarray,
+                      potion_tid: int, effect_kind: int):
+    """Monster throws an offensive potion at the player.
+
+    Vendor cite: muse.c lines 2005-2023 (MUSE_POT_PARALYSIS/BLINDNESS/
+    CONFUSION/SLEEPING/ACID) → m_throw() projectile.  Simplified to
+    apply effect directly when the monster has the potion and the player
+    is in range (gating handled by caller via ``can_attack``).
+
+    effect_kind selects player-side status:
+      0 = PARALYSIS  → FROZEN timer += rn1(10, 25) = 25..34
+      1 = BLINDNESS  → BLIND timer  += rnd(25) + 25 = 26..50
+      2 = CONFUSION  → CONFUSION    += rnd(30) + 1  = 2..31
+      3 = SLEEPING   → SLEEP        += rnd(50)      = 1..50
+      4 = ACID       → HP -= d(6, 6) (acid splash; resist halves)
+    """
+    from Nethax.nethax.subsystems.status_effects import (
+        Intrinsic as _Intr2, TimedStatus as _TS2,
+    )
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_POTION, potion_tid)
+    qty = mai.inv_quantity[idx, slot].astype(jnp.int32)
+    can_throw = found & (qty > 0)
+
+    timers = state.status.timed_statuses
+    rng_d, rng_e = jax.random.split(rng, 2)
+
+    # Damage path (ACID) — d(6,6), halved by RESIST_ACID.
+    is_acid = effect_kind == 4
+    acid_keys = jax.random.split(rng_d, 6)
+    acid_rolls = jax.vmap(
+        lambda k: jax.random.randint(k, (), 1, 7, dtype=jnp.int32)
+    )(acid_keys)
+    acid_raw = jnp.sum(acid_rolls).astype(jnp.int32)
+    has_acid_res = (
+        state.status.intrinsics[int(_Intr2.RESIST_ACID)]
+        | (state.status.timed_intrinsics[int(_Intr2.RESIST_ACID)] > jnp.int32(0))
+    )
+    acid_dmg = jnp.where(has_acid_res, acid_raw // jnp.int32(2), acid_raw)
+    acid_dmg = jnp.where(can_throw & is_acid, acid_dmg, jnp.int32(0))
+
+    new_player_hp = jnp.maximum(state.player_hp - acid_dmg, jnp.int32(0))
+
+    # Status path (PARALYSIS / BLINDNESS / CONFUSION / SLEEPING).
+    par_dur   = jax.random.randint(rng_e, (), 25, 35, dtype=jnp.int32)    # 25..34
+    rng_b, rng_c, rng_s = jax.random.split(rng_e, 3)
+    blind_dur = jax.random.randint(rng_b, (), 26, 51, dtype=jnp.int32)    # 26..50
+    conf_dur  = jax.random.randint(rng_c, (), 2, 32, dtype=jnp.int32)     # 2..31
+    sleep_dur = jax.random.randint(rng_s, (), 1, 51, dtype=jnp.int32)     # 1..50
+
+    is_par   = effect_kind == 0
+    is_blind = effect_kind == 1
+    is_conf  = effect_kind == 2
+    is_sleep = effect_kind == 3
+
+    # Free-action blocks paralysis.
+    has_free = (
+        state.status.intrinsics[int(_Intr2.FREE_ACTION)]
+        | (state.status.timed_intrinsics[int(_Intr2.FREE_ACTION)] > jnp.int32(0))
+    )
+    par_add   = jnp.where(can_throw & is_par   & ~has_free, par_dur,   jnp.int32(0))
+    blind_add = jnp.where(can_throw & is_blind,             blind_dur, jnp.int32(0))
+    conf_add  = jnp.where(can_throw & is_conf,              conf_dur,  jnp.int32(0))
+    sleep_add = jnp.where(can_throw & is_sleep,             sleep_dur, jnp.int32(0))
+
+    new_timers = (
+        timers
+        .at[int(_TS2.STUNNED)].add(jnp.int32(0))  # no-op placeholder for shape stability
+    )
+    # FROZEN is per-monster; for the player vendor uses ``nomul()``
+    # which doesn't have a direct timed-status slot — closest analog is
+    # apply STUNNED + CONFUSION-like immobility.  Use SLEEP slot for both
+    # PARALYSIS and SLEEPING (vendor's distinct slots are gameplay-
+    # equivalent for byte-equality purposes in the JAX port).
+    new_timers = new_timers.at[int(_TS2.SLEEP)].add(par_add + sleep_add)
+    new_timers = new_timers.at[int(_TS2.BLIND)].add(blind_add)
+    new_timers = new_timers.at[int(_TS2.CONFUSION)].add(conf_add)
+
+    new_status = state.status.replace(timed_statuses=new_timers)
+
+    new_qty = jnp.where(can_throw, qty - jnp.int32(1), qty).astype(jnp.int16)
+    new_mai = mai.replace(
+        inv_quantity=mai.inv_quantity.at[idx, slot].set(new_qty),
+    )
+    new_done = state.done | (new_player_hp <= 0)
+    return state.replace(
+        monster_ai=new_mai,
+        status=new_status,
+        player_hp=new_player_hp.astype(state.player_hp.dtype),
+        done=new_done,
+    )
+
+
 def _try_blow_horn(state, rng: jax.Array, monster_idx: jnp.ndarray,
                    horn_tid: int, resist_intrinsic: int):
     """Blow a horn at the player, dealing 6d6 with optional resistance.
@@ -2084,6 +2199,28 @@ def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
                 lambda st, k, i: _try_blow_horn(
                     st, k, i, _FROST_HORN_TID, int(_Intr.RESIST_COLD)),
                 rng_horns[1])
+
+    # ----- Thrown offensive potions (muse.c:2005-2023) ------------------
+    # POT_PARALYSIS/BLINDNESS/CONFUSION/SLEEPING/ACID — monster hurls a
+    # potion at the player.  Vendor m_throw() projectile is simplified
+    # to "applies effect if monster has potion in range" — matches the
+    # _spit_attack pattern in monster_actions.py.
+    rng_pots = jax.random.split(keys[9], 5)
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_throw_potion(st, k, i, _POT_PARALYSIS_TID, 0),
+                rng_pots[0])
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_throw_potion(st, k, i, _POT_BLINDNESS_TID, 1),
+                rng_pots[1])
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_throw_potion(st, k, i, _POT_CONFUSION_TID, 2),
+                rng_pots[2])
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_throw_potion(st, k, i, _POT_SLEEPING_TID, 3),
+                rng_pots[3])
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_throw_potion(st, k, i, _POT_ACID_TID, 4),
+                rng_pots[4])
 
     return s
 
