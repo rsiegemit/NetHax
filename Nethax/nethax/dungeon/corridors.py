@@ -118,6 +118,43 @@ def connect_segments(
     return terrain_out
 
 
+def _finddpos_door_mask(terrain: jnp.ndarray) -> jnp.ndarray:
+    """Return a bool[H, W] mask of preferred door positions.
+
+    Vendor citation: vendor/nethack/src/mklev.c::finddpos lines 147-199 and
+    its sibling ``good_rm_wall_doorpos`` (lines 80-102).  Vendor walks the
+    room wall and only accepts a door at a wall cell whose room-interior
+    neighbour is reachable and not adjacent to an existing door.  The key
+    structural rule: doors land on WALL cells that border a corridor (or
+    are themselves carved through by a corridor), not on interior FLOOR.
+
+    Our JIT-pure equivalent: a cell qualifies when it is currently a WALL
+    *and* at least one of its four orthogonal neighbours is CORRIDOR.  This
+    captures vendor's "wall position with corridor leading into it"
+    preference without needing per-room iteration — the mask is computed
+    once for the whole map.
+
+    Args:
+        terrain: int8[H, W] with rooms + corridors already carved.
+
+    Returns:
+        bool[H, W] — True on wall cells adjacent to a corridor tile.
+    """
+    is_wall = terrain == jnp.int8(_TILE_WALL)
+    is_corr = terrain == jnp.int8(_TILE_CORRIDOR)
+
+    # Pad-and-slice orthogonal-neighbour check (cheaper than .at[] gathers,
+    # and stays inside XLA's static-shape regime).
+    padded = jnp.pad(is_corr, ((1, 1), (1, 1)), constant_values=False)
+    corr_n = padded[:-2, 1:-1]   # north neighbour
+    corr_s = padded[2:,  1:-1]   # south
+    corr_w = padded[1:-1, :-2]   # west
+    corr_e = padded[1:-1, 2:]    # east
+    adj_corr = corr_n | corr_s | corr_w | corr_e
+
+    return is_wall & adj_corr
+
+
 def place_doors(
     rng: jnp.ndarray,
     terrain: jnp.ndarray,
@@ -127,10 +164,20 @@ def place_doors(
     """Place CLOSED_DOOR tiles at room/corridor boundaries.
 
     For each active room, scan the perimeter (the ring one cell outside the
-    interior bounding box).  Any perimeter cell that is currently CORRIDOR
-    becomes a CLOSED_DOOR with probability ~0.5.
+    interior bounding box).  A perimeter cell becomes a CLOSED_DOOR when
+    either:
+      (a) the finddpos-preferred mask is set (WALL cell adjacent to a
+          CORRIDOR — vendor-style structural choice), OR
+      (b) the cell is currently CORRIDOR AND a 50/50 coin comes up — the
+          legacy stamp that turns a carved-through corridor opening into a
+          door.
 
-    Citation: vendor/nethack/src/mklev.c add_door(), doconnect().
+    Branch (a) is the vendor preference (see :func:`_finddpos_door_mask`);
+    branch (b) is retained so previously-tested behaviour is preserved when
+    no wall-adjacent-to-corridor candidates exist for a given room.
+
+    Citation: vendor/nethack/src/mklev.c::finddpos lines 147-199 and
+        ``add_door()`` / ``doconnect()`` (preferred door positioning).
 
     Args:
         rng:     JAX PRNG key.
@@ -144,7 +191,10 @@ def place_doors(
     from Nethax.nethax.dungeon.rooms import MAX_ROOMS_PER_LEVEL
     h, w = terrain.shape
 
-    # One door-flip coin per room perimeter cell — pre-sample a full h×w mask.
+    # Pre-compute the finddpos-preferred mask once for the whole map.
+    preferred = _finddpos_door_mask(terrain)
+
+    # One door-flip coin per cell — used only on the corridor-fallback branch.
     rng, key_door = jax.random.split(rng)
     door_coin = jax.random.bernoulli(key_door, 0.5, shape=(h, w))
 
@@ -167,7 +217,13 @@ def place_doors(
                      ~(row_inner[:, None] & col_inner[None, :])
 
         is_corridor = terrain_ == jnp.int8(_TILE_CORRIDOR)
-        place = act & perimeter & is_corridor & door_coin
+        # Branch (a): finddpos-preferred WALL cells adjacent to CORRIDOR
+        # — stamp unconditionally (vendor structural preference).
+        place_pref = act & perimeter & preferred
+        # Branch (b): legacy CORRIDOR-cell stamp gated by 50/50 coin.
+        place_fallback = act & perimeter & is_corridor & door_coin
+
+        place = place_pref | place_fallback
         terrain_new = jnp.where(place, jnp.int8(_TILE_CLOSED_DOOR), terrain_)
         return terrain_new, None
 
