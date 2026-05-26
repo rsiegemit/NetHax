@@ -848,6 +848,27 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         state.ball_pos,
     )
 
+    # --- Blind-hero ball/chain under-glyph cache (vendor ball.c::set_bc /
+    # move_bc lines 379-556).  Save terrain under the ball/chain at their
+    # new positions so a Blinded hero can restore the glyph when the b&c
+    # leave the tile.  In Nethax we store the underlying TileType byte; we
+    # update whenever the ball moves (any step under Punished).  The chain
+    # tracks the hero's previous tile (vendor: chain follows on old player
+    # pos) — store terrain there.
+    _ball_moved_now = state.is_punished & moved
+    _nbp_r = jnp.clip(new_ball_pos[0].astype(jnp.int32), 0, map_h - 1)
+    _nbp_c = jnp.clip(new_ball_pos[1].astype(jnp.int32), 0, map_w - 1)
+    _new_ball_under = terrain_2d[_nbp_r, _nbp_c].astype(jnp.int8)
+    new_ball_under_glyph = jnp.where(
+        _ball_moved_now, _new_ball_under, state.ball_under_glyph,
+    )
+    _chain_r = jnp.clip(pos[0], 0, map_h - 1)
+    _chain_c = jnp.clip(pos[1], 0, map_w - 1)
+    _new_chain_under = terrain_2d[_chain_r, _chain_c].astype(jnp.int8)
+    new_chain_under_glyph = jnp.where(
+        _ball_moved_now, _new_chain_under, state.chain_under_glyph,
+    )
+
     # --- Pool/pit pull-back (vendor ball.c::drag_ball lines 783-826) ---
     # When the dragged ball lands on POOL/WATER or on a PIT trap, vendor
     # "jerks the hero back" to the ball's tile and triggers the terrain
@@ -893,6 +914,8 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         terrain=new_terrain,
         player_hp=bump_hp,
         ball_pos=new_ball_pos,
+        ball_under_glyph=new_ball_under_glyph,
+        chain_under_glyph=new_chain_under_glyph,
         player_in_water=new_in_water,
         player_in_trap=new_in_trap,
         player_trap_type=new_trap_type,

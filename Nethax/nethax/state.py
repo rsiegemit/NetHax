@@ -218,6 +218,14 @@ class EnvState:
     # ---- Punishment / genocide state (read.c) ----
     is_punished: jax.Array        # bool  — iron ball attached
     ball_pos:    jax.Array        # int16[2]  (row, col) of iron ball
+    # u.bglyph / u.cglyph — blind-hero glyph cache for the ball and chain.
+    # Vendor stores the glyph that "should appear" under the ball/chain when
+    # the hero is Blinded so that move_bc() can restore it after the b&c
+    # leave a tile.  We store the underlying terrain TileType byte (int8)
+    # which mirrors the data dependency without modelling glyph IDs.
+    # Cite: vendor/nethack/src/ball.c::set_bc / move_bc lines 379-556.
+    ball_under_glyph:  jax.Array  # int8  — terrain under ball when blind
+    chain_under_glyph: jax.Array  # int8  — terrain under chain when blind
     genocided_species: jax.Array  # bool[381] — True = genocided
 
     # ---- Stinking cloud state (read.c::do_stinking_cloud) ----
@@ -362,6 +370,8 @@ class EnvState:
             # punishment / genocide
             is_punished=jnp.bool_(False),
             ball_pos=jnp.zeros((2,), dtype=jnp.int16),
+            ball_under_glyph=jnp.int8(0),
+            chain_under_glyph=jnp.int8(0),
             genocided_species=jnp.zeros((381,), dtype=jnp.bool_),
             # stinking cloud (read.c::do_stinking_cloud)
             cloud_pos=jnp.zeros((2,), dtype=jnp.int16),
