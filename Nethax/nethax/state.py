@@ -31,6 +31,7 @@ from Nethax.nethax.subsystems.inventory import (
 from Nethax.nethax.subsystems.identification import IdentificationState
 from Nethax.nethax.subsystems.traps import TrapState
 from Nethax.nethax.subsystems.features import FeaturesState
+from Nethax.nethax.subsystems.timer_queue import TimerState
 from Nethax.nethax.subsystems.prayer import PrayerState
 from Nethax.nethax.subsystems.priest import PriestState
 from Nethax.nethax.subsystems.conduct import ConductState
@@ -115,6 +116,9 @@ class EnvState:
     lighting: LightingState
     region_state: RegionState
     worm_state: WormState
+    timers: TimerState   # Wave 47f: generic per-turn timer queue
+                         # (timeout.c::run_timers infrastructure;
+                         # consumer callbacks in timer_queue.TIMER_CALLBACKS)
 
     # ---- Player core (kept here for fast access; not part of any subsystem) ----
     player_pos: jax.Array       # int16[2]  (row, col)
@@ -283,6 +287,7 @@ class EnvState:
             lighting=LightingState.default(),
             region_state=make_region_state(),
             worm_state=make_worm_state(),
+            timers=TimerState.default(),
             # player core
             player_pos=jnp.zeros((2,), dtype=jnp.int16),
             player_hp=jnp.int32(10),
