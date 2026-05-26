@@ -873,6 +873,54 @@ def _mover_can_pass_bars(entry_idx: jnp.ndarray) -> jnp.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# stuff_prevents_passage   (vendor monmove.c:2321-2355)
+# ---------------------------------------------------------------------------
+# Vendor walks mtmp->minvent and returns TRUE when any single item is "too
+# bulky" to squeeze under a closed door / through iron bars (used by can_ooze
+# and can_fog).  The vendor whitelist of light items is large (gems, projectile
+# weapons, daggers, cloaks, gloves, lock picks, ...) and includes specific
+# otyp ranges (ARROW..BOOMERANG, DAGGER..CRYSKNIFE).  The Nethax port does not
+# track those exact otyp ranges, so we use a conservative category-based gate:
+#
+#   * Gold pile  > 100 coins              -> blocked (vendor line 2333)
+#   * Any inventory entry whose category  -> blocked
+#       is NOT in the always-light set    (vendor lines 2335-2349 inverted)
+#
+# Always-light categories: AMULET, RING, VENOM, GEM (and empty slots).
+# Vendor also exempts a long list of specific tools / projectiles / cloaks
+# that we cannot identify without per-otyp metadata; treating all WEAPON /
+# ARMOR / TOOL / SCROLL / POTION / WAND / FOOD as "bulky" is the safe
+# byte-equal direction (more amorphous monsters get gated, none extra slip
+# through).  Documented punt below — full per-otyp parity is a follow-up.
+def _stuff_prevents_passage(mai: 'MonsterAIState', idx: jnp.ndarray) -> jnp.ndarray:
+    """Return scalar bool: True iff monster ``idx`` cannot squeeze through
+    tight spaces because of its inventory weight.
+
+    Cite: vendor/nethack/src/monmove.c::stuff_prevents_passage lines 2321-2355.
+    Simplification: category-only gate (see comment block above).
+    """
+    i = idx.astype(jnp.int32)
+    cats = mai.inv_category[i].astype(jnp.int32)        # [MAX_MONSTER_INV]
+    qty  = mai.inv_quantity[i].astype(jnp.int32)        # [MAX_MONSTER_INV]
+    occ  = cats != jnp.int32(0)
+    # Vendor line 2333: COIN_CLASS quan > 100 → TRUE.
+    coin_heavy = (cats == jnp.int32(_CAT_COIN)) & (qty > jnp.int32(100))
+    # Always-light categories: AMULET (5), RING (4), VENOM (17), GEM (13).
+    # Empty slots are exempt via ``occ`` mask.  Vendor lines 2335-2349 also
+    # exempt specific weapon/cloak/tool otyps, but per-otyp parity is a
+    # follow-up — see TODO above.
+    light = (
+        (cats == jnp.int32(5))   # AMULET
+        | (cats == jnp.int32(4))   # RING
+        | (cats == jnp.int32(17))  # VENOM
+        | (cats == jnp.int32(13))  # GEM
+    )
+    bulky = occ & (~light) & (cats != jnp.int32(_CAT_COIN))
+    has_bulky = jnp.any(bulky)
+    return has_bulky | jnp.any(coin_heavy)
+
+
+# ---------------------------------------------------------------------------
 # mon_would_take_item — vendor monmove.c:999-1032 (category-only port).
 # ---------------------------------------------------------------------------
 # Returns scalar bool for "monster ``idx`` would walk toward ``cat`` ground
@@ -1258,9 +1306,23 @@ def pathfind_step(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
 
     # Wave 44a (vendor mon.c:2062-2126 mon_allowflags + mfndpos body 2225-2237):
     # per-monster door / bars / trap gates.
-    door_opener = _mover_can_open_door(entry)
-    door_buster = _mover_can_bust_door(entry)
-    bars_passer = _mover_can_pass_bars(entry)
+    # Decompose door-opener into "handed-and-not-tiny" vs amorphous-bypass so
+    # we can gate the amorphous bypass on stuff_prevents_passage (see below).
+    nohands_e   = _has_flag1(entry, _M1_NOHANDS)
+    safe_e      = jnp.clip(entry.astype(jnp.int32), 0,
+                           _MONSTER_SIZE_TABLE.shape[0] - 1)
+    msize_e     = _MONSTER_SIZE_TABLE[safe_e].astype(jnp.int32)
+    verysmall_e = msize_e < jnp.int32(_MZ_SMALL)
+    amorphous_e = _has_flag1(entry, _M1_AMORPHOUS)
+    door_opener_handed = (~nohands_e) & (~verysmall_e)
+    # vendor monmove.c::stuff_prevents_passage — heavy inventory blocks
+    # amorphous squeeze-through-doors / through-bars.  Cite lines 2321-2355.
+    load_blocked = _stuff_prevents_passage(mai, idx)
+    amorphous_squeeze = amorphous_e & ~load_blocked
+
+    door_opener  = door_opener_handed | amorphous_squeeze
+    door_buster  = _mover_can_bust_door(entry)
+    bars_passer  = amorphous_squeeze
     trap_avoider = _mover_avoids_traps(entry)
 
     # Mask of passable tiles for THIS mover.
