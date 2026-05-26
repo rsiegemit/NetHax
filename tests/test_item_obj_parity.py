@@ -112,6 +112,11 @@ def test_item_field_count_full():
         # Vendor obj.h: ``age`` cooldown timestamp (reused by arti_invoke
         # tired-gate) and ``oartifact`` index → Item.artifact_idx.
         "age", "artifact_idx",
+        # inv_strs prefix tokens: ``oeaten`` (partly-eaten food, obj.h
+        # Bitfield(oeaten,5)) and ``opoisoned`` (poisoned weapon, obj.h
+        # Bitfield(opoisoned,1)) — required by objnam.c::doname_base lines
+        # 1420 / 1506.
+        "oeaten", "opoisoned",
     }
     assert fields == expected, (
         f"Item field-set drift:\n"

@@ -359,6 +359,8 @@ def _scatter_ground_items(state, rng: jax.Array, center_pos: jax.Array):
         src_rknown      = gi.rknown[b, lv, ssr, ssc, slot_i]
         src_age         = gi.age[b, lv, ssr, ssc, slot_i]
         src_artifact    = gi.artifact_idx[b, lv, ssr, ssc, slot_i]
+        src_oeaten      = gi.oeaten[b, lv, ssr, ssc, slot_i]
+        src_opoisoned   = gi.opoisoned[b, lv, ssr, ssc, slot_i]
 
         new_gi = gi.replace(
             category             = _update(gi.category,             none_cat,                src_cat_now),
@@ -386,6 +388,8 @@ def _scatter_ground_items(state, rng: jax.Array, center_pos: jax.Array):
             rknown               = _update(gi.rknown,               jnp.bool_(False),        src_rknown),
             age                  = _update(gi.age,                  jnp.int32(0),            src_age),
             artifact_idx         = _update(gi.artifact_idx,         jnp.int8(-1),            src_artifact),
+            oeaten               = _update(gi.oeaten,               jnp.int8(0),             src_oeaten),
+            opoisoned            = _update(gi.opoisoned,            jnp.bool_(False),        src_opoisoned),
         )
         return new_gi, None
 

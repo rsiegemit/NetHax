@@ -601,6 +601,19 @@ _ALT_WEAPON_BYTES: jnp.ndarray = jnp.array(
     _pad_bytes(" (alternate weapon; not wielded)", 33), dtype=jnp.uint8,
 )  # uint8[33]
 
+# Vendor objnam.c prefix tokens emitted into the ``prefix`` buffer before
+# erosion / enchant: ``greased`` (line 1371), WEAPON_CLASS ``poisoned``
+# (line 1420), FOOD_CLASS ``partly eaten`` (line 1506).
+_GREASED_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("greased ", 9), dtype=jnp.uint8,
+)  # uint8[9]
+_POISONED_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("poisoned ", 10), dtype=jnp.uint8,
+)  # uint8[10]
+_PARTLY_EATEN_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("partly eaten ", 14), dtype=jnp.uint8,
+)  # uint8[14]
+
 
 # ---------------------------------------------------------------------------
 # JIT-compatible byte-buffer helpers
@@ -905,6 +918,63 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         b, c = lax.cond(
             show_buc,
             lambda bc: _write_buc(bc[0], bc[1], buc_row),
+            lambda bc: bc,
+            (b, c),
+        )
+
+        # 3a. Vendor objnam.c prefix tokens that go into the ``prefix`` buffer
+        # BEFORE add_erosion_words / enchant.  Order mirrors vendor:
+        #   greased  (objnam.c:1370-1371) — any item, ungated.
+        #   poisoned (objnam.c:1419-1420) — WEAPON_CLASS only, ispoisoned flag.
+        #   partly eaten (objnam.c:1505-1506) — FOOD_CLASS only, oeaten!=0.
+        # All three are unconditional in the sense that vendor doesn't gate
+        # them on identification (the player sees them whenever the bit is
+        # set on the object).
+        # ``getattr`` guards against legacy Item arrays that pre-date these
+        # bitfields, broadcasting a scalar default across all 52 slots so
+        # safe_idx indexing always works.
+        _greased_raw = getattr(inv_state.items, "greased",
+                               jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_))
+        _greased_arr = jnp.broadcast_to(
+            jnp.asarray(_greased_raw, dtype=jnp.bool_),
+            (MAX_INVENTORY_SLOTS,),
+        )
+        is_greased = _greased_arr[safe_idx]
+        b, c = lax.cond(
+            is_greased,
+            lambda bc: _write_fixed(bc[0], bc[1], _GREASED_BYTES, 9),
+            lambda bc: bc,
+            (b, c),
+        )
+
+        _opoisoned_raw = getattr(inv_state.items, "opoisoned",
+                                 jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_))
+        _opoisoned_arr = jnp.broadcast_to(
+            jnp.asarray(_opoisoned_raw, dtype=jnp.bool_),
+            (MAX_INVENTORY_SLOTS,),
+        )
+        is_weapon_cat = category == jnp.int32(_WEAPON_CLASS_VAL)
+        show_poisoned = is_weapon_cat & _opoisoned_arr[safe_idx]
+        b, c = lax.cond(
+            show_poisoned,
+            lambda bc: _write_fixed(bc[0], bc[1], _POISONED_BYTES, 10),
+            lambda bc: bc,
+            (b, c),
+        )
+
+        _oeaten_raw = getattr(inv_state.items, "oeaten",
+                              jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8))
+        _oeaten_arr = jnp.broadcast_to(
+            jnp.asarray(_oeaten_raw, dtype=jnp.int8),
+            (MAX_INVENTORY_SLOTS,),
+        )
+        is_food_cat = category == jnp.int32(_FOOD_CLASS_VAL)
+        show_partly_eaten = is_food_cat & (
+            _oeaten_arr[safe_idx].astype(jnp.int32) > jnp.int32(0)
+        )
+        b, c = lax.cond(
+            show_partly_eaten,
+            lambda bc: _write_fixed(bc[0], bc[1], _PARTLY_EATEN_BYTES, 14),
             lambda bc: bc,
             (b, c),
         )

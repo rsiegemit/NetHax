@@ -198,6 +198,16 @@ class Item:
     #       vendor/nethack/src/artifact.c::set_artifact_intrinsic
     #       (loops over all worn/carried artifacts).
     artifact_idx: jnp.ndarray = field(default_factory=lambda: jnp.int8(-1))
+    # oeaten: residual nutrition bytes remaining on a partially-eaten food
+    # item (vendor obj.h ``Bitfield(oeaten, 5)``).  Nonzero ⇒ "partly eaten "
+    # prefix in objnam.c::doname_base line 1506.  We only need the
+    # zero/nonzero distinction for inv_strs rendering; gameplay use of the
+    # counter is out of scope for this field.
+    oeaten: jnp.ndarray = field(default_factory=lambda: jnp.int8(0))
+    # opoisoned: weapon/ammo coated in poison.  Vendor obj.h
+    # ``Bitfield(opoisoned, 1)``; renders as "poisoned " prefix in
+    # objnam.c::doname_base line 1420 (WEAPON_CLASS branch).
+    opoisoned: jnp.ndarray = field(default_factory=lambda: jnp.bool_(False))
 
 
 def make_empty_item() -> Item:
@@ -217,6 +227,8 @@ def make_empty_item() -> Item:
         rknown=jnp.bool_(False),
         age=jnp.int32(0),
         artifact_idx=jnp.int8(-1),
+        oeaten=jnp.int8(0),
+        opoisoned=jnp.bool_(False),
     )
 
 
@@ -269,6 +281,8 @@ def make_item(
         rknown=jnp.bool_(False),
         age=jnp.int32(0),
         artifact_idx=jnp.int8(-1),
+        oeaten=jnp.int8(0),
+        opoisoned=jnp.bool_(False),
     )
 
 
@@ -318,6 +332,10 @@ def _stack_items(items: list) -> Item:
         artifact_idx=jnp.array(
             [int(it.artifact_idx) for it in items], dtype=jnp.int8
         ),
+        oeaten=jnp.array([int(it.oeaten) for it in items], dtype=jnp.int8),
+        opoisoned=jnp.array(
+            [bool(it.opoisoned) for it in items], dtype=jnp.bool_
+        ),
     )
 
 
@@ -350,6 +368,8 @@ def _empty_items_array() -> Item:
         rknown=jnp.zeros((n,), dtype=jnp.bool_),
         age=jnp.zeros((n,), dtype=jnp.int32),
         artifact_idx=jnp.full((n,), -1, dtype=jnp.int8),
+        oeaten=jnp.zeros((n,), dtype=jnp.int8),
+        opoisoned=jnp.zeros((n,), dtype=jnp.bool_),
     )
 
 
@@ -382,6 +402,8 @@ def _empty_ground_items_array(n_branches: int, max_levels: int, map_h: int, map_
         rknown=jnp.zeros(shape, dtype=jnp.bool_),
         age=jnp.zeros(shape, dtype=jnp.int32),
         artifact_idx=jnp.full(shape, -1, dtype=jnp.int8),
+        oeaten=jnp.zeros(shape, dtype=jnp.int8),
+        opoisoned=jnp.zeros(shape, dtype=jnp.bool_),
     )
 
 
