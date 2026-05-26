@@ -430,7 +430,136 @@ def next_uint64(state: Isaac64State) -> Tuple[Isaac64State, int]:
     return _state_from_py(py_state), int(v)
 
 
-# Note: a JAX-traceable refill is non-trivial because ``isaac64_update``
-# branches on the index and writes 256 entries.  Plan: implement via
-# ``jax.lax.fori_loop`` over half-blocks; for now expose only the
-# eager/numpy initialization path so the audit + skeleton land cleanly.
+# ---------------------------------------------------------------------------
+# JAX-traceable ISAAC64 — usable INSIDE @jax.jit.
+#
+# The host-side helpers above suffice for ``env.reset`` (which runs eagerly).
+# For byte-exact NLE replay, the per-step game logic also needs to draw from
+# the same ISAAC64 stream — and that runs inside ``_step_impl`` under JIT.
+# This section ports ``isaac64_update`` + ``next_uint64`` to JAX primitives.
+#
+# Cite: vendor/nle/src/isaac64.c::isaac64_update (lines 46-97) and
+#       isaac64_next_uint64 (lines 157-160).
+# ---------------------------------------------------------------------------
+
+# Constant uint64 mask — JAX's uint64 add/shift naturally wrap mod 2^64, but
+# the bitwise NOT (~) produces signed-style results we need to re-mask.
+_MASK64_U = jnp.uint64(MASK64)
+
+
+def _isaac64_one_mix(carry, i):
+    """One of the 4 unrolled mix steps inside isaac64_update.
+
+    Vendor unrolls the 256-iter loop into stanzas of 4 mixes; each stanza
+    uses a different ``a`` shuffle:
+        mix 0: a = ~(a ^ (a << 21)) + m[i + half]
+        mix 1: a =  (a ^ (a >>  5)) + m[i + half]
+        mix 2: a =  (a ^ (a << 12)) + m[i + half]
+        mix 3: a =  (a ^ (a >> 33)) + m[i + half]
+
+    For the second half (i >= half=128), ``+ m[i + half]`` becomes
+    ``+ m[i - half]`` because m is treated cyclically with stride ``half``.
+    JAX-traceable: we encode the mix-kind as ``i & 3`` and the half-pair
+    offset as ``i ^ half`` (since (i + half) % SZ == (i ^ half) when SZ
+    is a power of 2 and stride == half).
+    """
+    m, r, a, b, c = carry
+    half = jnp.uint32(ISAAC64_SZ // 2)
+    mask = jnp.uint64(ISAAC64_SZ - 1)
+    mix_kind = i & jnp.uint32(3)
+
+    x = m[i]
+    pair_idx = i ^ half  # (i + half) for i < half; (i - half) for i >= half
+    paired = m[pair_idx]
+
+    # Pick the right a-shuffle based on mix_kind.
+    a_xor_21 = a ^ jnp.left_shift(a, jnp.uint64(21))
+    a_kind0 = (~a_xor_21) & _MASK64_U
+    a_kind1 = a ^ jnp.right_shift(a, jnp.uint64(5))
+    a_kind2 = a ^ (jnp.left_shift(a, jnp.uint64(12)) & _MASK64_U)
+    a_kind3 = a ^ jnp.right_shift(a, jnp.uint64(33))
+    a_shuffled = jnp.where(
+        mix_kind == jnp.uint32(0), a_kind0,
+        jnp.where(
+            mix_kind == jnp.uint32(1), a_kind1,
+            jnp.where(mix_kind == jnp.uint32(2), a_kind2, a_kind3),
+        ),
+    )
+    a_new = (a_shuffled + paired) & _MASK64_U
+
+    # lower(x) = (x & ((SZ-1) << 3)) >> 3 — picks bits 3..10 of x.
+    lower_idx = jnp.right_shift(
+        jnp.bitwise_and(x, mask << jnp.uint64(3)), jnp.uint64(3)
+    ).astype(jnp.uint32)
+    y = (m[lower_idx] + a_new + b) & _MASK64_U
+    m_new = m.at[i].set(y)
+
+    # upper(y) = (y >> (SZ_LOG + 3)) & (SZ - 1) — picks bits SZ_LOG+3..SZ_LOG+11 of y.
+    upper_idx = jnp.bitwise_and(
+        jnp.right_shift(y, jnp.uint64(ISAAC64_SZ_LOG + 3)), mask
+    ).astype(jnp.uint32)
+    b_new = (m_new[upper_idx] + x) & _MASK64_U
+    r_new = r.at[i].set(b_new)
+
+    return (m_new, r_new, a_new, b_new, c), None
+
+
+def _isaac64_refill_jax(rng: "Isaac64State") -> "Isaac64State":
+    """JAX-traceable refill — one full 256-iter pass through m/r.
+
+    Equivalent to a single call to ``isaac64_update``; produces 256 new
+    output words into ``r[]`` and resets the slot pointer ``n`` to 256.
+    """
+    c_new = (rng.c + jnp.uint64(1)) & _MASK64_U
+    b_new = (rng.b + c_new) & _MASK64_U
+    carry = (rng.m, rng.r, rng.a, b_new, c_new)
+    (m_out, r_out, a_out, b_out, c_out), _ = jax.lax.scan(
+        _isaac64_one_mix, carry, jnp.arange(ISAAC64_SZ, dtype=jnp.uint32)
+    )
+    return Isaac64State(
+        m=m_out, r=r_out, a=a_out, b=b_out, c=c_out, n=jnp.int32(ISAAC64_SZ)
+    )
+
+
+def next_uint64_jax(rng: "Isaac64State") -> Tuple["Isaac64State", jax.Array]:
+    """JAX-traceable counterpart to ``next_uint64_py``.
+
+    Returns ``(new_rng, uint64)``.  Refills automatically when ``n == 0``.
+    Safe to call inside ``@jax.jit``.
+    """
+    needs_refill = rng.n <= jnp.int32(0)
+    refilled = jax.lax.cond(
+        needs_refill,
+        _isaac64_refill_jax,
+        lambda r: r,
+        rng,
+    )
+    new_n = refilled.n - jnp.int32(1)
+    val = refilled.r[new_n.astype(jnp.uint32)]
+    return Isaac64State(
+        m=refilled.m, r=refilled.r,
+        a=refilled.a, b=refilled.b, c=refilled.c,
+        n=new_n,
+    ), val
+
+
+def rn2_jax(rng: "Isaac64State", x) -> Tuple["Isaac64State", jax.Array]:
+    """JAX-traceable ``rn2(x)`` — returns ``(new_rng, int32 in [0, x))``.
+
+    Mirrors vendor ``rnd.c::rn2`` under ``USE_ISAAC64``: a single
+    ``isaac64_next_uint64() % x`` draw.  ``x`` must be a positive scalar.
+    """
+    new_rng, v = next_uint64_jax(rng)
+    return new_rng, (v % jnp.uint64(x)).astype(jnp.int32)
+
+
+def rnd_jax(rng: "Isaac64State", x) -> Tuple["Isaac64State", jax.Array]:
+    """JAX-traceable ``rnd(x)`` — returns ``(new_rng, int32 in [1, x])``."""
+    new_rng, v = rn2_jax(rng, x)
+    return new_rng, v + jnp.int32(1)
+
+
+def rn1_jax(rng: "Isaac64State", x, base) -> Tuple["Isaac64State", jax.Array]:
+    """JAX-traceable ``rn1(x, base)`` — ``base + rn2(x)`` (int32 result)."""
+    new_rng, v = rn2_jax(rng, x)
+    return new_rng, v + jnp.int32(base)
