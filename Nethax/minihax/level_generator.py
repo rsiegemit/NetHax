@@ -996,11 +996,16 @@ def _resolve_monster(
         # deterministic fallback so the directive always produces a monster.
         idx = _MONSTER_NAME_TO_IDX.get("gnome", 0)
     else:
-        if d.name not in _MONSTER_NAME_TO_IDX:
+        # vendor .des files capitalize monster names (e.g. "Minotaur") but
+        # Nethax MONSTERS uses lowercase ("minotaur").  Try lowercase first
+        # before raising KeyError.  Cite: vendor/minihack/minihack/dat/
+        # quest_hard.des line 63 "MONSTER:('a',\"Minotaur\")".
+        lookup = d.name if d.name in _MONSTER_NAME_TO_IDX else d.name.lower()
+        if lookup not in _MONSTER_NAME_TO_IDX:
             raise KeyError(
                 f"unknown monster name {d.name!r}; not present in MONSTERS table"
             )
-        idx = _MONSTER_NAME_TO_IDX[d.name]
+        idx = _MONSTER_NAME_TO_IDX[lookup]
     rc = _resolve_place(d.place, terrain_np, w, h, resolved_rooms, next_key)
     if rc is None:
         rc = (0, 0)
