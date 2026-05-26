@@ -1323,6 +1323,32 @@ def tick_slimed_lethal(env_state):
     return env_state.replace(player_hp=new_hp, done=new_done, scoring=new_scoring)
 
 
+def tick_slime_cancels_stoning(env_state):
+    """If both STONED and SLIMED are active, clear STONED on the turning-into-
+    slime tick (slime_dialogue ``i==1`` branch).
+
+    Vendor cite: timeout.c::slime_dialogue lines 436-440 —
+        case 1L: /* turning into slime */
+            if (Stoned) make_stoned(0L, (char *) 0, KILLED_BY_AN, (char *) 0);
+
+    Vendor's ``i = (Slimed & TIMEOUT) / 2L`` so ``i==1`` fires when the
+    SLIMED timer (pre-decrement) is 2 or 3.  Run this BEFORE the per-turn
+    timer decrement (i.e. before ``_status_step``).  Once the player has
+    progressed to "turning into slime" stoning is silently cancelled.
+    """
+    timers = env_state.status.timed_statuses
+    slimed_t = timers[TimedStatus.SLIMED].astype(jnp.int32)
+    stoned_t = timers[TimedStatus.STONED].astype(jnp.int32)
+    # vendor: i = t/2L, the i==1 branch fires for t in {2, 3}.
+    slime_at_i1 = (slimed_t == jnp.int32(2)) | (slimed_t == jnp.int32(3))
+    cancel = slime_at_i1 & (stoned_t > jnp.int32(0))
+    new_stoned = jnp.where(cancel, jnp.int32(0), stoned_t)
+    new_timers = timers.at[TimedStatus.STONED].set(new_stoned)
+    return env_state.replace(
+        status=env_state.status.replace(timed_statuses=new_timers)
+    )
+
+
 def tick_hallu_expiry(env_state):
     """Emit "Everything looks SO boring now." on HALLUCINATION timeout.
 

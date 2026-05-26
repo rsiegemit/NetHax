@@ -24,6 +24,9 @@ from Nethax.nethax.subsystems.monster_ai import step as _monster_ai_step
 from Nethax.nethax.subsystems.status_effects import step as _status_step
 from Nethax.nethax.subsystems.status_effects import tick_hallu_expiry as _tick_hallu_expiry
 from Nethax.nethax.subsystems.status_effects import tick_luck_drift as _tick_luck_drift
+from Nethax.nethax.subsystems.status_effects import (
+    tick_slime_cancels_stoning as _tick_slime_cancels_stoning,
+)
 from Nethax.nethax.subsystems.ascension import maybe_ascend
 from Nethax.nethax.subsystems.polymorph import step as _polymorph_step
 from Nethax.nethax.subsystems.shop import shop_step as _shop_step
@@ -337,6 +340,11 @@ def _step_impl(state, action, rng):
         #    HALLU case lines 778-783 — make_hallucinated(0L, TRUE, 0L) →
         #    "Everything looks SO boring now.").
         ns = _tick_hallu_expiry(ns)
+        # Stoning is cancelled silently on the "turning into slime" tick
+        # (slime_dialogue i==1 branch, timeout.c lines 436-440).  Must run
+        # BEFORE the timer decrement in _status_step so we read the
+        # pre-decrement SLIMED value.
+        ns = _tick_slime_cancels_stoning(ns)
         new_status, new_hp, new_pw, new_done = _status_step(
             ns.status,
             rng_status,
