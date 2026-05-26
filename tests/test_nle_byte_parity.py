@@ -49,6 +49,11 @@ def _safe_import_nethax():
         import jax
         import jax.numpy as jnp
         from Nethax.nethax.env import NethaxEnv
+        # Activate strict NLE byte-parity (ISAAC64 RNG, NLE bit layouts).
+        # Without this, Nethax uses Threefry → entirely different dungeon
+        # despite same seed.  Cite: Nethax/nethax/parity_mode.py:51 NLE_BYTEPARITY.
+        from Nethax.nethax.parity_mode import set_parity_mode, ParityMode
+        set_parity_mode(ParityMode.NLE_BYTEPARITY)
         return NethaxEnv, jax, jnp, None
     except Exception as e:
         return None, None, None, str(e)
@@ -142,9 +147,19 @@ def run_validator(num_steps: int = 20, seed: int = 0, verbose: bool = True) -> i
         pass
     nle_obs = nle_env.reset()
 
-    # Nethax reset.
+    # Nethax reset — force same role as NLE side (rog-hum-cha-mal).
     nax_env = nethax_cls()
-    nax_state, nax_obs = nax_env.reset(jax.random.PRNGKey(seed))
+    try:
+        from Nethax.nethax.constants.character import Role, Race
+        nax_state, nax_obs = nax_env.reset(
+            jax.random.PRNGKey(seed),
+            role=Role.ROGUE,
+            race=Race.HUMAN,
+            alignment=2,  # chaotic
+        )
+    except (ImportError, AttributeError):
+        # Fallback: default role (Valkyrie) if Role enum import fails
+        nax_state, nax_obs = nax_env.reset(jax.random.PRNGKey(seed))
 
     # Convert nethax obs (JAX arrays) to numpy dict.
     def _nax_to_dict(obs):
