@@ -680,30 +680,30 @@ def build_colors(env_state) -> jnp.ndarray:
 def build_specials(env_state) -> jnp.ndarray:
     """Per-tile special flags. Shape (21, 79) uint8.
 
-    Bit definitions match vendor exactly
-    (vendor/nethack/include/display.h:995-1009 MG_* macros, written via
-    vendor/nle/win/rl/winrl.cc::store_mapped_glyph using the `special` arg
-    produced by mapglyph()):
+    Bit definitions match NLE's bundled NetHack header
+    (vendor/nle/include/hack.h:77-84) which is what NLE-trained agents
+    observe — NOT vendor/nethack/include/display.h (whose layout shifts
+    every bit because it adds a MG_HERO=0x01 entry at the bottom).
 
-      0x01  MG_HERO     — the hero tile
-      0x02  MG_CORPSE   — corpse on floor (body glyph or food/"corpse" object)
-      0x04  MG_INVIS    — invisible monster sensed
-      0x08  MG_DETECT   — detected monster
-      0x10  MG_PET      — pet
-      0x20  MG_RIDDEN   — ridden monster
-      0x40  MG_STATUE   — statue
-      0x80  MG_OBJPILE  — 2+ object stacks on this tile
+      0x01  MG_CORPSE   — corpse on floor
+      0x02  MG_INVIS    — invisible monster sensed
+      0x04  MG_DETECT   — detected monster
+      0x08  MG_PET      — pet
+      0x10  MG_RIDDEN   — ridden monster
+      0x20  MG_STATUE   — statue
+      0x40  MG_OBJPILE  — 2+ object stacks on this tile
+      0x80  MG_BW_LAVA  — black&white lava highlight (or BW_ICE/BW_SINK/BW_ENGR alias)
+
+    Note: NLE has NO "MG_HERO" bit (the hero is conveyed separately via
+    blstats[0,1] = (x, y)).  Nethax previously emitted MG_HERO=0x01 which
+    silently re-tagged every tile as containing a corpse from NLE's
+    perspective.
 
     nethax-current support:
-      MG_HERO     : set on player tile
       MG_CORPSE   : food category + corpse type_id on ground stack
       MG_OBJPILE  : 2+ ground stacks
       MG_PET      : 1 if at least one pet exists at this tile (state.pets)
-      MG_INVIS/MG_DETECT/MG_RIDDEN/MG_STATUE: unset for now (no engine state).
-
-    NB: the previous nethax encoding bundled "has_trap" and "has_object" into
-    bits 0x04 and 0x20 — that conflicts with vendor MG_INVIS / MG_RIDDEN.  We
-    have removed those non-vendor bits so the byte layout is byte-equal to NLE.
+      MG_INVIS/MG_DETECT/MG_RIDDEN/MG_STATUE/MG_BW_LAVA: unset for now.
 
     Returns:
         uint8[21, 79]
@@ -729,26 +729,31 @@ def build_specials(env_state) -> jnp.ndarray:
     is_corpse_stack = (gi_cat == FOOD_CLASS) & (gi_typ == CORPSE_TYPE_ID)
     has_corpse = jnp.any(is_corpse_stack, axis=-1)
 
-    # MG_HERO at the player position.
-    pr = jnp.clip(jnp.int32(env_state.player_pos[0]), 0, 20)
-    pc = jnp.clip(jnp.int32(env_state.player_pos[1]), 0, 78)
-    hero_mask = jnp.zeros((21, 79), dtype=jnp.bool_).at[pr, pc].set(True)
-
     # MG_PET: any tile occupied by a tame monster (pets state).
     # The pets subsystem layout exposes positions per pet; fall back to all
     # zeros if not available.  We resolve dynamically to avoid import cycles.
     has_pet = _pet_mask(env_state, branch, level_idx)
 
+    # Parity-mode-aware MG_* layout (Nethax/nethax/parity_mode.py).
+    # NLE mode (default):     vendor/nle/include/hack.h:77-84
+    # NetHack 3.7 mode:       vendor/nethack/include/display.h:995-1009
+    from Nethax.nethax.parity_mode import mg_bits, is_nethack_mode
+    bits = mg_bits()
+
     specials = (
-        hero_mask.astype(jnp.uint8)    * jnp.uint8(0x01)  # MG_HERO
-        | has_corpse.astype(jnp.uint8) * jnp.uint8(0x02)  # MG_CORPSE
-        # bit 0x04 MG_INVIS    : unset (no engine state yet)
-        # bit 0x08 MG_DETECT   : unset (no engine state yet)
-        | has_pet.astype(jnp.uint8)    * jnp.uint8(0x10)  # MG_PET
-        # bit 0x20 MG_RIDDEN   : unset (no engine state yet)
-        # bit 0x40 MG_STATUE   : unset (no engine state yet)
-        | has_objpile.astype(jnp.uint8) * jnp.uint8(0x80)  # MG_OBJPILE
+          has_corpse.astype(jnp.uint8) * jnp.uint8(bits.MG_CORPSE)
+        | has_pet.astype(jnp.uint8)    * jnp.uint8(bits.MG_PET)
+        | has_objpile.astype(jnp.uint8) * jnp.uint8(bits.MG_OBJPILE)
     )
+    # NetHack-mode only: set MG_HERO bit at player position.
+    # NLE conveys hero position via blstats[0,1] instead.
+    if is_nethack_mode():
+        pr = jnp.clip(jnp.int32(env_state.player_pos[0]), 0, 20)
+        pc = jnp.clip(jnp.int32(env_state.player_pos[1]), 0, 78)
+        hero_mask = jnp.zeros((21, 79), dtype=jnp.uint8).at[pr, pc].set(
+            jnp.uint8(bits.MG_HERO)
+        )
+        specials = specials | hero_mask
     return specials.astype(jnp.uint8)
 
 

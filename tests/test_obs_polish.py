@@ -134,17 +134,30 @@ def test_specials_corpse_flag():
     assert (val & 0x02) != 0, f"MG_CORPSE bit not set, got {val}"
 
 
-def test_specials_hero_bit_at_player_position():
-    """The player tile must set MG_HERO (0x01).
+def test_specials_hero_bit_nethack_mode_only():
+    """MG_HERO=0x01 is set on the player tile ONLY in NetHack 3.7 mode.
 
-    Vendor bits (display.h:995): MG_HERO = 0x01.
+    Default is NLE mode (no MG_HERO bit; hero conveyed via blstats).
+    Cite: vendor/nle/include/hack.h:77-84 vs
+          vendor/nethack/include/display.h:995-1009.
     """
+    from Nethax.nethax.parity_mode import ParityMode, set_parity_mode
+
     state = _default_state().replace(
         player_pos=jnp.array([10, 12], dtype=jnp.int16),
     )
+    # NLE-mode (default): hero bit NOT set.
+    set_parity_mode(ParityMode.NLE)
     specials = build_specials(state)
     val = int(specials[10, 12])
-    assert (val & 0x01) != 0, f"MG_HERO bit not set at player pos, got {val}"
+    assert (val & 0x01) == 0, f"NLE mode should not set MG_HERO, got {val}"
+    # NetHack-mode: hero bit IS set.
+    set_parity_mode(ParityMode.NETHACK)
+    specials = build_specials(state)
+    val = int(specials[10, 12])
+    assert (val & 0x01) != 0, f"NetHack mode missing MG_HERO bit, got {val}"
+    # Restore default.
+    set_parity_mode(ParityMode.NLE)
 
 
 def test_specials_shape_and_dtype():

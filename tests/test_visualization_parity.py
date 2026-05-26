@@ -129,15 +129,21 @@ def test_colors_player_position_is_bright():
 # 5. specials — vendor MG_* bit layout
 # ---------------------------------------------------------------------------
 
-def test_specials_mg_hero_at_player_position():
-    """display.h:995 — MG_HERO = 0x01.  Player tile must have bit 0x01 set."""
+def test_specials_no_mg_hero_bit():
+    """NLE has NO MG_HERO bit (vendor/nle/include/hack.h:77-84).  Hero
+    position is conveyed via blstats[NLE_BL_X=0, NLE_BL_Y=1], not via
+    the specials channel.  This test guards against a regression where
+    Nethax emitted MG_HERO=0x01 (vendor NetHack 3.7 display.h layout)
+    which silently overlapped with NLE's MG_CORPSE bit.
+    """
     state = _state().replace(player_pos=jnp.array([8, 12], dtype=jnp.int16))
     specials = np.asarray(build_specials(state))
-    assert (int(specials[8, 12]) & 0x01) == 0x01
+    # Player tile must NOT have any special bit set when no corpse/pet/objpile.
+    assert int(specials[8, 12]) == 0
 
 
 def test_specials_mg_corpse_for_food_corpse():
-    """display.h:996 — MG_CORPSE = 0x02."""
+    """NLE hack.h:77 — MG_CORPSE = 0x01."""
     state = _state()
     branch = int(state.dungeon.current_branch)
     level = int(state.dungeon.current_level) - 1
