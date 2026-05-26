@@ -429,15 +429,15 @@ def _lookup_object_cost(type_id: jnp.ndarray) -> jnp.ndarray:
     """Look up ``OBJECTS[type_id].cost`` as a JAX int32.
 
     Built lazily — the OBJECTS table is a python tuple, so we materialise a
-    numpy array on first use (outside any trace) and convert at lookup
-    time.  Using a numpy cache avoids the UnexpectedTracerError that would
-    occur if the first call landed inside a ``lax.scan`` (a cached ``jnp``
-    array created mid-trace would escape the scan scope).
+    numpy array on first use (outside any trace) and convert at lookup time.
+    Using a numpy cache avoids the UnexpectedTracerError that would occur if
+    the first call landed inside a ``lax.scan`` (a cached ``jnp`` array
+    created mid-trace would escape the scan scope).
     """
     import numpy as _np
     from Nethax.nethax.constants.objects import OBJECTS, NUM_OBJECTS
 
-    # Module-level numpy cache — trace-safe.
+    # Module-level numpy cache - trace-safe.
     global _OBJECT_COST_TABLE_NP
     try:
         table_np = _OBJECT_COST_TABLE_NP
@@ -588,7 +588,7 @@ def _find_container_for_slot(containers, slot: jnp.ndarray) -> tuple:
     """Return (has_container, c_idx) for the container whose parent_slot == slot.
 
     The JAX container model holds at most one container per inventory slot
-    (containers cannot be nested — see containers.py line 442
+    (containers cannot be nested -- see containers.py line 442
     ``is_box_inside_box`` refusal), so a linear scan over N_CONTAINERS
     suffices.  Empty / floor containers (parent_slot == -1) are skipped.
     """
@@ -630,7 +630,7 @@ def contained_gold(state, slot_idx) -> jnp.ndarray:
     Sums the gold quantity inside the container held at inventory ``slot_idx``.
     Returns 0 when the slot has no container attached.
 
-    The JAX container model is single-level (boxes-in-boxes refused — see
+    The JAX container model is single-level (boxes-in-boxes refused -- see
     containers.py::put_in_container ``is_box_inside_box`` gate at line 442),
     so the vendor recursion collapses to a single ``lax.scan`` over the
     container's ``MAX_ITEMS_PER_CONTAINER`` slots.  Vendor's
@@ -667,7 +667,7 @@ def _container_item_price(state, c_idx: jnp.ndarray, pos: jnp.ndarray) -> jnp.nd
     is_coin = cat == jnp.int32(ItemCategory.COIN)
     billable_item = has_item & ~is_coin
 
-    # ContainerState doesn't carry per-slot dknown / artifact_idx — vendor's
+    # ContainerState doesn't carry per-slot dknown / artifact_idx -- vendor's
     # contained_cost branch at shk.c:3032-3034 falls through to get_cost which
     # respects obj->dknown / oc_name_known.  In this slice we approximate
     # both as ``identified`` (closest analogue exposed on container slots).
@@ -698,12 +698,12 @@ def _container_item_price(state, c_idx: jnp.ndarray, pos: jnp.ndarray) -> jnp.nd
 
 
 def _contained_cost(state, slot_idx) -> jnp.ndarray:
-    """Vendor ``contained_cost`` (shk.c:2995-3041) — buy-side, non-recursive.
+    """Vendor ``contained_cost`` (shk.c:2995-3041) -- buy-side, non-recursive.
 
     Computes the cumulative price of every non-coin item inside the
     container held at inventory ``slot_idx``.  Used by ``addtobill``
     (shk.c:3527) and by the recursive ``bill_box_content`` walker
-    (shk.c:3387-3407) — combined here because the JAX model is single-level.
+    (shk.c:3387-3407) -- combined here because the JAX model is single-level.
 
     JIT-safe.  Returns int32 (0 when no container at the slot).
     """
@@ -728,7 +728,7 @@ def _contained_cost(state, slot_idx) -> jnp.ndarray:
     return jnp.where(has_container, total, jnp.int32(0))
 
 
-def _apply_costly_gold(shop: "ShopState", amount: jnp.ndarray, active: jnp.ndarray) -> "ShopState":
+def _apply_costly_gold(shop, amount: jnp.ndarray, active: jnp.ndarray):
     """Vendor ``costly_gold`` (shk.c:5744-5786) credit/debit ledger update.
 
     Vendor flow:
@@ -767,14 +767,14 @@ def accrue_bill(state, slot_idx) -> object:
     """Player picks up an item inside the shop while not invisible.
 
     Vendor refs:
-        shk.c::addtobill          (shk.c:3489-3550) — billable gate then
+        shk.c::addtobill          (shk.c:3489-3550) -- billable gate then
                                                        add_one_tobill, plus
                                                        container content roll-in.
-        shk.c::get_cost           (shk.c:2877-2988) — per-item price.
-        shk.c::contained_cost     (shk.c:2995-3041) — sum of contained prices.
-        shk.c::contained_gold     (shk.c:3046-3061) — sum of contained gold.
-        shk.c::bill_box_content   (shk.c:3387-3407) — recursive content billing.
-        shk.c::costly_gold        (shk.c:5744-5786) — credit/debit ledger update.
+        shk.c::get_cost           (shk.c:2877-2988) -- per-item price.
+        shk.c::contained_cost     (shk.c:2995-3041) -- sum of contained prices.
+        shk.c::contained_gold     (shk.c:3046-3061) -- sum of contained gold.
+        shk.c::bill_box_content   (shk.c:3387-3407) -- recursive content billing.
+        shk.c::costly_gold        (shk.c:5744-5786) -- credit/debit ledger update.
 
     Side-effects (only when ``billable`` returns True):
         - shop.bill_prices[slot_idx] = get_cost(item at slot) + contained_cost
@@ -787,7 +787,7 @@ def accrue_bill(state, slot_idx) -> object:
         Vendor recursively bills every non-coin object in the container
         (``bill_box_content``) and routes contained gold through
         ``costly_gold``.  The JAX model is single-level (containers cannot
-        be nested — see containers.py::put_in_container ``is_box_inside_box``
+        be nested -- see containers.py::put_in_container ``is_box_inside_box``
         guard at line 442), so the recursion collapses to a flat scan over
         ``MAX_ITEMS_PER_CONTAINER``.
 
@@ -815,7 +815,7 @@ def accrue_bill(state, slot_idx) -> object:
     new_price_at_slot = jnp.where(eligible, price, prev_price)
     new_owned_at_slot = jnp.where(eligible, jnp.bool_(True), shop.items_owned_by_shop[slot])
 
-    # Adjust bill by (new_price - prev_price) — when prev_price == 0 this is
+    # Adjust bill by (new_price - prev_price) -- when prev_price == 0 this is
     # the first accrual; when re-accruing (prev_price != 0) we keep the
     # original price (eligible is False because items_owned_by_shop[slot] is
     # already True).  So the delta is just ``price`` for first-time accrual.
@@ -881,18 +881,18 @@ def pay_at_exit(state) -> object:
     """Called when the player crosses the shop door tile leaving the shop.
 
     Vendor refs:
-        shk.c::dopayobj      (shk.c:2220-2299) — itemised pay loop.
-        shk.c::setpaid       (shk.c:399-434)   — global object-list sweep
+        shk.c::dopayobj      (shk.c:2220-2299) -- itemised pay loop.
+        shk.c::setpaid       (shk.c:399-434)   -- global object-list sweep
                                                   clearing unpaid flags + zeroing
                                                   billct / credit / debit / loan.
-        shk.c::make_angry_shk (shk.c:1469-1489) — PAY_CANT path.
-        shk.c::hot_pursuit    (shk.c:1449-1463) — sets ``following = 1``.
+        shk.c::make_angry_shk (shk.c:1469-1489) -- PAY_CANT path.
+        shk.c::hot_pursuit    (shk.c:1449-1463) -- sets ``following = 1``.
 
     Behaviour:
         - bill == 0: no-op.
         - player gold >= bill: deduct gold, run setpaid() sweep (zero bill,
           clear ownership, zero per-slot prices, zero credit/debit/loan).
-        - player gold <  bill: PAY_CANT → set angry, set following, set
+        - player gold <  bill: PAY_CANT -> set angry, set following, set
           surcharge.  Bill stays on the books; ownership flags persist.
 
     setpaid() global object-list sweep (vendor shk.c:400-419):
@@ -900,7 +900,7 @@ def pay_at_exit(state) -> object:
         fobj / svl.level.buriedobjlist / gt.thrownobj / gk.kickedobj and
         every monster's minvent.  In this JAX port the only place that
         tracks "unpaid" state is ``shop.items_owned_by_shop`` (per
-        inventory slot — see ShopState docstring at module top); no
+        inventory slot -- see ShopState docstring at module top); no
         per-Item ``unpaid`` bit exists on ``state.ground_items``,
         ``state.containers.items_*``, or ``state.monster_ai.inv_*``.
         Consequently the sweep over those lists is a no-op by construction
@@ -928,14 +928,14 @@ def pay_at_exit(state) -> object:
     new_bill = jnp.where(paid, jnp.int32(0), shop.bill)
     new_owned = jnp.where(paid, cleared_owned, shop.items_owned_by_shop)
     new_prices = jnp.where(paid, cleared_prices, shop.bill_prices)
-    # Vendor shk.c:428-432 — setpaid() also zeros credit/debit/loan on the
+    # Vendor shk.c:428-432 -- setpaid() also zeros credit/debit/loan on the
     # paid branch.  This was previously omitted; clear them now to match
     # byte-equal vendor semantics.
     new_credit = jnp.where(paid, jnp.int32(0), shop.credit)
     new_debit = jnp.where(paid, jnp.int32(0), shop.debit)
     new_loan = jnp.where(paid, jnp.int32(0), shop.loan)
     new_angry = jnp.where(angered, jnp.bool_(True), shop.angry)
-    # vendor shk.c:1456 — hot_pursuit sets following=1; shk.c:1364 sets surcharge.
+    # vendor shk.c:1456 -- hot_pursuit sets following=1; shk.c:1364 sets surcharge.
     new_following = jnp.where(angered, jnp.bool_(True), shop.following)
     new_surcharge = jnp.where(angered, jnp.bool_(True), shop.surcharge)
 
@@ -1015,10 +1015,10 @@ def kill_shopkeeper(state) -> object:
     """Vendor ``shkgone`` (shk.c:235-269) folded with combat-side death.
 
     On shopkeeper death:
-        - setpaid(mtmp) — clear this shk's bill, clear unpaid flags.
-        - eshk->bill_p = NULL — bill record decommissioned (we zero
+        - setpaid(mtmp) -- clear this shk's bill, clear unpaid flags.
+        - eshk->bill_p = NULL -- bill record decommissioned (we zero
           ``bill_prices`` and ``items_owned_by_shop``).
-        - Clear no_charge on floor items in shoproom — modelled here as
+        - Clear no_charge on floor items in shoproom -- modelled here as
           clearing ``items_owned_by_shop`` (which is the inventory-side
           mirror of those flags in this port).
         - Note: vendor leaves neighbouring shopkeepers' anger state alone
@@ -1066,7 +1066,7 @@ def kill_shopkeeper(state) -> object:
         bill=jnp.where(will_kill, jnp.int32(0), shop.bill),
         items_owned_by_shop=jnp.where(will_kill, cleared_owned, shop.items_owned_by_shop),
         bill_prices=jnp.where(will_kill, cleared_prices, shop.bill_prices),
-        # Vendor shk.c:428-432 — setpaid() zeros credit/debit/loan too.
+        # Vendor shk.c:428-432 -- setpaid() zeros credit/debit/loan too.
         credit=jnp.where(will_kill, jnp.int32(0), shop.credit),
         debit=jnp.where(will_kill, jnp.int32(0), shop.debit),
         loan=jnp.where(will_kill, jnp.int32(0), shop.loan),
