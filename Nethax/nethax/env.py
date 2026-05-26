@@ -270,16 +270,14 @@ class NethaxEnv:
     # Status:
     #   * step_batched     — fully vmap-safe; wraps the JIT-compiled
     #                        ``_step_impl`` which has no host-side branches.
-    #   * reset_batched    — NOT vmap-safe today.  ``reset`` contains
-    #                        host-side Python (``jax.device_get``,
-    #                        ``np.array``, ``int(...)``, Python ``for``
-    #                        loops in ``_spawn_starting_pet``) that block
-    #                        ``jax.vmap``.  See ``VMAP_GAPS.md`` for the
-    #                        per-site catalogue and the proposed migration
-    #                        path (pure-JAX reset, no .item()/no host loops).
-    #                        For now, ``reset_batched`` runs the per-env
-    #                        reset in a Python loop and stacks the results
-    #                        — correct semantics, but not GPU-parallel.
+    #   * reset_batched    — vmap-safe in the default ``ParityMode.NLE``
+    #                        path (Threefry RNG, pure-JAX dungeon-gen,
+    #                        pure-JAX ``_init_attr_vendor`` loop,
+    #                        pure-JAX ``_spawn_starting_pet``).
+    #                        The opt-in ``ParityMode.NLE_BYTEPARITY``
+    #                        branch (ISAAC64) is host-only by design —
+    #                        ``_vendor_rng.init`` operates on Python lists
+    #                        and cannot vmap.  See ``VMAP_GAPS.md``.
     # ----------------------------------------------------------------------
 
     def step_batched(
@@ -313,27 +311,32 @@ class NethaxEnv:
     ) -> Tuple[EnvState, Dict[str, jax.Array]]:
         """Batched reset over PRNGKeys ``[B, 2]``.
 
-        See class-level note: full vmap-parallel reset is blocked by
-        host-side code paths in :meth:`reset` (catalogued in
-        ``VMAP_GAPS.md``).  Until that migration lands this routine runs
-        a Python loop over the batch and stacks the results — semantics
-        are correct (every env gets an independent dungeon) but the work
-        is not parallelised across the device.
+        Uses ``jax.vmap`` over the rng axis in the default ``ParityMode.NLE``
+        path — every env runs in parallel on the device.  ``role``/``race``/
+        ``alignment`` are static hyperparameters (broadcast to every env).
+
+        Under ``ParityMode.NLE_BYTEPARITY`` the ISAAC64 init in
+        :meth:`reset` is host-only (Python ISAAC64 ref impl), so this
+        falls back to a Python loop in that mode.
         """
-        n = int(rngs.shape[0])
-        per_states = []
-        per_obs = []
-        for i in range(n):
-            s_i, o_i = self.reset(rngs[i], role=role, race=race, alignment=alignment)
-            per_states.append(s_i)
-            per_obs.append(o_i)
-        batched_state = jax.tree_util.tree_map(
-            lambda *xs: jnp.stack(xs, axis=0), *per_states
-        )
-        batched_obs = jax.tree_util.tree_map(
-            lambda *xs: jnp.stack(xs, axis=0), *per_obs
-        )
-        return batched_state, batched_obs
+        if use_vendor_rng():
+            n = int(rngs.shape[0])
+            per_states = []
+            per_obs = []
+            for i in range(n):
+                s_i, o_i = self.reset(rngs[i], role=role, race=race, alignment=alignment)
+                per_states.append(s_i)
+                per_obs.append(o_i)
+            batched_state = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs, axis=0), *per_states
+            )
+            batched_obs = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs, axis=0), *per_obs
+            )
+            return batched_state, batched_obs
+        return jax.vmap(
+            lambda r: self.reset(r, role=role, race=race, alignment=alignment),
+        )(rngs)
 
 
 def _vendor_draw_prngkey(v_state):

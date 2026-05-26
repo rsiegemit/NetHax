@@ -146,15 +146,18 @@ once Gaps 1-3 are closed.
 
 ## Summary
 
-| Site                              | Severity | Fix complexity |
-| --------------------------------- | -------- | -------------- |
-| `device_get` + `int(key_u32)`     | blocker  | small (jnp ops) |
-| `_vendor_draw_prngkey` int shifts | blocker  | small (jnp ops) |
-| `_spawn_starting_pet` np/loops    | blocker  | medium (rewrite scan) |
-| `_roll_hp` int conversion         | blocker  | trivial |
+| Site                              | Severity | Status |
+| --------------------------------- | -------- | -------- |
+| `device_get` + `int(key_u32)`     | blocker  | **closed** — uses `jax.random.bits`; remaining `int(seed_arr)` is gated behind `use_vendor_rng()` (host-only opt-in mode) |
+| `_vendor_draw_prngkey` int shifts | blocker  | **closed** — pure `jnp.right_shift`/`jnp.bitwise_and` |
+| `_spawn_starting_pet` np/loops    | blocker  | **closed** — 8-neighbour `jnp.where` selection |
+| `_roll_hp` int conversion         | blocker  | **closed** — traced scalar stored directly |
+| `_init_attr_vendor` Python `while`| blocker  | **closed** — `lax.while_loop` + pre-split key bundle |
 | Default-arg Python branches       | n/a      | n/a (hyperparams) |
-| `populate_level_with_monsters`    | unknown  | follow-up |
-| `compute_fov` call site           | unknown  | follow-up |
+| `populate_level_with_monsters`    | clean    | vmap-safe today |
+| `compute_fov` call site           | clean    | vmap-safe today |
 
-`step_batched` works today.  `reset_batched` uses a Python-for fallback
-until Gaps 1-3 are closed.
+`step_batched` works today.  Default-mode `jax.vmap(env.reset)(rngs)`
+now runs cleanly — see smoke test in commit message.  The
+`use_vendor_rng()` byte-parity path is still host-only by design
+(ISAAC64 init operates on Python lists).

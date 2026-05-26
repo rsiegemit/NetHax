@@ -843,59 +843,105 @@ def _init_attr_vendor(
 
     Returns a dict mapping ``_STAT_NAMES`` to int32 JAX scalars.
 
-    JIT note: this is called from ``env.reset`` (non-jit path); we use Python
-    loops over a fixed iteration cap. Each call uses fresh PRNG keys from
-    ``jax.random.split`` so it remains deterministic for a given seed.
+    Pure-JAX implementation: uses ``lax.while_loop`` and ``jnp.where`` so the
+    function is ``jax.vmap``-safe.  ``role``/``race`` are static Python
+    hyperparameters (resolved at trace time); the per-iteration ``rn2(100)``
+    draws come from a pre-split key bundle so the loop body has no host-side
+    Python control flow on traced values.
     """
     r_entry = get_role(role)
     race_entry = get_race(race)
 
-    attrbase = list(r_entry.attrbase)
-    attrdist = list(r_entry.attrdist)
-    attrmin  = list(race_entry.attrmin)
-    attrmax  = list(race_entry.attrmax)
+    # Static (Python-int) role/race tables — these resolve at trace time.
+    attrbase_arr = jnp.asarray(list(r_entry.attrbase), dtype=jnp.int32)   # [6]
+    attrdist_arr = jnp.asarray(list(r_entry.attrdist), dtype=jnp.int32)   # [6]
+    attrmin_arr  = jnp.asarray(list(race_entry.attrmin), dtype=jnp.int32) # [6]
+    attrmax_arr  = jnp.asarray(list(race_entry.attrmax), dtype=jnp.int32) # [6]
 
-    # Start each stat at attrbase; remaining points to distribute.
-    values = [int(attrbase[i]) for i in range(6)]
-    remaining = int(np_total) - sum(values)
+    max_iters = 1000
+    base_sum = int(sum(int(v) for v in r_entry.attrbase))
+    initial_remaining = jnp.int32(int(np_total) - base_sum)
 
-    # Distribute extras weighted by attrdist, capped by race attrmax.
-    # tryct caps run-away when every stat is already at race-cap.
-    max_iters = 1000  # generous upper bound to ensure determinism
-    tryct = 0
-    keys = jax.random.split(rng, max_iters)
-    key_idx = 0
-    while remaining > 0 and tryct < 100 and key_idx < max_iters:
-        # x = rn2(100) — vendor's weighted selection.
-        x = int(jax.random.randint(
-            keys[key_idx], shape=(), minval=0, maxval=100
-        ))
-        key_idx += 1
-        i = 0
-        x_left = x
-        while i < 6:
-            x_left -= int(attrdist[i])
-            if x_left < 0:
-                break
-            i += 1
-        if i >= 6:
-            continue  # vendor: "impossible"
-        if values[i] >= int(attrmax[i]):
-            tryct += 1
-            continue
-        tryct = 0
-        values[i] += 1
-        remaining -= 1
+    # Pre-draw ``max_iters`` ``rn2(100)`` values via a single batched randint.
+    # Vendor draws one rn2(100) per iteration; pre-splitting consumes the same
+    # number of keys.  We split rng once then call randint with shape=(N,) so
+    # the result is a static-shape int32 array.
+    xs = jax.random.randint(
+        rng, shape=(max_iters,), minval=0, maxval=100, dtype=jnp.int32,
+    )  # [max_iters]
 
-    # Final clamp to race floor (paranoia: floor is 3 for all races).
-    for i in range(6):
-        if values[i] < int(attrmin[i]):
-            values[i] = int(attrmin[i])
-        if values[i] > int(attrmax[i]):
-            values[i] = int(attrmax[i])
+    # Loop carry: (values[6], remaining, tryct, idx)
+    init_carry = (attrbase_arr, initial_remaining, jnp.int32(0), jnp.int32(0))
+
+    def cond_fn(carry):
+        values, remaining, tryct, idx = carry
+        return (
+            (remaining > jnp.int32(0))
+            & (tryct < jnp.int32(100))
+            & (idx < jnp.int32(max_iters))
+        )
+
+    def body_fn(carry):
+        values, remaining, tryct, idx = carry
+        x = xs[idx]
+
+        # Walk attrdist to find target stat index i; mirror vendor:
+        #   i = 0
+        #   while i < 6:
+        #     x -= attrdist[i]
+        #     if x < 0: break
+        #     i += 1
+        # i ends in [0, 6]; i == 6 means "impossible" (skip this draw).
+        # Cumulative sum: i = first index where cumsum[i] > x; if none, 6.
+        cum = jnp.cumsum(attrdist_arr)              # [6]
+        # found[k] is True iff cum[k] > x.  argmax over found returns first True.
+        found = cum > x
+        any_found = jnp.any(found)
+        i_idx = jnp.where(
+            any_found,
+            jnp.argmax(found.astype(jnp.int32)).astype(jnp.int32),
+            jnp.int32(6),
+        )
+
+        impossible = i_idx >= jnp.int32(6)
+        # Safe index for read/write (clamped to [0, 5]); the impossible branch
+        # is masked out so the writeback is a no-op below.
+        i_safe = jnp.clip(i_idx, jnp.int32(0), jnp.int32(5))
+
+        cur_val = values[i_safe]
+        cap = attrmax_arr[i_safe]
+        at_cap = cur_val >= cap
+
+        # Increment: only if not impossible and not at cap.
+        do_increment = (~impossible) & (~at_cap)
+        new_values = jnp.where(
+            do_increment,
+            values.at[i_safe].add(jnp.int32(1)),
+            values,
+        )
+        new_remaining = jnp.where(
+            do_increment, remaining - jnp.int32(1), remaining,
+        )
+
+        # tryct: bumped only when at_cap (and not impossible); reset on success.
+        tryct_at_cap = (~impossible) & at_cap
+        new_tryct = jnp.where(
+            do_increment,
+            jnp.int32(0),
+            jnp.where(tryct_at_cap, tryct + jnp.int32(1), tryct),
+        )
+
+        return (new_values, new_remaining, new_tryct, idx + jnp.int32(1))
+
+    final_values, _rem, _tryct, _idx = jax.lax.while_loop(
+        cond_fn, body_fn, init_carry,
+    )
+
+    # Final clamp to race floor and ceiling.
+    clamped = jnp.clip(final_values, attrmin_arr, attrmax_arr)
 
     return {
-        name: jnp.int32(values[i])
+        name: clamped[i].astype(jnp.int32)
         for i, name in enumerate(_STAT_NAMES)
     }
 
