@@ -156,6 +156,7 @@ def clear_prompt(state):
         pending_action_kind=jnp.int8(0),
         pending_action_root=jnp.int8(0),
         pending_action_slot=jnp.int8(-1),
+        pending_action_dir=jnp.zeros((2,), dtype=jnp.int8),
     )
 
 

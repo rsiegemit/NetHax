@@ -174,6 +174,11 @@ class EnvState:
     pending_action_kind: jax.Array   # int8  PendingActionKind enum (0=NONE)
     pending_action_root: jax.Array   # int8  original action enum value
     pending_action_slot: jax.Array   # int8  inv-slot remembered for 2-step
+    # Two-step ZAP/THROW: direction (dy, dx) decoded from the agent's
+    # follow-up direction key.  Default (0, 0) means "no direction set"
+    # — handlers fall back to the legacy east-default.  Cite:
+    # vendor/nethack/src/cmd.c::getdir return value into u.dx/u.dy.
+    pending_action_dir: jax.Array    # int8[2]  (dy, dx) direction follow-up
 
     # ---- Player core (kept here for fast access; not part of any subsystem) ----
     player_pos: jax.Array       # int16[2]  (row, col)
@@ -375,6 +380,7 @@ class EnvState:
             pending_action_kind=jnp.int8(0),
             pending_action_root=jnp.int8(0),
             pending_action_slot=jnp.int8(-1),
+            pending_action_dir=jnp.zeros((2,), dtype=jnp.int8),
             calendar_moonphase=jnp.int8(0),
             calendar_friday13=jnp.bool_(False),
             # player core

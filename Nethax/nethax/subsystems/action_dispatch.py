@@ -1806,7 +1806,39 @@ def _handle_zap(state, rng):
         wall_info     = _wall_info_default,
     )
 
-    new_wand = _wands_handle_zap(wand_state, rng)
+    # Two-step ZAP direction follow-up: if the agent supplied a direction
+    # via the AWAIT_LETTER_THEN_DIR → AWAIT_DIRECTION sequence, decode the
+    # stored (dy, dx) into the 8-dir index used by items_wands (_DIR_DY/
+    # _DIR_DX).  Default 2 (East) preserves legacy behavior when the dir
+    # is (0, 0) — meaning no direction was supplied.  Cite: vendor
+    # nethack/src/cmd.c::dozap calls getdir(); items_wands.handle_zap now
+    # accepts that direction.
+    pdir = state.pending_action_dir.astype(jnp.int32)
+    pdy = pdir[0]
+    pdx = pdir[1]
+    # Map (dy, dx) → 0..7 index (N=0, NE=1, E=2, SE=3, S=4, SW=5, W=6, NW=7).
+    is_n  = (pdy == -1) & (pdx ==  0)
+    is_ne = (pdy == -1) & (pdx ==  1)
+    is_e  = (pdy ==  0) & (pdx ==  1)
+    is_se = (pdy ==  1) & (pdx ==  1)
+    is_s  = (pdy ==  1) & (pdx ==  0)
+    is_sw = (pdy ==  1) & (pdx == -1)
+    is_w  = (pdy ==  0) & (pdx == -1)
+    is_nw = (pdy == -1) & (pdx == -1)
+    has_dir = (pdy != 0) | (pdx != 0)
+    dir_from_pending = (
+        jnp.where(is_n,  jnp.int32(0), jnp.int32(0))
+        + jnp.where(is_ne, jnp.int32(1), jnp.int32(0))
+        + jnp.where(is_e,  jnp.int32(2), jnp.int32(0))
+        + jnp.where(is_se, jnp.int32(3), jnp.int32(0))
+        + jnp.where(is_s,  jnp.int32(4), jnp.int32(0))
+        + jnp.where(is_sw, jnp.int32(5), jnp.int32(0))
+        + jnp.where(is_w,  jnp.int32(6), jnp.int32(0))
+        + jnp.where(is_nw, jnp.int32(7), jnp.int32(0))
+    )
+    zap_direction = jnp.where(has_dir, dir_from_pending, jnp.int32(2))
+
+    new_wand = _wands_handle_zap(wand_state, rng, zap_direction)
 
     # Write back the mutated slices into EnvState.
     new_monster_ai = mai.replace(
@@ -3620,28 +3652,67 @@ def dispatch_action(state, action: jnp.int32, rng: jax.Array):
         action_opens_inv_letter_prompt,
         action_opens_letter_then_dir_prompt,
         letter_to_slot,
+        action_to_direction,
         is_pending,
     )
 
     action_val = jnp.clip(jnp.int32(action), 0, 255)
 
     # --- Step A: are we already waiting on a follow-up? -------------------
-    # In a future revision the deferred handler would consume the letter or
-    # direction (e.g. wear_armor(state, slot)).  For now we (a) stash the
-    # decoded slot in state.pending_action_slot so subsequent handlers can
-    # pick it up, then (b) clear the prompt and fall through to the normal
-    # dispatch.  This preserves NLE's "WEAR -> b" cadence: step 1 is a
-    # no-op turn that opens the prompt; step 2 carries the slot value.
+    # Three pending modes:
+    #   kind==1 (AWAIT_INV_LETTER): single-step prompt (WEAR/QUAFF/...).
+    #     Decode the letter into pending_action_slot, clear the prompt,
+    #     and fall through to the normal dispatch for the root action.
+    #   kind==3 (AWAIT_LETTER_THEN_DIR): two-step (ZAP/THROW).  Step 1 —
+    #     stash the slot AND transition kind→2 (AWAIT_DIRECTION) without
+    #     executing.  Vendor: cmd.c::dozap/dothrow call getobj() then
+    #     getdir() — two consecutive prompts.
+    #   kind==2 (AWAIT_DIRECTION): step 2 of the two-step prompt.  Decode
+    #     the direction into pending_action_dir, clear kind→0, and fall
+    #     through to dispatch the original root action with both the
+    #     stored slot and the stored direction.
     pending = is_pending(state)
+    pending_kind = state.pending_action_kind.astype(jnp.int32)
     slot_from_letter = letter_to_slot(action_val).astype(jnp.int8)
-    # Clear pending_kind/_root but PRESERVE the freshly-decoded slot — the
-    # next handler invocation may want to consult pending_action_slot.
-    # (clear_prompt() unconditionally resets slot=-1, which would overwrite
-    # the value we just stored.)
-    state_after_followup = state.replace(
+    dir_from_action = action_to_direction(action_val).astype(jnp.int8)
+
+    # --- Step A.1: single-step letter consumption (kind==1). -------------
+    # Clear kind/root but preserve the freshly-decoded slot for the
+    # downstream handler.  clear_prompt() would zero the slot — so we
+    # construct the replace() manually.
+    state_after_inv_letter = state.replace(
         pending_action_kind=jnp.int8(0),
         pending_action_root=jnp.int8(0),
         pending_action_slot=slot_from_letter,
+    )
+
+    # --- Step A.2: two-step step 1 (kind==3): stash slot, await dir. ----
+    # No execution: the root action is held in pending_action_root until
+    # the agent supplies the direction next turn.  Cite: getobj() returns
+    # then dozap proceeds to getdir() (vendor/nethack/src/cmd.c::dozap).
+    state_after_letter_two_step = state.replace(
+        pending_action_kind=jnp.int8(2),  # AWAIT_DIRECTION
+        pending_action_slot=slot_from_letter,
+        # pending_action_root preserved (still holds ZAP/THROW)
+    )
+
+    # --- Step A.3: two-step step 2 (kind==2): decode dir, dispatch root.
+    # Re-enter dispatch with the stored root action; the prompt is now
+    # cleared and the root handler will see pending_action_slot and
+    # pending_action_dir as the agent's choices.
+    root_action = state.pending_action_root.astype(jnp.int32) & jnp.int32(0xFF)
+    state_for_dir_dispatch = state.replace(
+        pending_action_kind=jnp.int8(0),
+        pending_action_root=jnp.int8(0),
+        pending_action_dir=dir_from_action,
+        # pending_action_slot preserved (was set on step 1)
+    )
+    handler_idx_root = _ACTION_TO_HANDLER_IDX[root_action].astype(jnp.int32)
+    compact_idx_root = _SLOT_TO_COMPACT[handler_idx_root]
+    dir_idx_root     = _SLOT_TO_DIR_IDX[handler_idx_root]
+    state_after_dir = jax.lax.switch(
+        compact_idx_root, _COMPACT_HANDLERS,
+        state_for_dir_dispatch, rng, dir_idx_root,
     )
 
     # --- Step B: does this action open a new prompt? ---------------------
@@ -3656,6 +3727,7 @@ def dispatch_action(state, action: jnp.int32, rng: jax.Array):
         pending_action_kind=kind_int,
         pending_action_root=action_val.astype(jnp.int8),
         pending_action_slot=jnp.int8(-1),
+        pending_action_dir=jnp.zeros((2,), dtype=jnp.int8),
     )
 
     # --- Step C: normal dispatch path -------------------------------------
@@ -3666,12 +3738,24 @@ def dispatch_action(state, action: jnp.int32, rng: jax.Array):
         compact_idx, _COMPACT_HANDLERS, state, rng, dir_idx
     )
 
-    # Branch select:
-    # - pending: state_after_followup (followup letter consumed, prompt cleared)
-    # - opens_any & !pending: state_open_prompt (open new prompt, no turn)
-    # - else: state_normal (legacy dispatch)
+    # Branch select for the pending case (selects between three sub-modes).
     def _branch_pending(_):
-        return state_after_followup
+        # kind==2 (AWAIT_DIRECTION): execute deferred root with dir+slot.
+        # kind==3 (AWAIT_LETTER_THEN_DIR step 1): stash slot, await dir.
+        # else (kind==1, AWAIT_INV_LETTER): stash slot, fall through.
+        is_dir   = pending_kind == jnp.int32(2)
+        is_ltd   = pending_kind == jnp.int32(3)
+        return jax.lax.cond(
+            is_dir,
+            lambda _: state_after_dir,
+            lambda _: jax.lax.cond(
+                is_ltd,
+                lambda __: state_after_letter_two_step,
+                lambda __: state_after_inv_letter,
+                None,
+            ),
+            None,
+        )
 
     def _branch_open(_):
         return state_open_prompt
