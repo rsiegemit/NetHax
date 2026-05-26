@@ -18,6 +18,7 @@ from Nethax.nethax.obs.nle_obs import (
     empty_nle_observation,
 )
 from Nethax.nethax.obs.strength_format import format_strength
+from Nethax.nethax.obs.rank_titles import rank_title
 from Nethax.nethax.obs.pixel_obs import (
     MAP_H,
     MAP_W,
@@ -49,6 +50,7 @@ __all__ = [
     "build_inventory_strings",
     "build_tty",
     "format_strength",
+    "rank_title",
     # Symbolic
     "SYMBOLIC_OBS_DIM",
     "build_symbolic_observation",
