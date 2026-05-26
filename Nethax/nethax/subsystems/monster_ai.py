@@ -2668,11 +2668,24 @@ def _apply_spell_effect(state, rng: jax.Array, idx: jnp.ndarray,
         new_timed[int(_TS.FROZEN)] + add_paral)
     new_status = status.replace(timed_statuses=new_timed)
 
-    return state.replace(
+    intermediate = state.replace(
         player_hp=new_hp.astype(state.player_hp.dtype),
         done=state.done | (new_hp <= 0),
         monster_ai=new_mai,
         status=new_status,
+    )
+
+    # ----- CLONE_WIZ — Wizard of Yendor doubles (mcastu.c:941-945) -------
+    # Vendor: ``mcast_clone_wiz`` calls ``clonewiz(mtmp)`` which copies the
+    # Wizard into an adjacent free tile at half HP and (50% chance) gives
+    # the clone a FAKE_AMULET_OF_YENDOR.  clone_mon already handles the
+    # FAKE_AMULET insertion when the parent is entry 281.  Fold the clone
+    # into the post-effect state only on CLONE_WIZ.
+    is_clone = sn == jnp.int32(MCAST_CLONE_WIZ)
+    rng_clone = jax.random.fold_in(rng, jnp.int32(0xC10E))
+    cloned_state = clone_mon(intermediate, idx, rng_clone)
+    return jax.lax.cond(
+        is_clone, lambda _: cloned_state, lambda _: intermediate, None
     )
 
 
