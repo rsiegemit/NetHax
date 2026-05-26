@@ -130,6 +130,16 @@ class EnvState:
     occupation_target: jax.Array     # int32  monster slot / item idx
     occupation_remaining: jax.Array  # int8   turns left
 
+    # ---- Wave 47x: lock-picking occupation scratch ----------------------
+    # Per-turn chance used by ``picklock`` (vendor lock.c::picklock line
+    # 98 — rn2(100) >= gx.xlock.chance).  Captured once at occupation
+    # start (lock.c:650) so role/dex changes mid-attempt don't perturb
+    # the running attempt — matches vendor's gx.xlock.chance semantics.
+    # Also bumped by +20 on the turn the player notices a trap on a
+    # magic-keyed box (lock.c:107).
+    pick_lock_chance: jax.Array      # int8   per-turn chance 0..99
+    pick_lock_magic_key: jax.Array   # bool   is_magic_key(uwep) at start
+
     # ---- Wave 47i: calendar (vendor calendar.c / flags.moonphase) -----
     # Approximate vendor's astronomical lookup with a 250-turn cycle:
     # ``calendar_moonphase`` cycles 0..3 (new→waxing→full→waning); ``
@@ -336,6 +346,8 @@ class EnvState:
             occupation_kind=jnp.int8(0),
             occupation_target=jnp.int32(-1),
             occupation_remaining=jnp.int8(0),
+            pick_lock_chance=jnp.int8(0),
+            pick_lock_magic_key=jnp.bool_(False),
             ball_thrown_pos=jnp.array([-1, -1], dtype=jnp.int16),
             ball_thrown_turns=jnp.int8(0),
             calendar_moonphase=jnp.int8(0),

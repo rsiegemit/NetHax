@@ -46,8 +46,14 @@ import jax.numpy as jnp
 
 
 class OccupationKind(IntEnum):
-    NONE      = 0
-    STEAL_ARM = 1  # nymph multi-turn armor undress (steal.c:165)
+    NONE             = 0
+    STEAL_ARM        = 1  # nymph multi-turn armor undress (steal.c:165)
+    # Vendor lock.c::picklock (lines 68-159): per-turn poll while the
+    # hero unlocks a door / box; rolls rn2(100) >= chance each turn and
+    # gives up after 50 turns.  Two kinds so we can encode the target
+    # differently (door uses packed coords; box uses container index).
+    PICK_LOCK_DOOR   = 2  # lock.c:650-654 — door variant
+    PICK_LOCK_BOX    = 3  # lock.c:536-538 — chest/box variant
 
 
 def start_occupation(
@@ -151,24 +157,73 @@ _OCCUPATION_CALLBACKS = (
 def tick_occupation(state):
     """Per-turn occupation tick.
 
-    Decrements ``occupation_remaining``.  When it transitions from 1 to
-    0 on this turn, the associated callback fires once.  After firing,
-    ``occupation_kind`` resets to NONE.
+    Two semantic modes coexist:
+
+    - STEAL_ARM (kind 1): countdown-then-fire.  When
+      ``occupation_remaining`` transitions from 1 to 0 on this turn, the
+      armor-doff callback fires once.
+
+    - PICK_LOCK_DOOR / PICK_LOCK_BOX (kinds 2-3): per-turn polling
+      (vendor lock.c::picklock lines 68-159).  Each turn rolls
+      rn2(100) >= chance; success or timeout (usedtime >= 50, equivalent
+      to remaining <= 1) clears the occupation.
+
+    After firing / finishing, ``occupation_kind`` resets to NONE.
 
     Cite: vendor/nethack/src/cmd.c — afternmv invocation when gm.multi
-          reaches 0.
+          reaches 0; vendor/nethack/src/lock.c:68-159 — picklock poll.
     """
     rem = state.occupation_remaining.astype(jnp.int32)
     kind = state.occupation_kind.astype(jnp.int32)
     active = kind > jnp.int32(0)
-    new_rem = jnp.where(active, jnp.maximum(rem - jnp.int32(1), jnp.int32(0)), rem)
-    firing = active & (rem == jnp.int32(1))
+
+    # --- Pick-lock per-turn poll (kinds 2 & 3) ---
+    # Lazy import to avoid module-load cycles.
+    from Nethax.nethax.subsystems.lock import tick_pick_lock as _tick_pick_lock
+
+    is_pick_lock = (kind == jnp.int32(int(OccupationKind.PICK_LOCK_DOOR))) | \
+                   (kind == jnp.int32(int(OccupationKind.PICK_LOCK_BOX)))
+
+    rng_pick, new_master_rng = jax.random.split(state.rng)
+
+    # Run the per-turn poll (always — tick_pick_lock is a no-op when the
+    # kind isn't a pick-lock); pytree-merge to keep the unaffected
+    # branches intact.
+    state_picked, pick_finished = _tick_pick_lock(state, rng_pick)
+    state_picked = jax.tree_util.tree_map(
+        lambda picked, base: jnp.where(is_pick_lock, picked, base),
+        state_picked, state,
+    )
+    # When pick-lock ran, advance the master rng (so the same key isn't
+    # consumed again next tick).  Other branches leave rng untouched.
+    state_picked = state_picked.replace(
+        rng=jax.tree_util.tree_map(
+            lambda new, old: jnp.where(is_pick_lock, new, old),
+            new_master_rng, state.rng,
+        )
+    )
+
+    # --- STEAL_ARM-style countdown (kind 1) ---
+    countdown_active = active & ~is_pick_lock
+    new_rem = jnp.where(
+        countdown_active | is_pick_lock,
+        jnp.maximum(rem - jnp.int32(1), jnp.int32(0)),
+        rem,
+    )
+    firing = countdown_active & (rem == jnp.int32(1))
 
     def _fire(s):
-        return jax.lax.switch(s.occupation_kind.astype(jnp.int32), _OCCUPATION_CALLBACKS, s)
+        return jax.lax.switch(
+            s.occupation_kind.astype(jnp.int32), _OCCUPATION_CALLBACKS, s,
+        )
 
-    state_post = jax.lax.cond(firing, _fire, lambda s: s, state)
-    new_kind = jnp.where(firing, jnp.int8(0), state_post.occupation_kind)
+    state_post = jax.lax.cond(firing, _fire, lambda s: s, state_picked)
+
+    # Clear occupation when:
+    #  - countdown callback fired (firing), OR
+    #  - pick-lock finished this turn (pick_finished).
+    cleared = firing | (is_pick_lock & pick_finished)
+    new_kind = jnp.where(cleared, jnp.int8(0), state_post.occupation_kind)
     return state_post.replace(
         occupation_kind=new_kind,
         occupation_remaining=new_rem.astype(jnp.int8),

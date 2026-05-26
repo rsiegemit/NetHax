@@ -249,6 +249,54 @@ def fire_container_trap(state, container_idx: int):
 
 
 # ---------------------------------------------------------------------------
+# Unlock (direct-unlock primitive used by lock._tick_box).
+# ---------------------------------------------------------------------------
+
+def unlock_container(state, container_idx):
+    """Clear ``is_locked`` on a container; fire ``chest_trap`` if trapped.
+
+    Public callers should start a multi-turn picklock attempt via
+    ``Nethax.nethax.subsystems.lock.start_pick_lock_box`` (vendor
+    lock.c:536-538 + 650).  The occupation tick (vendor lock.c:68-159)
+    rolls each turn and calls this primitive on success.
+
+    On unlock, vendor lock.c:154-155 fires ``chest_trap`` if the box is
+    otrapped.  We re-use ``fire_container_trap`` (defined above) for
+    that effect (1d10 hp damage + trap-state clear).
+
+    Parameters
+    ----------
+    state         : EnvState
+    container_idx : int  — index into state.containers (0..N_CONTAINERS-1)
+
+    Returns
+    -------
+    (new_state, did_unlock: bool)
+    """
+    cs = state.containers
+    c_idx = jnp.int32(container_idx)
+    safe_idx = jnp.clip(c_idx, 0, cs.is_locked.shape[0] - 1)
+    in_range = (c_idx >= 0) & (c_idx < jnp.int32(cs.is_locked.shape[0]))
+
+    was_locked = cs.is_locked[safe_idx] & in_range
+    new_is_locked = cs.is_locked.at[safe_idx].set(
+        jnp.where(was_locked, jnp.bool_(False), cs.is_locked[safe_idx])
+    )
+    new_cs = cs.replace(is_locked=new_is_locked)
+    state = state.replace(containers=new_cs)
+
+    # vendor lock.c:154-155 — if otrapped, fire chest_trap.
+    is_trapped = new_cs.is_trapped[safe_idx]
+
+    def _fire(s):
+        s2, _ = fire_container_trap(s, container_idx)
+        return s2
+
+    state = jax.lax.cond(was_locked & is_trapped, _fire, lambda s: s, state)
+    return state, was_locked
+
+
+# ---------------------------------------------------------------------------
 # Open / Close
 # ---------------------------------------------------------------------------
 

@@ -425,13 +425,20 @@ def unlock_door(
     pos: jnp.ndarray,
     key_slot: jnp.ndarray,
 ) -> tuple[FeaturesState, jnp.ndarray]:
-    """Unlock the door at *pos* using the item in *key_slot* (lock.c).
+    """Direct-unlock primitive used by the picklock occupation tick.
 
     pos      : int array [3] = (level, row, col)
-    key_slot : int — inventory slot index (not validated in Wave 3)
+    key_slot : int — inventory slot index (kept for legacy callers; the
+               new occupation-driven pipeline records the tool at
+               ``start_pick_lock_door`` time)
 
-    LOCKED → CLOSED.
-    Wave 3: always succeeds (d20 vs lock difficulty deferred to Wave 4).
+    LOCKED → CLOSED.  Always succeeds when called directly.
+
+    Public callers should instead start a multi-turn pick-lock attempt
+    via ``Nethax.nethax.subsystems.lock.start_pick_lock_door`` (vendor
+    lock.c:650-654 ``set_occupation(picklock, ...)``).  The occupation
+    tick (vendor lock.c:68-159) rolls ``rn2(100) >= chance`` each turn
+    and invokes this function exactly once on the turn the lock pops.
 
     Returns (new_state, success: bool).
     """
