@@ -43,6 +43,8 @@ from Nethax.nethax.constants import TileType
 from Nethax.nethax.subsystems.character import create_character, get_starting_pet
 from Nethax.nethax.subsystems.skills import init_skills
 from Nethax.nethax.subsystems.digging import dig_tick as _dig_tick
+from Nethax.nethax.subsystems.riding import tick_gallop as _tick_gallop
+from Nethax.nethax.subsystems.riding import tick_saddle as _tick_saddle
 from Nethax.nethax.subsystems.swallow import digest_tick as _digest_tick
 from Nethax.nethax.subsystems.experience import newexplevel as _newexplevel
 from Nethax.nethax.subsystems.regions import run_regions as _run_regions
@@ -386,6 +388,14 @@ def _step_impl(state, action, rng):
             player_pw=new_pw,
             done=new_done,
         )
+
+        # 4a-riding.  Per-turn riding ticks: decrement u.ugallop (gallop
+        # counter) and apply 1/100-chance saddle wear.  Both gated internally
+        # on player_steed_mid != 0.
+        # Cite: vendor/nethack/src/timeout.c lines 664-667 (ugallop--);
+        #       vendor/nethack/src/steed.c saddle wear (implicit).
+        ns = _tick_gallop(ns)
+        ns = _tick_saddle(ns)
 
         # 4a0. Luck drift toward baseluck=0 every 300/600 moves (300 if the
         #    hero is carrying the Amulet of Yendor or god_anger>0, else 600).

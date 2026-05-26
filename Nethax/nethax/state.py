@@ -207,6 +207,11 @@ class EnvState:
     player_steed_mid: jax.Array    # uint32 u.usteed_mid (you.h line 494); 0 = not riding
     player_extra_speed: jax.Array  # int8  extra move speed while riding steed (steed.c:447 ugallop)
     saddle_condition: jax.Array    # int8  0=broken, 100=new; degrades 1/100 turns riding (steed.c)
+    # u.ugallop accumulator — set by kick_steed (steed.c:448 ugallop += rn1(20,30))
+    # decrements 1/turn (timeout.c:664-666); pet gallops while > 0.  Cleared on
+    # dismount (steed.c:659).  int32 to mirror vendor long.
+    # Cite: vendor/nethack/src/steed.c lines 401-449 + timeout.c lines 664-667.
+    gallop_counter:   jax.Array    # int32  u.ugallop
     player_killer_mid: jax.Array   # uint32 last-attacker monster id (you.h: svk.killer)
     player_mortality: jax.Array  # int32  u.umortality (you.h line 497); deaths so far
     player_uhitinc:   jax.Array  # int8   u.uhitinc (you.h); ring of increase accuracy
@@ -388,6 +393,7 @@ class EnvState:
             player_steed_mid=jnp.uint32(0),
             player_extra_speed=jnp.int8(0),
             saddle_condition=jnp.int8(100),
+            gallop_counter=jnp.int32(0),
             player_killer_mid=jnp.uint32(0),
             player_mortality=jnp.int32(0),
             # per-stat attribute maxima (vendor u.urace.attrmax[]; init_attr race cap)

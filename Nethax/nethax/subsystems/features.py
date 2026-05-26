@@ -1287,8 +1287,16 @@ def handle_kick(state, rng: jax.Array):
     Returns new EnvState.
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS
+    from Nethax.nethax.subsystems.riding import kick_steed as _riding_kick_steed
 
     is_wounded = state.status.timed_statuses[int(_TS.WOUNDED_LEGS)] > jnp.int32(0)
+    is_riding = state.player_steed_mid != jnp.uint32(0)
+
+    # Vendor dokick.c::dokick lines 1271-1278: if riding, kick goes to the steed
+    # (kick_steed → ugallop bump or DISMOUNT_THROWN).  Auto-confirm 'y'.
+    # Cite: vendor/nethack/src/dokick.c lines 1271-1278.
+    def _do_kick_steed(s):
+        return _riding_kick_steed(s, rng)
 
     def _do_kick(s):
         flat_lv = _flat_lv_from_state(s)
@@ -1397,7 +1405,14 @@ def handle_kick(state, rng: jax.Array):
 
         return jax.lax.cond(any_monster, _kick_monster, _kick_door, s)
 
-    return jax.lax.cond(is_wounded, lambda s: s, _do_kick, state)
+    # Vendor priority (dokick.c:1271-1278): if riding, kick the steed; else
+    # the wounded-legs check (1279-1281) blocks ordinary kicks.
+    return jax.lax.cond(
+        is_riding,
+        _do_kick_steed,
+        lambda s: jax.lax.cond(is_wounded, lambda x: x, _do_kick, s),
+        state,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,8 @@ try_dismount(state, rng) -> EnvState
 fall_off_steed(state, rng, force) -> EnvState
 check_combat_dismount(state, damage_taken) -> EnvState
 tick_saddle(state) -> EnvState
+kick_steed(state, rng) -> EnvState
+tick_gallop(state) -> EnvState
 
 JIT-pure: no Python control-flow on traced JAX values.
 """
@@ -166,6 +168,128 @@ def _find_adjacent_tame_saddled_rideable(state) -> jnp.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# _landing_spot — vendor steed.c::landing_spot lines 459-571
+#
+# Pick a dismount tile adjacent to the player using up to three passes:
+#   pass 0 (voluntary, not impaired): avoids known traps AND boulders.
+#   pass 1 (impaired / knocked):       avoids boulders, allows traps.
+#   pass 2 (last resort):              allows both.
+# Fallback: enexto-style scan (any walkable tile) when nothing in passes 0-2
+# was viable.
+# Cite: vendor/nethack/src/steed.c lines 459-571.
+# ---------------------------------------------------------------------------
+
+# Directional offsets for the 8 adjacent tiles (matches vendor's xytodir order
+# for the scan; concrete order isn't load-bearing here because we union all
+# candidates and rank by Chebyshev distance == 1).
+_LANDING_DELTAS = jnp.array(
+    [[-1, -1], [-1, 0], [-1, 1],
+     [ 0, -1],          [ 0, 1],
+     [ 1, -1], [ 1, 0], [ 1, 1]],
+    dtype=jnp.int32,
+)
+
+# vendor TileType ids referenced (must match constants/terrain.TileType).
+_TILE_VOID_LANDING:  int = 0
+_TILE_WALL_LANDING:  int = 1
+# Trap kinds that landing_spot pass-0 always avoids: every nonzero TrapType
+# is treated as "known" once revealed.  We collapse: trap_revealed && trap_type != 0.
+# Boulders are detected via ground_items.type_id == 447 (BOULDER_TYPE_ID).
+_BOULDER_TYPE_ID_LANDING: int = 447
+
+
+def _landing_spot(state, rng: jax.Array):
+    """Find a safe landing tile adjacent to the player after dismount.
+
+    Returns ``(row, col, found)`` as int32 scalars (row/col) + bool.
+    Mirrors vendor steed.c::landing_spot — three-pass search:
+        pass 0: avoid known traps AND boulders     (voluntary, not impaired)
+        pass 1: avoid boulders, allow traps        (impaired / knocked)
+        pass 2: allow everything                   (last resort)
+    Fallback (enexto): pick any reachable tile on the 8-adjacency.
+
+    Cite: vendor/nethack/src/steed.c::landing_spot lines 459-571.
+    """
+    H, W = state.terrain.shape[2], state.terrain.shape[3]
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    max_lv = jnp.int32(state.terrain.shape[1])
+    flat_lv = b * max_lv + lv
+
+    p = state.player_pos.astype(jnp.int32)
+
+    # Build candidate (row, col) for each of the 8 neighbours.
+    cand_r = p[0] + _LANDING_DELTAS[:, 0]               # [8]
+    cand_c = p[1] + _LANDING_DELTAS[:, 1]               # [8]
+    safe_r = jnp.clip(cand_r, 0, H - 1)
+    safe_c = jnp.clip(cand_c, 0, W - 1)
+
+    in_bounds = (
+        (cand_r >= 0) & (cand_r < H) & (cand_c >= 0) & (cand_c < W)
+    )
+
+    tile = state.terrain[b, lv, safe_r, safe_c]
+    walkable = (tile != jnp.int8(_TILE_VOID_LANDING)) & (
+        tile != jnp.int8(_TILE_WALL_LANDING)
+    )
+
+    # Monster occupancy — any alive monster on the candidate tile.
+    mai = state.monster_ai
+    m_pos = mai.pos.astype(jnp.int32)                   # [N, 2]
+    # broadcast: cand[8,2] vs m[N,2] -> [N, 8]
+    same_r = (m_pos[:, 0:1] == cand_r[None, :])
+    same_c = (m_pos[:, 1:2] == cand_c[None, :])
+    occupied_by_mon = jnp.any(
+        (mai.alive[:, None]) & same_r & same_c, axis=0,
+    )                                                   # [8] bool
+
+    # Boulder presence — ground_items.type_id == 447 in slot 0.
+    g_tid = state.ground_items.type_id[b, lv, safe_r, safe_c, 0].astype(jnp.int32)
+    has_boulder = g_tid == jnp.int32(_BOULDER_TYPE_ID_LANDING)
+
+    # Trap presence — revealed trap of any nonzero type.
+    trap_kind = state.traps.trap_type[flat_lv, safe_r, safe_c].astype(jnp.int32)
+    trap_seen = state.traps.revealed[flat_lv, safe_r, safe_c]
+    has_known_trap = (trap_kind != jnp.int32(0)) & trap_seen
+
+    base_ok = in_bounds & walkable & (~occupied_by_mon)
+    pass0_ok = base_ok & (~has_boulder) & (~has_known_trap)
+    pass1_ok = base_ok & (~has_boulder)
+    pass2_ok = base_ok
+
+    # Pick the lowest-index viable tile per pass (deterministic).
+    n_cand = _LANDING_DELTAS.shape[0]
+    indices = jnp.arange(n_cand, dtype=jnp.int32)
+    SENT = jnp.int32(n_cand)
+
+    def _pick(mask):
+        masked = jnp.where(mask, indices, SENT)
+        return masked.min()
+
+    pick0 = _pick(pass0_ok)
+    pick1 = _pick(pass1_ok)
+    pick2 = _pick(pass2_ok)
+
+    # Voluntary preference: pass0; else pass1; else pass2.  Without impair-state
+    # plumbing we always start at pass 0 (cite vendor pass selection 521-525
+    # — DISMOUNT_BYCHOICE not impaired).
+    chosen = jnp.where(pick0 < SENT, pick0,
+                       jnp.where(pick1 < SENT, pick1,
+                                 pick2))
+    found = chosen < SENT
+
+    safe_chosen = jnp.clip(chosen, 0, n_cand - 1)
+    out_r = (p[0] + _LANDING_DELTAS[safe_chosen, 0])
+    out_c = (p[1] + _LANDING_DELTAS[safe_chosen, 1])
+
+    # On failure, default to player's own tile (no displacement).
+    out_r = jnp.where(found, out_r, p[0])
+    out_c = jnp.where(found, out_c, p[1])
+
+    return out_r.astype(jnp.int32), out_c.astype(jnp.int32), found
+
+
+# ---------------------------------------------------------------------------
 # fall_off_steed
 # ---------------------------------------------------------------------------
 
@@ -177,8 +301,12 @@ def fall_off_steed(state, rng: jax.Array, force: bool = False):
     set_wounded_legs(BOTH_SIDES, HWounded_legs + rn1(5,5)).
     We use 1d6 as the minimal damage model.  WOUNDED_LEGS wires through
     StatusState.timed_statuses[TimedStatus.WOUNDED_LEGS] (status_effects.py).
+
+    Also displaces the player to the ``landing_spot`` neighbour (vendor
+    steed.c:586/610 — DISMOUNT_FELL invokes landing_spot with forceit=1).
     """
-    dmg = jax.random.randint(rng, (), minval=1, maxval=7, dtype=jnp.int32)
+    rng_dmg, rng_land = jax.random.split(rng)
+    dmg = jax.random.randint(rng_dmg, (), minval=1, maxval=7, dtype=jnp.int32)
     new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(0))
 
     # WOUNDED_LEGS += 10 (capped at int32 max).
@@ -187,11 +315,21 @@ def fall_off_steed(state, rng: jax.Array, force: bool = False):
     new_wl = old_wl + jnp.int32(10)
     new_ts = state.status.timed_statuses.at[wl_idx].set(new_wl)
 
+    # Landing-spot displacement.  Vendor steed.c:586 — landing_spot is called
+    # with reason=DISMOUNT_FELL / DISMOUNT_KNOCKED and forceit=1.
+    # Cite: vendor/nethack/src/steed.c::dismount_steed lines 606-617.
+    land_r, land_c, land_found = _landing_spot(state, rng_land)
+    new_row = jnp.where(land_found, land_r, state.player_pos[0].astype(jnp.int32))
+    new_col = jnp.where(land_found, land_c, state.player_pos[1].astype(jnp.int32))
+    new_pos = jnp.stack([new_row.astype(jnp.int16), new_col.astype(jnp.int16)])
+
     return state.replace(
         player_hp=new_hp,
         player_steed_mid=jnp.uint32(0),
         player_extra_speed=jnp.int8(0),
+        gallop_counter=jnp.int32(0),
         status=state.status.replace(timed_statuses=new_ts),
+        player_pos=new_pos,
     )
 
 
@@ -352,16 +490,33 @@ def try_mount(state, rng: jax.Array):
 def try_dismount(state, rng: jax.Array):
     """Dismount the current steed.
 
-    No-op if not riding.  On dismount, clears player_steed_mid and
-    player_extra_speed.
+    No-op if not riding.  On dismount, clears player_steed_mid,
+    player_extra_speed, and gallop_counter; displaces the player to a safe
+    adjacent tile via ``_landing_spot``.
 
     Vendor reference: steed.c:658 (u.usteed = NULL after releasing steed) and
-    steed.c::dismount_steed DISMOUNT_BYCHOICE branch (~line 632).
+    steed.c::dismount_steed DISMOUNT_BYCHOICE branch (~line 632).  Pass-0
+    landing_spot is invoked at steed.c:586 with forceit=0 (vendor
+    DISMOUNT_BYCHOICE path).
+    Cite: vendor/nethack/src/steed.c lines 575-660.
     """
     riding = state.player_steed_mid != jnp.uint32(0)
     new_mid = jnp.where(riding, jnp.uint32(0), state.player_steed_mid)
     new_extra_speed = jnp.where(riding, jnp.int8(0), state.player_extra_speed)
-    return state.replace(player_steed_mid=new_mid, player_extra_speed=new_extra_speed)
+    new_gallop = jnp.where(riding, jnp.int32(0), state.gallop_counter)
+
+    land_r, land_c, land_found = _landing_spot(state, rng)
+    do_move = riding & land_found
+    new_row = jnp.where(do_move, land_r, state.player_pos[0].astype(jnp.int32))
+    new_col = jnp.where(do_move, land_c, state.player_pos[1].astype(jnp.int32))
+    new_pos = jnp.stack([new_row.astype(jnp.int16), new_col.astype(jnp.int16)])
+
+    return state.replace(
+        player_steed_mid=new_mid,
+        player_extra_speed=new_extra_speed,
+        gallop_counter=new_gallop,
+        player_pos=new_pos,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -437,9 +592,115 @@ def tick_saddle(state):
     broken = (new_condition == jnp.int8(0)) & riding
     new_mid = jnp.where(broken, jnp.uint32(0), state.player_steed_mid)
     new_extra_speed = jnp.where(broken, jnp.int8(0), state.player_extra_speed)
+    new_gallop = jnp.where(broken, jnp.int32(0), state.gallop_counter)
 
     return state.replace(
         saddle_condition=new_condition,
         player_steed_mid=new_mid,
         player_extra_speed=new_extra_speed,
+        gallop_counter=new_gallop,
     )
+
+
+# ---------------------------------------------------------------------------
+# kick_steed — vendor steed.c::kick_steed lines 401-449
+# ---------------------------------------------------------------------------
+
+def kick_steed(state, rng: jax.Array):
+    """Kick the steed: decrements ``mtame``, may throw rider (untame), and
+    on success bumps ``u.ugallop`` by ``rn1(20, 30)`` so the steed gallops
+    for the next 30..49 turns.
+
+    Vendor flow (steed.c:401-449):
+        1. helpless(u.usteed): try to rouse with prob 1/2; do not gallop.
+        2. mtame-- ; if mtame==0  →  dismount_steed(DISMOUNT_THROWN).
+           Also fails the gallop check when u.ulevel + mtame < rnd(MAXULEV/2+5).
+        3. Otherwise:  u.ugallop += rn1(20, 30);  // (30..49)
+
+    Helpless / asleep handling is simplified (no rouse roll), focusing on
+    the gallop accumulator and the mtame--/thrown branches.
+    Cite: vendor/nethack/src/steed.c lines 401-449.
+    """
+    rng_thr, rng_g = jax.random.split(rng)
+    riding = state.player_steed_mid != jnp.uint32(0)
+
+    # Slot index = player_steed_mid - 1 (0 == not riding).
+    raw_slot = state.player_steed_mid.astype(jnp.int32) - jnp.int32(1)
+    safe_slot = jnp.clip(raw_slot, 0, state.monster_ai.alive.shape[0] - 1)
+
+    mai = state.monster_ai
+    cur_mtame = mai.mtame[safe_slot].astype(jnp.int32)
+    new_mtame_val = jnp.maximum(cur_mtame - jnp.int32(1), jnp.int32(0))
+    bumped_mtame = jnp.where(riding, new_mtame_val.astype(jnp.int8), mai.mtame[safe_slot])
+
+    # Vendor gallop-resist gate: ulevel + mtame < rnd(MAXULEV/2 + 5)
+    # MAXULEV = 30; we approximate with rn1(20, 1) since u.ulevel is small early.
+    # Simplification: threshold = rn1(20, 1) = [1..20].
+    threshold = jax.random.randint(rng_thr, (), minval=1, maxval=21, dtype=jnp.int32)
+    ulev = state.player_xl.astype(jnp.int32)
+    resist = (new_mtame_val == jnp.int32(0)) | ((ulev + new_mtame_val) < threshold)
+    thrown = riding & resist
+
+    # Gallop bump (only on non-thrown success): rn1(20, 30) = 30..49.
+    gallop_inc = jax.random.randint(rng_g, (), minval=30, maxval=50, dtype=jnp.int32)
+    do_gallop = riding & (~resist)
+    new_gallop = jnp.where(
+        do_gallop,
+        state.gallop_counter + gallop_inc,
+        state.gallop_counter,
+    )
+
+    # Update mtame on the slot.
+    new_mtame_arr = mai.mtame.at[safe_slot].set(bumped_mtame)
+    state_kick = state.replace(
+        monster_ai=mai.replace(mtame=new_mtame_arr),
+        gallop_counter=new_gallop,
+    )
+
+    # On thrown: invoke fall_off_steed (clears steed + applies fall).
+    state_thrown = fall_off_steed(state_kick, rng_g)
+
+    # Merge fields conditional on thrown.
+    final_hp = jnp.where(thrown, state_thrown.player_hp, state_kick.player_hp)
+    final_mid = jnp.where(thrown, state_thrown.player_steed_mid, state_kick.player_steed_mid)
+    final_speed = jnp.where(
+        thrown, state_thrown.player_extra_speed, state_kick.player_extra_speed,
+    )
+    final_gallop = jnp.where(thrown, state_thrown.gallop_counter, state_kick.gallop_counter)
+    wl_idx = int(TimedStatus.WOUNDED_LEGS)
+    final_wl = jnp.where(
+        thrown,
+        state_thrown.status.timed_statuses[wl_idx],
+        state_kick.status.timed_statuses[wl_idx],
+    )
+    new_ts = state_kick.status.timed_statuses.at[wl_idx].set(final_wl)
+    final_pos = jnp.where(thrown, state_thrown.player_pos, state_kick.player_pos)
+
+    return state_kick.replace(
+        player_hp=final_hp,
+        player_steed_mid=final_mid,
+        player_extra_speed=final_speed,
+        gallop_counter=final_gallop,
+        status=state_kick.status.replace(timed_statuses=new_ts),
+        player_pos=final_pos,
+    )
+
+
+# ---------------------------------------------------------------------------
+# tick_gallop — vendor timeout.c::nh_timeout lines 664-667
+# ---------------------------------------------------------------------------
+
+def tick_gallop(state):
+    """Decrement ``gallop_counter`` by 1 per turn while > 0.
+
+    Vendor timeout.c:664-666:
+        if (u.ugallop) {
+            if (--u.ugallop == 0L && u.usteed)
+                pline("%s stops galloping.", Monnam(u.usteed));
+        }
+    The pline is omitted in the JAX port; only the counter is decremented.
+    Cite: vendor/nethack/src/timeout.c lines 664-667.
+    """
+    cur = state.gallop_counter.astype(jnp.int32)
+    new = jnp.where(cur > jnp.int32(0), cur - jnp.int32(1), cur)
+    return state.replace(gallop_counter=new.astype(jnp.int32))
