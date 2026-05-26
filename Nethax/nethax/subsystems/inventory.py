@@ -447,6 +447,11 @@ class InventoryState:
     worn_armor_welded: jnp.ndarray  # [N_ARMOR_SLOTS] bool
     worn_amulet_welded: jnp.ndarray  # scalar bool
     worn_rings_welded: jnp.ndarray   # [2] bool
+    letters: jnp.ndarray            # int8[MAX_INVENTORY_SLOTS] — ASCII letter
+                                    # per slot, 0=empty.  Vendor
+                                    # invent.c::assigninvlet allocates a..z
+                                    # first then A..Z; the letter sticks with
+                                    # the item record while it's in inventory.
 
     @classmethod
     def empty(cls) -> "InventoryState":
@@ -469,6 +474,7 @@ class InventoryState:
             worn_armor_welded=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.bool_),
             worn_amulet_welded=jnp.bool_(False),
             worn_rings_welded=jnp.zeros((2,), dtype=jnp.bool_),
+            letters=jnp.zeros(MAX_INVENTORY_SLOTS, dtype=jnp.int8),
         )
 
     @classmethod
@@ -476,7 +482,29 @@ class InventoryState:
         """Build an InventoryState pre-populated with a list of Items.
 
         Pads with empty items to MAX_INVENTORY_SLOTS.
+
+        Per vendor invent.c::assigninvlet, each item entering inventory
+        receives a persistent letter — lowercase a..z first, then A..Z.
+        We assign letters positionally to the first N occupied slots,
+        matching the canonical NetHack startup where slot 0 -> 'a',
+        slot 1 -> 'b', etc.
         """
+        # Build letters[] positionally: occupied slots 0..N-1 get a..z then A..Z.
+        letters_list = []
+        for i, item in enumerate(item_list):
+            if i >= MAX_INVENTORY_SLOTS:
+                break
+            # Empty items (category 0) get letter 0.
+            if int(item.category) == 0:
+                letters_list.append(0)
+            elif i < 26:
+                letters_list.append(ord('a') + i)
+            else:
+                letters_list.append(ord('A') + (i - 26))
+        # Pad to MAX_INVENTORY_SLOTS with 0 (empty letter).
+        letters_list += [0] * (MAX_INVENTORY_SLOTS - len(letters_list))
+        letters_arr = jnp.array(letters_list, dtype=jnp.int8)
+
         return cls(
             items=_items_from_list(item_list),
             wielded=jnp.int8(-1),
@@ -495,6 +523,7 @@ class InventoryState:
             worn_armor_welded=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.bool_),
             worn_amulet_welded=jnp.bool_(False),
             worn_rings_welded=jnp.zeros((2,), dtype=jnp.bool_),
+            letters=letters_arr,
         )
 
 
@@ -816,6 +845,55 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
         ),
     )
 
+    # Letter assignment per vendor invent.c::assigninvlet (lines 693-732).
+    # Mark all letters currently in use across the (existing) inventory,
+    # then pick the lowest unused letter (a..z, then A..Z).  Merge writes
+    # don't claim a new letter — the destination slot's letter is preserved.
+    inuse_lower = jnp.zeros((26,), dtype=jnp.bool_)
+    inuse_upper = jnp.zeros((26,), dtype=jnp.bool_)
+    cur_letters = state.inventory.letters.astype(jnp.int32)
+    def _mark_letters(carry, idx):
+        il, iu = carry
+        ch = cur_letters[idx]
+        is_lower = (ch >= jnp.int32(ord('a'))) & (ch <= jnp.int32(ord('z')))
+        is_upper = (ch >= jnp.int32(ord('A'))) & (ch <= jnp.int32(ord('Z')))
+        l_idx = jnp.clip(ch - jnp.int32(ord('a')), 0, 25)
+        u_idx = jnp.clip(ch - jnp.int32(ord('A')), 0, 25)
+        il = jnp.where(is_lower, il.at[l_idx].set(True), il)
+        iu = jnp.where(is_upper, iu.at[u_idx].set(True), iu)
+        return (il, iu), None
+    (inuse_lower, inuse_upper), _ = lax.scan(
+        _mark_letters,
+        (inuse_lower, inuse_upper),
+        jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32),
+    )
+    # First unused lowercase, else first unused uppercase.
+    def _first_free(carry, idx):
+        found, slot = carry
+        free_l = ~inuse_lower[idx]
+        slot = jnp.where(~found & free_l, jnp.int32(ord('a')) + idx, slot)
+        found = found | free_l
+        return (found, slot), None
+    (low_found, low_letter), _ = lax.scan(
+        _first_free, (jnp.bool_(False), jnp.int32(0)),
+        jnp.arange(26, dtype=jnp.int32),
+    )
+    def _first_free_upper(carry, idx):
+        found, slot = carry
+        free_u = ~inuse_upper[idx]
+        slot = jnp.where(~found & free_u, jnp.int32(ord('A')) + idx, slot)
+        found = found | free_u
+        return (found, slot), None
+    (up_found, up_letter), _ = lax.scan(
+        _first_free_upper, (jnp.bool_(False), jnp.int32(0)),
+        jnp.arange(26, dtype=jnp.int32),
+    )
+    chosen_letter = jnp.where(low_found, low_letter, up_letter).astype(jnp.int8)
+    # Only stamp the letter on fresh writes; merge keeps the existing letter.
+    new_letters = state.inventory.letters.at[safe_slot].set(
+        jnp.where(fresh_write, chosen_letter, state.inventory.letters[safe_slot])
+    )
+
     # Clear ground tile (set category to 0)
     new_ground_items = ground_items.replace(
         category=ground_items.category.at[branch, level, row, col, 0].set(
@@ -826,6 +904,7 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
     new_inv = state.inventory.replace(
         items=new_items,
         total_weight=total_weight(new_items),
+        letters=new_letters,
     )
     # Vendor pickup.c::pickup — gold goes to u.umoney0 (state.player_gold).
     new_gold = state.player_gold + gold_qty
@@ -1056,9 +1135,18 @@ def drop(state, rng, ground_items: Item, branch: int, level: int, slot_idx: int)
         ),
     )
 
+    # Clear the letter for the now-empty slot (vendor invent.c::freeinv
+    # nulls the obj's invlet implicitly as the obj detaches from gi.invent).
+    # The next pickup of any item will receive the lowest free letter, so
+    # the cleared letter naturally becomes available again.
+    new_letters = state_altared.inventory.letters.at[slot_idx].set(
+        jnp.where(can_drop, jnp.int8(0), state_altared.inventory.letters[slot_idx])
+    )
+
     new_inv = state_altared.inventory.replace(
         items=new_items,
         total_weight=total_weight(new_items),
+        letters=new_letters,
     )
     new_state = state_altared.replace(inventory=new_inv)
     return new_state, new_ground

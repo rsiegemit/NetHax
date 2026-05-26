@@ -964,12 +964,20 @@ def build_inv_letters(env_state) -> jnp.ndarray:
       Occupied slots  : obj->invlet  (i.e. 'a'..'z', 'A'..'Z')
       Empty slots     : 0
 
+    Source-of-truth: ``InventoryState.letters`` — populated at character
+    creation (subsystems/inventory.py::InventoryState.from_items) and on
+    pickup (subsystems/inventory.py::pickup) per vendor
+    invent.c::assigninvlet (lines 693-732).  Letters stick with the item
+    through wield/wear and are freed on drop.
+
     Returns:
         uint8[55]
     """
     cat = env_state.inventory.items.category
     occupied = (cat != 0)
-    letters_52 = jnp.where(occupied, _INV_LETTERS[:52], jnp.uint8(0))
+    # InventoryState.letters is int8 (signed); cast to uint8 for the obs.
+    letters_raw = env_state.inventory.letters.astype(jnp.uint8)
+    letters_52 = jnp.where(occupied, letters_raw, jnp.uint8(0))
     inv = jnp.zeros((55,), dtype=jnp.uint8)
     inv = inv.at[:52].set(letters_52)
     return inv
