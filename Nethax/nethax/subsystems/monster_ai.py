@@ -3897,6 +3897,40 @@ def clone_mon(state, mon_idx: jnp.ndarray, rng: jax.Array) -> object:
         # Halve parent HP too (vendor splits HP between original and clone).
         new_hp_parent = new_hp.at[idx].set(half_hp)
 
+        # Wizard-of-Yendor deception: if cloning the Wizard and the player
+        # doesn't already carry the real Amulet, give the clone a
+        # FAKE_AMULET_OF_YENDOR (objects.py type_id 187) at 1/2 chance.
+        # Vendor: wizard.c::clonewiz lines 524-526 —
+        #   if (!u.uhave.amulet && rn2(2))
+        #       mksobj_at(FAKE_AMULET_OF_YENDOR, ...);
+        # Vendor places the fake amulet on the floor at the clone's tile;
+        # the simpler subset here puts it in the clone's inv slot 0 so
+        # tests can detect it without the floor-item plumbing.
+        _PM_WIZARD_OF_YENDOR_AT = jnp.int32(281)
+        _FAKE_AMULET_TID = jnp.int16(187)
+        _CAT_AMULET = jnp.int8(5)
+        from Nethax.nethax.subsystems.magic import _AMULET_OF_YENDOR_TYPE_ID
+        is_wizard_clone = m.entry_idx[idx].astype(jnp.int32) == _PM_WIZARD_OF_YENDOR_AT
+        # Check player inventory for the real Amulet (type_id 188).
+        inv_cat = s.inventory.items.category
+        inv_tid = s.inventory.items.type_id
+        player_has_amulet = jnp.any(
+            (inv_cat != jnp.int8(0))
+            & (inv_tid == jnp.int16(_AMULET_OF_YENDOR_TYPE_ID))
+        )
+        rng_amulet = jax.random.fold_in(rng, jnp.int32(0xFA))
+        fake_roll = jax.random.randint(rng_amulet, (), 0, 2, dtype=jnp.int32) == jnp.int32(0)
+        give_fake = is_wizard_clone & ~player_has_amulet & fake_roll
+        new_inv_cat = m.inv_category.at[dead_idx, 0].set(
+            jnp.where(give_fake, _CAT_AMULET, m.inv_category[dead_idx, 0])
+        )
+        new_inv_tid_arr = m.inv_type_id.at[dead_idx, 0].set(
+            jnp.where(give_fake, _FAKE_AMULET_TID, m.inv_type_id[dead_idx, 0])
+        )
+        new_inv_qty = m.inv_quantity.at[dead_idx, 0].set(
+            jnp.where(give_fake, jnp.int16(1), m.inv_quantity[dead_idx, 0])
+        )
+
         new_m = m.replace(
             alive=new_alive,
             pos=new_pos_arr,
@@ -3917,6 +3951,9 @@ def clone_mon(state, mon_idx: jnp.ndarray, rng: jax.Array) -> object:
             mstrategy=new_mstrat,
             mcloned=new_mcloned,
             m_lev=new_m_lev,
+            inv_category=new_inv_cat,
+            inv_type_id=new_inv_tid_arr,
+            inv_quantity=new_inv_qty,
         )
         return s.replace(monster_ai=new_m)
 
