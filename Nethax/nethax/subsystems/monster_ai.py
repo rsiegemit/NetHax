@@ -668,6 +668,16 @@ class MonsterAIState:
     #       vendor/nethack/src/wizard.c::clonewiz lines 528-531.
     apparent_entry: jnp.ndarray    # [MAX_MONSTERS_PER_LEVEL]  int16
 
+    # ``death_cause`` mirrors vendor's per-kill ``how`` argument passed to
+    # ``e_died`` (dbridge.c::e_died lines 401-480 — DROWNING / BURNING /
+    # CRUSHING) and the matching xkill flag-set elsewhere.  Default 0
+    # (DeathCause.DIED) for live slots; consumers set this when the slot
+    # transitions to dead so that downstream scoring / log writers can
+    # distinguish drown / burn / crush / generic.
+    # Cite: vendor/nethack/include/hack.h::game_end_types;
+    #       vendor/nethack/src/dbridge.c::e_died lines 401-480.
+    death_cause: jnp.ndarray       # [MAX_MONSTERS_PER_LEVEL]  int8 (DeathCause)
+
 
 def make_monster_ai_state() -> MonsterAIState:
     """Return a zero-initialized MonsterAIState for one level."""
@@ -731,6 +741,8 @@ def make_monster_ai_state() -> MonsterAIState:
         m_lev=jnp.zeros(n, dtype=jnp.int16),
         blind_timer=jnp.zeros(n, dtype=jnp.int16),
         apparent_entry=jnp.full((n,), -1, dtype=jnp.int16),
+        # Per-slot death cause; default DeathCause.DIED (0).
+        death_cause=jnp.zeros(n, dtype=jnp.int8),
     )
 
 

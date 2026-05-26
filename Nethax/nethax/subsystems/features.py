@@ -788,9 +788,43 @@ def process_bridge_entities_on_close(state, pos: jnp.ndarray, rng: jax.Array | N
         crushed = affected & (~survives)
         new_pos = jnp.stack([out_rs, out_cs], axis=-1)
 
+    # --- Per-kill death_cause distinction (vendor e_died how-arg) ---------
+    # Vendor passes ``how`` to e_died based on the tile underneath:
+    #   pool/moat  → DROWNING
+    #   lava       → BURNING
+    #   else       → CRUSHING (the dbwall / drawbridge cases)
+    # We inspect the terrain at each monster's current (post-jump) position
+    # and pick the cause accordingly.  Slot indexing uses jnp.clip to keep
+    # the gather safe for unused slots (pos may be -1, -1).
+    # Cite: vendor/nethack/src/dbridge.c::do_entity lines 736-756.
+    from Nethax.nethax.subsystems.scoring import DeathCause as _DC
+    cur_r = new_pos[:, 0].astype(jnp.int32)
+    cur_c = new_pos[:, 1].astype(jnp.int32)
+    cur_r_safe = jnp.clip(cur_r, 0, map_h - 1)
+    cur_c_safe = jnp.clip(cur_c, 0, map_w - 1)
+    tile_under = terrain[cur_r_safe, cur_c_safe].astype(jnp.int32)
+    is_water = (tile_under == jnp.int32(int(TileType.WATER))) | \
+               (tile_under == jnp.int32(int(TileType.POOL)))
+    is_lava = tile_under == jnp.int32(int(TileType.LAVA))
+    cause_for_mon = jnp.where(
+        is_water,
+        jnp.int8(int(_DC.DROWNING)),
+        jnp.where(
+            is_lava,
+            jnp.int8(int(_DC.BURNING)),
+            jnp.int8(int(_DC.CRUSHING)),
+        ),
+    )
+    new_death_cause = jnp.where(crushed, cause_for_mon, mai.death_cause)
+
     new_alive = jnp.where(crushed, jnp.bool_(False), mai.alive)
     new_hp = jnp.where(crushed, jnp.int32(0), mai.hp)
-    new_mai = mai.replace(alive=new_alive, hp=new_hp, pos=new_pos)
+    new_mai = mai.replace(
+        alive=new_alive,
+        hp=new_hp,
+        pos=new_pos,
+        death_cause=new_death_cause,
+    )
     state = state.replace(monster_ai=new_mai)
 
     # --- Hero-side crush (dbridge.c::do_entity hero branch + e_died) ------
@@ -847,10 +881,28 @@ def process_bridge_entities_on_close(state, pos: jnp.ndarray, rng: jax.Array | N
     new_hp_hero = jnp.maximum(state.player_hp - dmg, jnp.int32(0))
     lethal = hero_crushed & (new_hp_hero == jnp.int32(0))
 
+    # Vendor e_died chooses how based on the terrain at the hero's tile:
+    #   pool/moat → DROWNING ; lava → BURNING ; else CRUSHING.
+    # Cite: vendor/nethack/src/dbridge.c::do_entity lines 736-756.
+    p_r_safe = jnp.clip(p_r, 0, map_h - 1)
+    p_c_safe = jnp.clip(p_c, 0, map_w - 1)
+    hero_tile = terrain[p_r_safe, p_c_safe].astype(jnp.int32)
+    hero_water = (hero_tile == jnp.int32(int(TileType.WATER))) | \
+                 (hero_tile == jnp.int32(int(TileType.POOL)))
+    hero_lava = hero_tile == jnp.int32(int(TileType.LAVA))
+    hero_cause = jnp.where(
+        hero_water,
+        jnp.int8(int(DeathCause.DROWNING)),
+        jnp.where(
+            hero_lava,
+            jnp.int8(int(DeathCause.BURNING)),
+            jnp.int8(int(DeathCause.CRUSHING)),
+        ),
+    )
     new_done = state.done | lethal
     new_cause = jnp.where(
         lethal,
-        jnp.int8(int(DeathCause.CRUSHING)),
+        hero_cause,
         state.scoring.death_cause,
     )
     new_scoring = state.scoring.replace(death_cause=new_cause)
