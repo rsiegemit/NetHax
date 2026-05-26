@@ -1763,6 +1763,66 @@ def _try_wand_speed_self(state, rng: jax.Array, monster_idx: jnp.ndarray):
     return state.replace(monster_ai=new_mai)
 
 
+# ---------------------------------------------------------------------------
+# Monster blows FIRE_HORN / FROST_HORN at the player (vendor muse.c:1862-1876)
+# ---------------------------------------------------------------------------
+# Tool category, with vendor objects.h indices:
+#   225 = frost horn  (AD_COLD beam)
+#   226 = fire horn   (AD_FIRE beam)
+# Vendor mplayhorn() routes the beam through buzz() at d(6, 6) (6d6).
+# Uses the existing monster-inventory ``charges`` field; horns cost 1 charge
+# per blow (vendor: ``otmp->spe--`` in mplayhorn).
+_CAT_TOOL:   int = 6     # ItemCategory.TOOL
+_FROST_HORN_TID: int = 225
+_FIRE_HORN_TID:  int = 226
+
+
+def _try_blow_horn(state, rng: jax.Array, monster_idx: jnp.ndarray,
+                   horn_tid: int, resist_intrinsic: int):
+    """Blow a horn at the player, dealing 6d6 with optional resistance.
+
+    Vendor cite: muse.c lines 1862-1876 — find_offensive horn branch
+    routes through mplayhorn() → buzz() → zhitu() with d(6, 6) damage.
+    Resistance halves the damage (zap.c::resist).  Horn must have
+    positive charges (vendor: ``otmp->spe > 0``).
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_TOOL, horn_tid)
+    charges = mai.inv_charges[idx, slot].astype(jnp.int32)
+    can_blow = found & (charges > 0)
+
+    # 6d6 vendor d(6,6).
+    keys = jax.random.split(rng, 6)
+    rolls = jax.vmap(
+        lambda k: jax.random.randint(k, (), 1, 7, dtype=jnp.int32)
+    )(keys)
+    dmg = jnp.sum(rolls).astype(jnp.int32)
+
+    # Resistance halves damage (vendor zap.c::resist behavior).
+    has_resist = (
+        state.status.intrinsics[int(resist_intrinsic)]
+        | (state.status.timed_intrinsics[int(resist_intrinsic)] > jnp.int32(0))
+    )
+    dmg = jnp.where(has_resist, dmg // jnp.int32(2), dmg)
+
+    new_player_hp = jnp.where(
+        can_blow,
+        jnp.maximum(state.player_hp - dmg, jnp.int32(0)),
+        state.player_hp,
+    ).astype(state.player_hp.dtype)
+    new_done = state.done | (new_player_hp <= 0)
+    new_charges = jnp.where(can_blow, charges - jnp.int32(1), charges).astype(jnp.int8)
+    new_mai = mai.replace(
+        inv_charges=mai.inv_charges.at[idx, slot].set(new_charges),
+    )
+    return state.replace(
+        monster_ai=new_mai,
+        player_hp=new_player_hp,
+        done=new_done,
+    )
+
+
 def mpickstuff(state, monster_idx: jnp.ndarray):
     """Monster picks up the top ground-item on its tile (single stack).
 
@@ -2010,6 +2070,20 @@ def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
                 lambda st, k, i: _try_zap_offensive_wand(
                     st, k, i, _WAN_TELEPORT, 0, 1, -1),
                 keys[15])
+
+    # ----- Horn beams (muse.c:1862-1876) --------------------------------
+    # FIRE_HORN / FROST_HORN — 6d6 buzz beam at player.  Vendor uses
+    # mplayhorn() + buzz() which routes via zhitu() and resist().  Range
+    # is BOLT_LIM (already gated by can_attack: dist <= 8).
+    rng_horns = jax.random.split(keys[8], 2)
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_blow_horn(
+                    st, k, i, _FIRE_HORN_TID, int(_Intr.RESIST_FIRE)),
+                rng_horns[0])
+    s = _branch(s, can_attack,
+                lambda st, k, i: _try_blow_horn(
+                    st, k, i, _FROST_HORN_TID, int(_Intr.RESIST_COLD)),
+                rng_horns[1])
 
     return s
 
