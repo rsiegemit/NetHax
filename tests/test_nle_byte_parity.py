@@ -57,10 +57,14 @@ def _safe_import_nethax():
 def _diff_obs(nle_obs: dict, nax_obs: dict, step_idx: int) -> list[str]:
     """Diff each shared field byte-for-byte; return a list of human-
     readable divergence strings (one per failing channel)."""
+    # Channels NLE doesn't expose in its default observation_shape but
+    # Nethax builds anyway — not a divergence, just a superset.
+    NETHAX_ONLY_OK = {"internal", "misc", "program_state"}
+
     diffs = []
     shared = set(nle_obs.keys()) & set(nax_obs.keys())
     missing_in_nax = set(nle_obs.keys()) - set(nax_obs.keys())
-    missing_in_nle = set(nax_obs.keys()) - set(nle_obs.keys())
+    missing_in_nle = (set(nax_obs.keys()) - set(nle_obs.keys())) - NETHAX_ONLY_OK
 
     if missing_in_nax:
         diffs.append(
