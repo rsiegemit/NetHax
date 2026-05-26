@@ -1893,6 +1893,63 @@ def _try_throw_potion(state, rng: jax.Array, monster_idx: jnp.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Polymorph self-buff (vendor muse.c:2222-2233)
+# ---------------------------------------------------------------------------
+# Vendor: monster quaffs POT_POLYMORPH or zaps WAN_POLYMORPH at itself,
+# calling newcham(mtmp, NULL, ...) which picks a random form via rndmonst.
+# In Nethax, polymorph_monster takes a known target entry_idx; we pass
+# a random index in [1, 250] (the bulk of vendor's MONSTERS table).
+_POT_POLYMORPH_TID: int = 87       # 68 + PotionEffect.POLYMORPH(19)
+_WAN_POLYMORPH:     int = 11       # WandEffect.POLYMORPH
+
+
+def _try_polymorph_self(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Quaff POT_POLYMORPH or zap WAN_POLYMORPH at self.
+
+    Cite: vendor/nethack/src/muse.c lines 2222-2233 (POT/WAN polymorph
+    MUSE_MISC branches), vendor/nethack/src/mon.c::newcham (form-roll).
+
+    Looks for either item in monster inventory; if found, consumes one
+    charge (wand) or quantity (potion) and re-rolls the monster's
+    ``entry_idx`` to a random valid index in [1, 250] via
+    ``polymorph_monster``.  The HP/HP_max recalculation is handled
+    inside polymorph_monster.
+    """
+    from Nethax.nethax.subsystems.polymorph import polymorph_monster
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    # Check potion first, then wand (vendor priority irrelevant — we use
+    # whichever is present and bail if neither).
+    pot_found, pot_slot = _find_inv_slot(mai, idx, _CAT_POTION, _POT_POLYMORPH_TID)
+    pot_qty = mai.inv_quantity[idx, pot_slot].astype(jnp.int32)
+    has_pot = pot_found & (pot_qty > 0)
+
+    wan_found, wan_slot = _find_inv_slot(mai, idx, _CAT_WAND, _WAN_POLYMORPH)
+    wan_chg = mai.inv_charges[idx, wan_slot].astype(jnp.int32)
+    has_wan = wan_found & (wan_chg > 0)
+
+    has_either = has_pot | has_wan
+
+    # Consume one: prefer potion if both present (vendor: same effect).
+    new_pot_qty = jnp.where(has_pot, pot_qty - jnp.int32(1), pot_qty)
+    new_wan_chg = jnp.where(has_pot, wan_chg, jnp.where(has_wan, wan_chg - jnp.int32(1), wan_chg))
+
+    rng_pick, rng_poly = jax.random.split(rng, 2)
+    # Random form in [1, 250].  Skip 0 (NON_PM sentinel).
+    new_form = jax.random.randint(rng_pick, (), 1, 251, dtype=jnp.int32)
+
+    new_mai_pre = mai.replace(
+        inv_quantity=mai.inv_quantity.at[idx, pot_slot].set(new_pot_qty.astype(jnp.int16)),
+        inv_charges=mai.inv_charges.at[idx, wan_slot].set(new_wan_chg.astype(jnp.int8)),
+    )
+    state_pre = state.replace(monster_ai=new_mai_pre)
+
+    state_post = polymorph_monster(state_pre, rng_poly, idx, new_form.astype(jnp.int16))
+    return jax.lax.cond(has_either, lambda _: state_post, lambda _: state, None)
+
+
+# ---------------------------------------------------------------------------
 # Expensive camera flash blind (vendor muse.c:1938-1955)
 # ---------------------------------------------------------------------------
 # Vendor: monster with EXPENSIVE_CAMERA (TOOL type_id 204) flashes the player;
@@ -2214,6 +2271,13 @@ def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
     # (8) speed self
     s = _branch(s, eligible & (mai.speed_mod[idx] <= 0),
                 _try_wand_speed_self, keys[7])
+    # (8b) polymorph self — POT_POLYMORPH or WAN_POLYMORPH (muse.c:2222-2233).
+    # Only fires when the monster is at low HP (panic re-roll for a stronger
+    # form).  Mirrors vendor's misc-priority gating which fires polymorph
+    # self when defensive options fail.
+    rng_poly_self = jax.random.fold_in(keys[7], jnp.int32(0xFEED))
+    s = _branch(s, eligible & hp_low_half,
+                _try_polymorph_self, rng_poly_self)
 
     # ----- Offensive cascade (only when player in LoS & in range) -------
     can_attack = eligible & in_los & (dist > 1) & (dist <= 8) & ~hp_low_half
