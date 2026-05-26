@@ -1534,7 +1534,26 @@ def _single_melee_strike(
                           gi.corpse_entry_idx[branch, level, d_row, d_col, safe_gs])
             ),
         )
-        return s.replace(ground_items=new_gi)
+        s2 = s.replace(ground_items=new_gi)
+
+        # Arm a ROT_CORPSE / REVIVE_MON timer for the just-placed corpse.
+        # Vendor cite: mkobj.c::start_corpse_timeout lines 1388-1432 — called
+        # from xkilled() right after the corpse is placed on the floor.
+        # Lizards / lichens skip the timer entirely (line 1402-1404);
+        # trolls revive (line 1418-1424); everything else rots at ROT_AGE.
+        from Nethax.nethax.subsystems.timer_queue import (
+            start_corpse_timer as _start_corpse_timer,
+        )
+        s3 = jax.lax.cond(
+            can_place,
+            lambda ss: _start_corpse_timer(
+                ss, branch, level, d_row, d_col, safe_gs,
+                corpse_entry.astype(jnp.int32),
+            ),
+            lambda ss: ss,
+            s2,
+        )
+        return s3
 
     new_state = jax.lax.cond(
         killed,
