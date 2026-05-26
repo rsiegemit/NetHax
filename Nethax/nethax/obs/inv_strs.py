@@ -207,6 +207,7 @@ _SPBOOK_CLASS_VAL  = int(ObjectClass.SPBOOK_CLASS)
 _RING_CLASS_VAL    = int(ObjectClass.RING_CLASS)
 _AMULET_CLASS_VAL  = int(ObjectClass.AMULET_CLASS)
 _FOOD_CLASS_VAL    = int(ObjectClass.FOOD_CLASS)
+_COIN_CLASS_VAL    = int(ObjectClass.COIN_CLASS)
 
 # Special type-ID sentinels — looked up once at module load.
 # vendor/nethack/src/objnam.c:841 (holy/unholy water),
@@ -881,8 +882,10 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         )
 
         # 3. BUC word (only if buc_status != UNKNOWN == 0).
-        # Exception: holy/unholy water -- BUC is encoded in the name itself
+        # Exception 1: holy/unholy water -- BUC is encoded in the name itself
         # (vendor objnam.c:841-843), so suppress the BUC prefix for that case.
+        # Exception 2: COIN_CLASS -- vendor objnam.c:1318 explicitly excludes
+        # coins from the bknown BUC branch (``obj->oclass != COIN_CLASS``).
         is_water_special = (
             (category == jnp.int32(_POTION_CLASS_VAL)) &
             (type_id  == jnp.int32(_POT_WATER_TYPE_ID)) &
@@ -890,7 +893,8 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             ((buc_status == jnp.int32(BUCStatus.BLESSED)) |
              (buc_status == jnp.int32(BUCStatus.CURSED)))
         )
-        show_buc = buc_known & ~is_water_special
+        is_coin = category == jnp.int32(_COIN_CLASS_VAL)
+        show_buc = buc_known & ~is_water_special & ~is_coin
         b, c = lax.cond(
             show_buc,
             lambda bc: _write_buc(bc[0], bc[1], buc_row),
