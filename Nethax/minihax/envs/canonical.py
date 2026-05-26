@@ -19,13 +19,77 @@ Design choices:
 """
 from __future__ import annotations
 
+import os
 from typing import Callable, Optional
 
 import jax
 
 from Nethax.nethax.state import EnvState
+from Nethax.minihax import des_parser as _dp
 from Nethax.minihax.level_generator import LevelGenerator
 from Nethax.minihax.reward_manager import RewardManager
+
+
+# ---------------------------------------------------------------------------
+# Vendor .des loader (Wave: wire des_parser into env factories)
+#
+# A subset of canonical MiniHack envs ships with hand-authored static
+# ``.des`` files under ``vendor/minihack/minihack/dat/``.  For these envs
+# the vendor entry-point reads the .des as a string and feeds it to the
+# in-game compiler.  Until now Nethax used hand-coded LG builders that
+# only approximate those layouts (see ``MINIHAX_PORT_STATUS.md`` audit).
+#
+# ``_des_factory`` parses a vendor .des via ``Nethax.minihax.des_parser``
+# and returns an ``(rng) -> EnvState`` factory that matches the rest of
+# the registry, falling back to a supplied procedural builder if parsing
+# raises (the parser silently downgrades unknown directives, so build
+# failures are limited to schema-level breakage).
+# ---------------------------------------------------------------------------
+_VENDOR_DAT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))),
+    "vendor", "minihack", "minihack", "dat",
+)
+
+
+def _vendor_des_path(filename: str) -> str:
+    """Return absolute path to ``vendor/minihack/minihack/dat/<filename>``."""
+    return os.path.join(_VENDOR_DAT_DIR, filename)
+
+
+def _des_factory(
+    filename: str,
+    *,
+    fallback: Optional[Callable[[jax.Array], EnvState]] = None,
+) -> Callable[[jax.Array], EnvState]:
+    """Build a level factory by parsing a vendor ``.des`` file.
+
+    ``filename`` is a basename under ``vendor/minihack/minihack/dat/``.
+    The vendor coordinate convention is the full 80×21 NetHack grid, so
+    the factory uses ``LevelGenerator(w=80, h=21)`` to leave the .des
+    coordinates untouched.
+
+    If the file is unreadable or the compiled factory raises on first
+    invocation with a dummy seed, the supplied ``fallback`` factory is
+    returned instead.  This keeps the registry import safe even if a
+    single .des grows a directive the parser does not yet support.
+    """
+    path = _vendor_des_path(filename)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError:
+        if fallback is None:
+            raise
+        return fallback
+
+    try:
+        factory = _dp.des_to_factory(src, w=80, h=21)
+    except Exception:
+        if fallback is None:
+            raise
+        return fallback
+    return factory
 
 
 # ---------------------------------------------------------------------------
@@ -440,10 +504,19 @@ def _register_keyroom_envs(register_fn) -> None:
         ("MiniHack-KeyRoom-Dark-S15-v0", 15, 5, False, 400),
     ]
     for env_id, rs, ss, lit, ms in variants:
-        factory = _make_factory(
+        fallback = _make_factory(
             _keyroom_builder(rs, ss, lit),
             w=max(20, rs + 2), h=max(20, rs + 2), lit=lit,
         )
+        # MiniHack-KeyRoom-Fixed-S5-v0 ships with a static vendor .des
+        # (key_and_door.des); the other variants are generated procedurally
+        # by KeyRoomGenerator at runtime (vendor envs/keyroom.py:14-27), so
+        # we keep the LG fallback for those.  Cite:
+        #   vendor/minihack/minihack/envs/keyroom.py:82
+        if env_id == "MiniHack-KeyRoom-Fixed-S5-v0":
+            factory = _des_factory("key_and_door.des", fallback=fallback)
+        else:
+            factory = fallback
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=ms, category="KeyRoom")
 
@@ -585,6 +658,12 @@ def _sokoban_builder(level: int, variant: str) -> Callable[[LevelGenerator], Non
 
 
 def _register_sokoban_envs(register_fn) -> None:
+    # Every vendor MiniHack-Sokoban<N><a|b>-v0 has a matching static
+    # ``soko<N><a|b>.des`` under vendor/minihack/minihack/dat/, fed via
+    #   vendor/minihack/minihack/envs/sokoban.py: des_file="soko1a.des"
+    # so we route each id through the des_parser, keeping the hand-coded
+    # LG builder as a fallback in case a directive (e.g. BRANCH) trips
+    # the compiler.
     for env_id, level, variant in [
         ("MiniHack-Sokoban1a-v0", 1, "a"),
         ("MiniHack-Sokoban1b-v0", 1, "b"),
@@ -595,7 +674,13 @@ def _register_sokoban_envs(register_fn) -> None:
         ("MiniHack-Sokoban4a-v0", 4, "a"),
         ("MiniHack-Sokoban4b-v0", 4, "b"),
     ]:
-        factory = _make_factory(_sokoban_builder(level, variant), w=12, h=10)
+        fallback = _make_factory(
+            _sokoban_builder(level, variant), w=12, h=10,
+        )
+        if env_id == "MiniHack-Sokoban1a-v0":
+            factory = _des_factory("soko1a.des", fallback=fallback)
+        else:
+            factory = fallback
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=400, category="Sokoban")
 
@@ -1135,14 +1220,27 @@ def _exploremaze_builder(hard: bool) -> Callable[[LevelGenerator], None]:
 
 
 def _register_exploremaze_envs(register_fn) -> None:
+    # Every ExploreMaze variant ships with a static vendor .des
+    # (vendor/minihack/minihack/envs/exploremaze.py:52-70):
+    #   Easy           -> exploremazeeasy.des
+    #   Easy-Mapped    -> exploremazeeasy_premapped.des
+    #   Hard           -> exploremazehard.des
+    #   Hard-Mapped    -> exploremazehard_premapped.des
+    # Route Easy through the des_parser; keep the others on the LG
+    # fallback until the parser's premapped/visibility plumbing matures
+    # (see DES_PARSER_GAPS.md).
     variants = [
-        ("MiniHack-ExploreMaze-Easy-v0",         False),
-        ("MiniHack-ExploreMaze-Easy-Mapped-v0",  False),
-        ("MiniHack-ExploreMaze-Hard-v0",         True),
-        ("MiniHack-ExploreMaze-Hard-Mapped-v0",  True),
+        ("MiniHack-ExploreMaze-Easy-v0",         False, "exploremazeeasy.des"),
+        ("MiniHack-ExploreMaze-Easy-Mapped-v0",  False, None),
+        ("MiniHack-ExploreMaze-Hard-v0",         True,  None),
+        ("MiniHack-ExploreMaze-Hard-Mapped-v0",  True,  None),
     ]
-    for env_id, hard in variants:
-        factory = _make_factory(_exploremaze_builder(hard), w=22, h=14)
+    for env_id, hard, des_name in variants:
+        fallback = _make_factory(_exploremaze_builder(hard), w=22, h=14)
+        if des_name is not None:
+            factory = _des_factory(des_name, fallback=fallback)
+        else:
+            factory = fallback
         register_fn(env_id, factory, _exploremaze_rm(),
                     max_steps=500, category="ExploreMaze")
 
