@@ -132,6 +132,68 @@ _MONSTER_PRIMARY_ADTYP_TABLE: jnp.ndarray = _build_monster_primary_adtyp_table()
 
 
 # ---------------------------------------------------------------------------
+# dmgval per-monster gates (vendor/nethack/src/weapon.c::dmgval 304-334).
+#
+# Three vendor checks that previously had no Nethax counterpart:
+#   * thick_skinned(ptr) — `ptr->mflags1 & M1_THICK_HIDE` (mondata.h:69).
+#     Combined with `objects[otyp].oc_material <= LEATHER`, the strike
+#     does zero damage (weapon.c:304-306).
+#   * (ptr == &mons[PM_SHADE]) && !shade_glare(otmp) → damage = 0
+#     (weapon.c:307-308).  shade_glare() returns true when the weapon
+#     material is SILVER (artifact.c:559-561); the artifact-vs-undead
+#     branch (lines 562-566) is approximated by the existing silver path.
+#   * is_axe(otmp) && is_wooden(ptr) → +rnd(4) damage bonus
+#     (weapon.c:329-330).  is_wooden() is true only for PM_WOOD_GOLEM
+#     (mondata.h:68).
+# ---------------------------------------------------------------------------
+def _build_dmgval_monster_tables():
+    from Nethax.nethax.constants.monsters import MONSTERS, M1_THICK_HIDE
+    thick = jnp.array(
+        [bool(int(m.flags1) & M1_THICK_HIDE) for m in MONSTERS],
+        dtype=jnp.bool_,
+    )
+    # PM_SHADE: looked up by canonical name to avoid embedding the raw index.
+    shade = jnp.array(
+        [m.name == "shade" for m in MONSTERS], dtype=jnp.bool_,
+    )
+    # PM_WOOD_GOLEM: same.
+    wood = jnp.array(
+        [m.name == "wood golem" for m in MONSTERS], dtype=jnp.bool_,
+    )
+    return thick, shade, wood
+
+
+_THICK_HIDE, _IS_SHADE, _IS_WOOD_GOLEM = _build_dmgval_monster_tables()
+
+
+def _build_object_is_axe_table() -> jnp.ndarray:
+    """is_axe(otmp): WEAPON_CLASS or TOOL_CLASS with oc_skill == P_AXE.
+
+    Vendor: obj.h:217-219.  P_AXE skill id resolved through OBJECTS table.
+    """
+    from Nethax.nethax.constants.objects import OBJECTS
+    # Match-by-name avoids depending on internal oc_skill/oclass field names
+    # that vary by object_entries chunk.  Vendor weapon.c::is_axe whitelist:
+    #   axe, battle-axe, dwarvish mattock (excluded: pick-axe = is_pick).
+    _AXE_NAMES = frozenset((
+        "axe",
+        "battle-axe",
+        "dwarvish mattock",
+    ))
+    arr = []
+    for o in OBJECTS:
+        if o is None:
+            arr.append(False)
+            continue
+        nm = (getattr(o, "name", "") or "").lower()
+        arr.append(nm in _AXE_NAMES)
+    return jnp.array(arr, dtype=jnp.bool_)
+
+
+_OBJECT_IS_AXE: jnp.ndarray = _build_object_is_axe_table()
+
+
+# ---------------------------------------------------------------------------
 # Per-monster MONSTERS-table fields needed by JIT-side spawn paths
 # (release_camera_demon, summon scrolls).  Each cell holds the species-level
 # default for one MONSTERS row; spawn paths copy them into monster_ai.
@@ -1358,6 +1420,48 @@ def _single_melee_strike(
         jnp.int32(0),
     )
     base_dmg = (base_dmg + silver_bonus_m).astype(jnp.int32)
+
+    # vendor/nethack/src/weapon.c:329-330 — axe vs wood-golem bonus:
+    #   if (is_axe(otmp) && is_wooden(ptr)) bonus += rnd(4);
+    # is_wooden() is true only for PM_WOOD_GOLEM (mondata.h:68).
+    wep_type_axe = _wielded_type_id(state)
+    safe_wep_for_axe = jnp.clip(wep_type_axe, 0, _OBJECT_IS_AXE.shape[0] - 1)
+    is_axe_weapon = (wep_type_axe >= jnp.int32(0)) & _OBJECT_IS_AXE[safe_wep_for_axe]
+    safe_tgt_for_wood = jnp.clip(
+        mai.entry_idx[idx].astype(jnp.int32), 0, _IS_WOOD_GOLEM.shape[0] - 1
+    )
+    target_is_wood = _IS_WOOD_GOLEM[safe_tgt_for_wood]
+    key_axe = jax.random.fold_in(key_dmg, jnp.uint32(0xAEC0))
+    axe_d4 = rnd(key_axe, 4).astype(jnp.int32)
+    axe_bonus = jnp.where(
+        is_axe_weapon & target_is_wood & ~is_poly,
+        axe_d4,
+        jnp.int32(0),
+    )
+    base_dmg = (base_dmg + axe_bonus).astype(jnp.int32)
+
+    # vendor/nethack/src/weapon.c:304-306 — leather (or softer) vs thick-hide:
+    #   if (objects[otyp].oc_material <= LEATHER && thick_skinned(ptr)) tmp = 0;
+    # Material enum LEATHER == 7 (constants/objects.py:59).  Bare-hand
+    # (wep_type < 0) reads material 0 == NO_MATERIAL, which is also <= LEATHER
+    # — but is_weapon below also gates the rule (polymorphed form damage is
+    # unaffected, matching vendor's "weapon-class only" pre-condition).
+    target_thick = _THICK_HIDE[safe_tgt_for_wood]
+    leather_or_softer = (wep_type_axe >= jnp.int32(0)) & (
+        wep_material <= jnp.int32(int(Material.LEATHER))
+    )
+    nullify_leather = leather_or_softer & target_thick & ~is_poly
+    base_dmg = jnp.where(nullify_leather, jnp.int32(0), base_dmg)
+
+    # vendor/nethack/src/weapon.c:307-308 — PM_SHADE no-glare nullification:
+    #   if (ptr == &mons[PM_SHADE] && !shade_glare(otmp)) tmp = 0;
+    # vendor/nethack/src/artifact.c:559-561 — shade_glare() returns TRUE for
+    # any SILVER weapon; the artifact-vs-undead branch (lines 562-566) is
+    # approximated by reusing is_silver_weapon (silver is the dominant
+    # vendor case).  TODO: also accept SPFX_DFLAG2 vs M2_UNDEAD artifacts.
+    target_is_shade = _IS_SHADE[safe_tgt_for_wood]
+    shade_immune = target_is_shade & ~is_silver_weapon & ~is_poly
+    base_dmg = jnp.where(shade_immune, jnp.int32(0), base_dmg)
 
     # vendor/nethack/src/uhitm.c:5424-5670 (hmonas) — when the hero is
     # polymorphed and the form has multiple natural attacks, slot 0 is the
