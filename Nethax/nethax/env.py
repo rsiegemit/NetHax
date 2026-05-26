@@ -452,12 +452,55 @@ def _step_impl(state, action, rng):
             is_aggr, jnp.zeros_like(mai.sleep_timer), mai.sleep_timer
         )
 
+        # Effect 4: nasty — summon a high-difficulty demon at first
+        # dead monster slot.  Vendor nasty() picks from a 44-species
+        # nasties[] pool; this MVP picks uniformly from a 3-demon set
+        # (water demon=297, horned devil=299, barbed devil=301).
+        is_nasty = wiz_just_died & (which == jnp.int32(4))
+        rng_iv3, rng_iv4 = jax.random.split(rng_iv2, 2)
+        nasty_pick_roll = jax.random.randint(rng_iv3, (), 0, 3, dtype=jnp.int32)
+        nasty_entry = jnp.where(
+            nasty_pick_roll == jnp.int32(0), jnp.int16(297),
+            jnp.where(nasty_pick_roll == jnp.int32(1), jnp.int16(299),
+                                                      jnp.int16(301)),
+        )
+        dead_slots = ~new_asleep & ~mai.alive   # logic-only: use alive only
+        dead_mask = ~mai.alive
+        any_dead = jnp.any(dead_mask)
+        dead_idx = jnp.argmax(dead_mask.astype(jnp.int32)).astype(jnp.int32)
+        do_nasty = is_nasty & any_dead
+
+        spawn_pos = state.player_pos  # Nasty spawns near hero (vendor enexto)
+        nasty_alive = jnp.where(do_nasty, jnp.bool_(True),  mai.alive[dead_idx])
+        nasty_entry_v = jnp.where(do_nasty, nasty_entry, mai.entry_idx[dead_idx])
+        nasty_hp     = jnp.where(do_nasty, jnp.int32(20), mai.hp[dead_idx])
+        nasty_hpmax  = jnp.where(do_nasty, jnp.int32(20), mai.hp_max[dead_idx])
+
+        # Effect 5: resurrect — re-spawn the Wizard at first dead slot.
+        is_resurr = wiz_just_died & (which == jnp.int32(5))
+        do_resurr = is_resurr & any_dead
+        resurr_alive = jnp.where(do_resurr, jnp.bool_(True), nasty_alive)
+        resurr_entry = jnp.where(do_resurr, jnp.int16(281), nasty_entry_v)
+        resurr_hp    = jnp.where(do_resurr, jnp.int32(50), nasty_hp)
+        resurr_hpmax = jnp.where(do_resurr, jnp.int32(50), nasty_hpmax)
+
+        new_alive_arr  = mai.alive.at[dead_idx].set(resurr_alive)
+        new_entry_arr  = mai.entry_idx.at[dead_idx].set(resurr_entry)
+        new_hp_arr     = mai.hp.at[dead_idx].set(resurr_hp)
+        new_hpmax_arr  = mai.hp_max.at[dead_idx].set(resurr_hpmax)
+
         ns = ns.replace(
             inventory=ns.inventory.replace(items=new_items),
-            monster_ai=mai.replace(asleep=new_asleep, sleep_timer=new_sleep_t),
+            monster_ai=mai.replace(
+                asleep=new_asleep,
+                sleep_timer=new_sleep_t,
+                alive=new_alive_arr,
+                entry_idx=new_entry_arr,
+                hp=new_hp_arr,
+                hp_max=new_hpmax_arr,
+            ),
         )
-        # Effects 0/1/4/5 are no-ops in this MVP (nasty + resurrect need
-        # additional plumbing — see deferred-doc).
+        # Effects 0/1 remain no-ops (vendor's "You feel nervous." flavor).
         return ns
 
     new_state = jax.lax.cond(already_done, lambda _: state, _do_step, operand=None)
