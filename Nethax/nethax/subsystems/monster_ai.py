@@ -4074,6 +4074,82 @@ def _faction(mai, idx: jnp.ndarray) -> jnp.ndarray:
                      jnp.where(is_peace, jnp.int32(1), jnp.int32(0)))
 
 
+# ---------------------------------------------------------------------------
+# were-creature shape-shift (vendor were.c::were_change lines 8-45)
+# ---------------------------------------------------------------------------
+# Were-monster MONSTERS table indices (verified against
+# Nethax/nethax/constants/monster_entries/chunk{1,2,5}.py):
+#   15  = werejackal  (animal form)         <-> 270 = werejackal  (human form)
+#   21  = werewolf    (animal form)         <-> 271 = werewolf    (human form)
+#   95  = wererat     (animal form)         <-> 269 = wererat     (human form)
+# Vendor counter_were(pm) in were.c lines 47-66 returns each pair's
+# counterpart; new_were(mon) at lines 95-138 sets the new permonst and heals
+# 1/4 of the lost HP.
+_WERE_PAIRS = jnp.array(
+    [[15, 270], [270, 15], [21, 271], [271, 21], [95, 269], [269, 95]],
+    dtype=jnp.int32,
+)
+
+
+def _were_counterpart(entry: jnp.ndarray) -> jnp.ndarray:
+    """Map a were-monster entry_idx to its counterpart; identity if non-were.
+
+    Pure JAX (vmap-safe).
+    """
+    matches = _WERE_PAIRS[:, 0] == entry           # (6,)
+    any_match = jnp.any(matches)
+    first = jnp.argmax(matches.astype(jnp.int32))
+    return jnp.where(any_match, _WERE_PAIRS[first, 1], entry).astype(jnp.int32)
+
+
+def _were_change_all(mai, rng: jax.Array):
+    """Per-turn 1/30 chance for each alive were-monster to switch form.
+
+    Vendor cite: were.c::were_change lines 8-45.  Vendor's probability is
+    keyed on ``night()``/``flags.moonphase`` which Nethax doesn't model
+    (no in-game calendar) — use the most common night-not-full-moon
+    branch ``rn2(30)`` for both directions.  Animal-form vendor path is
+    already a flat ``rn2(30)``; human-form simplifies to the same rate.
+
+    On a successful roll:
+      * swap ``entry_idx`` to the counterpart (counter_were);
+      * heal 1/4 of lost HP (new_were line 127 ``healmon(...)``);
+      * if helpless (sleeping / paralyzed), wake immediately and zero the
+        sleep / paralyze timers (new_were lines 120-125).
+    """
+    entry = mai.entry_idx.astype(jnp.int32)
+    counterpart = jax.vmap(_were_counterpart)(entry)
+    is_were = counterpart != entry
+
+    n = entry.shape[0]
+    keys = jax.random.split(rng, n)
+    rolls = jax.vmap(
+        lambda k: jax.random.randint(k, (), 0, 30, dtype=jnp.int32)
+    )(keys)
+
+    transforms = mai.alive & is_were & (rolls == jnp.int32(0))
+
+    new_entry = jnp.where(transforms, counterpart, entry).astype(jnp.int16)
+
+    hp_now = mai.hp.astype(jnp.int32)
+    hp_max = mai.hp_max.astype(jnp.int32)
+    heal_amt = jnp.where(transforms, (hp_max - hp_now) // jnp.int32(4), jnp.int32(0))
+    new_hp = jnp.minimum(hp_now + heal_amt, hp_max).astype(jnp.int32)
+
+    # Vendor new_were lines 120-125: helpless monsters wake on transform.
+    new_asleep = jnp.where(transforms, jnp.bool_(False), mai.asleep)
+    new_sleep_t = jnp.where(transforms, jnp.int16(0), mai.sleep_timer)
+    new_paral_t = jnp.where(transforms, jnp.int16(0), mai.paralyzed_timer)
+
+    return mai.replace(
+        entry_idx=new_entry,
+        hp=new_hp,
+        asleep=new_asleep,
+        sleep_timer=new_sleep_t,
+        paralyzed_timer=new_paral_t,
+    )
+
+
 def monsters_step_all(state, rng: jax.Array) -> object:
     """Advance all monster slots by one game tick.
 
@@ -4094,6 +4170,15 @@ def monsters_step_all(state, rng: jax.Array) -> object:
           vendor/nethack/src/mhitm.c lines 1024-1100 (mattackm).
     """
     mai = state.monster_ai
+
+    # ---- Were-creature per-turn shape-shift (vendor were.c::were_change) ----
+    # 1/30 chance per alive were-monster slot per turn to swap between
+    # animal/human form and heal 1/4 of lost HP.  Runs BEFORE speed
+    # accumulation so a newly-transformed monster still uses its (now
+    # post-swap) speed lookup this turn.
+    rng, rng_were = jax.random.split(rng)
+    mai = _were_change_all(mai, rng_were)
+    state = state.replace(monster_ai=mai)
 
     # ---- Speed-energy accumulation (vendor mon.c::mcalcmove lines 1126-1167) ----
     # Vendor piecewise speed adjust:
