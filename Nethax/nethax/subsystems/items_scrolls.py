@@ -1807,8 +1807,15 @@ def handle_read(state, rng):
     has_stock  = quantities > jnp.int16(0)
     valid_mask = is_scroll & has_stock
 
-    slot_idx = jnp.argmax(valid_mask).astype(jnp.int32)
+    fallback_slot = jnp.argmax(valid_mask).astype(jnp.int32)
     found    = jnp.any(valid_mask)
+
+    # NLE multi-key: prefer agent-chosen letter if it's a valid scroll.
+    # Cite: vendor/nethack/src/read.c::doread → getobj() returns the letter.
+    from Nethax.nethax.subsystems.pending_action import resolve_slot
+    chosen_slot = resolve_slot(state, fallback_slot)
+    chosen_is_valid = valid_mask[jnp.clip(chosen_slot, 0, valid_mask.shape[0] - 1)]
+    slot_idx = jnp.where(chosen_is_valid, chosen_slot, fallback_slot).astype(jnp.int32)
 
     new_state = jax.lax.cond(
         found,

@@ -1548,8 +1548,18 @@ def handle_quaff(state, rng):
     valid_mask = is_potion & has_stock
 
     # argmax returns 0 when all False; guard with found flag.
-    slot_idx = jnp.argmax(valid_mask).astype(jnp.int32)
-    found    = jnp.any(valid_mask)
+    fallback_slot = jnp.argmax(valid_mask).astype(jnp.int32)
+    found_any    = jnp.any(valid_mask)
+
+    # NLE multi-key: prefer the agent-chosen slot (state.pending_action_slot)
+    # if it points at a valid potion; else fall back to argmax.
+    # Cite: vendor/nethack/src/potion.c::dodrink calls getobj() which returns
+    # the player's chosen letter.  See Nethax/nethax/subsystems/pending_action.
+    from Nethax.nethax.subsystems.pending_action import resolve_slot
+    chosen_slot = resolve_slot(state, fallback_slot)
+    chosen_is_valid = valid_mask[jnp.clip(chosen_slot, 0, valid_mask.shape[0] - 1)]
+    slot_idx = jnp.where(chosen_is_valid, chosen_slot, fallback_slot).astype(jnp.int32)
+    found = found_any
 
     return jax.lax.cond(
         found,

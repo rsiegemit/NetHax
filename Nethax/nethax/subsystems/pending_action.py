@@ -195,3 +195,24 @@ def action_opens_letter_then_dir_prompt(action_val: jax.Array) -> jax.Array:
 def is_pending(state) -> jax.Array:
     """True if the state is waiting on a follow-up key."""
     return state.pending_action_kind.astype(jnp.int8) != jnp.int8(0)
+
+
+def resolve_slot(state, fallback_slot: jax.Array) -> jax.Array:
+    """Return the slot the agent picked, or fall back to ``fallback_slot``.
+
+    Multi-key NLE actions (WEAR/WIELD/QUAFF/EAT/READ/ZAP/THROW/APPLY) carry
+    the agent's chosen inventory letter in ``state.pending_action_slot``
+    (set by the dispatcher's letter-consumption branch).  Handlers should
+    consult ``resolve_slot`` so that when an agent emits ``WEAR → letter b``,
+    slot 1 is wielded — not the auto-pick first-armor slot 0.
+
+    When no pending letter is present (e.g. legacy direct API call), the
+    handler's own argmax-derived ``fallback_slot`` is used.
+
+    Cite: vendor/nethack/src/cmd.c::doapply etc. all call getobj(), which
+    returns the letter the player typed.  We mirror that by threading
+    pending_action_slot through dispatch.
+    """
+    pending_slot = state.pending_action_slot.astype(jnp.int32)
+    have_letter = pending_slot >= jnp.int32(0)
+    return jnp.where(have_letter, pending_slot, fallback_slot.astype(jnp.int32))

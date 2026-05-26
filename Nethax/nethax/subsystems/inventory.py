@@ -1429,7 +1429,18 @@ def handle_wield(state, rng):
     (found_weapon, first_weapon), _ = lax.scan(
         _find_weapon, (jnp.bool_(False), jnp.int32(0)), jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32)
     )
-    new_state = wield(state, first_weapon)
+
+    # NLE multi-key: prefer agent-chosen slot if it's a valid weapon.
+    # Cite: vendor/nethack/src/wield.c::dowield calls getobj().
+    from Nethax.nethax.subsystems.pending_action import resolve_slot
+    chosen = resolve_slot(state, first_weapon)
+    safe_chosen = jnp.clip(chosen, 0, MAX_INVENTORY_SLOTS - 1)
+    chosen_is_weapon = (
+        state.inventory.items.category[safe_chosen]
+        == jnp.int8(ItemCategory.WEAPON)
+    ) & (state.inventory.items.quantity[safe_chosen] > jnp.int16(0))
+    weapon_slot = jnp.where(chosen_is_weapon, safe_chosen, first_weapon).astype(jnp.int32)
+    new_state = wield(state, weapon_slot)
     # Clear wielded_artifact_idx when wielding via the action handler (no
     # artifact context available here; callers that grant artifacts set it
     # directly via state.inventory.replace(wielded_artifact_idx=...)).
@@ -1455,7 +1466,13 @@ def handle_unwield(state, rng):
 
 
 def handle_wear(state, rng):
-    """Wear action handler — wear first armor in inventory (BODY slot)."""
+    """Wear action handler — wear armor at pending_action_slot (or first
+    armor in inventory if no slot specified; vendor/nethack/src/do_wear.c
+    calls getobj() for the letter prompt).
+
+    NLE multi-key compat: if state.pending_action_slot >= 0 AND that slot
+    holds an armor, wear it.  Otherwise fall back to argmax-over-ARMOR.
+    """
     def _find_armor(carry, idx):
         found, slot = carry
         is_armor = state.inventory.items.category[idx] == jnp.int8(ItemCategory.ARMOR)
@@ -1466,7 +1483,17 @@ def handle_wear(state, rng):
     (_, first_armor), _ = lax.scan(
         _find_armor, (jnp.bool_(False), jnp.int32(0)), jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32)
     )
-    return wear_armor(state, first_armor, ArmorSlot.BODY)
+
+    # Multi-key follow-up: prefer agent-chosen slot if it's a valid armor.
+    from Nethax.nethax.subsystems.pending_action import resolve_slot
+    chosen = resolve_slot(state, first_armor)
+    safe_chosen = jnp.clip(chosen, 0, MAX_INVENTORY_SLOTS - 1)
+    chosen_is_armor = (
+        state.inventory.items.category[safe_chosen]
+        == jnp.int8(ItemCategory.ARMOR)
+    ) & (state.inventory.items.quantity[safe_chosen] > jnp.int16(0))
+    slot_idx = jnp.where(chosen_is_armor, safe_chosen, first_armor).astype(jnp.int32)
+    return wear_armor(state, slot_idx, ArmorSlot.BODY)
 
 
 def step(state, rng):
