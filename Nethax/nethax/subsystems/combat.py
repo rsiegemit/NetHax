@@ -2141,11 +2141,24 @@ def thrown_attack(
         category=items.category.at[slot].set(new_cat),
     )
 
+    # --- Mimic absorption (vendor steal.c::maybe_absorb_item 776-810) ---
+    # When a thrown projectile reaches a mimic (found_hit), the mimic has a
+    # 10% chance to absorb an ordinary item (5% for artifacts).  Absorbed
+    # items vanish from the world: they enter the mimic's minvent (we route
+    # them into the first empty inv slot) and are NOT placed on the floor.
+    # JIT-pure: absorb_check is a single rn2(100) draw gated on the mimic
+    # symbol mask.
+    from Nethax.nethax.subsystems.throwing import _mimic_absorb_check
+    key_mimic = jax.random.fold_in(key_brk_side, jnp.uint32(0x171717))
+    mimic_absorbed = found_hit & _mimic_absorb_check(
+        state_after_hit, target_idx, slot, key_mimic,
+    )
+
     # --- Drop on ground at terminal tile if no hit landed (projectile missed) ---
     drop_row = jnp.clip(end_row, 0, map_h - 1)
     drop_col = jnp.clip(end_col, 0, map_w - 1)
 
-    should_drop = consume & ~hit_landed  # missed: projectile lands on floor
+    should_drop = consume & ~hit_landed & ~mimic_absorbed
 
     # --- Gap 4: boomerang return (dothrow.c:1601-1611) ---
     # BOOMERANG / AKLYS return to thrower; rn2(100) > 2*Dex+50 => fumble => drop.
@@ -2156,7 +2169,8 @@ def thrown_attack(
     boom_roll = _rn2(key_boom, 100)
     catches = boom_roll <= catch_threshold
     # Returning and caught: undo the inventory decrement.
-    boomerang_return = is_returning & catches & ~hit_landed & has_item
+    # Mimic-absorbed items do not return (the mimic now owns them).
+    boomerang_return = is_returning & catches & ~hit_landed & has_item & ~mimic_absorbed
 
     # --- Mjollnir auto-return (dothrow.c:1710-1759, artilist.h:97-108) ---
     # Mjollnir thrown by Valkyrie with STR>=25 returns 99% of the time.
@@ -2166,7 +2180,7 @@ def thrown_attack(
     from Nethax.nethax.subsystems.artifact_powers import (
         mjollnir_throw_returns as _mjollnir_returns,
     )
-    mjol_return = _mjollnir_returns(state, key_mjol) & ~hit_landed & has_item
+    mjol_return = _mjollnir_returns(state, key_mjol) & ~hit_landed & has_item & ~mimic_absorbed
 
     any_return = boomerang_return | mjol_return
     return_qty = jnp.where(any_return, old_qty, new_items.quantity[slot])
@@ -2388,6 +2402,40 @@ def thrown_attack(
         ac=new_ac2,
         attack_dice_n=new_atk_n2,
         attack_dice_sides=new_atk_s2,
+    )
+
+    # --- Mimic absorption — write the projectile into the mimic's minvent.
+    # vendor steal.c::maybe_absorb_item line 809: mpickobj(mon, obj).  We
+    # find the first empty inv slot on the target mimic and copy
+    # category/type_id/quantity into it.  When no slot is free the item is
+    # silently consumed (matches vendor add_to_minv overflow path which
+    # frees the obj).
+    mimic_inv_cats = final_mai.inv_category[target_idx]
+    inv_empty_mask = mimic_inv_cats == jnp.int8(0)
+    any_inv_free = jnp.any(inv_empty_mask)
+    inv_free_slot = jnp.argmax(inv_empty_mask.astype(jnp.int32)).astype(jnp.int32)
+    do_absorb = mimic_absorbed & any_inv_free
+    safe_inv_slot = jnp.clip(inv_free_slot, 0, mimic_inv_cats.shape[0] - 1)
+    proj_cat = items.category[slot]
+    proj_tid = items.type_id[slot]
+    proj_buc = items.buc_status[slot]
+    new_inv_cat = final_mai.inv_category.at[target_idx, safe_inv_slot].set(
+        jnp.where(do_absorb, proj_cat, final_mai.inv_category[target_idx, safe_inv_slot])
+    )
+    new_inv_tid = final_mai.inv_type_id.at[target_idx, safe_inv_slot].set(
+        jnp.where(do_absorb, proj_tid, final_mai.inv_type_id[target_idx, safe_inv_slot])
+    )
+    new_inv_qty = final_mai.inv_quantity.at[target_idx, safe_inv_slot].set(
+        jnp.where(do_absorb, jnp.int16(1), final_mai.inv_quantity[target_idx, safe_inv_slot])
+    )
+    new_inv_buc = final_mai.inv_buc.at[target_idx, safe_inv_slot].set(
+        jnp.where(do_absorb, proj_buc, final_mai.inv_buc[target_idx, safe_inv_slot])
+    )
+    final_mai = final_mai.replace(
+        inv_category=new_inv_cat,
+        inv_type_id=new_inv_tid,
+        inv_quantity=new_inv_qty,
+        inv_buc=new_inv_buc,
     )
 
     return state_after_hit.replace(

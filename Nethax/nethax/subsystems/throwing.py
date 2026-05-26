@@ -10,6 +10,8 @@ thrown_attack() in combat.py:
                             (vendor/nethack/src/dothrow.c:1616-1625)
   - BOOMERANG_TYPE_IDS — frozenset of returning-weapon type_ids
                          (vendor/nethack/src/dothrow.c:1601-1611)
+  - _IS_MIMIC[N]      — bool mask, monsters that can absorb thrown items
+                         (vendor/nethack/src/steal.c::maybe_absorb_item 776-810)
 """
 
 import jax
@@ -215,3 +217,104 @@ def vendor_breaktest(
 
     raw_break = glass_break | switch_break
     return raw_break & (~resisted)
+
+
+# ---------------------------------------------------------------------------
+# Mimic absorption — vendor/nethack/src/steal.c::maybe_absorb_item lines
+# 776-810.
+#
+# vendor signature:
+#   maybe_absorb_item(struct monst *mon, struct obj *obj,
+#                     int ochance /* percent for ordinary */, int achance /* artifact */)
+#
+# Used by hmonas (uhitm.c) for poke/throw/kick contact with a mimic.  Vendor
+# call sites pass (10, 5) — i.e. 10% chance to absorb an ordinary item and
+# 5% chance for an artifact.  The vendor body calls obj_resists which rolls
+# rn2(100) < (100 - chance) and returns TRUE on resist; we model the
+# inverse roll directly (rn2(100) < chance == absorbs).
+# ---------------------------------------------------------------------------
+
+def _build_mimic_mask() -> jnp.ndarray:
+    """Return bool[N_MONSTERS]; True for any mimic (S_MIMIC symbol)."""
+    from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
+    mimic_sym = MonsterSymbol.S_MIMIC
+    return jnp.array(
+        [m.symbol == mimic_sym for m in MONSTERS],
+        dtype=jnp.bool_,
+    )
+
+
+_IS_MIMIC: jnp.ndarray = _build_mimic_mask()
+
+
+# Default percent chances per vendor steal.c call sites (uhitm.c:hmonas
+# passes 10/5 for thrown-or-kicked, 30/15 for melee poke).
+MIMIC_ABSORB_THROWN_ORDINARY: int = 10
+MIMIC_ABSORB_THROWN_ARTIFACT: int = 5
+
+
+def mimic_absorb_check(
+    rng: jax.Array,
+    entry_idx: jnp.ndarray,
+    is_artifact: jnp.ndarray,
+    is_attached: jnp.ndarray = None,
+) -> jnp.ndarray:
+    """Return scalar bool: does this mimic absorb the projectile?
+
+    Byte-equal approximation of vendor ``maybe_absorb_item`` lines 776-810.
+
+    Parameters
+    ----------
+    rng         : JAX PRNG key (one rn2(100) draw).
+    entry_idx   : int32 — MONSTERS table index for the candidate monster.
+    is_artifact : bool   — True iff obj has an artifact_idx >= 0.
+    is_attached : bool   — Optional; True iff obj is uball/uchain (skips
+                  absorption per vendor steal.c:777).  Defaults to False.
+
+    Vendor logic abbreviated:
+        if (obj == uball|uchain || oclass == ROCK_CLASS
+            || obj_resists(obj, 100 - ochance, 100 - achance)
+            || !touch_artifact(...))
+                return;  # no absorb
+    We model:
+        absorb = is_mimic & ~is_attached & (rn2(100) < chance)
+    The ``touch_artifact`` blast (cursed artifact vs wrong alignment) and
+    ROCK_CLASS gates are deferred — they only narrow the absorb chance and
+    do not affect the simpler thrown-projectile call sites used here.
+    """
+    e_safe = jnp.clip(entry_idx.astype(jnp.int32), 0, _IS_MIMIC.shape[0] - 1)
+    is_mimic = _IS_MIMIC[e_safe]
+    if is_attached is None:
+        is_attached = jnp.bool_(False)
+    chance = jnp.where(
+        is_artifact,
+        jnp.int32(MIMIC_ABSORB_THROWN_ARTIFACT),
+        jnp.int32(MIMIC_ABSORB_THROWN_ORDINARY),
+    )
+    roll = jax.random.randint(rng, (), 0, 100, dtype=jnp.int32)
+    return is_mimic & (~is_attached) & (roll < chance)
+
+
+def _mimic_absorb_check(
+    state,
+    mimic_idx: jnp.ndarray,
+    item_slot: jnp.ndarray,
+    rng: jax.Array,
+) -> jnp.ndarray:
+    """Convenience wrapper matching the task spec signature.
+
+    Returns scalar bool ``absorbed`` — does the mimic at ``mimic_idx``
+    absorb the inventory item at ``item_slot``?  Does NOT mutate state;
+    callers thread the absorb branch into their own update logic (e.g.
+    in thrown_attack we use this to short-circuit the floor-drop and
+    move the projectile into the mimic's minvent).
+    """
+    mai = state.monster_ai
+    inv = state.inventory.items
+    n_m = mai.entry_idx.shape[0]
+    m_safe = jnp.clip(mimic_idx.astype(jnp.int32), 0, n_m - 1)
+    entry = mai.entry_idx[m_safe]
+    n_i = inv.category.shape[0]
+    s_safe = jnp.clip(item_slot.astype(jnp.int32), 0, n_i - 1)
+    is_artifact = inv.artifact_idx[s_safe] >= jnp.int8(0)
+    return mimic_absorb_check(rng, entry, is_artifact)
