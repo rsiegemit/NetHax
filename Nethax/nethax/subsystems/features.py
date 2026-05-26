@@ -599,6 +599,45 @@ def destroy_drawbridge(
     return state, new_terrain
 
 
+def process_bridge_entities_on_close(state, pos: jnp.ndarray):
+    """Crush any monsters standing on the bridge tile + paired wall tile when
+    a drawbridge closes (vendor dbridge.c::do_entity lines 554-759 — entities
+    on the bridge are processed for crush / drown / lava-burn).
+
+    Simplified subset: monsters on the bridge tile (which becomes
+    DRAWBRIDGE_UP / DBWALL) are killed in place (HP → 0, alive → False).
+    The hero is not processed here (vendor handles hero separately with
+    crush-by-portcullis damage and e_jump escape — left as a deferred
+    item since the JAX port has no jump-mechanic input).
+
+    Also: process the 4-neighbour pair-tile that will be raised
+    (vendor lev2 in close_drawbridge).
+
+    Cite: vendor/nethack/src/dbridge.c::do_entity lines 554-759.
+    """
+    b, lv, row, col = pos[0], pos[1], pos[2], pos[3]
+    mai = state.monster_ai
+
+    mr = mai.pos[:, 0].astype(jnp.int32)
+    mc = mai.pos[:, 1].astype(jnp.int32)
+
+    # Crush mask: monster alive AND on the bridge tile OR any 4-neighbour
+    # tile that will become DRAWBRIDGE_UP (paired wall side).  We don't
+    # need to gate on per-tile branch/level — Nethax monster_ai is
+    # already scoped to the current level.
+    on_bridge = (mr == row) & (mc == col)
+    on_n = (mr == row - jnp.int32(1)) & (mc == col)
+    on_s = (mr == row + jnp.int32(1)) & (mc == col)
+    on_w = (mr == row) & (mc == col - jnp.int32(1))
+    on_e = (mr == row) & (mc == col + jnp.int32(1))
+    crushed = mai.alive & (on_bridge | on_n | on_s | on_w | on_e)
+
+    new_alive = jnp.where(crushed, jnp.bool_(False), mai.alive)
+    new_hp = jnp.where(crushed, jnp.int32(0), mai.hp)
+    new_mai = mai.replace(alive=new_alive, hp=new_hp)
+    return state.replace(monster_ai=new_mai)
+
+
 def open_drawbridge(
     state: FeaturesState,
     terrain: jnp.ndarray,
