@@ -2077,19 +2077,19 @@ def _try_wan_undead_turning(state, rng: jax.Array, monster_idx: jnp.ndarray):
 
     Vendor muse.c:1878 + zap.c::zhitu cases ZT_BEAM(0)/UNDEAD_TURNING.
     Effects on player:
-      - If player wields a CORPSE item (player's inventory has a
-        weapon-slot category == FOOD and type_id corresponds to corpse
-        category), animate the corpse — vendor calls revive() on it.
-        Nethax simplification: clear that wielded slot (corpse is gone)
-        and deal 1d8 damage as the "animated zombie attacks back".
-      - If no wielded corpse and the player is UNDEAD (via Intrinsic
-        UNDEAD_WARNING — placeholder gate), deal 2d8 turning damage.
-      - Otherwise no-op (vendor's ZT_BEAM with no undead target prints a
-        flavor message only).
+      - If player wields a CORPSE item, animate the corpse (vendor revive());
+        Nethax simplification: clear that wielded slot and deal 1d8 damage
+        as the "animated zombie attacks back".
+      - If the player is currently polymorphed into an UNDEAD form
+        (vendor is_undead(youmonst.data)), deal 2d8 turning damage.
+        Cite zap.c::zhitu ZT_UNDEAD_TURNING: turning damage applies even
+        to the caster's intended target when that target is undead.
+      - Otherwise no-op (vendor's ZT_BEAM flavor only).
 
     Cite: vendor/nethack/src/muse.c lines 1878-1889 (MUSE_WAN_UNDEAD_TURNING),
           vendor/nethack/src/zap.c::zhitu ZT_UNDEAD_TURNING branch.
     """
+    from Nethax.nethax.subsystems.polymorph import _FORM_IS_UNDEAD
     idx = monster_idx.astype(jnp.int32)
     mai = state.monster_ai
     found, slot = _find_inv_slot(mai, idx, _CAT_WAND, _WAN_UNDEAD_TURNING)
@@ -2105,11 +2105,24 @@ def _try_wan_undead_turning(state, rng: jax.Array, monster_idx: jnp.ndarray):
     w_corpse_idx = state.inventory.items.corpse_entry_idx[safe_w]
     is_corpse_wielded = has_wielded & (w_cat == jnp.int8(7)) & (w_corpse_idx >= jnp.int16(0))
 
-    # Damage roll: 1d8 if corpse-wielded; 2d8 if player is undead (we
-    # don't track player-undead, so just use the corpse branch).
-    keys = jax.random.split(rng, 2)
+    # Detect player as undead via polymorph form (vendor: is_undead(youmonst.data)).
+    poly_active = state.polymorph.is_polymorphed
+    safe_form = jnp.clip(
+        state.polymorph.current_form_idx.astype(jnp.int32),
+        0, _FORM_IS_UNDEAD.shape[0] - 1,
+    )
+    player_is_undead = poly_active & _FORM_IS_UNDEAD[safe_form]
+
+    # Damage rolls: 1d8 if corpse-wielded, 2d8 if player is undead.
+    # When both true, vendor still routes via the corpse branch first;
+    # we follow that priority so the wielded corpse gets animated.
+    keys = jax.random.split(rng, 3)
     dmg_corpse = jax.random.randint(keys[0], (), 1, 9, dtype=jnp.int32)
+    d1 = jax.random.randint(keys[1], (), 1, 9, dtype=jnp.int32)
+    d2 = jax.random.randint(keys[2], (), 1, 9, dtype=jnp.int32)
+    dmg_undead = (d1 + d2).astype(jnp.int32)
     do_corpse = can_zap & is_corpse_wielded
+    do_undead = can_zap & ~is_corpse_wielded & player_is_undead
 
     # Clear the wielded corpse slot (vendor animates it; Nethax just
     # removes it since we have no monster-animation pipeline).
@@ -2122,7 +2135,8 @@ def _try_wan_undead_turning(state, rng: jax.Array, monster_idx: jnp.ndarray):
     new_wielded = jnp.where(do_corpse, jnp.int8(-1), state.inventory.wielded)
     new_inv = state.inventory.replace(items=new_items, wielded=new_wielded)
 
-    dmg = jnp.where(do_corpse, dmg_corpse, jnp.int32(0))
+    dmg = jnp.where(do_corpse, dmg_corpse,
+            jnp.where(do_undead, dmg_undead, jnp.int32(0)))
     new_hp = jnp.maximum(state.player_hp - dmg, jnp.int32(0)).astype(state.player_hp.dtype)
     new_charges = jnp.where(can_zap, charges - jnp.int32(1), charges).astype(jnp.int8)
     new_mai = mai.replace(
