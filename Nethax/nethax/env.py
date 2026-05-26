@@ -51,6 +51,8 @@ from Nethax.nethax.subsystems.regions import run_regions as _run_regions
 from Nethax.nethax.subsystems.mplayer import (
     maybe_seed_astral_mplayers as _maybe_seed_astral_mplayers,
 )
+from Nethax.nethax.parity_mode import use_vendor_rng
+from Nethax.nethax import vendor_rng as _vendor_rng
 
 
 class NethaxEnv:
@@ -87,6 +89,17 @@ class NethaxEnv:
 
         rng_state, rng_level, rng_char, rng_monsters = jax.random.split(rng, 4)
         state = EnvState.default(rng=rng_state, static=self.static)
+
+        # NLE_BYTEPARITY: seed ISAAC64 from the host-side integer derived
+        # from the incoming PRNGKey.  Vendor NLE seeds each rnglist[] entry
+        # via ``init_isaac64(seed)`` where ``seed`` is the platform unsigned
+        # long.  We collapse the two PRNGKey words via XOR so a 64-bit seed
+        # round-trips deterministically.  Cite: vendor/nle/src/rnd.c
+        # ``init_isaac64`` (lines 42-58) and hacklib.c::set_random (854-868).
+        if use_vendor_rng():
+            key_u32 = jax.device_get(rng).astype(jnp.uint32)
+            seed_int = (int(key_u32[0]) << 32) ^ int(key_u32[1])
+            state = state.replace(vendor_rng=_vendor_rng.init(seed_int))
 
         # Apply character creation (stats, inventory, AC)
         char_fields = create_character(rng_char, role, race, alignment)

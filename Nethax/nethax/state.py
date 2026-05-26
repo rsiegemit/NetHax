@@ -57,6 +57,7 @@ from Nethax.nethax.dungeon.branches import (
     MAP_W,
 )
 from Nethax.nethax.dungeon.level_memory import LevelMemoryState, make_empty_level_memory
+from Nethax.nethax.vendor_rng import Isaac64State
 
 
 @struct.dataclass
@@ -329,6 +330,16 @@ class EnvState:
     timestep: jax.Array         # int32
     done: jax.Array             # bool
 
+    # ---- ISAAC64 vendor RNG state (NLE_BYTEPARITY mode) -----------------
+    # When parity_mode.use_vendor_rng() is True, env.reset seeds this from
+    # the integer derived from the PRNGKey and dungeon/feature generation
+    # threads it instead of consuming Threefry keys.  In default NLE mode
+    # this slot is the zero-valued ``Isaac64State.empty()`` sentinel — JIT
+    # pytree shapes stay stable across modes.
+    # Cite: vendor/nle/include/config.h:584 ``#define USE_ISAAC64``;
+    #       vendor/nle/src/rnd.c (USE_ISAAC64 path).
+    vendor_rng: Isaac64State
+
     @classmethod
     def default(
         cls,
@@ -462,6 +473,9 @@ class EnvState:
             rng=rng,
             timestep=jnp.int32(0),
             done=jnp.bool_(False),
+            # ISAAC64 vendor RNG — empty by default; populated by env.reset()
+            # when parity_mode.use_vendor_rng() is True.
+            vendor_rng=Isaac64State.empty(),
         )
 
 

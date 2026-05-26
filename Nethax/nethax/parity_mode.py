@@ -40,8 +40,9 @@ from enum import IntEnum
 class ParityMode(IntEnum):
     """Which upstream byte layout to mirror."""
 
-    NLE = 0      # default — matches vendor/nle/ for agent transferability
-    NETHACK = 1  # matches vendor/nethack/ for replay parity with C builds
+    NLE = 0              # default — matches vendor/nle/ for agent transferability
+    NETHACK = 1          # matches vendor/nethack/ for replay parity with C builds
+    NLE_BYTEPARITY = 2   # NLE layout + ISAAC64 vendor RNG (byte-exact rollouts)
 
 
 _current: ParityMode = ParityMode.NLE
@@ -65,13 +66,24 @@ def get_parity_mode() -> ParityMode:
 
 
 def is_nle_mode() -> bool:
-    """True iff parity mode is NLE (the default)."""
-    return _current == ParityMode.NLE
+    """True iff parity mode is NLE-style obs layout (default or byte-parity)."""
+    return _current in (ParityMode.NLE, ParityMode.NLE_BYTEPARITY)
 
 
 def is_nethack_mode() -> bool:
     """True iff parity mode is vendor NetHack 3.7."""
     return _current == ParityMode.NETHACK
+
+
+def use_vendor_rng() -> bool:
+    """True iff the active mode requires byte-exact ISAAC64 RNG.
+
+    Threefry is fast and JIT-friendly but its bytes never match NLE.  When
+    this returns True, the env threads an ``Isaac64State`` through every
+    site that would otherwise consume a Threefry key.
+    Cite: vendor/nle/include/config.h:584 ``#define USE_ISAAC64``.
+    """
+    return _current == ParityMode.NLE_BYTEPARITY
 
 
 # ---------------------------------------------------------------------------

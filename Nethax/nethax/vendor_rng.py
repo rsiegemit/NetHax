@@ -347,6 +347,23 @@ class Isaac64State:
         del aux
         return cls(*children)
 
+    @classmethod
+    def empty(cls) -> "Isaac64State":
+        """Zero-valued sentinel state — used as the EnvState default.
+
+        Not a valid RNG (every output would be 0); call :func:`init` with a
+        real seed before draining.  Kept as the default so JIT-cached pytree
+        shapes are stable whether or not ``NLE_BYTEPARITY`` is active.
+        """
+        return cls(
+            m=jnp.zeros((ISAAC64_SZ,), dtype=jnp.uint64),
+            r=jnp.zeros((ISAAC64_SZ,), dtype=jnp.uint64),
+            a=jnp.zeros((), dtype=jnp.uint64),
+            b=jnp.zeros((), dtype=jnp.uint64),
+            c=jnp.zeros((), dtype=jnp.uint64),
+            n=jnp.zeros((), dtype=jnp.int32),
+        )
+
 
 def init(seed: int) -> Isaac64State:
     """Initialize ISAAC64 state from an integer seed (matches NLE seeding)."""
@@ -359,6 +376,58 @@ def init(seed: int) -> Isaac64State:
         c=jnp.asarray(c, dtype=jnp.uint64),
         n=jnp.asarray(n, dtype=jnp.int32),
     )
+
+
+# ---------------------------------------------------------------------------
+# Host-side JAX wrappers — eager scalar draws used in non-JIT setup paths.
+#
+# These pull host-side ints out of the pytree, call the reference Python
+# helpers, and pack the result back into a fresh ``Isaac64State``.  They are
+# NOT JIT-traceable yet (ISAAC64 refill is non-trivial inside jit; see the
+# note at the bottom of this module).  Reset/dungeon-gen runs eagerly, so
+# host-side wrappers are sufficient for the first byte-parity wiring.
+# ---------------------------------------------------------------------------
+
+def _state_to_py(state: Isaac64State):
+    """Pull host-side Python lists/ints out of an ``Isaac64State`` pytree."""
+    m = [int(v) for v in np.asarray(state.m)]
+    r = [int(v) for v in np.asarray(state.r)]
+    a = int(np.asarray(state.a))
+    b = int(np.asarray(state.b))
+    c = int(np.asarray(state.c))
+    n = int(np.asarray(state.n))
+    return m, r, a, b, c, n
+
+
+def _state_from_py(py_state) -> Isaac64State:
+    """Repack a host-side ``(m, r, a, b, c, n)`` tuple as an ``Isaac64State``."""
+    m, r, a, b, c, n = py_state
+    return Isaac64State(
+        m=jnp.asarray(m, dtype=jnp.uint64),
+        r=jnp.asarray(r, dtype=jnp.uint64),
+        a=jnp.asarray(a, dtype=jnp.uint64),
+        b=jnp.asarray(b, dtype=jnp.uint64),
+        c=jnp.asarray(c, dtype=jnp.uint64),
+        n=jnp.asarray(n, dtype=jnp.int32),
+    )
+
+
+def rn2(state: Isaac64State, x: int) -> Tuple[Isaac64State, int]:
+    """Host-side ``rn2(x)`` — returns ``(new_state, value_in_[0, x))``.
+
+    Mirrors ``vendor/nethack/src/rnd.c::rn2`` under ``USE_ISAAC64``: a single
+    ``isaac64_next_uint64() % x`` draw.  ``x`` must be a positive Python int.
+    """
+    py_state = _state_to_py(state)
+    py_state, v = rn2_py(py_state, int(x))
+    return _state_from_py(py_state), int(v)
+
+
+def next_uint64(state: Isaac64State) -> Tuple[Isaac64State, int]:
+    """Host-side raw 64-bit draw — returns ``(new_state, uint64)``."""
+    py_state = _state_to_py(state)
+    py_state, v = next_uint64_py(py_state)
+    return _state_from_py(py_state), int(v)
 
 
 # Note: a JAX-traceable refill is non-trivial because ``isaac64_update``
