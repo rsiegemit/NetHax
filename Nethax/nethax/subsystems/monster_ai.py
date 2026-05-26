@@ -2290,6 +2290,11 @@ def _try_camera_flash(state, rng: jax.Array, monster_idx: jnp.ndarray):
     BLIND_RES intrinsic (in vendor BLINDED via eyewear).  Nethax has no
     BLIND_RES intrinsic, so the gate is purely "monster has camera with
     charges & in LoS & not already blind from this attack".
+
+    Multi-target (vendor muse.c:1938-1955): the camera flash blinds all
+    monsters within Chebyshev distance 1 of the firing monster (i.e.
+    every adjacent ally) for the same 51..100-turn duration.  The
+    firing monster itself is excluded.
     """
     from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS3
     idx = monster_idx.astype(jnp.int32)
@@ -2304,8 +2309,28 @@ def _try_camera_flash(state, rng: jax.Array, monster_idx: jnp.ndarray):
     new_timers = timers.at[int(_TS3.BLIND)].add(add)
 
     new_charges = jnp.where(can_flash, charges - jnp.int32(1), charges).astype(jnp.int8)
+
+    # Blind all OTHER monsters within Chebyshev dist 1 of the firing slot.
+    n = mai.pos.shape[0]
+    src_pos = mai.pos[idx].astype(jnp.int32)
+    all_pos = mai.pos.astype(jnp.int32)
+    d_rows = jnp.abs(all_pos[:, 0] - src_pos[0])
+    d_cols = jnp.abs(all_pos[:, 1] - src_pos[1])
+    cheb = jnp.maximum(d_rows, d_cols)
+    slot_indices = jnp.arange(n, dtype=jnp.int32)
+    adj_alive = (
+        mai.alive
+        & (cheb <= jnp.int32(1))
+        & (slot_indices != idx)
+    )
+    apply_adj = adj_alive & can_flash
+    cur_blind = mai.blind_timer.astype(jnp.int32)
+    add_per_slot = jnp.where(apply_adj, dur, jnp.int32(0))
+    new_blind = (cur_blind + add_per_slot).astype(mai.blind_timer.dtype)
+
     new_mai = mai.replace(
         inv_charges=mai.inv_charges.at[idx, slot].set(new_charges),
+        blind_timer=new_blind,
     )
     return state.replace(
         monster_ai=new_mai,
