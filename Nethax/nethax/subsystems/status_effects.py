@@ -1324,28 +1324,63 @@ def tick_slimed_lethal(env_state):
 
 
 def tick_slime_cancels_stoning(env_state):
-    """If both STONED and SLIMED are active, clear STONED on the turning-into-
-    slime tick (slime_dialogue ``i==1`` branch).
+    """Slime-dialogue per-turn side effects: cancel STONED at i==1 and
+    clear intrinsic FAST at i==3.
 
-    Vendor cite: timeout.c::slime_dialogue lines 436-440 —
-        case 1L: /* turning into slime */
-            if (Stoned) make_stoned(0L, (char *) 0, KILLED_BY_AN, (char *) 0);
+    Vendor cite: timeout.c::slime_dialogue lines 424-441 —
+        switch (i) {
+        case 3L:  /* limbs becoming oozy */
+            HFast = 0L; /* lose intrinsic speed */
+            ...
+            break;
+        ...
+        case 1L:  /* turning into slime */
+            if (Stoned)
+                make_stoned(0L, (char *) 0, KILLED_BY_AN, (char *) 0);
+            break;
+        }
 
-    Vendor's ``i = (Slimed & TIMEOUT) / 2L`` so ``i==1`` fires when the
-    SLIMED timer (pre-decrement) is 2 or 3.  Run this BEFORE the per-turn
-    timer decrement (i.e. before ``_status_step``).  Once the player has
-    progressed to "turning into slime" stoning is silently cancelled.
+    Vendor's ``i = (Slimed & TIMEOUT) / 2L`` so:
+      i==3 fires when pre-decrement SLIMED ∈ {6, 7}  → clear HFast.
+      i==1 fires when pre-decrement SLIMED ∈ {2, 3}  → cancel stoning.
+
+    Runs BEFORE the per-turn timer decrement (i.e. before
+    ``_status_step``) so we read the pre-decrement SLIMED value.
     """
     timers = env_state.status.timed_statuses
     slimed_t = timers[TimedStatus.SLIMED].astype(jnp.int32)
     stoned_t = timers[TimedStatus.STONED].astype(jnp.int32)
-    # vendor: i = t/2L, the i==1 branch fires for t in {2, 3}.
+
+    # i==1 (slimed t ∈ {2,3}): clear stoning.
     slime_at_i1 = (slimed_t == jnp.int32(2)) | (slimed_t == jnp.int32(3))
-    cancel = slime_at_i1 & (stoned_t > jnp.int32(0))
-    new_stoned = jnp.where(cancel, jnp.int32(0), stoned_t)
+    cancel_stone = slime_at_i1 & (stoned_t > jnp.int32(0))
+    new_stoned = jnp.where(cancel_stone, jnp.int32(0), stoned_t)
+
+    # i==3 (slimed t ∈ {6,7}): lose intrinsic Fast.  Vendor's
+    # ``HFast = 0L;`` zeros BOTH the timed bits AND the permanent flag;
+    # mirror by clearing intrinsics[FAST] and timed_intrinsics[FAST].
+    slime_at_i3 = (slimed_t == jnp.int32(6)) | (slimed_t == jnp.int32(7))
+    clear_fast = slime_at_i3
+    intrinsics = env_state.status.intrinsics
+    timed_intr = env_state.status.timed_intrinsics
+    new_intr = jnp.where(
+        clear_fast,
+        intrinsics.at[Intrinsic.FAST].set(jnp.bool_(False)),
+        intrinsics,
+    )
+    new_timed_intr = jnp.where(
+        clear_fast,
+        timed_intr.at[Intrinsic.FAST].set(jnp.int32(0)),
+        timed_intr,
+    )
+
     new_timers = timers.at[TimedStatus.STONED].set(new_stoned)
     return env_state.replace(
-        status=env_state.status.replace(timed_statuses=new_timers)
+        status=env_state.status.replace(
+            timed_statuses=new_timers,
+            intrinsics=new_intr,
+            timed_intrinsics=new_timed_intr,
+        )
     )
 
 
