@@ -1530,6 +1530,120 @@ def build_blstats(env_state) -> jnp.ndarray:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Wall-angle pass for build_glyphs.
+#
+# Vendor citation: vendor/nethack/src/display.c::wall_angle (decl line 151,
+# body 3512+) and set_wall_state / xy_set_wall_state (3275-3354) — those
+# compute per-tile wall mode from neighbours and the cell type so the
+# renderer can pick S_vwall / S_hwall / S_tlcorn / S_trcorn / S_blcorn /
+# S_brcorn / S_crwall / S_tuwall / S_tdwall / S_tlwall / S_trwall.
+#
+# Cmap-index mapping (vendor/nethack/include/defsym.h):
+#    1 S_vwall   '|'      vertical
+#    2 S_hwall   '-'      horizontal
+#    3 S_tlcorn  '-'      top-left corner of room   (opens S and E)
+#    4 S_trcorn  '-'      top-right corner of room  (opens S and W)
+#    5 S_blcorn  '-'      bottom-left corner        (opens N and E)
+#    6 S_brcorn  '-'      bottom-right corner       (opens N and W)
+#    7 S_crwall  '-'      crossing (+)              (all four neighbours)
+#    8 S_tuwall  '-'      T pointing up   (open up, walls on S/E/W)
+#    9 S_tdwall  '-'      T pointing down (open down, walls on N/E/W)
+#   10 S_tlwall  '|'      T pointing left (open left, walls on N/S/E)
+#   11 S_trwall  '|'      T pointing right(open right, walls on N/S/W)
+#
+# Our JAX terrain map only stores a single TileType.WALL (=3) and lacks
+# vendor's pre-baked typ split (VWALL/HWALL/T*WALL/CROSSWALL).  We instead
+# derive the variant at render time by counting wall neighbours in each of
+# the four cardinal directions.  Doors are treated as continuations of the
+# wall they are embedded in (a wall flowing through a door is the vendor
+# default: walls and doors share an `IS_ROCK` / `IS_DOOR` continuation in
+# check_pos()).
+# ---------------------------------------------------------------------------
+
+# Pattern bits: N=1, S=2, E=4, W=8 -> 16-entry table of cmap indices.
+def _build_wall_angle_table():
+    import numpy as _np
+    S_vwall, S_hwall = 1, 2
+    S_tlcorn, S_trcorn, S_blcorn, S_brcorn = 3, 4, 5, 6
+    S_crwall = 7
+    S_tuwall, S_tdwall, S_tlwall, S_trwall = 8, 9, 10, 11
+    N, S, E, W = 1, 2, 4, 8
+
+    tbl = _np.zeros((16,), dtype=_np.int16)
+    # No neighbours / single neighbour -> default vwall or hwall.
+    tbl[0]              = S_vwall                    # isolated stub
+    tbl[N]              = S_vwall                    # N only
+    tbl[S]              = S_vwall                    # S only
+    tbl[E]              = S_hwall                    # E only
+    tbl[W]              = S_hwall                    # W only
+    tbl[N | S]          = S_vwall                    # vertical run
+    tbl[E | W]          = S_hwall                    # horizontal run
+    # Two-neighbour L-corners: name reflects where the corner SITS, the
+    # opening directions are the two wall-neighbours.
+    tbl[S | E]          = S_tlcorn                   # top-left of room: opens down + right
+    tbl[S | W]          = S_trcorn                   # top-right of room
+    tbl[N | E]          = S_blcorn                   # bottom-left of room
+    tbl[N | W]          = S_brcorn                   # bottom-right of room
+    # Three-neighbour T-junctions: name reflects the OPEN direction.
+    tbl[N | S | E]      = S_tlwall                   # only W is open
+    tbl[N | S | W]      = S_trwall                   # only E is open
+    tbl[N | E | W]      = S_tdwall                   # only S is open (T points down)
+    tbl[S | E | W]      = S_tuwall                   # only N is open (T points up)
+    # Four-neighbour cross
+    tbl[N | S | E | W]  = S_crwall
+    return jnp.array(tbl, dtype=jnp.int16)
+
+
+_WALL_ANGLE_TABLE: jnp.ndarray = _build_wall_angle_table()
+
+
+def _apply_wall_angle(display_terrain: jnp.ndarray,
+                      cmap_idx: jnp.ndarray) -> jnp.ndarray:
+    """Replace generic S_vwall on WALL tiles with the correct corner variant.
+
+    Args:
+        display_terrain: int8/int16[21, 79] terrain TileType per cell.
+        cmap_idx:        int16[21, 79] current cmap indices from _TILE_TO_CMAP.
+
+    Returns:
+        int16[21, 79] cmap indices with wall variants resolved.
+    """
+    from Nethax.nethax.constants.tiles import TileType
+
+    t = display_terrain.astype(jnp.int16)
+    WALL = jnp.int16(int(TileType.WALL))
+    CLOSED = jnp.int16(int(TileType.CLOSED_DOOR))
+    OPEN = jnp.int16(int(TileType.OPEN_DOOR))
+
+    # A neighbour counts as a wall-continuation when it is WALL or a door.
+    # Vendor check_pos() treats walls + doors as connected segments.
+    is_wallish = (t == WALL) | (t == CLOSED) | (t == OPEN)
+
+    H, W = is_wallish.shape
+
+    # Pad with False (out-of-bounds = open) so edge cells behave like rooms.
+    zero_row = jnp.zeros((1, W), dtype=jnp.bool_)
+    zero_col = jnp.zeros((H, 1), dtype=jnp.bool_)
+
+    n = jnp.concatenate([zero_row, is_wallish[:-1, :]], axis=0)   # north neighbour
+    s = jnp.concatenate([is_wallish[1:, :], zero_row], axis=0)    # south neighbour
+    w = jnp.concatenate([zero_col, is_wallish[:, :-1]], axis=1)   # west neighbour
+    e = jnp.concatenate([is_wallish[:, 1:], zero_col], axis=1)    # east neighbour
+
+    pattern = (n.astype(jnp.int16)
+               | (s.astype(jnp.int16) << jnp.int16(1))
+               | (e.astype(jnp.int16) << jnp.int16(2))
+               | (w.astype(jnp.int16) << jnp.int16(3)))           # int16[21,79], 0..15
+
+    wall_variant = _WALL_ANGLE_TABLE[pattern]                     # int16[21,79]
+
+    # Only rewrite cells that are themselves WALL.  Door tiles keep their
+    # CLOSED_DOOR / OPEN_DOOR cmap (which is _NOT_ a wall variant).
+    is_wall_cell = (t == WALL)
+    return jnp.where(is_wall_cell, wall_variant, cmap_idx)
+
+
 def build_glyphs(env_state) -> jnp.ndarray:
     """Map the current level's terrain to NLE glyph IDs.
 
@@ -1575,6 +1689,13 @@ def build_glyphs(env_state) -> jnp.ndarray:
     # Clamp tile index to valid _TILE_TO_CMAP range (in case of corrupt data)
     tile_idx = jnp.clip(display_terrain.astype(jnp.int16), 0, NUM_TILE_TYPES - 1)
     cmap_idx = _TILE_TO_CMAP[tile_idx]                                     # int16[21,79]
+
+    # Wall-angle pass — replace generic S_vwall (cmap 1) for WALL tiles with
+    # the correct corner / T-junction / cross / horizontal variant, derived
+    # from the 4 cardinal neighbours' wall pattern.  Vendor reference:
+    # vendor/nethack/src/display.c::wall_angle (lines 143-151 forward decl,
+    # body at lines 3512-3700) and set_wall_state / xy_set_wall_state.
+    cmap_idx = _apply_wall_angle(display_terrain, cmap_idx)
 
     # Terrain glyph IDs
     terrain_glyphs = (cmap_idx + jnp.int16(GLYPH_CMAP_OFF)).astype(jnp.int16)
