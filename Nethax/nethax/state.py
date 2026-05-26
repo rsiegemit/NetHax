@@ -158,6 +158,23 @@ class EnvState:
     ball_thrown_pos: jax.Array       # int16[2] (row, col) target tile
     ball_thrown_turns: jax.Array     # int8     turns left in flight
 
+    # ---- NLE multi-key follow-up state machine ------------------------
+    # NLE-trained policies emit certain actions as two-step sequences:
+    # ``WEAR → letter('b')`` selects which inventory slot to wear.  Vendor
+    # NetHack implements this via getobj() / getdir() prompts inside the
+    # command handlers (vendor/nethack/src/cmd.c).  In Nethax, we expose
+    # the prompts as ``PendingActionKind`` states that the dispatcher
+    # checks BEFORE the normal action lookup.  When pending != NONE, the
+    # incoming action argument is interpreted as the answer to the prompt
+    # (a letter for inventory, a direction for getdir) and the deferred
+    # handler is invoked with that arg.
+    #
+    # Cite: vendor/nethack/src/cmd.c::doapply, dowield, dowear, dodrink,
+    #       doread, dozap, dothrow, docast (each calls getobj / getdir).
+    pending_action_kind: jax.Array   # int8  PendingActionKind enum (0=NONE)
+    pending_action_root: jax.Array   # int8  original action enum value
+    pending_action_slot: jax.Array   # int8  inv-slot remembered for 2-step
+
     # ---- Player core (kept here for fast access; not part of any subsystem) ----
     player_pos: jax.Array       # int16[2]  (row, col)
     player_hp: jax.Array        # int32
@@ -355,6 +372,9 @@ class EnvState:
             pick_lock_magic_key=jnp.bool_(False),
             ball_thrown_pos=jnp.array([-1, -1], dtype=jnp.int16),
             ball_thrown_turns=jnp.int8(0),
+            pending_action_kind=jnp.int8(0),
+            pending_action_root=jnp.int8(0),
+            pending_action_slot=jnp.int8(-1),
             calendar_moonphase=jnp.int8(0),
             calendar_friday13=jnp.bool_(False),
             # player core

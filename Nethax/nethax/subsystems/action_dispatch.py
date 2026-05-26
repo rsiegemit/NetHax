@@ -3568,6 +3568,25 @@ def dispatch_action(state, action: jnp.int32, rng: jax.Array):
     -------
     New game state after applying the action.
 
+    Multi-key prompts
+    -----------------
+    NLE-trained policies emit certain actions as two-step sequences:
+    ``WEAR → letter('b')`` selects the inventory slot to wear.  Before
+    the main switch we check ``state.pending_action_kind``:
+
+      * If a prompt is open, interpret ``action`` as the answer and clear
+        the prompt (consuming this step without going to the normal switch).
+      * If the incoming ``action`` is a known prompt-opener (WEAR/WIELD/
+        QUAFF/EAT/READ/PUT_ON/TAKE_OFF for inv-letter; ZAP/THROW/APPLY for
+        letter+direction), open the prompt and return without consuming a
+        turn.
+
+    The auto-pick handlers (selected by the main switch when no prompt is
+    open) remain the fallback for legacy callers and direct API use.
+
+    Cite: vendor/nethack/src/cmd.c::doapply/dowear/dowield/...; the NLE
+    LETTER_A..LETTER_Z action enums in vendor/nle/nle/nethack/actions.py.
+
     Implementation
     --------------
     Uses a 256-entry lookup table ``_ACTION_TO_HANDLER_IDX`` to map the
@@ -3579,11 +3598,73 @@ def dispatch_action(state, action: jnp.int32, rng: jax.Array):
     JAX primitives used: jax.lax.switch, jax.lax.while_loop, jnp.where,
     jnp.clip, jnp.array_equal.
     """
+    from Nethax.nethax.subsystems.pending_action import (
+        action_opens_inv_letter_prompt,
+        action_opens_letter_then_dir_prompt,
+        letter_to_slot,
+        is_pending,
+        clear_prompt,
+    )
+
     action_val = jnp.clip(jnp.int32(action), 0, 255)
+
+    # --- Step A: are we already waiting on a follow-up? -------------------
+    # In a future revision the deferred handler would consume the letter or
+    # direction (e.g. wear_armor(state, slot)).  For now we (a) stash the
+    # decoded slot in state.pending_action_slot so subsequent handlers can
+    # pick it up, then (b) clear the prompt and fall through to the normal
+    # dispatch.  This preserves NLE's "WEAR -> b" cadence: step 1 is a
+    # no-op turn that opens the prompt; step 2 carries the slot value.
+    pending = is_pending(state)
+    slot_from_letter = letter_to_slot(action_val).astype(jnp.int8)
+    state_after_followup = state.replace(
+        pending_action_slot=slot_from_letter,
+    )
+    state_after_followup = clear_prompt(state_after_followup)
+
+    # --- Step B: does this action open a new prompt? ---------------------
+    opens_inv = action_opens_inv_letter_prompt(action_val)
+    opens_ltd = action_opens_letter_then_dir_prompt(action_val)
+    opens_any = opens_inv | opens_ltd
+
+    # Pick the prompt kind: 1=AWAIT_INV_LETTER, 3=AWAIT_LETTER_THEN_DIR.
+    kind_int = jnp.where(opens_inv, jnp.int8(1),
+                          jnp.where(opens_ltd, jnp.int8(3), jnp.int8(0)))
+    state_open_prompt = state.replace(
+        pending_action_kind=kind_int,
+        pending_action_root=action_val.astype(jnp.int8),
+        pending_action_slot=jnp.int8(-1),
+    )
+
+    # --- Step C: normal dispatch path -------------------------------------
     handler_idx = _ACTION_TO_HANDLER_IDX[action_val].astype(jnp.int32)
     compact_idx = _SLOT_TO_COMPACT[handler_idx]
     dir_idx     = _SLOT_TO_DIR_IDX[handler_idx]
-    return jax.lax.switch(compact_idx, _COMPACT_HANDLERS, state, rng, dir_idx)
+    state_normal = jax.lax.switch(
+        compact_idx, _COMPACT_HANDLERS, state, rng, dir_idx
+    )
+
+    # Branch select:
+    # - pending: state_after_followup (followup letter consumed, prompt cleared)
+    # - opens_any & !pending: state_open_prompt (open new prompt, no turn)
+    # - else: state_normal (legacy dispatch)
+    def _branch_pending(_):
+        return state_after_followup
+
+    def _branch_open(_):
+        return state_open_prompt
+
+    def _branch_normal(_):
+        return state_normal
+
+    # pending takes priority over opens_any (you can't open a new prompt
+    # while one is already open — the followup consumes the action).
+    return jax.lax.cond(
+        pending,
+        _branch_pending,
+        lambda _: jax.lax.cond(opens_any, _branch_open, _branch_normal, None),
+        None,
+    )
 
 
 def _action_value_to_index(action_value: jnp.int32) -> jnp.int32:
