@@ -82,12 +82,44 @@ def _des_factory(
         if fallback is None:
             raise
         return fallback
+    return _des_factory_from_source(src, fallback=fallback)
 
+
+def _des_factory_from_source(
+    src: str,
+    *,
+    fallback: Optional[Callable[[jax.Array], EnvState]] = None,
+) -> Callable[[jax.Array], EnvState]:
+    """Like ``_des_factory`` but takes raw .des source (for templated envs).
+
+    Probe-invokes once with a dummy PRNGKey so runtime-level breakage
+    (e.g. unknown monster names) falls back to the LG builder instead
+    of surfacing at agent-rollout time.
+    """
     try:
         factory = _dp.des_to_factory(src, w=80, h=21)
     except Exception:
         if fallback is None:
             raise
+        return fallback
+
+    # Probe build to catch directives the parser accepts at AST time but
+    # the LG emitter rejects at run time (e.g. monster names missing from
+    # the MONSTERS table).  Use a stable test key.
+    #
+    # ``des_to_factory`` swallows exceptions from ``inner.get_factory()``
+    # and returns the LG instance instead of an EnvState; require an
+    # ``EnvState``-shaped object (with ``.terrain``) to consider the
+    # factory healthy.
+    try:
+        result = factory(jax.random.PRNGKey(0))
+    except Exception:
+        if fallback is None:
+            raise
+        return fallback
+    if not hasattr(result, "terrain"):
+        if fallback is None:
+            return factory
         return fallback
     return factory
 
@@ -369,13 +401,19 @@ def _corridor_builder(n_rooms: int) -> Callable[[LevelGenerator], None]:
 
 
 def _register_corridor_envs(register_fn) -> None:
-    """Register Corridor-R2/R3/R5 + CorridorBattle envs (Group A)."""
-    for env_id, n_rooms in [
-        ("MiniHack-Corridor-R2-v0", 2),
-        ("MiniHack-Corridor-R3-v0", 3),
-        ("MiniHack-Corridor-R5-v0", 5),
+    """Register Corridor-R2/R3/R5 + CorridorBattle envs (Group A).
+
+    Corridor-R{2,3,5} ship with static vendor ``corridor{2,3,5}.des``
+    (vendor/minihack/minihack/envs/corridor.py:29-39); route those through
+    the des_parser with the procedural LG builder as a fallback.
+    """
+    for env_id, n_rooms, des_name in [
+        ("MiniHack-Corridor-R2-v0", 2, "corridor2.des"),
+        ("MiniHack-Corridor-R3-v0", 3, "corridor3.des"),
+        ("MiniHack-Corridor-R5-v0", 5, "corridor5.des"),
     ]:
-        factory = _make_factory(_corridor_builder(n_rooms), w=76, h=21)
+        fallback = _make_factory(_corridor_builder(n_rooms), w=76, h=21)
+        factory = _des_factory(des_name, fallback=fallback)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=1000, category="Corridor")
 
@@ -460,16 +498,24 @@ def _hidenseek_builder(big: bool, lava: bool) -> Callable[[LevelGenerator], None
 
 
 def _register_hidenseek_envs(register_fn) -> None:
+    """Register HideNSeek envs.
+
+    All 4 variants ship with a static vendor .des
+    (vendor/minihack/minihack/envs/hidenseek.py:9-27).  Route each through
+    the des_parser with the procedural LG builder as a fallback.
+    """
     variants = [
-        ("MiniHack-HideNSeek-v0",        False, False),
-        ("MiniHack-HideNSeek-Mapped-v0", False, False),
-        ("MiniHack-HideNSeek-Lava-v0",   False, True),
-        ("MiniHack-HideNSeek-Big-v0",    True,  False),
+        # (env_id, big, lava, des_name)
+        ("MiniHack-HideNSeek-v0",        False, False, "hidenseek.des"),
+        ("MiniHack-HideNSeek-Mapped-v0", False, False, "hidenseek_mapped.des"),
+        ("MiniHack-HideNSeek-Lava-v0",   False, True,  "hidenseek_lava.des"),
+        ("MiniHack-HideNSeek-Big-v0",    True,  False, "hidenseek_big.des"),
     ]
-    for env_id, big, lava in variants:
-        factory = _make_factory(
+    for env_id, big, lava, des_name in variants:
+        fallback = _make_factory(
             _hidenseek_builder(big, lava), w=25, h=18,
         )
+        factory = _des_factory(des_name, fallback=fallback)
         rm = _lava_avoid_reward_manager() if lava else _default_goal_reward_manager()
         register_fn(env_id, factory, rm,
                     max_steps=200, category="HideNSeek")
@@ -494,7 +540,35 @@ def _keyroom_builder(room_size: int, subroom_size: int,
     return build
 
 
+def _keyroom_templated_des(room_size: int, subroom_size: int,
+                           lit: bool) -> Optional[str]:
+    """Render ``key_and_door_tmp.des`` with RS/SS substitutions.
+
+    Mirrors vendor ``KeyRoomGenerator`` (envs/keyroom.py:13-27).  Returns
+    ``None`` if the template is unreadable so the caller can keep the
+    procedural LG fallback.
+    """
+    try:
+        with open(_vendor_des_path("key_and_door_tmp.des"),
+                  "r", encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError:
+        return None
+    src = src.replace("RS", str(room_size)).replace("SS", str(subroom_size))
+    if not lit:
+        src = src.replace("lit", "unlit")
+    return src
+
+
 def _register_keyroom_envs(register_fn) -> None:
+    """Register all KeyRoom envs.
+
+    Fixed-S5 ships with the static ``key_and_door.des``
+    (vendor/minihack/minihack/envs/keyroom.py:82); the other variants are
+    materialised by ``KeyRoomGenerator`` from ``key_and_door_tmp.des``
+    with RS/SS/lit substitutions (envs/keyroom.py:13-27).  We render the
+    template ourselves and feed the resulting source to the des_parser.
+    """
     variants = [
         # (env_id, room_size, subroom_size, lit, max_steps)
         ("MiniHack-KeyRoom-Fixed-S5-v0", 5,  2, True,  200),
@@ -508,15 +582,14 @@ def _register_keyroom_envs(register_fn) -> None:
             _keyroom_builder(rs, ss, lit),
             w=max(20, rs + 2), h=max(20, rs + 2), lit=lit,
         )
-        # MiniHack-KeyRoom-Fixed-S5-v0 ships with a static vendor .des
-        # (key_and_door.des); the other variants are generated procedurally
-        # by KeyRoomGenerator at runtime (vendor envs/keyroom.py:14-27), so
-        # we keep the LG fallback for those.  Cite:
-        #   vendor/minihack/minihack/envs/keyroom.py:82
         if env_id == "MiniHack-KeyRoom-Fixed-S5-v0":
             factory = _des_factory("key_and_door.des", fallback=fallback)
         else:
-            factory = fallback
+            tmpl = _keyroom_templated_des(rs, ss, lit)
+            if tmpl is None:
+                factory = fallback
+            else:
+                factory = _des_factory_from_source(tmpl, fallback=fallback)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=ms, category="KeyRoom")
 
@@ -586,7 +659,17 @@ def _register_lavacross_envs(register_fn) -> None:
          dict(with_potion=True,  with_ring=False, inv=False)),
     ]
     for env_id, kw in skill_variants:
-        factory = _make_factory(_lavacross_builder(**kw), w=18, h=10)
+        fallback = _make_factory(_lavacross_builder(**kw), w=18, h=10)
+        # MiniHack-LavaCross-Full and -Restricted are the only LavaCross
+        # variants that use the shipped lava_crossing.des
+        # (vendor/minihack/minihack/envs/skills_lava.py:339-358).  The other
+        # Levitate-* variants build their .des inline as Python strings,
+        # so we keep the LG fallback for those.
+        if env_id in ("MiniHack-LavaCross-Full-v0",
+                      "MiniHack-LavaCross-Restricted-v0"):
+            factory = _des_factory("lava_crossing.des", fallback=fallback)
+        else:
+            factory = fallback
         register_fn(env_id, factory, _lava_avoid_reward_manager(),
                     max_steps=200, category="LavaCross")
 
@@ -677,10 +760,8 @@ def _register_sokoban_envs(register_fn) -> None:
         fallback = _make_factory(
             _sokoban_builder(level, variant), w=12, h=10,
         )
-        if env_id == "MiniHack-Sokoban1a-v0":
-            factory = _des_factory("soko1a.des", fallback=fallback)
-        else:
-            factory = fallback
+        des_name = f"soko{level}{variant}.des"
+        factory = _des_factory(des_name, fallback=fallback)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=400, category="Sokoban")
 
@@ -854,12 +935,21 @@ def _quest_builder(difficulty: str) -> Callable[[LevelGenerator], None]:
 
 
 def _register_quest_envs(register_fn) -> None:
-    for env_id, diff in [
-        ("MiniHack-Quest-Easy-v0",   "easy"),
-        ("MiniHack-Quest-Medium-v0", "medium"),
-        ("MiniHack-Quest-Hard-v0",   "hard"),
+    """Register Quest envs.
+
+    All 3 variants ship with static vendor .des files
+    (vendor/minihack/minihack/envs/skills_quest.py:10-24).  Hard.des
+    references a ``Minotaur`` monster the Minihax MONSTERS table does
+    not yet include; the _des_factory probe-build catches that and
+    falls back to the LG builder.  See MINIHAX_PARSER_GAPS.md.
+    """
+    for env_id, diff, des_name in [
+        ("MiniHack-Quest-Easy-v0",   "easy",   "quest_easy.des"),
+        ("MiniHack-Quest-Medium-v0", "medium", "quest_medium.des"),
+        ("MiniHack-Quest-Hard-v0",   "hard",   "quest_hard.des"),
     ]:
-        factory = _make_factory(_quest_builder(diff), w=25, h=10)
+        fallback = _make_factory(_quest_builder(diff), w=25, h=10)
+        factory = _des_factory(des_name, fallback=fallback)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=1000, category="Quest")
 
@@ -881,13 +971,21 @@ def _memento_builder(variant: str) -> Callable[[LevelGenerator], None]:
 
 
 def _register_memento_envs(register_fn) -> None:
+    """Register Memento envs.
+
+    All 3 variants ship with static vendor .des files
+    (vendor/minihack/minihack/envs/memento.py:28-43): Short-F2 → memento_short,
+    F2 → memento_easy, F4 → memento_hard.
+    """
     variants = [
-        ("MiniHack-Memento-Short-F2-v0", "short", 200),
-        ("MiniHack-Memento-F2-v0",       "med",   400),
-        ("MiniHack-Memento-F4-v0",       "med",   400),
+        # (env_id, builder_variant, max_steps, des_name)
+        ("MiniHack-Memento-Short-F2-v0", "short", 200, "memento_short.des"),
+        ("MiniHack-Memento-F2-v0",       "med",   400, "memento_easy.des"),
+        ("MiniHack-Memento-F4-v0",       "med",   400, "memento_hard.des"),
     ]
-    for env_id, v, ms in variants:
-        factory = _make_factory(_memento_builder(v), w=22, h=12)
+    for env_id, v, ms, des_name in variants:
+        fallback = _make_factory(_memento_builder(v), w=22, h=12)
+        factory = _des_factory(des_name, fallback=fallback)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=ms, category="Memento")
 
@@ -1226,14 +1324,13 @@ def _register_exploremaze_envs(register_fn) -> None:
     #   Easy-Mapped    -> exploremazeeasy_premapped.des
     #   Hard           -> exploremazehard.des
     #   Hard-Mapped    -> exploremazehard_premapped.des
-    # Route Easy through the des_parser; keep the others on the LG
-    # fallback until the parser's premapped/visibility plumbing matures
-    # (see DES_PARSER_GAPS.md).
+    # All four parse and build via the des_parser; the LG builder remains
+    # as a safety fallback if the probe-build raises (see _des_factory).
     variants = [
-        ("MiniHack-ExploreMaze-Easy-v0",         False, "exploremazeeasy.des"),
-        ("MiniHack-ExploreMaze-Easy-Mapped-v0",  False, None),
-        ("MiniHack-ExploreMaze-Hard-v0",         True,  None),
-        ("MiniHack-ExploreMaze-Hard-Mapped-v0",  True,  None),
+        ("MiniHack-ExploreMaze-Easy-v0",        False, "exploremazeeasy.des"),
+        ("MiniHack-ExploreMaze-Easy-Mapped-v0", False, "exploremazeeasy_premapped.des"),
+        ("MiniHack-ExploreMaze-Hard-v0",        True,  "exploremazehard.des"),
+        ("MiniHack-ExploreMaze-Hard-Mapped-v0", True,  "exploremazehard_premapped.des"),
     ]
     for env_id, hard, des_name in variants:
         fallback = _make_factory(_exploremaze_builder(hard), w=22, h=14)
