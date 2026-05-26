@@ -782,11 +782,27 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     bump_hp = jnp.maximum(jnp.int32(0), state.player_hp - new_features[1])
     new_features = new_features[0]
 
+    # --- Drag ball-and-chain on punished movement (vendor ball.c::drag_ball) ---
+    # Vendor lines 560-870: when the hero takes a step while ``Punished``, the
+    # iron ball is repositioned so it stays within Chebyshev distance ≤ 2.
+    # Simplification: the ball lands on the hero's prior tile each step (a
+    # subset of vendor's collision behavior — vendor allows the ball to stay
+    # put when the new player tile is still within range, but always within
+    # 2 tiles of player).  In Nethax we model the strict "ball follows on
+    # the previous tile" subset which preserves the |dist| ≤ 1 invariant.
+    moved = can_move & jnp.any(new_pos != pos.astype(jnp.int16))
+    new_ball_pos = jnp.where(
+        state.is_punished & moved,
+        pos.astype(jnp.int16),
+        state.ball_pos,
+    )
+
     state_mid = state.replace(
         player_pos=new_pos,
         features=new_features,
         terrain=new_terrain,
         player_hp=bump_hp,
+        ball_pos=new_ball_pos,
     )
 
     # --- Trap triggering (trap.c dotrap) ---
