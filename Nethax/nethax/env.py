@@ -431,10 +431,26 @@ def _step_impl(state, action, rng):
 
         # 6. age_spells — vendor/nethack/src/spell.c::age_spells (called
         #    from allmain.c line 355).  Decrement every spell_memory > 0
-        #    by 1.
+        #    by 1, or by 2 when the hero is Confused (vendor doubles the
+        #    decay under confusion — Wave 47i parity).
+        from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS_spell
         magic = ns.magic
-        new_mem = jnp.maximum(magic.spell_memory - jnp.int32(1), jnp.int32(0))
+        is_confused = ns.status.timed_statuses[int(_TS_spell.CONFUSION)] > jnp.int32(0)
+        decrement = jnp.where(is_confused, jnp.int32(2), jnp.int32(1))
+        new_mem = jnp.maximum(magic.spell_memory - decrement, jnp.int32(0))
         ns = ns.replace(magic=magic.replace(spell_memory=new_mem))
+
+        # 6b. Calendar tick — cycle moonphase every 250 turns (Wave 47i
+        # approximation of vendor calendar.c).  Mirrors flags.moonphase
+        # cycle (new→waxing→full→waning).  Used by luck-drift baseluck
+        # and were_change rate.
+        moon_advance = (ns.timestep % jnp.int32(250)) == jnp.int32(0)
+        new_moon = jnp.where(
+            moon_advance,
+            (ns.calendar_moonphase.astype(jnp.int32) + jnp.int32(1)) % jnp.int32(4),
+            ns.calendar_moonphase.astype(jnp.int32),
+        ).astype(jnp.int8)
+        ns = ns.replace(calendar_moonphase=new_moon)
 
         # 7. Shop tick — Wave 6 #47 (pay-at-exit + angry shopkeeper pursuit).
         #    Vendor: shk.c invoked from moveloop's per-turn block.
@@ -477,18 +493,23 @@ def _step_impl(state, action, rng):
             is_aggr, jnp.zeros_like(mai.sleep_timer), mai.sleep_timer
         )
 
-        # Effect 4: nasty — summon a high-difficulty demon at first
+        # Effect 4: nasty — summon a high-difficulty monster at first
         # dead monster slot.  Vendor nasty() picks from a 44-species
-        # nasties[] pool; this MVP picks uniformly from a 3-demon set
-        # (water demon=297, horned devil=299, barbed devil=301).
+        # nasties[] pool; this expanded set covers a representative
+        # 10-monster slice across demons/devils/giant beasts:
+        #   297 water demon     299 horned devil    300 erinys
+        #   301 barbed devil    302 marilith        307 nalfeshnee
+        #   150 red dragon       49 master mind flayer
+        #   182 jabberwock      234 vampire lord
         is_nasty = wiz_just_died & (which == jnp.int32(4))
         rng_iv3, rng_iv4 = jax.random.split(rng_iv2, 2)
-        nasty_pick_roll = jax.random.randint(rng_iv3, (), 0, 3, dtype=jnp.int32)
-        nasty_entry = jnp.where(
-            nasty_pick_roll == jnp.int32(0), jnp.int16(297),
-            jnp.where(nasty_pick_roll == jnp.int32(1), jnp.int16(299),
-                                                      jnp.int16(301)),
+        _NASTY_POOL = jnp.array(
+            [297, 299, 300, 301, 302, 307, 150, 49, 182, 234], dtype=jnp.int16
         )
+        nasty_pick_roll = jax.random.randint(
+            rng_iv3, (), 0, _NASTY_POOL.shape[0], dtype=jnp.int32
+        )
+        nasty_entry = _NASTY_POOL[nasty_pick_roll]
         dead_slots = ~new_asleep & ~mai.alive   # logic-only: use alive only
         dead_mask = ~mai.alive
         any_dead = jnp.any(dead_mask)

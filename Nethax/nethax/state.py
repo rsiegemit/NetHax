@@ -130,6 +130,15 @@ class EnvState:
     occupation_target: jax.Array     # int32  monster slot / item idx
     occupation_remaining: jax.Array  # int8   turns left
 
+    # ---- Wave 47i: calendar (vendor calendar.c / flags.moonphase) -----
+    # Approximate vendor's astronomical lookup with a 250-turn cycle:
+    # ``calendar_moonphase`` cycles 0..3 (new→waxing→full→waning); ``
+    # calendar_friday13`` is False in default play.  Used by luck-drift
+    # baseluck and were_change probability.
+    # Cite: vendor/nethack/include/flag.h flags.moonphase / friday13.
+    calendar_moonphase: jax.Array    # int8 in [0, 3]
+    calendar_friday13: jax.Array     # bool
+
     # ---- Wave 47h: ball-as-projectile state (vendor ball.c::drop_ball) -
     # Tracks when the hero throws the ball at a trap to escape (vendor
     # drop_ball lines 882-961).  Once thrown, the ball is in flight for
@@ -320,6 +329,8 @@ class EnvState:
             occupation_remaining=jnp.int8(0),
             ball_thrown_pos=jnp.array([-1, -1], dtype=jnp.int16),
             ball_thrown_turns=jnp.int8(0),
+            calendar_moonphase=jnp.int8(0),
+            calendar_friday13=jnp.bool_(False),
             # player core
             player_pos=jnp.zeros((2,), dtype=jnp.int16),
             player_hp=jnp.int32(10),
