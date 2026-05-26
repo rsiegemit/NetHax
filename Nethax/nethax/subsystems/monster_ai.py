@@ -4658,6 +4658,112 @@ def maybe_wake_monster(state, monster_idx: jnp.ndarray, rng: jax.Array = None):
 
 
 # ---------------------------------------------------------------------------
+# postmov() — vendor monmove.c::postmov lines 1455-1707.
+# ---------------------------------------------------------------------------
+#
+# Per-turn post-move dispatch.  After each monster's m_move/dog_move call,
+# vendor postmov():
+#   * fires mintrap() on the new tile (lines 1509-1516) so a freshly-stepped
+#     monster trips the trap it just walked onto;
+#   * runs m_postmove_effect() for hezrou stench / steam-vortex cloud
+#     (lines 2049 + 672-683 — outside the moved-this-turn block);
+#   * refreshes visibility via newsym() / vision_recalc on the monster's
+#     new tile (lines 1508, 1658).
+#
+# JAX-required divergence:
+#   * Vision refresh: Nethax does not maintain a viz_array overlay; visibility
+#     is recomputed on demand via subsystems/vision.couldsee.  We instead
+#     update the per-monster ``last_seen_player_pos`` so the next-turn AI
+#     uses the freshest player coordinate when LoS holds — the closest
+#     analogue to vendor's per-tile newsym() effect on a JAX state shape.
+#   * ``inroom`` flag: vendor caches in_rooms(mx, my) on each monster
+#     (mtmp->mroom) and updates it post-move.  Nethax has no per-monster
+#     room id slot; recompute is punted until that field is added.
+#   * Tile effects: minimum useful subset — vendor mintrap(NO_TRAP_FLAGS) is
+#     a thick dispatch (door-collapse, lava sink, water drown, pit fall, …).
+#     We focus on the two cases that already have monster-aware effects
+#     wired in this codebase: (1) trap reveal for any trap on the tile,
+#     mirroring vendor's "monster sets off the trap" → tile becomes known
+#     to the player, and (2) lava/water tile entry which is currently
+#     resolved player-side only.  Full mintrap-for-monsters and the
+#     hezrou/steam-vortex cloud emit are documented punts.
+# ---------------------------------------------------------------------------
+
+# Tile type constants — keep local to avoid an import cycle with constants.tiles
+# (loaded from many other subsystems).  Values mirror TileType in
+# Nethax/nethax/constants/tiles.py.
+_TILE_LAVA: int = 13   # TileType.LAVA
+_TILE_POOL: int = 12   # TileType.POOL / shallow water
+
+
+def _postmov_per_monster(state, monster_idx: jnp.ndarray) -> object:
+    """Run vendor postmov() side-effects for a single monster slot.
+
+    Cite: vendor/nethack/src/monmove.c::postmov lines 1455-1707.
+
+    Minimum-scope JAX port (see header notes):
+      * If the monster's current tile holds a trap, mark it revealed so the
+        player learns of it (vendor trap.c::mintrap reveal step).
+      * Refresh ``last_seen_player_pos`` when LoS holds after the move
+        (vendor newsym + couldsee combo on the new tile).
+      * Lava/water effects on the monster are an explicit punt — see header.
+
+    JIT-pure.  No-op for dead / out-of-bounds slots.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    alive = mai.alive[idx]
+
+    mpos = mai.pos[idx].astype(jnp.int32)
+    mr, mc = mpos[0], mpos[1]
+
+    h = _MAP_H
+    w = _MAP_W
+    in_bounds = (mr >= 0) & (mr < h) & (mc >= 0) & (mc < w)
+    active = alive & in_bounds
+
+    # ---- Tile-effect: reveal a trap if the monster is standing on one ----
+    # Vendor mintrap(NO_TRAP_FLAGS) handles trigger + reveal; we keep the
+    # reveal half (player-knowledge mark) which is the only piece visible
+    # to downstream subsystems on a per-monster basis.  Damage to monsters
+    # from traps is wired through trigger_trap when invoked by callers
+    # explicitly (see traps.trigger_trap signature taking victim_pos).
+    traps = getattr(state, "traps", None)
+    if traps is not None:
+        # Use the same flat-level addressing as subsystems/traps._flat_level_idx
+        # (state.terrain.shape[1] = max levels per branch).
+        max_lv_per_branch = jnp.int32(state.terrain.shape[1])
+        b  = state.dungeon.current_branch.astype(jnp.int32)
+        lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+        flat_lv = b * max_lv_per_branch + lv
+        safe_lv = jnp.clip(flat_lv, 0, traps.trap_type.shape[0] - 1)
+        safe_r = jnp.clip(mr, 0, traps.trap_type.shape[1] - 1)
+        safe_c = jnp.clip(mc, 0, traps.trap_type.shape[2] - 1)
+        trap_here = traps.trap_type[safe_lv, safe_r, safe_c] != jnp.int8(0)
+        do_reveal = active & trap_here
+        new_rev = traps.revealed.at[safe_lv, safe_r, safe_c].set(
+            jnp.where(do_reveal, jnp.bool_(True), traps.revealed[safe_lv, safe_r, safe_c])
+        )
+        new_traps = traps.replace(revealed=new_rev)
+        state = state.replace(traps=new_traps)
+        mai = state.monster_ai  # refresh local handle
+
+    # ---- last_seen_player_pos refresh (vendor newsym/cansee chain) ----
+    # If the post-move tile has clear LoS to the player and the player is
+    # not invisible / hidden, the monster "sees" them — same refresh the
+    # bump-attack and move branches do, applied generically so a monster
+    # that didn't move but is still active still gets the update.
+    can_see_now = monster_can_see_player(state, idx) & active
+    ppos_i16 = state.player_pos.astype(jnp.int16)
+    old_seen = mai.last_seen_player_pos[idx]
+    new_seen = jnp.where(can_see_now, ppos_i16, old_seen)
+    new_mai = mai.replace(
+        last_seen_player_pos=mai.last_seen_player_pos.at[idx].set(new_seen),
+    )
+    return state.replace(monster_ai=new_mai)
+
+
+# ---------------------------------------------------------------------------
 # Single-monster turn  (src/monmove.c::m_move) — Wave 5 refactor
 # ---------------------------------------------------------------------------
 
@@ -4840,7 +4946,10 @@ def monster_turn(state, rng: jax.Array, monster_idx: jnp.ndarray) -> object:
                 )
                 return s2.replace(monster_ai=new_m)
 
-            return jax.lax.cond(steps_onto_player, _attack, _move, st)
+            new_st = jax.lax.cond(steps_onto_player, _attack, _move, st)
+            # --- vendor postmov() per-tile refresh (monmove.c:1455-1707) ---
+            # Run after the move/attack so reveal + LoS pick up the new tile.
+            return _postmov_per_monster(new_st, idx)
 
         return jax.lax.cond(should_act, _act, lambda st: st, s)
 
