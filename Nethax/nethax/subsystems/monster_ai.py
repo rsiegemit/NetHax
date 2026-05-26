@@ -2343,9 +2343,43 @@ def _try_bullwhip_disarm(state, rng: jax.Array, monster_idx: jnp.ndarray):
            <= jnp.int32(1))
     has_wielded = state.inventory.wielded >= jnp.int8(0)
     can_disarm = found & adj & has_wielded
+    # Wave 47i: vendor muse.c:2178-2193 transfers the disarmed weapon to
+    # the monster's inventory (relobj path).  Copy player's wielded item
+    # into monster's first free minvent slot, then zero the player's
+    # inventory slot and unwield.
+    safe_w = jnp.clip(state.inventory.wielded.astype(jnp.int32), 0,
+                       state.inventory.items.category.shape[0] - 1)
+    w_cat = state.inventory.items.category[safe_w]
+    w_tid = state.inventory.items.type_id[safe_w]
+    w_qty = state.inventory.items.quantity[safe_w]
+
+    # First free monster inv slot (>0 to preserve slot 0).
+    inv_cats = mai.inv_category[idx].astype(jnp.int32)
+    free_mask = inv_cats == jnp.int32(0)
+    free_mask = free_mask.at[0].set(False)
+    any_free = jnp.any(free_mask)
+    free_slot = jnp.argmax(free_mask.astype(jnp.int32)).astype(jnp.int32)
+    do_transfer = can_disarm & any_free
+
+    new_mcat = jnp.where(do_transfer, w_cat, mai.inv_category[idx, free_slot])
+    new_mtid = jnp.where(do_transfer, w_tid, mai.inv_type_id[idx, free_slot])
+    new_mqty = jnp.where(do_transfer, w_qty, mai.inv_quantity[idx, free_slot])
+    new_mai = mai.replace(
+        inv_category=mai.inv_category.at[idx, free_slot].set(new_mcat),
+        inv_type_id=mai.inv_type_id.at[idx, free_slot].set(new_mtid),
+        inv_quantity=mai.inv_quantity.at[idx, free_slot].set(new_mqty),
+    )
+
+    # Zero player's inventory slot and unwield.
+    new_pcat = jnp.where(do_transfer, jnp.int8(0), state.inventory.items.category[safe_w])
+    new_pqty = jnp.where(do_transfer, jnp.int16(0), state.inventory.items.quantity[safe_w])
+    new_items = state.inventory.items.replace(
+        category=state.inventory.items.category.at[safe_w].set(new_pcat),
+        quantity=state.inventory.items.quantity.at[safe_w].set(new_pqty),
+    )
     new_wielded = jnp.where(can_disarm, jnp.int8(-1), state.inventory.wielded)
-    new_inv = state.inventory.replace(wielded=new_wielded)
-    return state.replace(inventory=new_inv)
+    new_inv = state.inventory.replace(items=new_items, wielded=new_wielded)
+    return state.replace(inventory=new_inv, monster_ai=new_mai)
 
 
 def _try_blow_horn(state, rng: jax.Array, monster_idx: jnp.ndarray,
