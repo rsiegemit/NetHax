@@ -324,10 +324,30 @@ def test_scroll_identify_marks_item_identified():
     )
 
 
+@pytest.mark.timeout(900)
 def test_scroll_teleportation_moves_player():
-    """SCR_TELEPORTATION — vendor tele()."""
+    """SCR_TELEPORTATION — vendor tele().
+
+    Wave 43d: the helper ``_state_with_scroll`` returns a default
+    EnvState whose terrain is all ``TileType.UNKNOWN`` (=0), and
+    ``_teleds`` only accepts walkable tiles — so the 40-try rejection
+    loop never finds a destination and the player stays put.  Paint a
+    floor patch on the current level so the teleport has somewhere
+    valid to land.
+
+    Cite: vendor/nethack/src/teleport.c::safe_teleds lines 716-770;
+          vendor/nethack/src/read.c::seffect_teleportation.
+    """
     state = _state_with_scroll(ScrollEffect.TELEPORTATION)
     state = state.replace(player_pos=jnp.array([10, 10], dtype=jnp.int16))
+    b  = int(state.dungeon.current_branch)
+    lv = int(state.dungeon.current_level) - 1
+    # Paint a wide floor band so safe_teleds finds a valid tile.
+    floor_layer = jnp.full(
+        state.terrain[b, lv].shape, int(TileType.FLOOR), dtype=state.terrain.dtype
+    )
+    state = state.replace(terrain=state.terrain.at[b, lv].set(floor_layer))
+
     moved = False
     for seed in range(10):
         rng = jax.random.PRNGKey(seed)
@@ -422,8 +442,19 @@ def test_wand_light_marks_all_explored():
     assert not bool(result.explored[0, 0])
 
 
+@pytest.mark.timeout(900)
 def test_wand_digging_carves_wall():
-    """WAN_DIGGING — vendor dig_map turns WALL into corridor."""
+    """WAN_DIGGING — vendor dig_map turns WALL into OPEN_DOOR (D_NODOOR).
+
+    Wave D12 rebalance: in non-maze levels vendor zap.c:1725 carves WALL
+    tiles into D_NODOOR (open doorway), not CORRIDOR.  CORRIDOR is the
+    outcome only for *stone* tiles (zap.c:1731).  Older assertions
+    expected CORRIDOR; updated to match the per-tile outcomes in
+    Nethax/nethax/subsystems/items_wands.py::_effect_digging lines
+    1220-1230.
+
+    Cite: vendor/nethack/src/dig.c lines 1714-1731.
+    """
     state = _wand_state_with_wand(WandEffect.DIGGING, player_row=10, player_col=10)
     # Place WALL north of player.
     new_terrain = state.terrain
@@ -433,9 +464,9 @@ def test_wand_digging_carves_wall():
     result = zap_wand(state, _RNG, slot_idx=jnp.int32(0), direction=jnp.int32(0))
     changed = 0
     for row in range(3, 10):
-        if int(result.terrain[row, 10]) == int(TileType.CORRIDOR):
+        if int(result.terrain[row, 10]) == int(TileType.OPEN_DOOR):
             changed += 1
-    assert changed > 0, "WAN_DIGGING should carve WALL tiles into CORRIDOR"
+    assert changed > 0, "WAN_DIGGING should carve WALL tiles into OPEN_DOOR"
 
 
 def test_wand_opening_unlocks_doors():
