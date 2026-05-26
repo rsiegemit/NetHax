@@ -719,8 +719,12 @@ def _h_instrument(state, rng: jax.Array) -> object:
     )
 
     # DRUM_OF_EARTHQUAKE: wake every sleeping monster within force radius
-    # 9 (vendor music.c:344-475 — also creates pits, but Nethax doesn't
-    # model dynamic pit creation here; emit the wake-cascade only).
+    # 9 AND create up to rn2(6) = 0..5 PIT traps on random walkable tiles
+    # within 9 cells of the player.  Vendor music.c:344-475 (do_earthquake)
+    # iterates the full -2*force..+2*force square around the hero and rolls
+    # rn2(14-force) per tile to decide whether to do_pit().  Nethax models
+    # the simplified per-call PIT count specified in the task spec.
+    # Cite: vendor/nethack/src/music.c::do_earthquake lines 344-475.
     is_drum = tid == jnp.int32(_DRUM_OF_EARTHQUAKE_TID)
     drum_targets = mai.alive & mai.asleep & (dist <= jnp.int32(9))
     new_asleep_drum = jnp.where(
@@ -728,6 +732,10 @@ def _h_instrument(state, rng: jax.Array) -> object:
         jnp.where(drum_targets, jnp.zeros(MAX_MONSTERS_PER_LEVEL, dtype=bool), new_asleep_tooled),
         new_asleep_tooled,
     )
+
+    # ---- Pit creation (only when is_drum) -------------------------------
+    rng, sub_drum = jax.random.split(rng)
+    new_traps = _drum_create_pits(state, sub_drum, is_drum)
 
     mai_out = mai.replace(
         asleep=new_asleep_drum,
@@ -739,7 +747,113 @@ def _h_instrument(state, rng: jax.Array) -> object:
     return state.replace(
         monster_ai=mai_out,
         inventory=inv.replace(items=new_items_hop),
+        traps=new_traps,
     )
+
+
+# ---------------------------------------------------------------------------
+# DRUM_OF_EARTHQUAKE pit-creation helper.
+# Cite: vendor/nethack/src/music.c::do_earthquake (lines 344-475).
+#
+# Vendor: for every tile in a square of side 2*force around the hero, with
+# probability 1/(14-force) (force=10 → ~1/4 chance), invoke do_pit() which
+# converts ROOM/CORR (and several special tiles) into a PIT trap.
+#
+# Nethax simplification (per task spec):
+#   * Sample n_pits = rn2(6) ∈ {0..5}.
+#   * Sample 5 random (dr, dc) offsets in [-9, +9]^2.
+#   * For the first n_pits candidates whose target tile is in-bounds,
+#     walkable, and not already trapped: place a PIT trap there.
+#
+# JIT-purity: lax.scan over a fixed 5-iteration loop; all gating done via
+# jnp.where over the trap_type array .at[...].set(...) updates.
+# ---------------------------------------------------------------------------
+_DRUM_MAX_PIT_CANDIDATES = 5
+
+
+def _drum_create_pits(state, rng: jax.Array, is_drum: jax.Array):
+    """Place up to rn2(6) PIT traps on walkable tiles within 9 of the hero.
+
+    Returns the (possibly updated) TrapState.  When ``is_drum`` is False,
+    no writes fire (per-step gate masks them off) but the structure is
+    preserved so the caller can pass through unchanged.
+    """
+    from Nethax.nethax.subsystems.features import _flat_lv_from_state
+    from Nethax.nethax.constants.tiles import TileType
+    from Nethax.nethax.subsystems.traps import TrapType
+
+    traps = state.traps
+    flat_lv = _flat_lv_from_state(state).astype(jnp.int32)
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    terrain_level = state.terrain[
+        state.dungeon.current_branch.astype(jnp.int32),
+        state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1),
+    ]
+    map_h = jnp.int32(terrain_level.shape[0])
+    map_w = jnp.int32(terrain_level.shape[1])
+
+    # Walkable / pit-eligible tile types — conservative subset of vendor
+    # do_pit() accept list (ROOM/CORR/DOOR/SCORR/THRONE/SINK/FOUNTAIN/
+    # ALTAR/GRAVE); we use the open / walkable Nethax tile codes.
+    PIT_OK_TILES = jnp.array(
+        [
+            int(TileType.FLOOR),
+            int(TileType.CORRIDOR),
+            int(TileType.OPEN_DOOR),
+        ],
+        dtype=jnp.int32,
+    )
+
+    # Sample n_pits = rn2(6) once.
+    rng, k_n, k_offs = jax.random.split(rng, 3)
+    n_pits = jax.random.randint(k_n, (), 0, 6, dtype=jnp.int32)
+
+    # Per-candidate keys: 1 key each, split into row/col draws.
+    cand_keys = jax.random.split(k_offs, _DRUM_MAX_PIT_CANDIDATES)
+
+    def _per_candidate_offsets(k):
+        k1, k2 = jax.random.split(k, 2)
+        dr = jax.random.randint(k1, (), -9, 10, dtype=jnp.int32)
+        dc = jax.random.randint(k2, (), -9, 10, dtype=jnp.int32)
+        return jnp.stack([dr, dc])
+
+    offsets = jax.vmap(_per_candidate_offsets)(cand_keys)  # [N_CAND, 2]
+
+    no_trap_code = jnp.int8(int(TrapType.NO_TRAP))
+    pit_code     = jnp.int8(int(TrapType.PIT))
+
+    def _per_pit(carry, args):
+        trap_type_arr = carry
+        i, off = args
+        eligible_count = (i < n_pits) & is_drum
+        tr = pr + off[0]
+        tc = pc + off[1]
+        in_bounds = (
+            (tr >= jnp.int32(0)) & (tr < map_h)
+            & (tc >= jnp.int32(0)) & (tc < map_w)
+        )
+        str_ = jnp.clip(tr, 0, map_h - 1)
+        stc_ = jnp.clip(tc, 0, map_w - 1)
+        tile_t = terrain_level[str_, stc_].astype(jnp.int32)
+        walkable = jnp.any(PIT_OK_TILES == tile_t)
+        # Don't overwrite an existing trap.
+        existing = trap_type_arr[flat_lv, str_, stc_]
+        empty_trap = existing == no_trap_code
+        do_place = eligible_count & in_bounds & walkable & empty_trap
+        new_trap_type = jnp.where(
+            do_place,
+            trap_type_arr.at[flat_lv, str_, stc_].set(pit_code),
+            trap_type_arr,
+        )
+        return new_trap_type, None
+
+    new_trap_type, _ = jax.lax.scan(
+        _per_pit,
+        traps.trap_type,
+        (jnp.arange(_DRUM_MAX_PIT_CANDIDATES, dtype=jnp.int32), offsets),
+    )
+    return traps.replace(trap_type=new_trap_type)
 
 
 # ---------------------------------------------------------------------------

@@ -263,6 +263,15 @@ class EnvState:
     probed_hp:  jax.Array  # int32  HP of the last probed monster; 0 = no probe
     probed_idx: jax.Array  # int32  MonsterAIState slot index; -1 = no probe
 
+    # ---- Unblind telepathy range (worn.c::recalc_telepat_range) ----
+    # Mirrors vendor ``u.unblind_telepat_range`` (you.h:406).  Recomputed on
+    # every wear/take-off as ``(BOLT_LIM * BOLT_LIM) * nobjs`` where ``nobjs``
+    # is the count of currently-worn items granting TELEPAT.  ``-1`` is the
+    # vendor sentinel for "no worn ESP source".
+    # Cite: vendor/nethack/src/worn.c::recalc_telepat_range lines 50-69;
+    #       vendor/nethack/src/u_init.c line 1021 (init -1).
+    unblind_telepat_range: jax.Array  # int32
+
     # ---- Terrain layers (kept at top level; subsystems read but rarely write) ----
     terrain: jax.Array          # int8[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]  tile type
     explored: jax.Array         # bool[N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H, MAP_W]
@@ -395,6 +404,9 @@ class EnvState:
             # probe result cache (apply.c::use_stethoscope / zap.c::probe_monster)
             probed_hp=jnp.int32(0),
             probed_idx=jnp.int32(-1),
+            # unblind telepathy range — vendor sentinel -1 = none
+            # (vendor/nethack/src/u_init.c:1021)
+            unblind_telepat_range=jnp.int32(-1),
             # terrain layers
             terrain=jnp.zeros((b, l, h, w), dtype=jnp.int8),
             explored=jnp.zeros((b, l, h, w), dtype=jnp.bool_),
