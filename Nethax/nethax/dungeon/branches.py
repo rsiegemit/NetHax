@@ -754,9 +754,10 @@ def generate_main_branch_l1_with_features(
     from Nethax.nethax.dungeon.rooms import (
         fill_ordinary_rooms,
         maybe_create_vault,
+        _place_niches,
     )
 
-    k_level, k_fill, k_vault = jax.random.split(rng, 3)
+    k_level, k_fill, k_vault, k_niche = jax.random.split(rng, 4)
 
     terrain, rooms, active, up_pos, dn_pos = generate_main_branch_l1(
         k_level, static_params
@@ -774,6 +775,12 @@ def generate_main_branch_l1_with_features(
     terrain, features, traps = maybe_create_vault(
         k_vault, rooms, active, terrain, features, traps, flat_lv=flat_lv,
     )
+
+    # vendor/nethack/src/mklev.c::make_niches lines 802-820 — late-stage
+    # niche feature pass: stamp fountain / sink / grave / throne onto two
+    # random room interiors.  Runs after fill_ordinary_rooms so the niche
+    # tiles only land on plain FLOOR cells the per-room roll didn't claim.
+    terrain = _place_niches(terrain, rooms, active, k_niche, n=2)
 
     return terrain, rooms, active, up_pos, dn_pos, features, traps
 

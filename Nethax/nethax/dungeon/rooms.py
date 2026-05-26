@@ -1493,6 +1493,113 @@ def make_niches(
 
 
 # ---------------------------------------------------------------------------
+# _place_niches — fixed-n post-generation niche pass
+# ---------------------------------------------------------------------------
+#
+# Vendor cite: vendor/nethack/src/mklev.c::make_niches lines 802-820.
+#
+#   ct = rnd((svn.nroom >> 1) + 1);
+#   while (ct--) makeniche(...);
+#
+# This helper is the level-gen-finalizer entry point used by
+# ``generate_main_branch_l1_with_features``.  It picks exactly ``n`` rooms
+# uniformly at random (with replacement) from the active set and stamps one
+# of {FOUNTAIN, SINK, GRAVE, THRONE} onto a uniformly-random interior cell
+# of each.  Unlike :func:`make_niches`, the count is fixed (so the trace is
+# constant-size for any ``n``) and there is no "trap variant" branch — this
+# is a pure level-polish pass that only writes feature tiles where the
+# current terrain is FLOOR (so it never overwrites carved walls, stairs,
+# doors, or earlier feature stamps).
+# ---------------------------------------------------------------------------
+
+
+def _place_niches(
+    terrain: jnp.ndarray,
+    rooms: Room,
+    active: jnp.ndarray,
+    rng: jnp.ndarray,
+    n: int = 2,
+) -> jnp.ndarray:
+    """Stamp ``n`` niche feature tiles onto random interior cells of random rooms.
+
+    Vendor citation: vendor/nethack/src/mklev.c::make_niches lines 802-820.
+    Vendor picks ``rnd((nroom/2)+1)`` niche cells and trap-bombs each one;
+    our JAX port uses a fixed count ``n`` (default 2) and substitutes a
+    uniform pick from {FOUNTAIN, SINK, GRAVE, THRONE} for the trap payload.
+
+    JIT-pure: implemented via :func:`jax.lax.fori_loop` over the ``n``
+    niche slots with independent sub-keys.  Slots are no-ops when no active
+    rooms exist or the chosen tile is not currently FLOOR.
+
+    Args:
+        terrain: int8[MAP_H, MAP_W] terrain map (rooms already carved).
+        rooms:   Room pytree from generate_rooms().
+        active:  bool[MAX_ROOMS_PER_LEVEL] mask of placed rooms.
+        rng:     JAX PRNG key.
+        n:       Number of niches to stamp (compile-time constant, default 2).
+
+    Returns:
+        Updated terrain int8[MAP_H, MAP_W].
+    """
+    from Nethax.nethax.constants.tiles import TileType
+    FOUNTAIN = jnp.int8(int(TileType.FOUNTAIN))
+    SINK     = jnp.int8(int(TileType.SINK))
+    GRAVE    = jnp.int8(int(TileType.GRAVE))
+    THRONE   = jnp.int8(int(TileType.THRONE))
+    FLOOR    = jnp.int8(int(TileType.FLOOR))
+
+    feature_table = jnp.stack([FOUNTAIN, SINK, GRAVE, THRONE])  # int8[4]
+
+    n_active = jnp.sum(active.astype(jnp.int32))
+    has_any_room = n_active > jnp.int32(0)
+    safe_n_active = jnp.maximum(n_active, jnp.int32(1))
+    active_cum = jnp.cumsum(active.astype(jnp.int32))
+
+    # Pre-split per-slot sub-keys for deterministic, independent draws.
+    niche_keys = jax.random.split(rng, n)
+
+    def body_fn(i, terrain_):
+        k_room, k_kind, k_row, k_col = jax.random.split(niche_keys[i], 4)
+
+        # Pick a uniformly-random active room via dense-rank lookup.
+        room_rank = jax.random.randint(
+            k_room, (), 0, safe_n_active, dtype=jnp.int32,
+        )
+        matches = (active_cum - jnp.int32(1) == room_rank) & active
+        room_idx = jnp.argmax(matches.astype(jnp.int32)).astype(jnp.int32)
+
+        y1 = rooms.y1[room_idx].astype(jnp.int32)
+        x1 = rooms.x1[room_idx].astype(jnp.int32)
+        y2 = rooms.y2[room_idx].astype(jnp.int32)
+        x2 = rooms.x2[room_idx].astype(jnp.int32)
+
+        # Uniformly random interior cell; clamp degenerate 1x1 rooms.
+        row = jax.random.randint(
+            k_row, (),
+            minval=y1, maxval=jnp.maximum(y2 + jnp.int32(1), y1 + jnp.int32(1)),
+            dtype=jnp.int32,
+        )
+        col = jax.random.randint(
+            k_col, (),
+            minval=x1, maxval=jnp.maximum(x2 + jnp.int32(1), x1 + jnp.int32(1)),
+            dtype=jnp.int32,
+        )
+        row = jnp.clip(row, 0, terrain_.shape[0] - 1)
+        col = jnp.clip(col, 0, terrain_.shape[1] - 1)
+
+        kind_idx = jax.random.randint(k_kind, (), 0, 4, dtype=jnp.int32)
+        kind_tile = feature_table[kind_idx]
+
+        # Only stamp on FLOOR — preserves doors, stairs, existing features.
+        cur = terrain_[row, col]
+        do_stamp = has_any_room & (cur == FLOOR)
+        new_val = jnp.where(do_stamp, kind_tile, cur)
+        return terrain_.at[row, col].set(new_val)
+
+    return lax.fori_loop(0, n, body_fn, terrain)
+
+
+# ---------------------------------------------------------------------------
 # TODO blocks
 # ---------------------------------------------------------------------------
 # Wave 4:
