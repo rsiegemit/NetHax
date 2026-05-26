@@ -1347,6 +1347,152 @@ def maybe_create_vault(
 
 
 # ---------------------------------------------------------------------------
+# make_niches — per-level "niche feature" placement pass
+# ---------------------------------------------------------------------------
+#
+# Vendor cite: vendor/nethack/src/mklev.c::make_niches lines 802-820.
+#
+#   ct = rnd((svn.nroom >> 1) + 1);
+#   ltptr = (!noteleport && dep > 15);
+#   vamp  = (dep > 5 && dep < 25);
+#   while (ct--):
+#       if (ltptr && !rn2(6)) { ltptr = FALSE; makeniche(LEVEL_TELEP); }
+#       else if (vamp && !rn2(6)) { vamp = FALSE; makeniche(TRAPDOOR); }
+#       else                     { makeniche(NO_TRAP); }
+#
+# Vendor's makeniche carves a 1x1 cell adjacent to a room wall and (when
+# a trap kind is supplied) plants a trap inside.  Our port keeps the
+# vendor's per-level count semantics (1..nroom/2+1) but adapts the
+# niche payload to the dungeon-feature set the JAX side already supports:
+# FOUNTAIN, SINK (placeholder — stored as FLOOR in compact TileType),
+# GRAVE, THRONE.  One feature kind is rolled per niche and stamped on a
+# uniformly-random interior tile of a uniformly-random active room — the
+# closest JIT-pure analogue of vendor's makeniche tile pick.
+# ---------------------------------------------------------------------------
+
+
+def make_niches(
+    rng: jnp.ndarray,
+    rooms: Room,
+    active: jnp.ndarray,
+    terrain: jnp.ndarray,
+) -> jnp.ndarray:
+    """Place 1..3 niche features on randomly selected room interior tiles.
+
+    Vendor citation: vendor/nethack/src/mklev.c::make_niches lines 802-820.
+    Vendor selects ``rnd((nroom/2)+1)`` niches and trap-bombs each one;
+    our port uses the same per-level count rule capped at 3 and substitutes
+    dungeon-feature stamps (fountain / sink / grave / throne) for the
+    vendor trap payload — these are the level-wide "polish" features the
+    JAX TileType enum exposes today.
+
+    JIT-pure: implemented as a fixed-size ``lax.scan`` over 3 niche slots.
+    Each iteration consumes one independent sub-key derived via
+    ``jax.random.split``.  Slots beyond the rolled count are masked out
+    so the trace runs at constant cost.
+
+    Args:
+        rng:     JAX PRNG key.
+        rooms:   Room pytree from generate_rooms().
+        active:  bool[MAX_ROOMS_PER_LEVEL] mask of placed rooms.
+        terrain: int8[MAP_H, MAP_W] terrain map (rooms already carved).
+
+    Returns:
+        Updated terrain int8[MAP_H, MAP_W].
+    """
+    from Nethax.nethax.constants.tiles import TileType
+    FOUNTAIN = jnp.int8(int(TileType.FOUNTAIN))
+    GRAVE    = jnp.int8(int(TileType.GRAVE))
+    THRONE   = jnp.int8(int(TileType.THRONE))
+    SINK     = jnp.int8(int(TileType.SINK))
+    FLOOR    = jnp.int8(int(TileType.FLOOR))
+
+    feature_table = jnp.stack([FOUNTAIN, SINK, GRAVE, THRONE])  # int8[4]
+
+    # Vendor-style niche count: rnd((nroom/2)+1) — i.e. uniform in
+    # [1, (nroom/2)+1].  We cap at MAX_NICHES = 3 for a constant-size
+    # scan; vendor allows more on rooms-rich levels but typical counts
+    # land in 1..3 anyway.
+    MAX_NICHES = 3
+    rng, k_count = jax.random.split(rng)
+    n_active = jnp.sum(active.astype(jnp.int32))
+    upper = jnp.maximum(jnp.int32(1), (n_active // jnp.int32(2)) + jnp.int32(1))
+    upper = jnp.minimum(upper, jnp.int32(MAX_NICHES))
+    n_niches = jax.random.randint(
+        k_count, (), 1, upper + jnp.int32(1), dtype=jnp.int32
+    )
+
+    # Pre-split per-niche sub-keys.
+    niche_keys = jax.random.split(rng, MAX_NICHES)
+
+    # Pre-compute a list of active room indices for uniform sampling.
+    # ``jnp.cumsum(active) - 1`` gives a dense rank we can index against
+    # via a random pick in [0, n_active).  When n_active == 0 we early-out.
+    has_any_room = n_active > jnp.int32(0)
+    safe_n_active = jnp.maximum(n_active, jnp.int32(1))
+
+    def place_one(state, niche_idx):
+        terrain_, = state
+        active_now = niche_idx < n_niches  # mask out unused niche slots
+        k_room, k_kind, k_row, k_col = jax.random.split(
+            niche_keys[niche_idx], 4,
+        )
+
+        # Pick a uniformly-random active room.
+        room_rank = jax.random.randint(
+            k_room, (), 0, safe_n_active, dtype=jnp.int32,
+        )
+        # active_cum[i] = number of active rooms in [0, i].  The picked
+        # room is the smallest i where active_cum[i] - 1 == room_rank
+        # and active[i] is True.
+        active_cum = jnp.cumsum(active.astype(jnp.int32))
+        matches = (active_cum - jnp.int32(1) == room_rank) & active
+        room_idx = jnp.argmax(matches.astype(jnp.int32)).astype(jnp.int32)
+
+        y1 = rooms.y1[room_idx].astype(jnp.int32)
+        x1 = rooms.x1[room_idx].astype(jnp.int32)
+        y2 = rooms.y2[room_idx].astype(jnp.int32)
+        x2 = rooms.x2[room_idx].astype(jnp.int32)
+
+        # Pick a uniformly-random interior tile.  Clamp to keep the slot
+        # legal when room degenerates to 1×1.
+        row = jax.random.randint(
+            k_row, (),
+            minval=y1, maxval=jnp.maximum(y2 + jnp.int32(1), y1 + jnp.int32(1)),
+            dtype=jnp.int32,
+        )
+        col = jax.random.randint(
+            k_col, (),
+            minval=x1, maxval=jnp.maximum(x2 + jnp.int32(1), x1 + jnp.int32(1)),
+            dtype=jnp.int32,
+        )
+        row = jnp.clip(row, 0, terrain_.shape[0] - 1)
+        col = jnp.clip(col, 0, terrain_.shape[1] - 1)
+
+        # Pick a niche feature kind uniformly from the 4-entry table.
+        kind_idx = jax.random.randint(
+            k_kind, (), 0, 4, dtype=jnp.int32,
+        )
+        kind_tile = feature_table[kind_idx]
+
+        # Only stamp when (a) within rolled niche count, (b) at least one
+        # room exists, and (c) the chosen tile is currently FLOOR — we
+        # don't want to overwrite carved walls, doors, or earlier niches.
+        cur = terrain_[row, col]
+        do_stamp = active_now & has_any_room & (cur == FLOOR)
+        new_val = jnp.where(do_stamp, kind_tile, cur)
+        terrain_new = terrain_.at[row, col].set(new_val)
+        return (terrain_new,), None
+
+    (terrain_out,), _ = lax.scan(
+        place_one,
+        (terrain,),
+        jnp.arange(MAX_NICHES, dtype=jnp.int32),
+    )
+    return terrain_out
+
+
+# ---------------------------------------------------------------------------
 # TODO blocks
 # ---------------------------------------------------------------------------
 # Wave 4:
