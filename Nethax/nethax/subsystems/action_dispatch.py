@@ -2547,8 +2547,34 @@ def _handle_apply(state, rng):
     dig northward (direction=0).  The direction default matches dodig's
     prompt-north fallback when no direction is given.
     Cite: vendor/nethack/src/dig.c::dodig (line 445).
+
+    Apply-to-wield: when the player applies a pick-axe / bullwhip / grappling
+    hook / polearm that is in inventory but not currently wielded, vendor's
+    use_* helpers open with wield_tool(obj, ...) which auto-wields the tool
+    (subject to welded-uwep + shield/bimanual gates).  We mirror that here:
+    scan inventory for the first apply-to-wield tool; if found and not the
+    wielded slot, auto-wield before the digging dispatch.
+    Cite: vendor/nethack/src/wield.c::wield_tool lines 682-758;
+          vendor/nethack/src/apply.c::use_pick_axe / use_whip / use_pole /
+          use_grapple (callers).
     """
     from Nethax.nethax.subsystems.digging import start_dig, _has_digging_tool
+    from Nethax.nethax.subsystems.apply_tools import (
+        _find_first_wield_tool_slot,
+        wield_tool as _apply_wield_tool,
+    )
+
+    # Auto-wield pass: if a pick/whip/grapple/polearm sits in inventory but
+    # isn't the wielded slot, attempt to wield it.  ``wield_tool`` itself
+    # gates on the cursed-welded uwep / shield-bimanual cases.
+    found_tool, tool_slot = _find_first_wield_tool_slot(state)
+    state = jax.lax.cond(
+        found_tool,
+        lambda s: _apply_wield_tool(s, tool_slot),
+        lambda s: s,
+        operand=state,
+    )
+
     # Route pickaxe apply → start dig (north by default).
     # jax.lax.cond requires both branches to be traced; _containers_handle_apply
     # is the non-dig path.

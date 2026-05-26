@@ -76,6 +76,23 @@ _MAGIC_HARP_TYPE_ID     = 229
 _BUGLE_TYPE_ID          = 231
 _DRUM_OF_EARTHQUAKE_TID = 233
 
+# Apply-to-wield tool type IDs (vendor wield.c:682 wield_tool callers).
+# Pick-axe and mattock route through ``use_pick_axe``; bullwhip through
+# ``use_whip``; grappling hook through ``use_grapple``; polearms through
+# ``use_pole``.  Each of those entry points opens with wield_tool(obj, ...).
+# Cite: vendor/nethack/src/apply.c::use_pick_axe (line ~525),
+#       vendor/nethack/src/apply.c::use_whip (line ~3083),
+#       vendor/nethack/src/apply.c::use_grapple (line ~3360),
+#       vendor/nethack/src/apply.c::use_pole (line ~3274);
+#       all invoke vendor/nethack/src/wield.c::wield_tool (line 682).
+_PICKAXE_TYPE_ID      = 234
+_MATTOCK_TYPE_ID      = 50
+_BULLWHIP_TYPE_ID     = 64
+_GRAPPLING_HOOK_TYPE_ID = 235
+# Polearm WEAPON_CLASS type_ids (constants/objects.py rows 42-49, 51-55).
+# Lance (46) included; dwarvish mattock (50) is P_PICK_AXE, handled above.
+_POLEARM_TYPE_IDS = (42, 43, 44, 45, 46, 47, 48, 49, 51, 52, 53, 54, 55)
+
 # Food type IDs (vendor/nethack/include/objects.h)
 _TRIPE_RATION_TYPE_ID = 239
 _CORPSE_TYPE_ID       = 240
@@ -102,6 +119,113 @@ _TIN_TYPE_ID          = None  # created by tinning kit; we use a synthetic id
 # special food item with otyp==CORPSE but marked as canned; we reuse type_id
 # 240 (CORPSE) with a tin_poisoned=False flag to represent the resulting tin.
 # For parity with vendor/nethack/src/apply.c::use_tinning_kit (line 2177).
+
+# ---------------------------------------------------------------------------
+# wield_tool — auto-wield a pick-axe / bullwhip / grappling hook / polearm
+# when the player applies it without first wielding it.
+#
+# Vendor: applying any of these tools opens its use_* helper with a call to
+# wield_tool(obj, verb), which auto-wields the tool subject to gates:
+#   - already wielded: no-op (return TRUE)
+#   - obj worn as armor/accessory: refuse (Nethax: weapon/tool slots only)
+#   - current uwep welded: refuse  (Nethax: inventory.welded == True)
+#   - cantwield(youmonst): refuse  (Nethax: no polyform handling here)
+#   - bimanual + shield: refuse  (vendor wield.c:724-728: uarms && bimanual)
+# When the gate passes we delegate to ``inventory.wield`` so the
+# cursed/weld/two-handed-shield and Sunsword begin_burn book-keeping stays
+# in one place (vendor's wield_tool falls through to setuwep/ready_weapon).
+#
+# Cite: vendor/nethack/src/wield.c::wield_tool lines 682-758.
+# Cite: vendor/nethack/src/apply.c::use_pick_axe / use_whip / use_pole /
+#       use_grapple — entry points calling wield_tool.
+# ---------------------------------------------------------------------------
+
+def _is_wield_tool_type(tid: jnp.ndarray) -> jnp.ndarray:
+    """Return True if ``tid`` is a pick-axe / mattock / bullwhip / grappling
+    hook / polearm type_id (i.e. an apply-to-wield tool).
+    """
+    tid32 = tid.astype(jnp.int32)
+    pred = (
+        (tid32 == jnp.int32(_PICKAXE_TYPE_ID))
+        | (tid32 == jnp.int32(_MATTOCK_TYPE_ID))
+        | (tid32 == jnp.int32(_BULLWHIP_TYPE_ID))
+        | (tid32 == jnp.int32(_GRAPPLING_HOOK_TYPE_ID))
+    )
+    for pt in _POLEARM_TYPE_IDS:
+        pred = pred | (tid32 == jnp.int32(pt))
+    return pred
+
+
+def _find_first_wield_tool_slot(state):
+    """Scan inventory for the first slot whose item is an apply-to-wield tool.
+
+    Returns
+    -------
+    (found, slot_idx) : (bool, int32) — found=False if no candidate; slot_idx
+    is 0 in that case (callers must gate on ``found``).
+    """
+    items = state.inventory.items
+
+    def _step(carry, idx):
+        found, slot = carry
+        occupied = items.category[idx] != jnp.int8(0)
+        is_tool = occupied & _is_wield_tool_type(items.type_id[idx])
+        slot = jnp.where(~found & is_tool, idx, slot)
+        found = found | is_tool
+        return (found, slot), None
+
+    (found, slot), _ = jax.lax.scan(
+        _step,
+        (jnp.bool_(False), jnp.int32(0)),
+        jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32),
+    )
+    return found, slot
+
+
+def wield_tool(state, slot_idx: jnp.ndarray):
+    """Auto-wield the item at ``slot_idx`` per vendor wield_tool.
+
+    Refuses (no-op) when:
+      - the slot is already the wielded slot;
+      - the current wielded weapon is welded (cursed-welded uwep);
+      - the candidate is bimanual AND a shield is worn.
+
+    Otherwise sets ``inventory.wielded = slot_idx`` via ``inventory.wield``
+    so the cursed/weld and Sunsword begin_burn book-keeping stays in one
+    place.
+
+    JIT-pure: pure jnp.where gates, no Python control flow on tracers.
+
+    Cite: vendor/nethack/src/wield.c::wield_tool lines 682-758.
+    """
+    from Nethax.nethax.subsystems.inventory import wield, ArmorSlot
+
+    inv = state.inventory
+    slot_i32 = slot_idx.astype(jnp.int32)
+    safe_slot = jnp.clip(slot_i32, 0, MAX_INVENTORY_SLOTS - 1)
+
+    has_item = inv.items.category[safe_slot] != jnp.int8(0)
+    already_wielded = inv.wielded.astype(jnp.int32) == slot_i32
+
+    # Current uwep welded → cannot swap.
+    welded_block = inv.welded
+
+    # Bimanual + shield gate (vendor wield.c:724-728).
+    is_bimanual = inv.items.is_two_handed[safe_slot]
+    shield_slot = inv.worn_armor[int(ArmorSlot.SHIELD)].astype(jnp.int32)
+    has_shield = shield_slot >= jnp.int32(0)
+    shield_block = is_bimanual & has_shield
+
+    can_wield = has_item & ~already_wielded & ~welded_block & ~shield_block
+
+    wielded_state = wield(state, safe_slot.astype(jnp.int8))
+    return jax.lax.cond(
+        can_wield,
+        lambda _: wielded_state,
+        lambda _: state,
+        operand=None,
+    )
+
 
 # Handler index constants — 0 is always noop.
 _H_NOOP         = 0
@@ -734,6 +858,9 @@ def _h_instrument(state, rng: jax.Array) -> object:
     )
 
     # ---- Pit creation (only when is_drum) -------------------------------
+    # Sample rn2(6) = 0..5 candidate offsets in [-9,+9]^2 around the hero
+    # and place PIT traps on the walkable ones.  Non-drum invocations
+    # short-circuit because the per-iteration gate is `is_drum & (i < n)`.
     rng, sub_drum = jax.random.split(rng)
     new_traps = _drum_create_pits(state, sub_drum, is_drum)
 

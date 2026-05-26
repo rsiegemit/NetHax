@@ -1030,6 +1030,23 @@ def drop(state, rng, ground_items: Item, branch: int, level: int, slot_idx: int)
     return new_state, new_ground
 
 
+# Cockatrice / chickatrice monster indices (Nethax PM ordering — see
+# constants/monster_entries/chunk1.py lines 196, 215).  These are the
+# only entries for which vendor's touch_petrifies() returns TRUE.
+# Cite: vendor/nethack/include/mondata.h lines 200-201.
+_PM_CHICKATRICE: int = 9
+_PM_COCKATRICE:  int = 10
+
+# CORPSE otyp (vendor/nethack/include/objects.h; mirrored in
+# apply_tools._CORPSE_TYPE_ID).
+_CORPSE_TYPE_ID: int = 240
+
+# Sunsword artifact index (wish._ARTIFACTS row 32; artilist.h line 209).
+# artifact_light(uwep) returns TRUE only for SUNSWORD on the weapon path.
+# Cite: vendor/nethack/src/artifact.c::artifact_light lines 2264-2275.
+_ARTI_SUNSWORD: int = 32
+
+
 def wield(state, slot_idx: int):
     """Wield the item in slot_idx as the primary weapon.
 
@@ -1039,6 +1056,16 @@ def wield(state, slot_idx: int):
     If the item is cursed (buc_status == 1), sets inventory.welded = True —
     the weapon is stuck until uncursed.
     Cite: vendor/nethack/src/wield.c::welded() lines 1051-1058.
+
+    Petrification gate: wielding a cockatrice/chickatrice corpse with bare
+    hands and no Stone_resistance instakills the hero (STONING death).
+    Cite: vendor/nethack/src/wield.c::cant_wield_corpse lines 137-153 and
+          ready_weapon line 183.
+
+    Sunsword begin_burn: wielding Sunsword sets lamplit=True on the slot
+    (artifact_light(wep) && !wep->lamplit → begin_burn(wep, FALSE)).
+    Cite: vendor/nethack/src/wield.c::ready_weapon lines 245-250;
+          vendor/nethack/src/artifact.c::artifact_light lines 2264-2275.
 
     Canonical: vendor/nethack/src/wield.c::wieldwep
 
@@ -1051,17 +1078,53 @@ def wield(state, slot_idx: int):
     -------
     new_state
     """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic, TimedStatus
+    from Nethax.nethax.subsystems.scoring import DeathCause
+
     slot_idx = jnp.int8(slot_idx)
     slot_i32 = slot_idx.astype(jnp.int32)
     has_item = state.inventory.items.category[slot_i32] != 0
 
-    new_wielded = jnp.where(has_item, slot_idx, state.inventory.wielded)
+    # ---- Petrification gate (vendor wield.c:183 + cant_wield_corpse:142) -----
+    items = state.inventory.items
+    is_corpse = has_item & (items.type_id[slot_i32].astype(jnp.int32)
+                            == jnp.int32(_CORPSE_TYPE_ID))
+    cnm = items.corpse_entry_idx[slot_i32].astype(jnp.int32)
+    is_petrify_corpse = is_corpse & (
+        (cnm == jnp.int32(_PM_COCKATRICE))
+        | (cnm == jnp.int32(_PM_CHICKATRICE))
+    )
+    gloves_slot = state.inventory.worn_armor[int(ArmorSlot.GLOVES)].astype(jnp.int32)
+    has_gloves = gloves_slot >= jnp.int32(0)
+    stone_res = (
+        state.status.intrinsics[int(Intrinsic.RESIST_STONE)]
+        | (state.status.timed_intrinsics[int(Intrinsic.RESIST_STONE)] > 0)
+    )
+    petrify = is_petrify_corpse & (~has_gloves) & (~stone_res)
+
+    # Instapetrify when petrify gate trips: zero HP + done + STONING cause.
+    new_hp = jnp.where(petrify, jnp.int32(0), state.player_hp)
+    new_done = state.done | petrify
+    new_cause = jnp.where(
+        petrify,
+        jnp.int8(int(DeathCause.STONING)),
+        state.scoring.death_cause,
+    )
+    new_scoring = state.scoring.replace(death_cause=new_cause)
+    cur_stoned = state.status.timed_statuses[int(TimedStatus.STONED)].astype(jnp.int32)
+    new_stoned = jnp.where(petrify, jnp.int32(1), cur_stoned)
+
+    # Block the wield if the corpse is petrifying (vendor cant_wield_corpse
+    # returns TRUE on the petrify path, so wield is skipped entirely).
+    can_wield = has_item & ~is_petrify_corpse
+
+    new_wielded = jnp.where(can_wield, slot_idx, state.inventory.wielded)
 
     # Two-handed: unequip shield if present
     is_two_handed = state.inventory.items.is_two_handed[slot_i32]
     shield_slot   = jnp.int32(ArmorSlot.SHIELD)
     new_worn_armor = jnp.where(
-        has_item & is_two_handed,
+        can_wield & is_two_handed,
         state.inventory.worn_armor.at[shield_slot].set(jnp.int8(-1)),
         state.inventory.worn_armor,
     )
@@ -1069,14 +1132,36 @@ def wield(state, slot_idx: int):
     # Cursed weapon welds to hand.
     CURSED = jnp.int8(1)
     is_cursed = state.inventory.items.buc_status[slot_i32] == CURSED
-    new_welded = jnp.where(has_item & is_cursed, jnp.bool_(True), state.inventory.welded)
+    new_welded = jnp.where(can_wield & is_cursed, jnp.bool_(True), state.inventory.welded)
+
+    # Sunsword begin_burn (vendor wield.c:245-250).  artifact_light(wep)
+    # returns TRUE only for SUNSWORD on the weapon path.
+    is_sunsword = (
+        state.inventory.items.artifact_idx[slot_i32].astype(jnp.int32)
+        == jnp.int32(_ARTI_SUNSWORD)
+    )
+    cur_lamplit = state.inventory.items.lamplit[slot_i32]
+    new_lamplit = state.inventory.items.lamplit.at[slot_i32].set(
+        jnp.where(can_wield & is_sunsword, jnp.bool_(True), cur_lamplit)
+    )
+    new_items = state.inventory.items.replace(lamplit=new_lamplit)
+
+    new_statuses = state.status.timed_statuses.at[int(TimedStatus.STONED)].set(new_stoned)
+    new_status = state.status.replace(timed_statuses=new_statuses)
 
     new_inv = state.inventory.replace(
+        items=new_items,
         wielded=new_wielded,
         worn_armor=new_worn_armor,
         welded=new_welded,
     )
-    return state.replace(inventory=new_inv)
+    return state.replace(
+        inventory=new_inv,
+        player_hp=new_hp,
+        done=new_done,
+        scoring=new_scoring,
+        status=new_status,
+    )
 
 
 def unwield(state):
@@ -1085,13 +1170,29 @@ def unwield(state):
     No-op if inventory.welded == True (cursed weapon stuck to hand).
     Cite: vendor/nethack/src/wield.c::welded() — cannot unwield while welded.
 
+    Sunsword end_burn: unwielding Sunsword clears lamplit on the slot.
+    Cite: vendor/nethack/src/wield.c::setuwep lines 114-119.
+
     Returns
     -------
     new_state
     """
     can_unwield = ~state.inventory.welded
+    # End-burn the previously-wielded slot if it was Sunsword.
+    prev_slot = state.inventory.wielded.astype(jnp.int32)
+    prev_safe = jnp.clip(prev_slot, 0, MAX_INVENTORY_SLOTS - 1)
+    was_sunsword = (prev_slot >= jnp.int32(0)) & (
+        state.inventory.items.artifact_idx[prev_safe].astype(jnp.int32)
+        == jnp.int32(_ARTI_SUNSWORD)
+    )
+    clear_lamp = can_unwield & was_sunsword
+    cur_lamp = state.inventory.items.lamplit[prev_safe]
+    new_lamp_at_slot = jnp.where(clear_lamp, jnp.bool_(False), cur_lamp)
+    new_lamplit = state.inventory.items.lamplit.at[prev_safe].set(new_lamp_at_slot)
+    new_items = state.inventory.items.replace(lamplit=new_lamplit)
+
     new_wielded = jnp.where(can_unwield, jnp.int8(-1), state.inventory.wielded)
-    new_inv = state.inventory.replace(wielded=new_wielded)
+    new_inv = state.inventory.replace(items=new_items, wielded=new_wielded)
     return state.replace(inventory=new_inv)
 
 
