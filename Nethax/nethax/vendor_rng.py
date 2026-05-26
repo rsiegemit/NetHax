@@ -563,3 +563,23 @@ def rn1_jax(rng: "Isaac64State", x, base) -> Tuple["Isaac64State", jax.Array]:
     """JAX-traceable ``rn1(x, base)`` — ``base + rn2(x)`` (int32 result)."""
     new_rng, v = rn2_jax(rng, x)
     return new_rng, v + jnp.int32(base)
+
+
+def randint_jax(rng: "Isaac64State", shape, minval, maxval) -> Tuple["Isaac64State", jax.Array]:
+    """JAX-traceable drop-in for ``jax.random.randint(key, shape, minval, maxval)``.
+
+    Returns ``(new_rng, value)`` where value is in [minval, maxval).
+
+    The output is byte-exact with vendor C ``minval + isaac64_next_uint64() %
+    (maxval - minval)`` for each scalar slot.  Unlike ``jax.random.randint``,
+    this consumes from the ISAAC64 stream — so dungeon-gen call sites that
+    swap in ``randint_jax(state.vendor_rng, ...)`` will produce trajectories
+    that match vendor NLE on the same seed.
+
+    Currently supports scalar output only (shape=()); multi-dim sampling
+    requires N sequential draws and should use a scan loop.
+    """
+    range_size = jnp.uint64(maxval) - jnp.uint64(minval)
+    new_rng, v = next_uint64_jax(rng)
+    sampled = (v % range_size).astype(jnp.int32) + jnp.int32(minval)
+    return new_rng, sampled
