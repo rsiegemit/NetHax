@@ -799,9 +799,52 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     # 2 tiles of player).  In Nethax we model the strict "ball follows on
     # the previous tile" subset which preserves the |dist| ≤ 1 invariant.
     moved = can_move & jnp.any(new_pos != pos.astype(jnp.int16))
+    _desired_ball_pos = pos.astype(jnp.int16)
+
+    # Vendor ball.c::drag_ball lines 700-820 — if the candidate ball tile is
+    # rock/closed-door (IS_CHAIN_ROCK in vendor), the chain/ball must reroute
+    # to an accessible adjacent tile.  In Nethax, project onto the nearest
+    # walkable tile from the 8-neighbour ring around the hero's NEW position.
+    # If every neighbour is solid (corner case: hero passed through walls),
+    # fall back to keeping the ball at its previous position (state.ball_pos).
+    _desired_r = jnp.clip(_desired_ball_pos[0].astype(jnp.int32), 0, map_h - 1)
+    _desired_c = jnp.clip(_desired_ball_pos[1].astype(jnp.int32), 0, map_w - 1)
+    _desired_tile = jnp.clip(
+        terrain_2d[_desired_r, _desired_c].astype(jnp.int32),
+        0, _NUM_TILE_TYPES - 1,
+    )
+    _desired_solid = _IS_SOLID[_desired_tile]
+
+    # Ring of 8 deltas; pick first walkable neighbour of new player position.
+    _ring_r = new_pos[0].astype(jnp.int32) + _DIR_TABLE[:, 0]
+    _ring_c = new_pos[1].astype(jnp.int32) + _DIR_TABLE[:, 1]
+    _ring_r_safe = jnp.clip(_ring_r, 0, map_h - 1)
+    _ring_c_safe = jnp.clip(_ring_c, 0, map_w - 1)
+    _ring_in_bounds = (
+        (_ring_r >= 0) & (_ring_r < map_h)
+        & (_ring_c >= 0) & (_ring_c < map_w)
+    )
+    _ring_tiles = jnp.clip(
+        terrain_2d[_ring_r_safe, _ring_c_safe].astype(jnp.int32),
+        0, _NUM_TILE_TYPES - 1,
+    )
+    _ring_walkable = _ring_in_bounds & ~_IS_SOLID[_ring_tiles]
+    # First walkable index (8 if none).
+    _ring_idx = jnp.argmax(_ring_walkable.astype(jnp.int32))
+    _any_walkable = jnp.any(_ring_walkable)
+    _reroute_pos = jnp.stack([
+        _ring_r_safe[_ring_idx].astype(jnp.int16),
+        _ring_c_safe[_ring_idx].astype(jnp.int16),
+    ])
+    _rerouted_ball = jnp.where(
+        _any_walkable, _reroute_pos, state.ball_pos,
+    )
+    _ball_when_moved = jnp.where(
+        _desired_solid, _rerouted_ball, _desired_ball_pos,
+    )
     new_ball_pos = jnp.where(
         state.is_punished & moved,
-        pos.astype(jnp.int16),
+        _ball_when_moved,
         state.ball_pos,
     )
 
