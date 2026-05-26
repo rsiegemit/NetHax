@@ -1242,11 +1242,14 @@ def _build_status_row1(env_state, blstats) -> jnp.ndarray:
     # Role enum int8; ``player_xl`` (u.ulevel) drives xlev_to_rank.
     header = _role_header_bytes(env_state.player_role, env_state.player_xl)
 
-    # Stats fragment.
+    # Stats fragment.  Strength uses vendor botl.c::get_strength_str format
+    # (see Nethax.nethax.obs.strength_format) — fixed 5-byte field so
+    # downstream column offsets stay deterministic across the [3..125] range.
+    from Nethax.nethax.obs.strength_format import render_strength_bytes
     parts = [
         header,
         _S_ST,                                       # 3
-        _uint_to_bytes(blstats[BL_STR25], 2),
+        render_strength_bytes(blstats[BL_STR125]),
         _S_SP_DX,
         _uint_to_bytes(blstats[BL_DEX], 2),
         _S_SP_CO,
