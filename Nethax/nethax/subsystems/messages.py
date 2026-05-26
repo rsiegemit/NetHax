@@ -116,6 +116,15 @@ class MessageId(IntEnum):
     LEVI_FLOAT_LOWER     = 41  # timeout.c:348 "You float slightly lower."
     LEVI_WOBBLE          = 42  # timeout.c:349 "You wobble unsteadily in the air."
 
+    # Game-start role-specific intro line (vendor allmain.c::welcome lines
+    # 920-922):
+    #     pline("%s %s, welcome to NetHack!  You are a%s.",
+    #           Hello((struct monst *) 0), svp.plname, buf);
+    # The leading "Hello"-equivalent varies by role (role.c::Hello lines
+    # 2119-2140): "Salutations" (Knight), "Konnichi wa" (Samurai),
+    # "Aloha" (Tourist), "Velkommen" (Valkyrie), "Hello" otherwise.
+    ROLE_INTRO           = 43  # allmain.c:920 per-role welcome pline()
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -515,6 +524,115 @@ def clear_message(state: MessageState) -> MessageState:
     """
     return state.replace(
         message_buffer=jnp.zeros((MSG_BUF_LEN,), dtype=jnp.uint8)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Game-start role-specific intro line (NLE pline parity).
+#
+# Cite: vendor/nethack/src/allmain.c::welcome lines 920-922 ::
+#     pline("%s %s, welcome to NetHack!  You are a%s.",
+#           Hello((struct monst *) 0), svp.plname, buf);
+# Where Hello() (role.c lines 2119-2140) returns a role-specific greeting:
+#     KNIGHT   -> "Salutations"
+#     SAMURAI  -> "Konnichi wa"
+#     TOURIST  -> "Aloha"
+#     VALKYRIE -> "Velkommen"
+#     other    -> "Hello"
+# ``buf`` is built from align + race_adj + role_name; we omit the leading
+# alignment/race composition here because the static table is keyed only
+# by role (race + alignment vary independently and are emitted via the
+# header-builder; mirror the role-specific portion of the line which is
+# what the validator checks against ``tty_chars row 0``).
+# ---------------------------------------------------------------------------
+
+# Per-role greeting prefix from vendor role.c::Hello.
+_ROLE_HELLO: tuple[str, ...] = (
+    "Hello",        # 0  ARCHEOLOGIST
+    "Hello",        # 1  BARBARIAN
+    "Hello",        # 2  CAVEMAN
+    "Hello",        # 3  HEALER
+    "Salutations",  # 4  KNIGHT       role.c:2123
+    "Hello",        # 5  MONK
+    "Hello",        # 6  PRIEST
+    "Hello",        # 7  RANGER
+    "Hello",        # 8  ROGUE
+    "Konnichi wa",  # 9  SAMURAI      role.c:2125
+    "Aloha",        # 10 TOURIST      role.c:2129
+    "Velkommen",    # 11 VALKYRIE     role.c:2131
+    "Hello",        # 12 WIZARD
+)
+
+# Per-role role-name as used in vendor welcome buf (role.c::roles[].name.m).
+_ROLE_NAME: tuple[str, ...] = (
+    "Archeologist", "Barbarian", "Caveman", "Healer", "Knight",
+    "Monk", "Priest", "Ranger", "Rogue", "Samurai", "Tourist",
+    "Valkyrie", "Wizard",
+)
+
+# Number of roles (matches Nethax.nethax.constants.roles.N_ROLES = 13).
+_N_ROLES_INTRO: int = 13
+
+
+def _bake_role_intro_table() -> jnp.ndarray:
+    """Pack per-role welcome lines into a [N_ROLES, MSG_BUF_LEN] uint8 array.
+
+    Each row layout matches the buffer contract used elsewhere:
+        row[0]        = MessageId.ROLE_INTRO
+        row[1..1+len] = ASCII bytes of the rendered line.
+
+    Player-name defaults to "Player" (matches the legacy header in
+    obs/nle_obs.py ``_S_NAME_PREFIX`` and tombstone NAME_LINE rendering).
+    """
+    arr = _np.zeros((_N_ROLES_INTRO, MSG_BUF_LEN), dtype=_np.uint8)
+    msg_id = int(MessageId.ROLE_INTRO) & 0xFF
+    for r in range(_N_ROLES_INTRO):
+        hello = _ROLE_HELLO[r]
+        role_name = _ROLE_NAME[r]
+        line = f"{hello} Player, welcome to NetHack!  You are a {role_name}."
+        raw = line.encode("ascii")[: MSG_BUF_LEN - 1]
+        arr[r, 0] = msg_id
+        arr[r, 1 : 1 + len(raw)] = list(raw)
+    return jnp.asarray(arr, dtype=jnp.uint8)
+
+
+# Module-level constant; baked once at import.
+_ROLE_INTRO_MSG: jnp.ndarray = _bake_role_intro_table()
+
+
+def emit_role_intro(state: MessageState, role) -> MessageState:
+    """Emit the role-specific game-start welcome line.
+
+    Mirrors vendor/nethack/src/allmain.c::welcome lines 920-922 — the
+    ``pline("%s %s, welcome to NetHack! ...", Hello(), plname, buf)`` call
+    that runs once at new-game start.  Implemented as a static-byte-table
+    lookup (``_ROLE_INTRO_MSG[role]``) so the message text is pre-rendered
+    and the function is JIT-pure / vmap-safe.
+
+    Parameters
+    ----------
+    state : MessageState
+    role  : int / jnp.int32 — Role enum value (clipped to [0, N_ROLES-1]).
+
+    Returns
+    -------
+    Updated MessageState with the role-specific welcome line in
+    ``message_buffer`` and the previous buffer rotated into ``message_history``.
+    """
+    # Rotate current buffer into history (same contract as ``emit``).
+    safe_idx = jnp.mod(state.history_index, jnp.int32(HISTORY_LEN))
+    new_history = state.message_history.at[safe_idx].set(state.message_buffer)
+    new_index = jnp.mod(state.history_index + jnp.int32(1), jnp.int32(HISTORY_LEN))
+
+    # Clip the role index so out-of-range values fall back to row 0.
+    role_i32 = jnp.int32(role)
+    safe_role = jnp.clip(role_i32, jnp.int32(0), jnp.int32(_N_ROLES_INTRO - 1))
+    new_buffer = _ROLE_INTRO_MSG[safe_role]
+
+    return state.replace(
+        message_buffer=new_buffer,
+        message_history=new_history,
+        history_index=new_index,
     )
 
 

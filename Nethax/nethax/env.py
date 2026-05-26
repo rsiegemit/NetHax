@@ -157,6 +157,19 @@ class NethaxEnv:
         # Initialise role-specific skill caps (vendor/nethack/src/u_init.c Skill_X tables).
         state = state.replace(skills=init_skills(role))
 
+        # Emit the role-specific NLE intro line on row 0 of the message line.
+        # Mirrors vendor/nethack/src/allmain.c::welcome lines 920-922 ::
+        #     pline("%s %s, welcome to NetHack!  You are a%s.",
+        #           Hello(), svp.plname, buf);
+        # The greeting prefix (Hello / Salutations / Konnichi wa / Aloha /
+        # Velkommen) is selected by role.c::Hello.  Without this the
+        # validator sees ``tty_chars row 0`` as blank while NLE shows the
+        # per-role welcome line.
+        from Nethax.nethax.subsystems.messages import emit_role_intro as _emit_role_intro
+        state = state.replace(
+            messages=_emit_role_intro(state.messages, int(role)),
+        )
+
         # Generate Main branch level 1 and write into the [branch=0, level=0]
         # slot.  This includes the per-room independent feature rolls
         # (fountain / altar / grave / traps) and the 2x2 detached vault —
