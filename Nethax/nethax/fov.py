@@ -57,6 +57,7 @@ _OPAQUE_TABLE: jnp.ndarray = _build_opaque_table()
 def _cast_ray(
     visible: jnp.ndarray,
     terrain: jnp.ndarray,
+    opaque_overlay: jnp.ndarray,
     pr: jnp.int32,
     pc: jnp.int32,
     dr: jnp.int32,
@@ -68,6 +69,12 @@ def _cast_ray(
     Marks each tile visible as we walk.  Stops (without marking further tiles)
     after the first opaque tile is encountered — the opaque tile itself IS
     marked visible (you see the wall blocking you).
+
+    The ``opaque_overlay`` is an optional per-cell boolean mask whose True
+    entries augment the terrain-only opacity table.  Used to fold vendor
+    ``does_block`` overlays (boulders on the tile, ``D_LOCKED`` / ``D_TRAPPED``
+    doors) into ray-stop decisions.  Cite: vendor/nethack/src/vision.c::
+    does_block lines 152-202.
 
     Returns updated visible mask.
     """
@@ -87,7 +94,14 @@ def _cast_ray(
         tile_idx = jnp.where(in_bounds, terrain[cur_r, cur_c], jnp.int32(0))
         # Clip to lookup table size for safety.
         tile_idx_clipped = jnp.clip(tile_idx, 0, _OPAQUE_TABLE_SIZE - 1)
-        is_opaque = _OPAQUE_TABLE[tile_idx_clipped]
+        is_opaque_terrain = _OPAQUE_TABLE[tile_idx_clipped]
+        # Fold in the overlay (boulders + locked/trapped doors).  Bounds-
+        # check matches the terrain probe above.
+        safe_r = jnp.clip(cur_r, 0, h - 1)
+        safe_c = jnp.clip(cur_c, 0, w - 1)
+        is_opaque_overlay = jnp.where(in_bounds, opaque_overlay[safe_r, safe_c],
+                                       jnp.bool_(False))
+        is_opaque = is_opaque_terrain | is_opaque_overlay
 
         # Mark current cell visible if we're still going and in bounds.
         new_vis = jnp.where(
@@ -140,6 +154,7 @@ def compute_fov(
     terrain: jnp.ndarray,
     player_pos: jnp.ndarray,
     sight_radius: int = DEFAULT_SIGHT_RADIUS,
+    opaque_overlay: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """Compute field-of-view mask via Bresenham-line raycast.
 
@@ -147,6 +162,13 @@ def compute_fov(
         terrain: int[H, W] tile grid (current level only).
         player_pos: int[2] (row, col).
         sight_radius: max line-of-sight distance.
+        opaque_overlay: optional bool[H, W] mask whose True cells augment
+            the terrain-only opacity table.  Used to fold vendor
+            ``does_block`` overlays into the FOV computation: boulders on
+            the tile (vendor vision.c:181-184) and door state bits
+            ``D_LOCKED|D_TRAPPED|D_SECRET`` (vendor vision.c:167-168) that
+            are not already encoded in the TileType enum.  Defaults to an
+            all-False mask (terrain-only opacity, current behaviour).
 
     Returns:
         bool[H, W] mask, True where player can see this turn.
@@ -165,6 +187,8 @@ def compute_fov(
     h, w = terrain.shape
     pr = player_pos[0].astype(jnp.int32)
     pc = player_pos[1].astype(jnp.int32)
+    if opaque_overlay is None:
+        opaque_overlay = jnp.zeros((h, w), dtype=jnp.bool_)
 
     # Start with the player's own tile visible.
     visible = jnp.zeros((h, w), dtype=jnp.bool_)
@@ -201,7 +225,8 @@ def compute_fov(
         new_vis = jax.lax.cond(
             skip,
             lambda v: v,
-            lambda v: _cast_ray(v, terrain, pr, pc, dr, dc, max_steps),
+            lambda v: _cast_ray(v, terrain, opaque_overlay,
+                                pr, pc, dr, dc, max_steps),
             vis,
         )
         return new_vis, None

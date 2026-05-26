@@ -61,6 +61,21 @@ _TILE_WALL        = jnp.int8(int(TileType.WALL))
 _TILE_CLOSED_DOOR = jnp.int8(int(TileType.CLOSED_DOOR))
 _TILE_TREE        = jnp.int8(int(TileType.TREE))
 
+# Boulder ground-item identity (mirrors subsystems/boulders.py).
+# Vendor vision.c:182-184 walks ``svl.level.objects[x][y]`` looking for an
+# obj with ``obj->otyp == BOULDER`` and treats it as an LoS blocker.
+_BOULDER_CATEGORY: int = 14  # ItemCategory.ROCK
+_BOULDER_TYPE_ID:  int = 0   # generic boulder sub-type
+
+# Door state values (mirrors features.DoorState).  Vendor vision.c:167-168
+# treats any door with ``doormask & (D_CLOSED | D_LOCKED | D_TRAPPED)``
+# as an LoS blocker.  Our DoorState enum encodes:
+#   GONE=0, BROKEN=1, OPEN=2, CLOSED=4, LOCKED=8, SECRET=32.
+# We additionally consult ``features.door_trapped`` for the D_TRAPPED bit.
+_DOOR_CLOSED: int = 4
+_DOOR_LOCKED: int = 8
+_DOOR_SECRET: int = 32
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -74,15 +89,83 @@ def _current_level_terrain(state) -> jnp.ndarray:
 
 
 def _tile_blocks_los(tile: jnp.ndarray) -> jnp.ndarray:
-    """Return True if ``tile`` blocks line of sight.
+    """Return True if ``tile`` blocks line of sight at the terrain layer only.
 
     Cite: vendor/nethack/src/vision.c::does_block (lines 165-184).  We model
     the tile-layer blockers we currently carry in TileType: WALL, CLOSED_DOOR
     (vendor IS_DOOR with D_CLOSED|D_LOCKED|D_TRAPPED), and TREE.  Boulders,
     clouds, water-walls and lava-walls are not yet modeled as tile types.
+
+    This helper is kept for callers that only have terrain context (e.g.
+    ``fov.compute_fov`` with its terrain-only signature).  For callers
+    that hold an EnvState, prefer :func:`_cell_blocks_los_full` which also
+    consults the door-state and ground-item overlays.
     """
     t = tile.astype(jnp.int8)
     return (t == _TILE_WALL) | (t == _TILE_CLOSED_DOOR) | (t == _TILE_TREE)
+
+
+def _cell_blocks_los_full(state, tile: jnp.ndarray,
+                          row: jnp.ndarray, col: jnp.ndarray) -> jnp.ndarray:
+    """Vendor-parity does_block check at a single cell.
+
+    Cite: vendor/nethack/src/vision.c::does_block lines 152-202.  We model:
+
+      * Terrain blockers (lines 166-169): WALL, TREE, and any IS_DOOR tile
+        whose ``doormask`` carries ``D_CLOSED``, ``D_LOCKED`` or ``D_TRAPPED``.
+        Our :class:`features.DoorState` already encodes CLOSED/LOCKED and the
+        SECRET state, and the trapped bit lives on ``features.door_trapped``.
+      * Boulder objects on the tile (lines 181-184): we walk only the front
+        slot of ``state.ground_items[b, lv, row, col, 0]`` because Nethax
+        stores boulders as the sole ground item in that slot (mirrors
+        subsystems/boulders.py).
+
+    Mimics impersonating doors/boulders (vendor lines 186-189) are NOT yet
+    modelled — Nethax does not carry the ``m_ap_type`` discriminator that
+    distinguishes ``M_AP_FURNITURE`` and ``M_AP_OBJECT`` disguises from
+    ``M_AP_MONSTER`` and ``M_AP_NOTHING``.  This is documented as a known
+    divergence; callers that need mimic-as-blocker semantics should extend
+    monster_ai.MonsterAIState with that field first.
+    """
+    t = tile.astype(jnp.int8)
+    blocks_terrain = (t == _TILE_WALL) | (t == _TILE_TREE)
+
+    # Door-state overlay — vendor lines 167-168.  Any IS_DOOR tile (terrain
+    # CLOSED_DOOR or the matching door_state at any non-OPEN value) with
+    # D_CLOSED|D_LOCKED|D_TRAPPED set on the doormask is a blocker.  In
+    # Nethax the terrain CLOSED_DOOR enum is the single representation of
+    # a closed door (an open door is tile OPEN_DOOR), so the terrain check
+    # already covers D_CLOSED; we additionally honour the LOCKED/SECRET
+    # encoding by consulting the features.door_state plane.
+    from Nethax.nethax.dungeon.branches import MAX_LEVELS_PER_BRANCH
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv_local = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    flat_lv = b * jnp.int32(MAX_LEVELS_PER_BRANCH) + lv_local
+    door_val = state.features.door_state[flat_lv, row, col].astype(jnp.int32)
+    door_trapped = state.features.door_trapped[flat_lv, row, col]
+    is_closed_state = door_val == jnp.int32(_DOOR_CLOSED)
+    is_locked_state = door_val == jnp.int32(_DOOR_LOCKED)
+    is_secret_state = door_val == jnp.int32(_DOOR_SECRET)
+    blocks_door = (
+        (t == _TILE_CLOSED_DOOR)  # terrain-level closed door
+        | is_closed_state
+        | is_locked_state
+        | is_secret_state
+        | door_trapped
+    )
+
+    # Boulder overlay — vendor lines 181-184.  Walk ``ground_items[b, lv,
+    # row, col, 0]`` (the only slot used for boulders per
+    # subsystems/boulders.py::_tile_has_boulder).
+    gi = state.ground_items
+    g_cat = gi.category[b, lv_local, row, col, 0].astype(jnp.int32)
+    g_tid = gi.type_id[b, lv_local, row, col, 0].astype(jnp.int32)
+    blocks_boulder = (
+        (g_cat == jnp.int32(_BOULDER_CATEGORY))
+        & (g_tid == jnp.int32(_BOULDER_TYPE_ID))
+    )
+
+    return blocks_terrain | blocks_door | blocks_boulder
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +213,10 @@ def clear_path(state, row1: jnp.ndarray, col1: jnp.ndarray,
         safe_r = jnp.clip(tr, 0, H - 1)
         safe_c = jnp.clip(tc, 0, W - 1)
         tile = terrain[safe_r, safe_c]
-        blocked = _tile_blocks_los(tile)
+        # Full vendor does_block (vision.c:152-202): terrain + door state
+        # + boulder overlay.  Mimic-as-blocker is documented as a known
+        # divergence (see _cell_blocks_los_full).
+        blocked = _cell_blocks_los_full(state, tile, safe_r, safe_c)
         return jnp.where(active & blocked, jnp.bool_(False), clear)
 
     clear = jax.lax.fori_loop(0, MAX_DIST, body, jnp.bool_(True))

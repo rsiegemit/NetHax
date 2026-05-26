@@ -290,7 +290,30 @@ def _apply_fov(state):
             DEFAULT_SIGHT_RADIUS,
         ),
     )
-    new_visible = compute_fov(terrain_2d, state.player_pos, sight_radius)
+    # Build the vendor does_block overlay (vision.c:152-202) for the
+    # current level: boulders sitting on the tile plus door-state bits
+    # (LOCKED / TRAPPED / SECRET) that are not already encoded in the
+    # TileType.CLOSED_DOOR check.
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    from Nethax.nethax.dungeon.branches import MAX_LEVELS_PER_BRANCH
+    flat_lv = b * jnp.int32(MAX_LEVELS_PER_BRANCH) + lv
+    gi = state.ground_items
+    g_cat = gi.category[b, lv, :, :, 0].astype(jnp.int32)
+    g_tid = gi.type_id[b, lv, :, :, 0].astype(jnp.int32)
+    boulder_plane = (g_cat == jnp.int32(14)) & (g_tid == jnp.int32(0))  # ItemCategory.ROCK + boulder
+    door_val = state.features.door_state[flat_lv].astype(jnp.int32)
+    door_trapped = state.features.door_trapped[flat_lv]
+    door_block = (
+        (door_val == jnp.int32(4))   # DoorState.CLOSED
+        | (door_val == jnp.int32(8))  # DoorState.LOCKED
+        | (door_val == jnp.int32(32)) # DoorState.SECRET
+        | door_trapped
+    )
+    opaque_overlay = boulder_plane | door_block
+
+    new_visible = compute_fov(terrain_2d, state.player_pos, sight_radius,
+                              opaque_overlay=opaque_overlay)
 
     b  = state.dungeon.current_branch
     lv = state.dungeon.current_level - 1
