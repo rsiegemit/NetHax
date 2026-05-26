@@ -51,6 +51,7 @@ def _make_wand_state(player_pos=(5, 5), map_h=21, map_w=80):
         mon_sleep_timer = jnp.zeros(n, dtype=jnp.int16),
         terrain       = jnp.full((map_h, map_w), int(TileType.FLOOR), dtype=jnp.int8),
         explored      = jnp.zeros((map_h, map_w), dtype=bool),
+        blockers      = jnp.zeros((map_h, map_w), dtype=bool),
         inventory     = InventoryState.empty(),
         player_pos    = jnp.array(player_pos, dtype=jnp.int16),
         dungeon_level = jnp.int8(1),

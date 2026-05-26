@@ -267,6 +267,7 @@ def test_reflection_bounces_ray():
         mon_sleep_timer=jnp.zeros(N, dtype=jnp.int16),
         terrain=terrain,
         explored=jnp.zeros((MAP_H, MAP_W), dtype=jnp.bool_),
+        blockers=jnp.zeros((MAP_H, MAP_W), dtype=jnp.bool_),
         inventory=InventoryState.empty(),
         player_pos=jnp.array([5, 5], dtype=jnp.int16),
         dungeon_level=jnp.int8(1),

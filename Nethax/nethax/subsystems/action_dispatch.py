@@ -1749,6 +1749,27 @@ def _handle_zap(state, rng):
     # W_NONDIGGABLE check never fires in real gameplay (which matches
     # current EnvState fidelity — no permanent diggable walls modeled).
     _wall_info_default = jnp.zeros(state.traps.trap_type.shape, dtype=jnp.bool_)
+    # Per-tile ray blockers for cast_ray.  Mirrors vendor zap.c::bhit line
+    # 4076 (``!ZAP_POS(typ) || closed_door(x, y)`` halts the beam) and
+    # vision.c::does_block line 182 (boulders block line-of-effect).
+    door_state_2d = state.features.door_state[b, lv].astype(jnp.int32)
+    is_closed_or_locked = (
+        (door_state_2d == jnp.int32(DoorState.CLOSED))
+        | (door_state_2d == jnp.int32(DoorState.LOCKED))
+    )
+    # Boulder slot — ground_items[..., 0] is the canonical boulder cell
+    # (vendor floor objects; cite boulders.py::_tile_has_boulder).
+    from Nethax.nethax.subsystems.boulders import (
+        BOULDER_CATEGORY as _BLDR_CAT,
+        BOULDER_TYPE_ID  as _BLDR_TID,
+    )
+    gi_cat_2d = state.ground_items.category[b, lv, :, :, 0].astype(jnp.int32)
+    gi_tid_2d = state.ground_items.type_id[b, lv, :, :, 0].astype(jnp.int32)
+    has_boulder_2d = (
+        (gi_cat_2d == jnp.int32(_BLDR_CAT))
+        & (gi_tid_2d == jnp.int32(_BLDR_TID))
+    )
+    blockers_2d = is_closed_or_locked | has_boulder_2d
     wand_state = WandState(
         mon_pos       = mai.pos,
         mon_hp        = mai.hp,
@@ -1765,6 +1786,7 @@ def _handle_zap(state, rng):
         mon_sleep_timer = mai.sleep_timer,
         terrain       = terrain_2d,
         explored      = explored_2d,
+        blockers      = blockers_2d,
         inventory     = state.inventory,
         player_pos    = state.player_pos,
         dungeon_level = state.dungeon.current_level.astype(jnp.int8),

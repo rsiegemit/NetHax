@@ -123,6 +123,24 @@ _MONSTER_GEN_LEVEL: jax.Array = jnp.array(
     [m.level for m in MONSTERS], dtype=jnp.int8
 )
 
+# int8[N_MONSTERS] — vendor find_mac base AC (no worn-armor adjustment).
+# Cite: vendor/nethack/src/worn.c::find_mac line 717 — ``int base = mon->data->ac;``
+# adjusted by worn-armor ARM_BONUS.  Nethax monsters do not yet equip armor
+# (monster_ai has no worn_armor slot), so base = MonsterEntry.ac is exact.
+# Used by _effect_striking to implement the vendor WAN_STRIKING to-hit gate
+# ``rnd(20) < 10 + find_mac(mtmp)`` (vendor zap.c:202).
+_MONSTER_BASE_AC: jax.Array = jnp.array(
+    [m.ac for m in MONSTERS], dtype=jnp.int8
+)
+
+# bool[N_MONSTERS] — natural shapeshifter mask, vendor M2_SHAPESHIFTER flag.
+# Cite: vendor/nethack/src/zap.c:290 — ``if (mtmp->cham == NON_PM && !rn2(25))``
+# fires the system-shock instakill on non-natural-shifter targets.  We track
+# this per-species via the M2_SHAPESHIFTER bit in monster flags2.
+_MON_NATURAL_SHIFTER: jax.Array = jnp.array(
+    [bool(m.flags2 & M2_SHAPESHIFTER) for m in MONSTERS], dtype=jnp.bool_
+)
+
 # Byte-equal new-form HP roll lives in polymorph._form_hp_max (imported at
 # the call site to avoid a circular module load).  It mirrors vendor
 # makemon.c:1012-1054 newmonhp:
@@ -279,6 +297,16 @@ class WandState:
     terrain:       jax.Array   # int8[MAP_H, MAP_W]
     explored:      jax.Array   # bool[MAP_H, MAP_W]
 
+    # Per-tile ray-blocker mask: True on tiles that absorb a wand beam beyond
+    # the usual WALL stop.  Vendor zap.c::bhit line 4076 halts the beam on
+    # ``!ZAP_POS(typ) || closed_door(x, y)`` — i.e. closed/locked doors stop
+    # rays.  Vendor vision.c::does_block line 182 (and the parallel beam-stop
+    # rule) further treats boulders on a tile as obstructions.  Callers
+    # (action_dispatch._handle_zap) populate this mask from
+    # features.door_state ∈ {CLOSED, LOCKED} ∪ tiles holding a BOULDER in
+    # ground_items[..., 0].
+    blockers:      jax.Array   # bool[MAP_H, MAP_W]
+
     inventory:     InventoryState
 
     player_pos:    jax.Array   # int16[2]
@@ -327,6 +355,7 @@ class WandState:
             mon_sleep_timer=jnp.zeros(n, dtype=jnp.int16),
             terrain=jnp.zeros((map_h, map_w), dtype=jnp.int8),
             explored=jnp.zeros((map_h, map_w), dtype=bool),
+            blockers=jnp.zeros((map_h, map_w), dtype=bool),
             inventory=InventoryState.empty(),
             player_pos=jnp.zeros(2, dtype=jnp.int16),
             dungeon_level=jnp.int8(1),
@@ -431,6 +460,13 @@ def cast_ray(
         tile = s.terrain[next_pos[0], next_pos[1]].astype(jnp.int32)
         is_wall = tile == int(TileType.WALL)
 
+        # Closed/locked doors and boulders also absorb the beam.
+        # Cite: vendor/nethack/src/zap.c::bhit line 4076 — beam halts on
+        # ``!ZAP_POS(typ) || closed_door(x, y)``.
+        # Cite: vendor/nethack/src/vision.c::does_block line 182 — boulders
+        # on a tile block the line of effect.
+        is_blocker = s.blockers[next_pos[0], next_pos[1]]
+
         mon_idx = _find_monster_at(s, next_pos)
         has_monster = (mon_idx > 0) & s.mon_alive[mon_idx]
 
@@ -461,7 +497,7 @@ def cast_ray(
         )
 
         # Determine whether the beam should halt after this step.
-        beam_stopped = stopped | is_wall | oob
+        beam_stopped = stopped | is_wall | is_blocker | oob
         beam_stopped = lax.cond(
             (~stopped) & has_monster & stop_on_hit,
             lambda _: jnp.bool_(True),
@@ -751,12 +787,42 @@ def _effect_striking(
 ) -> tuple[WandState, jax.Array]:
     """WAN_STRIKING — BEAM, 2d12 damage to first monster hit.
 
-    vendor/nethack/src/zap.c bhitm() WAN_STRIKING: d(2,12).
+    Vendor: zap.c::bhitm WAN_STRIKING (lines 189-217).  The damage roll
+    ``d(2, 12)`` is gated by a to-hit check:
+
+        if (resists_magm(mtmp))         { ... "Boing!" ... }
+        else if (u.uswallow ||
+                 rnd(20) < 10 + find_mac(mtmp)) {
+            dmg = d(2, 12);
+            ... hit + resist(...) ...
+        } else {
+            ... miss ...
+        }
+
+    ``find_mac(mtmp)`` returns the monster's effective AC (vendor worn.c:717,
+    base AC adjusted by worn armor).  Nethax monsters don't equip armor, so
+    we use the per-species base AC table ``_MONSTER_BASE_AC``.  The engulf
+    path (``u.uswallow``) is not modeled at the wand layer; the standard
+    ``rnd(20) < 10 + ac`` predicate covers all in-game cases here.
     """
     def on_hit(s, r, mon_idx):
-        r, dmg = _rng_d(r, 2, 12)
-        s = _deal_damage(s, mon_idx, dmg)
-        return s, r
+        # Resolve the find_mac gate first; the d(2,12) roll is only consumed
+        # when the gate passes (mirrors vendor: dmg lives inside the else-if).
+        entry_idx = s.mon_type[mon_idx].astype(jnp.int32)
+        ac = _MONSTER_BASE_AC[entry_idx].astype(jnp.int32)
+        r, roll = _rng_rnd(r, 20)
+        hit = roll < (jnp.int32(10) + ac)
+
+        def _on_hit(args):
+            s_, r_ = args
+            r_, dmg = _rng_d(r_, 2, 12)
+            s_ = _deal_damage(s_, mon_idx, dmg)
+            return s_, r_
+
+        def _on_miss(args):
+            return args
+
+        return lax.cond(hit, _on_hit, _on_miss, (s, r))
 
     return cast_ray(state, rng, state.player_pos, direction,
                     on_hit_fn=on_hit, stop_on_hit=True)
@@ -828,40 +894,64 @@ def _effect_polymorph(
     from Nethax.nethax.subsystems.polymorph import _POLY_FORM_VALID, _form_hp_max
 
     def on_hit(s, r, mon_idx):
-        # Rejection-sample a _POLY_FORM_VALID index in [1, N_MONSTERS-1].
-        def _cond(ws):
-            _, candidate = ws
-            return ~_POLY_FORM_VALID[candidate]
+        # System-shock branch — vendor/nethack/src/zap.c:290:
+        #   if (mtmp->cham == NON_PM && !rn2(25)) {
+        #       ... xkilled(mtmp, XKILL_GIVEMSG | XKILL_NOCORPSE);
+        #   }
+        # Natural shapeshifters (M2_SHAPESHIFTER, ``mtmp->cham != NON_PM``)
+        # are exempt; everyone else has a 1/25 chance of dying outright.
+        # We always consume one rn2(25) roll so the RNG stream advances
+        # deterministically regardless of branch (mirrors the vendor evaluation
+        # order which calls rn2(25) inside the cham guard).
+        entry_idx = s.mon_type[mon_idx].astype(jnp.int32)
+        natural_shifter = _MON_NATURAL_SHIFTER[entry_idx]
+        r, shock_roll = _rng_rnd(r, 25)            # rn1==1 ⇔ rn2(25)==0
+        shock_fires = (~natural_shifter) & (shock_roll == jnp.int32(1))
 
-        def _body(ws):
-            r_, _ = ws
-            r_, sub = jax.random.split(r_)
-            c = jax.random.randint(sub, shape=(), minval=1,
-                                   maxval=N_MONSTERS, dtype=jnp.int32)
-            return (r_, c)
+        def _do_kill(args):
+            s_, r_ = args
+            new_alive = s_.mon_alive.at[mon_idx].set(jnp.bool_(False))
+            new_hp = s_.mon_hp.at[mon_idx].set(jnp.int32(0))
+            return s_.replace(mon_alive=new_alive, mon_hp=new_hp), r_
 
-        r, sub0 = jax.random.split(r)
-        init_c = jax.random.randint(sub0, shape=(), minval=1,
-                                    maxval=N_MONSTERS, dtype=jnp.int32)
-        r, new_type = lax.while_loop(_cond, _body, (r, init_c))
-        new_type = new_type.astype(jnp.int32)
+        def _do_morph(args):
+            s_, r_ = args
+            # Rejection-sample a _POLY_FORM_VALID index in [1, N_MONSTERS-1].
+            def _cond(ws):
+                _, candidate = ws
+                return ~_POLY_FORM_VALID[candidate]
 
-        # Byte-equal newmonhp roll (vendor/nethack/src/makemon.c:1012).
-        r, sub_hp = jax.random.split(r)
-        new_hp_max = _form_hp_max(new_type.astype(jnp.int16),
-                                  sub_hp).astype(jnp.int32)
-        old_hp_max = jnp.maximum(s.mon_hp_max[mon_idx].astype(jnp.float32),
-                                 jnp.float32(1.0))
-        ratio  = s.mon_hp[mon_idx].astype(jnp.float32) / old_hp_max
-        new_hp = jnp.maximum(jnp.int32(1),
-                             (ratio * new_hp_max.astype(jnp.float32)).astype(jnp.int32))
+            def _body(ws):
+                rr, _ = ws
+                rr, sub = jax.random.split(rr)
+                c = jax.random.randint(sub, shape=(), minval=1,
+                                       maxval=N_MONSTERS, dtype=jnp.int32)
+                return (rr, c)
 
-        s = s.replace(
-            mon_type=s.mon_type.at[mon_idx].set(new_type.astype(jnp.int16)),
-            mon_hp=s.mon_hp.at[mon_idx].set(new_hp),
-            mon_hp_max=s.mon_hp_max.at[mon_idx].set(new_hp_max),
-        )
-        return s, r
+            r_, sub0 = jax.random.split(r_)
+            init_c = jax.random.randint(sub0, shape=(), minval=1,
+                                        maxval=N_MONSTERS, dtype=jnp.int32)
+            r_, new_type = lax.while_loop(_cond, _body, (r_, init_c))
+            new_type = new_type.astype(jnp.int32)
+
+            # Byte-equal newmonhp roll (vendor/nethack/src/makemon.c:1012).
+            r_, sub_hp = jax.random.split(r_)
+            new_hp_max = _form_hp_max(new_type.astype(jnp.int16),
+                                      sub_hp).astype(jnp.int32)
+            old_hp_max = jnp.maximum(s_.mon_hp_max[mon_idx].astype(jnp.float32),
+                                     jnp.float32(1.0))
+            ratio  = s_.mon_hp[mon_idx].astype(jnp.float32) / old_hp_max
+            new_hp = jnp.maximum(jnp.int32(1),
+                                 (ratio * new_hp_max.astype(jnp.float32)).astype(jnp.int32))
+
+            s_ = s_.replace(
+                mon_type=s_.mon_type.at[mon_idx].set(new_type.astype(jnp.int16)),
+                mon_hp=s_.mon_hp.at[mon_idx].set(new_hp),
+                mon_hp_max=s_.mon_hp_max.at[mon_idx].set(new_hp_max),
+            )
+            return s_, r_
+
+        return lax.cond(shock_fires, _do_kill, _do_morph, (s, r))
 
     return cast_ray(state, rng, state.player_pos, direction,
                     on_hit_fn=on_hit, stop_on_hit=True)

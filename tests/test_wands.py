@@ -128,6 +128,30 @@ def test_charges_do_not_go_negative():
 # Test: striking reduces adjacent monster HP
 # ---------------------------------------------------------------------------
 
+def _striking_hit_rng(seed_start: int = 0, max_tries: int = 64):
+    """Return a PRNGKey for which the WAN_STRIKING to-hit gate passes against
+    a giant ant (vendor base AC=3 → rnd(20) < 13 passes ~60% of the time).
+
+    Cite: vendor/nethack/src/zap.c::bhitm WAN_STRIKING (line 202):
+      ``rnd(20) < 10 + find_mac(mtmp)``  gates the d(2,12) damage roll.
+    Tests below need a deterministic-hit RNG; we search a small key range
+    rather than mocking the roll so the parity gate keeps real coverage.
+    """
+    from Nethax.nethax.subsystems.items_wands import (
+        _MONSTER_BASE_AC,
+        _rng_rnd,
+    )
+    # AC for giant ant (entry_idx=0).
+    ac = int(_MONSTER_BASE_AC[0])
+    for i in range(seed_start, seed_start + max_tries):
+        key = jax.random.PRNGKey(i)
+        # The first rnd(20) consumed inside on_hit is the gate.
+        _, roll = _rng_rnd(key, 20)
+        if int(roll) < 10 + ac:
+            return key
+    raise AssertionError("could not find a hit-passing seed")
+
+
 def test_striking_reduces_monster_hp():
     """Zap of WAN_STRIKING on an adjacent monster (East) reduces its HP."""
     state = _make_state(player_row=10, player_col=10)
@@ -137,16 +161,38 @@ def test_striking_reduces_monster_hp():
 
     initial_hp = int(state.mon_hp[1])
 
-    result = zap_wand(state, _RNG, slot_idx=jnp.int32(0), direction=jnp.int32(2))
+    # zap_wand splits the RNG once before invoking the per-effect handler
+    # (see items_wands.handle_zap).  cast_ray then carries that split key
+    # through; the very first random draw inside on_hit is the find_mac
+    # gate.  We just need a starting seed whose own first rnd(20) lands a
+    # hit — the in-engine split is structure-preserving so the same seed
+    # that lands a hit on giant-ant in isolation does so end-to-end.
+    rng = _striking_hit_rng()
+    # zap_wand consumes the first split for charge bookkeeping; the
+    # easier path is to retry seeds until we observe a hit end-to-end.
+    final_hp = None
+    for i in range(64):
+        result = zap_wand(state, jax.random.PRNGKey(i), slot_idx=jnp.int32(0),
+                          direction=jnp.int32(2))
+        cand = int(result.mon_hp[1])
+        if cand < initial_hp:
+            final_hp = cand
+            break
 
-    final_hp = int(result.mon_hp[1])
-    assert final_hp < initial_hp, (
+    assert final_hp is not None and final_hp < initial_hp, (
         f"Expected HP to decrease from {initial_hp}, got {final_hp}"
     )
 
 
 def test_striking_is_beam_stops_at_first_monster():
-    """STRIKING is a BEAM — second monster behind first must be unharmed."""
+    """STRIKING is a BEAM — second monster behind first must be unharmed.
+
+    Vendor: zap.c::bhitm WAN_STRIKING gates the damage roll on a
+    ``rnd(20) < 10 + find_mac(mtmp)`` hit check (line 202); the BEAM
+    class halts the ray on the first monster encountered regardless of
+    hit/miss.  We iterate seeds to find one that lands a hit on the
+    first monster, then assert the second monster is still untouched.
+    """
     state = _make_state(player_row=10, player_col=10)
     # First monster at col=11 (adjacent east).
     state = _place_monster(state, slot=1, row=10, col=11, hp=20)
@@ -154,14 +200,19 @@ def test_striking_is_beam_stops_at_first_monster():
     state = _place_monster(state, slot=2, row=10, col=13, hp=20)
     state = _with_wand(state, WandEffect.STRIKING, charges=5)
 
-    result = zap_wand(state, _RNG, slot_idx=jnp.int32(0), direction=jnp.int32(2))
-
-    # Second monster must be untouched.
-    assert int(result.mon_hp[2]) == 20, (
-        f"Second monster HP should be 20 (untouched), got {int(result.mon_hp[2])}"
-    )
-    # First monster must have taken damage.
-    assert int(result.mon_hp[1]) < 20
+    hit_observed = False
+    for i in range(64):
+        result = zap_wand(state, jax.random.PRNGKey(i), slot_idx=jnp.int32(0),
+                          direction=jnp.int32(2))
+        if int(result.mon_hp[1]) < 20:
+            hit_observed = True
+            # Second monster must be untouched (BEAM stops at first target).
+            assert int(result.mon_hp[2]) == 20, (
+                f"Second monster HP should be 20 (untouched), got "
+                f"{int(result.mon_hp[2])}"
+            )
+            break
+    assert hit_observed, "no seed in 0..63 produced a striking hit"
 
 
 # ---------------------------------------------------------------------------
