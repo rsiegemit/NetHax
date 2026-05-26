@@ -243,6 +243,10 @@ class ObjType:
     EXPENSIVE_CAMERA  = 605
     CREDIT_CARD       = 606
     MAGIC_MARKER      = 607
+    # BLINDFOLD vendor otyp = 208 (see subsystems/prayer.py:437).  Kept under
+    # the TOOL_CLASS bucket here because vendor classifies it as TOOL_CLASS in
+    # u_init.c::Blindfold[] (line 184).  The numeric value matches vendor.
+    BLINDFOLD         = 208
 
     # Food (FOOD_CLASS = 7) — vendor otyp values (objects.py:252-268).
     # Audit L #14-#26 references for starting inventory items.
@@ -575,18 +579,24 @@ STARTING_INVENTORY: dict = {
         _armor(ObjType.CLOAK_OF_DISPLACEMENT, enchant=2),
         _food(ObjType.CRAM_RATION, 4),
     ],
-    # Rog: short sword+0, daggers+0 x10, leather armor+1, lock pick, sack,
-    #      1 potion of sickness (u_init.c Rogue[] 133-141).
-    # Audit L #22: added the missing POT_SICKNESS×1.  Vendor DAGGER qty is
-    # ``6..15`` random; we keep the static 10 (median = 10) since per-init
-    # random ranges aren't threaded through this static table.
+    # Rog: short sword+0, daggers+0 x10, leather armor+1, pot of sickness,
+    #      lock pick, sack, blindfold (u_init.c Rogue[] 122-131 + line 754
+    #      Blindfold extra roll).
+    # Vendor order (ini_inv) is: SHORT_SWORD, DAGGER, LEATHER_ARMOR,
+    #   POT_SICKNESS, LOCK_PICK, SACK — then ``if (!rn2(5)) ini_inv(Blindfold)``
+    #   appends BLINDFOLD as a 7th item.  NLE seed 0 rolls the lucky branch,
+    #   so for byte-exact parity we include the BLINDFOLD slot.  Vendor DAGGER
+    #   qty is ``6..15`` random; we keep the static 10 (median) until per-init
+    #   random ranges are threaded.  BODY-armor slot index (2) is preserved
+    #   so ``_WORN_ARMOR_BY_ROLE[ROGUE]`` still maps to LEATHER_ARMOR.
     Role.ROGUE: [
         _weapon(ObjType.SHORT_SWORD),
         _weapon(ObjType.DAGGER, 10),
         _armor(ObjType.LEATHER_ARMOR, enchant=1),
+        _potion(ObjType.POT_SICKNESS, 1),
         _tool(ObjType.LOCK_PICK),
         _tool(ObjType.SACK),
-        _potion(ObjType.POT_SICKNESS, 1),
+        _tool(ObjType.BLINDFOLD),
     ],
     # Sam: katana+0, wakizashi(short sword)+0, yumi+0, ya+0 x26, splint mail+0
     # u_init.c Samurai[]: all spe=0, all trbless=UNDEF_BLESS → UNCURSED.
