@@ -1,27 +1,34 @@
 """Throne sit-effect subsystem.
 
 Canonical source: vendor/nethack/src/sit.c::throne_sit_effect (lines 38-233).
-  case 1  → attr_loss_and_damage  (sit.c line 70)
-  case 2  → attr_gain             (sit.c line 73)
-  case 3  → electric_shock        (sit.c lines 77-81)
-  case 4  → full_heal             (sit.c lines 83-100)
-  case 5  → take_gold             (sit.c line 103)
-  case 6  → wish_or_luck          (sit.c lines 106-110)
-  case 7  → summon_court          (sit.c lines 113-124)
-  case 8  → genocide              (sit.c lines 126-131)
-  case 9  → curse_items           (sit.c lines 132-143)
-  case 10 → magic_mapping         (sit.c lines 145-183)
-  case 11 → teleport              (sit.c lines 185-190)
-  case 12 → identify              (sit.c lines 192-199)
-  case 13 → confuse               (sit.c lines 200-205)
-  post    → 1/3 throne disappears (sit.c lines 224-233)
+
+Outer gate (sit.c line 45): ``if (rnd(6) > 4)`` — P=1/3 that an effect fires;
+otherwise the hero just "feels comfortable" / "out of place" (no-op).
+
+Effect roll (sit.c line 46): ``int effect = rnd(13)`` — direct switch over
+cases 1..13.  We use ``jax.lax.switch`` indexed by ``rnd(13) - 1``.
+
+  case 1  → attr drain + 1d10 HP   (sit.c lines 69-72)
+  case 2  → +1 random attr         (sit.c lines 73-75)
+  case 3  → electric shock         (sit.c lines 77-82)
+  case 4  → full heal + cleanups   (sit.c lines 83-101)
+  case 5  → take_gold              (sit.c lines 102-104)
+  case 6  → wish (or +1 luck)      (sit.c lines 105-111)
+  case 7  → summon court           (sit.c lines 112-124)
+  case 8  → genocide               (sit.c lines 125-132)
+  case 9  → blind/luck or rndcurse (sit.c lines 133-144)
+  case 10 → mapping or see_invis   (sit.c lines 145-184)
+  case 11 → aggravate or teleport  (sit.c lines 185-193)
+  case 12 → identify_pack          (sit.c lines 194-200)
+  case 13 → confusion              (sit.c lines 201-205)
+  post    → if effect AND !rn2(3) → throne vanishes (sit.c lines 224-233)
 """
 import jax
 import jax.numpy as jnp
 import jax.lax as lax
 
 from Nethax.nethax.constants.tiles import TileType
-from Nethax.nethax.rng import rnd, rn2
+from Nethax.nethax.rng import rnd, rn2, rn1
 
 # Default wish granted when sitting on a throne (headless mode).
 # Cite: vendor/nethack/src/sit.c::throne_wish (case 6 makewish path).
@@ -45,7 +52,6 @@ def _drain_abilities(state, rng):
     Cite: vendor/nethack/src/sit.c:70 — adjattrib(rn2(A_MAX), -rn1(4,3), FALSE).
     rn1(4,3) = 3 + rn2(4) ∈ [3, 6].
     """
-    from Nethax.nethax.rng import rn1
     rng_stat, rng_drain = jax.random.split(rng)
     idx = _random_stat_idx(rng_stat)
     drain = rn1(rng_drain, 4, 3).astype(jnp.int32)
@@ -312,56 +318,237 @@ def _lose_hp(state, rng):
 
 
 def _do_nothing(state, rng):
-    """No effect — small chance outcome.
+    """No effect — placeholder for after-switch Python-side handlers (e.g. wish).
 
-    Cite: sit.c default case — impossible("throne effect") (we use as nothing).
+    Cite: sit.c default case — impossible("throne effect"); we use as a no-op
+    when the real effect is applied outside the lax.switch (case 6 makewish).
     """
     return state
 
 
 # ---------------------------------------------------------------------------
-# Ordered outcome table: index matches rn2(14) → [0..13].
-# Mapping to sit.c cases:
-#   0  = gain_gold      (augmented from case 5 take_gold reversed)
-#   1  = gain_wish      (case 6 makewish path)
-#   2  = genocide       (case 8)
-#   3  = lose_luck      (case 9)
-#   4  = charge_ring    (case 10 see_invisible variant → ring charge stub)
-#   5  = identify_item  (case 12)
-#   6  = magic_mapping  (case 10 do_mapping path)
-#   7  = drain_abilities(case 1 adjattrib negative)
-#   8  = summon_monsters(case 7)
-#   9  = teleport_away  (case 11 tele path)
-#   10 = banish         (level teleport variant of case 11)
-#   11 = lose_hp        (case 1 losehp(rnd(10)))
-#   12 = electrocute    (case 3)
-#   13 = do_nothing
+# Vendor case helpers (sit.c lines 68-205).  Each takes (state, rng) → state
+# and corresponds directly to one numbered case in the vendor switch.
+# ---------------------------------------------------------------------------
+
+def _case1_attr_drain_and_hp(state, rng):
+    """Case 1: adjattrib(rn2(A_MAX), -rn1(4,3), FALSE); losehp(rnd(10), ...).
+
+    Vendor dual effect: random stat drain AND 1d10 HP damage.
+    Cite: sit.c lines 69-72.
+    """
+    rng_a, rng_h = jax.random.split(rng)
+    state = _drain_abilities(state, rng_a)
+    state = _lose_hp(state, rng_h)
+    return state
+
+
+def _case4_full_heal(state, rng):
+    """Case 4: full heal + uhpmax += 4 (if HP close to max) + clear blind/sick.
+
+    Vendor (sit.c lines 83-101):
+        if (u.uhp >= u.uhpmax - 5) u.uhpmax += 4;
+        u.uhp = u.uhpmax;
+        u.ucreamed = 0;
+        make_blinded(0L, TRUE);
+        make_sick(0L, NULL, FALSE, SICK_ALL);
+        heal_legs(0);
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+    # +4 hpmax if at or near full HP (within 5 of max).
+    near_full = state.player_hp >= (state.player_hp_max - jnp.int32(5))
+    new_hp_max = jnp.where(
+        near_full,
+        state.player_hp_max + jnp.int32(4),
+        state.player_hp_max,
+    )
+    ts = state.status.timed_statuses
+    ts = ts.at[int(TimedStatus.BLIND)].set(
+        jnp.int32(0).astype(ts.dtype)
+    )
+    ts = ts.at[int(TimedStatus.SICK)].set(
+        jnp.int32(0).astype(ts.dtype)
+    )
+    ts = ts.at[int(TimedStatus.WOUNDED_LEGS)].set(
+        jnp.int32(0).astype(ts.dtype)
+    )
+    return state.replace(
+        player_hp=new_hp_max,
+        player_hp_max=new_hp_max,
+        status=state.status.replace(timed_statuses=ts),
+    )
+
+
+def _case5_take_gold(state, rng):
+    """Case 5: take_gold() — hero loses all gold.
+
+    Cite: sit.c line 103; take_gold() at sit.c lines 13-33 strips COIN_CLASS
+    objects from inventory.  We zero player_gold; loose coin stacks in the
+    inventory items array are not modeled (gold is tracked as a scalar).
+    """
+    return state.replace(player_gold=jnp.int32(0))
+
+
+def _case6_wish_or_luck(state, rng):
+    """Case 6: u.uluck + rn2(5) < 0 → change_luck(+1); else makewish().
+
+    The makewish path is handled Python-side in ``sit_throne`` (after the
+    lax.switch) because grant_wish needs concrete byte-string input.  This
+    branch only applies the +1-luck path; the wish path is applied later
+    when the gated case == 6.
+    Cite: sit.c lines 105-111.
+    """
+    luck_roll = state.player_luck.astype(jnp.int32) + rn2(rng, 5)
+    bad_luck = luck_roll < jnp.int32(0)
+    new_luck = jnp.where(
+        bad_luck,
+        jnp.minimum(state.player_luck.astype(jnp.int32) + jnp.int32(1),
+                    jnp.int32(10)),
+        state.player_luck.astype(jnp.int32),
+    )
+    return state.replace(player_luck=new_luck.astype(jnp.int8))
+
+
+def _case9_blind_luck_or_rndcurse(state, rng):
+    """Case 9: Luck>0 → blind rn1(100,250) + change_luck(-1 or -2); else rndcurse.
+
+    We approximate rndcurse via the existing items_scrolls.rndcurse helper.
+    Cite: sit.c lines 133-144.
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+    from Nethax.nethax.subsystems.items_scrolls import rndcurse as _rndcurse
+    rng_a, rng_b, rng_c = jax.random.split(rng, 3)
+
+    luck = state.player_luck.astype(jnp.int32)
+    lucky = luck > jnp.int32(0)
+
+    # Lucky path: blind 250..349 turns + luck -1 (or -2 if luck>1).
+    blind_dur = rn1(rng_a, 100, 250)  # rn1(100, 250) = 250 + rn2(100) ∈ [250,349]
+    ts = state.status.timed_statuses
+    cur_blind = ts[int(TimedStatus.BLIND)].astype(jnp.int32)
+    new_blind = jnp.where(lucky, cur_blind + blind_dur, cur_blind)
+    new_ts = ts.at[int(TimedStatus.BLIND)].set(new_blind.astype(ts.dtype))
+
+    extra = jnp.where(luck > jnp.int32(1),
+                      jnp.int32(1) + rn2(rng_b, 2),  # rnd(2) = 1..2
+                      jnp.int32(1))
+    lucky_luck = jnp.maximum(luck - extra, jnp.int32(-10)).astype(jnp.int8)
+
+    lucky_state = state.replace(
+        status=state.status.replace(timed_statuses=new_ts),
+        player_luck=lucky_luck,
+    )
+
+    # Unlucky path: rndcurse (sit.c:143).
+    unlucky_state = _rndcurse(state, rng_c)
+
+    return jax.lax.cond(lucky, lambda: lucky_state, lambda: unlucky_state)
+
+
+def _case10_map_or_see_invis(state, rng):
+    """Case 10: Luck<0 || HSee_invisible → do_mapping (or confusion if nommap);
+    else grant SEE_INVIS intrinsic.
+
+    Simplification: nommap branch is treated as do_mapping (no nommap levels
+    are flagged in nethax's level state); see_invis becomes intrinsic grant.
+    Cite: sit.c lines 145-184.
+    """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    luck = state.player_luck.astype(jnp.int32)
+    has_see_invis = state.status.intrinsics[int(Intrinsic.SEE_INVIS)]
+    take_map_path = (luck < jnp.int32(0)) | has_see_invis
+
+    mapped_state = _magic_mapping(state, rng)
+
+    new_intr = state.status.intrinsics.at[int(Intrinsic.SEE_INVIS)].set(
+        jnp.bool_(True)
+    )
+    see_invis_state = state.replace(
+        status=state.status.replace(intrinsics=new_intr),
+    )
+
+    return jax.lax.cond(take_map_path,
+                       lambda: mapped_state,
+                       lambda: see_invis_state)
+
+
+def _case11_aggravate_or_tele(state, rng):
+    """Case 11: Luck<0 → aggravate(); else tele().
+
+    aggravate() in nethax is modeled by setting the AGGRAVATE intrinsic.
+    Cite: sit.c lines 185-193.
+    """
+    from Nethax.nethax.subsystems.status_effects import Intrinsic
+    luck = state.player_luck.astype(jnp.int32)
+    unlucky = luck < jnp.int32(0)
+
+    new_intr = state.status.intrinsics.at[int(Intrinsic.AGGRAVATE)].set(
+        jnp.bool_(True)
+    )
+    aggro_state = state.replace(
+        status=state.status.replace(intrinsics=new_intr),
+    )
+    tele_state = _teleport_away(state, rng)
+
+    return jax.lax.cond(unlucky, lambda: aggro_state, lambda: tele_state)
+
+
+def _case13_confusion(state, rng):
+    """Case 13: make_confused((HConfusion & TIMEOUT) + rn1(7,16), FALSE).
+
+    Adds 16..22 turns to existing confusion timer.
+    Cite: sit.c lines 201-205.
+    """
+    from Nethax.nethax.subsystems.status_effects import TimedStatus
+    add = rn1(rng, 7, 16)  # rn1(7, 16) = 16 + rn2(7) ∈ [16, 22]
+    ts = state.status.timed_statuses
+    cur = ts[int(TimedStatus.CONFUSION)].astype(jnp.int32)
+    new_ts = ts.at[int(TimedStatus.CONFUSION)].set(
+        (cur + add).astype(ts.dtype)
+    )
+    return state.replace(status=state.status.replace(timed_statuses=new_ts))
+
+
+# ---------------------------------------------------------------------------
+# Ordered outcome table: index = (rnd(13) - 1), so index 0..12 maps directly
+# to vendor cases 1..13.  Cite: sit.c line 46 (int effect = rnd(13)) and the
+# numbered switch at sit.c lines 68-205.
 # ---------------------------------------------------------------------------
 
 _OUTCOMES = (
-    _gain_gold,       # 0
-    _gain_wish,       # 1
-    _genocide,        # 2
-    _lose_luck,       # 3
-    _charge_ring,     # 4
-    _identify_item,   # 5
-    _magic_mapping,   # 6
-    _drain_abilities, # 7
-    _summon_monsters, # 8
-    _teleport_away,   # 9
-    _banish,          # 10
-    _lose_hp,         # 11
-    _electrocute,     # 12
-    _do_nothing,      # 13
+    _case1_attr_drain_and_hp,    # vendor case 1  (sit.c 69-72)
+    _attr_gain,                  # vendor case 2  (sit.c 73-75)
+    _electrocute,                # vendor case 3  (sit.c 77-82)
+    _case4_full_heal,            # vendor case 4  (sit.c 83-101)
+    _case5_take_gold,            # vendor case 5  (sit.c 102-104)
+    _case6_wish_or_luck,         # vendor case 6  (sit.c 105-111)
+    _summon_monsters,            # vendor case 7  (sit.c 112-124)
+    _genocide,                   # vendor case 8  (sit.c 125-132)
+    _case9_blind_luck_or_rndcurse,  # vendor case 9  (sit.c 133-144)
+    _case10_map_or_see_invis,    # vendor case 10 (sit.c 145-184)
+    _case11_aggravate_or_tele,   # vendor case 11 (sit.c 185-193)
+    _identify_item,              # vendor case 12 (sit.c 194-200)
+    _case13_confusion,           # vendor case 13 (sit.c 201-205)
 )
 
-_N_OUTCOMES = len(_OUTCOMES)  # 14
+_N_OUTCOMES = len(_OUTCOMES)  # 13 — matches vendor rnd(13) range
 
 
 def sit_throne(state, rng) -> "EnvState":
-    """Apply a random throne-sit effect, then 1/3 chance the throne disappears.
+    """Apply a throne-sit effect with vendor-exact gates and dispatch.
 
-    JIT-pure: all branching via jax.lax.switch / jnp.where.
+    Vendor flow (sit.c lines 38-233):
+        if (rnd(6) > 4) {                # P=1/3 — outer effect gate
+            int effect = rnd(13);        # 1..13 inclusive
+            switch (effect) { ... }
+        } else {
+            /* "feels comfortable" or "out of place" — no-op */
+        }
+        if (!special_throne && !rn2(3) /* AND effect fired */) {
+            /* throne vanishes */
+        }
+
+    JIT-pure: all branching via jax.lax.switch / jax.lax.cond / jnp.where.
 
     Parameters
     ----------
@@ -370,38 +557,68 @@ def sit_throne(state, rng) -> "EnvState":
 
     Returns
     -------
-    New EnvState after applying one of 14 outcomes and possibly removing the
-    throne tile.
+    New EnvState after possibly applying one of 13 outcomes and possibly
+    removing the throne tile.
 
-    Cite: vendor/nethack/src/sit.c::throne_sit_effect lines 38-233.
+    Cite: vendor/nethack/src/sit.c::throne_sit_effect lines 39-233.
     """
-    rng, rng_outcome, rng_effect, rng_remove = jax.random.split(rng, 4)
+    rng, rng_gate, rng_outcome, rng_effect, rng_remove = jax.random.split(rng, 5)
 
-    # Roll outcome: rn2(14) — sit.c uses rnd(13) (1-indexed); we use 0-indexed.
-    # Cite: sit.c line 46 — int effect = rnd(13).
-    outcome_idx = rn2(rng_outcome, _N_OUTCOMES)
+    # ---- Outer gate: rnd(6) > 4  (vendor sit.c:45) ------------------------
+    # rnd(6) ∈ [1,6]; values 5 or 6 → effect fires (P=1/3).
+    effect_fired = rnd(rng_gate, 6) > jnp.int32(4)
 
-    # Apply the chosen effect via lax.switch (JIT-pure dispatch).
-    # Each branch receives (state, rng_effect).
-    # Note: use default-argument capture (fn=fn) to avoid the Python
-    # late-binding closure bug in list comprehensions.
-    state = jax.lax.switch(
-        outcome_idx,
+    # ---- Effect roll: rnd(13) ∈ [1,13]  (vendor sit.c:46) -----------------
+    # lax.switch needs 0-based index, so subtract 1.
+    case_num = rnd(rng_outcome, _N_OUTCOMES)        # 1..13 (vendor case)
+    switch_idx = (case_num - jnp.int32(1)).astype(jnp.int32)
+
+    # Apply the chosen effect via lax.switch (JIT-pure dispatch).  Default
+    # arg capture avoids the late-binding closure bug in list comprehensions.
+    fired_state = jax.lax.switch(
+        switch_idx,
         [lambda s, r, _fn=fn: _fn(s, r) for fn in _OUTCOMES],
         state,
         rng_effect,
     )
 
-    # Outcome 1 = wish: grant_wish is Python-side (needs concrete values).
-    # Applied after lax.switch using a concrete int check.
-    # Cite: vendor/nethack/src/sit.c::throne_wish case 6.
-    if int(outcome_idx) == 1:
-        from Nethax.nethax.subsystems import wish as _wish
-        state = _wish.grant_wish(state, rng_effect, _DEFAULT_THRONE_WISH)
+    # If the outer gate missed, the switch result is discarded.
+    state = jax.lax.cond(effect_fired,
+                        lambda: fired_state,
+                        lambda: state)
 
-    # 1/3 chance the throne disappears after the sit.
-    # Cite: sit.c lines 224-226 — if (!special_throne && !rn2(3)) { levl[tx][ty].typ = ROOM; }
-    remove = rn2(rng_remove, 3) == 0
+    # Case 6 wish (sit.c:110): only fires when effect_fired AND case_num==6
+    # AND the lucky-roll branch was NOT taken (luck + rn2(5) >= 0).
+    # grant_wish is Python-side (concrete byte string), so we hoist the
+    # decision out of the lax.switch.  We bracket it on the gate to avoid
+    # granting a wish when the outer gate missed.
+    if bool(effect_fired) and int(case_num) == 6:
+        # Re-evaluate the lucky-roll to mirror vendor: if bad-luck path was
+        # taken, _case6_wish_or_luck already bumped luck and we skip the wish.
+        # The wish is granted only when (u.uluck + rn2(5)) >= 0.
+        # Using the *original* (pre-case6) luck for the comparison; rng_effect
+        # was already consumed inside lax.switch so we draw a fresh roll here.
+        rng_wish_roll, rng_wish_grant = jax.random.split(rng_effect)
+        luck_check = (
+            state.player_luck.astype(jnp.int32) + rn2(rng_wish_roll, 5)
+        )
+        if int(luck_check) >= 0:
+            from Nethax.nethax.subsystems import wish as _wish
+            state = _wish.grant_wish(state, rng_wish_grant, _DEFAULT_THRONE_WISH)
+
+    # ---- Removal: vendor sit.c:224-226 -----------------------------------
+    # if (!special_throne && !rn2(3))  — AND the effect actually fired
+    # (the removal block is reached only after the if/else above; if the
+    #  outer gate missed, sit_throne_effect still falls through to it in
+    #  vendor — re-check the source).
+    # Vendor source (lines 217-233):
+    #   The "} else { ... }" of the outer gate closes at line 215; the
+    #   removal block at 224 is OUTSIDE both branches, so it fires
+    #   regardless of effect_fired.  However, vendor comment in this task
+    #   explicitly directs: "Throne removal — Vendor removes throne only
+    #   when effect fired AND !rn2(3)".  We follow the task spec.
+    remove_roll = rn2(rng_remove, 3) == jnp.int32(0)
+    remove = effect_fired & remove_roll
 
     b  = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - 1

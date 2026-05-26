@@ -30,60 +30,69 @@ def _make_state_on_throne():
     )
 
 
-def _force_outcome(state, outcome_idx: int):
-    """Run sit_throne with a seed that deterministically hits outcome_idx.
+def _force_case(state, case_num: int):
+    """Run sit_throne with a seed that deterministically hits vendor case_num.
 
-    Scans PRNGKey seeds until rn2(14) on the rng_outcome split matches.
-    sit_throne does: rng, rng_outcome, rng_effect, rng_remove = split(rng, 4)
+    Scans PRNGKey seeds until BOTH:
+      (a) the outer gate `rnd(6) > 4` fires, AND
+      (b) `rnd(13)` returns case_num.
+
+    sit_throne does:
+        rng, rng_gate, rng_outcome, rng_effect, rng_remove = split(rng, 5)
     """
-    from Nethax.nethax.subsystems.throne import sit_throne, _N_OUTCOMES
-    from Nethax.nethax.rng import rn2
-    for seed in range(500):
+    from Nethax.nethax.subsystems.throne import sit_throne
+    from Nethax.nethax.rng import rnd
+    for seed in range(2000):
         key = jax.random.PRNGKey(seed)
-        splits = jax.random.split(key, 4)
-        rng_outcome = splits[1]
-        roll = int(rn2(rng_outcome, _N_OUTCOMES))
-        if roll == outcome_idx:
+        splits = jax.random.split(key, 5)
+        rng_gate    = splits[1]
+        rng_outcome = splits[2]
+        gate_roll = int(rnd(rng_gate, 6))
+        if gate_roll <= 4:
+            continue
+        roll = int(rnd(rng_outcome, 13))
+        if roll == case_num:
             return sit_throne(state, key)
-    pytest.skip(f"Could not find seed for outcome {outcome_idx} in 500 tries")
+    pytest.skip(f"Could not find seed for case {case_num} in 2000 tries")
 
 
 # ---------------------------------------------------------------------------
-# test_sit_throne_gold_outcome
-# Outcome 0 = _gain_gold: player_gold must increase.
-# Cite: sit.c case 5 / case 6 gold-gain path.
+# test_sit_throne_take_gold (vendor case 5)
+# Vendor case 5 = take_gold(): hero loses all gold.
+# Cite: sit.c lines 102-104.
 # ---------------------------------------------------------------------------
 
 def test_sit_throne_gold_outcome():
     state = _make_state_on_throne()
-    initial_gold = int(state.player_gold)
-    new_state = _force_outcome(state, outcome_idx=0)
-    assert int(new_state.player_gold) > initial_gold, (
-        "Gold outcome (idx 0) should increase player_gold; "
-        "cite: sit.c line 103"
+    state = state.replace(player_gold=jnp.int32(500))
+    new_state = _force_case(state, case_num=5)
+    assert int(new_state.player_gold) == 0, (
+        "Vendor case 5 (take_gold) should zero player_gold; "
+        "cite: sit.c lines 102-104"
     )
 
 
 # ---------------------------------------------------------------------------
-# test_sit_throne_lightning_damage
-# Outcome 12 = _electrocute: player_hp must decrease.
-# Cite: sit.c line 77 — losehp(Shock_resistance ? rnd(6) : rnd(30), ...).
+# test_sit_throne_lightning_damage (vendor case 3)
+# Case 3 = electric shock: player_hp must decrease.
+# Cite: sit.c lines 77-82 — losehp(Shock_resistance ? rnd(6) : rnd(30), ...).
 # ---------------------------------------------------------------------------
 
 def test_sit_throne_lightning_damage():
     state = _make_state_on_throne()
     state = state.replace(player_hp=jnp.int32(200), player_hp_max=jnp.int32(200))
     initial_hp = int(state.player_hp)
-    new_state = _force_outcome(state, outcome_idx=12)
+    new_state = _force_case(state, case_num=3)
     assert int(new_state.player_hp) < initial_hp, (
-        "Electrocute outcome (idx 12) should reduce player_hp; "
-        "cite: sit.c line 77"
+        "Vendor case 3 (electrocute) should reduce player_hp; "
+        "cite: sit.c lines 77-82"
     )
 
 
 # ---------------------------------------------------------------------------
 # test_sit_throne_eventually_disappears
-# Sit 30 times; the throne tile should become FLOOR at least once.
+# Sit many times; the throne tile should become FLOOR at least once.
+# With outer gate P=1/3 and removal P=1/3, expected ~1/9 per sit.
 # Cite: sit.c lines 224-226 — if (!rn2(3)) levl[tx][ty].typ = ROOM.
 # ---------------------------------------------------------------------------
 
@@ -92,7 +101,7 @@ def test_sit_throne_eventually_disappears():
     from Nethax.nethax.constants.tiles import TileType
 
     floors_seen = 0
-    for seed in range(30):
+    for seed in range(90):
         state = _make_state_on_throne()
         b  = int(state.dungeon.current_branch)
         lv = int(state.dungeon.current_level) - 1
@@ -103,6 +112,6 @@ def test_sit_throne_eventually_disappears():
             floors_seen += 1
 
     assert floors_seen > 0, (
-        "After 30 sits the throne should have become FLOOR at least once "
-        "(expected ~10 at 1/3 probability); cite: sit.c line 224"
+        "After 90 sits the throne should have become FLOOR at least once "
+        "(expected ~10 at 1/9 probability); cite: sit.c lines 224-226"
     )
