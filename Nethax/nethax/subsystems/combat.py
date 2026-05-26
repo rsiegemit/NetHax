@@ -1053,6 +1053,112 @@ def _knight_chivalric_bonus(state, target_monster_idx: jnp.ndarray) -> jnp.ndarr
     return jnp.where(is_knight & is_humanoid, jnp.int32(1), jnp.int32(0))
 
 
+# ---------------------------------------------------------------------------
+# relobj — dead-monster inventory drop  (vendor/nethack/src/steal.c::relobj
+# lines 873-898 + mdrop_obj lines 813-846).  When a monster dies, its
+# minvent items spill onto the floor at the death tile (vault guard gold is
+# annihilated by xkilled, handled at the kill site; this helper just drops
+# the carried items).  JIT-pure: lax.scan over the per-monster inv slots,
+# each iteration tries to place into the first empty ground stack slot.
+# ---------------------------------------------------------------------------
+
+def relobj_drop_monster_inventory(state, monster_idx: jnp.ndarray, do_drop: jnp.ndarray):
+    """Drop monster ``monster_idx``'s inventory at its current tile.
+
+    Mirrors ``relobj(mtmp, show, is_pet=FALSE)`` from steal.c:875 — iterates
+    minvent items in order, calling mdrop_obj on each.  ``do_drop`` gates the
+    whole operation so callers can pass ``killed`` from their kill-resolution
+    code path.
+
+    JIT-pure: lax.scan accumulates ground-stack writes; no Python branches
+    on traced values.
+    """
+    mai = state.monster_ai
+    n_m = mai.entry_idx.shape[0]
+    m_safe = jnp.clip(monster_idx.astype(jnp.int32), 0, n_m - 1)
+
+    death_pos = mai.pos[m_safe].astype(jnp.int32)
+    map_h = state.terrain.shape[2]
+    map_w = state.terrain.shape[3]
+    d_row = jnp.clip(death_pos[0], 0, map_h - 1)
+    d_col = jnp.clip(death_pos[1], 0, map_w - 1)
+    branch = state.dungeon.current_branch.astype(jnp.int32)
+    level = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+
+    inv_cats = mai.inv_category[m_safe]
+    inv_tids = mai.inv_type_id[m_safe]
+    inv_qtys = mai.inv_quantity[m_safe]
+    inv_bucs = mai.inv_buc[m_safe]
+    n_minv = inv_cats.shape[0]
+
+    n_stack = state.ground_items.category.shape[-1]
+
+    def _step(carry, minv_slot):
+        gi = carry
+        item_cat = inv_cats[minv_slot]
+        item_tid = inv_tids[minv_slot]
+        item_qty = inv_qtys[minv_slot]
+        item_buc = inv_bucs[minv_slot]
+        has_item = item_cat != jnp.int8(0)
+
+        # Find the first empty ground stack slot at the death tile.
+        def _find_slot(c2, sidx):
+            found, gs = c2
+            is_empty = gi.category[branch, level, d_row, d_col, sidx] == jnp.int8(0)
+            gs = jnp.where(~found & is_empty, sidx, gs)
+            found = found | is_empty
+            return (found, gs), None
+
+        (gfound, gslot), _ = jax.lax.scan(
+            _find_slot,
+            (jnp.bool_(False), jnp.int32(0)),
+            jnp.arange(n_stack, dtype=jnp.int32),
+        )
+        can_place = gfound & has_item & do_drop
+        safe_gs = jnp.clip(gslot, 0, n_stack - 1)
+
+        new_gi = gi.replace(
+            category=gi.category.at[branch, level, d_row, d_col, safe_gs].set(
+                jnp.where(can_place, item_cat,
+                          gi.category[branch, level, d_row, d_col, safe_gs])
+            ),
+            type_id=gi.type_id.at[branch, level, d_row, d_col, safe_gs].set(
+                jnp.where(can_place, item_tid,
+                          gi.type_id[branch, level, d_row, d_col, safe_gs])
+            ),
+            quantity=gi.quantity.at[branch, level, d_row, d_col, safe_gs].set(
+                jnp.where(can_place, item_qty,
+                          gi.quantity[branch, level, d_row, d_col, safe_gs])
+            ),
+            buc_status=gi.buc_status.at[branch, level, d_row, d_col, safe_gs].set(
+                jnp.where(can_place, item_buc,
+                          gi.buc_status[branch, level, d_row, d_col, safe_gs])
+            ),
+        )
+        return new_gi, None
+
+    new_gi, _ = jax.lax.scan(
+        _step,
+        state.ground_items,
+        jnp.arange(n_minv, dtype=jnp.int32),
+    )
+
+    # Clear the monster's minvent when we actually dropped (so the items are
+    # not duplicated by any future relobj invocation).  Gated on ``do_drop``.
+    cleared_cat = jnp.where(do_drop, jnp.zeros_like(inv_cats), inv_cats)
+    cleared_tid = jnp.where(do_drop, jnp.zeros_like(inv_tids), inv_tids)
+    cleared_qty = jnp.where(do_drop, jnp.zeros_like(inv_qtys), inv_qtys)
+    cleared_buc = jnp.where(do_drop, jnp.zeros_like(inv_bucs), inv_bucs)
+
+    new_mai = mai.replace(
+        inv_category=mai.inv_category.at[m_safe].set(cleared_cat),
+        inv_type_id=mai.inv_type_id.at[m_safe].set(cleared_tid),
+        inv_quantity=mai.inv_quantity.at[m_safe].set(cleared_qty),
+        inv_buc=mai.inv_buc.at[m_safe].set(cleared_buc),
+    )
+    return state.replace(ground_items=new_gi, monster_ai=new_mai)
+
+
 def _single_melee_strike(
     state,
     rng: jax.Array,
@@ -1436,6 +1542,11 @@ def _single_melee_strike(
         lambda s: s,
         new_state,
     )
+
+    # vendor steal.c::relobj — drop the slain monster's carried inventory at
+    # the death tile (lines 873-898).  Gated on ``killed`` so the helper is
+    # a no-op for survivors.
+    new_state = relobj_drop_monster_inventory(new_state, idx, killed)
 
     # Quest nemesis kill hook (quest.c::nemdead ~109-113: Qstat(killed_nemesis)=TRUE).
     # JIT-pure: entry_idx comparison is scalar; lax.cond gates the state update.
@@ -1998,6 +2109,7 @@ def thrown_attack(
 
     new_hp = jnp.maximum(mai.hp[target_idx] - dmg, jnp.int32(0)).astype(jnp.int32)
     new_alive = (new_hp > 0) & target_alive
+    thrown_killed = target_alive & ~new_alive
     new_hp_arr = mai.hp.at[target_idx].set(new_hp)
     new_alive_arr = mai.alive.at[target_idx].set(new_alive)
     new_mai = mai.replace(hp=new_hp_arr, alive=new_alive_arr)
@@ -2438,13 +2550,19 @@ def thrown_attack(
         inv_buc=new_inv_buc,
     )
 
-    return state_after_hit.replace(
+    state_out = state_after_hit.replace(
         monster_ai=final_mai,
         inventory=new_inv,
         ground_items=new_ground,
         player_luck=luck_after_egg,
         player_hp=new_player_hp,
     )
+
+    # vendor steal.c::relobj — drop the slain monster's carried inventory at
+    # the death tile (lines 873-898).  Hooked here so thrown-projectile kills
+    # also spill the monster's minvent (single-melee path is hooked above).
+    state_out = relobj_drop_monster_inventory(state_out, target_idx, thrown_killed)
+    return state_out
 
 
 
