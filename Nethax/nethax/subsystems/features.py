@@ -176,6 +176,20 @@ class FeaturesState:
     guard_escort_active : bool scalar
                        True while the vault guard is escorting the player out
                        (vendor vault.c::gd_move line 888).
+    guard_fcorr_pos   : int16 [MAX_FCORR_LEN, 2]
+                       (row, col) per fake-corridor tile.  Mirrors vendor
+                       ``EGD->fakecorr[i].fx/fy`` (vendor include/mextra.h
+                       FCSIZ=15, vault.c lines 47-116 ``clear_fcorr`` walks
+                       ``fcbeg..fcend`` and restores each tile).
+    guard_fcorr_orig  : int8 [MAX_FCORR_LEN]
+                       Original tile type per fake-corridor tile (vendor
+                       ``fakecorr[i].ftyp``).  Used by ``clear_fcorr`` to
+                       reset terrain back to its pre-escort state
+                       (vault.c:89 ``lev->typ = egrd->fakecorr[fcbeg].ftyp``).
+    guard_fcorr_len   : int32 scalar
+                       Live prefix length of the fcorr buffer.  Mirrors
+                       vendor ``EGD->fcend - EGD->fcbeg``.  Zeroed by
+                       ``clear_fcorr`` (vault.c:64-106) after the sweep.
     lit              : bool [num_levels, map_h, map_w]
                        True iff the tile is permanently lit.  Mirrors vendor
                        ``levl[x][y].lit`` (vendor/nethack/include/rm.h line
@@ -222,6 +236,11 @@ class FeaturesState:
     vault_pos:       jnp.ndarray   # [num_levels, 2]             int16
     guard_slot:      jnp.ndarray   # scalar                       int32
     guard_escort_active: jnp.ndarray   # scalar                   bool
+    # Vault-guard fake-corridor buffer (vendor vault.c::EGD->fakecorr).
+    # Sized MAX_FCORR_LEN=15 to match vendor FCSIZ; only one guard at a time.
+    guard_fcorr_pos: jnp.ndarray   # [MAX_FCORR_LEN, 2]          int16
+    guard_fcorr_orig: jnp.ndarray  # [MAX_FCORR_LEN]             int8
+    guard_fcorr_len: jnp.ndarray   # scalar                       int32
     lit:             jnp.ndarray   # [num_levels, map_h, map_w]  bool
     waslit:          jnp.ndarray   # [num_levels, map_h, map_w]  bool
     rememberedlit:   jnp.ndarray   # [num_levels, map_h, map_w]  bool
@@ -245,6 +264,10 @@ class FeaturesState:
             vault_pos=jnp.full((num_levels, 2), -1, dtype=jnp.int16),
             guard_slot=jnp.int32(-1),
             guard_escort_active=jnp.bool_(False),
+            # Fake-corridor buffer (vendor vault.c EGD->fakecorr; FCSIZ=15).
+            guard_fcorr_pos=jnp.full((15, 2), -1, dtype=jnp.int16),
+            guard_fcorr_orig=jnp.zeros((15,), dtype=jnp.int8),
+            guard_fcorr_len=jnp.int32(0),
             # Per-tile lighting (vendor rm.h lines 165-166: lit / waslit
             # bitfields).  Zero-init: dungeon generation later flips lit=True
             # for tiles inside lit rooms (vendor mklev.c lines 249-255).

@@ -8,6 +8,10 @@ Canonical sources:
     vendor/nethack/src/vault.c::mk_vault   — vault room generation
     vendor/nethack/src/vault.c::invault    — guard spawn on player entry (line 317)
     vendor/nethack/src/vault.c::gd_move    — guard escort step (line 888)
+    vendor/nethack/src/vault.c::clear_fcorr — fake corridor cleanup (lines 47-116)
+    vendor/nethack/src/vault.c::grddead    — guard-death cleanup (lines 174-189)
+    vendor/nethack/src/vault.c::vault_gd_watching — witness gold-eat/destroy
+                                              (lines 1277-1286)
     vendor/nethack/src/vault.c line 267-270 — guard turns hostile when attacked
 
 Design notes:
@@ -18,6 +22,11 @@ Design notes:
     - ``state.features.vault_pos``: int16[N_BRANCHES, MAX_LEVELS, 2], (-1,-1) = no vault.
     - ``state.features.guard_slot``: int32, -1 = no guard.
     - ``state.features.guard_escort_active``: bool.
+    - Fake-corridor buffer (vendor ``EGD->fakecorr``): we mirror it via
+      ``features.guard_fcorr_*`` arrays of length ``MAX_FCORR_LEN``.  Each
+      slot stores (row, col, original_tile); ``guard_fcorr_len`` counts the
+      live prefix.  ``_clear_fcorr`` resets terrain tiles back to their
+      pre-corridor type.  See vendor vault.c lines 47-116.
 """
 from __future__ import annotations
 
@@ -45,6 +54,14 @@ _WALL  = int(TileType.WALL)
 
 # Minimum clearance from map edge for vault placement (walls + interior).
 _VAULT_MARGIN: int = 3
+
+# Maximum length of the fake corridor buffer (vendor vault.c: EGD->fakecorr
+# array, sized FCSIZ=15 in include/mextra.h).  We mirror that as 15 entries.
+MAX_FCORR_LEN: int = 15
+
+# vault_gd_watching activity flags — vendor include/mextra.h lines 68-69.
+GD_EATGOLD:    int = 0x01   # player ate gold on vault floor
+GD_DESTROYGOLD: int = 0x02  # player destroyed gold on vault floor
 
 
 # ---------------------------------------------------------------------------
@@ -262,3 +279,169 @@ def _escort_tick(state):
         features=new_features,
         player_pos=new_player_pos,
     )
+
+
+# ---------------------------------------------------------------------------
+# vault_gd_watching  (vendor vault.c:1277-1286)
+# ---------------------------------------------------------------------------
+
+def vault_gd_watching(state, action_kind: int):
+    """Vault guard reacts when player eats/destroys gold on the vault floor.
+
+    Vendor reference: vault.c:1277-1286 ::
+
+        void
+        vault_gd_watching(unsigned int activity) {
+            struct monst *guard = findgd();
+            if (guard && guard->mx && guard->mcansee && m_canseeu(guard)) {
+                if (activity == GD_EATGOLD || activity == GD_DESTROYGOLD)
+                    EGD(guard)->witness = activity;
+            }
+        }
+
+    The witness bit is consumed by vault.c::gd_move (line 933) on the
+    guard's next turn: it verbalises the alarm message and flips
+    ``mpeaceful = 0``.  We collapse that two-tick sequence into one: when
+    a witness fires we set ``peaceful=False`` immediately so callers don't
+    need to thread a separate witness flag.
+
+    Parameters
+    ----------
+    state : EnvState
+    action_kind : int   GD_EATGOLD (0x01) or GD_DESTROYGOLD (0x02).
+
+    Returns the updated state.  No-op when no guard is alive.  JIT-pure.
+    """
+    slot = VAULT_GUARD_SLOT
+    mai = state.monster_ai
+    guard_slot_val = state.features.guard_slot
+
+    has_guard = (guard_slot_val >= jnp.int32(0)) & mai.alive[slot]
+    is_witness = jnp.bool_(int(action_kind) == GD_EATGOLD
+                           or int(action_kind) == GD_DESTROYGOLD)
+    triggers = has_guard & is_witness
+
+    new_peaceful = jnp.where(
+        triggers,
+        mai.peaceful.at[slot].set(jnp.bool_(False)),
+        mai.peaceful,
+    )
+    new_mai = mai.replace(peaceful=new_peaceful)
+    return state.replace(monster_ai=new_mai)
+
+
+# ---------------------------------------------------------------------------
+# _clear_fcorr  (vendor vault.c:47-116)
+# ---------------------------------------------------------------------------
+
+def _clear_fcorr(state, guard_idx=None):
+    """Restore terrain along the fake corridor back to its original tiles.
+
+    Vendor reference: vault.c::clear_fcorr (lines 47-116).  As the guard
+    escorts the player out, the temporary corridor tiles dug during the
+    escort are restored to their pre-corridor type (typically STONE/WALL).
+    The vendor function iterates ``egrd->fakecorr[fcbeg..fcend]`` and
+    writes ``fakecorr[i].ftyp`` back into ``levl[x][y].typ``.
+
+    In Nethax we mirror the fakecorr buffer via FeaturesState fields:
+        guard_fcorr_pos[MAX_FCORR_LEN, 2]   — (row, col) per tile
+        guard_fcorr_orig[MAX_FCORR_LEN]     — original tile type (int8)
+        guard_fcorr_len                      — live prefix length
+    The buffer is per-level (one guard at a time), so we restore at the
+    current level only — matches vendor ``on_level(&egrd->gdlevel, &u.uz)``
+    gate at vault.c:58.
+
+    Parameters
+    ----------
+    state : EnvState
+    guard_idx : unused (kept for API parity with vendor's single-arg call).
+
+    Returns the updated state with corridor tiles restored and the fcorr
+    buffer length zeroed.  JIT-pure (uses dynamic slicing on a fixed buffer).
+    """
+    del guard_idx  # vendor passes the guard pointer; only one slot is used.
+
+    # No-op when buffer is empty (no escort in progress).
+    fcorr_len = state.features.guard_fcorr_len.astype(jnp.int32)
+
+    branch = state.dungeon.current_branch.astype(jnp.int32)
+    level  = (state.dungeon.current_level - jnp.int8(1)).astype(jnp.int32)
+
+    fcorr_pos  = state.features.guard_fcorr_pos    # int16[MAX_FCORR_LEN, 2]
+    fcorr_orig = state.features.guard_fcorr_orig   # int8 [MAX_FCORR_LEN]
+
+    # Walk the buffer; for indices < fcorr_len, write orig back into terrain.
+    def _restore(i, terrain):
+        live = i < fcorr_len
+        r = fcorr_pos[i, 0].astype(jnp.int32)
+        c = fcorr_pos[i, 1].astype(jnp.int32)
+        orig = fcorr_orig[i]
+        # Clamp to map bounds (-1,-1 sentinels stay clamped to 0,0 but live=False).
+        r_safe = jnp.clip(r, 0, MAP_H - 1)
+        c_safe = jnp.clip(c, 0, MAP_W - 1)
+        new_val = jnp.where(live, orig, terrain[branch, level, r_safe, c_safe])
+        return terrain.at[branch, level, r_safe, c_safe].set(new_val)
+
+    new_terrain = jax.lax.fori_loop(0, MAX_FCORR_LEN, _restore, state.terrain)
+
+    # Reset buffer length to zero (vendor sets fcbeg=fcend after the sweep).
+    new_features = state.features.replace(
+        guard_fcorr_len=jnp.int32(0),
+    )
+    return state.replace(terrain=new_terrain, features=new_features)
+
+
+# ---------------------------------------------------------------------------
+# grddead  (vendor vault.c:174-189)
+# ---------------------------------------------------------------------------
+
+def grddead(state):
+    """Force corridor cleanup when the vault guard dies.
+
+    Vendor reference: vault.c::grddead (lines 174-189) ::
+
+        boolean grddead(struct monst *grd) {
+            boolean dispose = clear_fcorr(grd, TRUE);
+            if (!dispose) {
+                relobj(grd, 0, FALSE);
+                grd->mhp = 0;
+                parkguard(grd);
+                dispose = clear_fcorr(grd, TRUE);
+            }
+            if (dispose) grd->isgd = 0;
+            return dispose;
+        }
+
+    On guard death we unconditionally clear the fake corridor and zero
+    the guard tracking fields (``guard_slot = -1``, ``guard_escort_active
+    = False``).  The relobj / parkguard branches deal with vendor's
+    in-corridor edge case (guard dies while still occupying a corridor
+    tile); our cleared-by-construction model collapses both branches.
+
+    Callers: ``monster_ai`` death handler — see monster_ai.py death-sweep
+    that detects ``alive=False`` on ``VAULT_GUARD_SLOT`` and invokes this.
+
+    JIT-pure.
+    """
+    state = _clear_fcorr(state)
+    new_features = state.features.replace(
+        guard_slot=jnp.int32(-1),
+        guard_escort_active=jnp.bool_(False),
+    )
+    return state.replace(features=new_features)
+
+
+def maybe_grddead(state):
+    """Run :func:`grddead` if the vault guard has just died.
+
+    Helper for monster_ai.py: detects that the VAULT_GUARD_SLOT monster
+    is no longer alive while ``guard_slot >= 0`` and triggers the
+    corridor-cleanup sweep.  Safe to call every tick — no-op when the
+    guard is alive or never existed.
+    """
+    slot = VAULT_GUARD_SLOT
+    guard_slot_val = state.features.guard_slot
+    alive = state.monster_ai.alive[slot]
+    was_tracked = guard_slot_val >= jnp.int32(0)
+    died = was_tracked & (~alive)
+    return jax.lax.cond(died, grddead, lambda s: s, state)

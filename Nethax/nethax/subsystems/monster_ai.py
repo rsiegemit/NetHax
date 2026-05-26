@@ -6172,7 +6172,17 @@ def monsters_step_all(state, rng: jax.Array) -> object:
         mspec_used=new_mspec,
         asleep=new_asleep,
     )
-    return final_state.replace(monster_ai=mai)
+    final_state = final_state.replace(monster_ai=mai)
+
+    # Vault-guard death cleanup (vendor vault.c::grddead, lines 174-189).
+    # If the guard at VAULT_GUARD_SLOT died during this tick (its alive bit
+    # went False while ``features.guard_slot >= 0``), restore the fake
+    # corridor tiles and clear the guard tracking fields.  No-op when the
+    # guard is alive or never existed.
+    from Nethax.nethax.subsystems.vault import maybe_grddead as _maybe_grddead
+    final_state = _maybe_grddead(final_state)
+
+    return final_state
 
 
 # ---------------------------------------------------------------------------

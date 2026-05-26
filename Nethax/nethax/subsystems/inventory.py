@@ -830,6 +830,40 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
     # Vendor pickup.c::pickup — gold goes to u.umoney0 (state.player_gold).
     new_gold = state.player_gold + gold_qty
     new_state = state.replace(inventory=new_inv, player_gold=new_gold)
+
+    # Vault-guard witness hook (vendor vault.c::vault_gd_watching, line 1278).
+    # If the player picks up gold from the vault floor while the guard can
+    # see them, the guard treats it as the GD_EATGOLD activity and turns
+    # hostile.  We approximate "on vault floor" by checking the per-level
+    # vault_pos: when the pickup tile is within the 2x2 vault interior
+    # (matches ``check_invault``'s Chebyshev<=1 gate at vault.py:138-140).
+    from Nethax.nethax.subsystems.vault import (
+        vault_gd_watching as _vault_witness,
+        GD_EATGOLD as _GD_EATGOLD,
+    )
+    from Nethax.nethax.dungeon.branches import (
+        MAX_LEVELS_PER_BRANCH as _MAX_LV,
+    )
+    flat_lv = (
+        new_state.dungeon.current_branch.astype(jnp.int32) * jnp.int32(_MAX_LV)
+        + (new_state.dungeon.current_level - jnp.int8(1)).astype(jnp.int32)
+    )
+    vp = new_state.features.vault_pos[flat_lv]
+    vr, vc = vp[0].astype(jnp.int32), vp[1].astype(jnp.int32)
+    pr_i = new_state.player_pos[0].astype(jnp.int32)
+    pc_i = new_state.player_pos[1].astype(jnp.int32)
+    in_vault = (vr >= jnp.int32(0)) & (
+        (jnp.abs(pr_i - vr) <= jnp.int32(1))
+        & (jnp.abs(pc_i - vc) <= jnp.int32(1))
+    )
+    witnessed = in_vault & (gold_qty > jnp.int32(0))
+    new_state = jax.lax.cond(
+        witnessed,
+        lambda s: _vault_witness(s, _GD_EATGOLD),
+        lambda s: s,
+        new_state,
+    )
+
     return new_state, new_ground_items
 
 
