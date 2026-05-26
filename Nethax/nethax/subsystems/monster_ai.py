@@ -398,6 +398,14 @@ _M2_HUMAN: int        = 0x00000008  # vendor monflag.h:126 — is a human.
 _M2_DEMON: int        = 0x00000100
 _M2_GIANT: int        = 0x00002000  # vendor monflag.h:136 — is_giant → BUSTDOOR.
 _M2_PEACEFUL: int     = 0x00200000
+# Vendor monflag.h:150-156 item-want bits — used by mon_would_take_item
+# (monmove.c:999-1032) and m_search_items (monmove.c:1330).  The high bits
+# (0x40000000, 0x80000000) overflow jnp.int32(...) literals when fed directly,
+# so we pre-sign-extend below via _u32_to_i32_const.
+_M2_GREEDY:  int      = 0x10000000  # likes gold      (monflag.h:150)
+_M2_JEWELS:  int      = 0x20000000  # likes gems      (monflag.h:151)
+_M2_COLLECT: int      = 0x40000000  # likes weapons/food (monflag.h:152)
+_M2_MAGIC:   int      = -0x80000000 # likes magic items, signed (monflag.h:154)
 
 # Tile constants — kept local to avoid an import cycle with constants.tiles.
 # Must mirror Nethax.nethax.constants.tiles.TileType.
@@ -862,6 +870,142 @@ def _mover_can_pass_bars(entry_idx: jnp.ndarray) -> jnp.ndarray:
     under doors / through bars").
     """
     return _has_flag1(entry_idx, _M1_AMORPHOUS)
+
+
+# ---------------------------------------------------------------------------
+# mon_would_take_item — vendor monmove.c:999-1032 (category-only port).
+# ---------------------------------------------------------------------------
+# Returns scalar bool for "monster ``idx`` would walk toward ``cat`` ground
+# item".  We omit the load-percentage gate (vendor's curr_mon_load /
+# max_mon_load); the Nethax port does not track per-monster carry-weight yet,
+# so every "wants" predicate fires whenever a matching item is in range.
+# Cite: vendor/nethack/include/mondata.h lines 143-146 likes_gold/gems/objs/magic.
+_PRACTICAL_CATS = (
+    int(2),   # WEAPON
+    int(3),   # ARMOR
+    int(13),  # GEM (also covered by likes_gems)
+    int(7),   # FOOD
+)
+_MAGICAL_CATS = (
+    int(5),   # AMULET
+    int(8),   # POTION
+    int(9),   # SCROLL
+    int(11),  # WAND
+    int(4),   # RING
+    int(10),  # SPBOOK
+)
+
+
+def _mon_wants_cat(entry_idx: jnp.ndarray, cat: jnp.ndarray) -> jnp.ndarray:
+    """True iff this monster type would pick up an item of ``cat``.
+
+    Cite: vendor/nethack/src/monmove.c::mon_would_take_item lines 999-1032.
+    Category-only port (otyp-level gating deferred).
+    """
+    e = entry_idx.astype(jnp.int32)
+    likes_gold  = _has_flag2(e, _M2_GREEDY)
+    likes_gems  = _has_flag2(e, _M2_JEWELS)
+    likes_objs  = _has_flag2(e, _M2_COLLECT)
+    likes_magic = _has_flag2(e, _M2_MAGIC)
+    c = cat.astype(jnp.int32)
+    practical = jnp.zeros_like(c, dtype=jnp.bool_)
+    for pc in _PRACTICAL_CATS:
+        practical = practical | (c == jnp.int32(pc))
+    magical = jnp.zeros_like(c, dtype=jnp.bool_)
+    for mc in _MAGICAL_CATS:
+        magical = magical | (c == jnp.int32(mc))
+    is_gold = c == jnp.int32(_CAT_COIN)
+    is_gem  = c == jnp.int32(13)
+    occupied = c != jnp.int32(0)
+    return occupied & (
+        (likes_gold  & is_gold)
+        | (likes_gems & is_gem)
+        | (likes_objs & practical)
+        | (likes_magic & magical)
+    )
+
+
+# ---------------------------------------------------------------------------
+# m_search_items — vendor monmove.c:1330-1452.
+# ---------------------------------------------------------------------------
+# Per-turn item-attractor scan.  When a monster has a wanted item within
+# SQSRCHRADIUS (= 5 vendor squares) of its current tile, we return the
+# closest such tile so monster_turn can steer one step toward it instead
+# of toward the player.
+#
+# Simplifications vs vendor:
+#   * Only the top ground-stack slot (index 0) is inspected.  Vendor walks
+#     the entire pile via otmp->nexthere.  This matches our existing
+#     mpickstuff() heuristic so the search and the pickup target agree.
+#   * Shop/Sokoban/mines-prize/can_touch_safely/trap-awareness gates are
+#     punted; the port's m_search predicate only fires for ALIVE & HOSTILE
+#     monsters, which is the dominant case.
+#   * Distance metric: Chebyshev (distmin) — vendor uses distmin().
+#
+# Cite: vendor/nethack/src/monmove.c::m_search_items lines 1330-1452.
+_SQSRCHRADIUS: int = 5
+# vendor monmove.c:1413 — ROCK ground stacks are skipped in m_search_items.
+# Local mirror of subsystems/inventory.ItemCategory.ROCK so the predicate
+# above this file's existing _CAT_ROCK definition has a JIT-time constant.
+_M_SEARCH_CAT_ROCK: int = 14
+
+
+def _m_search_items(state, monster_idx: jnp.ndarray) -> tuple:
+    """Scan a (2*SQSRCHRADIUS+1)^2 box around the monster for wanted items.
+
+    Returns ``(found, target_row, target_col)``:
+      * found     : scalar bool — True iff a desirable item is in range.
+      * target_*  : int32 (row, col) of the chosen item tile; (0, 0) when
+        ``found`` is False (caller must gate on ``found``).
+
+    JIT-pure: the box is a constant-shape window so we slice the ground_items
+    arrays for the player's current level, mask out tiles outside the map and
+    tiles farther than the radius (Chebyshev) from the monster, score with
+    ``-distmin`` so argmax picks the closest, and break ties by row-major order.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    mpos = mai.pos[idx].astype(jnp.int32)
+    omx, omy = mpos[0], mpos[1]
+    entry = mai.entry_idx[idx]
+
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    # Top-of-stack category and qty for every tile on the level.
+    cat_map = state.ground_items.category[b, lv, :, :, 0].astype(jnp.int32)   # [H, W]
+
+    # Build a [H, W] mask of (in-radius) tiles.
+    rows = jnp.arange(_MAP_H, dtype=jnp.int32)[:, None]
+    cols = jnp.arange(_MAP_W, dtype=jnp.int32)[None, :]
+    drow = jnp.abs(rows - omx)
+    dcol = jnp.abs(cols - omy)
+    distmin = jnp.maximum(drow, dcol)                          # [H, W]
+    in_box  = (distmin <= jnp.int32(_SQSRCHRADIUS))            # [H, W]
+    # Skip the monster's own tile (distance 0 == already there).
+    in_box  = in_box & (distmin > jnp.int32(0))
+
+    # Per-tile "wanted" predicate.
+    wanted_cat = _mon_wants_cat(entry, cat_map.flatten()).reshape(cat_map.shape)
+    # ROCK (category 14) is filtered out per vendor monmove.c:1413.
+    is_rock = cat_map == jnp.int32(_M_SEARCH_CAT_ROCK)
+    candidate = in_box & wanted_cat & ~is_rock
+
+    # Score: prefer the closest tile (smallest distmin).  We encode
+    # ``score = -distmin`` so jnp.argmax picks the nearest, with row-major
+    # tiebreak (lower row first then lower col).  Non-candidates get -INF.
+    NEG_INF = jnp.int32(-1_000_000)
+    score = jnp.where(candidate, -distmin, NEG_INF)            # [H, W]
+
+    flat   = score.flatten()
+    bestf  = jnp.argmax(flat)
+    found  = jnp.any(candidate)
+    trow   = (bestf // jnp.int32(_MAP_W)).astype(jnp.int32)
+    tcol   = (bestf %  jnp.int32(_MAP_W)).astype(jnp.int32)
+    # Mask out the position when ``found`` is False so callers don't read
+    # an arbitrary location.
+    trow_safe = jnp.where(found, trow, jnp.int32(0))
+    tcol_safe = jnp.where(found, tcol, jnp.int32(0))
+    return found, trow_safe, tcol_safe
 
 
 def _monster_level(entry_idx: jnp.ndarray) -> jnp.ndarray:
@@ -4569,6 +4713,18 @@ def monster_turn(state, rng: jax.Array, monster_idx: jnp.ndarray) -> object:
             retreat_step = maybe_retreat(st, idx)
             wants_retreat = jnp.any(retreat_step != 0)
             path_step = pathfind_step(st, idx)
+            # 7b': m_search_items — vendor monmove.c:1330-1452.  When a wanted
+            # ground item lies within SQSRCHRADIUS Chebyshev squares of the
+            # monster, vendor reorients the goal toward the item tile so the
+            # next move-step closes on the loot instead of the player.  We
+            # override the pathfind step with a one-tile Chebyshev gradient
+            # toward the item (vendor m_move's final greedy delta).  Retreat
+            # still wins (low HP self-preservation has priority).
+            _ms_found, _ms_r, _ms_c = _m_search_items(st, idx)
+            _mpos_i32 = st.monster_ai.pos[idx].astype(jnp.int32)
+            _item_target = jnp.stack([_ms_r, _ms_c]).astype(jnp.int32)
+            _item_step = jnp.clip(_item_target - _mpos_i32, -1, 1).astype(jnp.int32)
+            path_step = jnp.where(_ms_found, _item_step, path_step)
             step_delta = jnp.where(wants_retreat, retreat_step, path_step)
             # Confusion-driven random step: vendor mfndpos sets ``flag |=
             # ALLOW_ALL`` when ``mon->mconf`` (mon.c:2199-2202), and dochug's
