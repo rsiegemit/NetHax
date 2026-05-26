@@ -225,26 +225,29 @@ def test_jit_compute_reward():
 
 
 def test_kill_event_registers_but_does_not_fire():
-    """Kill events stub out as no-ops pending Wave 5 message wiring."""
+    """Kill events are now implemented via message-buffer predicates
+    (Wave 17i, vendor reward_manager.py:535-566) but do not fire when
+    the message buffer is empty."""
     rm = RewardManager()
     rm.add_kill_event("newt", reward=10.0, terminal_sufficient=True)
     assert len(rm) == 1
-    assert rm.events[0].implemented is False
+    assert rm.events[0].implemented is True
 
     fired = rm.initial_fired_mask()
     prev = _fresh_state()
+    # Empty message buffer → predicate is False → event does not fire.
     r, done, _ = rm.compute_reward(prev, prev, fired)
     assert float(r) == 0.0
-    # Stub event has terminal_required=True (default) and never fires,
-    # so done must stay False.
     assert bool(done) is False
 
 
 def test_eat_event_registers_but_does_not_fire():
-    """Eat events stub out as no-ops pending Wave 5 message wiring."""
+    """Eat events are now implemented via message-buffer predicates
+    (Wave 17i, vendor reward_manager.py:402-440) but do not fire when
+    the message buffer is empty."""
     rm = RewardManager()
     rm.add_eat_event("apple", reward=5.0)
-    assert rm.events[0].implemented is False
+    assert rm.events[0].implemented is True
 
     fired = rm.initial_fired_mask()
     prev = _fresh_state()

@@ -375,26 +375,34 @@ def test_light_sets_lit_radius_flag():
 
 
 def test_flame_sphere_spawns_fire_elemental():
-    """FLAME_SPHERE: spawn a tame creature with entry_idx=3 (PM_FLAMING_SPHERE).
+    """FLAME_SPHERE: spawn a tame PM_FLAMING_SPHERE adjacent to caster.
 
-    Cite: vendor/nethack/src/makemon.c::makemon (PM_FLAMING_SPHERE).
+    Wave 47b parity: uses canonical MONSTERS table entry_idx=30 (chunk1.py:561)
+    rather than the prior placeholder=3.
+
+    Cite: vendor/nethack/include/monsters.h MON("flaming sphere", ...),
+          vendor/nethack/src/makemon.c::makemon.
     """
     state = _base_state()
     new_state = _run_effect(SpellId.FLAME_SPHERE, state, seed=17)
     assert bool(new_state.monster_ai.alive[0])
-    assert int(new_state.monster_ai.entry_idx[0]) == 3
+    assert int(new_state.monster_ai.entry_idx[0]) == 30
     assert bool(new_state.monster_ai.tame[0])
 
 
 def test_freeze_sphere_spawns_freezing_sphere():
-    """FREEZE_SPHERE: spawn a tame creature with entry_idx=4 (PM_FREEZING_SPHERE).
+    """FREEZE_SPHERE: spawn a tame PM_FREEZING_SPHERE adjacent to caster.
 
-    Cite: vendor/nethack/src/makemon.c::makemon (PM_FREEZING_SPHERE).
+    Wave 47b parity: uses canonical MONSTERS table entry_idx=29 (chunk1.py:544)
+    rather than the prior placeholder=4.
+
+    Cite: vendor/nethack/include/monsters.h MON("freezing sphere", ...),
+          vendor/nethack/src/makemon.c::makemon.
     """
     state = _base_state()
     new_state = _run_effect(SpellId.FREEZE_SPHERE, state, seed=18)
     assert bool(new_state.monster_ai.alive[0])
-    assert int(new_state.monster_ai.entry_idx[0]) == 4
+    assert int(new_state.monster_ai.entry_idx[0]) == 29
     assert bool(new_state.monster_ai.tame[0])
 
 
