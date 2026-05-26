@@ -387,12 +387,49 @@ def _nymph_steal(state, slot: jnp.ndarray, rng: jax.Array):
 #    ~2269-2302 — "tries to take your gold", money2mon, rloc)
 # ---------------------------------------------------------------------------
 
-def _leprechaun_steal_gold(state, slot: jnp.ndarray, rng: jax.Array):
-    """Adjacent leprechaun grabs player gold, then teleports.
+_COIN_CATEGORY:   int = 12  # ItemCategory.COIN
+_GOLD_PIECE_TID:  int = 410 # objects.py: gold piece
 
-    Vendor cite: steal.c::stealgold lines 57-115 — leprechaun seizes gold
-    via somegold(money_cnt(invent)), then rlocs after theft.
-    The amount formula is byte-equal to vendor steal.c::somegold lines 13-34:
+
+def _floor_gold_at(state, row: jnp.ndarray, col: jnp.ndarray):
+    """Return (slot_idx, quantity) for the first COIN/gold ground stack at
+    (br, lv, row, col).  slot_idx = -1 + quantity = 0 if no gold present.
+
+    Vendor cite: steal.c:60 — ``fgold = g_at(u.ux, u.uy)`` then advances past
+    lesser coins (steal.c:67-68).  Nethax only models gold pieces as COIN, so
+    we just scan the 8-deep ground stack for category==COIN.
+    """
+    g = state.ground_items
+    br = state.dungeon.current_branch.astype(jnp.int32)
+    lv = (state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1))
+    r = row.astype(jnp.int32)
+    c = col.astype(jnp.int32)
+
+    cats = g.category[br, lv, r, c, :].astype(jnp.int32)        # (MAX_GROUND_STACK,)
+    tids = g.type_id[br, lv, r, c, :].astype(jnp.int32)
+    qtys = g.quantity[br, lv, r, c, :].astype(jnp.int32)
+    is_gold = (cats == jnp.int32(_COIN_CATEGORY)) & (tids == jnp.int32(_GOLD_PIECE_TID))
+    any_gold = jnp.any(is_gold)
+    first_idx = jnp.argmax(is_gold.astype(jnp.int32))
+    quantity = jnp.where(any_gold, qtys[first_idx], jnp.int32(0))
+    safe_idx = jnp.where(any_gold, first_idx, jnp.int32(-1))
+    return safe_idx, quantity
+
+
+def _leprechaun_steal_gold(state, slot: jnp.ndarray, rng: jax.Array):
+    """Adjacent leprechaun grabs gold (floor priority, then inventory), then
+    teleports.
+
+    Vendor cite: steal.c::stealgold lines 57-115.
+      1. ``fgold = g_at(u.ux, u.uy)`` after skipping lesser coins (60-68).
+      2. ``ygold = findgold(invent)`` (71).
+      3. If ``fgold && (!ygold || fgold->quan > ygold->quan || !rn2(5))``,
+         take the whole floor gold pile (74-93); teleport when
+         ``!ygold || !rn2(5)`` (94-98).
+      4. Else if ``ygold``, take ``somegold(money_cnt(invent))`` from
+         inventory (99-115) and always teleport.
+
+    Amount formula (steal.c::somegold lines 13-34) is byte-equal:
         igold < 50    : steal all
         igold < 100   : rn1(igold-25+1, 25)   == uniform[25, igold]
         igold < 500   : rn1(igold-50+1, 50)   == uniform[50, igold]
@@ -409,8 +446,26 @@ def _leprechaun_steal_gold(state, slot: jnp.ndarray, rng: jax.Array):
     adjacent = _cheby(mpos, ppos) <= jnp.int32(1)
 
     def _apply(s):
-        rng_amt, rng_tele = jax.random.split(rng)
+        rng_amt, rng_tele, rng_pref, rng_tele2 = jax.random.split(rng, 4)
         gold = s.player_gold.astype(jnp.int32)
+
+        # Vendor steal.c:60-68 — floor gold at player tile.
+        pr = s.player_pos[0]
+        pc = s.player_pos[1]
+        fgold_slot, fgold_qty = _floor_gold_at(s, pr, pc)
+        has_fgold = fgold_qty > jnp.int32(0)
+        has_ygold = gold > jnp.int32(0)
+
+        # steal.c:73 — `fgold && (!ygold || fgold->quan > ygold->quan || !rn2(5))`
+        # !rn2(5) == 1/5 chance preferring floor over inventory.
+        prefer_floor_roll = jax.random.randint(
+            rng_pref, (), 0, 5, dtype=jnp.int32
+        ) == jnp.int32(0)
+        take_floor = has_fgold & (
+            (~has_ygold)
+            | (fgold_qty > gold)
+            | prefer_floor_roll
+        )
         # Vendor steal.c:14-34 somegold(): bracketed rn1 of gold.
         # rn1(n, x) = x + rn2(n) = uniform[x, x+n-1].
         bracket_n = jnp.where(
@@ -435,19 +490,51 @@ def _leprechaun_steal_gold(state, slot: jnp.ndarray, rng: jax.Array):
         rn2_roll = jax.random.randint(rng_amt, (), 0, safe_n, dtype=jnp.int32)
         rn1_result = (bracket_x + rn2_roll).astype(jnp.int32)
         # Below 50 gold, vendor returns igold unchanged (steal all).
-        stolen = jnp.where(gold < jnp.int32(50), gold, rn1_result)
+        stolen_inv = jnp.where(gold < jnp.int32(50), gold, rn1_result)
         # Vendor steal.c:103 caps at ygold->quan (player's gold quantity).
-        stolen = jnp.minimum(stolen, gold)
-        new_gold = jnp.maximum(gold - stolen, jnp.int32(0)).astype(jnp.int32)
+        stolen_inv = jnp.minimum(stolen_inv, gold)
+        new_gold_inv = jnp.maximum(gold - stolen_inv, jnp.int32(0)).astype(jnp.int32)
+
+        # Floor-gold branch: take the whole pile (vendor steal.c:74
+        # ``obj_extract_self(fgold); add_to_minv(mtmp, fgold);``).
+        new_player_gold = jnp.where(take_floor, gold, new_gold_inv)
+        # Clear floor gold slot when taken.  safe_idx is valid only when
+        # has_fgold is True.
+        clear_slot = jnp.where(take_floor, fgold_slot, jnp.int32(0))
+        br = s.dungeon.current_branch.astype(jnp.int32)
+        lv = s.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+        g = s.ground_items
+        zero_cat = jnp.where(take_floor, jnp.int8(0), g.category[br, lv, pr, pc, clear_slot])
+        zero_qty = jnp.where(take_floor, jnp.int16(0), g.quantity[br, lv, pr, pc, clear_slot])
+        new_ground = g.replace(
+            category=g.category.at[br, lv, pr, pc, clear_slot].set(zero_cat),
+            quantity=g.quantity.at[br, lv, pr, pc, clear_slot].set(zero_qty),
+        )
+
+        # Teleport gating (vendor steal.c:94-97 floor path; :111-113 inv path):
+        #   floor: `if (!ygold || !rn2(5)) rloc(); monflee();` — tele only on
+        #          1/5 roll OR when inv is empty.
+        #   inv:   always rloc + monflee.
+        tele_roll = jax.random.randint(rng_tele2, (), 0, 5, dtype=jnp.int32) == jnp.int32(0)
+        floor_tele = (~has_ygold) | tele_roll
+        do_teleport = jnp.where(take_floor, floor_tele, jnp.bool_(True))
 
         raw_tele = jax.random.randint(rng_tele, (), 0, _N_TELE_TILES)
         tele_r = jnp.int16(raw_tele // _MAP_W)
         tele_c = jnp.int16(raw_tele % _MAP_W)
-        new_pos = jnp.stack([tele_r, tele_c])
-        new_mai = s.monster_ai.replace(
-            pos=s.monster_ai.pos.at[idx].set(new_pos)
+        new_mon_pos = jnp.where(
+            do_teleport,
+            jnp.stack([tele_r, tele_c]),
+            s.monster_ai.pos[idx],
         )
-        return s.replace(player_gold=new_gold, monster_ai=new_mai)
+        new_mai = s.monster_ai.replace(
+            pos=s.monster_ai.pos.at[idx].set(new_mon_pos)
+        )
+        return s.replace(
+            player_gold=new_player_gold,
+            monster_ai=new_mai,
+            ground_items=new_ground,
+        )
 
     return jax.lax.cond(adjacent, _apply, lambda s: s, state)
 
