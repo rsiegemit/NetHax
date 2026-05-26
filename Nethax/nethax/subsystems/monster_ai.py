@@ -1893,6 +1893,84 @@ def _try_throw_potion(state, rng: jax.Array, monster_idx: jnp.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Unicorn horn self-cure (vendor muse.c:820-837) and Bugle awaken-soldiers
+# (vendor muse.c:838-848)
+# ---------------------------------------------------------------------------
+# Type_ids:
+#   bugle        = 231 (TOOL)
+#   unicorn horn = 236 (TOOL — categorized as WEPTOOL in vendor)
+_BUGLE_TID:        int = 231
+_UNICORN_HORN_TID: int = 236
+
+
+def _try_unicorn_horn_self(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Monster applies its unicorn horn to cure own blind/confused/stunned.
+
+    Cite: vendor/nethack/src/muse.c lines 820-837 — MUSE_UNICORN_HORN
+    branch (defensive cascade).  Vendor calls ``use_unicorn_horn(otmp)``
+    which clears Blinded/Confused/Stunned/Hallucinated and may degrade
+    the horn (rust + spe-- on a low roll).
+
+    Simplification: clear stun_timer/confuse_timer/blind_timer on the
+    monster; no degrade modelling.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_TOOL, _UNICORN_HORN_TID)
+
+    # Only fire when the monster has SOME afflicting status (else no-op).
+    afflicted = (
+        (mai.stun_timer[idx]    > jnp.int16(0))
+        | (mai.confuse_timer[idx] > jnp.int16(0))
+        | (mai.blind_timer[idx]   > jnp.int16(0))
+    )
+    can_apply = found & afflicted
+
+    new_stun  = jnp.where(can_apply, jnp.int16(0), mai.stun_timer[idx])
+    new_conf  = jnp.where(can_apply, jnp.int16(0), mai.confuse_timer[idx])
+    new_blind = jnp.where(can_apply, jnp.int16(0), mai.blind_timer[idx])
+    new_mai = mai.replace(
+        stun_timer=mai.stun_timer.at[idx].set(new_stun),
+        confuse_timer=mai.confuse_timer.at[idx].set(new_conf),
+        blind_timer=mai.blind_timer.at[idx].set(new_blind),
+    )
+    return state.replace(monster_ai=new_mai)
+
+
+def _try_bugle_awaken_allies(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Mercenary-class monster blows bugle, waking nearby soldier allies.
+
+    Cite: vendor/nethack/src/muse.c lines 838-848 — MUSE_BUGLE (defensive
+    branch).  Vendor calls ``awaken_soldiers(mtmp)`` which scans the
+    level for sleeping mercenary monsters and wakes them.
+
+    Simplification: wake every alive sleeping monster (no mercenary-
+    class filter — Nethax doesn't yet track M2_MERCENARY).  This is
+    slightly over-eager vs vendor but the gameplay impact is the same
+    direction (more monsters acting against the player).
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    found, slot = _find_inv_slot(mai, idx, _CAT_TOOL, _BUGLE_TID)
+    # Only fire when at least one ally is sleeping; otherwise no-op.
+    any_sleeping = jnp.any(mai.alive & mai.asleep)
+    can_blow = found & any_sleeping
+
+    new_asleep = jnp.where(
+        can_blow,
+        jnp.zeros_like(mai.asleep),
+        mai.asleep,
+    )
+    new_sleep_t = jnp.where(
+        can_blow,
+        jnp.zeros_like(mai.sleep_timer),
+        mai.sleep_timer,
+    )
+    new_mai = mai.replace(asleep=new_asleep, sleep_timer=new_sleep_t)
+    return state.replace(monster_ai=new_mai)
+
+
+# ---------------------------------------------------------------------------
 # Polymorph self-buff (vendor muse.c:2222-2233)
 # ---------------------------------------------------------------------------
 # Vendor: monster quaffs POT_POLYMORPH or zaps WAN_POLYMORPH at itself,
@@ -2278,6 +2356,15 @@ def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
     rng_poly_self = jax.random.fold_in(keys[7], jnp.int32(0xFEED))
     s = _branch(s, eligible & hp_low_half,
                 _try_polymorph_self, rng_poly_self)
+    # (8c) unicorn horn self-cure — muse.c:820-837.  Cure own
+    # blind/confused/stunned timers when monster has the horn.
+    rng_unicorn = jax.random.fold_in(keys[7], jnp.int32(0xC07E))
+    s = _branch(s, eligible, _try_unicorn_horn_self, rng_unicorn)
+    # (8d) bugle awaken soldiers — muse.c:838-848.  Mercenary-class
+    # monster wakes sleeping allies (gating is broader here — see
+    # _try_bugle_awaken_allies docstring).
+    rng_bugle = jax.random.fold_in(keys[7], jnp.int32(0xB061E))
+    s = _branch(s, eligible, _try_bugle_awaken_allies, rng_bugle)
 
     # ----- Offensive cascade (only when player in LoS & in range) -------
     can_attack = eligible & in_los & (dist > 1) & (dist <= 8) & ~hp_low_half
