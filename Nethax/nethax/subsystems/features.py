@@ -648,22 +648,29 @@ def scatter_iron_chain_debris(state, pos: jnp.ndarray, rng: jax.Array):
     return state.replace(ground_items=new_g)
 
 
-def process_bridge_entities_on_close(state, pos: jnp.ndarray):
+def process_bridge_entities_on_close(state, pos: jnp.ndarray, rng: jax.Array | None = None):
     """Crush any monsters standing on the bridge tile + paired wall tile when
     a drawbridge closes (vendor dbridge.c::do_entity lines 554-759 — entities
     on the bridge are processed for crush / drown / lava-burn).
 
-    Simplified subset: monsters on the bridge tile (which becomes
-    DRAWBRIDGE_UP / DBWALL) are killed in place (HP → 0, alive → False).
-    The hero is not processed here (vendor handles hero separately with
-    crush-by-portcullis damage and e_jump escape — left as a deferred
-    item since the JAX port has no jump-mechanic input).
+    For each affected monster, vendor ``e_jumps`` (dbridge.c:530-551) gives a
+    chance to ``jump clear`` to an adjacent square — vendor formula ``tmp=4
+    out of 10``; the task spec collapses this to ``rn2(5)`` for the JAX port
+    (1/5 chance to succeed).  On success, relocate the monster to the first
+    walkable 8-neighbour tile (FLOOR / CORRIDOR / OPEN_DOOR / ...).  On
+    failure (no walkable neighbour, or roll missed), the monster is crushed
+    in place (HP → 0, alive → False).
 
-    Also: process the 4-neighbour pair-tile that will be raised
+    The hero is not processed here (vendor handles hero separately —
+    hero-side crush damage is wired in a follow-up commit).
+
+    Also processes the 4-neighbour pair-tile that will be raised
     (vendor lev2 in close_drawbridge).
 
-    Cite: vendor/nethack/src/dbridge.c::do_entity lines 554-759.
+    Cite: vendor/nethack/src/dbridge.c::do_entity lines 554-759;
+          vendor/nethack/src/dbridge.c::e_jumps lines 530-551.
     """
+    from Nethax.nethax.constants.tiles import TileType
     b, lv, row, col = pos[0], pos[1], pos[2], pos[3]
     mai = state.monster_ai
 
@@ -679,11 +686,96 @@ def process_bridge_entities_on_close(state, pos: jnp.ndarray):
     on_s = (mr == row + jnp.int32(1)) & (mc == col)
     on_w = (mr == row) & (mc == col - jnp.int32(1))
     on_e = (mr == row) & (mc == col + jnp.int32(1))
-    crushed = mai.alive & (on_bridge | on_n | on_s | on_w | on_e)
+    affected = mai.alive & (on_bridge | on_n | on_s | on_w | on_e)
+
+    # --- e_jumped escape (dbridge.c::do_entity case e_jumped) -------------
+    # If no rng provided, no jump roll fires (back-compat with callers that
+    # don't yet thread randomness through close).  When rng is provided,
+    # each affected monster rolls rn2(5); on a 0, attempt to relocate to
+    # the first walkable 8-neighbour of its current tile that is not the
+    # bridge/paired-wall set.
+    n_slots = mai.alive.shape[0]
+    terrain = state.terrain[b, lv]
+    map_h = terrain.shape[0]
+    map_w = terrain.shape[1]
+
+    # Walkable predicate: not WALL/CLOSED_DOOR/VOID/DRAWBRIDGE_UP and
+    # not deadly liquid (WATER/LAVA/POOL).  Conservative subset of vendor
+    # e_survives_at — generic monsters drown/burn on liquid.
+    _BAD_TILES = jnp.array(
+        [
+            int(TileType.VOID),
+            int(TileType.WALL),
+            int(TileType.CLOSED_DOOR),
+            int(TileType.DRAWBRIDGE_UP),
+            int(TileType.WATER),
+            int(TileType.LAVA),
+            int(TileType.POOL),
+        ],
+        dtype=jnp.int32,
+    )
+
+    def _tile_walkable(rr: jnp.ndarray, cc: jnp.ndarray) -> jnp.ndarray:
+        in_bounds = (rr >= 0) & (rr < map_h) & (cc >= 0) & (cc < map_w)
+        rs = jnp.clip(rr, 0, map_h - 1)
+        cs = jnp.clip(cc, 0, map_w - 1)
+        t = terrain[rs, cs].astype(jnp.int32)
+        bad = jnp.any(_BAD_TILES == t)
+        return in_bounds & (~bad)
+
+    # 8-neighbour offsets (vendor: enexto picks any adjacent free tile).
+    _OFFS = jnp.array(
+        [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]],
+        dtype=jnp.int32,
+    )
+
+    if rng is None:
+        # Back-compat path: no jump roll, behaviour matches legacy
+        # implementation (everyone in the crush mask dies).
+        crushed = affected
+        new_pos = mai.pos
+    else:
+        # Build per-monster RNG vector (one subkey per slot).
+        keys = jax.random.split(rng, n_slots)
+
+        def _per_monster(carry, args):
+            key, m_r, m_c, is_affected = args
+            # rn2(5): 1/5 chance to jump.
+            roll = jax.random.randint(key, (), 0, 5, dtype=jnp.int32)
+            jumps = is_affected & (roll == jnp.int32(0))
+            # Scan 8 neighbours; pick the first walkable one.
+            def _find_target(carry2, off):
+                tgt_r, tgt_c, found = carry2
+                cand_r = m_r + off[0]
+                cand_c = m_c + off[1]
+                ok = _tile_walkable(cand_r, cand_c)
+                pick = (~found) & ok
+                new_tgt_r = jnp.where(pick, cand_r, tgt_r)
+                new_tgt_c = jnp.where(pick, cand_c, tgt_c)
+                new_found = found | ok
+                return (new_tgt_r, new_tgt_c, new_found), None
+            (tgt_r, tgt_c, found), _ = jax.lax.scan(
+                _find_target,
+                (m_r, m_c, jnp.bool_(False)),
+                _OFFS,
+            )
+            relocates = jumps & found
+            out_r = jnp.where(relocates, tgt_r, m_r).astype(jnp.int16)
+            out_c = jnp.where(relocates, tgt_c, m_c).astype(jnp.int16)
+            survives = relocates
+            return None, (out_r, out_c, survives)
+
+        _, (out_rs, out_cs, survives) = jax.lax.scan(
+            _per_monster,
+            None,
+            (keys, mr, mc, affected),
+        )
+        crushed = affected & (~survives)
+        new_pos = jnp.stack([out_rs, out_cs], axis=-1)
 
     new_alive = jnp.where(crushed, jnp.bool_(False), mai.alive)
     new_hp = jnp.where(crushed, jnp.int32(0), mai.hp)
-    new_mai = mai.replace(alive=new_alive, hp=new_hp)
+    new_mai = mai.replace(alive=new_alive, hp=new_hp, pos=new_pos)
     return state.replace(monster_ai=new_mai)
 
 
