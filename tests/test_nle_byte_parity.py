@@ -126,9 +126,19 @@ def _diff_obs(nle_obs: dict, nax_obs: dict, step_idx: int) -> list[str]:
     return diffs
 
 
-def run_validator(num_steps: int = 20, seed: int = 0, verbose: bool = True) -> int:
+def run_validator(
+    num_steps: int = 20,
+    seed: int = 0,
+    verbose: bool = True,
+    show_all: bool = False,
+) -> int:
     """Run the side-by-side validator.  Returns the number of total
-    divergence strings collected across all steps.  Zero = full parity."""
+    divergence strings collected across all steps.  Zero = full parity.
+
+    If ``show_all`` is True, prints every per-step divergence line (no
+    truncation).  Useful for trajectory analysis where summary-tail data
+    matters as much as the first 8 channels.
+    """
     nle_env, nle_err = _safe_import_nle()
     if nle_err:
         print(f"[SKIP] Could not import nle: {nle_err}")
@@ -150,7 +160,8 @@ def run_validator(num_steps: int = 20, seed: int = 0, verbose: bool = True) -> i
     # Nethax reset — force same role as NLE side (rog-hum-cha-mal).
     nax_env = nethax_cls()
     try:
-        from Nethax.nethax.constants.character import Role, Race
+        from Nethax.nethax.constants.roles import Role
+        from Nethax.nethax.constants.races import Race
         nax_state, nax_obs = nax_env.reset(
             jax.random.PRNGKey(seed),
             role=Role.ROGUE,
@@ -176,7 +187,8 @@ def run_validator(num_steps: int = 20, seed: int = 0, verbose: bool = True) -> i
     if verbose:
         if diffs:
             print(f"\n=== step 0 (after reset): {len(diffs)} divergences ===")
-            for d in diffs[:20]:
+            limit = len(diffs) if show_all else 20
+            for d in diffs[:limit]:
                 print(f"  {d}")
         else:
             print("\n=== step 0 (after reset): MATCH ===")
@@ -217,9 +229,10 @@ def run_validator(num_steps: int = 20, seed: int = 0, verbose: bool = True) -> i
                 print(
                     f"\n=== step {step_idx}: {len(diffs)} divergences ==="
                 )
-                for d in diffs[:8]:
+                limit = len(diffs) if show_all else 8
+                for d in diffs[:limit]:
                     print(f"  {d}")
-                if len(diffs) > 8:
+                if not show_all and len(diffs) > 8:
                     print(f"  ... ({len(diffs) - 8} more)")
             else:
                 print(f"=== step {step_idx}: MATCH ===")
@@ -233,8 +246,12 @@ def run_validator(num_steps: int = 20, seed: int = 0, verbose: bool = True) -> i
 
 
 if __name__ == "__main__":
-    n_steps = int(sys.argv[1]) if len(sys.argv) > 1 else 5
-    total = run_validator(num_steps=n_steps, verbose=True)
+    # CLI: tests/test_nle_byte_parity.py [n_steps] [--all]
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    n_steps = int(args[0]) if args else 5
+    show_all = "--all" in flags
+    total = run_validator(num_steps=n_steps, verbose=True, show_all=show_all)
     if total < 0:
         print("\n[skip] validator could not run")
         sys.exit(2)
