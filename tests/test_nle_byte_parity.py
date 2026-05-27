@@ -149,12 +149,19 @@ def run_validator(
         print(f"[SKIP] Could not import Nethax: {nax_err}")
         return -2
 
-    # NLE reset.  NLE uses `env.seed(seed); env.reset()`.
-    try:
-        if hasattr(nle_env, "seed"):
-            nle_env.seed(seeds=(seed, seed))
-    except Exception:
-        pass
+    # NLE reset.  NLE's `env.seed` signature is
+    #   ``seed(core=None, disp=None, reseed=False)``
+    # (vendor/nle/nle/env/base.py:441).  The previous call used
+    # ``seeds=(seed, seed)`` (kwarg name ``seeds`` — invalid!).  Python
+    # raised TypeError which the broad except silently swallowed, so NLE
+    # fell back to its default wallclock/urandom seeding — hence the
+    # NLE-side non-determinism observed across validator runs (player_x
+    # flipping between 15, 32, 46, 57, ... for nominal seed=0).
+    #
+    # Pass explicit core+disp positional args AND reseed=False to disable
+    # NLE's anti-TAS strong-reseed (vendor/nle/nle/env/base.py:455-466).
+    if hasattr(nle_env, "seed"):
+        nle_env.seed(core=seed, disp=seed, reseed=False)
     nle_obs = nle_env.reset()
 
     # Nethax reset — force same role as NLE side (rog-hum-cha-mal).
