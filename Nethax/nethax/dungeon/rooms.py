@@ -54,6 +54,12 @@ _TILE_WALL:     int = 3
 _TILE_FLOOR:    int = 1
 _TILE_CORRIDOR: int = 2
 
+# Vendor map dimensions (vendor/nle/include/global.h:327-328).  Used to size
+# the in-flight level grid that drives create_room's check_room cell scan
+# (sp_lev.c:1099-1113).
+_COLNO: int = 80
+_ROWNO: int = 21
+
 # ---------------------------------------------------------------------------
 # RoomType enum
 #
@@ -477,6 +483,7 @@ def _invoke_create_room(
     vrng,
     pool,
     rooms_lx, rooms_ly, rooms_hx, rooms_hy, rooms_lit,
+    level_grid,
     nroom,
     depth: int,
     vault: jax.Array,
@@ -491,15 +498,22 @@ def _invoke_create_room(
     = -1`` to mark the slot as detached — we mirror that via the
     ``sentinel_hx`` argument (``-1`` for vault, ``hx`` for OROOM).
 
+    ``level_grid`` is the int8[ROWNO, COLNO] non-stone bitmap consumed by
+    create_room's check_room scan (sp_lev.c:1099-1113).  On success we
+    stamp the placed room's interior + 1-cell wall border to non-stone so
+    subsequent attempts' check_room scans see the existing rooms (vendor's
+    ``add_room`` -> ``topologize`` sets ``levl[x][y].typ`` for floor and
+    walls -- everything inside ``[lx-1..hx+1] x [ly-1..hy+1]``).
+
     Returns the updated carry tuple
     ``(vrng, pool, rooms_lx, rooms_ly, rooms_hx, rooms_hy, rooms_lit,
-       nroom, success)``.
+       level_grid, nroom, success)``.
     """
     from Nethax.nethax.dungeon.create_room import create_room_random
 
     abs_depth = jnp.int32(depth)
     res = create_room_random(
-        vrng, pool, abs_depth, nroom, vault,
+        vrng, pool, abs_depth, nroom, vault, level_grid,
     )
 
     # Compute the absolute room bounding box from create_room's returns.
@@ -547,9 +561,29 @@ def _invoke_create_room(
     )
     new_nroom = jnp.where(success, nroom + jnp.int32(1), nroom)
 
+    # On success, stamp the room footprint into level_grid so the next
+    # create_room call's check_room scan (sp_lev.c:1099-1113) sees the
+    # placed room.  Footprint = interior + 1-cell wall border, i.e.
+    # ``[xabs-1 .. hx+1] x [yabs-1 .. hy+1]`` (vendor ``add_room`` ->
+    # ``topologize`` sets ``levl[x][y].typ`` across this area).  For the
+    # vault branch (hx_written == -1) we use the un-sentineled bounds.
+    h_grid, w_grid = level_grid.shape
+    foot_lx = jnp.maximum(res.xabs.astype(jnp.int32) - 1, jnp.int32(0))
+    foot_ly = jnp.maximum(res.yabs.astype(jnp.int32) - 1, jnp.int32(0))
+    foot_hx = jnp.minimum(hx.astype(jnp.int32) + 1, jnp.int32(w_grid - 1))
+    foot_hy = jnp.minimum(hy.astype(jnp.int32) + 1, jnp.int32(h_grid - 1))
+    rows = jnp.arange(h_grid, dtype=jnp.int32)
+    cols = jnp.arange(w_grid, dtype=jnp.int32)
+    row_mask = (rows >= foot_ly) & (rows <= foot_hy)
+    col_mask = (cols >= foot_lx) & (cols <= foot_hx)
+    footprint = row_mask[:, None] & col_mask[None, :]
+    stamp = success & footprint
+    new_level_grid = jnp.where(stamp, jnp.int8(1), level_grid)
+
     return (
         res.rng, res.pool,
         rooms_lx, rooms_ly, rooms_hx, rooms_hy, rooms_lit,
+        new_level_grid,
         new_nroom, success,
     )
 
@@ -612,11 +646,16 @@ def makerooms(
     #                 exit from the ``while`` loop.
     init_coords = jnp.full((MAX_ROOMS_PER_LEVEL,), -1, dtype=jnp.int16)
     init_lit    = jnp.zeros((MAX_ROOMS_PER_LEVEL,), dtype=jnp.int8)
+    # int8[ROWNO, COLNO] non-stone bitmap consumed by create_room's
+    # check_room scan (sp_lev.c:1099-1113).  All-stone at level start;
+    # each successful create_room stamps its footprint to 1.
+    init_level_grid = jnp.zeros((_ROWNO, _COLNO), dtype=jnp.int8)
 
     carry0 = (
         vendor_rng,
         rect_pool,
         init_coords, init_coords, init_coords, init_coords, init_lit,
+        init_level_grid,
         jnp.int32(0),         # nroom
         jnp.bool_(False),     # tried_vault
         jnp.bool_(True),      # alive
@@ -625,6 +664,7 @@ def makerooms(
     def body(_i, carry):
         (vrng, pool,
          rlx, rly, rhx, rhy, rlit,
+         level_grid,
          nroom, tried_vault, alive) = carry
 
         # --- Step A: rnd_rect() — vendor mklev.c:229 ``while (... && rnd_rect())``
@@ -706,6 +746,7 @@ def makerooms(
         def do_create_room(args):
             (vrng_in, pool_in,
              rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
+             level_grid_in,
              nroom_in, vault_in) = args
             sentinel_hx = jnp.where(
                 vault_in, jnp.int16(-1), jnp.int16(0)
@@ -713,6 +754,7 @@ def makerooms(
             return _invoke_create_room(
                 vrng_in, pool_in,
                 rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
+                level_grid_in,
                 nroom_in, depth=abs_depth,
                 vault=vault_in,
                 sentinel_hx=sentinel_hx,
@@ -721,20 +763,23 @@ def makerooms(
         def skip_create_room(args):
             (vrng_in, pool_in,
              rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
+             level_grid_in,
              nroom_in, _vault_in) = args
             return (
                 vrng_in, pool_in,
                 rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
+                level_grid_in,
                 nroom_in, jnp.bool_(False),
             )
 
         (vrng, pool,
          rlx, rly, rhx, rhy, rlit,
+         level_grid,
          nroom, cr_success) = lax.cond(
             do_create_branch,
             do_create_room,
             skip_create_room,
-            (vrng, pool, rlx, rly, rhx, rhy, rlit, nroom, take_vault),
+            (vrng, pool, rlx, rly, rhx, rhy, rlit, level_grid, nroom, take_vault),
         )
 
         # Update alive: vendor exits the outer ``while`` only when
@@ -749,11 +794,13 @@ def makerooms(
         return (
             vrng, pool,
             rlx, rly, rhx, rhy, rlit,
+            level_grid,
             nroom, new_tried_vault, new_alive,
         )
 
     (vrng, pool,
      rlx, rly, rhx, rhy, rlit,
+     _level_grid,
      nroom, tried_vault, _alive) = lax.fori_loop(
         0, MAXNROFROOMS, body, carry0,
     )

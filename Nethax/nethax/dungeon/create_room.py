@@ -102,8 +102,12 @@ _ROWNO: int = 21
 _XLIM: int = 4
 _YLIM: int = 3
 
-# vendor/nle/src/sp_lev.c:1161, 1277 -- ``trycnt <= 100``.
-_MAX_TRYCNT: int = 100
+# vendor/nle/src/sp_lev.c:1161, 1218 -- ``do { ... } while (++trycnt <= 100);``.
+# trycnt starts at 0 and the post-increment ``++trycnt`` runs *before* the
+# ``<= 100`` test, so the body executes for trycnt values 0..100 inclusive --
+# 101 iterations total.  Our previous value of 100 was off-by-one (~21 RNG
+# bytes/level deficit).  Restoring vendor parity per sp_lev.c:1175,1218.
+_MAX_TRYCNT: int = 101
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +214,146 @@ def _draw_rlit(
 # ---------------------------------------------------------------------------
 
 
+def _scan_check_room(
+    rng: Isaac64State,
+    level_grid: jax.Array,   # int8[_ROWNO, _COLNO] -- 0 = STONE
+    lowx: jax.Array,         # int16, post-clamp
+    lowy: jax.Array,         # int16, post-clamp
+    hix: jax.Array,          # int16, post-clamp
+    hiy: jax.Array,          # int16, post-clamp
+    vault: jax.Array,        # bool
+    enable: jax.Array,       # bool -- skip entirely (and consume zero RNG) when False
+) -> Tuple[Isaac64State, jax.Array]:
+    """Vendor ``check_room`` cell scan -- sp_lev.c:1099-1113.
+
+    Vendor (sp_lev.c::check_room) scans the padded bounding box
+    ``[lowx-xlim .. hix+xlim] x [lowy-ylim .. hiy+ylim]`` (with x clamped to
+    1..COLNO-1 and y clamped to 0..ROWNO-1), and for every non-stone cell
+    (``levl[x][y].typ != 0``) draws ``rn2(3)`` and rejects the attempt when
+    the roll is 0::
+
+        for (x = *lowx - xlim; x <= hix + xlim; x++) {
+            if (x <= 0 || x >= COLNO) continue;
+            y = *lowy - ylim;
+            ymax = hiy + ylim;
+            if (y < 0) y = 0;
+            if (ymax >= ROWNO) ymax = ROWNO - 1;
+            lev = &levl[x][y];
+            for (; y <= ymax; y++) {
+                if (lev++->typ) {
+                    if (!rn2(3))
+                        return FALSE;
+                    ...
+                    goto chk;
+                }
+            }
+        }
+
+    On a freshly-stoned level (room 0) every cell is stone, so the inner
+    ``rn2(3)`` never fires and the scan is a no-op.  On rooms 1+ the padded
+    bounding boxes of previously placed rooms intrude into the candidate's
+    scan window and consume RNG bytes -- audit MAKEROOMS_DEFICIT_AUDIT.md
+    estimates "hundreds of draws/attempt x 100 attempts x 7 rooms = 1000+
+    draws/level".  Prior to this fix that entire stream was skipped.
+
+    Simplification vs vendor:
+        Vendor's ``goto chk`` shrinks the candidate room on a non-zero
+        ``rn2(3)`` roll and restarts the scan from the new bounds; the
+        post-shrink cells consume *more* RNG bytes.  We model the linear
+        single-pass scan only -- one ``rn2(3)`` per non-stone cell, exit on
+        the first ``0`` roll.  This captures the dominant per-attempt draw
+        count; the shrink+retry refinement (additional ~tens of bytes when
+        a roll is non-zero) is a future polish item.  See audit doc for
+        the impact estimate.
+
+    JIT shape: the scan iterates over the full padded box
+    ``[lowx-xlim_max .. hix+xlim_max] x [lowy-ylim_max .. hiy+ylim_max]``
+    -- both ranges are bounded by COLNO/ROWNO so we use a static-sized
+    ``fori_loop`` over ``_COLNO x _ROWNO`` cells and mask out cells outside
+    the per-attempt bounding box via ``jnp.where``.  Vendor's clamps
+    (``x <= 0 || x >= COLNO`` and ``y < 0`` / ``ymax >= ROWNO``) are folded
+    into the same mask.
+
+    Args:
+        rng: ISAAC64 stream.
+        level_grid: int8[_ROWNO, _COLNO] where cell == 0 means STONE
+            (vendor ``levl[x][y].typ == 0``).  Indexed ``[y, x]``.
+        lowx, lowy, hix, hiy: post-clamp interior bounds (sp_lev.c:1075-1082).
+        vault: bumps xlim/ylim by 1 (sp_lev.c:1072-1073).
+        enable: when False, skip the scan entirely (no RNG consumed).  Used
+            when the attempt has already failed an earlier gate (``has_rect
+            & fits``) so vendor would never have reached ``check_room``.
+
+    Returns:
+        ``(new_rng, check_ok)``.  ``check_ok`` is True iff every non-stone
+        cell in the scan window rolled a non-zero ``rn2(3)`` (or there were
+        no non-stone cells).
+    """
+    xlim = jnp.int16(_XLIM) + jnp.where(vault, jnp.int16(1), jnp.int16(0))
+    ylim = jnp.int16(_YLIM) + jnp.where(vault, jnp.int16(1), jnp.int16(0))
+
+    # Padded scan window (pre-clamp -- the per-cell mask applies vendor's
+    # ``x <= 0 || x >= COLNO`` / ``y < 0`` / ``ymax >= ROWNO`` clamps).
+    scan_lowx = lowx - xlim
+    scan_lowy = lowy - ylim
+    scan_hix = hix + xlim
+    scan_hiy = hiy + ylim
+
+    n_cells = _COLNO * _ROWNO
+
+    def _body(i, carry):
+        rng_c, ok_c = carry
+        # Cell coordinates -- iterate y inner (matches vendor's ``lev++``
+        # which walks down the column).
+        x = jnp.int16(i // _ROWNO)
+        y = jnp.int16(i % _ROWNO)
+
+        # Vendor mask: ``lowx-xlim <= x <= hix+xlim`` AND ``1 <= x < COLNO``
+        # (vendor: ``if (x <= 0 || x >= COLNO) continue;``) AND
+        # ``max(0, lowy-ylim) <= y <= min(ROWNO-1, hiy+ylim)``.
+        in_x = (
+            (x >= scan_lowx)
+            & (x <= scan_hix)
+            & (x > jnp.int16(0))
+            & (x < jnp.int16(_COLNO))
+        )
+        in_y = (
+            (y >= scan_lowy)
+            & (y <= scan_hiy)
+            & (y >= jnp.int16(0))
+            & (y < jnp.int16(_ROWNO))
+        )
+        in_box = enable & in_x & in_y
+
+        cell = level_grid[y, x]
+        non_stone = cell != jnp.int8(0)
+
+        # Draw rn2(3) iff (in_box AND non_stone) -- short-circuited via
+        # lax.cond so the ISAAC64 stream is consumed only on cells vendor
+        # would have hit.
+        def _draw(r):
+            return rn2_jax(r, jnp.int32(3))
+
+        def _skip(r):
+            return r, jnp.int32(0)
+
+        # Once we've already rejected (ok_c=False) vendor would have
+        # returned FALSE -- no further draws.  Gate on ok_c too.
+        gate = in_box & non_stone & ok_c
+        rng_n, roll = lax.cond(gate, _draw, _skip, rng_c)
+
+        # Reject when this cell consumed a draw and rolled 0.
+        ok_n = ok_c & ((~gate) | (roll != jnp.int32(0)))
+        return (rng_n, ok_n)
+
+    rng_f, ok_f = lax.fori_loop(0, n_cells, _body, (rng, jnp.bool_(True)))
+    return rng_f, ok_f
+
+
 def _try_one_attempt(
     rng: Isaac64State,
     pool: RectPool,
+    level_grid: jax.Array,    # int8[_ROWNO, _COLNO]
     nroom: jax.Array,        # int32
     vault: jax.Array,        # bool
 ) -> AttemptResult:
@@ -397,23 +538,38 @@ def _try_one_attempt(
     )
     dy_final = dy_decremented
 
-    # ----- check_room -- sp_lev.c:1209-1212 -------------------------------
-    # On a freshly-stoned makerooms level every ``levl[x][y].typ == 0``,
-    # so the inner ``rn2(3)`` (sp_lev.c:1103) is never reached.  The only
-    # side effect that survives is the boundary clamp on lowx/lowy
-    # (sp_lev.c:1075-1082) and the final ``*ddx = hix - *lowx``
-    # (sp_lev.c:1117).  We mirror those clamps to keep the geometry
-    # exact, without consuming RNG.
-    # hix = lowx + ddx; hiy = lowy + ddy  (sp_lev.c:1068)
+    # ----- check_room -- sp_lev.c:1063-1120 -------------------------------
+    # Per-cell scan of the padded bounding box (sp_lev.c:1099-1113).  On
+    # rooms 1+ the padded windows of previously placed rooms intersect the
+    # scan and consume one ``rn2(3)`` draw per non-stone cell -- audit
+    # MAKEROOMS_DEFICIT_AUDIT.md flags this as the top RNG deficit.
+    # Pre-scan we apply the vendor clamps on lowx/lowy/hix/hiy
+    # (sp_lev.c:1075-1082) and short-circuit when the geometry would
+    # collapse (sp_lev.c:1084 ``hix <= lowx || hiy <= lowy`` -> FALSE).
     hix = xabs + dx
     hiy = yabs_final + dy_final
     lowx_clamped = jnp.maximum(xabs, jnp.int16(3))
     lowy_clamped = jnp.maximum(yabs_final, jnp.int16(2))
     hix_clamped = jnp.minimum(hix, jnp.int16(_COLNO - 3))
     hiy_clamped = jnp.minimum(hiy, jnp.int16(_ROWNO - 3))
-    # check_room returns FALSE when (hix <= lowx || hiy <= lowy) per
-    # sp_lev.c:1084.
-    check_ok = (hix_clamped > lowx_clamped) & (hiy_clamped > lowy_clamped)
+    geom_ok = (hix_clamped > lowx_clamped) & (hiy_clamped > lowy_clamped)
+
+    # Cell scan -- consumes ``rn2(3)`` per non-stone cell in the padded
+    # window.  Gated on ``can_place & geom_ok`` so vendor's earlier exits
+    # (no rect / rect-fits FALSE / collapsed geometry) skip the scan
+    # without consuming RNG.  See sp_lev.c:1099-1113.
+    scan_enable = can_place & geom_ok
+    rng, scan_ok = _scan_check_room(
+        rng,
+        level_grid,
+        lowx_clamped,
+        lowy_clamped,
+        hix_clamped,
+        hiy_clamped,
+        vault,
+        scan_enable,
+    )
+    check_ok = geom_ok & scan_ok
     final_dx = hix_clamped - lowx_clamped
     final_dy = hiy_clamped - lowy_clamped
 
@@ -462,6 +618,7 @@ def create_room_random(
     depth: jax.Array,    # int32 scalar (current dungeon depth, signed)
     nroom: jax.Array,    # int32 scalar (current room count, before insert)
     vault: jax.Array,    # bool scalar
+    level_grid: jax.Array | None = None,  # int8[_ROWNO, _COLNO]
 ) -> CreateRoomResult:
     """Port of ``create_room`` for the random/vault path (sp_lev.c:1172-1218).
 
@@ -476,6 +633,16 @@ def create_room_random(
         vault:  ``True`` iff the caller is placing a vault.  Bumps
                 xlim/ylim by 1 (sp_lev.c:1145-1146) and skips D2/D3
                 (sp_lev.c:1185-1186).
+        level_grid: optional int8[_ROWNO, _COLNO] -- 0 means STONE, non-zero
+                means an already-placed room/wall/etc.  Drives the vendor
+                ``check_room`` per-cell ``rn2(3)`` scan (sp_lev.c:1099-1113).
+                On room 0 (first placement) the grid is all stone and no
+                draws fire; rooms 1+ may consume hundreds of bytes here.
+                When ``None``, defaults to all-stone (back-compat for the
+                Phase-2 smoke test and any caller that hasn't wired a grid
+                yet).  Phase 3 ``makerooms`` is expected to maintain the
+                grid by stamping each placed room's interior + 1-cell
+                wall border to non-stone after success.
 
     Returns:
         :class:`CreateRoomResult`.  On ``success=True``, the pool has had
@@ -489,6 +656,12 @@ def create_room_random(
         the returned ``(xabs, yabs, xabs+wtmp-1, yabs+htmp-1, rlit)`` into
         the level's Room array (vendor ``add_room`` at sp_lev.c:1285).
     """
+    # Default level_grid to all-stone when caller doesn't pass one (back-
+    # compat).  Phase 3's makerooms passes a real grid that reflects every
+    # already-placed room's interior + wall-border footprint.
+    if level_grid is None:
+        level_grid = jnp.zeros((_ROWNO, _COLNO), dtype=jnp.int8)
+
     # ------------------------------------------------------------------
     # Pre-loop lit draws (sp_lev.c:1153-1154) -- ONCE per create_room.
     # ------------------------------------------------------------------
@@ -507,7 +680,7 @@ def create_room_random(
 
         def _do_attempt(state):
             r, p = state
-            res = _try_one_attempt(r, p, nroom, vault)
+            res = _try_one_attempt(r, p, level_grid, nroom, vault)
             return res
 
         def _skip_attempt(state):
