@@ -73,6 +73,25 @@ _TRACE_ISAAC_COUNTER = 0
 _TRACE_OP_COUNTER = 0
 _TRACE_INITED = False
 
+# ---------------------------------------------------------------------------
+# Draw counter — counts every host-side ISAAC64 uint64 draw.
+# JAX-traced draws (rn2_jax, rn1_jax, etc.) are NOT counted here because
+# they run inside lax.fori_loop / lax.while_loop and bypass _trace_isaac.
+# Use get_draw_count() / reset_draw_count() to instrument env.reset() phases.
+# ---------------------------------------------------------------------------
+_DRAW_COUNT: int = 0
+
+
+def get_draw_count() -> int:
+    """Return the current host-side ISAAC64 draw count."""
+    return _DRAW_COUNT
+
+
+def reset_draw_count() -> None:
+    """Reset the host-side draw counter to zero."""
+    global _DRAW_COUNT
+    _DRAW_COUNT = 0
+
 
 def _trace_init():
     global _TRACE_FP, _TRACE_OPS_FP, _TRACE_INITED
@@ -88,7 +107,8 @@ def _trace_init():
 
 
 def _trace_isaac(val: int):
-    global _TRACE_ISAAC_COUNTER
+    global _TRACE_ISAAC_COUNTER, _DRAW_COUNT
+    _DRAW_COUNT += 1
     _trace_init()
     if _TRACE_FP is not None:
         _TRACE_FP.write(f"ISAAC {_TRACE_ISAAC_COUNTER} val={val:016x}\n")

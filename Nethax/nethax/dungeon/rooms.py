@@ -32,6 +32,7 @@ from Nethax.nethax.dungeon.branches import MAP_H, MAP_W
 from Nethax.nethax.vendor_rng import Isaac64State, randint_jax
 from Nethax.nethax.subsystems.random_objects import (
     _MKOBJ_TABLE,
+    _mkbox_cnts_draws,
     consume_mksobj_init_draws,
     decode_picked_otyp,
 )
@@ -1989,24 +1990,13 @@ def fill_ordinary_rooms(
             vrng_in, _locked  = randint_jax(vrng_in, (), 0, 5)
             vrng_in, _trapped = randint_jax(vrng_in, (), 0, 10)
             vrng_in, _tknown  = randint_jax(vrng_in, (), 0, 100)
-            # mkbox_cnts (mkobj.c:304-371): rn2(n+1) for item count.
-            # n = CHEST locked→7, CHEST unlocked→5, LARGE_BOX locked→5,
-            # LARGE_BOX unlocked→3 (mkobj.c:316-320).  Use max cap n=7 →
-            # rn2(8).  Each item: rnd(100) class-pick + rnd(100) type-pick
-            # proxy (vendor rnd(oclass_prob_total), bounded by ~100).
-            # Cap 8 items (vendor unbounded; 8 covers 99%+ with n≤7).
-            # Vendor cite: mkobj.c::mkbox_cnts lines 338-355.
-            vrng_in, _cnt_raw = randint_jax(vrng_in, (), 0, 8)
-            def _box_item_step(carry, _):
-                v, cont = carry
-                v, _cls  = randint_jax(v, (), 1, 101)   # rnd(100) class
-                v, _typ  = randint_jax(v, (), 1, 101)   # rnd(prob_total)
-                return (v, cont), None
-            (vrng_in, _), _ = lax.scan(
-                _box_item_step,
-                (vrng_in, jnp.bool_(True)),
-                xs=None, length=8,
-            )
+            # mkbox_cnts cascade — vendor mkobj.c:274-353.
+            # box_otyp: rn2(3)==0 → CHEST (190), else → LARGE_BOX (189).
+            # Vendor cite: mkobj.c:274-353 (mkbox_cnts).
+            box_otyp = jnp.where(_box_type == jnp.int32(0),
+                                 jnp.int32(190),   # CHEST
+                                 jnp.int32(189))   # LARGE_BOX
+            vrng_in = _mkbox_cnts_draws(vrng_in, box_otyp)
             return vrng_in
 
         def _box_false(vrng_in):

@@ -53,12 +53,14 @@ from Nethax.nethax.constants.monsters import (
     G_LGROUP,
     AttackType,
     DamageType,
+    MonsterSymbol,
     MZ_LARGE,
     MZ_HUGE,
     MZ_GIGANTIC,
     M2_MAGIC,
     M2_NASTY,
     M2_GREEDY,
+    M2_MERC,
     M2_STRONG,
     M2_NEUTER,
     M2_DEMON,
@@ -484,6 +486,73 @@ _IS_GROUP_L:        jnp.ndarray = _compute_is_group_l()          # [NUMMONS] boo
 _IS_DOMESTIC:       jnp.ndarray = _compute_is_domestic()         # [NUMMONS] bool
 _PEACE_MINDED_RN2_NEEDED: jnp.ndarray = _compute_peace_minded_needs_rn2()  # [NUMMONS] bool
 _MONSTER_MALIGNTYP: jnp.ndarray = _compute_monster_maligntyp()   # [NUMMONS] int32
+
+
+# ---------------------------------------------------------------------------
+# m_initinv per-class body masks — vendor/nle/src/makemon.c:589-788
+# ---------------------------------------------------------------------------
+# Each array gates the RNG draws in the switch(ptr->mlet) body of m_initinv.
+# Only classes that contain any rn2() call are listed; all others fall to the
+# default: break branch (0 draws).
+
+def _compute_mlet_mask(symbol: MonsterSymbol) -> jnp.ndarray:
+    """Bool[NUMMONS]: True where MONSTERS[i].symbol == symbol."""
+    flags = [m.symbol == symbol for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_mlet_human_merc() -> jnp.ndarray:
+    """S_HUMAN monsters with M2_MERC flag (guard/soldier/watchman).
+
+    Cite: vendor/nle/src/makemon.c:591 ``is_mercenary(ptr)``
+          vendor/nle/include/mondata.h:118 ``M2_MERC``
+    """
+    mask = int(M2_MERC) & 0xFFFFFFFF
+    flags = [
+        m.symbol == MonsterSymbol.S_HUMAN and bool(int(m.flags2) & mask)
+        for m in MONSTERS
+    ]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_mlet_human_shopkeeper() -> jnp.ndarray:
+    """S_HUMAN monsters with MS_SELL sound (shopkeeper).
+
+    Cite: vendor/nle/src/makemon.c:673 ``ptr == &mons[PM_SHOPKEEPER]``
+    Shopkeeper is identified by MS_SELL sound in our table.
+    """
+    flags = [
+        m.symbol == MonsterSymbol.S_HUMAN and int(m.sound) == int(MS_SELL)
+        for m in MONSTERS
+    ]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_mlet_human_priest() -> jnp.ndarray:
+    """S_HUMAN monsters with MS_PRIEST sound (aligned priest / high priest).
+
+    Cite: vendor/nle/src/makemon.c:689 ``ptr->msound == MS_PRIEST``
+    """
+    flags = [
+        m.symbol == MonsterSymbol.S_HUMAN and int(m.sound) == int(MS_PRIEST)
+        for m in MONSTERS
+    ]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+# Per-class masks.  Computed once at import time.
+_MLET_NYMPH:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_NYMPH)
+_MLET_GNOME:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_GNOME)
+_MLET_KOBOLD:      jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOBOLD)
+_MLET_MUMMY:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_MUMMY)
+_MLET_QUANTMECH:   jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_QUANTMECH)
+_MLET_LEPRECHAUN:  jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_LEPRECHAUN)
+_MLET_DEMON:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_DEMON)
+_MLET_GIANT:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_GIANT)
+_MLET_LICH:        jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_LICH)
+_MLET_HUMAN_MERC:  jnp.ndarray = _compute_mlet_human_merc()
+_MLET_HUMAN_SK:    jnp.ndarray = _compute_mlet_human_shopkeeper()
+_MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
 
 
 # ---------------------------------------------------------------------------

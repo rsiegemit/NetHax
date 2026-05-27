@@ -341,7 +341,13 @@ class NethaxEnv:
 
         # Spawn starting pet adjacent to player — vendor/nethack/src/u_init.c::makedog.
         # Host-side (reset is not jit-compiled), so Python loops are fine.
-        state = _spawn_starting_pet(state, role)
+        # Under NLE_BYTEPARITY, thread vendor_rng so the rn2(2) pet-type coin
+        # flip (dog.c:66) is consumed for roles with petnum == NON_PM.
+        if use_vendor_rng():
+            state, new_vrng = _spawn_starting_pet(state, role, vendor_rng=state.vendor_rng)
+            state = state.replace(vendor_rng=new_vrng)
+        else:
+            state = _spawn_starting_pet(state, role)
 
         # Seed the explored mask via FOV so the player can see their starting
         # room on the very first frame.  Without this the initial obs is all
@@ -503,13 +509,20 @@ _PET_NEIGHBOUR_OFFSETS = jnp.array(
 )  # [8, 2] — vendor u_init.c::makedog scans the 8 adjacent tiles.
 
 
-def _spawn_starting_pet(state, role: Role):
+def _spawn_starting_pet(state, role: Role, vendor_rng=None):
     """Spawn the role's starting pet adjacent to the player.
 
     Vendor: vendor/nethack/src/u_init.c::makedog (called from u_init()).
     Pure-JAX so this routine is ``jax.vmap``-safe — the 8-neighbour scan is
     a static-shape ``jnp.where`` selection over the precomputed offsets.
     Pet is placed in slot 5 (after the 5 wild monsters in slots 0-4).
+
+    When ``vendor_rng`` is provided (NLE_BYTEPARITY mode), roles whose
+    ``petnum == NON_PM`` consume one ``rn2(2)`` draw from the ISAAC64 stream
+    to select kitten (0) vs. little dog (1), matching vendor dog.c:66.
+    Returns ``(state, vendor_rng)`` when vendor_rng is not None, else ``state``.
+
+    Citation: vendor/nle/src/dog.c:57-67 (pet_type)
     """
     from Nethax.nethax.constants.monsters import MONSTERS
     from Nethax.nethax.dungeon.spawning import (
@@ -517,10 +530,26 @@ def _spawn_starting_pet(state, role: Role):
     )
     import jax.random as jr
 
+    # Roles with petnum == NON_PM in vendor/nle/src/role.c roles[].
+    # dog.c:59-66: if urole.petnum != NON_PM → return petnum; else rn2(2).
+    _NON_PM_PET_ROLES = {
+        Role.ARCHEOLOGIST, Role.BARBARIAN, Role.HEALER, Role.MONK,
+        Role.PRIEST, Role.ROGUE, Role.TOURIST, Role.VALKYRIE,
+    }
+
     # Resolve pet monster name → MONSTERS index.  ``role`` is a Python
     # hyperparameter (not a traced value), so this Python lookup is fine
     # under ``jax.vmap`` over the rng axis.
-    pet_name = get_starting_pet(role)
+    if vendor_rng is not None and role in _NON_PM_PET_ROLES:
+        # Consume the rn2(2) coin flip from the vendor ISAAC64 stream.
+        # Vendor dog.c:66: return rn2(2) ? PM_KITTEN : PM_LITTLE_DOG;
+        # (non-zero → kitten, zero → little dog — same as C truthiness)
+        # Cite: vendor/nle/src/dog.c:66
+        vendor_rng, flip = _vendor_rng.rn2(vendor_rng, 2)
+        pet_name = "kitten" if int(flip) != 0 else "little dog"
+    else:
+        pet_name = get_starting_pet(role)
+
     pet_pm = next(
         (i for i, m in enumerate(MONSTERS) if m.name == pet_name),
         32,  # fallback: kitten (index 32)
@@ -583,7 +612,10 @@ def _spawn_starting_pet(state, role: Role):
             _ATK_DICE_S[pet_pm]
         ),
     )
-    return state.replace(monster_ai=mai)
+    new_state = state.replace(monster_ai=mai)
+    if vendor_rng is not None:
+        return new_state, vendor_rng
+    return new_state
 
 
 def _tick_stinking_cloud(state):
