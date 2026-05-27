@@ -1028,10 +1028,121 @@ def _ini_hpwp_vendor(
 
 
 # ---------------------------------------------------------------------------
+# consume_init_attr_draws  — vendor ISAAC64 init_attr replay
+# ---------------------------------------------------------------------------
+
+def consume_init_attr_draws(
+    vendor_rng,
+    role: Role,
+    race: Race,
+    np_total: int = 75,
+):
+    """Replay vendor ``attrib.c::init_attr(np)`` consuming ISAAC64 draws.
+
+    Mirrors vendor/nle/src/attrib.c:614-660 line-for-line using the
+    ISAAC64 host-side ``rn2`` helper.  Vendor algorithm:
+
+      1. ABASE(i) = role.attrbase[i]; np -= sum(attrbase).        (lines 619-623)
+      2. while np > 0 and tryct < 100:                            (line 626)
+           x = rn2(100)                                           (line 627)
+           walk attrdist to find stat index i                     (lines 628-629)
+           if i >= A_MAX: continue  (impossible, attrdist sums to (line 630-631)
+                                     100 so never reached)
+           if ABASE(i) >= ATTRMAX(i): tryct++; continue          (lines 633-636)
+           tryct = 0; ABASE(i)++; AMAX(i)++; np--               (lines 637-640)
+      3. Redistribution loop (np < 0) mirrors the same pattern.  (lines 644-660)
+
+    Each iteration that advances (does not hit cap or impossible) consumes
+    exactly one ``rn2(100)`` draw.  Capped/impossible iterations also
+    consume one draw (vendor does not re-draw on those paths).
+
+    Parameters
+    ----------
+    vendor_rng : Isaac64State
+        Live ISAAC64 state to consume from.
+    role, race : Role, Race
+        Character role and race.
+    np_total : int
+        Point budget passed to init_attr (vendor always calls ``init_attr(75)``
+        via u_init.c:1390).
+
+    Returns
+    -------
+    (vendor_rng, attributes) where ``vendor_rng`` is the post-draw
+    Isaac64State and ``attributes`` is a ``{stat_name: int}`` dict
+    mapping _STAT_NAMES → Python int values.
+
+    Cite: vendor/nle/src/attrib.c:614-660
+          vendor/nle/src/u_init.c:1390 (``init_attr(75)`` call site)
+    """
+    from Nethax.nethax import vendor_rng as _vrng
+
+    r_entry = get_role(role)
+    race_entry = get_race(race)
+
+    attrbase = list(int(v) for v in r_entry.attrbase)   # [6] ints
+    attrdist = list(int(v) for v in r_entry.attrdist)   # [6] ints
+    attrmin  = list(int(v) for v in race_entry.attrmin) # [6] ints
+    attrmax  = list(int(v) for v in race_entry.attrmax) # [6] ints
+    a_max_idx = 6  # A_MAX — vendor include/attrib.h
+
+    # Step 1: initialise ABASE from role, compute remaining points.
+    # attrib.c:619-623
+    abase = list(attrbase)
+    np = np_total - sum(attrbase)
+
+    # Step 2: distribute excess points upward.
+    # attrib.c:625-640
+    tryct = 0
+    while np > 0 and tryct < 100:
+        vendor_rng, x = _vrng.rn2(vendor_rng, 100)  # attrib.c:627
+        # Walk attrdist: i = first index where cumulative attrdist > x.
+        # attrib.c:628-629: ``for (i=0; (i<A_MAX) && ((x -= attrdist[i]) > 0); i++)``
+        i = 0
+        while i < a_max_idx and x >= 0:
+            x -= attrdist[i]
+            if x >= 0:
+                i += 1
+        if i >= a_max_idx:          # attrib.c:630-631 impossible branch
+            continue                 # (never reached when attrdist sums to 100)
+        if abase[i] >= attrmax[i]:  # attrib.c:633-636
+            tryct += 1
+            continue
+        tryct = 0                   # attrib.c:637-640
+        abase[i] += 1
+        np -= 1
+
+    # Step 3: redistribute excess points downward (np < 0).
+    # attrib.c:643-660
+    tryct = 0
+    while np < 0 and tryct < 100:
+        vendor_rng, x = _vrng.rn2(vendor_rng, 100)  # attrib.c:646
+        i = 0
+        while i < a_max_idx and x >= 0:
+            x -= attrdist[i]
+            if x >= 0:
+                i += 1
+        if i >= a_max_idx:          # attrib.c:649-651
+            continue
+        if abase[i] <= attrmin[i]:  # attrib.c:652-655
+            tryct += 1
+            continue
+        tryct = 0                   # attrib.c:656-659
+        abase[i] -= 1
+        np += 1
+
+    # Clamp final values to [attrmin, attrmax].
+    clamped = [max(attrmin[i], min(attrmax[i], abase[i])) for i in range(a_max_idx)]
+
+    attributes = {name: clamped[i] for i, name in enumerate(_STAT_NAMES)}
+    return vendor_rng, attributes
+
+
+# ---------------------------------------------------------------------------
 # create_character
 # ---------------------------------------------------------------------------
 
-def create_character(rng: jax.Array, role: Role, race: Race, alignment: int):
+def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, vendor_rng=None):
     """Build an EnvState for a newly created character.
 
     Rolls attribute scores via the vendor ``init_attr(75)`` formula,
@@ -1043,16 +1154,23 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int):
 
     Parameters
     ----------
-    rng       : JAX PRNG key
-    role      : Role enum value
-    race      : Race enum value
-    alignment : 0=lawful, 1=neutral, 2=chaotic (int)
+    rng        : JAX PRNG key
+    role       : Role enum value
+    race       : Race enum value
+    alignment  : 0=lawful, 1=neutral, 2=chaotic (int)
+    vendor_rng : Isaac64State | None
+        When provided (NLE_BYTEPARITY mode), consume vendor ISAAC64 draws for
+        u_init RNG gating (e.g. the rn2(5) BLINDFOLD roll at
+        vendor/nle/src/u_init.c:753).  When None (default NLE / Threefry
+        mode), fall back to the static role-kit logic.
 
     Returns
     -------
     Keyword-argument dict suitable for EnvState(**kwargs) or state.replace(**kwargs).
     We return a dict rather than an EnvState to avoid a circular import — the
     caller (env.py) merges these fields into the state returned by EnvState.default().
+    When vendor_rng is provided, the dict also includes a ``vendor_rng`` key
+    carrying the post-draw Isaac64State so the caller can thread it forward.
 
     Citations
     ---------
@@ -1076,19 +1194,33 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int):
 
     # --- Build inventory ---
     items_list = STARTING_INVENTORY[role]
-    # Rogue's BLINDFOLD slot is gated `!rn2(5)` in vendor u_init.c:754 —
-    # NLE seed-0 deterministic (`env.seed(0, 0, reseed=False)`) FAILS the
-    # `!rn2(5)` roll at vendor/nle/src/u_init.c:144 — validator with
-    # reseed=False confirms inv_letters[6]=0 (empty) and inv_oclasses[6]=18
-    # (MAXOCLASSES sentinel) on the NLE side.  So in BOTH NLE modes
-    # (default + BYTEPARITY) we strip the BLINDFOLD until the actual
-    # rn2(5) draw is consumed from the ISAAC64 stream at the correct
-    # call-order point in u_init — at that point we can conditionally
-    # include the BLINDFOLD based on the roll outcome (and consume the
-    # draw so subsequent RNG is byte-aligned).
-    # Cite: vendor/nle/src/u_init.c:144 (the rn2(5) roll for BLINDFOLD).
+    # Rogue's BLINDFOLD slot is gated `!rn2(5)` in vendor u_init.c:753-754:
+    #     Rogue[R_DAGGERS].trquan = rn1(10, 6);
+    #     ini_inv(Rogue);
+    #     if (!rn2(5))
+    #         ini_inv(Blindfold);
+    # In NLE_BYTEPARITY mode we consume the rn2(5) draw from the ISAAC64
+    # CORE stream and include BLINDFOLD iff the result is 0 (i.e. !rn2(5)).
+    # In plain NLE / Threefry mode we strip the BLINDFOLD statically because
+    # seed-0 deterministic runs (`env.seed(0, 0, reseed=False)`) always fail
+    # this roll (validator confirms inv_oclasses[6]=18 == MAXOCLASSES sentinel).
+    # Cite: vendor/nle/src/u_init.c:753-754.
     from Nethax.nethax.parity_mode import is_nle_mode as _is_nle
-    if _is_nle() and role == Role.ROGUE:
+    if vendor_rng is not None and role == Role.ROGUE:
+        # NLE_BYTEPARITY: consume rn2(5) from ISAAC64 CORE stream.
+        # vendor/nle/src/u_init.c:753 — `if (!rn2(5)) ini_inv(Blindfold);`
+        from Nethax.nethax import vendor_rng as _vendor_rng_mod
+        vendor_rng, blindfold_roll = _vendor_rng_mod.rn2(vendor_rng, 5)
+        if blindfold_roll != 0:
+            # rn2(5) != 0 → !rn2(5) is False → skip BLINDFOLD
+            items_list = [
+                it for it in items_list
+                if int(it.type_id) != int(ObjType.BLINDFOLD)
+            ]
+        # else: rn2(5) == 0 → !rn2(5) is True → keep BLINDFOLD in kit
+    elif _is_nle() and role == Role.ROGUE:
+        # Static fallback (plain NLE / Threefry): strip BLINDFOLD.
+        # Cite: vendor/nle/src/u_init.c:753-754.
         items_list = [
             it for it in items_list
             if int(it.type_id) != int(ObjType.BLINDFOLD)
@@ -1190,4 +1322,5 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int):
         inventory=inv_state,
         magic=magic_state,
         prayer=prayer_state,
+        **({"vendor_rng": vendor_rng} if vendor_rng is not None else {}),
     )

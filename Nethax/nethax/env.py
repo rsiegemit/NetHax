@@ -203,8 +203,17 @@ class NethaxEnv:
             #   ``active.sum()``.
             state = state.replace(vendor_rng=v_state)
 
-        # Apply character creation (stats, inventory, AC)
-        char_fields = create_character(rng_char, role, race, alignment)
+        # Apply character creation (stats, inventory, AC).
+        # In NLE_BYTEPARITY mode, thread the ISAAC64 CORE state through
+        # create_character so it can consume the u_init rn2(5) BLINDFOLD
+        # draw (vendor/nle/src/u_init.c:753-754) in byte-exact call order.
+        # The returned dict may include an updated ``vendor_rng`` key; the
+        # state.replace(**char_fields) call below threads it forward into
+        # EnvState so subsequent dungeon-gen draws stay byte-aligned.
+        char_fields = create_character(
+            rng_char, role, race, alignment,
+            vendor_rng=state.vendor_rng if use_vendor_rng() else None,
+        )
         state = state.replace(**char_fields)
 
         # Initialise role-specific skill caps (vendor/nethack/src/u_init.c Skill_X tables).
