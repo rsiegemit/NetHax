@@ -707,6 +707,14 @@ def generate_main_branch_l1(
 
     rng, k_rooms, k_corridors = jax.random.split(rng, 3)
 
+    # Preamble: vendor nle/src/mklev.c:693 — ``rn2(5)`` fires unconditionally
+    # as the LHS of ``|| (rn2(5) && u.uz.dnum == medusa_level.dnum && ...)``.
+    # On Main DoD Dlvl 1 the RHS is false (not Medusa's dungeon/depth), so we
+    # never enter makemaz(""), but the draw is consumed before makerooms().
+    if vendor_rng is not None:
+        from Nethax.nethax.vendor_rng import rn2_jax as _rn2_jax
+        vendor_rng, _medusa_r5 = _rn2_jax(vendor_rng, jnp.int32(5))
+
     # 1. Place rooms.  When vendor_rng is supplied (NLE_BYTEPARITY) the
     #    per-room y/x/h/w/lit draws come from the ISAAC64 stream so the
     #    layout byte-matches vendor C; otherwise the original Threefry path.
@@ -860,6 +868,64 @@ def generate_main_branch_l1(
         # Up-stair somex/somey on Dlvl 1 are NOT drawn (mklev.c:720
         # ``if (u.uz.dlevel != 1)`` short-circuits).  Phase 4+ levels
         # will need an extra branch for Dlvl > 1.
+
+        # ------------------------------------------------------------------
+        # makecorridors + make_niches — vendor mklev.c:734-735.
+        #
+        # Vendor C, immediately after the stair picks at lines 710-727:
+        #
+        #     makecorridors();   /* mklev.c:734 */
+        #     make_niches();     /* mklev.c:735 */
+        #
+        # These consume ~100-200 ISAAC64 draws between them (see
+        # MKLEV_PREAMBLE_AUDIT.md §2).  The byte-exact vendor port lives
+        # in ``corridors.py`` and operates on a dedicated
+        # :class:`LevelGenState` pytree disjoint from this function's
+        # ``terrain`` array.  We thread ``vendor_rng`` through both calls
+        # purely for byte-parity of the ISAAC64 stream; the structural
+        # corridor / niche tiles land on ``gs.typ`` and are NOT merged
+        # into ``terrain`` here — the Threefry ``connect_rooms`` call
+        # above already produced the playable corridor layout.  Phase 5
+        # of MKLEV_PORT_PLAN.md will unify the two surfaces.
+        from Nethax.nethax.dungeon.corridors import (
+            makecorridors as _vendor_makecorridors,
+            make_niches as _vendor_make_niches,
+            make_empty_level_gen_state as _vendor_make_lgs,
+            RoomsBox as _VendorRoomsBox,
+        )
+
+        # Build a RoomsBox view over the existing Room pytree.  Vendor
+        # ``struct mkroom`` uses (lx, ly, hx, hy) = (x_left, y_top,
+        # x_right, y_bottom); our Room exposes (x1, y1, x2, y2) in the
+        # same order, so the mapping is a direct field rename.  Inactive
+        # slots carry the -1 sentinel from ``generate_rooms``; ``join``
+        # short-circuits on ``~rooms.active[a]`` (corridors.py:820-822)
+        # so the sentinel is never dereferenced for an active draw.
+        _rooms_box = _VendorRoomsBox(
+            lx=rooms.x1.astype(jnp.int16),
+            ly=rooms.y1.astype(jnp.int16),
+            hx=rooms.x2.astype(jnp.int16),
+            hy=rooms.y2.astype(jnp.int16),
+            rtype=rooms.room_type,
+            active=active,
+        )
+        _lgs = _vendor_make_lgs()
+        # mklev.c:734 — makecorridors(rooms, nroom).
+        vendor_rng, _lgs = _vendor_makecorridors(
+            vendor_rng, _lgs, _rooms_box, nroom_int,
+        )
+        # mklev.c:735 — make_niches(rooms, nroom).  ``depth=1`` on
+        # Main Dlvl 1 short-circuits both the ltptr (depth > 15) and
+        # vamp (5 < depth < 25) gates so their rn2(6) draws are skipped,
+        # matching vendor C control flow.
+        vendor_rng, _lgs = _vendor_make_niches(
+            vendor_rng, _lgs, _rooms_box, nroom_int,
+            depth=1, noteleport=False,
+        )
+        # ``_lgs`` is discarded — its corridor/door cells live on a
+        # separate [COLNO, ROWNO] grid in vendor tile-type encoding.
+        # Phase 5 will rasterise it onto ``terrain``.
+        del _lgs, _rooms_box
 
         # Use the vendor down-stair (sx, sy) as the JAX-level player /
         # down-stair position so the byte-parity stream is observable
