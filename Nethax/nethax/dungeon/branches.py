@@ -1067,9 +1067,12 @@ def generate_main_branch_l1_with_features(
         )
 
     # vendor/nethack/src/mklev.c lines 404-410 + 1316-1342 — 2x2 detached
-    # vault with teleport-trap entry.
-    terrain, features, traps = maybe_create_vault(
+    # vault with teleport-trap entry.  Thread vendor_rng so the rn2(2) vault
+    # gate (mklev.c:230) and rn2(3) makevtele gate (mklev.c:752) come from
+    # the ISAAC64 stream under NLE_BYTEPARITY.
+    terrain, features, traps, vendor_rng = maybe_create_vault(
         k_vault, rooms, active, terrain, features, traps, flat_lv=flat_lv,
+        vendor_rng=vendor_rng,
     )
 
     # vendor/nethack/src/mklev.c::make_niches lines 802-820 — late-stage
