@@ -1947,13 +1947,15 @@ def fill_ordinary_rooms(
             # somex/somey are evaluated arguments to mkgold().
             v, _rg, _cg = somexy(v)
             # mkgold(amount==0) draws two RNG values inside (mkobj.c:1486-1504):
-            #   mul  = rnd(30 / max(12 - depth, 2))    (mkobj.c:1493)
-            #   base = rnd(level_difficulty() + 2)      (mkobj.c:1495)
+            #   mul  = rnd(level_difficulty() + 2)      (mkobj.c:1493)
+            #   amount = rnd(30 * mul)                  (mkobj.c:1495)
+            # Vendor cite: vendor/nle/src/mkobj.c:1486-1504.
+            # mul = rnd(level_difficulty() + 2) → [1, depth+2] FIRST
+            v, _ = randint_jax(v, (), 1, depth_i + jnp.int32(3))
+            # amount = rnd(30 * mul) → [1, 30*mul] SECOND
             _denom = jnp.maximum(jnp.int32(12) - depth_i, jnp.int32(2))
             _hi = jnp.int32(30) // _denom          # rnd(30/denom) → [1, hi]
             v, _ = randint_jax(v, (), 1, _hi + jnp.int32(1))
-            # base = rnd(level_difficulty() + 2) → [1, depth+2]
-            v, _ = randint_jax(v, (), 1, depth_i + jnp.int32(3))
             return v
 
         vrng = lax.cond(_gold_gate, _mkgold_true, lambda v: v, vrng)
@@ -1970,15 +1972,17 @@ def fill_ordinary_rooms(
         place_fount = is_ordinary & fount_roll
 
         def _fount_true(carry):
-            v, t = carry
+            v, t, aa = carry
             # mkfount somexy (single attempt; vendor's tryct loop almost always
             # succeeds on iter 1 — we model one somexy draw, matching vendor
             # behaviour on open rooms).
             v, rf_, cf_ = somexy(v)
-            # rn2(7) blessedftn (mklev.c:1590-1591).
-            v, _ = randint_jax(v, (), 0, 7)
+            # rn2(7) blessedftn (mklev.c:1571-1594).
+            v, blessed_ = randint_jax(v, (), 0, 7)
+            blessed_ftn = (blessed_ == jnp.int32(0)).astype(jnp.int8)
             new_t = t.at[rf_, cf_].set(FOUNTAIN)
-            return (v, new_t)
+            new_aa = aa.at[flat_lv, rf_, cf_].set(blessed_ftn)
+            return (v, new_t, new_aa)
 
         def _fount_false(carry):
             return carry
