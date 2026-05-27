@@ -135,18 +135,18 @@ class NethaxEnv:
             v_state, rng_char = _vendor_draw_prngkey(v_state)
             v_state, rng_monsters = _vendor_draw_prngkey(v_state)
 
-            # Byte-replay wire-up — pre-draw dungeon-gen scalars from ISAAC64
-            # so the room count and monster count match vendor C output for
-            # the same seed.  Vendor mklev.c::makerooms uses rn2(5)+5 (5..9)
-            # for the per-level room target; mklev.c:804 uses
-            # rnd((nroom >> 1) + 1) for monster count.  Both bottom out in
-            # ``isaac64_next_uint64() % x`` (rnd.c rn2/rnd, USE_ISAAC64 path).
-            v_state, room_target = _vendor_rng.rn2(v_state, 5)
-            n_rooms_vendor = int(room_target) + 5   # rn2(5)+5 → 5..9 inclusive
-            # rnd(N) == rn2(N) + 1; upper bound is ((n_rooms_vendor>>1)+1).
-            mc_upper = max((n_rooms_vendor >> 1) + 1, 1)
-            v_state, mc_roll = _vendor_rng.rn2(v_state, mc_upper)
-            n_monsters_vendor = max(min(int(mc_roll) + 1, 5), 1)
+            # Byte-replay wire-up — DO NOT pre-draw room/monster counts.
+            # Vendor mklev.c:996 (reseed_random) goes straight into
+            # makerooms() → create_room() with no count draw — the room
+            # count is determined by rnd_rect() exhaustion (mklev.c:403:
+            # ``while (svn.nroom < (MAXNROFROOMS - 1) && rnd_rect())``).
+            # Monster count likewise has no pre-draw; per-room fill at
+            # mklev.c:551 consumes the stream only as fills run.  Use a
+            # static MAXNROFROOMS-bounded target for the JAX placement
+            # loop; the actual count still emerges from overlap-rejection.
+            # Cite: vendor/nethack/src/mklev.c:996, mklev.c:403, mklev.c:551
+            n_rooms_vendor = 40          # MAXNROFROOMS cap; rejection sampling stops earlier
+            n_monsters_vendor = 5         # vendor mklev.c:551 fills per-room, not pre-counted
 
             state = state.replace(vendor_rng=v_state)
 
