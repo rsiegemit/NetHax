@@ -1041,23 +1041,26 @@ def fill_ordinary_rooms(
     depth,
     player_align: int = 1,
     vendor_rng: Isaac64State | None = None,
+    nroom: jnp.ndarray | None = None,
 ):
     """Apply per-room independent feature rolls to every ordinary room.
 
-    Vendor cite: vendor/nethack/src/mklev.c::fill_ordinary_room lines 968-1006:
+    Vendor cite: vendor/nethack/src/mklev.c lines 803-885 (fill_ordinary_rooms
+    inlined in makelevel).  Full 17-draw sequence per OROOM:
 
-        if ((u.uhave.amulet || !rn2(3)) && somexyspace(croom, &pos))
-            tmonst = makemon(...);                      # sleeping monster
-        x = 8 - (level_difficulty() / 6);  if (x <= 1) x = 2;
-        while (!rn2(x) && trycnt++ < 1000) mktrap(...); # traps
-        if (!rn2(3) && somexyspace(croom, &pos)) mkgold(...);
-        if (!rn2(10))  mkfount(croom);                  # fountain 1/10
-        if (!rn2(60))  mksink(croom);                   # sink     1/60
-        if (!rn2(60))  mkaltar(croom);                  # altar    1/60
-        x = 80 - (depth(&u.uz) * 2); if (x < 2) x = 2;
-        if (!rn2(x))  mkgrave(croom);                   # grave depth-scaled
-        if (!rn2(20) && somexyspace(croom, &pos))
-            (void) mkcorpstat(STATUE, ...);             # statue 1/20
+        if (u.uhave.amulet || !rn2(3)) { x=somex; y=somey; makemon(); }  #813
+        while (!rn2(trap_x)) mktrap(...);                                  #825
+        if (!rn2(3)) mkgold(0L, somex, somey);                             #827
+        if (!rn2(10))  mkfount(croom);                                     #831
+        if (!rn2(60))  mksink(croom);                                      #833
+        if (!rn2(60))  mkaltar(croom);                                     #835
+        if (!rn2(grave_x)) mkgrave(croom);                                 #840
+        if (!rn2(20)) mkcorpstat(STATUE, ...);                             #844
+        if (!rn2(nroom*5/2)) mksobj_at(rn2(3)?LARGE_BOX:CHEST, ...);      #853
+        if (!rn2(27+3*abs(depth))) { random_engraving;                     #858
+            do { x=somex; y=somey; } while (typ!=ROOM && !rn2(40)); }      #863
+        if (!rn2(3)) { mkobj_at(...);                                       #874
+            while (!rn2(5)) mkobj_at(...); }                               #877
 
     JIT-safety: this function consumes ``rng`` via ``jax.random.split`` so
     no PRNG key is reused.  Each room receives an independent sub-key, and
@@ -1065,11 +1068,14 @@ def fill_ordinary_rooms(
     a fixed-size lax.scan over MAX_ROOMS_PER_LEVEL — no Python branching
     on traced values.
 
-    Note: we cap the per-room trap loop at 4 placements (vendor's
-    ``while (!rn2(x))`` is geometrically distributed with mean
-    ``1/(1 - 1/x) - 1`` ≈ 1 for typical x).  Vendor uses trycnt < 1000 as a
-    safety bound; 4 iterations gives the same effective trap count at the
-    feasible range while keeping the trace length finite.
+    Variable-length loops are capped at 8 iterations (vendor uses open-ended
+    while loops; cap=8 covers the feasible range while keeping trace length
+    finite).  The trap loop is capped at 4 (geometric mean ~1 for typical
+    trap_x=8).
+
+    Short-circuit && gates (box, graffiti, mkobj): inner RHS draws only fire
+    when the gate passes.  Implemented via ``lax.cond`` so the ISAAC64 stream
+    advances exactly as vendor C would (no phantom draws on failed gates).
 
     Args:
         rng:          jax.random.PRNGKey scalar.
@@ -1090,6 +1096,10 @@ def fill_ordinary_rooms(
                       stream matches vendor C for a given seed.  When
                       ``None`` the original Threefry-split path runs
                       unchanged.
+        nroom:        optional int/scalar — total active rooms on this level
+                      (vendor ``svn.nroom``).  Used for box gate
+                      ``rn2(nroom*5/2)`` (mklev.c:853).  When ``None``,
+                      computed as ``jnp.sum(active)``.
 
     Returns:
         ``(terrain, features, traps, vendor_rng_out)`` — updated in-place
@@ -1119,6 +1129,17 @@ def fill_ordinary_rooms(
     # Grave rate (vendor mklev.c:996-998):
     #   x = 80 - depth(&u.uz) * 2;  if (x < 2) x = 2;
     grave_x = jnp.maximum(jnp.int32(80) - depth_i * jnp.int32(2), jnp.int32(2))
+
+    # Box gate modulus (vendor mklev.c:853): rn2(nroom * 5 / 2).
+    # nroom = svn.nroom = total active rooms.  Must be >= 1 to avoid rn2(0).
+    if nroom is None:
+        nroom = jnp.sum(active).astype(jnp.int32)
+    nroom_i = jnp.maximum(jnp.asarray(nroom, dtype=jnp.int32), jnp.int32(1))
+    box_mod = jnp.maximum(nroom_i * jnp.int32(5) // jnp.int32(2), jnp.int32(1))
+
+    # Graffiti gate modulus (vendor mklev.c:858): rn2(27 + 3 * abs(depth)).
+    abs_depth_i = jnp.abs(depth_i)
+    graffiti_mod = jnp.int32(27) + jnp.int32(3) * abs_depth_i
 
     # Number of independent per-room keys we need — see scan body.
     PER_ROOM_KEYS = 16  # generous; only ~10 rolls used.
@@ -1413,9 +1434,91 @@ def fill_ordinary_rooms(
             jnp.where(place_grave, GRAVE, terrain_[rg2, cg2])
         )
 
-        # --- Statue: !rn2(20) + somexy (vendor 1003-1006) ---
+        # --- Statue: !rn2(20) + somexy (vendor mklev.c:844-847) ---
         vrng, _statue_roll = randint_jax(vrng, (), 0, 20)
         vrng, _rst, _cst = somexy(vrng)
+
+        # --- Box/chest: !rn2(nroom*5/2) gate (vendor mklev.c:853-855) ---
+        # Short-circuit &&: rn2(3) chest/large and somexy only draw when gate
+        # passes.  lax.cond branches so the ISAAC64 stream advances only on
+        # the true path — matching vendor C short-circuit semantics.
+        vrng, box_gate_v = randint_jax(vrng, (), 0, box_mod)
+        box_gate = (box_gate_v == jnp.int32(0)) & is_ordinary
+
+        def _box_true(vrng_in):
+            # rn2(3): 0 → CHEST, 1/2 → LARGE_BOX  (vendor mklev.c:854)
+            vrng_in, _box_type = randint_jax(vrng_in, (), 0, 3)
+            vrng_in, _rbx, _cbx = somexy(vrng_in)
+            return vrng_in
+
+        def _box_false(vrng_in):
+            return vrng_in
+
+        vrng = lax.cond(box_gate, _box_true, _box_false, vrng)
+
+        # --- Graffiti: !rn2(27+3*|depth|) gate (vendor mklev.c:858-870) ---
+        # Short-circuit: inner do-loop only runs when gate passes.
+        # do { somex; somey; } while (typ!=ROOM && !rn2(40)) — cap=8 iters.
+        # random_engraving() is a table-lookup with no RNG draw in vendor C.
+        vrng, graffiti_gate_v = randint_jax(vrng, (), 0, graffiti_mod)
+        graffiti_gate = (graffiti_gate_v == jnp.int32(0)) & is_ordinary
+
+        def _graffiti_true(vrng_in):
+            # First iteration of do-loop fires unconditionally (vendor:863).
+            vrng_in, _rx, _ry = somexy(vrng_in)
+            # Remaining up to 7 iterations: each fires somexy + rn2(40)
+            # and continues while rn2(40) != 0.  Cap=8 total iters.
+            # (vendor while condition: levl[x][y].typ != ROOM && !rn2(40))
+            def _graffiti_step(carry, _):
+                vrng_s, cont = carry
+                vrng_s, _gx, _gy = somexy(vrng_s)
+                vrng_s, rn40 = randint_jax(vrng_s, (), 0, 40)
+                cont = cont & (rn40 != jnp.int32(0))
+                return (vrng_s, cont), None
+            # 7 more iterations after the mandatory first (cap=8 total).
+            (vrng_in, _), _ = lax.scan(
+                _graffiti_step,
+                (vrng_in, jnp.bool_(True)),
+                xs=None, length=7,
+            )
+            return vrng_in
+
+        def _graffiti_false(vrng_in):
+            return vrng_in
+
+        vrng = lax.cond(graffiti_gate, _graffiti_true, _graffiti_false, vrng)
+
+        # --- mkobj outer: !rn2(3) gate (vendor mklev.c:874-883) ---
+        # Short-circuit: somexy + inner while loop only run when gate passes.
+        # while (!rn2(5)) mkobj_at(somex, somey) — cap=8 inner iters.
+        vrng, mkobj_gate_v = randint_jax(vrng, (), 0, 3)
+        mkobj_gate = (mkobj_gate_v == jnp.int32(0)) & is_ordinary
+
+        def _mkobj_true(vrng_in):
+            # First mkobj_at call (vendor mklev.c:875).
+            vrng_in, _rmk, _cmk = somexy(vrng_in)
+            # Inner while (!rn2(5)) loop — cap=8 iters (vendor: tryct<=100).
+            def _mkobj_step(carry, _):
+                vrng_s, cont = carry
+                vrng_s, rn5 = randint_jax(vrng_s, (), 0, 5)
+                cont = cont & (rn5 == jnp.int32(0))
+                # Only draw somexy when loop body executes.
+                def _inner_true(v):
+                    v, _ro, _co = somexy(v)
+                    return v
+                vrng_s = lax.cond(cont, _inner_true, lambda v: v, vrng_s)
+                return (vrng_s, cont), None
+            (vrng_in, _), _ = lax.scan(
+                _mkobj_step,
+                (vrng_in, jnp.bool_(True)),
+                xs=None, length=8,
+            )
+            return vrng_in
+
+        def _mkobj_false(vrng_in):
+            return vrng_in
+
+        vrng = lax.cond(mkobj_gate, _mkobj_true, _mkobj_false, vrng)
 
         return (terrain_, features_aa, features_lit, traps_tt, vrng), None
 
