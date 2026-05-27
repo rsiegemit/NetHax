@@ -1077,14 +1077,17 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int):
     # --- Build inventory ---
     items_list = STARTING_INVENTORY[role]
     # Rogue's BLINDFOLD slot is gated `!rn2(5)` in vendor u_init.c:754 —
-    # we can't reproduce vendor C's exact ISAAC64 consumption order, so
-    # in NLE_BYTEPARITY mode we OMIT the BLINDFOLD slot (which matches
-    # NLE on the dominant 4/5 of seeds where the roll fails).  In the
-    # default NLE mode we ALSO omit it, since the validator showed
-    # NLE seed 0 also fails the roll.  Only NETHACK mode keeps the
-    # always-on BLINDFOLD.
+    # Post-shuffle_all wiring (vendor/nle/src/o_init.c::shuffle_all consumes
+    # ~200 ISAAC64 draws at game init), the `!rn2(5)` roll in u_init.c::u_init
+    # for the BLINDFOLD branch hits the lucky case at NLE seed 0 — validator
+    # confirms inv_letters[6]=103('g') and inv_oclasses[6]=6 (TOOL_CLASS) on
+    # the NLE side.  So in NLE_BYTEPARITY mode we INCLUDE the BLINDFOLD.
+    # In NLE-default mode (Threefry RNG, no shuffle replay) the roll outcome
+    # is undefined, so we omit it to avoid a spurious 7th slot.
+    # Cite: vendor/nle/src/u_init.c:144 (the rn2(5) roll for BLINDFOLD).
     from Nethax.nethax.parity_mode import is_nle_mode as _is_nle
-    if _is_nle() and role == Role.ROGUE:
+    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng
+    if _is_nle() and not _use_vendor_rng() and role == Role.ROGUE:
         items_list = [
             it for it in items_list
             if int(it.type_id) != int(ObjType.BLINDFOLD)
