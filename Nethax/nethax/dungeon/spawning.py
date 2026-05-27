@@ -405,6 +405,18 @@ def _compute_is_rider() -> jnp.ndarray:
     return jnp.array(flags, dtype=jnp.bool_)
 
 
+def _find_pm_index(name: str) -> int:
+    """Locate a monster entry by name; returns -1 if absent.
+
+    Defined here (rather than at later use sites) so the forward references
+    in ``_compute_is_adult_dragon`` and ``_compute_is_demon_worm_eel`` see it.
+    """
+    for i, m in enumerate(MONSTERS):
+        if m.name == name:
+            return i
+    return -1
+
+
 def _compute_is_adult_dragon() -> jnp.ndarray:
     """True for adult dragons (mlet==S_DRAGON && mndx >= PM_GRAY_DRAGON).
 
@@ -468,13 +480,7 @@ _FIXED_GOLEM_HP:  jnp.ndarray = _compute_fixed_golem_hp()    # [NUMMONS] int32
 # to remain robust against future chunk reordering — the comment in
 # populate_level_with_monsters claiming PM_LONG_WORM=118 is a stale
 # index (true index is 113 in the current MONSTERS table).
-def _find_pm_index(name: str) -> int:
-    """Locate a monster entry by name; returns -1 if absent."""
-    for i, m in enumerate(MONSTERS):
-        if m.name == name:
-            return i
-    return -1
-
+# _find_pm_index defined earlier (above _compute_is_adult_dragon).
 _PM_WUMPUS    = _find_pm_index("wumpus")
 _PM_LONG_WORM = _find_pm_index("long worm")
 _PM_GIANT_EEL = _find_pm_index("giant eel")
