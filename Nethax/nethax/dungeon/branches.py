@@ -2338,18 +2338,56 @@ def consume_init_dungeons_draws(vendor_rng):
     vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 fakewiz1
     vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 fakewiz2
 
-    # place_level slot picks — dungeon.c:661 — npossibles from dungeon.def
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)            # valley   (1,0)  npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)            # sanctum  (-1,0) npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 4)            # juiblex  (4,4)  npossible=4
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 4)            # baalz    (6,4)  npossible=4
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 6)            # asmodeus (2,6)  npossible=6
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 6)            # wizard1  (11,6) npossible=6
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)            # wizard2  CHAINLEVEL+1 npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)            # wizard3  CHAINLEVEL+2 npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 6)            # orcus    (10,6) npossible=6
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 4)            # fakewiz1 (-6,4) npossible=4
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 3)            # fakewiz2 (-6,4) npossible=3 (fakewiz1 took one)
+    # place_level slot picks — dungeon.c:661.  npossible is dynamic:
+    # ``possible_places`` (dungeon.c:574) returns the level-range count
+    # MINUS slots already taken by prior placements in this dungeon.
+    # We simulate the pick sequence so npossible reflects collisions.
+    # Cite: vendor/nle/src/dungeon.c::possible_places (line 574),
+    #       pick_level (line 606), place_level (line 640).
+    geh_num_dunlevs = int(geh_levels) + 20
+    geh_placed_slots: set[int] = set()
+
+    def _geh_place(base, rand, chain_slot=None):
+        """Apply one place_level draw and record the slot chosen.
+
+        chain_slot, if set, is the slot of a CHAINLEVEL parent — the new
+        slot is parent_slot + base (CHAINLEVEL only has rand=0 here so
+        npossible always reduces to 1 after subtracting the parent).
+        """
+        nonlocal vendor_rng
+        if chain_slot is not None:
+            # CHAINLEVEL: range is [parent+base, parent+base+rand]
+            start = chain_slot + base
+        elif base < 0:
+            start = geh_num_dunlevs + base + 1
+        else:
+            start = base
+        # span = rand or 1 (RNDLEVEL with rand=-1 means "to end")
+        if rand == -1:
+            span = geh_num_dunlevs - start + 1
+        elif rand:
+            span = min(rand, geh_num_dunlevs - start + 1)
+        else:
+            span = 1
+        # subtract slots already placed within [start, start+span)
+        avail = [s for s in range(start, start + span) if s not in geh_placed_slots]
+        npossible = len(avail)
+        vendor_rng, pick = _vrng.rn2(vendor_rng, max(npossible, 1))
+        chosen = avail[int(pick)] if avail else start
+        geh_placed_slots.add(chosen)
+        return chosen
+
+    valley_slot   = _geh_place(1, 0)            # valley   (1, 0)
+    sanctum_slot  = _geh_place(-1, 0)           # sanctum  (-1, 0)
+    juiblex_slot  = _geh_place(4, 4)            # juiblex  (4, 4)
+    baalz_slot    = _geh_place(6, 4)            # baalz    (6, 4)
+    asmodeus_slot = _geh_place(2, 6)            # asmodeus (2, 6)
+    wizard1_slot  = _geh_place(11, 6)           # wizard1  (11, 6)
+    wizard2_slot  = _geh_place(1, 0, chain_slot=wizard1_slot)  # wizard2 +1
+    wizard3_slot  = _geh_place(2, 0, chain_slot=wizard1_slot)  # wizard3 +2
+    orcus_slot    = _geh_place(10, 6)           # orcus    (10, 6)
+    fakewiz1_slot = _geh_place(-6, 4)           # fakewiz1 (-6, 4)
+    fakewiz2_slot = _geh_place(-6, 4)           # fakewiz2 (-6, 4)
 
     # =======================================================================
     # i = 2 : "The Gnomish Mines" (8, 2)
@@ -2426,20 +2464,19 @@ def consume_init_dungeons_draws(vendor_rng):
 
     # =======================================================================
     # i = 5 : "Fort Ludios" (1, 0)
-    #         chance=10 → skip-gate draw FIRST (dungeon.c:775-776).
-    #         If gated out, NO further per-dungeon draws fire for this i.
-    #         lev.rand=0 → no depth draw; 1 LEVEL: knox.
-    #         BRANCH @ (18,4) portal in Main → num=4.
+    #         chance=0 (NOT 10!) per binary parse of
+    #         vendor/nle/build/.../dat/dungeon — DUNGEON line in
+    #         dungeon.def has no INT, so dgn_comp.y's optional_int rule
+    #         (line ~158) defaults chance to 0.  init_dungeons short-circuits
+    #         at ``pd.tmpdungeon[i].chance && ...`` (dungeon.c:775) so NO
+    #         skip-gate rn2 fires.  Always placed.
+    #         lev.rand=0 → no depth draw; 1 LEVEL: knox (chance=100 LEVEL).
+    #         BRANCH @ (18,4) portal in Main → parent_dlevel num=4.
     # =======================================================================
 
-    vendor_rng, ludios_gate = _vrng.rn2(vendor_rng, 100)  # dungeon.c:776 skip-gate
-    drawn["ludios_gate"] = ludios_gate
-    ludios_placed = int(ludios_gate) < 10  # placed when gate < chance(=10)
-
-    if ludios_placed:
-        vendor_rng, _ = _vrng.rn2(vendor_rng, 4)         # dungeon.c:398 parent_dlevel num=4
-        vendor_rng, _ = _vrng.rn2(vendor_rng, 100)       # dungeon.c:548 knox
-        vendor_rng, _ = _vrng.rn2(vendor_rng, 1)         # dungeon.c:661 knox npossible=1
+    vendor_rng, _ = _vrng.rn2(vendor_rng, 4)         # dungeon.c:398 parent_dlevel num=4
+    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)       # dungeon.c:548 knox
+    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)         # dungeon.c:661 knox npossible=1
 
     # =======================================================================
     # i = 6 : "Vlad's Tower" (3, 0)
