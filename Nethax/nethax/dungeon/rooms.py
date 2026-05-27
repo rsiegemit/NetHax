@@ -1811,32 +1811,42 @@ def fill_ordinary_rooms(
                     return vi
                 v = lax.cond(is_item_trap, _item_true, lambda vi: vi, v)
 
-                # Possession loop: do { rn2(4) class + mkobj(poss_class) }
-                # while (!rn2(5)); cap=8 iterations.
-                # Vendor: mklev.c:1460-1490.  mkobj(poss_class, FALSE) calls
-                # mksobj(i, init=TRUE, artif=FALSE) so init draws DO fire.
-                # rnd(1000) picks type within class; then consume_mksobj_init.
-                def _poss_step(carry_p, _):
-                    vp, cont_p = carry_p
-                    vp, rn4 = randint_jax(vp, (), 0, 4)      # rn2(4) class
-                    poss_cls = _POSS_CLASS[rn4]
-                    vp, _ = randint_jax(vp, (), 1, 1001)     # rnd(1000) type
-                    vp = consume_mksobj_init_draws(vp, poss_cls)
-                    vp, rn5 = randint_jax(vp, (), 0, 5)      # !rn2(5) loop gate
-                    cont_p = cont_p & (rn5 == jnp.int32(0))
-                    return (vp, cont_p), None
-
-                # First iteration runs unconditionally (do-while semantics).
+                # Possession do-while (vendor mklev.c:1460-1490):
+                #   do { switch (rn2(4)) ...; mkobj(poss_class, FALSE); }
+                #   while (!rn2(5));
+                # First iter fires unconditionally; each subsequent iter
+                # continues iff rn2(5)==0 (~20% probability).  mkobj draws
+                # rnd(1000) for the per-class type pick, then mksobj_init
+                # cascade.  Replace the fixed-length cap=8 scan with
+                # lax.while_loop so only vendor-consumed draws fire
+                # (expected ≈ 1.25 iters vs 8 unconditional in prior scan).
+                # Vendor cite: mklev.c:1460-1490.
+                # Mandatory first iter (do-while semantics).
                 v, rn4_0 = randint_jax(v, (), 0, 4)
                 poss_cls_0 = _POSS_CLASS[rn4_0]
                 v, _ = randint_jax(v, (), 1, 1001)
                 v = consume_mksobj_init_draws(v, poss_cls_0)
                 v, rn5_0 = randint_jax(v, (), 0, 5)
-                # Remaining up to 7 iterations (cap=8 total).
-                (v, _), _ = lax.scan(
-                    _poss_step,
-                    (v, rn5_0 == jnp.int32(0)),
-                    xs=None, length=7,
+                cont0_p = rn5_0 == jnp.int32(0)
+                POSS_CAP = jnp.int32(100)
+
+                def _poss_cond(carry_p):
+                    _vp, cont_p, iters_p = carry_p
+                    return cont_p & (iters_p < POSS_CAP)
+
+                def _poss_body(carry_p):
+                    vp, _cont_p, iters_p = carry_p
+                    vp, rn4 = randint_jax(vp, (), 0, 4)       # rn2(4) class
+                    poss_cls = _POSS_CLASS[rn4]
+                    vp, _ = randint_jax(vp, (), 1, 1001)      # rnd(1000) type
+                    vp = consume_mksobj_init_draws(vp, poss_cls)
+                    vp, rn5 = randint_jax(vp, (), 0, 5)       # !rn2(5) gate
+                    return (vp, rn5 == jnp.int32(0), iters_p + jnp.int32(1))
+
+                v, _, _ = lax.while_loop(
+                    _poss_cond,
+                    _poss_body,
+                    (v, cont0_p, jnp.int32(1)),
                 )
 
                 # Victim race: rn2(15).  Cases 6-9 (GNOME) also draw
@@ -2029,22 +2039,39 @@ def fill_ordinary_rooms(
             vrng_in, _rne4  = randint_jax(vrng_in, (), 0, 4)      # rn2(4) branch
             vrng_in, _rne2  = randint_jax(vrng_in, (), 0, 2)      # rn2(2) truth (getrumor)
             vrng_in, _rnfs  = randint_jax(vrng_in, (), 0, 10000)  # rng(filesize) line-pick
-            # First iteration of do-loop fires unconditionally (vendor:863).
-            vrng_in, _rx, _ry = somexy(vrng_in)
-            # Remaining up to 7 iterations: each fires somexy + rn2(40)
-            # and continues while rn2(40) != 0.  Cap=8 total iters.
-            # (vendor while condition: levl[x][y].typ != ROOM && !rn2(40))
-            def _graffiti_step(carry, _):
-                vrng_s, cont = carry
-                vrng_s, _gx, _gy = somexy(vrng_s)
-                vrng_s, rn40 = randint_jax(vrng_s, (), 0, 40)
-                cont = cont & (rn40 != jnp.int32(0))
-                return (vrng_s, cont), None
-            # 7 more iterations after the mandatory first (cap=8 total).
-            (vrng_in, _), _ = lax.scan(
-                _graffiti_step,
-                (vrng_in, jnp.bool_(True)),
-                xs=None, length=7,
+            # Vendor do-while (mklev.c:863-866):
+            #   do { x = somex(croom); y = somey(croom); }
+            #   while (levl[x][y].typ != ROOM && !rn2(40));
+            # First iteration always draws somex+somey.  Continuation is
+            # the conjunction of (typ != ROOM) && (rn2(40) == 0); the
+            # `typ != ROOM` half is purely deterministic (no RNG), so the
+            # only RNG-side termination is `rn2(40) == 0`.  We model the
+            # vendor draw-stream by issuing exactly one rn2(40) per iter
+            # whose result is non-zero (the typically-true ROOM short-
+            # circuit caps loops at the first rn2(40) miss in practice).
+            # Use lax.while_loop — JIT-compatible, fixed-pytree carry —
+            # so we burn only the draws vendor actually consumes.
+            vrng_in, _rx0, _ry0 = somexy(vrng_in)
+            vrng_in, rn40_0 = randint_jax(vrng_in, (), 0, 40)
+            cont0 = rn40_0 == jnp.int32(0)
+            # Safety cap matches vendor's implicit ROOM short-circuit;
+            # average vendor iters ≈ 1.026 (1/39 continuation rate).
+            GRAFFITI_CAP = jnp.int32(40)
+
+            def _graf_cond(carry):
+                _v, cont, iters = carry
+                return cont & (iters < GRAFFITI_CAP)
+
+            def _graf_body(carry):
+                v, _cont, iters = carry
+                v, _gx, _gy = somexy(v)
+                v, rn40 = randint_jax(v, (), 0, 40)
+                return (v, rn40 == jnp.int32(0), iters + jnp.int32(1))
+
+            vrng_in, _, _ = lax.while_loop(
+                _graf_cond,
+                _graf_body,
+                (vrng_in, cont0, jnp.int32(1)),
             )
             return vrng_in
 
@@ -2078,26 +2105,45 @@ def fill_ordinary_rooms(
             # classes ignore the otyp argument (legacy 0-draw fallback).
             otyp0 = decode_picked_otyp(oclass0, typ0)              # mkobj.c:264-266
             vrng_in = consume_mksobj_init_draws(vrng_in, oclass0, otyp0)  # mkobj.c:801-1069
-            # Inner while (!rn2(5)) loop — cap=8 iters (vendor mklev.c:876-883).
-            def _mkobj_step(carry, _):
-                vrng_s, cont = carry
-                vrng_s, rn5 = randint_jax(vrng_s, (), 0, 5)
-                cont = cont & (rn5 == jnp.int32(0))
-                # Inner body: somexy + full mkobj draws (only when cont).
-                def _inner_true(v):
-                    v, _ro, _co = somexy(v)
-                    v, cls_roll = randint_jax(v, (), 0, 100)        # rnd(100)-1 (mkobj.c:259)
+            # Vendor inner loop (mklev.c:877-883):
+            #   while (!rn2(5)) {
+            #       if (++tryct > 100) { impossible; break; }
+            #       mkobj_at(0, somex, somey, TRUE);
+            #   }
+            # Each iter draws rn2(5) up front; only when it returns 0 does
+            # the body fire (somexy + full mkobj cascade).  Replace the
+            # fixed-length cap=8 scan with lax.while_loop so the draw
+            # stream consumes exactly the vendor count (expected ≈ 0.25
+            # body iters per outer firing vs 8 unconditional in the prior
+            # scan).  Cap matches vendor tryct safety limit.
+            # Vendor cite: mklev.c:877-883.
+            MKOBJ_CAP = jnp.int32(100)
+
+            def _mko_cond(carry):
+                _v, cont, iters = carry
+                return cont & (iters < MKOBJ_CAP)
+
+            def _mko_body(carry):
+                v, _cont, iters = carry
+                v, rn5 = randint_jax(v, (), 0, 5)
+                cont_next = rn5 == jnp.int32(0)
+
+                def _inner_true(vi):
+                    vi, _ro, _co = somexy(vi)
+                    vi, cls_roll = randint_jax(vi, (), 0, 100)       # rnd(100)-1 (mkobj.c:259)
                     oclass_i = _MKOBJ_TABLE[cls_roll]
-                    v, typ_i = randint_jax(v, (), 1, 1001)          # rnd(prob_total) (mkobj.c:265)
-                    otyp_i = decode_picked_otyp(oclass_i, typ_i)    # mkobj.c:264-266
-                    v = consume_mksobj_init_draws(v, oclass_i, otyp_i)  # mkobj.c:801-1069
-                    return v
-                vrng_s = lax.cond(cont, _inner_true, lambda v: v, vrng_s)
-                return (vrng_s, cont), None
-            (vrng_in, _), _ = lax.scan(
-                _mkobj_step,
-                (vrng_in, jnp.bool_(True)),
-                xs=None, length=8,
+                    vi, typ_i = randint_jax(vi, (), 1, 1001)         # rnd(prob_total) (mkobj.c:265)
+                    otyp_i = decode_picked_otyp(oclass_i, typ_i)     # mkobj.c:264-266
+                    vi = consume_mksobj_init_draws(vi, oclass_i, otyp_i)  # mkobj.c:801-1069
+                    return vi
+
+                v = lax.cond(cont_next, _inner_true, lambda vi: vi, v)
+                return (v, cont_next, iters + jnp.int32(1))
+
+            vrng_in, _, _ = lax.while_loop(
+                _mko_cond,
+                _mko_body,
+                (vrng_in, jnp.bool_(True), jnp.int32(0)),
             )
             return vrng_in
 
