@@ -725,32 +725,6 @@ def generate_main_branch_l1(
     #    applied here because CLOSED_DOOR tiles block BFS connectivity tests.
     #    Wave 4 will reintroduce doors once the walkability logic accounts for them.
 
-    # 4b. Stair-room selection draws (ISAAC64 path only).
-    #     Vendor mklev.c::generate_stairs_find_room (line 2236, 2243) calls
-    #     ``rn2(ai)`` (or ``rn2(svn.nroom)`` fallback at line 2243) once
-    #     per stair to pick which room hosts it.  On Dlvl 1 this fires
-    #     twice — once via generate_stairs() for the down-stair, and once
-    #     via place_branch() → find_branch_room() → generate_stairs_find_room()
-    #     for the player up-stair (the branch entry).  Nethax places
-    #     stairs deterministically at the first/last active-room centres,
-    #     but to keep the ISAAC64 byte stream aligned with vendor C we
-    #     must still consume the two stream positions.
-    #
-    #     Cite: vendor/nethack/src/mklev.c:2236, mklev.c:2243 (rn2 in
-    #           generate_stairs_find_room); audit lines 87-90 of
-    #           ISAAC64_CALL_ORDER_AUDIT.md.
-    if vendor_rng is not None:
-        from Nethax.nethax.vendor_rng import randint_jax
-        n_active = jnp.maximum(jnp.sum(active.astype(jnp.int32)), jnp.int32(1))
-        # First rn2(nroom): down-stair via generate_stairs().
-        vendor_rng, _stair_down_pick = randint_jax(
-            vendor_rng, (), jnp.int32(0), n_active,
-        )
-        # Second rn2(nroom): up-stair (player start) via place_branch().
-        vendor_rng, _stair_up_pick = randint_jax(
-            vendor_rng, (), jnp.int32(0), n_active,
-        )
-
     # 5. Place up-stair in centre of first active room.
     #    We always use slot 0; if it's inactive the pos defaults to (1,1)
     #    which is safe (will be in a border area).
