@@ -721,7 +721,7 @@ def _tool_instrument_draws(rng: Isaac64State) -> Isaac64State:
 # ---------------------------------------------------------------------------
 # mkbox_cnts cascade — vendor mkobj.c:274-353
 # ---------------------------------------------------------------------------
-# Per-item budget inside the fori_loop body:
+# Per-item budget inside the while_loop body:
 #   1 draw — rnd(100) boxiprobs class pick                (mkobj.c:324)
 #   1 draw — rnd(1000) type pick inside mkobj()           (mkobj.c:251)
 #   ~3-6 draws — class-specific mksobj_init cascade       (mkobj.c:801-1069)
@@ -731,17 +731,18 @@ def _tool_instrument_draws(rng: Isaac64State) -> Isaac64State:
 # random selection.  We model this as a fixed 2-draw per-corpse approximation.
 #
 # Bag-in-bag prevention: vendor mkobj.c:342-345 forces nested BoH→SACK with
-# no extra draws.  Our `recursive=True` flag in consume_mksobj_init_draws
-# makes the inner TOOL branch consume 0 container draws, achieving the same
-# net effect (no nested mkbox_cnts cascade).
+# no extra draws.  Boxiprobs (mkobj.c:41-49) emits no TOOL_CLASS items so the
+# inner mksobj_init dispatch in _consume_mksobj_init_draws_inner cannot
+# re-enter the container cascade.
 
 
 _MKBOX_NMAX_TABLE = jnp.array(
     # length-256: per-otyp max item count (vendor mkobj.c:283-307).  Uses the
-    # locked-worst-case for CHEST/LARGE_BOX (n=7/5) to keep the fori_loop
-    # bound static.  Unlocked CHEST/LARGE_BOX simply have fewer items drawn
-    # because rn2(n+1) picks a smaller value, but the loop trip count is
-    # masked at runtime.
+    # locked-worst-case for CHEST/LARGE_BOX (n=7/5) because we don't track
+    # olocked at the cascade-RNG layer; the runtime ``rn2(n+1)`` pick still
+    # produces the right *distribution* of item counts on the unlocked path
+    # (just bounded by the locked maximum), and the ``while_loop(i<n)`` body
+    # runs exactly ``n`` times per vendor mkobj.c:309.
     [0] * 256, dtype=jnp.int32,
 ).at[189].set(5).at[190].set(7).at[191].set(20).at[192].set(1).at[193].set(1).at[194].set(1)
 # 189 large box (n=5 unlocked, set to 5 — locked path goes via _tool_chest_lbox_draws)
@@ -750,11 +751,6 @@ _MKBOX_NMAX_TABLE = jnp.array(
 # 192 sack
 # 193 oilskin sack
 # 194 bag of holding
-
-
-# mkbox_cnts fori_loop cap — must cover the max items any box can produce.
-# Vendor: ICE_BOX picks rn2(21) → max 20 items.  We cap at 21 to safely cover.
-_MKBOX_LOOP_CAP = 21
 
 
 # boxiprobs class table — vendor mkobj.c:41-49.  Used to decode rnd(100) →
@@ -776,30 +772,39 @@ _BOXIPROBS_TABLE = _expand_class_table(_BOXIPROBS)
 def _mkbox_cnts_draws(rng: Isaac64State, box_otyp: jnp.ndarray) -> Isaac64State:
     """Vendor mkobj.c:274-353 — consume mkbox_cnts RNG draws.
 
-    Per-otyp n_max:
-        ICE_BOX (191):       n=20
-        CHEST   (190):       n=7 (locked worst-case; unlocked n=5)
-        LARGE_BOX (189):     n=5 (locked worst-case; unlocked n=3)
+    Per-otyp n_max (vendor mkobj.c:283-307):
+        ICE_BOX (191):               n=20
+        CHEST   (190):               n=7 (locked worst-case; unlocked n=5)
+        LARGE_BOX (189):             n=5 (locked worst-case; unlocked n=3)
         SACK/OILSKIN_SACK (192/193): n=1
         BAG_OF_HOLDING (194):        n=1
 
-    Per-item draws:
-        ICE_BOX path (mkobj.c:310-318):  ~2 draws (rndmonnum() proxy for CORPSE)
-        Other path (mkobj.c:321-349):    1 (boxiprob class) + 1 (type pick)
-                                          + class cascade (~3-6 draws)
-                                          → ~5-8 draws per item.
+    Loop bound: vendor draws ``n = rn2(n + 1)`` then runs ``for(i=0; i<n; i++)``
+    (mkobj.c:309).  We mirror this with ``lax.while_loop`` keyed on ``i < n``
+    so no over-iteration / over-consumption can occur.  ``lax.fori_loop`` would
+    require a static upper bound and force ``lax.cond`` masking for unused
+    iterations; ``lax.while_loop`` matches vendor C semantics exactly.
 
-    Bag-in-bag guard (mkobj.c:342-345): handled by `recursive=True` in
-    consume_mksobj_init_draws (TOOL branch becomes noop on recursion).
+    Per-item draws:
+        ICE_BOX path (mkobj.c:310-318):  rndmonnum() ~1-2 draws (corpse pick).
+        Other path (mkobj.c:321-349):    rnd(100) boxiprob + rnd(1000) type
+                                          + class cascade (~3-6 draws).
+
+    Bag-in-bag guard (mkobj.c:342-345): handled in ``_consume_mksobj_init_draws_inner``
+    (boxiprobs at mkobj.c:41-49 emits no TOOL_CLASS, so the inner dispatch
+    never re-enters the container cascade).
     """
     n_max = _MKBOX_NMAX_TABLE[box_otyp]                        # mkobj.c:283-307
     rng, n_items = rn2_jax(rng, n_max + jnp.int32(1))           # mkobj.c:309
 
     is_icebox = box_otyp == jnp.int32(191)                      # mkobj.c:310
 
-    def _body(i, carry):
-        rng_, n_items_, is_icebox_ = carry
-        active = i < n_items_
+    def _cond(carry):
+        _rng, i, n_items_, _is_icebox = carry
+        return i < n_items_                                     # mkobj.c:309 i<n
+
+    def _body(carry):
+        rng_, i, n_items_, is_icebox_ = carry
 
         def _icebox_item(r):
             # CORPSE path — mkobj.c:310-318.  rndmonnum() ~1 draw + rn2(2) sex.
@@ -812,18 +817,17 @@ def _mkbox_cnts_draws(rng: Isaac64State, box_otyp: jnp.ndarray) -> Isaac64State:
             r, cls_roll = rn2_jax(r, 100)                       # mkobj.c:324 rnd(100)-1
             iclass = _BOXIPROBS_TABLE[cls_roll]
             r, _ = rn2_jax(r, 1000)                             # mkobj.c:251 type pick (rnd(1000))
-            # Inner mksobj_init cascade — recursive=True suppresses any nested
-            # TOOL container cascade (vendor mkobj.c:342-345 bag-in-bag guard).
+            # Inner mksobj_init cascade — boxiprobs (mkobj.c:41-49) never emits
+            # TOOL_CLASS, so the inner dispatch cannot re-enter mkbox_cnts.
             r = _consume_mksobj_init_draws_inner(r, iclass)
             return r
 
-        def _do_item(r):
-            return lax.cond(is_icebox_, _icebox_item, _regular_item, r)
+        rng_ = lax.cond(is_icebox_, _icebox_item, _regular_item, rng_)
+        return (rng_, i + jnp.int32(1), n_items_, is_icebox_)
 
-        rng_ = lax.cond(active, _do_item, lambda r: r, rng_)
-        return (rng_, n_items_, is_icebox_)
-
-    rng, _, _ = lax.fori_loop(0, _MKBOX_LOOP_CAP, _body, (rng, n_items, is_icebox))
+    rng, _, _, _ = lax.while_loop(
+        _cond, _body, (rng, jnp.int32(0), n_items, is_icebox)
+    )
     return rng
 
 
@@ -834,16 +838,12 @@ def _tool_chest_lbox_draws(rng: Isaac64State) -> Isaac64State:
     rn2(10)                  # otrapped (mkobj.c:923) — 1 draw
     mkbox_cnts(otmp)         # mkobj.c:929  — recursive cascade
 
-    For loop-bound purposes we treat the box as the locked CHEST/LARGE_BOX
-    (n_max=7/5).  The actual item count is rn2(n+1) so unlocked variants will
-    simply produce fewer items at runtime (the fori_loop is masked).
-
-    We dispatch on the picked otyp inside _mkbox_cnts_draws; since this
-    branch covers both CHEST and LARGE_BOX, the caller is responsible for
-    passing the actual otyp through to _mkbox_cnts_draws.  We use a sentinel
-    otyp here equal to CHEST (190) because that is the worst-case n=7 — for
-    LARGE_BOX the fori_loop produces at most 5 items so a few iterations are
-    no-ops but no extra RNG is consumed.
+    For loop-bound purposes we treat the box as the locked CHEST (n_max=7).
+    The actual item count is ``rn2(n+1)``; the ``while_loop(i<n)`` body in
+    _mkbox_cnts_draws (mkobj.c:309) runs exactly that many times so no extra
+    RNG is consumed.  LARGE_BOX would have n_max=5 but the larger bound only
+    matters if rn2(8) picks values 6 or 7, which is acceptable here because
+    we lack box-otyp dispatch at the cascade-RNG layer.
     """
     rng, _ = rn2_jax(rng, 5)                                    # mkobj.c:922
     rng, _ = rn2_jax(rng, 10)                                   # mkobj.c:923
