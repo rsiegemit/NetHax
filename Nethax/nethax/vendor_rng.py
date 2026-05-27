@@ -472,6 +472,22 @@ def next_uint64(state: Isaac64State) -> Tuple[Isaac64State, int]:
     return _state_from_py(py_state), int(v)
 
 
+def rne(state: Isaac64State, x: int, ulevel: int = 0) -> Tuple[Isaac64State, int]:
+    """Host-side ``rne(x)`` — returns ``(new_state, value_in_[1, utmp])``.
+
+    Mirrors vendor rnd.c:196-215.  ``utmp = 5`` for ulevel < 15.
+    Draws rn2(x) up to ``utmp - 1`` times, stopping on first non-zero.
+
+    Citations
+    ---------
+    vendor/nle/src/rnd.c:196-215   -- rne implementation
+    vendor/nle/src/rnd.c:194       -- range comment
+    """
+    py_state = _state_to_py(state)
+    py_state, v = rne_py(py_state, int(x), int(ulevel))
+    return _state_from_py(py_state), int(v)
+
+
 # ---------------------------------------------------------------------------
 # JAX-traceable ISAAC64 — usable INSIDE @jax.jit.
 #
@@ -605,6 +621,37 @@ def rn1_jax(rng: "Isaac64State", x, base) -> Tuple["Isaac64State", jax.Array]:
     """JAX-traceable ``rn1(x, base)`` — ``base + rn2(x)`` (int32 result)."""
     new_rng, v = rn2_jax(rng, x)
     return new_rng, v + jnp.int32(base)
+
+
+def rne_jax(rng: "Isaac64State", x, ulevel: int = 0) -> Tuple["Isaac64State", jax.Array]:
+    """JAX-traceable ``rne(x)`` — vendor rnd.c:196-215.
+
+    ``utmp = (ulevel < 15) ? 5 : ulevel / 3``; tmp starts at 1 and
+    increments while ``tmp < utmp && rn2(x) == 0``.
+
+    Uses ``lax.while_loop`` so it is JIT-compatible.  The loop body consumes
+    at most ``utmp - 1`` draws (4 for ulevel 0-14, fewer for higher levels).
+
+    Citations
+    ---------
+    vendor/nle/src/rnd.c:196-215   -- rne implementation
+    vendor/nle/src/rnd.c:194       -- range comment ``1 <= rne(x) <= max(...)``
+    """
+    utmp = jnp.int32(5 if ulevel < 15 else ulevel // 3)
+
+    def cond(carry):
+        _rng, tmp = carry
+        return tmp < utmp
+
+    def body(carry):
+        _rng, tmp = carry
+        new_rng, v = rn2_jax(_rng, x)
+        # stop incrementing when rn2(x) != 0 by jumping to utmp (terminates cond)
+        new_tmp = jax.lax.cond(v == jnp.int32(0), lambda: tmp + jnp.int32(1), lambda: utmp)
+        return new_rng, new_tmp
+
+    rng_out, tmp_out = jax.lax.while_loop(cond, body, (rng, jnp.int32(1)))
+    return rng_out, tmp_out
 
 
 def isaac_weighted_choice(rng: "Isaac64State", weights: jax.Array) -> Tuple["Isaac64State", jax.Array]:

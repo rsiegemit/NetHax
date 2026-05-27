@@ -1160,10 +1160,10 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
 
         rn2(11)           # always
         if !rn2(11):
-            rn2(2)        # blessed flag
-            # rne(3) omitted — jit-inexact; draws suppressed (see note)
+            rne(3)        # spe — mkobj.c:806
+            rn2(2)        # blessed flag — mkobj.c:807
         elif !rn2(10):
-            pass          # curse branch — rne(3) suppressed
+            rne(3)        # spe (curse branch) — mkobj.c:810
         else:
             blessorcurse(10) → rn2(10) [+ rn2(2) if hit]
 
@@ -1171,19 +1171,25 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
 
         rn2(10)           # outer: fumble/levitation/etc. guard
         if outer hit:
-            rn2(11)       # inner: !rn2(11) blessed check
-            # rne(3) suppressed
+            rn2(11)       # inner: !rn2(11) curse check
+            if !rn2(11):
+                rne(3)    # spe (curse branch) — mkobj.c:999
+            elif !rn2(10):
+                rn2(2)    # blessed flag — mkobj.c:1001
+                rne(3)    # spe — mkobj.c:1002
+            else:
+                blessorcurse(10) → rn2(10) [+ rn2(2) if hit]
         elif !rn2(10):
-            rn2(2)        # blessed flag
-            # rne(3) suppressed
+            rn2(2)        # blessed flag — mkobj.c:1001
+            rne(3)        # spe — mkobj.c:1002
         else:
             blessorcurse(10) → rn2(10) [+ rn2(2) if hit]
 
-    Note on rne(3): ``rne(3)`` at u.ulevel==0 draws 1–5 times (``while tmp <
-    5 && !rn2(3)``).  The number of draws is seed-dependent and at this stage
-    we have no way to correctly branch without running the full game logic.
-    The audit (PRE_MKLEV_RNG_AUDIT.md §4c) counts these draws inside the
-    minimum ~11-draw estimate; omitting them is tracked as a known gap.
+    ``rne(3)`` at u.ulevel==0 draws 1–4 times from rn2(3) (``while tmp < 5
+    && !rn2(3)``), consuming 1–4 ISAAC64 words per call.  For Rogue there is
+    exactly **1 rne(3) call** (LEATHER_ARMOR trspe=1); WEAPON_CLASS items have
+    trspe=0 but the weapon-class branch also calls rne when rn2(11)==0 or
+    rn2(10)==0 — those draws are now included.
 
     Returns the post-draw ``Isaac64State``.
 
@@ -1195,6 +1201,8 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
     vendor/nle/src/mkobj.c:981-987      — POTION_CLASS / blessorcurse(4)
     vendor/nle/src/mkobj.c:309          — mkbox_cnts rn2(n+1)
     vendor/nle/src/mkobj.c:1370-1385    — blessorcurse definition
+    vendor/nle/src/rnd.c:196-215        — rne implementation
+    vendor/nle/src/rnd.c:194            — rne range comment
     """
     from Nethax.nethax import vendor_rng as _vrng
 
@@ -1202,26 +1210,30 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
     vendor_rng, _dagger_qty = _vrng.rn2(vendor_rng, 10)
 
     # 2–3. SHORT_SWORD and DAGGER — WEAPON_CLASS (mkobj.c:803-818)
+    # trspe=0 for both → rne draws only if rn2(11)==0 or rn2(10)==0 branches hit.
+    # Vendor order in !rn2(11) branch: spe=rne(3) THEN blessed=rn2(2) (mkobj.c:806-807).
+    # Vendor order in elif !rn2(10) branch: curse + spe=-rne(3) only (mkobj.c:809-810).
     for _ in range(2):
         vendor_rng, r11 = _vrng.rn2(vendor_rng, 11)
         if r11 == 0:
-            # !rn2(11) branch: spe=rne(3), blessed=rn2(2)
-            # rne(3) omitted (variable; tracked as known gap)
+            # !rn2(11) branch: spe=rne(3), blessed=rn2(2) — mkobj.c:806-807
+            vendor_rng, _spe = _vrng.rne(vendor_rng, 3)
             vendor_rng, _blessed = _vrng.rn2(vendor_rng, 2)
         else:
             vendor_rng, r10 = _vrng.rn2(vendor_rng, 10)
             if r10 == 0:
-                # elif !rn2(10): curse + rne(3) — rne(3) omitted
-                pass
+                # elif !rn2(10): curse + spe=-rne(3) — mkobj.c:809-810
+                vendor_rng, _spe = _vrng.rne(vendor_rng, 3)
             else:
-                # else: blessorcurse(10) → rn2(10) [+ rn2(2) if 0]
+                # else: blessorcurse(10) → rn2(10) [+ rn2(2) if 0] — mkobj.c:812
                 vendor_rng, bc = _vrng.rn2(vendor_rng, 10)
                 if bc == 0:
                     vendor_rng, _bc2 = _vrng.rn2(vendor_rng, 2)
 
     # 4. LEATHER_ARMOR — ARMOR_CLASS (mkobj.c:992-1004)
-    # C code: if (rn2(10) && (FUMBLE_BOOTS||...||!rn2(11))) { curse; rne }
-    #         else if (!rn2(10))                              { bless; rne }
+    # trspe=1 → rne(3) fires in both the curse and blessed branches.
+    # C code: if (rn2(10) && (FUMBLE_BOOTS||...||!rn2(11))) { curse; spe=-rne(3) }
+    #         else if (!rn2(10))                              { blessed=rn2(2); spe=rne(3) }
     #         else                                            { blessorcurse(10) }
     # LEATHER_ARMOR is none of the named special types, so the inner || chain
     # reaches !rn2(11) — that draw always fires when outer rn2(10) != 0.
@@ -1231,16 +1243,17 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
         # outer rn2(10) non-zero → evaluate || chain → reaches !rn2(11)
         vendor_rng, r11 = _vrng.rn2(vendor_rng, 11)  # mkobj.c:997
         if r11 == 0:
-            # if-branch taken: curse + rne(3) — rne(3) omitted (known gap)
-            pass
+            # if-branch taken: curse + spe=-rne(3) — mkobj.c:999
+            vendor_rng, _spe = _vrng.rne(vendor_rng, 3)
         else:
             # if-condition False → fall to elif !rn2(10)
             vendor_rng, elif10 = _vrng.rn2(vendor_rng, 10)  # mkobj.c:1000
             if elif10 == 0:
-                # elif branch: blessed = rn2(2) + rne(3) — rne(3) omitted
+                # elif branch: blessed=rn2(2) then spe=rne(3) — mkobj.c:1001-1002
                 vendor_rng, _blessed = _vrng.rn2(vendor_rng, 2)
+                vendor_rng, _spe = _vrng.rne(vendor_rng, 3)
             else:
-                # else: blessorcurse(10)
+                # else: blessorcurse(10) — mkobj.c:1004
                 vendor_rng, bc = _vrng.rn2(vendor_rng, 10)
                 if bc == 0:
                     vendor_rng, _bc2 = _vrng.rn2(vendor_rng, 2)
@@ -1249,8 +1262,11 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
         # fall to elif !rn2(10)
         vendor_rng, elif10 = _vrng.rn2(vendor_rng, 10)  # mkobj.c:1000
         if elif10 == 0:
+            # elif branch: blessed=rn2(2) then spe=rne(3) — mkobj.c:1001-1002
             vendor_rng, _blessed = _vrng.rn2(vendor_rng, 2)
+            vendor_rng, _spe = _vrng.rne(vendor_rng, 3)
         else:
+            # else: blessorcurse(10) — mkobj.c:1004
             vendor_rng, bc = _vrng.rn2(vendor_rng, 10)
             if bc == 0:
                 vendor_rng, _bc2 = _vrng.rn2(vendor_rng, 2)
