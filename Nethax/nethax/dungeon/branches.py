@@ -2135,6 +2135,114 @@ def apply_branch_graph_to_dungeon(
 
 
 # ---------------------------------------------------------------------------
+# init_dungeons fixed ISAAC64 pre-draws
+# ---------------------------------------------------------------------------
+
+def consume_init_dungeons_draws(vendor_rng):
+    """Replay the ~18 fixed ISAAC64 draws of vendor ``init_dungeons``.
+
+    These draws occur in vendor ``vendor/nle/src/dungeon.c::init_dungeons``
+    (line 714) BEFORE ``mklev`` runs, and must be consumed in byte-exact order
+    to keep Nethax's ISAAC64 stream aligned with NLE.
+
+    Draw breakdown (18 total):
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │ Phase            │ Count │ Vendor cite                                  │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ Dungeon depths   │  4    │ dungeon.c:796-798  rn1(rand, base)           │
+    │   DoD   rn2(5)   │       │   "The Dungeons of Doom" (25, 5) → rand=5   │
+    │   Gehennom rn2(5)│       │   "Gehennom"            (20, 5) → rand=5   │
+    │   Mines rn2(2)   │       │   "The Gnomish Mines"   (8,  2) → rand=2   │
+    │   Quest rn2(2)   │       │   "The Quest"           (5,  2) → rand=2   │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ Fort Ludios gate │  1    │ dungeon.c:775-776  rn2(100) chance gate      │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ RNDLEVEL gates   │  8    │ dungeon.c:548      rn2(100) per RNDLEVEL     │
+    │   bigrm          │       │   chance=40 in dungeon.def                   │
+    │   medusa         │       │   chance=4                                   │
+    │   minetn         │       │   chance=7                                   │
+    │   minend         │       │   chance=3                                   │
+    │   soko1..soko4   │       │   chance=2 each (4 draws)                    │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ Tune string      │  5    │ dungeon.c:917-918  rn2(7) × 5                │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+    The variable-count draws (``place_level`` slot picks at dungeon.c:661 and
+    ``parent_dlevel`` branch picks at dungeon.c:398) are seed-dependent and are
+    deferred to a later wave.
+
+    Args:
+        vendor_rng: Isaac64State from ``Nethax.nethax.vendor_rng``.
+
+    Returns:
+        ``(new_vendor_rng, dungeon_state)`` where ``dungeon_state`` is a dict
+        holding the sampled scalar values keyed by name (informational only;
+        the caller is not required to use them).
+
+    Citation:
+        vendor/nle/src/dungeon.c:775-776  (Fort Ludios chance gate)
+        vendor/nle/src/dungeon.c:796-798  (dungeon depth rn1 draws)
+        vendor/nle/src/dungeon.c:548      (RNDLEVEL chance gate)
+        vendor/nle/src/dungeon.c:917-918  (tune string rn2(7) × 5)
+    """
+    from Nethax.nethax import vendor_rng as _vrng
+
+    # --- Phase 1: dungeon depth draws (dungeon.c:796-798) ---
+    # Dungeons with lev.rand > 0 each get one rn1(rand, base) = rn2(rand)+base.
+    # Fired in dungeon.def parse order: DoD, Gehennom, Mines, Quest.
+    vendor_rng, dod_levels    = _vrng.rn2(vendor_rng, 5)   # dungeon.c:797 DoD   (25,5)
+    vendor_rng, geh_levels    = _vrng.rn2(vendor_rng, 5)   # dungeon.c:797 Gehennom (20,5)
+    vendor_rng, mines_levels  = _vrng.rn2(vendor_rng, 2)   # dungeon.c:797 Mines (8,2)
+    vendor_rng, quest_levels  = _vrng.rn2(vendor_rng, 2)   # dungeon.c:797 Quest (5,2)
+
+    # --- Phase 2: Fort Ludios chance gate (dungeon.c:775-776) ---
+    # ``if (!wizard && pd.tmpdungeon[i].chance && (pd.tmpdungeon[i].chance <= rn2(100)))``
+    # Fort Ludios is the only dungeon in dungeon.def with chance > 0.
+    vendor_rng, ludios_gate   = _vrng.rn2(vendor_rng, 100)  # dungeon.c:776
+
+    # --- Phase 3: RNDLEVEL chance gates (dungeon.c:548) ---
+    # ``init_level``: ``if (!wizard && tlevel->chance <= rn2(100)) return;``
+    # One draw per RNDLEVEL entry in dungeon.def, in definition order:
+    #   bigrm (DoD, chance=40), medusa (DoD, chance=4),
+    #   minetn (Mines, chance=7), minend (Mines, chance=3),
+    #   soko1..soko4 (Sokoban, chance=2 each).
+    vendor_rng, gate_bigrm    = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 bigrm
+    vendor_rng, gate_medusa   = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 medusa
+    vendor_rng, gate_minetn   = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 minetn
+    vendor_rng, gate_minend   = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 minend
+    vendor_rng, gate_soko1    = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko1
+    vendor_rng, gate_soko2    = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko2
+    vendor_rng, gate_soko3    = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko3
+    vendor_rng, gate_soko4    = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko4
+
+    # --- Phase 4: tune string (dungeon.c:917-918) ---
+    # ``for (i = 0; i < 5; i++) tune[i] = 'A' + rn2(7);``
+    # Five unconditional rn2(7) draws; we consume but do not store the tune.
+    vendor_rng, _tune0        = _vrng.rn2(vendor_rng, 7)    # dungeon.c:918 tune[0]
+    vendor_rng, _tune1        = _vrng.rn2(vendor_rng, 7)    # dungeon.c:918 tune[1]
+    vendor_rng, _tune2        = _vrng.rn2(vendor_rng, 7)    # dungeon.c:918 tune[2]
+    vendor_rng, _tune3        = _vrng.rn2(vendor_rng, 7)    # dungeon.c:918 tune[3]
+    vendor_rng, _tune4        = _vrng.rn2(vendor_rng, 7)    # dungeon.c:918 tune[4]
+
+    dungeon_state = {
+        "dod_levels":   dod_levels   + 25,  # rn2(5)+25 ∈ [25, 29]
+        "geh_levels":   geh_levels   + 20,  # rn2(5)+20 ∈ [20, 24]
+        "mines_levels": mines_levels + 8,   # rn2(2)+8  ∈ [8,  9]
+        "quest_levels": quest_levels + 5,   # rn2(2)+5  ∈ [5,  6]
+        "ludios_gate":  ludios_gate,
+        "gate_bigrm":   gate_bigrm,
+        "gate_medusa":  gate_medusa,
+        "gate_minetn":  gate_minetn,
+        "gate_minend":  gate_minend,
+        "gate_soko1":   gate_soko1,
+        "gate_soko2":   gate_soko2,
+        "gate_soko3":   gate_soko3,
+        "gate_soko4":   gate_soko4,
+    }
+    return vendor_rng, dungeon_state
+
+
+# ---------------------------------------------------------------------------
 # TODO blocks
 # ---------------------------------------------------------------------------
 # Wave 4:

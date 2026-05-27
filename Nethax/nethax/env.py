@@ -35,6 +35,7 @@ from Nethax.nethax.subsystems.shop import shop_step as _shop_step
 from Nethax.nethax.dungeon.branches import (
     generate_main_branch_l1,
     generate_main_branch_l1_with_features,
+    consume_init_dungeons_draws,
 )
 from Nethax.nethax.dungeon.spawning import populate_level_with_monsters
 from Nethax.nethax.constants.roles import Role
@@ -231,6 +232,18 @@ class NethaxEnv:
         state = state.replace(
             messages=_emit_role_intro(state.messages, int(role)),
         )
+
+        # Consume the fixed ~18 ISAAC64 draws of vendor init_dungeons.
+        # Vendor sequence (allmain.c:610): init_dungeons fires AFTER u_init
+        # and BEFORE mklev.  The 18 fixed draws are:
+        #   4 × dungeon depth rn1 (dungeon.c:796-798)
+        #   1 × Fort Ludios chance gate rn2(100) (dungeon.c:775-776)
+        #   8 × RNDLEVEL chance gates rn2(100) (dungeon.c:548)
+        #   5 × tune rn2(7) (dungeon.c:917-918)
+        # Citation: vendor/nle/src/dungeon.c:714 init_dungeons.
+        if use_vendor_rng():
+            new_vrng, _dungeon_state = consume_init_dungeons_draws(state.vendor_rng)
+            state = state.replace(vendor_rng=new_vrng)
 
         # Vendor mklev() begins by reseeding BOTH streams (vendor
         # mklev.c:996-997)::
