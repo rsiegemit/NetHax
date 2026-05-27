@@ -42,7 +42,8 @@ For Dlvl 1, seed=0:
   - Normal main-branch level → scan proceeds.
   - Each fully-stone 3×3 cell fires: rn2(1000) [gold], rn2(1000) [gem].
   - On gold hit: rnd(60) + rn2(3).
-  - On gem hit: rnd(2) for count, then per-gem rn2(3).
+  - On gem hit: rnd(2) for count, then per gem: rnd(1000) type pick;
+    if ROCK → rn1(6,6), no rn2(3); if LUCKSTONE → rn2(3); else → rn2(6)+rn2(3).
   Total depends on terrain; typical Dlvl 1 has O(50-150) eligible cells.
 
 JIT notes
@@ -64,7 +65,9 @@ import jax
 import jax.numpy as jnp
 import jax.lax as lax
 
-from Nethax.nethax.vendor_rng import Isaac64State, rn2_jax, rnd_jax
+from Nethax.nethax.vendor_rng import Isaac64State, rn2_jax, rnd_jax, rn1_jax
+from Nethax.nethax.subsystems.random_objects import decode_picked_otyp
+from Nethax.nethax.constants.objects import ObjectClass
 
 # ---------------------------------------------------------------------------
 # Map geometry — vendor/nle/include/global.h:327-328
@@ -95,6 +98,18 @@ _VMOAT:  jnp.int8 = jnp.int8(17)  # MOAT  = 17
 # Rooms carve FLOOR=1, corridors carve CORRIDOR=2, walls=3; everything else
 # is VOID (== solid stone in the dungeon generator's pre-render map).
 _TILE_VOID: jnp.int8 = jnp.int8(0)  # TileType.VOID — solid stone / unexplored
+
+# GEM_CLASS id for decode_picked_otyp (ObjectClass.GEM_CLASS = 13).
+# Citation: Nethax/nethax/constants/objects.py::ObjectClass
+_GEM_CLASS_ID: int = int(ObjectClass.GEM_CLASS)  # 13
+
+# ROCK otyp (positional index 446 in OBJECTS[]).
+# Citation: Nethax/nethax/constants/objects.py line ~9108; vendor onames.h ROCK
+_OTYP_ROCK: jnp.int32 = jnp.int32(446)
+
+# LUCKSTONE otyp (index 442).  mksobj GEM_CLASS skips rn2(6) for luckstone.
+# Citation: vendor/nle/src/mkobj.c:892 ``else if (otmp->otyp != LUCKSTONE && !rn2(6))``
+_OTYP_LUCKSTONE: jnp.int32 = jnp.int32(442)
 
 
 # ---------------------------------------------------------------------------
@@ -351,17 +366,57 @@ def _mineral_scan(
                 # cnt = rnd(2 + dunlev//3)  Citation mklev.c:974
                 vv, cnt = rnd_jax(vv, jnp.int32(2) + dl // jnp.int32(3))
 
-                # Per-gem: rn2(3) for burial. Vendor draws once per non-ROCK gem.
-                # We conservatively draw rn2(3) _MAX_GEMS times, gated on i<cnt.
-                # Citation: mklev.c:980
+                # Per-gem cascade mirrors vendor mkobj(GEM_CLASS, FALSE) +
+                # mklev.c:975-984 placement logic.
+                #
+                # Vendor sequence per gem (Citation: vendor/nle/src/mklev.c:975-984,
+                #                          vendor/nle/src/mkobj.c:251,886-895):
+                #   1. rnd(1000)       — type pick inside mkobj()  [mkobj.c:251]
+                #   2. decode otyp via weighted walk on GEM_CLASS objects
+                #   3a. if ROCK:       rn1(6,6) quantity           [mkobj.c:891]
+                #                      discard (no rn2(3))         [mklev.c:976-977]
+                #   3b. if LUCKSTONE:  no quantity draw             [mkobj.c:892]
+                #                      rn2(3) for burial/place     [mklev.c:980]
+                #   3c. else:          rn2(6) quantity check        [mkobj.c:892]
+                #                      rn2(3) for burial/place     [mklev.c:980]
                 def gem_body(i, inner_v):
-                    def draw_coin(iv):
-                        iv, _ = rn2_jax(iv, jnp.int32(3))
+                    def do_gem(iv):
+                        # 1. rnd(1000) type pick — Citation: vendor/nle/src/mkobj.c:251
+                        iv, type_roll = rnd_jax(iv, jnp.int32(1000))
+                        # 2. decode otyp
+                        otyp = decode_picked_otyp(
+                            jnp.int32(_GEM_CLASS_ID), type_roll
+                        )
+                        is_rock      = otyp == _OTYP_ROCK
+                        is_luckstone = otyp == _OTYP_LUCKSTONE
+
+                        def rock_branch(rv):
+                            # rn1(6,6) quantity; no placement draw
+                            # Citation: vendor/nle/src/mkobj.c:891
+                            rv, _ = rn1_jax(rv, 6, 6)
+                            return rv
+
+                        def non_rock_branch(rv):
+                            # rn2(6) quantity (skipped for luckstone)
+                            # Citation: vendor/nle/src/mkobj.c:892
+                            rv = lax.cond(
+                                is_luckstone,
+                                lambda r: r,
+                                lambda r: rn2_jax(r, jnp.int32(6))[0],
+                                rv,
+                            )
+                            # rn2(3) burial/place draw
+                            # Citation: vendor/nle/src/mklev.c:980
+                            rv, _ = rn2_jax(rv, jnp.int32(3))
+                            return rv
+
+                        iv = lax.cond(is_rock, rock_branch, non_rock_branch, iv)
                         return iv
+
                     # Only draw when i < cnt (mirrors vendor's for-loop)
                     inner_v = lax.cond(
                         jnp.int32(i) < cnt,
-                        draw_coin,
+                        do_gem,
                         lambda iv: iv,
                         inner_v,
                     )
