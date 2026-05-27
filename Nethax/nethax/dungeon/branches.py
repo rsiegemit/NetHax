@@ -1039,6 +1039,7 @@ def generate_main_branch_l1_with_features(
         maybe_create_vault,
         _place_niches,
     )
+    from Nethax.nethax.dungeon.mineralize import mineralize as _mineralize
 
     k_level, k_fill, k_vault, k_niche = jax.random.split(rng, 4)
 
@@ -1055,6 +1056,15 @@ def generate_main_branch_l1_with_features(
         flat_lv=flat_lv, depth=depth, player_align=player_align,
         vendor_rng=vendor_rng,
     )
+
+    # vendor/nethack/src/mklev.c::mineralize (lines 894-988) — place mineral
+    # deposits (gold/gems) in solid-stone areas and kelp in water.  Called
+    # from mklev() after makelevel() (line 1006).  Thread vendor_rng so the
+    # ISAAC64 draw sequence matches vendor C byte-for-byte.
+    if vendor_rng is not None:
+        terrain, vendor_rng = _mineralize(
+            terrain, vendor_rng, depth=depth, dunlev=depth,
+        )
 
     # vendor/nethack/src/mklev.c lines 404-410 + 1316-1342 — 2x2 detached
     # vault with teleport-trap entry.
