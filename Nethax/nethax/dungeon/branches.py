@@ -1046,13 +1046,51 @@ def generate_main_branch_l1_with_features(
 
     k_level, k_fill, k_vault, k_niche = jax.random.split(rng, 4)
 
+    # ------------------------------------------------------------------
+    # Vendor call order — vendor/nle/src/mklev.c::makelevel (652-886) and
+    # ::mklev (990-1036), traced for seed=0 Main Dlvl 1:
+    #
+    #   makelevel():
+    #     clear_level_structures()                 [665]   no RNG
+    #     rn2(5) Medusa gate                       [693]   *
+    #     makerooms()                              [706]   *
+    #     sort_rooms()                             [707]   no RNG
+    #     rn2(nroom) + somex/y down-stair          [710-712] *
+    #     rn2(nroom-1) up-stair-room               [715]   *  (somex/y
+    #                                                          gated by
+    #                                                          dlevel!=1)
+    #     makecorridors()                          [734]   *
+    #     make_niches()                            [735]   *
+    #     do_vault() + vault fill + makevtele      [738-762] *
+    #     SHOPBASE block                           [764-796] no RNG @ Dlvl 1
+    #     place_branch(NULL, 0, 0)                 [800]   no RNG @ Dlvl 1
+    #     fill_ordinary_rooms loop                 [803-885] *
+    #   (makelevel returns)
+    #     bound_digging()                          [1005]  no RNG
+    #     mineralize(-1, -1, -1, -1, FALSE)        [1006]  *
+    #
+    # Items marked * consume ISAAC64 draws.  Steps already folded into
+    # generate_main_branch_l1: Medusa gate, makerooms, stair picks,
+    # makecorridors, make_niches.  This wrapper layers on, in vendor
+    # order: do_vault -> fill_ordinary_rooms -> mineralize.
+    # ------------------------------------------------------------------
+
     terrain, rooms, active, up_pos, dn_pos, vendor_rng = generate_main_branch_l1(
         k_level, static_params, n_rooms=n_rooms, vendor_rng=vendor_rng,
     )
 
-    # vendor/nethack/src/mklev.c::fill_ordinary_room (line 939) — per-room
-    # independent feature rolls applied to every ordinary / themeroom.
-    # Thread ``vendor_rng`` so per-room rn2/somexy draws come from the
+    # vendor/nle/src/mklev.c:738-762 — do_vault() block runs BEFORE
+    # fill_ordinary_rooms.  Thread vendor_rng so the rn2(2) vault gate
+    # (mklev.c:230) and rn2(3) makevtele gate (mklev.c:752) come from
+    # the ISAAC64 stream under NLE_BYTEPARITY in the correct slot.
+    terrain, features, traps, vendor_rng = maybe_create_vault(
+        k_vault, rooms, active, terrain, features, traps, flat_lv=flat_lv,
+        vendor_rng=vendor_rng,
+    )
+
+    # vendor/nle/src/mklev.c:803-885 — fill_ordinary_rooms loop (per-OROOM
+    # feature/trap rolls).  Runs AFTER the vault block in vendor C.
+    # Thread vendor_rng so per-room rn2/somexy draws come from the
     # ISAAC64 stream under NLE_BYTEPARITY (byte-exact with vendor C).
     terrain, features, traps, vendor_rng = fill_ordinary_rooms(
         k_fill, rooms, active, terrain, features, traps,
@@ -1060,28 +1098,20 @@ def generate_main_branch_l1_with_features(
         vendor_rng=vendor_rng,
     )
 
-    # vendor/nethack/src/mklev.c::mineralize (lines 894-988) — place mineral
-    # deposits (gold/gems) in solid-stone areas and kelp in water.  Called
-    # from mklev() after makelevel() (line 1006).  Thread vendor_rng so the
-    # ISAAC64 draw sequence matches vendor C byte-for-byte.
+    # vendor/nle/src/mklev.c::mineralize line 1006 — called from mklev()
+    # AFTER makelevel() returns, i.e. after fill_ordinary_rooms.  Thread
+    # vendor_rng so the ISAAC64 draw sequence matches vendor C byte-for-byte.
     if vendor_rng is not None:
         terrain, vendor_rng = _mineralize(
             terrain, vendor_rng, depth=depth, dunlev=depth,
         )
 
-    # vendor/nethack/src/mklev.c lines 404-410 + 1316-1342 — 2x2 detached
-    # vault with teleport-trap entry.  Thread vendor_rng so the rn2(2) vault
-    # gate (mklev.c:230) and rn2(3) makevtele gate (mklev.c:752) come from
-    # the ISAAC64 stream under NLE_BYTEPARITY.
-    terrain, features, traps, vendor_rng = maybe_create_vault(
-        k_vault, rooms, active, terrain, features, traps, flat_lv=flat_lv,
-        vendor_rng=vendor_rng,
-    )
-
-    # vendor/nethack/src/mklev.c::make_niches lines 802-820 — late-stage
-    # niche feature pass: stamp fountain / sink / grave / throne onto two
-    # random room interiors.  Runs after fill_ordinary_rooms so the niche
-    # tiles only land on plain FLOOR cells the per-room roll didn't claim.
+    # Threefry-only post-pass (NOT a vendor call): stamp fountain / sink /
+    # grave / throne tiles onto random FLOOR cells.  Vendor's make_niches
+    # already ran inside generate_main_branch_l1 against the corridors.py
+    # LevelGenState surface; this is the JAX-side terrain materialisation
+    # so niche features are observable.  Runs last so it does not disturb
+    # the vendor_rng (ISAAC64) byte-parity stream.
     terrain = _place_niches(terrain, rooms, active, k_niche, n=2)
 
     return terrain, rooms, active, up_pos, dn_pos, features, traps, vendor_rng
