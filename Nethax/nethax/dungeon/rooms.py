@@ -430,6 +430,350 @@ def generate_rooms(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 — vendor makerooms() outer loop (mklev.c:222-241)
+#
+# Vendor C (mklev.c:222-241)::
+#
+#     STATIC_OVL void makerooms() {
+#         boolean tried_vault = FALSE;
+#         while (nroom < MAXNROFROOMS && rnd_rect()) {
+#             if (nroom >= (MAXNROFROOMS / 6) && rn2(2) && !tried_vault) {
+#                 tried_vault = TRUE;
+#                 if (create_vault()) { ... }
+#             } else if (!create_room(-1, -1, -1, -1, -1, -1, OROOM, -1))
+#                 return;
+#         }
+#     }
+#
+# ISAAC64 draw order per iteration (see MKLEV_PORT_PLAN.md §1.4):
+#
+#   A. rn2(rect_cnt)        — inside rnd_rect();   rect.c:91
+#      (vendor: only when rect_cnt > 0; if 0 the while-condition exits)
+#   B. rn2(2)               — vault gate;         mklev.c:230
+#      (ONLY fires when ``nroom >= MAXNROFROOMS/6 && !tried_vault``)
+#   C. rnd(1+|depth|),
+#      rn2(77)              — create_vault lit roll; sp_lev.c:1185-6
+#      (ONLY fires when the rn2(2) above returned non-zero)
+#   D. create_room(...)     — Phase 2 (sp_lev.c:1126); not invoked when
+#                             vault path was taken.
+#
+# &&-short-circuit handling: every conditional draw is wrapped in a
+# ``lax.cond`` keyed on the precise vendor predicate so we never consume
+# an RNG byte that vendor C wouldn't.  See Phase 5 §R2 in
+# MKLEV_PORT_PLAN.md.
+# ---------------------------------------------------------------------------
+
+
+# Vendor: vendor/nle/include/global.h MAXNROFROOMS = 40
+MAXNROFROOMS: int = 40
+
+# Vendor mklev.c:230 — vault attempt is gated by ``nroom >= MAXNROFROOMS/6``
+# (integer division; equals 6).  Hoisted as a named constant so the
+# fori_loop body reads cleanly.
+_MAKEROOMS_VAULT_THRESHOLD: int = MAXNROFROOMS // 6  # = 6
+
+
+def _invoke_create_room(
+    vrng,
+    pool,
+    rooms_lx, rooms_ly, rooms_hx, rooms_hy, rooms_lit,
+    nroom,
+    depth: int,
+    vault: jax.Array,
+    sentinel_hx: jax.Array,
+):
+    """Call Phase 2's ``create_room_random`` and merge the result into the
+    room arrays (vendor ``add_room`` at sp_lev.c:1285).
+
+    Vendor's ``add_room(xabs, yabs, xabs+wtmp-1, yabs+htmp-1, rlit, rtype,
+    FALSE)`` appends one slot to ``rooms[]`` and bumps ``svn.nroom``.
+    The vault branch (mklev.c:233-235) then overwrites ``rooms[nroom].hx
+    = -1`` to mark the slot as detached — we mirror that via the
+    ``sentinel_hx`` argument (``-1`` for vault, ``hx`` for OROOM).
+
+    Returns the updated carry tuple
+    ``(vrng, pool, rooms_lx, rooms_ly, rooms_hx, rooms_hy, rooms_lit,
+       nroom, success)``.
+    """
+    from Nethax.nethax.dungeon.create_room import create_room_random
+
+    abs_depth = jnp.int32(depth)
+    res = create_room_random(
+        vrng, pool, abs_depth, nroom, vault,
+    )
+
+    # Compute the absolute room bounding box from create_room's returns.
+    # Vendor: hx = xabs + wtmp - 1, hy = yabs + htmp - 1.
+    hx = (res.xabs + res.wtmp - jnp.int16(1)).astype(jnp.int16)
+    hy = (res.yabs + res.htmp - jnp.int16(1)).astype(jnp.int16)
+
+    # Apply vault hx-sentinel: rooms[nroom].hx = -1 when vault placement
+    # succeeded (mklev.c:235).
+    hx_written = jnp.where(res.success & vault, sentinel_hx, hx)
+
+    # Write only on success; otherwise leave the slot untouched.
+    success = res.success
+    write_idx = jnp.minimum(nroom, jnp.int32(MAX_ROOMS_PER_LEVEL - 1))
+
+    rooms_lx = lax.cond(
+        success,
+        lambda a: a.at[write_idx].set(res.xabs.astype(jnp.int16)),
+        lambda a: a,
+        rooms_lx,
+    )
+    rooms_ly = lax.cond(
+        success,
+        lambda a: a.at[write_idx].set(res.yabs.astype(jnp.int16)),
+        lambda a: a,
+        rooms_ly,
+    )
+    rooms_hx = lax.cond(
+        success,
+        lambda a: a.at[write_idx].set(hx_written),
+        lambda a: a,
+        rooms_hx,
+    )
+    rooms_hy = lax.cond(
+        success,
+        lambda a: a.at[write_idx].set(hy),
+        lambda a: a,
+        rooms_hy,
+    )
+    rooms_lit = lax.cond(
+        success,
+        lambda a: a.at[write_idx].set(res.rlit.astype(jnp.int8)),
+        lambda a: a,
+        rooms_lit,
+    )
+    new_nroom = jnp.where(success, nroom + jnp.int32(1), nroom)
+
+    return (
+        res.rng, res.pool,
+        rooms_lx, rooms_ly, rooms_hx, rooms_hy, rooms_lit,
+        new_nroom, success,
+    )
+
+
+def makerooms(
+    vendor_rng: Isaac64State,
+    rect_pool,
+    depth: int = 1,
+):
+    """Port of vendor ``makerooms()`` (mklev.c:222-241).
+
+    Drives room placement on a regular (non-rogue, non-special) level by
+    drawing free sub-rectangles from the rect pool until either
+    ``rnd_rect()`` runs dry or ``MAXNROFROOMS`` has been reached.  Honours
+    vendor's vault side-attempt: once ``nroom >= MAXNROFROOMS/6`` an
+    ``rn2(2)`` coin decides whether to invoke ``create_vault`` (one-shot,
+    gated by ``tried_vault``).
+
+    All draws are routed through the ISAAC64 stream so the byte sequence
+    matches vendor C for a given seed.  The ``&&`` short-circuit at
+    mklev.c:230 is honoured exactly: the ``rn2(2)`` ONLY fires when
+    ``nroom >= MAXNROFROOMS/6 && !tried_vault``; the ``lit_A/lit_B``
+    create_vault draws ONLY fire when that ``rn2(2)`` returns non-zero;
+    and the per-iteration ``rnd_rect()`` draw is skipped (via
+    ``lax.cond``) once the loop has died (``alive == False``).
+
+    Args:
+        vendor_rng: ISAAC64 state (CORE stream).
+        rect_pool:  RectPool seeded with the level's bounding rect
+                    (typically from ``rect_pool.init_rect()``).
+        depth:      dungeon depth (1 for Main Dlvl 1) — feeds ``rnd(1 +
+                    abs(depth))`` for the vault lit roll.
+
+    Returns:
+        ``(vendor_rng, rect_pool, rooms, active, nroom, tried_vault)``::
+
+          vendor_rng  : updated Isaac64State
+          rect_pool   : updated RectPool (Phase 2 mutates via split_rects)
+          rooms       : Room pytree of length MAX_ROOMS_PER_LEVEL.  Phase
+                        2 fills coordinate slots; in the stub path every
+                        slot is sentinel -1.
+          active      : bool[MAX_ROOMS_PER_LEVEL] mask
+          nroom       : int32 — number of placed rooms
+          tried_vault : bool — whether the vault side-attempt was made
+    """
+    from Nethax.nethax.dungeon.rect_pool import rnd_rect
+    from Nethax.nethax.vendor_rng import rn2_jax
+
+    abs_depth = abs(int(depth))
+
+    # Carry layout (kept flat so lax.fori_loop sees a simple pytree).
+    #   vrng        : Isaac64State
+    #   pool        : RectPool
+    #   rooms_lx..  : int16[MAX_ROOMS_PER_LEVEL]
+    #   rooms_lit   : int8[MAX_ROOMS_PER_LEVEL]
+    #   nroom       : int32 scalar
+    #   tried_vault : bool scalar
+    #   alive       : bool scalar — once False, every remaining iteration
+    #                 short-circuits all draws to mirror vendor's early
+    #                 exit from the ``while`` loop.
+    init_coords = jnp.full((MAX_ROOMS_PER_LEVEL,), -1, dtype=jnp.int16)
+    init_lit    = jnp.zeros((MAX_ROOMS_PER_LEVEL,), dtype=jnp.int8)
+
+    carry0 = (
+        vendor_rng,
+        rect_pool,
+        init_coords, init_coords, init_coords, init_coords, init_lit,
+        jnp.int32(0),         # nroom
+        jnp.bool_(False),     # tried_vault
+        jnp.bool_(True),      # alive
+    )
+
+    def body(_i, carry):
+        (vrng, pool,
+         rlx, rly, rhx, rhy, rlit,
+         nroom, tried_vault, alive) = carry
+
+        # --- Step A: rnd_rect() — vendor mklev.c:229 ``while (... && rnd_rect())``
+        # Vendor draws rn2(rect_cnt) iff rect_cnt > 0; if rect_cnt == 0
+        # the while-condition exits and no draw occurs.  ``rnd_rect``
+        # already encapsulates that ``rect_cnt > 0`` short-circuit, but
+        # we also gate on ``alive`` so iterations after the loop has
+        # exited consume zero bytes (matching vendor's terminated loop).
+        def do_rnd_rect(args):
+            vrng_in, pool_in = args
+            pool_out, _lx, _ly, _hx, _hy, vrng_out, has = rnd_rect(pool_in, vrng_in)
+            return vrng_out, pool_out, has
+
+        def skip_rnd_rect(args):
+            vrng_in, pool_in = args
+            return vrng_in, pool_in, jnp.bool_(False)
+
+        vrng, pool, has_rect = lax.cond(
+            alive, do_rnd_rect, skip_rnd_rect, (vrng, pool),
+        )
+
+        # Vendor's while-condition combines ``nroom < MAXNROFROOMS &&
+        # rnd_rect()``.  After the rnd_rect draw above (which itself
+        # honours rect_cnt > 0) we kill the loop if either side failed.
+        still_alive = alive & has_rect & (nroom < jnp.int32(MAXNROFROOMS))
+
+        # --- Step B: rn2(2) vault gate — vendor mklev.c:230
+        #     ``nroom >= MAXNROFROOMS/6 && rn2(2) && !tried_vault``
+        # The rn2(2) sits in the middle of the ``&&`` chain; vendor's
+        # C evaluator short-circuits both LHS (nroom >= threshold) and
+        # the post-roll ``!tried_vault`` test.  We must NOT draw rn2(2)
+        # unless the LHS gate is satisfied; otherwise every dlvl-1
+        # seed shifts by one ISAAC64 byte.
+        vault_gate_lhs = (
+            still_alive
+            & (nroom >= jnp.int32(_MAKEROOMS_VAULT_THRESHOLD))
+            & (~tried_vault)
+        )
+
+        def do_vault_roll(args):
+            vrng_in = args
+            vrng_out, r = rn2_jax(vrng_in, jnp.int32(2))
+            return vrng_out, r
+
+        def skip_vault_roll(args):
+            vrng_in = args
+            return vrng_in, jnp.int32(0)
+
+        vrng, vault_roll = lax.cond(
+            vault_gate_lhs, do_vault_roll, skip_vault_roll, vrng,
+        )
+
+        take_vault = vault_gate_lhs & (vault_roll != jnp.int32(0))
+
+        # Vendor's ``tried_vault = TRUE;`` (mklev.c:231) fires inside the
+        # if-branch before checking the ``create_vault()`` return value,
+        # so a *taken* coin (rn2(2) returned non-zero) burns the one-shot
+        # flag regardless of whether the vault placement succeeded.
+        new_tried_vault = tried_vault | take_vault
+
+        # --- Step C/D: create_room(...) — vendor mklev.c:232 / mklev.c:237
+        #
+        # Vendor's branches both call ``create_room`` (vault path via
+        # the ``create_vault()`` macro at mklev.c:38, OROOM path via the
+        # direct call at mklev.c:237).  Phase 2 (Nethax.nethax.dungeon.
+        # create_room.create_room_random) consumes the full per-attempt
+        # ISAAC64 stream — lit_A, lit_B, rnd_rect, dx (skipped if vault),
+        # dy (skipped if vault), xabs, yabs, D6, D7 — in vendor order.
+        #
+        # We dispatch BOTH paths through the same call, varying only the
+        # ``vault`` boolean and the post-success hx-sentinel write:
+        #   * vault branch: pass vault=True, hx_sentinel=-1
+        #   * OROOM branch: pass vault=False, hx_sentinel = hx (unchanged)
+        # On vault, vendor (mklev.c:235) overwrites ``rooms[nroom].hx``
+        # with -1 to detach the slot from sort_rooms; we do the same via
+        # ``_invoke_create_room``'s ``sentinel_hx`` parameter.
+        do_create_branch = still_alive
+
+        def do_create_room(args):
+            (vrng_in, pool_in,
+             rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
+             nroom_in, vault_in) = args
+            sentinel_hx = jnp.where(
+                vault_in, jnp.int16(-1), jnp.int16(0)
+            )  # ``hx_written`` only used when vault_in==True.
+            return _invoke_create_room(
+                vrng_in, pool_in,
+                rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
+                nroom_in, depth=abs_depth,
+                vault=vault_in,
+                sentinel_hx=sentinel_hx,
+            )
+
+        def skip_create_room(args):
+            (vrng_in, pool_in,
+             rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
+             nroom_in, _vault_in) = args
+            return (
+                vrng_in, pool_in,
+                rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
+                nroom_in, jnp.bool_(False),
+            )
+
+        (vrng, pool,
+         rlx, rly, rhx, rhy, rlit,
+         nroom, cr_success) = lax.cond(
+            do_create_branch,
+            do_create_room,
+            skip_create_room,
+            (vrng, pool, rlx, rly, rhx, rhy, rlit, nroom, take_vault),
+        )
+
+        # Update alive: vendor exits the outer ``while`` only when
+        #   (a) rnd_rect() returned 0  (already folded into still_alive),
+        #   (b) nroom hits MAXNROFROOMS  (folded into still_alive next iter),
+        #   (c) the OROOM-branch create_room returned 0 (mklev.c:237-238).
+        # The vault branch's create_room return value does NOT exit the
+        # loop (vendor falls through to the next ``while`` iteration).
+        oroom_failed = do_create_branch & (~take_vault) & (~cr_success)
+        new_alive = still_alive & (~oroom_failed)
+
+        return (
+            vrng, pool,
+            rlx, rly, rhx, rhy, rlit,
+            nroom, new_tried_vault, new_alive,
+        )
+
+    (vrng, pool,
+     rlx, rly, rhx, rhy, rlit,
+     nroom, tried_vault, _alive) = lax.fori_loop(
+        0, MAXNROFROOMS, body, carry0,
+    )
+
+    # Build the output Room pytree.  Active slots are those with
+    # non-sentinel coords (a Phase-2-filled slot has lx >= 0).
+    active = rlx >= jnp.int16(0)
+    room_type = jnp.zeros((MAX_ROOMS_PER_LEVEL,), dtype=jnp.int8)
+    rooms = Room(
+        y1=rly,
+        x1=rlx,
+        y2=rhy,
+        x2=rhx,
+        room_type=room_type,
+        is_lit=rlit.astype(bool),
+    )
+    return vrng, pool, rooms, active, nroom, tried_vault
+
+
+# ---------------------------------------------------------------------------
 # Wave 17f — Special-room assignment
 #
 # Vendor (vendor/nethack/src/mklev.c::makelevel lines 1344-1376) makes up to
