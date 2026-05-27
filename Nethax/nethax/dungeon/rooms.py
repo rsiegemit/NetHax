@@ -1369,8 +1369,13 @@ def _vendor_traptype_rnd(rng, level_diff):
     VIBRATING_SQUARE), plus depth-gated kinds (SLP_GAS_TRAP, LEVEL_TELEP,
     SPIKED_PIT, LANDMINE, WEB, STATUE_TRAP, POLY_TRAP, etc.).
 
+    HOLE (13) requires a second ``rn2(7)`` draw
+    (vendor/nethack/src/mklev.c:1991-1994):
+        ``case HOLE: if (rn2(7)) kind = NO_TRAP; break;``
+    Both keys are consumed unconditionally to keep the draw sequence stable.
+
     Vendor's ``do { kind = traptype_rnd(); } while (kind == NO_TRAP)`` loop
-    is approximated here with a single draw + a NO_TRAP→ARROW_TRAP fallback
+    is approximated here with a single draw + a NO_TRAP->ARROW_TRAP fallback
     so the function is JIT-safe (no traced-loop).  Callers that need the
     exact retry-until-non-zero behaviour can iterate at a fixed bound.
 
@@ -1381,9 +1386,12 @@ def _vendor_traptype_rnd(rng, level_diff):
     Returns:
         int32 scalar TrapType value (NO_TRAP=0 if no legal kind drawn).
     """
-    # rnd(TRAPNUM - 1) → uniform in [1, TRAPNUM-1].  TRAPNUM = 26 per
+    # Split: k_kind for rnd(TRAPNUM-1), k_hole for HOLE's rn2(7).
+    # vendor/nethack/src/mklev.c:1941,1991-1994
+    k_kind, k_hole = jax.random.split(rng, 2)
+    # rnd(TRAPNUM - 1) -> uniform in [1, TRAPNUM-1].  TRAPNUM = 26 per
     # vendor/nethack/include/trap.h (mirrors our N_TRAP_TYPES = 26).
-    kind = jax.random.randint(rng, (), minval=1, maxval=26, dtype=jnp.int32)
+    kind = jax.random.randint(k_kind, (), minval=1, maxval=26, dtype=jnp.int32)
     lvl  = jnp.asarray(level_diff, dtype=jnp.int32)
 
     # Disallow non-map trap kinds (vendor lines 1946-1955).
@@ -1396,15 +1404,18 @@ def _vendor_traptype_rnd(rng, level_diff):
     illegal = is_trapped_door | is_trapped_chest | is_portal | is_vibsquare | is_fire
 
     # Depth gates (vendor lines 1956-1995).
+    # HOLE (13): vendor draws rn2(7) and rejects unless it equals 0 (1/7 chance).
+    hole_rn7 = jax.random.randint(k_hole, (), minval=0, maxval=7, dtype=jnp.int32)
     depth_too_low = (
-        ((kind == jnp.int32(7))  & (lvl < jnp.int32(2)))  | # ROLLING_BOULDER_TRAP
-        ((kind == jnp.int32(8))  & (lvl < jnp.int32(2)))  | # SLP_GAS_TRAP
-        ((kind == jnp.int32(16)) & (lvl < jnp.int32(5)))  | # LEVEL_TELEP
-        ((kind == jnp.int32(12)) & (lvl < jnp.int32(5)))  | # SPIKED_PIT
-        ((kind == jnp.int32(6))  & (lvl < jnp.int32(6)))  | # LANDMINE
-        ((kind == jnp.int32(18)) & (lvl < jnp.int32(7)))  | # WEB
-        ((kind == jnp.int32(19)) & (lvl < jnp.int32(8)))  | # STATUE_TRAP
-        ((kind == jnp.int32(22)) & (lvl < jnp.int32(8)))    # POLY_TRAP
+        ((kind == jnp.int32(7))  & (lvl < jnp.int32(2)))           | # ROLLING_BOULDER_TRAP
+        ((kind == jnp.int32(8))  & (lvl < jnp.int32(2)))           | # SLP_GAS_TRAP
+        ((kind == jnp.int32(13)) & (hole_rn7 != jnp.int32(0)))     | # HOLE — 1/7 only
+        ((kind == jnp.int32(16)) & (lvl < jnp.int32(5)))           | # LEVEL_TELEP
+        ((kind == jnp.int32(12)) & (lvl < jnp.int32(5)))           | # SPIKED_PIT
+        ((kind == jnp.int32(6))  & (lvl < jnp.int32(6)))           | # LANDMINE
+        ((kind == jnp.int32(18)) & (lvl < jnp.int32(7)))           | # WEB
+        ((kind == jnp.int32(19)) & (lvl < jnp.int32(8)))           | # STATUE_TRAP
+        ((kind == jnp.int32(22)) & (lvl < jnp.int32(8)))             # POLY_TRAP
     )
 
     # Substitute illegal/too-deep draws with ARROW_TRAP (always legal — the
@@ -1414,7 +1425,7 @@ def _vendor_traptype_rnd(rng, level_diff):
     return jnp.where(legal, kind, jnp.int32(1))  # ARROW_TRAP fallback
 
 
-def _isaac_legalise_trap_kind(kind, level_diff):
+def _isaac_legalise_trap_kind(kind, level_diff, hole_rn7):
     """ISAAC64-path twin of :func:`_vendor_traptype_rnd` — takes a pre-drawn
     ``rnd(TRAPNUM-1)`` value instead of consuming a Threefry key.
 
@@ -1422,9 +1433,16 @@ def _isaac_legalise_trap_kind(kind, level_diff):
     draws to ARROW_TRAP (vendor retry loop approximation).  Used by the
     NLE_BYTEPARITY path inside :func:`fill_ordinary_rooms` where the
     underlying rn2 draw must come from the ISAAC64 stream.
+
+    Args:
+        kind:       pre-drawn rnd(TRAPNUM-1) value from the ISAAC64 stream.
+        level_diff: vendor ``level_difficulty()`` (depth-equivalent int).
+        hole_rn7:   pre-drawn rn2(7) value from the ISAAC64 stream for the
+                    HOLE frequency filter (vendor/nethack/src/mklev.c:1991-1994).
     """
     kind = jnp.asarray(kind, dtype=jnp.int32)
     lvl  = jnp.asarray(level_diff, dtype=jnp.int32)
+    hole_rn7 = jnp.asarray(hole_rn7, dtype=jnp.int32)
 
     is_trapped_door  = kind == jnp.int32(24)
     is_trapped_chest = kind == jnp.int32(25)
@@ -1433,15 +1451,18 @@ def _isaac_legalise_trap_kind(kind, level_diff):
     is_fire          = kind == jnp.int32(10)
     illegal = is_trapped_door | is_trapped_chest | is_portal | is_vibsquare | is_fire
 
+    # HOLE (13): vendor draws rn2(7) and rejects unless it equals 0 (1/7 chance).
+    # vendor/nethack/src/mklev.c:1991-1994
     depth_too_low = (
-        ((kind == jnp.int32(7))  & (lvl < jnp.int32(2)))  |
-        ((kind == jnp.int32(8))  & (lvl < jnp.int32(2)))  |
-        ((kind == jnp.int32(16)) & (lvl < jnp.int32(5)))  |
-        ((kind == jnp.int32(12)) & (lvl < jnp.int32(5)))  |
-        ((kind == jnp.int32(6))  & (lvl < jnp.int32(6)))  |
-        ((kind == jnp.int32(18)) & (lvl < jnp.int32(7)))  |
-        ((kind == jnp.int32(19)) & (lvl < jnp.int32(8)))  |
-        ((kind == jnp.int32(22)) & (lvl < jnp.int32(8)))
+        ((kind == jnp.int32(7))  & (lvl < jnp.int32(2)))           |  # ROLLING_BOULDER_TRAP
+        ((kind == jnp.int32(8))  & (lvl < jnp.int32(2)))           |  # SLP_GAS_TRAP
+        ((kind == jnp.int32(13)) & (hole_rn7 != jnp.int32(0)))     |  # HOLE — 1/7 only
+        ((kind == jnp.int32(16)) & (lvl < jnp.int32(5)))           |  # LEVEL_TELEP
+        ((kind == jnp.int32(12)) & (lvl < jnp.int32(5)))           |  # SPIKED_PIT
+        ((kind == jnp.int32(6))  & (lvl < jnp.int32(6)))           |  # LANDMINE
+        ((kind == jnp.int32(18)) & (lvl < jnp.int32(7)))           |  # WEB
+        ((kind == jnp.int32(19)) & (lvl < jnp.int32(8)))           |  # STATUE_TRAP
+        ((kind == jnp.int32(22)) & (lvl < jnp.int32(8)))              # POLY_TRAP
     )
     legal = ~(illegal | depth_too_low)
     return jnp.where(legal, kind, jnp.int32(1))
@@ -1857,7 +1878,7 @@ def fill_ordinary_rooms(
             v, rn15 = randint_jax(v, (), 0, 15)
             is_gnome_victim = (rn15 >= jnp.int32(6)) & (rn15 <= jnp.int32(9))
             is_elf_victim   = rn15 == jnp.int32(0)
-            SLP_GAS_TRAP = jnp.int32(10)
+            SLP_GAS_TRAP = jnp.int32(8)   # vendor/nethack/include/trap.h:66
 
             def _elf_slp_true(vi):
                 vi, _ = randint_jax(vi, (), 0, 2)
@@ -1901,7 +1922,10 @@ def fill_ordinary_rooms(
                 v, t_in, tr_in = carry_m
                 # traptype_rnd: rnd(TRAPNUM-1) = randint(1, TRAPNUM=26).
                 v, kind_raw = randint_jax(v, (), 1, 26)
-                kind_ = _isaac_legalise_trap_kind(kind_raw, depth_i)
+                # HOLE rn2(7) filter: vendor/nethack/src/mklev.c:1991-1994
+                # draw always consumed (matches vendor stream even on non-HOLE kinds).
+                v, hole_rn7_ = randint_jax(v, (), 0, 7)
+                kind_ = _isaac_legalise_trap_kind(kind_raw, depth_i, hole_rn7_)
                 # mktrap's do/while: somexy placement (single-attempt model).
                 v, rt_r_, rt_c_ = somexy(v)
                 new_t = t_in.at[rt_r_, rt_c_].set(TRAP_TILE)
