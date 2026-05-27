@@ -6150,7 +6150,11 @@ def monsters_step_all(state, rng: jax.Array) -> object:
 
     # Tick status timers (vendor src/timeout.c::run_timers pattern).
     mai = final_state.monster_ai
-    new_sleep     = jnp.maximum(mai.sleep_timer.astype(jnp.int32)     - 1, 0).astype(jnp.int16)
+    # NOTE: sleep_timer / asleep are NOT decremented here.
+    # Vendor msleeping is a boolean flag cleared only by disturb() (wakeup on
+    # LoS/sound/attack) — vendor/nethack/src/mon.c::wakeup lines 4333-4338.
+    # There is no per-turn countdown; decrementing sleep_timer was causing
+    # every spawned monster to unconditionally wake after 127 turns.
     new_stun      = jnp.maximum(mai.stun_timer.astype(jnp.int32)      - 1, 0).astype(jnp.int16)
     new_confuse   = jnp.maximum(mai.confuse_timer.astype(jnp.int32)   - 1, 0).astype(jnp.int16)
     new_paralyzed = jnp.maximum(mai.paralyzed_timer.astype(jnp.int32) - 1, 0).astype(jnp.int16)
@@ -6162,15 +6166,12 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     # loop) ticks every monster's mspec_used so casts re-arm.
     new_mspec     = jnp.maximum(mai.mspec_used.astype(jnp.int32)      - 1, 0).astype(jnp.int16)
     # flee_until_turn is an absolute turn counter; do not decrement.
-    new_asleep    = new_sleep > jnp.int16(0)
     mai = mai.replace(
-        sleep_timer=new_sleep,
         stun_timer=new_stun,
         confuse_timer=new_confuse,
         paralyzed_timer=new_paralyzed,
         blind_timer=new_blind,
         mspec_used=new_mspec,
-        asleep=new_asleep,
     )
     final_state = final_state.replace(monster_ai=mai)
 
