@@ -177,19 +177,30 @@ class NethaxEnv:
             v_state, rng_char = _vendor_draw_prngkey(v_state)
             v_state, rng_monsters = _vendor_draw_prngkey(v_state)
 
-            # Byte-replay wire-up — pre-draw dungeon-gen scalars from ISAAC64
-            # so the room count and monster count match vendor C output for
-            # the same seed.  Vendor mklev.c::makerooms uses rn2(5)+5 (5..9)
-            # for the per-level room target; mklev.c:804 uses
-            # rnd((nroom >> 1) + 1) for monster count.  Both bottom out in
-            # ``isaac64_next_uint64() % x`` (rnd.c rn2/rnd, USE_ISAAC64 path).
-            v_state, room_target = _vendor_rng.rn2(v_state, 5)
-            n_rooms_vendor = int(room_target) + 5   # rn2(5)+5 → 5..9 inclusive
-            # rnd(N) == rn2(N) + 1; upper bound is ((n_rooms_vendor>>1)+1).
-            mc_upper = max((n_rooms_vendor >> 1) + 1, 1)
-            v_state, mc_roll = _vendor_rng.rn2(v_state, mc_upper)
-            n_monsters_vendor = max(min(int(mc_roll) + 1, 5), 1)
-
+            # NOTE (Phase 3 — MKLEV_PORT_PLAN.md §1.4):
+            #   Previously this block pre-drew rn2(5) + rn2(mc_upper) here
+            #   to derive ``n_rooms_vendor`` (5..9) and ``n_monsters_vendor``
+            #   for downstream generate_rooms / populate_level_with_monsters
+            #   calls.  Vendor C makes NO such pre-draws -- makerooms
+            #   (mklev.c:229) drives room count implicitly via
+            #   rnd_rect()-exhaustion of the rect pool, and the monster
+            #   count rnd((nroom>>1)+1) (mklev.c:804) is drawn AFTER the
+            #   per-room feature pass.  Pre-drawing them here shifted every
+            #   downstream ISAAC64 byte by 16 (two uint64 outputs), causing
+            #   the seed=0 player_x/y divergence flagged in
+            #   ISAAC64_CALL_ORDER_AUDIT.md.
+            #
+            #   Phase 3 makerooms (rooms.py::makerooms) + the new
+            #   rn2(nroom)/somex/somey/rn2(nroom-1) stair-pick draws in
+            #   branches.py::generate_main_branch_l1 consume the bytes in
+            #   vendor order, so these pre-draws are dropped.
+            #
+            #   The n_rooms_vendor / n_monsters_vendor Python locals keep
+            #   their initialised defaults from above (8 / 5) so the
+            #   downstream calls still receive concrete ints.  In the
+            #   vendor path the *true* nroom is whatever generate_rooms
+            #   actually placed; downstream consumers re-derive it from
+            #   ``active.sum()``.
             state = state.replace(vendor_rng=v_state)
 
         # Apply character creation (stats, inventory, AC)
