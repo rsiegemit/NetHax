@@ -415,9 +415,15 @@ class Isaac64State:
     b: jnp.ndarray
     c: jnp.ndarray
     n: jnp.ndarray
+    # JIT-aware draw counter — incremented by every ``next_uint64_jax`` call
+    # (and host-side ``next_uint64`` / ``rn2`` / ``rnd``) so total uint64
+    # consumption can be inspected after JIT-traced code runs.  int64 scalar.
+    # See ``get_draw_count()`` / ``reset_draw_count()`` for the parallel
+    # host-only counter (kept for legacy phase instrumentation).
+    draws: jnp.ndarray = None  # type: ignore[assignment]
 
     def tree_flatten(self):
-        return (self.m, self.r, self.a, self.b, self.c, self.n), None
+        return (self.m, self.r, self.a, self.b, self.c, self.n, self.draws), None
 
     @classmethod
     def tree_unflatten(cls, aux, children):
@@ -439,6 +445,7 @@ class Isaac64State:
             b=jnp.zeros((), dtype=jnp.uint64),
             c=jnp.zeros((), dtype=jnp.uint64),
             n=jnp.zeros((), dtype=jnp.int32),
+            draws=jnp.zeros((), dtype=jnp.int64),
         )
 
 
@@ -452,6 +459,7 @@ def init(seed: int) -> Isaac64State:
         b=jnp.asarray(b, dtype=jnp.uint64),
         c=jnp.asarray(c, dtype=jnp.uint64),
         n=jnp.asarray(n, dtype=jnp.int32),
+        draws=jnp.zeros((), dtype=jnp.int64),
     )
 
 
@@ -518,8 +526,13 @@ def _state_to_py(state: Isaac64State):
     return m, r, a, b, c, n
 
 
-def _state_from_py(py_state) -> Isaac64State:
-    """Repack a host-side ``(m, r, a, b, c, n)`` tuple as an ``Isaac64State``."""
+def _state_from_py(py_state, draws: jnp.ndarray) -> Isaac64State:
+    """Repack a host-side ``(m, r, a, b, c, n)`` tuple as an ``Isaac64State``.
+
+    ``draws`` is carried separately (host-side roundtrip doesn't touch it)
+    so the JIT-aware counter survives ``_state_to_py`` -> Python helper ->
+    ``_state_from_py``.  Callers pass the incremented value explicitly.
+    """
     m, r, a, b, c, n = py_state
     return Isaac64State(
         m=jnp.asarray(m, dtype=jnp.uint64),
@@ -528,6 +541,7 @@ def _state_from_py(py_state) -> Isaac64State:
         b=jnp.asarray(b, dtype=jnp.uint64),
         c=jnp.asarray(c, dtype=jnp.uint64),
         n=jnp.asarray(n, dtype=jnp.int32),
+        draws=jnp.asarray(draws, dtype=jnp.int64),
     )
 
 
@@ -539,14 +553,16 @@ def rn2(state: Isaac64State, x: int) -> Tuple[Isaac64State, int]:
     """
     py_state = _state_to_py(state)
     py_state, v = rn2_py(py_state, int(x))
-    return _state_from_py(py_state), int(v)
+    new_draws = jnp.asarray(int(np.asarray(state.draws)) + 1, dtype=jnp.int64)
+    return _state_from_py(py_state, new_draws), int(v)
 
 
 def next_uint64(state: Isaac64State) -> Tuple[Isaac64State, int]:
     """Host-side raw 64-bit draw — returns ``(new_state, uint64)``."""
     py_state = _state_to_py(state)
     py_state, v = next_uint64_py(py_state)
-    return _state_from_py(py_state), int(v)
+    new_draws = jnp.asarray(int(np.asarray(state.draws)) + 1, dtype=jnp.int64)
+    return _state_from_py(py_state, new_draws), int(v)
 
 
 def rne(state: Isaac64State, x: int, ulevel: int = 0) -> Tuple[Isaac64State, int]:
@@ -560,9 +576,13 @@ def rne(state: Isaac64State, x: int, ulevel: int = 0) -> Tuple[Isaac64State, int
     vendor/nle/src/rnd.c:196-215   -- rne implementation
     vendor/nle/src/rnd.c:194       -- range comment
     """
+    # rne_py drains the trace global counter — read draws delta from there.
+    before = _DRAW_COUNT
     py_state = _state_to_py(state)
     py_state, v = rne_py(py_state, int(x), int(ulevel))
-    return _state_from_py(py_state), int(v)
+    delta = _DRAW_COUNT - before
+    new_draws = jnp.asarray(int(np.asarray(state.draws)) + delta, dtype=jnp.int64)
+    return _state_from_py(py_state, new_draws), int(v)
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +672,8 @@ def _isaac64_refill_jax(rng: "Isaac64State") -> "Isaac64State":
         _isaac64_one_mix, carry, jnp.arange(ISAAC64_SZ, dtype=jnp.uint32)
     )
     return Isaac64State(
-        m=m_out, r=r_out, a=a_out, b=b_out, c=c_out, n=jnp.int32(ISAAC64_SZ)
+        m=m_out, r=r_out, a=a_out, b=b_out, c=c_out,
+        n=jnp.int32(ISAAC64_SZ), draws=rng.draws,
     )
 
 
@@ -675,6 +696,7 @@ def next_uint64_jax(rng: "Isaac64State") -> Tuple["Isaac64State", jax.Array]:
         m=refilled.m, r=refilled.r,
         a=refilled.a, b=refilled.b, c=refilled.c,
         n=new_n,
+        draws=refilled.draws + jnp.int64(1),
     ), val
 
 
