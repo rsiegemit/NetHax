@@ -117,20 +117,26 @@ class NethaxEnv:
         n_rooms_vendor: int = 8         # generate_rooms default
         n_monsters_vendor: int = 5      # populate_level_with_monsters default
         if use_vendor_rng():
-            # Derive a uint64 seed from the incoming PRNGKey using pure-JAX
-            # ops so this branch does not force a host transfer of the key.
-            # ``jax.random.bits(rng, (), dtype=jnp.uint64)`` returns a traced
-            # uint64 scalar (when JAX_ENABLE_X64=1).  Under default x32 mode
-            # the result is truncated to uint32, which is still vendor-equiv
-            # for ISAAC64 seeding (NLE packs to ``sizeof(unsigned long)``
-            # bytes little-endian; the low 32 bits dominate when the seed is
-            # ``unsigned int`` -- vendor/nle/src/hacklib.c:854-868).
+            # Derive the ISAAC64 seed from the raw PRNGKey integer so it
+            # matches NLE's ``env.seed(seeds=(s, s))`` byte-for-byte.  NLE
+            # packs an ``unsigned long`` little-endian as the ISAAC64 seed
+            # (vendor/nle/src/rnd.c::init_isaac64 lines 40-57), so for seed
+            # ``s`` we need to pass exactly ``s`` to ``_vendor_rng.init``.
+            #
+            # JAX's ``jax.random.PRNGKey(s)`` returns the key ``[s_hi, s_lo]``
+            # (two uint32 words, big-endian).  Reconstruct ``s`` as a uint64
+            # by combining ``(hi << 32) | lo``.  Previously we used
+            # ``jax.random.bits(rng, (), dtype=jnp.uint64)`` which hashes the
+            # key (PRNGKey(0) hashed to 7719171245655871230 instead of 0),
+            # leading to a completely different ISAAC64 stream from NLE's.
             # NOTE: ``_vendor_rng.init`` still runs reference Python ISAAC64
             # math, so this branch is not yet ``jax.vmap``-safe; under vmap
             # the ``int(seed_arr)`` below would raise ConcretizationTypeError.
             # The non-vendor default path (ParityMode.NLE) skips this branch
             # entirely and vmaps cleanly.
-            seed_arr = jax.random.bits(rng, (), dtype=jnp.uint64)
+            seed_hi = jnp.uint64(rng[0])
+            seed_lo = jnp.uint64(rng[1])
+            seed_arr = (seed_hi << jnp.uint64(32)) | seed_lo
             v_state = _vendor_rng.init(int(seed_arr))
 
             # Replay vendor ``init_objects()`` BEFORE any dungeon-gen
