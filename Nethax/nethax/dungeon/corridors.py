@@ -511,11 +511,14 @@ def dodoor(
     gs: "LevelGenState",
     x: jnp.ndarray, y: jnp.ndarray,
     shdoor: jnp.ndarray = jnp.bool_(False),
+    depth: int = 1,
 ) -> tuple["Isaac64State", "LevelGenState"]:
     """Vendor mklev.c:1249-1260 ``dodoor`` -> mklev.c:383-447 ``dosdoor``.
 
     Draws (in vendor order):
-        rn2(8)   — DOOR vs SDOOR (mklev.c:1259)
+        rn2(8)   — DOOR vs SDOOR (mklev.c:1259), only when depth > 2
+                   (vendor maybe_sdoor mklev.c:1793-1795 gates on depth>2;
+                   on Dlvl 1-2 this draw is SKIPPED and type is forced DOOR)
         rn2(3)   — DOOR: locked/closed/open path vs NODOOR (mklev.c:395)
         rn2(5)   — DOOR&&path: open? (mklev.c:396)
         rn2(6)   — DOOR&&path&&!open: locked? (mklev.c:398)
@@ -530,10 +533,18 @@ def dodoor(
     encode that with ``lax.cond`` — Phase 5 will pass real level_difficulty.
     For Phase 4 we expose a ``level_difficulty`` int parameter; defaults
     skip the trap rolls (Dlvl 1 behaviour).
+
+    Vendor cite: mklev.c:1793-1802 maybe_sdoor + dodoor.
     """
-    # rn2(8): DOOR (non-zero) vs SDOOR (zero)
-    rng, r8 = rn2_jax(rng, jnp.int32(8))
-    is_door_kind = r8 != jnp.int32(0)
+    # rn2(8): DOOR (non-zero) vs SDOOR (zero).
+    # Vendor maybe_sdoor(8): only draws when depth > 2; returns FALSE
+    # (force DOOR) on shallow levels without consuming RNG.
+    # Vendor cite: vendor/nethack/src/mklev.c:1793-1795
+    if depth > 2:
+        rng, r8 = rn2_jax(rng, jnp.int32(8))
+        is_door_kind = r8 != jnp.int32(0)
+    else:
+        is_door_kind = jnp.bool_(True)  # forced DOOR, no draw
 
     # Avoid SDOORs on already-made doors: if !IS_WALL(typ), force DOOR.
     cur = gs.typ[x, y]
@@ -863,6 +874,7 @@ def join(
     a_idx: jnp.ndarray,
     b_idx: jnp.ndarray,
     nxcor: jnp.ndarray,
+    depth: int = 1,
 ) -> tuple["Isaac64State", "LevelGenState"]:
     """Vendor mklev.c:243-316 join.
 
@@ -946,7 +958,7 @@ def join(
         # actually fires.  We mirror with lax.cond.
         def call_first_dodoor(rg):
             r_, g_ = rg
-            return dodoor(r_, g_, xx, yy)
+            return dodoor(r_, g_, xx, yy, depth=depth)
         ok = okdoor(g, xx, yy) | ~nxcor
         first_gate = ok & ~nxcor_block
         r, g = lax.cond(first_gate, call_first_dodoor, lambda rg: rg, (r, g))
@@ -965,7 +977,7 @@ def join(
 
         def call_second_dodoor(rg):
             r_, g_ = rg
-            return dodoor(r_, g_, ttx, tty)
+            return dodoor(r_, g_, ttx, tty, depth=depth)
         r, g = lax.cond(second_gate, call_second_dodoor, lambda rg: rg, (r, g))
 
         # smeq union (vendor:312-315) — no RNG.
@@ -997,6 +1009,7 @@ def makecorridors(
     gs: "LevelGenState",
     rooms: "RoomsBox",
     nroom: jnp.ndarray,
+    depth: int = 1,
 ) -> tuple["Isaac64State", "LevelGenState"]:
     """Vendor mklev.c:319-348 makecorridors.
 
@@ -1017,7 +1030,7 @@ def makecorridors(
         # Vendor draws rn2(50) AFTER the join (mklev.c:325-327).
         def do_step(rg):
             r_, g_ = rg
-            r_, g_ = join(r_, g_, rooms, jnp.int32(i), jnp.int32(i) + jnp.int32(1), jnp.bool_(False))
+            r_, g_ = join(r_, g_, rooms, jnp.int32(i), jnp.int32(i) + jnp.int32(1), jnp.bool_(False), depth=depth)
             r_, r50 = rn2_jax(r_, jnp.int32(50))
             broken_new = r50 == jnp.int32(0)
             return r_, g_, broken_new
@@ -1044,7 +1057,7 @@ def makecorridors(
                 differ,
                 lambda rg2: join(rg2[0], rg2[1], rooms,
                                   jnp.int32(i), jnp.int32(i) + jnp.int32(2),
-                                  jnp.bool_(False)),
+                                  jnp.bool_(False), depth=depth),
                 lambda rg2: rg2,
                 (r_, g_),
             )
@@ -1071,7 +1084,7 @@ def makecorridors(
                     def call_join(rg2):
                         return join(rg2[0], rg2[1], rooms,
                                     jnp.int32(a), jnp.int32(b),
-                                    jnp.bool_(False))
+                                    jnp.bool_(False), depth=depth)
                     r3, g3 = lax.cond(differ, call_join, lambda rg2: rg2, (r2, g2))
                     return r3, g3, _any | differ
                 return lax.cond(inner_active, do_inner, lambda rg: rg, (r_i, g_i, any_i))
@@ -1095,7 +1108,7 @@ def makecorridors(
         r, a = rn2_jax(r, nroom_safe)
         r, b = rn2_jax(r, nm2_safe)
         b = jnp.where(b >= a, b + jnp.int32(2), b)
-        return join(r, g, rooms, a, b, jnp.bool_(True))
+        return join(r, g, rooms, a, b, jnp.bool_(True), depth=depth)
 
     def do_p4(carry):
         r, g = carry
@@ -1169,16 +1182,29 @@ def _makeniche(
     rooms: "RoomsBox",
     nroom: jnp.ndarray,
     trap_type: jnp.ndarray,
+    depth: int = 1,
 ) -> tuple["Isaac64State", "LevelGenState"]:
     """Vendor mklev.c:483-546 makeniche.
 
     Loops up to vct=8 attempts.  Per attempt:
         rn2(nroom)         room pick
-        rn2(5)             doorct==1 gate
-        (place_niche draws)
-        rn2(4)             trap_type==0 path gate
-        (then trap+dosdoor or corridor path with rn2(7), rn2(5), rn2(5),
-         rn2(3), rn2(3) inside)
+        rn2(5)             doorct==1 gate (drawn when room is OROOM)
+        (place_niche draws: rn2(2) + finddpos rn1 pair)
+        rn2(4)             SCORR-vs-CORR gate (vendor:504)
+
+        SCORR branch: dosdoor(xx, yy, SDOOR)
+            → dosdoor SDOOR draws: rn2(5) locked-vs-closed
+              [+rn2(20) if depth>=4, skipped on shallow levels]
+
+        CORR branch:
+            rn2(7)         door-vs-inaccessible gate (vendor:525)
+            if rn2(7)!=0:  rn2(5) SDOOR-vs-DOOR pick (vendor:526)
+                           dosdoor(xx, yy, type)  — DOOR or SDOOR draws
+            else:          rn2(5) ironbars gate (vendor:529)
+                           [rn2(3) corpse if ironbars fires] (vendor:531)
+                           rn2(3) mkobj gate (vendor:533)
+
+    Vendor cite: vendor/nethack/src/mklev.c:483-546 makeniche.
     """
     nroom_i = nroom.astype(jnp.int32)
 
@@ -1197,34 +1223,143 @@ def _makeniche(
         # place_niche
         r, pok, xx, yy, _dy = _place_niche(r, g, rooms, aidx)
 
-        # rn2(4) — trap_type || !rn2(4) gate (vendor:504)
+        # rn2(4) — SCORR vs CORR branch (vendor mklev.c:504)
         r, r4 = rn2_jax(r, jnp.int32(4))
         scorr_branch = (trap_type != jnp.int32(0)) | (r4 == jnp.int32(0))
 
-        # CORR-branch draws (vendor:525-540): rn2(7), rn2(5), rn2(5), rn2(3), rn2(3)
-        r, r7   = rn2_jax(r, jnp.int32(7))
-        r, r5b  = rn2_jax(r, jnp.int32(5))
-        r, r5c  = rn2_jax(r, jnp.int32(5))
-        r, r3a  = rn2_jax(r, jnp.int32(3))
-        r, r3b  = rn2_jax(r, jnp.int32(3))
-        del r7, r5b, r5c, r3a, r3b
+        # SCORR branch: dosdoor(xx, yy, aroom, SDOOR) — vendor mklev.c:476.
+        # Draws: rn2(5) locked-vs-closed [+rn2(20) if depth>=4].
+        # We call via lax.cond so draws only fire on the SCORR path.
+        # Vendor cite: vendor/nethack/src/mklev.c:476,615-675 dosdoor SDOOR.
+        def _scorr_path(rg):
+            r_, g_ = rg
+            # dosdoor called with explicit SDOOR — skip rn2(8) (no maybe_sdoor).
+            # SDOOR branch of dosdoor: rn2(5) locked-vs-closed, then depth gate.
+            r_, r5s = rn2_jax(r_, jnp.int32(5))
+            sdoor_locked = r5s == jnp.int32(0)
+            mask_s = jnp.where(sdoor_locked, jnp.int8(DMASK_LOCKED), jnp.int8(DMASK_CLOSED))
+            # depth>=4 trap gate for SDOOR: skip on shallow levels (Phase 4 default).
+            # Vendor cite: mklev.c:671 !rn2(20) depth>=4
+            if depth >= 4:
+                r_, _r20 = rn2_jax(r_, jnp.int32(20))
+            new_typ = g_.typ.at[xx, yy].set(jnp.int8(VTILE_SDOOR))
+            new_dm  = g_.doormask.at[xx, yy].set(mask_s)
+            idx = jnp.clip(g_.doorindex, 0, DOORMAX - 1)
+            new_dx = g_.door_x.at[idx].set(xx.astype(jnp.int8))
+            new_dy = g_.door_y.at[idx].set(yy.astype(jnp.int8))
+            new_di = g_.doorindex + jnp.int32(1)
+            return r_, LevelGenState(
+                typ=new_typ, doormask=new_dm,
+                door_x=new_dx, door_y=new_dy,
+                doorindex=new_di, smeq=g_.smeq,
+            )
 
-        # Carve niche tile (vendor:524, 505).  We do this only when pok and
-        # not already done.
+        # CORR branch: vendor mklev.c:477-540.
+        # Draws rn2(7), then either door-type path or inaccessible-niche path.
+        # Vendor cite: vendor/nethack/src/mklev.c:525-540.
+        def _corr_path(rg):
+            r_, g_ = rg
+            r_, r7 = rn2_jax(r_, jnp.int32(7))
+            has_door = r7 != jnp.int32(0)
+
+            # rn2(7)!=0 sub-path: rn2(5) pick + dosdoor (vendor:526).
+            def _corr_door(rg2):
+                r2, g2 = rg2
+                r2, r5d = rn2_jax(r2, jnp.int32(5))
+                # rn2(5)!=0 → SDOOR, ==0 → DOOR (vendor:526: rn2(5)?SDOOR:DOOR)
+                use_sdoor = r5d != jnp.int32(0)
+                # Call dosdoor inline: skip rn2(8) (explicit type already known).
+                # For DOOR branch: rn2(3), rn2(5), rn2(6); depth>=5 rn2(25).
+                # For SDOOR branch: rn2(5); depth>=4 rn2(20).
+                # Vendor cite: mklev.c:615-675 dosdoor.
+                def _door_type(r3):
+                    r3, r3v  = rn2_jax(r3, jnp.int32(3))
+                    r3, r5v  = rn2_jax(r3, jnp.int32(5))
+                    r3, r6v  = rn2_jax(r3, jnp.int32(6))
+                    if depth >= 5:
+                        r3, _r25 = rn2_jax(r3, jnp.int32(25))
+                    door_path = r3v == jnp.int32(0)
+                    door_open = r5v == jnp.int32(0)
+                    door_lock = (~door_open) & (r6v == jnp.int32(0))
+                    mask_d = jnp.where(door_open,  jnp.int8(DMASK_ISOPEN),
+                             jnp.where(door_lock,  jnp.int8(DMASK_LOCKED),
+                                                   jnp.int8(DMASK_CLOSED)))
+                    mask_d = jnp.where(door_path, mask_d, jnp.int8(DMASK_NODOOR))
+                    return r3, mask_d
+
+                def _sdoor_type(r3):
+                    r3, r5s = rn2_jax(r3, jnp.int32(5))
+                    if depth >= 4:
+                        r3, _r20 = rn2_jax(r3, jnp.int32(20))
+                    mask_s = jnp.where(r5s == jnp.int32(0),
+                                       jnp.int8(DMASK_LOCKED), jnp.int8(DMASK_CLOSED))
+                    return r3, mask_s
+
+                r2, door_mask = lax.cond(use_sdoor, _sdoor_type, _door_type, r2)
+                new_tile = jnp.where(use_sdoor, jnp.int8(VTILE_SDOOR), jnp.int8(VTILE_DOOR))
+                new_typ = g2.typ.at[xx, yy].set(new_tile)
+                new_dm  = g2.doormask.at[xx, yy].set(door_mask)
+                idx = jnp.clip(g2.doorindex, 0, DOORMAX - 1)
+                new_dx = g2.door_x.at[idx].set(xx.astype(jnp.int8))
+                new_dy = g2.door_y.at[idx].set(yy.astype(jnp.int8))
+                new_di = g2.doorindex + jnp.int32(1)
+                return r2, LevelGenState(
+                    typ=new_typ, doormask=new_dm,
+                    door_x=new_dx, door_y=new_dy,
+                    doorindex=new_di, smeq=g2.smeq,
+                )
+
+            # rn2(7)==0 sub-path: inaccessible niche (vendor:529-540).
+            # Draws: rn2(5) ironbars gate, cond rn2(3) corpse, rn2(3) mkobj.
+            # No dosdoor call on this path.
+            # Vendor cite: mklev.c:529-540.
+            def _corr_inaccessible(rg2):
+                r2, g2 = rg2
+                r2, r5i = rn2_jax(r2, jnp.int32(5))   # !rn2(5) ironbars gate
+                ironbars = r5i == jnp.int32(0)
+
+                def _ironbars_true(r3):
+                    # rn2(3) corpse gate (vendor:531)
+                    r3, r3c = rn2_jax(r3, jnp.int32(3))
+                    del r3c  # no object layer yet
+                    return r3
+
+                r2 = lax.cond(ironbars, _ironbars_true, lambda r3: r3, r2)
+                # rn2(3) mkobj gate (vendor:533) — drawn unconditionally
+                r2, _r3mk = rn2_jax(r2, jnp.int32(3))
+                return r2, g2
+
+            r_, g_ = lax.cond(has_door, _corr_door, _corr_inaccessible, (r_, g_))
+            return r_, g_
+
+        # Route through the two branches only when pok and not already done.
+        # Vendor returns immediately after first successful placement (vct--
+        # early-return).  We gate on pok & ~done so post-success iterations
+        # are no-ops on state.
+        do_place = pok & ~done
+
+        # Carve niche tile (vendor:477/505) — only on first success.
         new_tile = jnp.where(scorr_branch, jnp.int8(VTILE_SCORR), jnp.int8(VTILE_CORR))
-        do_set = pok & ~done
-        new_typ = lax.cond(
-            do_set,
-            lambda t: t.at[xx, yy].set(new_tile),  # placeholder y+dy slot
-            lambda t: t,
-            g.typ,
-        )
-        g_new = LevelGenState(
-            typ=new_typ, doormask=g.doormask,
+        g = LevelGenState(
+            typ=lax.cond(
+                do_place,
+                lambda t: t.at[xx, yy].set(new_tile),
+                lambda t: t,
+                g.typ,
+            ),
+            doormask=g.doormask,
             door_x=g.door_x, door_y=g.door_y,
             doorindex=g.doorindex, smeq=g.smeq,
         )
-        return (r, g_new, done | pok)
+
+        # Branch draws — only fire on first successful placement.
+        def _place_draws(rg):
+            r_, g_ = rg
+            return lax.cond(scorr_branch, _scorr_path, _corr_path, (r_, g_))
+
+        r, g = lax.cond(do_place, _place_draws, lambda rg: rg, (r, g))
+
+        return (r, g, done | pok)
 
     rng, gs, _ = lax.fori_loop(0, 8, attempt, (rng, gs, jnp.bool_(False)))
     return rng, gs
@@ -1288,7 +1423,7 @@ def make_niches(
 
         trap_type = jnp.where(lt_fire, LEVEL_TELEP,
                     jnp.where(vamp_fire, TRAPDOOR, NO_TRAP))
-        r, g = _makeniche(r, g, rooms, nroom_i, trap_type)
+        r, g = _makeniche(r, g, rooms, nroom_i, trap_type, depth=depth)
 
         return (r, g, ltptr & ~lt_fire, vamp & ~vamp_fire)
 

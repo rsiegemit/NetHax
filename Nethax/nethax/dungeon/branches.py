@@ -910,9 +910,12 @@ def generate_main_branch_l1(
             active=active,
         )
         _lgs = _vendor_make_lgs()
-        # mklev.c:734 — makecorridors(rooms, nroom).
+        # mklev.c:734 — makecorridors(rooms, nroom).  ``depth=1`` on
+        # Main Dlvl 1 gates maybe_sdoor: depth>2 is false so dodoor skips
+        # the rn2(8) draw and forces DOOR on every corridor endpoint.
+        # Vendor cite: vendor/nethack/src/mklev.c:1793-1795 maybe_sdoor.
         vendor_rng, _lgs = _vendor_makecorridors(
-            vendor_rng, _lgs, _rooms_box, nroom_int,
+            vendor_rng, _lgs, _rooms_box, nroom_int, depth=1,
         )
         # mklev.c:735 — make_niches(rooms, nroom).  ``depth=1`` on
         # Main Dlvl 1 short-circuits both the ltptr (depth > 15) and
