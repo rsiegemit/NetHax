@@ -330,26 +330,61 @@ class NethaxEnv:
         # NLE_BYTEPARITY the per-room y/x/h/w/lit draws consume the same
         # stream as vendor C; in default Threefry mode this is a no-op.
         vendor_rng_for_gen = state.vendor_rng if use_vendor_rng() else None
-        (
-            terrain,
-            _rooms,
-            _active,
-            up_pos,
-            down_pos,
-            new_features,
-            new_traps,
-            vendor_rng_after_gen,
-        ) = generate_main_branch_l1_with_features(
-            rng_level,
-            self.static,
-            state.features,
-            state.traps,
-            flat_lv=0,
-            depth=1,
-            player_align=int(alignment),
-            n_rooms=n_rooms_vendor,
-            vendor_rng=vendor_rng_for_gen,
-        )
+        # Vendor cite: vendor/nle/src/mklev.c:813-817 — the per-OROOM
+        # sleeping-monster spawn is the FIRST draw in each
+        # ``fill_ordinary_room`` iteration (before traps/gold/fountain/
+        # etc).  Under NLE_BYTEPARITY we now thread ``state`` into
+        # :func:`generate_main_branch_l1_with_features` so the monster
+        # spawn interleaves with each room's fills inside
+        # ``fill_ordinary_rooms`` — see
+        # :func:`Nethax.nethax.dungeon.spawning._populate_oroom_single`
+        # which is invoked as step 1 of each per-OROOM iteration.  The
+        # separate ``populate_level_with_monsters`` post-fill call is no
+        # longer required.
+        if use_vendor_rng():
+            (
+                terrain,
+                _rooms,
+                _active,
+                up_pos,
+                down_pos,
+                new_features,
+                new_traps,
+                vendor_rng_after_gen,
+                state,
+            ) = generate_main_branch_l1_with_features(
+                rng_level,
+                self.static,
+                state.features,
+                state.traps,
+                flat_lv=0,
+                depth=1,
+                player_align=int(alignment),
+                n_rooms=n_rooms_vendor,
+                vendor_rng=vendor_rng_for_gen,
+                state=state,
+            )
+        else:
+            (
+                terrain,
+                _rooms,
+                _active,
+                up_pos,
+                down_pos,
+                new_features,
+                new_traps,
+                vendor_rng_after_gen,
+            ) = generate_main_branch_l1_with_features(
+                rng_level,
+                self.static,
+                state.features,
+                state.traps,
+                flat_lv=0,
+                depth=1,
+                player_align=int(alignment),
+                n_rooms=n_rooms_vendor,
+                vendor_rng=vendor_rng_for_gen,
+            )
         state = state.replace(
             terrain=state.terrain.at[0, 0].set(terrain),
             player_pos=up_pos.astype(jnp.int16),
@@ -360,30 +395,12 @@ class NethaxEnv:
         if use_vendor_rng() and vendor_rng_after_gen is not None:
             state = state.replace(vendor_rng=vendor_rng_after_gen)
 
-        # Populate level 1 with monsters after dungeon gen.  Vendor's
-        # sleeping-monster spawn is a per-OROOM loop, NOT a level-wide
-        # count loop — exactly one potential spawn per ordinary room,
-        # gated by ``!rn2(3)`` (vendor/nle/src/mklev.c:813-817).  The
-        # prior ``rnd((nroom>>1)+1)`` site cited here drove
-        # ``make_niches`` (mklev.c:551), not monsters.
-        #
-        # Pass the ``_rooms`` pytree + ``_active`` mask returned from
-        # generate_main_branch_l1_with_features so populate iterates
-        # active OROOM slots host-side and applies the vendor
-        # rn2(3)+somex/somey+makemon cascade per room.
-        #
-        # Under NLE_BYTEPARITY, thread the Isaac64State through the
-        # per-room rn2(3) gate, somex/somey draws, and the per-monster
-        # HP + makemon-post-HP cascade so the ISAAC64 byte stream
-        # matches vendor C; the updated state is written back into
-        # ``state.vendor_rng``.
-        if use_vendor_rng():
-            state = populate_level_with_monsters(
-                state, rng_monsters,
-                rooms=_rooms, active=_active,
-                vendor_rng=state.vendor_rng,
-            )
-        else:
+        # Threefry-only fallback: when NLE_BYTEPARITY is off, the
+        # in-loop per-OROOM monster spawn is skipped (it requires the
+        # vendor_rng path).  Drive the legacy host-side per-OROOM
+        # populate as a separate pass.  Vendor cite:
+        # vendor/nle/src/mklev.c:813-817.
+        if not use_vendor_rng():
             state = populate_level_with_monsters(
                 state, rng_monsters,
                 rooms=_rooms, active=_active,

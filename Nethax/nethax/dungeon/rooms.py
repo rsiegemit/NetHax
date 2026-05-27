@@ -1480,6 +1480,8 @@ def fill_ordinary_rooms(
     player_align: int = 1,
     vendor_rng: Isaac64State | None = None,
     nroom: jnp.ndarray | None = None,
+    state=None,
+    monster_rng=None,
 ):
     """Apply per-room independent feature rolls to every ordinary room.
 
@@ -1538,12 +1540,26 @@ def fill_ordinary_rooms(
                       (vendor ``svn.nroom``).  Used for box gate
                       ``rn2(nroom*5/2)`` (mklev.c:853).  When ``None``,
                       computed as ``jnp.sum(active)``.
+        state:        optional EnvState — when supplied alongside
+                      ``vendor_rng``, the per-OROOM sleeping-monster
+                      spawn (vendor/nle/src/mklev.c:813-817) runs as
+                      step 1 of each room's iteration, interleaved with
+                      the room's feature/trap fills.  When ``None``,
+                      monster spawning is deferred to the caller (legacy
+                      path).
+        monster_rng:  optional JAX PRNG key — only used as a fallback for
+                      the threefry path inside the per-OROOM monster
+                      spawn (the vendor_rng path uses ``vendor_rng``).
 
     Returns:
-        ``(terrain, features, traps, vendor_rng_out)`` — updated in-place
-        via functional ops.  ``vendor_rng_out`` is the threaded
-        :class:`Isaac64State` when ``vendor_rng`` was supplied, otherwise
-        it is the input ``vendor_rng`` (``None``) passed through.
+        ``(terrain, features, traps, vendor_rng_out)`` when ``state`` is
+        ``None`` (legacy 4-tuple).  When ``state`` is supplied, returns
+        ``(terrain, features, traps, vendor_rng_out, state_out)`` so the
+        caller can pick up the monster_ai writes produced by the
+        in-loop sleeping-monster spawn.  ``vendor_rng_out`` is the
+        threaded :class:`Isaac64State` when ``vendor_rng`` was supplied,
+        otherwise it is the input ``vendor_rng`` (``None``) passed
+        through.
     """
     from Nethax.nethax.constants.tiles import TileType
     FLOOR    = jnp.int8(int(TileType.FLOOR))
@@ -2364,22 +2380,81 @@ def fill_ordinary_rooms(
             jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
         )
         vendor_rng_out = vendor_rng  # passthrough (still None)
+        state_out = state  # unchanged in threefry path
     else:
-        init_state = (
-            terrain,
-            features.altar_alignment,
-            features.lit,
-            traps.trap_type,
-            vendor_rng,
-        )
-        (terrain_out, aa_out, lit_out, tt_out, vendor_rng_out), _ = lax.scan(
-            fill_one_isaac,
-            init_state,
-            jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
-        )
+        # Vendor cite: vendor/nle/src/mklev.c:813-817 — the per-OROOM
+        # sleeping-monster spawn (line 813) is the FIRST draw of each
+        # ``fill_ordinary_room`` iteration, before the trap/gold/
+        # fountain/etc fills (lines 825-883).  To preserve that draw
+        # order on the ISAAC64 byte stream, we drive the per-room loop
+        # host-side (Python ``for``) instead of ``lax.scan``, calling
+        # :func:`_populate_oroom_single` as step 1 and then the JIT'd
+        # ``fill_one_isaac`` body for steps 2-onwards (traps, gold,
+        # fountain, sink, altar, grave, statue, box, graffiti, mkobj).
+        # ``fill_one_isaac`` still JIT-compiles per call (the body is
+        # pure JAX ops on the threaded carry), so the only host-side
+        # work is the slot allocator + per-room dispatch.
+        if state is not None:
+            from Nethax.nethax.dungeon.spawning import (
+                _populate_oroom_single,
+                _PEACE_MINDED_TABLE,
+            )
+
+            # Pull room arrays to host (small int arrays of length 40).
+            active_np = jax.device_get(active)
+            rtype_np  = jax.device_get(rooms.room_type)
+            y1_np     = jax.device_get(rooms.y1)
+            x1_np     = jax.device_get(rooms.x1)
+            y2_np     = jax.device_get(rooms.y2)
+            x2_np     = jax.device_get(rooms.x2)
+            rooms_arrays = (active_np, rtype_np, y1_np, x1_np, y2_np, x2_np)
+
+            player_align_bucket_val = int(jnp.clip(
+                state.player_align.astype(jnp.int32) + jnp.int32(1),
+                0, _PEACE_MINDED_TABLE.shape[1] - 1,
+            ))
+        else:
+            rooms_arrays = None
+            player_align_bucket_val = 0
+
+        terrain_out = terrain
+        aa_out = features.altar_alignment
+        lit_out = features.lit
+        tt_out = traps.trap_type
+        vendor_rng_out = vendor_rng
+        state_out = state
+        next_slot = 0
+        m_rng = monster_rng if monster_rng is not None else rng
+
+        for i in range(MAX_ROOMS_PER_LEVEL):
+            # --- Step 1: sleeping-monster spawn (vendor mklev.c:813-817) ---
+            # Interleaved with each room's fill so the ISAAC64 byte stream
+            # matches vendor's per-OROOM draw order.  No-op when ``state``
+            # is None (legacy caller drives the spawn separately).
+            if state is not None:
+                (
+                    state_out, m_rng, vendor_rng_out, next_slot,
+                ) = _populate_oroom_single(
+                    state_out, m_rng, rooms_arrays, i, next_slot,
+                    player_align_bucket_val, vendor_rng=vendor_rng_out,
+                )
+
+            # --- Steps 2-onwards: traps/gold/fountain/sink/altar/grave/
+            # statue/box/graffiti/mkobj — vendor mklev.c:825-883.
+            (terrain_out, aa_out, lit_out, tt_out, vendor_rng_out), _ = (
+                fill_one_isaac(
+                    (terrain_out, aa_out, lit_out, tt_out, vendor_rng_out),
+                    jnp.int32(i),
+                )
+            )
+
+        if state is not None:
+            state_out = state_out.replace(vendor_rng=vendor_rng_out)
     new_features = features.replace(altar_alignment=aa_out, lit=lit_out)
     new_traps    = traps.replace(trap_type=tt_out)
-    return terrain_out, new_features, new_traps, vendor_rng_out
+    if state is None:
+        return terrain_out, new_features, new_traps, vendor_rng_out
+    return terrain_out, new_features, new_traps, vendor_rng_out, state_out
 
 
 # ---------------------------------------------------------------------------

@@ -999,6 +999,7 @@ def generate_main_branch_l1_with_features(
     player_align: int = 1,
     n_rooms: int = 8,
     vendor_rng=None,
+    state=None,
 ):
     """Generate Main Dlvl 1 and apply per-room feature/trap rolls + vault.
 
@@ -1035,6 +1036,11 @@ def generate_main_branch_l1_with_features(
 
         ``vendor_rng_out`` is the threaded :class:`Isaac64State` when
         ``vendor_rng`` was supplied; otherwise it's ``None`` (passthrough).
+
+        When ``state`` is supplied alongside ``vendor_rng``, the return
+        is extended with a trailing ``state_out`` slot carrying the
+        monster_ai writes produced by the in-loop per-OROOM sleeping-
+        monster spawn (vendor/nle/src/mklev.c:813-817).
     """
     # Import here to avoid circular dependency at module load time.
     from Nethax.nethax.dungeon.rooms import (
@@ -1044,7 +1050,7 @@ def generate_main_branch_l1_with_features(
     )
     from Nethax.nethax.dungeon.mineralize import mineralize as _mineralize
 
-    k_level, k_fill, k_vault, k_niche = jax.random.split(rng, 4)
+    k_level, k_fill, k_vault, k_niche, k_monster = jax.random.split(rng, 5)
 
     # ------------------------------------------------------------------
     # Vendor call order — vendor/nle/src/mklev.c::makelevel (652-886) and
@@ -1092,11 +1098,28 @@ def generate_main_branch_l1_with_features(
     # feature/trap rolls).  Runs AFTER the vault block in vendor C.
     # Thread vendor_rng so per-room rn2/somexy draws come from the
     # ISAAC64 stream under NLE_BYTEPARITY (byte-exact with vendor C).
-    terrain, features, traps, vendor_rng = fill_ordinary_rooms(
-        k_fill, rooms, active, terrain, features, traps,
-        flat_lv=flat_lv, depth=depth, player_align=player_align,
-        vendor_rng=vendor_rng,
-    )
+    #
+    # When ``state`` is supplied (NLE_BYTEPARITY reset path), the
+    # per-OROOM sleeping-monster spawn (vendor mklev.c:813-817) runs as
+    # step 1 of each room iteration INSIDE :func:`fill_ordinary_rooms`,
+    # interleaved with that room's feature/trap fills.  The returned
+    # ``state_out`` carries the monster_ai writes; the separate
+    # post-fill ``populate_level_with_monsters`` call is no longer
+    # needed.  When ``state`` is ``None``, the legacy 4-tuple is
+    # returned and monster spawning is deferred to the caller.
+    if state is not None and vendor_rng is not None:
+        terrain, features, traps, vendor_rng, state = fill_ordinary_rooms(
+            k_fill, rooms, active, terrain, features, traps,
+            flat_lv=flat_lv, depth=depth, player_align=player_align,
+            vendor_rng=vendor_rng,
+            state=state, monster_rng=k_monster,
+        )
+    else:
+        terrain, features, traps, vendor_rng = fill_ordinary_rooms(
+            k_fill, rooms, active, terrain, features, traps,
+            flat_lv=flat_lv, depth=depth, player_align=player_align,
+            vendor_rng=vendor_rng,
+        )
 
     # vendor/nle/src/mklev.c::mineralize line 1006 — called from mklev()
     # AFTER makelevel() returns, i.e. after fill_ordinary_rooms.  Thread
@@ -1114,6 +1137,8 @@ def generate_main_branch_l1_with_features(
     # the vendor_rng (ISAAC64) byte-parity stream.
     terrain = _place_niches(terrain, rooms, active, k_niche, n=2)
 
+    if state is not None:
+        return terrain, rooms, active, up_pos, dn_pos, features, traps, vendor_rng, state
     return terrain, rooms, active, up_pos, dn_pos, features, traps, vendor_rng
 
 
