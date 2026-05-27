@@ -2047,10 +2047,9 @@ def fill_ordinary_rooms(
         #                                              + mksobj_init cascade
         #   if (dobell) mksobj_at(BELL, ...);       # TOOL_CLASS mksobj_init
         # All draws short-circuited behind the !rn2(grave_x) gate.
-        # We model the leading dobell + somexy + gold-gate scalars; the
-        # tryct mkobj loop and bell mksobj_init are not yet modelled
-        # (potential under-draw on grave-hit; <1.25% probability per room).
-        # Vendor cite: vendor/nle/src/mklev.c:840-841, 1642-1693.
+        # Full cascade modelled: dobell + somexy + gold-gate scalars +
+        # tryct mkobj(RANDOM_CLASS) loop + dobell-gated mksobj_at(BELL).
+        # Vendor cite: vendor/nle/src/mklev.c:1642-1693.
         vrng, grave_roll_v = randint_jax(vrng, (), 0, grave_x)
         grave_roll = grave_roll_v == jnp.int32(0)
         place_grave = is_ordinary & grave_roll
@@ -2061,18 +2060,52 @@ def fill_ordinary_rooms(
             v, rg2_, cg2_ = somexy(v)                      # somexy placement
             v, _gold_gate_g = randint_jax(v, (), 0, 3)    # rn2(3) gold-fill gate
             # rnd(20) + level_diff*rnd(5) inside the gold-fill branch.
+            # Vendor mkgrave mklev.c:1671-1676: mksobj(GOLD_PIECE); quan = rnd(20)+rnd(5).
             def _gold_grave_true(vi):
-                vi, _ = randint_jax(vi, (), 1, 21)        # rnd(20)
-                vi, _ = randint_jax(vi, (), 1, 6)         # rnd(5)
+                vi, _ = randint_jax(vi, (), 1, 21)        # rnd(20) — mklev.c:1673
+                vi, _ = randint_jax(vi, (), 1, 6)         # rnd(5)  — mklev.c:1673
                 return vi
             v = lax.cond(
                 _gold_gate_g == jnp.int32(0),
                 _gold_grave_true, lambda vi: vi, v,
             )
-            # rn2(5) for tryct count (the loop body's mkobj cascade is
-            # NOT modelled — see comment above).  Drawing rn2(5) here
-            # consumes the loop-bound draw even when we elide the body.
-            v, _tryct = randint_jax(v, (), 0, 5)
+            # tryct loop — vendor mkgrave mklev.c:1678-1686:
+            #   for (tryct = rn2(5); tryct; tryct--)
+            #       mkobj(RANDOM_CLASS, TRUE);  → rnd(100)-1 + rnd(prob_total) + mksobj_init
+            # lax.fori_loop executes exactly _tryct body iters (JIT-static upper
+            # bound 4 = rn2(5)-1; body is a no-op when idx >= _tryct via cond).
+            # Vendor cite: vendor/nle/src/mklev.c:1678-1686;
+            #              vendor/nle/src/mkobj.c:251-272, 801-1069.
+            v, _tryct = randint_jax(v, (), 0, 5)          # rn2(5) — mklev.c:1678
+
+            def _tryct_body(idx, vi):
+                def _do_mkobj(vj):
+                    vj, cls_roll = randint_jax(vj, (), 0, 100)   # rnd(100)-1 mkobj.c:259
+                    oclass_g = _MKOBJ_TABLE[cls_roll]
+                    vj, typ_g = randint_jax(vj, (), 1, 1001)     # rnd(prob_total) mkobj.c:265
+                    otyp_g = decode_picked_otyp(oclass_g, typ_g) # mkobj.c:264-266
+                    vj = consume_mksobj_init_draws(vj, oclass_g, otyp_g)  # mkobj.c:801-1069
+                    return vj
+                return lax.cond(
+                    jnp.int32(idx) < _tryct,
+                    _do_mkobj, lambda vj: vj, vi,
+                )
+
+            v = lax.fori_loop(0, 4, _tryct_body, v)
+
+            # dobell branch — vendor mkgrave mklev.c:1689-1690:
+            #   if (dobell) mksobj_at(BELL, m.x, m.y, TRUE, FALSE);
+            # BELL (otyp 230) is TOOL_CLASS with 0 mksobj_init draws
+            # (_TOOL_BR_NOOP); consume_mksobj_init_draws is a no-op here but
+            # kept for fidelity in case the table is ever updated.
+            # Vendor cite: vendor/nle/src/mklev.c:1689-1690;
+            #              vendor/nle/src/mkobj.c:897-966 (TOOL_CLASS dispatch).
+            v = lax.cond(
+                _dobell == jnp.int32(0),
+                lambda vi: consume_mksobj_init_draws(vi, jnp.int32(6), jnp.int32(230)),
+                lambda vi: vi,
+                v,
+            )
             new_t = t.at[rg2_, cg2_].set(GRAVE)
             return (v, new_t)
 
