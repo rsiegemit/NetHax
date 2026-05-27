@@ -63,6 +63,8 @@ from Nethax.nethax.constants.monsters import (
     M2_MERC,
     M2_STRONG,
     M2_NEUTER,
+    M2_FEMALE,
+    M2_MALE,
     M2_DEMON,
     M2_LORD,
     M2_PRINCE,
@@ -351,6 +353,43 @@ _BASE_AC: jnp.ndarray = _compute_base_ac()                   # [NUMMONS] int8
 _ATK_DICE_N, _ATK_DICE_S = _compute_primary_attack_dice()    # [NUMMONS] int8 each
 _IS_NEUTER: jnp.ndarray = _compute_is_neuter()               # [NUMMONS] bool
 _IS_ARMED: jnp.ndarray = _compute_is_armed()                 # [NUMMONS] bool
+
+
+def _compute_has_fixed_gender() -> jnp.ndarray:
+    """True where M2_FEMALE or M2_MALE flag2 is set.
+
+    Vendor (vendor/nle/src/makemon.c:1214-1226):
+        if (is_female(ptr))   mtmp->female = TRUE;
+        else if (is_male(ptr)) mtmp->female = FALSE;
+        ... (quest leader/nemesis preset) ...
+        else mtmp->female = rn2(2);
+
+    is_female/is_male check M2_FEMALE/M2_MALE (mondata.h:119-120).
+    The rn2(2) draw fires when BOTH bits are absent — G_NEUTER monsters
+    STILL draw rn2(2) (vendor comment "ignored for neuters" describes
+    semantic ignoring; the RNG call still happens).
+    """
+    mask = (int(M2_FEMALE) | int(M2_MALE)) & 0xFFFFFFFF
+    flags = [(int(m.flags2) & 0xFFFFFFFF & mask) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_likes_gold() -> jnp.ndarray:
+    """True where M2_GREEDY flag2 is set.
+
+    Vendor (vendor/nle/include/mondata.h:142):
+        #define likes_gold(ptr) (((ptr)->mflags2 & M2_GREEDY) != 0L)
+    Used by vendor/nle/src/makemon.c:798:
+        if (likes_gold(ptr) && !findgold(mtmp->minvent) && !rn2(5)) ...
+    C short-circuit: rn2(5) ONLY fires when likes_gold is true.
+    """
+    mask = int(M2_GREEDY) & 0xFFFFFFFF
+    flags = [(int(m.flags2) & 0xFFFFFFFF & mask) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+_HAS_FIXED_GENDER: jnp.ndarray = _compute_has_fixed_gender()  # [NUMMONS] bool
+_LIKES_GOLD:       jnp.ndarray = _compute_likes_gold()        # [NUMMONS] bool
 
 
 # ---------------------------------------------------------------------------
@@ -1245,7 +1284,7 @@ _INITWEAP_CASCADE_CAP = 8  # static upper bound on per-monster weapon draws
 
 def _consume_makemon_post_hp_draws(vrng, type_id,
                                    player_align=0, player_align_record=0,
-                                   in_mklev=True):
+                                   in_mklev=True, level_difficulty=1):
     """Consume the post-newmonhp RNG cascade for one monster.
 
     Mirrors vendor/nle/src/makemon.c lines 1214-1386 in draw order:
@@ -1284,13 +1323,14 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         new Isaac64State with the appropriate draws consumed.
     """
     tid = type_id.astype(jnp.int32)
-    is_neuter      = _IS_NEUTER[tid]
+    has_fixed_gen  = _HAS_FIXED_GENDER[tid]
     is_armed       = _IS_ARMED[tid]
     is_dwe         = _IS_DEMON_WORM_EEL[tid]
     is_lworm       = _IS_LONGWORM[tid]
     is_sgrp        = _IS_GROUP_S[tid]
     is_lgrp        = _IS_GROUP_L[tid]
     is_dom         = _IS_DOMESTIC[tid]
+    likes_gold     = _LIKES_GOLD[tid]
     peace_needs    = _PEACE_MINDED_RN2_NEEDED[tid]
     mal            = _MONSTER_MALIGNTYP[tid]
     # Shapeshifter: vendor makemon.c:1356-1368 — pm_to_cham() != NON_PM
@@ -1306,23 +1346,37 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
     # vendor: !!rn2(2 + abs(mal))
     rn2_arg_b = jnp.int32(2) + jnp.abs(mal)
 
-    # --- 1. female draw — vendor makemon.c:1226 ---
+    # --- 1. female draw — vendor makemon.c:1214-1226 ---
+    # Vendor draws rn2(2) ONLY when is_female(ptr) AND is_male(ptr) are
+    # both false (M2_FEMALE/M2_MALE flags absent).  Quest LEADER/NEMESIS
+    # also skip (preset gender), but those never appear in initial-fill
+    # spawning so we approximate with the flag2 gate.  Previously gated
+    # on M2_NEUTER which suppressed draws for neuters (vendor still
+    # draws for neuters — flag means "ignored", not "skipped").
     def _draw_female(v):
         new_v, _ = randint_jax(v, (), 0, 2)
         return new_v
 
-    vrng = jax.lax.cond(is_neuter, lambda v: v, _draw_female, vrng)
+    vrng = jax.lax.cond(has_fixed_gen, lambda v: v, _draw_female, vrng)
 
     # --- 2. peace_minded co-aligned tail — vendor makemon.c:2039-2041 ---
-    # Two rn2 draws fire only for species that reach the tail AND are
-    # co-aligned with the player.
-    def _draw_peace(v):
-        v1, _ = randint_jax(v,  (), 0, rn2_arg_a)
-        v2, _ = randint_jax(v1, (), 0, rn2_arg_b)
-        return v2
-
+    #   return (boolean) (!!rn2(16 + ...) && !!rn2(2 + abs(mal)));
+    # C short-circuit: the SECOND rn2 fires only when the FIRST is
+    # non-zero.  The first returns 0 with probability 1/(16+record).
     peace_fires = peace_needs & co_aligned
-    vrng = jax.lax.cond(peace_fires, _draw_peace, lambda v: v, vrng)
+
+    def _do_peace(v):
+        v1, r1 = randint_jax(v, (), 0, rn2_arg_a)
+
+        def _draw_peace_second(vv):
+            new_v, _ = randint_jax(vv, (), 0, rn2_arg_b)
+            return new_v
+
+        return jax.lax.cond(
+            r1 != jnp.int32(0), _draw_peace_second, lambda vv: vv, v1
+        )
+
+    vrng = jax.lax.cond(peace_fires, _do_peace, lambda v: v, vrng)
 
     # --- 3. in_mklev sleep gate — vendor makemon.c:1319-1322 ---
     #   if ((is_ndemon(ptr) || PM_WUMPUS || PM_LONG_WORM || PM_GIANT_EEL)
@@ -1441,13 +1495,26 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             return nv
         v = jax.lax.cond(is_qmech, _draw_qmech, lambda vv: vv, v)
 
-        # S_LEPRECHAUN: d(level,30) gold — vendor makemon.c:765; capped 8
-        _LEP_DRAW_CAP = _INITWEAP_CASCADE_CAP
+        # S_LEPRECHAUN: d(level_difficulty(), 30) gold — vendor makemon.c:765
+        # Vendor:  mkmonmoney(mtmp, (long) d(level_difficulty(), 30));
+        # d(n, x) rolls EXACTLY n dice of (rn2(x)+1) — n rn2(30) draws.
+        # On Dlvl 1 with depth=1 this is 1 draw (was capped at 8 → over-consumed
+        # 7 extra ISAAC64 draws per leprechaun).
+        ld = jnp.maximum(jnp.int32(level_difficulty), jnp.int32(1))
+
         def _draw_lep(vv):
-            def _body(_, vc):
-                nvc, _ = randint_jax(vc, (), 0, 30)
-                return nvc
-            return jax.lax.fori_loop(0, _LEP_DRAW_CAP, _body, vv)
+            def _cond(carry):
+                _, idx = carry
+                return idx < ld
+
+            def _body(carry):
+                vc, idx = carry
+                nvc, _r = randint_jax(vc, (), 0, 30)
+                return (nvc, idx + jnp.int32(1))
+
+            v_after, _ = jax.lax.while_loop(_cond, _body, (vv, jnp.int32(0)))
+            return v_after
+
         v = jax.lax.cond(is_lep, _draw_lep, lambda vv: vv, v)
 
         # S_DEMON: rn2(4) ice devil gate — vendor makemon.c:770
@@ -1491,13 +1558,24 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             return v3
         v = jax.lax.cond(is_hpr, _draw_hpr, lambda vv: vv, v)
 
-        # --- 7. m_initinv unconditional tail — vendor makemon.c:794,796,798 ---
-        #   if (m_lev > rn2(50))  rnd_defensive_item
-        #   if (m_lev > rn2(100)) rnd_misc_item
-        #   if (likes_gold && !findgold && !rn2(5)) mkmonmoney
+        # --- 7. m_initinv tail — vendor makemon.c:794,796,798 ---
+        #   if ((int) mtmp->m_lev > rn2(50))   rnd_defensive_item
+        #   if ((int) mtmp->m_lev > rn2(100))  rnd_misc_item
+        #   if (likes_gold(ptr) && !findgold(mtmp->minvent) && !rn2(5)) ...
+        # First two rn2 draws ALWAYS fire.  The third is C-short-circuit
+        # gated by likes_gold (M2_GREEDY): rn2(5) is only evaluated when
+        # likes_gold(ptr) is TRUE.  Initial-spawn minvent is empty so
+        # !findgold is always true.  Previously drew rn2(5) for ALL monsters
+        # → over-consumed 1 ISAAC64 draw per non-greedy monster (the
+        # majority of species).
         v, _ = randint_jax(v, (), 0, 50)
         v, _ = randint_jax(v, (), 0, 100)
-        v, _ = randint_jax(v, (), 0, 5)
+
+        def _draw_gold_tail(vv):
+            nv, _ = randint_jax(vv, (), 0, 5)
+            return nv
+
+        v = jax.lax.cond(likes_gold, _draw_gold_tail, lambda vv: vv, v)
 
         return v
 
@@ -1617,6 +1695,7 @@ def spawn_initial_monsters(
                 player_align=player_align,
                 player_align_record=player_align_record,
                 in_mklev=True,
+                level_difficulty=depth,
             )
             pos = _pick_valid_tile(pos_keys[i], valid_tiles_mask, map_h, map_w)
 
