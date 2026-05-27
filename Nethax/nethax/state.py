@@ -341,6 +341,23 @@ class EnvState:
     #       vendor/nle/src/rnd.c (USE_ISAAC64 path).
     vendor_rng: Isaac64State
 
+    # ---- ISAAC64 DISP stream (vendor rnglist[DISP]) ---------------------
+    # NLE keeps TWO independent ISAAC64 streams: CORE (rn2 / game logic)
+    # and DISP (rn2_on_display_rng / glyph + inventory rendering).  Both
+    # are seeded independently from ``nle_seeds_init->seeds[CORE,DISP]``
+    # (vendor/nle/src/nle.c:530-532) and have separate ``rnglist_t``
+    # entries (vendor/nle/src/rnd.c:22-25).  CORE drives gameplay outcomes;
+    # DISP drives passive rendering: ``mon_to_glyph`` /
+    # ``detected_mon_to_glyph`` / ``pet_to_glyph`` per visible monster per
+    # frame (vendor/nle/src/display.c:486-498) and per-slot
+    # ``obj_to_glyph`` calls in the RL inventory callback
+    # (vendor/nle/win/rl/winrl.cc:458).  Modeling DISP as its own pytree
+    # slot lets the obs builders consume from it without polluting CORE,
+    # preserving byte parity on ``glyphs`` and ``inv_glyphs``.
+    # Cite: vendor/nle/src/rnd.c:20-25 ``enum { CORE = 0, DISP = 1 }``;
+    #       vendor/nle/src/hacklib.c:854 ``nle_seeds[CORE,DISP]``.
+    vendor_rng_disp: Isaac64State
+
     # ---- Object-description shuffle (NLE_BYTEPARITY mode) ---------------
     # ``descr_idx[otyp]`` is the shuffled appearance index for canonical
     # type ``otyp`` — mirrors vendor ``objects[otyp].oc_descr_idx`` after
@@ -488,6 +505,11 @@ class EnvState:
             # ISAAC64 vendor RNG — empty by default; populated by env.reset()
             # when parity_mode.use_vendor_rng() is True.
             vendor_rng=Isaac64State.empty(),
+            # ISAAC64 DISP stream — also empty by default; env.reset() seeds
+            # it alongside CORE under NLE_BYTEPARITY.  Cite:
+            # vendor/nle/src/rnd.c:20-25 ``enum { CORE = 0, DISP = 1 }``;
+            # vendor/nle/src/nle.c:530-532 ``set_random(disp, rn2_on_display_rng)``.
+            vendor_rng_disp=Isaac64State.empty(),
             # Object-description shuffle — identity by default; replaced
             # in env.reset() under NLE_BYTEPARITY via
             # obs.glyph_shuffle.compute_descr_shuffle().  Cite:
