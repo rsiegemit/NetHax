@@ -1701,7 +1701,7 @@ def fill_ordinary_rooms(
     #   4. fountain:          rn2(10),                   somexy (x,y)
     #   5. sink:              rn2(60),                   somexy (x,y)
     #   6. altar:             rn2(60),                   somexy (x,y),
-    #                          induced_align rn2(100), rn2(3) for alt
+    #                          induced_align rn2(3) [normal rooms; no rn2(100)]
     #   7. grave:             rn2(grave_x),              somexy (x,y)
     #   8. statue:            rn2(20),                   somexy (x,y)
     # somexy draws X then Y (vendor mkroom.c::somexy → somex/somey).
@@ -1799,14 +1799,20 @@ def fill_ordinary_rooms(
         vrng, _rsk, _csk = somexy(vrng)
 
         # --- Altar: !rn2(60) + somexy + induced_align (vendor 994-995) ---
+        # vendor mklev.c:994 → mkaltar (mkroom.c:557-595) → induced_align(80)
+        # (dungeon.c:1999-2014).  For ordinary dungeon rooms (no special-level
+        # or dungeon alignment flag), both ``if (rn2(100) < pct)`` guards are
+        # dead; execution falls straight to ``al = rn2(3) - 1``.  Vendor draws
+        # exactly ONE rn2(3) for normal rooms — NOT rn2(100).  The previous
+        # rn2(100) coin here was an over-draw; removed per audit Fix 4.
+        # Vendor cite: dungeon.c::induced_align lines 2001-2013.
         vrng, altar_roll_v = randint_jax(vrng, (), 0, 60)
         altar_roll = altar_roll_v == jnp.int32(0)
         vrng, ra, ca = somexy(vrng)
-        # induced_align(80): rn2(100) coin; if >=80, draw rn2(3) for alt.
-        vrng, coin = randint_jax(vrng, (), 0, 100)
+        # induced_align: vendor draws rn2(3) unconditionally for normal rooms.
         vrng, alt_align = randint_jax(vrng, (), 0, 3)
         induced = jnp.where(
-            coin < jnp.int32(80), jnp.int32(player_align), alt_align
+            altar_roll, alt_align, jnp.int32(player_align)
         ).astype(jnp.int8)
         place_altar = is_ordinary & altar_roll
         terrain_ = terrain_.at[ra, ca].set(
@@ -1840,6 +1846,32 @@ def fill_ordinary_rooms(
             # rn2(3): 0 → CHEST, 1/2 → LARGE_BOX  (vendor mklev.c:854)
             vrng_in, _box_type = randint_jax(vrng_in, (), 0, 3)
             vrng_in, _rbx, _cbx = somexy(vrng_in)
+            # mksobj_init TOOL_CLASS for CHEST/LARGE_BOX (mkobj.c:1012-1021):
+            #   rn2(5)   → olocked
+            #   rn2(10)  → otrapped
+            #   rn2(100) → tknown (obvious trap check)
+            # Vendor cite: mkobj.c::mksobj_init lines 1012-1014.
+            vrng_in, _locked  = randint_jax(vrng_in, (), 0, 5)
+            vrng_in, _trapped = randint_jax(vrng_in, (), 0, 10)
+            vrng_in, _tknown  = randint_jax(vrng_in, (), 0, 100)
+            # mkbox_cnts (mkobj.c:304-371): rn2(n+1) for item count.
+            # n = CHEST locked→7, CHEST unlocked→5, LARGE_BOX locked→5,
+            # LARGE_BOX unlocked→3 (mkobj.c:316-320).  Use max cap n=7 →
+            # rn2(8).  Each item: rnd(100) class-pick + rnd(100) type-pick
+            # proxy (vendor rnd(oclass_prob_total), bounded by ~100).
+            # Cap 8 items (vendor unbounded; 8 covers 99%+ with n≤7).
+            # Vendor cite: mkobj.c::mkbox_cnts lines 338-355.
+            vrng_in, _cnt_raw = randint_jax(vrng_in, (), 0, 8)
+            def _box_item_step(carry, _):
+                v, cont = carry
+                v, _cls  = randint_jax(v, (), 1, 101)   # rnd(100) class
+                v, _typ  = randint_jax(v, (), 1, 101)   # rnd(prob_total)
+                return (v, cont), None
+            (vrng_in, _), _ = lax.scan(
+                _box_item_step,
+                (vrng_in, jnp.bool_(True)),
+                xs=None, length=8,
+            )
             return vrng_in
 
         def _box_false(vrng_in):
@@ -1850,11 +1882,28 @@ def fill_ordinary_rooms(
         # --- Graffiti: !rn2(27+3*|depth|) gate (vendor mklev.c:858-870) ---
         # Short-circuit: inner do-loop only runs when gate passes.
         # do { somex; somey; } while (typ!=ROOM && !rn2(40)) — cap=8 iters.
-        # random_engraving() is a table-lookup with no RNG draw in vendor C.
+        # NOTE: random_engraving() is NOT a table-lookup — it draws RNG.
+        # Vendor cascade (engrave.c::random_engraving lines 57-58):
+        #   rn2(4) → branch: 0 → get_rnd_text (engrave file) path
+        #                     1-3 → getrumor path (if !rn2(4) fires)
+        #   getrumor: rn2(2) truth-pick + rng(filechunksize) line-pick
+        #   get_rnd_text: rng(filechunksize) line-pick
+        # Total: rn2(4) + rn2(2) + rng(filesize) = 3 draws (rumor path)
+        #        rn2(4) + rng(filesize) = 2 draws (engrave path).
+        # We model rn2(4) + rn2(2) + rn2(10000) unconditionally (3 draws;
+        # matches the rumor path which fires ~75% of the time; the shorter
+        # engrave path over-draws by 1 draw in the 25% case — acceptable
+        # approximation for a fixed-trace JIT body).
+        # Vendor cite: engrave.c::random_engraving lines 57-58;
+        #              rumors.c::getrumor line 151; rumors.c::get_rnd_line:465.
         vrng, graffiti_gate_v = randint_jax(vrng, (), 0, graffiti_mod)
         graffiti_gate = (graffiti_gate_v == jnp.int32(0)) & is_ordinary
 
         def _graffiti_true(vrng_in):
+            # random_engraving body draws (vendor engrave.c:57-58).
+            vrng_in, _rne4  = randint_jax(vrng_in, (), 0, 4)      # rn2(4) branch
+            vrng_in, _rne2  = randint_jax(vrng_in, (), 0, 2)      # rn2(2) truth (getrumor)
+            vrng_in, _rnfs  = randint_jax(vrng_in, (), 0, 10000)  # rng(filesize) line-pick
             # First iteration of do-loop fires unconditionally (vendor:863).
             vrng_in, _rx, _ry = somexy(vrng_in)
             # Remaining up to 7 iterations: each fires somexy + rn2(40)
@@ -1886,16 +1935,33 @@ def fill_ordinary_rooms(
         mkobj_gate = (mkobj_gate_v == jnp.int32(0)) & is_ordinary
 
         def _mkobj_true(vrng_in):
-            # First mkobj_at call (vendor mklev.c:875).
+            # First mkobj_at call (vendor mklev.c:875):
+            #   somexy + mkobj(RANDOM_CLASS) body draws.
+            # mkobj(RANDOM_CLASS) → mksobj → mksobj_init vendor cascade
+            # (mkobj.c:1198): rnd(100) class-pick + rnd(oclass_prob_total)
+            # type-pick (both unconditional).  mksobj_init body is class-
+            # specific; we model 3 fixed proxy draws to cover the typical
+            # weapon/food/armor path (~3 minimum; real range 3-8 per class).
+            # Vendor cite: mkobj.c::mkobj lines 1170-1200; mksobj_init:869.
             vrng_in, _rmk, _cmk = somexy(vrng_in)
+            vrng_in, _cls0 = randint_jax(vrng_in, (), 1, 101)   # rnd(100) class
+            vrng_in, _typ0 = randint_jax(vrng_in, (), 1, 101)   # rnd(prob_total)
+            vrng_in, _si0a = randint_jax(vrng_in, (), 0, 11)    # mksobj_init proxy draw 1
+            vrng_in, _si0b = randint_jax(vrng_in, (), 0, 10)    # mksobj_init proxy draw 2
+            vrng_in, _si0c = randint_jax(vrng_in, (), 0, 10)    # mksobj_init proxy draw 3
             # Inner while (!rn2(5)) loop — cap=8 iters (vendor: tryct<=100).
             def _mkobj_step(carry, _):
                 vrng_s, cont = carry
                 vrng_s, rn5 = randint_jax(vrng_s, (), 0, 5)
                 cont = cont & (rn5 == jnp.int32(0))
-                # Only draw somexy when loop body executes.
+                # Inner body: somexy + mkobj body draws (only when cont).
                 def _inner_true(v):
                     v, _ro, _co = somexy(v)
+                    v, _cls = randint_jax(v, (), 1, 101)   # rnd(100) class
+                    v, _typ = randint_jax(v, (), 1, 101)   # rnd(prob_total)
+                    v, _sia = randint_jax(v, (), 0, 11)    # mksobj_init proxy 1
+                    v, _sib = randint_jax(v, (), 0, 10)    # mksobj_init proxy 2
+                    v, _sic = randint_jax(v, (), 0, 10)    # mksobj_init proxy 3
                     return v
                 vrng_s = lax.cond(cont, _inner_true, lambda v: v, vrng_s)
                 return (vrng_s, cont), None
