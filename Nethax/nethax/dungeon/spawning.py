@@ -61,10 +61,20 @@ from Nethax.nethax.constants.monsters import (
     M2_GREEDY,
     M2_STRONG,
     M2_NEUTER,
+    M2_DEMON,
+    M2_LORD,
+    M2_PRINCE,
+    M2_MINION,
+    M2_HOSTILE,
+    M2_PEACEFUL,
+    M2_DOMESTIC,
     MS_SOLDIER,
     MS_PRIEST,
     MS_SPELL,
     MS_SELL,
+    MS_LEADER,
+    MS_GUARDIAN,
+    MS_NEMESIS,
 )
 from Nethax.nethax.constants.tiles import TileType
 from Nethax.nethax.subsystems.monster_ai import (
@@ -337,6 +347,143 @@ _BASE_AC: jnp.ndarray = _compute_base_ac()                   # [NUMMONS] int8
 _ATK_DICE_N, _ATK_DICE_S = _compute_primary_attack_dice()    # [NUMMONS] int8 each
 _IS_NEUTER: jnp.ndarray = _compute_is_neuter()               # [NUMMONS] bool
 _IS_ARMED: jnp.ndarray = _compute_is_armed()                 # [NUMMONS] bool
+
+
+# ---------------------------------------------------------------------------
+# Monster-flag masks for the post-newmonhp draw cascade.
+# Cite: vendor/nle/src/makemon.c lines 1226-1386.
+# ---------------------------------------------------------------------------
+
+# Entry indices used by the in_mklev sleep gate (makemon.c:1319-1322:
+#   is_ndemon(ptr) || mndx == PM_WUMPUS || mndx == PM_LONG_WORM
+#                  || mndx == PM_GIANT_EEL).
+# Resolved by name (chunk2.py:wumpus, long worm; chunk6.py:giant eel)
+# to remain robust against future chunk reordering — the comment in
+# populate_level_with_monsters claiming PM_LONG_WORM=118 is a stale
+# index (true index is 113 in the current MONSTERS table).
+def _find_pm_index(name: str) -> int:
+    """Locate a monster entry by name; returns -1 if absent."""
+    for i, m in enumerate(MONSTERS):
+        if m.name == name:
+            return i
+    return -1
+
+_PM_WUMPUS    = _find_pm_index("wumpus")
+_PM_LONG_WORM = _find_pm_index("long worm")
+_PM_GIANT_EEL = _find_pm_index("giant eel")
+
+
+def _compute_is_demon_worm_eel() -> jnp.ndarray:
+    """True where monster is is_ndemon() OR wumpus OR long worm OR giant eel.
+
+    Cite: vendor/nle/src/makemon.c:1319-1322 (in_mklev msleeping gate).
+        is_ndemon(ptr) = is_demon(ptr) && !(M2_LORD|M2_PRINCE)
+        is_demon(ptr) = (mflags2 & M2_DEMON) != 0
+    """
+    M2_DEMON_MASK  = int(M2_DEMON)  & 0xFFFFFFFF
+    M2_LORD_MASK   = int(M2_LORD)   & 0xFFFFFFFF
+    M2_PRINCE_MASK = int(M2_PRINCE) & 0xFFFFFFFF
+    flags = []
+    for i, m in enumerate(MONSTERS):
+        f2 = int(m.flags2) & 0xFFFFFFFF
+        is_ndemon = (f2 & M2_DEMON_MASK) != 0 and (f2 & (M2_LORD_MASK | M2_PRINCE_MASK)) == 0
+        is_special = (i == _PM_WUMPUS) or (i == _PM_LONG_WORM) or (i == _PM_GIANT_EEL)
+        flags.append(bool(is_ndemon or is_special))
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_is_longworm() -> jnp.ndarray:
+    """True only at the PM_LONG_WORM entry index.
+
+    Cite: vendor/nle/src/makemon.c:1336-1348 (initworm(mtmp, rn2(5))).
+    """
+    flags = [(i == _PM_LONG_WORM) for i in range(len(MONSTERS))]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_is_group_s() -> jnp.ndarray:
+    """True where monster has G_SGROUP geno flag.
+
+    Cite: vendor/nle/src/makemon.c:1370 (if ((ptr->geno & G_SGROUP) && rn2(2))).
+    """
+    flags = [(int(m.generation_mask) & G_SGROUP) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_is_group_l() -> jnp.ndarray:
+    """True where monster has G_LGROUP geno flag.
+
+    Cite: vendor/nle/src/makemon.c:1372-1376 (if ptr->geno & G_LGROUP: rn2(3)).
+    """
+    flags = [(int(m.generation_mask) & G_LGROUP) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_is_domestic() -> jnp.ndarray:
+    """True where monster has M2_DOMESTIC flag2.
+
+    Cite: vendor/nle/include/mondata.h:116 (is_domestic).  Drives the
+    saddle check at vendor/nle/src/makemon.c:1386 ``!rn2(100) && is_domestic``.
+    """
+    mask = int(M2_DOMESTIC) & 0xFFFFFFFF
+    flags = [((int(m.flags2) & 0xFFFFFFFF) & mask) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_peace_minded_needs_rn2() -> jnp.ndarray:
+    """True where peace_minded(ptr) reaches the trailing rn2 branches.
+
+    Cite: vendor/nle/src/makemon.c:2003-2042 peace_minded.
+    Vendor draws rn2(16 + record) and rn2(2 + abs(mal)) only when:
+      * NOT always_peaceful (M2_PEACEFUL)
+      * NOT always_hostile  (M2_HOSTILE)
+      * msound NOT in (MS_LEADER, MS_GUARDIAN, MS_NEMESIS)
+      * NOT race_peaceful / race_hostile (skipped here — race masks vary
+        by chosen role; record=0 game-start co-aligned default is the
+        common case which we model with co-aligned + non-minion)
+      * sgn(mal) == sgn(ual)   — co-aligned check (call-site gated)
+      * NOT (mal < 0 && have_amulet)   — game-start: no amulet
+      * NOT is_minion(ptr)
+    Per-monster contribution here covers the species-level filters; the
+    co-aligned check is applied at consume time using the player's
+    alignment + the precomputed maligntyp.
+    """
+    M2_PEACE   = int(M2_PEACEFUL) & 0xFFFFFFFF
+    M2_HOST    = int(M2_HOSTILE)  & 0xFFFFFFFF
+    M2_MIN     = int(M2_MINION)   & 0xFFFFFFFF
+    flags = []
+    for m in MONSTERS:
+        f2  = int(m.flags2) & 0xFFFFFFFF
+        snd = int(m.sound)
+        if (f2 & M2_PEACE) != 0:
+            flags.append(False); continue
+        if (f2 & M2_HOST) != 0:
+            flags.append(False); continue
+        if snd in (int(MS_LEADER), int(MS_GUARDIAN), int(MS_NEMESIS)):
+            flags.append(False); continue
+        if (f2 & M2_MIN) != 0:
+            flags.append(False); continue
+        flags.append(True)
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_monster_maligntyp() -> jnp.ndarray:
+    """Per-monster ``permonst.maligntyp`` (signed alignment magnitude).
+
+    Cite: vendor/nle/src/makemon.c:2006 (mal = ptr->maligntyp).  Used by
+    the peace_minded rn2(2 + abs(mal)) draw at makemon.c:2041.
+    """
+    vals = [int(getattr(m, "alignment", 0)) for m in MONSTERS]
+    return jnp.array(vals, dtype=jnp.int32)
+
+
+_IS_DEMON_WORM_EEL: jnp.ndarray = _compute_is_demon_worm_eel()   # [NUMMONS] bool
+_IS_LONGWORM:       jnp.ndarray = _compute_is_longworm()         # [NUMMONS] bool
+_IS_GROUP_S:        jnp.ndarray = _compute_is_group_s()          # [NUMMONS] bool
+_IS_GROUP_L:        jnp.ndarray = _compute_is_group_l()          # [NUMMONS] bool
+_IS_DOMESTIC:       jnp.ndarray = _compute_is_domestic()         # [NUMMONS] bool
+_PEACE_MINDED_RN2_NEEDED: jnp.ndarray = _compute_peace_minded_needs_rn2()  # [NUMMONS] bool
+_MONSTER_MALIGNTYP: jnp.ndarray = _compute_monster_maligntyp()   # [NUMMONS] int32
 
 
 # ---------------------------------------------------------------------------
@@ -790,33 +937,65 @@ def _pick_valid_tile(
 _INITWEAP_CASCADE_CAP = 8  # static upper bound on per-monster weapon draws
 
 
-def _consume_makemon_post_hp_draws(vrng, type_id):
+def _consume_makemon_post_hp_draws(vrng, type_id,
+                                   player_align=0, player_align_record=0,
+                                   in_mklev=True):
     """Consume the post-newmonhp RNG cascade for one monster.
 
-    Mirrors vendor/nle/src/makemon.c lines 1214-1383 in draw order:
-      * line 1226: ``mtmp->female = rn2(2)`` — drawn iff non-neuter and not
-        explicitly gendered (M2_MALE / M2_FEMALE).  Our flag table folds
-        is_male/is_female into "gendered" — only neuter monsters skip the
-        draw.  (Vendor draws for gendered monsters too if msound is not
-        LEADER/NEMESIS; we approximate by always drawing when !neuter.)
+    Mirrors vendor/nle/src/makemon.c lines 1214-1386 in draw order:
+      * line 1226: ``mtmp->female = rn2(2)`` (non-neuter monsters).
+      * line 1236 → peace_minded() (vendor makemon.c:2003-2042): when the
+        species reaches the tail (NOT always_peaceful / hostile, NOT
+        LEADER/GUARDIAN/NEMESIS, NOT is_minion) AND is co-aligned with
+        the player, vendor draws TWO rn2:
+            rn2(16 + clamp(record, -15, ∞))
+            rn2(2 + abs(maligntyp))
+      * line 1321: in_mklev sleep gate for is_ndemon || wumpus ||
+        long-worm || giant-eel — single ``rn2(5)``.
+      * line 1345: long-worm ``initworm(mtmp, rn2(5))`` — single rn2(5).
+      * lines 1370-1376: group rolls.  ``rn2(2)`` for G_SGROUP species;
+        for G_LGROUP species ``rn2(3)``.  Vendor first checks SGROUP, and
+        the LGROUP branch only fires when SGROUP is absent — so a monster
+        consumes ONE of the two (never both).
       * lines 1382 + 182-558: ``m_initweap`` cascade if is_armed(ptr).
-        Capped at _INITWEAP_CASCADE_CAP=8 sequential rn2() draws, matching
-        the average 5-7 draws per armed branch (orcs/soldiers/giants).
+        Capped at _INITWEAP_CASCADE_CAP=8 rn2(2) draws.
         Plus the trailing ``rn2(75)`` at line 556.
       * lines 1383 + 794/796/798: ``m_initinv`` unconditional tail —
-        three rn2() draws (rn2(50), rn2(100), rn2(5)) for every monster
-        regardless of class.
+        three rn2 draws (rn2(50), rn2(100), rn2(5)).
+      * line 1386: saddle check ``!rn2(100) && is_domestic(...)``.  Due
+        to C short-circuit, rn2(100) is evaluated for EVERY monster
+        (is_domestic is checked only after the rn2(100) draw).
 
     Args:
-        vrng:   Isaac64State
-        type_id: scalar int32 monster entry index.
+        vrng:                Isaac64State.
+        type_id:             scalar int32 monster entry index.
+        player_align:        int — player's alignment sign (-1/0/+1).
+        player_align_record: int — u.ualign.record (game-start: 0).
+        in_mklev:            bool — True during level-gen (default).
+                             Gates the line-1321 sleep draw.
 
     Returns:
         new Isaac64State with the appropriate draws consumed.
     """
     tid = type_id.astype(jnp.int32)
-    is_neuter = _IS_NEUTER[tid]
-    is_armed = _IS_ARMED[tid]
+    is_neuter   = _IS_NEUTER[tid]
+    is_armed    = _IS_ARMED[tid]
+    is_dwe      = _IS_DEMON_WORM_EEL[tid]
+    is_lworm    = _IS_LONGWORM[tid]
+    is_sgrp     = _IS_GROUP_S[tid]
+    is_lgrp     = _IS_GROUP_L[tid]
+    is_dom      = _IS_DOMESTIC[tid]
+    peace_needs = _PEACE_MINDED_RN2_NEEDED[tid]
+    mal         = _MONSTER_MALIGNTYP[tid]
+
+    ual_sgn = jnp.sign(jnp.int32(player_align))
+    mal_sgn = jnp.sign(mal)
+    co_aligned = ual_sgn == mal_sgn
+    # vendor: !!rn2(16 + (record < -15 ? -15 : record))
+    record = jnp.maximum(jnp.int32(player_align_record), jnp.int32(-15))
+    rn2_arg_a = jnp.maximum(jnp.int32(16) + record, jnp.int32(1))
+    # vendor: !!rn2(2 + abs(mal))
+    rn2_arg_b = jnp.int32(2) + jnp.abs(mal)
 
     # --- 1. female draw — vendor makemon.c:1226 ---
     def _draw_female(v):
@@ -825,7 +1004,55 @@ def _consume_makemon_post_hp_draws(vrng, type_id):
 
     vrng = jax.lax.cond(is_neuter, lambda v: v, _draw_female, vrng)
 
-    # --- 2. m_initweap cascade — vendor makemon.c:1382 + lines 182-558 ---
+    # --- 2. peace_minded co-aligned tail — vendor makemon.c:2039-2041 ---
+    # Two rn2 draws fire only for species that reach the tail AND are
+    # co-aligned with the player.
+    def _draw_peace(v):
+        v1, _ = randint_jax(v,  (), 0, rn2_arg_a)
+        v2, _ = randint_jax(v1, (), 0, rn2_arg_b)
+        return v2
+
+    peace_fires = peace_needs & co_aligned
+    vrng = jax.lax.cond(peace_fires, _draw_peace, lambda v: v, vrng)
+
+    # --- 3. in_mklev sleep gate — vendor makemon.c:1319-1322 ---
+    #   if ((is_ndemon(ptr) || PM_WUMPUS || PM_LONG_WORM || PM_GIANT_EEL)
+    #        && !u.uhave.amulet && rn2(5))
+    # u.uhave.amulet is False during initial spawn; the rn2(5) is the
+    # final operand and is evaluated for every species in the predicate.
+    def _draw_sleep(v):
+        new_v, _ = randint_jax(v, (), 0, 5)
+        return new_v
+
+    sleep_fires = jnp.bool_(in_mklev) & is_dwe
+    vrng = jax.lax.cond(sleep_fires, _draw_sleep, lambda v: v, vrng)
+
+    # --- 4. long-worm initworm — vendor makemon.c:1345 ---
+    #   initworm(mtmp, rn2(5));
+    def _draw_lworm(v):
+        new_v, _ = randint_jax(v, (), 0, 5)
+        return new_v
+
+    vrng = jax.lax.cond(is_lworm, _draw_lworm, lambda v: v, vrng)
+
+    # --- 5. group rolls — vendor makemon.c:1370-1376 ---
+    #   if (ptr->geno & G_SGROUP) && rn2(2)         → m_initsgrp
+    #   else if (ptr->geno & G_LGROUP) { rn2(3) ... }
+    # Mutually exclusive species-level branches; consume the matching
+    # single rn2 draw per branch.
+    def _draw_sgrp(v):
+        new_v, _ = randint_jax(v, (), 0, 2)
+        return new_v
+
+    def _draw_lgrp(v):
+        new_v, _ = randint_jax(v, (), 0, 3)
+        return new_v
+
+    vrng = jax.lax.cond(is_sgrp, _draw_sgrp, lambda v: v, vrng)
+    # LGROUP branch only fires when SGROUP is absent (vendor "else if").
+    vrng = jax.lax.cond(is_lgrp & ~is_sgrp, _draw_lgrp, lambda v: v, vrng)
+
+    # --- 6. m_initweap cascade — vendor makemon.c:1382 + lines 182-558 ---
     # Conservative fixed-cap consumer: N=8 rn2(2) draws covering the
     # average orc/soldier/elf branch depth.  The exact bound varies by
     # mlet but stays within [3, 8] for Dlvl-1-eligible armed species.
@@ -841,13 +1068,23 @@ def _consume_makemon_post_hp_draws(vrng, type_id):
 
     vrng = jax.lax.cond(is_armed, _draw_initweap, lambda v: v, vrng)
 
-    # --- 3. m_initinv unconditional tail — vendor makemon.c:794, 796, 798 ---
+    # --- 7. m_initinv unconditional tail — vendor makemon.c:794, 796, 798 ---
     #   if ((int) mtmp->m_lev > rn2(50))  → rnd_defensive_item
     #   if ((int) mtmp->m_lev > rn2(100)) → rnd_misc_item
     #   if (likes_gold && !findgold && !rn2(5))  → mkmonmoney
     vrng, _ = randint_jax(vrng, (), 0, 50)
     vrng, _ = randint_jax(vrng, (), 0, 100)
     vrng, _ = randint_jax(vrng, (), 0, 5)
+
+    # --- 8. saddle check — vendor makemon.c:1386 ---
+    #   if (!rn2(100) && is_domestic(ptr) && ...)
+    # C short-circuit: rn2(100) is the first operand and is evaluated for
+    # every monster regardless of is_domestic.  Consume unconditionally.
+    vrng, _ = randint_jax(vrng, (), 0, 100)
+    # The further `mksobj(SADDLE,...)` sub-cascade fires only when the
+    # rn2(100) rolled 0 AND is_domestic — covered separately by the
+    # mksobj draw audit and not modelled here.
+    _ = is_dom  # retained for documentation / future saddle modelling.
 
     return vrng
 
@@ -865,6 +1102,8 @@ def spawn_initial_monsters(
     map_w: int,
     genocided=None,
     vendor_rng=None,
+    player_align: int = 0,
+    player_align_record: int = 0,
 ) -> tuple:
     """Spawn ``n_monsters`` monsters for dungeon level ``depth``.
 
@@ -908,11 +1147,16 @@ def spawn_initial_monsters(
             )
             level = MONSTR_DIFFICULTIES[type_id]
             vrng, hp = _roll_hp(hp_keys[i], level, vendor_rng=vrng)
-            # Consume vendor makemon.c:1214-1383 post-newmonhp draws:
-            #   * line 1226: rn2(2) female flag (non-neuter monsters)
-            #   * line 1382 + 182-558: m_initweap cascade (is_armed monsters)
-            #   * line 1383 + 794/796/798: m_initinv unconditional tail
-            vrng = _consume_makemon_post_hp_draws(vrng, type_id)
+            # Consume vendor makemon.c:1214-1386 post-newmonhp draws.
+            # See _consume_makemon_post_hp_draws for the full cascade
+            # (female / peace_minded / in_mklev sleep / long-worm /
+            #  group / m_initweap / m_initinv / saddle).
+            vrng = _consume_makemon_post_hp_draws(
+                vrng, type_id,
+                player_align=player_align,
+                player_align_record=player_align_record,
+                in_mklev=True,
+            )
             pos = _pick_valid_tile(pos_keys[i], valid_tiles_mask, map_h, map_w)
 
             positions = positions.at[i].set(pos)
@@ -1013,12 +1257,21 @@ def populate_level_with_monsters(
     player_tile_mask = jnp.ones((map_h, map_w), dtype=jnp.bool_).at[pr, pc].set(False)
     valid_tiles_mask = walkable & player_tile_mask
 
+    # Player alignment fields drive the peace_minded co-aligned tail
+    # (vendor makemon.c:2039-2041).  state.player_align is the alignment
+    # sign (-1/0/+1); u.ualign.record is not yet tracked on EnvState and
+    # defaults to 0 at game start (vendor role.c init_role).
+    player_align_py = int(state.player_align)
+    player_align_record_py = 0
+
     if vendor_rng is not None:
         vendor_rng, positions, type_ids, hps, max_hps, count = spawn_initial_monsters(
             rng, depth=1, n_monsters=n_monsters, valid_tiles_mask=valid_tiles_mask,
             map_h=map_h, map_w=map_w,
             genocided=state.genocided_species,
             vendor_rng=vendor_rng,
+            player_align=player_align_py,
+            player_align_record=player_align_record_py,
         )
         # Thread updated Isaac64State back into the EnvState so subsequent
         # consumers (env.step) read the post-spawn vendor RNG.
