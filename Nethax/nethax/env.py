@@ -175,6 +175,27 @@ class NethaxEnv:
             v_state, descr_idx = _compute_descr_shuffle(v_state)
             state = state.replace(descr_idx=descr_idx)
 
+            # role_init (vendor/nle/src/role.c:2011-2137) sits between
+            # init_objects and init_dungeons in allmain.c::newgame.  For the
+            # pre-specified Rogue-Human-Chaotic-Male loadout it consumes ZERO
+            # ISAAC64 draws because every conditional RNG path is gated off:
+            #   - validrole(Rogue)=true   → skip randrole_filtered (role.c:2022-2027)
+            #   - validrace(Rogue,Human)=true → skip randrace        (role.c:2035-2036)
+            #   - validgend(Rogue,Human,Male)=true → skip both gender
+            #     fallbacks (role.c:2041-2046; Rogue.allow has ROLE_MALE at
+            #     role.c:347, Human.allow has ROLE_MALE, genders[0].allow OK)
+            #   - validalign(Rogue,Human,Chaotic)=true → skip randalign
+            #     (role.c:2049-2051; Rogue.allow has ROLE_CHAOTIC at role.c:347)
+            #   - quest leader rn2(100) (role.c:2070) skipped: PM_MASTER_OF_THIEVES
+            #     has M2_MALE → is_male(pm)=true (monst.c:2931)
+            #   - quest nemesis rn2(100) (role.c:2091) skipped: PM_MASTER_ASSASSIN
+            #     has M2_MALE → is_male(pm)=true (monst.c:3073)
+            #   - pantheon randrole loop (role.c:2095-2099) skipped: Rogue.lgod
+            #     = "Issek" is non-NULL (role.c:332), loop condition false
+            # Therefore no ISAAC64 byte-shift is needed here.  If the chosen
+            # role/race/gender/alignment ever becomes user-configurable, this
+            # audit must be revisited.
+
             v_state, rng_level = _vendor_draw_prngkey(v_state)
             v_state, rng_char = _vendor_draw_prngkey(v_state)
             v_state, rng_monsters = _vendor_draw_prngkey(v_state)
