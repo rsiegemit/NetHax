@@ -1187,7 +1187,14 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     rng_stats, rng_hp = jax.random.split(rng, 2)
 
     # --- Stat rolls (vendor init_attr(75) parity) ---
-    stats = _init_attr_vendor(rng_stats, role, race, np_total=75)
+    # NLE_BYTEPARITY mode: consume ISAAC64 draws via consume_init_attr_draws.
+    # Plain mode: fall back to Threefry-based _init_attr_vendor.
+    # Cite: vendor/nle/src/attrib.c:614-660; u_init.c:1390.
+    if vendor_rng is not None:
+        vendor_rng, stats_raw = consume_init_attr_draws(vendor_rng, role, race)
+        stats = {k: jnp.int32(v) for k, v in stats_raw.items()}
+    else:
+        stats = _init_attr_vendor(rng_stats, role, race, np_total=75)
 
     # --- HP / Pw (vendor ini_hpwp parity, u.ulevel == 0 branch) ---
     hp, pw = _ini_hpwp_vendor(rng_hp, role, race)
