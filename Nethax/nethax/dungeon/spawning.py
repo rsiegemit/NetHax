@@ -354,6 +354,109 @@ _IS_ARMED: jnp.ndarray = _compute_is_armed()                 # [NUMMONS] bool
 
 
 # ---------------------------------------------------------------------------
+# HP-path classification arrays  (vendor makemon.c::newmonhp lines 1018-1044)
+# ---------------------------------------------------------------------------
+#
+# Vendor newmonhp dispatch order (makemon.c:1018-1044):
+#   1. is_golem(ptr)          → golemhp(mndx) fixed value
+#   2. is_rider(ptr)          → d(10, 8)  (basehp=10)
+#   3. ptr->mlevel > 49       → 2*(mlevel-6) fixed value
+#   4. S_DRAGON && mndx>=GRAY → 4*m_lev + d(m_lev, 4)  (non-endgame)
+#   5. !m_lev                 → rnd(4)
+#   6. else                   → d(m_lev, 8)
+#
+# is_golem: mlet == S_GOLEM  (mondata.h:108)
+# is_rider: ptr == Death/Famine/Pestilence  (mondata.h:161-163)
+# adult dragon: mlet==S_DRAGON && mndx >= PM_GRAY_DRAGON
+
+def _compute_is_shapeshifter() -> jnp.ndarray:
+    """True where monster has M2_SHAPESHIFTER flag2.
+
+    Cite: vendor/nethack/src/makemon.c:1356-1368 — shapechanger detection
+    via pm_to_cham(); these monsters call newcham() which consumes 5-15 extra
+    RNG draws and sets allow_minvent=FALSE (skipping m_initweap/m_initinv).
+    """
+    mask = int(M2_SHAPESHIFTER) & 0xFFFFFFFF
+    flags = [((int(m.flags2) & 0xFFFFFFFF) & mask) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_is_golem() -> jnp.ndarray:
+    """True where monster's mlet == S_GOLEM.
+
+    Cite: vendor/nethack/include/mondata.h:108
+        #define is_golem(ptr) ((ptr)->mlet == S_GOLEM)
+    Used in vendor/nethack/src/makemon.c::newmonhp line 1018.
+    """
+    S_GOLEM_val = int(MonsterSymbol.S_GOLEM)
+    flags = [int(m.symbol) == S_GOLEM_val for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_is_rider() -> jnp.ndarray:
+    """True for Death, Famine, Pestilence (the Riders).
+
+    Cite: vendor/nethack/include/mondata.h:161-163
+        #define is_rider(ptr) ((ptr)==&mons[PM_DEATH] || ...)
+    Used in vendor/nethack/src/makemon.c::newmonhp line 1021.
+    """
+    rider_names = {"Death", "Famine", "Pestilence"}
+    flags = [m.name in rider_names for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_is_adult_dragon() -> jnp.ndarray:
+    """True for adult dragons (mlet==S_DRAGON && mndx >= PM_GRAY_DRAGON).
+
+    Cite: vendor/nethack/src/makemon.c::newmonhp line 1032
+        else if (ptr->mlet == S_DRAGON && mndx >= PM_GRAY_DRAGON)
+    Adult dragons use d(m_lev,4)+4*m_lev instead of d(m_lev,8).
+    Baby dragons (mndx < PM_GRAY_DRAGON) fall through to the normal d(m_lev,8).
+    """
+    S_DRAGON_val = int(MonsterSymbol.S_DRAGON)
+    gray_idx = _find_pm_index("gray dragon")  # PM_GRAY_DRAGON
+    flags = [
+        (int(m.symbol) == S_DRAGON_val and i >= gray_idx)
+        for i, m in enumerate(MONSTERS)
+    ]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+# Golem fixed-HP lookup: golemhp() vendor/nethack/src/makemon.c:2233-2261.
+# Keyed by monster name; monsters not in the table get 0 (unreachable if
+# is_golem is True, since every S_GOLEM entry is listed here).
+_GOLEM_HP_BY_NAME: dict[str, int] = {
+    "straw golem":   20,
+    "paper golem":   20,
+    "rope golem":    30,
+    "leather golem": 40,
+    "gold golem":    60,
+    "wood golem":    50,
+    "flesh golem":   40,
+    "clay golem":    70,
+    "stone golem":   100,
+    "glass golem":   80,
+    "iron golem":    120,
+}
+
+
+def _compute_fixed_golem_hp() -> jnp.ndarray:
+    """Fixed HP for each monster slot; non-zero only for golem entries.
+
+    Cite: vendor/nethack/src/makemon.c::golemhp (lines 2233-2261).
+    """
+    vals = [_GOLEM_HP_BY_NAME.get(m.name, 0) for m in MONSTERS]
+    return jnp.array(vals, dtype=jnp.int32)
+
+
+_IS_SHAPESHIFTER: jnp.ndarray = _compute_is_shapeshifter()   # [NUMMONS] bool
+_IS_GOLEM:        jnp.ndarray = _compute_is_golem()          # [NUMMONS] bool
+_IS_RIDER:        jnp.ndarray = _compute_is_rider()          # [NUMMONS] bool
+_IS_ADULT_DRAGON: jnp.ndarray = _compute_is_adult_dragon()   # [NUMMONS] bool
+_FIXED_GOLEM_HP:  jnp.ndarray = _compute_fixed_golem_hp()    # [NUMMONS] int32
+
+
+# ---------------------------------------------------------------------------
 # Monster-flag masks for the post-newmonhp draw cascade.
 # Cite: vendor/nle/src/makemon.c lines 1226-1386.
 # ---------------------------------------------------------------------------
@@ -884,68 +987,194 @@ def roll_monster_hp(rng: jax.Array, hit_dice: int, vendor_rng=None):
 
 
 # ---------------------------------------------------------------------------
-# Roll initial HP for a monster (makemon.c::newmonhp)
+# Roll initial HP for a monster (makemon.c::newmonhp lines 1012-1054)
 # ---------------------------------------------------------------------------
 
-def _roll_hp(rng: jax.Array, level: jnp.ndarray, vendor_rng=None):
+def _roll_hp(rng: jax.Array, level: jnp.ndarray, vendor_rng=None,
+             type_id=None):
     """Roll initial HP for a freshly-generated monster — byte-equal vendor.
 
-    Vendor: vendor/nethack/src/makemon.c::newmonhp (~line 1500)::
+    Vendor: vendor/nethack/src/makemon.c::newmonhp (lines 1012-1054).
 
-        if (mlvl == 0) hp = rnd(4);     // 1..4 for "zero-level" monsters
-        else           hp = d(mlvl, 8); // sum of mlvl rolls of d8
+    Dispatch order (mirrors vendor):
+      1. is_golem  → fixed HP from _FIXED_GOLEM_HP table; zero RNG draws.
+         Cite: makemon.c:1018-1020  ``mon->mhpmax = golemhp(mndx)``
+      2. is_rider  → d(10, 8); basehp=10, 10 dice of d8.
+         Cite: makemon.c:1021-1024  ``basehp=10; d(basehp, 8)``
+      3. adult dragon (S_DRAGON && mndx>=PM_GRAY_DRAGON, non-endgame):
+         4*m_lev + d(m_lev, 4).
+         Cite: makemon.c:1032-1036  ``4*basehp + d(basehp, 4)``
+      4. m_lev==0 → rnd(4) (1..4).
+         Cite: makemon.c:1037-1039
+      5. else     → d(m_lev, 8).
+         Cite: makemon.c:1040-1044
 
-    JIT-safe via masked scan over a static cap of 20 dice.
+    ``type_id`` (optional int32 scalar): when supplied, paths 1-3 are
+    active via the precomputed _IS_GOLEM/_IS_RIDER/_IS_ADULT_DRAGON masks
+    and _FIXED_GOLEM_HP.  When None, only the d(m_lev,8)/rnd(4) path fires
+    (backward-compatible for callers that don't pass type_id).
 
-    Byte-replay path: when ``vendor_rng`` (Isaac64State) is supplied, the
-    per-die ``rnd(8)`` and the zero-level ``rnd(4)`` draws are routed
-    through :func:`vendor_rng.randint_jax`, which is byte-exact with vendor
-    C ``minval + isaac64_next_uint64() % range``.  The scan carries
-    ``vendor_rng`` through each iteration; returns ``(new_vendor_rng, hp)``
-    so the caller can thread state.  ``vendor_rng=None`` retains the
-    Threefry path unchanged.
+    Byte-replay path: when ``vendor_rng`` (Isaac64State) is supplied, all
+    draws are routed through :func:`vendor_rng.randint_jax`.
+    Returns ``(new_vendor_rng, hp)`` when vendor_rng is not None.
     """
     MAX_LEVEL = 20  # static cap; no monster generated by mklev exceeds this
     level_i32 = jnp.clip(level.astype(jnp.int32), 0, MAX_LEVEL)
 
+    # ---- Golem / Rider / adult-dragon flags (all False when type_id absent) ---
+    if type_id is not None:
+        tid = type_id.astype(jnp.int32)
+        is_golem_flag   = _IS_GOLEM[tid]
+        is_rider_flag   = _IS_RIDER[tid]
+        is_adragon_flag = _IS_ADULT_DRAGON[tid]
+        golem_fixed_hp  = _FIXED_GOLEM_HP[tid]
+    else:
+        is_golem_flag   = jnp.bool_(False)
+        is_rider_flag   = jnp.bool_(False)
+        is_adragon_flag = jnp.bool_(False)
+        golem_fixed_hp  = jnp.int32(0)
+
     if vendor_rng is not None:
-        # Byte-replay path: consume ISAAC64 via randint_jax inside the scan.
-        def _one_die_v(carry, die_idx):
+        # ---- Byte-replay path: consume ISAAC64 ----
+
+        # Golem: fixed HP, zero draws.  Thread vrng unchanged.
+        # Rider: d(10, 8) — always 10 draws regardless of level.
+        # Adult dragon: d(m_lev, 4) + 4*m_lev — m_lev draws of d4.
+        # Normal: d(m_lev, 8) — m_lev draws of d8.
+        # Level-0 normal: rnd(4) — 1 draw of d4.
+        #
+        # We always consume MAX_LEVEL draws from the stream for each of
+        # the rider and normal paths (masked by die_idx < cap), then a
+        # final rnd(4) draw shared by the level-0-normal and dragon paths.
+        # This keeps the scan shape static for JIT.
+
+        RIDER_CAP = 10  # basehp=10 in vendor; exactly 10 dice
+
+        # Scan for rider d(10,8): consume 10 d8 draws.
+        def _rider_die_v(carry, die_idx):
             vrng, total = carry
             new_vrng, roll = randint_jax(vrng, (), 1, 9)
+            roll_masked = jnp.where(die_idx < jnp.int32(RIDER_CAP),
+                                    roll, jnp.int32(0))
+            return (new_vrng, total + roll_masked), None
+
+        # Scan for adult-dragon / normal d(m_lev, sides): MAX_LEVEL draws.
+        # sides=4 for dragons, sides=8 for normal; controlled by caller-side
+        # dispatch after we've decided which total to use.
+        def _d8_die_v(carry, die_idx):
+            vrng, total = carry
+            new_vrng, roll = randint_jax(vrng, (), 1, 9)   # 1..8
             roll_masked = jnp.where(die_idx < level_i32, roll, jnp.int32(0))
             return (new_vrng, total + roll_masked), None
 
-        (vrng_after_dice, total), _ = jax.lax.scan(
-            _one_die_v,
-            (vendor_rng, jnp.int32(0)),
-            jnp.arange(MAX_LEVEL, dtype=jnp.int32),
+        def _d4_die_v(carry, die_idx):
+            vrng, total = carry
+            new_vrng, roll = randint_jax(vrng, (), 1, 5)   # 1..4
+            roll_masked = jnp.where(die_idx < level_i32, roll, jnp.int32(0))
+            return (new_vrng, total + roll_masked), None
+
+        # We must consume draws in a branch-free manner for JIT: run the
+        # scan branch that matches the monster type, the others are no-ops
+        # wrapped in jax.lax.cond so JAX traces only one live branch.
+
+        def _run_rider(vrng):
+            (v2, total_r), _ = jax.lax.scan(
+                _rider_die_v, (vrng, jnp.int32(0)),
+                jnp.arange(RIDER_CAP, dtype=jnp.int32),
+            )
+            # Rider has no rnd(4) tail draw; vendor basehp boost check is
+            # handled by the min-hp guard below.
+            return v2, jnp.maximum(total_r, jnp.int32(1))
+
+        def _run_dragon(vrng):
+            (v2, total_d), _ = jax.lax.scan(
+                _d4_die_v, (vrng, jnp.int32(0)),
+                jnp.arange(MAX_LEVEL, dtype=jnp.int32),
+            )
+            hp_d = jnp.int32(4) * level_i32 + total_d
+            return v2, jnp.maximum(hp_d, jnp.int32(1))
+
+        def _run_normal(vrng):
+            (v2, total_n), _ = jax.lax.scan(
+                _d8_die_v, (vrng, jnp.int32(0)),
+                jnp.arange(MAX_LEVEL, dtype=jnp.int32),
+            )
+            v3, zero_roll = randint_jax(v2, (), 1, 5)
+            hp_n = jnp.where(level_i32 == jnp.int32(0), zero_roll, total_n)
+            return v3, jnp.maximum(hp_n, jnp.int32(1))
+
+        # Dispatch: golem → no draws; rider → rider scan; dragon → dragon
+        # scan; else → normal scan.  jax.lax.cond is JIT-safe.
+        vrng_final, rolled_hp = jax.lax.cond(
+            is_golem_flag,
+            lambda v: (v, golem_fixed_hp),
+            lambda v: jax.lax.cond(
+                is_rider_flag,
+                _run_rider,
+                lambda v2: jax.lax.cond(
+                    is_adragon_flag,
+                    _run_dragon,
+                    _run_normal,
+                    v2,
+                ),
+                v,
+            ),
+            vendor_rng,
         )
-        # rnd(4) = 1..4 when mlvl == 0.
-        vrng_final, zero_roll = randint_jax(vrng_after_dice, (), 1, 5)
-        hp = jnp.where(level_i32 == jnp.int32(0), zero_roll, total)
-        return vrng_final, jnp.maximum(hp, jnp.int32(1))
+        return vrng_final, rolled_hp
 
-    keys = jax.random.split(rng, MAX_LEVEL + 1)
+    # ---- Threefry path (no vendor_rng) ----
+    keys = jax.random.split(rng, MAX_LEVEL + 2)  # +2: zero-roll + dragon d4 tail
 
-    # d(mlvl, 8) for mlvl >= 1.
-    def _one_die(carry, args):
+    # d(m_lev, 8) scan.
+    def _d8_die(carry, args):
         die_idx, key = args
         roll = jax.random.randint(key, (), minval=1, maxval=9, dtype=jnp.int32)
-        roll_masked = jnp.where(die_idx < level_i32, roll, jnp.int32(0))
-        return carry + roll_masked, None
+        return carry + jnp.where(die_idx < level_i32, roll, jnp.int32(0)), None
 
-    total, _ = jax.lax.scan(
-        _one_die,
-        jnp.int32(0),
+    # d(m_lev, 4) scan for adult dragon.
+    def _d4_die(carry, args):
+        die_idx, key = args
+        roll = jax.random.randint(key, (), minval=1, maxval=5, dtype=jnp.int32)
+        return carry + jnp.where(die_idx < level_i32, roll, jnp.int32(0)), None
+
+    d8_total, _ = jax.lax.scan(
+        _d8_die, jnp.int32(0),
         (jnp.arange(MAX_LEVEL, dtype=jnp.int32), keys[:MAX_LEVEL]),
     )
-
-    # rnd(4) = 1..4 when mlvl == 0.
     zero_roll = jax.random.randint(keys[MAX_LEVEL], (), minval=1, maxval=5,
                                    dtype=jnp.int32)
-    hp = jnp.where(level_i32 == jnp.int32(0), zero_roll, total)
-    return jnp.maximum(hp, jnp.int32(1))
+    normal_hp = jnp.where(level_i32 == jnp.int32(0), zero_roll, d8_total)
+    normal_hp = jnp.maximum(normal_hp, jnp.int32(1))
+
+    if type_id is not None:
+        # Rider: d(10,8) — reuse d8 scan with cap=10.
+        rider_level = jnp.int32(10)
+        rider_cap   = jnp.int32(10)
+        def _d8_rider(carry, args):
+            die_idx, key = args
+            roll = jax.random.randint(key, (), minval=1, maxval=9, dtype=jnp.int32)
+            return carry + jnp.where(die_idx < rider_cap, roll, jnp.int32(0)), None
+        rider_total, _ = jax.lax.scan(
+            _d8_rider, jnp.int32(0),
+            (jnp.arange(MAX_LEVEL, dtype=jnp.int32), keys[:MAX_LEVEL]),
+        )
+        rider_hp = jnp.maximum(rider_total, jnp.int32(1))
+
+        # Dragon: 4*m_lev + d(m_lev, 4).
+        d4_total, _ = jax.lax.scan(
+            _d4_die, jnp.int32(0),
+            (jnp.arange(MAX_LEVEL, dtype=jnp.int32), keys[:MAX_LEVEL]),
+        )
+        dragon_hp = jnp.maximum(jnp.int32(4) * level_i32 + d4_total, jnp.int32(1))
+
+        hp = jnp.where(is_golem_flag, golem_fixed_hp,
+             jnp.where(is_rider_flag, rider_hp,
+             jnp.where(is_adragon_flag, dragon_hp,
+             normal_hp)))
+        return hp
+
+    return normal_hp
 
 
 # ---------------------------------------------------------------------------
@@ -1049,15 +1278,18 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         new Isaac64State with the appropriate draws consumed.
     """
     tid = type_id.astype(jnp.int32)
-    is_neuter   = _IS_NEUTER[tid]
-    is_armed    = _IS_ARMED[tid]
-    is_dwe      = _IS_DEMON_WORM_EEL[tid]
-    is_lworm    = _IS_LONGWORM[tid]
-    is_sgrp     = _IS_GROUP_S[tid]
-    is_lgrp     = _IS_GROUP_L[tid]
-    is_dom      = _IS_DOMESTIC[tid]
-    peace_needs = _PEACE_MINDED_RN2_NEEDED[tid]
-    mal         = _MONSTER_MALIGNTYP[tid]
+    is_neuter      = _IS_NEUTER[tid]
+    is_armed       = _IS_ARMED[tid]
+    is_dwe         = _IS_DEMON_WORM_EEL[tid]
+    is_lworm       = _IS_LONGWORM[tid]
+    is_sgrp        = _IS_GROUP_S[tid]
+    is_lgrp        = _IS_GROUP_L[tid]
+    is_dom         = _IS_DOMESTIC[tid]
+    peace_needs    = _PEACE_MINDED_RN2_NEEDED[tid]
+    mal            = _MONSTER_MALIGNTYP[tid]
+    # Shapeshifter: vendor makemon.c:1356-1368 — pm_to_cham() != NON_PM
+    # → newcham() fires, allow_minvent=FALSE, initweap/initinv skipped.
+    is_shapeshifter = _IS_SHAPESHIFTER[tid]
 
     ual_sgn = jnp.sign(jnp.int32(player_align))
     mal_sgn = jnp.sign(mal)
@@ -1123,166 +1355,189 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
     # LGROUP branch only fires when SGROUP is absent (vendor "else if").
     vrng = jax.lax.cond(is_lgrp & ~is_sgrp, _draw_lgrp, lambda v: v, vrng)
 
-    # --- 6. m_initweap cascade — vendor makemon.c:1382 + lines 182-558 ---
-    # Conservative fixed-cap consumer: N=8 rn2(2) draws covering the
-    # average orc/soldier/elf branch depth.  The exact bound varies by
-    # mlet but stays within [3, 8] for Dlvl-1-eligible armed species.
-    def _draw_initweap(v):
-        def _body(_, vc):
-            new_v, _r = randint_jax(vc, (), 0, 2)
-            return new_v
-        v_after = jax.lax.fori_loop(0, _INITWEAP_CASCADE_CAP, _body, v)
-        # Trailing offensive-item check — vendor makemon.c:556
-        #   if ((int) mtmp->m_lev > rn2(75)) (void) mongets(...)
-        v_after, _ = randint_jax(v_after, (), 0, 75)
-        return v_after
-
-    vrng = jax.lax.cond(is_armed, _draw_initweap, lambda v: v, vrng)
-
-    # --- 6b. m_initinv per-class body — vendor/nle/src/makemon.c:589-788 ---
-    # switch(ptr->mlet) body that precedes the unconditional tail.
-    # Only classes containing rn2() calls are listed; all others are
-    # default: break (0 draws).  Draw counts are the minimum fixed draws
-    # needed to keep the ISAAC64 stream byte-aligned with vendor NLE.
+    # --- 6/6b/7. initweap + initinv — gated by allow_minvent ---------------
     #
-    # Classes covered and vendor line citations:
-    #   S_KOBOLD    (k, line 457): rn2(4)                          — 1 draw
-    #   S_GNOME     (G, line 778): rn2(60) [outside mines]         — 1 draw
-    #   S_NYMPH     (n, lines 701,703): 2 × rn2(2)                 — 2 draws
-    #   S_MUMMY     (M, line 741): rn2(7)                          — 1 draw
-    #   S_QUANTMECH (Q, line 745): rn2(20)                         — 1 draw
-    #   S_LEPRECHAUN(l, line 765): d(level_difficulty,30) up to 30 — capped 8
-    #   S_DEMON     (&, line 770): rn2(4) for ice_devil gate        — 1 draw
-    #   S_GIANT     (H, line 711): rn2(m_lev/2) loop count draw    — 1 draw
-    #   S_LICH      (L, lines 728,730): rn2(13) + possible rn2(7)  — 2 draws
-    #   S_HUMAN/merc(@, line 622): chain of rn2(5) armor draws     — capped 8
-    #   S_HUMAN/shop(@, line 675): rn2(4) fallthrough wand/potion  — 1 draw
-    #   S_HUMAN/priest(@,line 691): rn2(7) + rn2(3) + rn2(10)     — 3 draws
+    # Vendor makemon.c:1367-1368: for shapechangers newcham() fires and sets
+    # allow_minvent=FALSE, so m_initweap and m_initinv are both SKIPPED.
+    # Instead the shapechanger consumes newcham draws (see step 6-newcham).
+    #
+    # Vendor makemon.c:1441-1444 (allow_minvent guard):
+    #   if (allow_minvent) {
+    #       if (is_armed(ptr)) m_initweap(mtmp);
+    #       m_initinv(mtmp);
+    #       ...
+    #   }
+    #
+    # allow_minvent is True for all non-shapechangers.
 
-    # Fetch per-class flags from precomputed [NUMMONS] bool arrays.
-    is_kobold    = _MLET_KOBOLD[tid]
-    is_gnome     = _MLET_GNOME[tid]
-    is_nymph     = _MLET_NYMPH[tid]
-    is_mummy     = _MLET_MUMMY[tid]
-    is_qmech     = _MLET_QUANTMECH[tid]
-    is_lep       = _MLET_LEPRECHAUN[tid]
-    is_demon_cls = _MLET_DEMON[tid]
-    is_giant_cls = _MLET_GIANT[tid]
-    is_lich_cls  = _MLET_LICH[tid]
-    is_hmerc     = _MLET_HUMAN_MERC[tid]
-    is_hsk       = _MLET_HUMAN_SK[tid]
-    is_hpr       = _MLET_HUMAN_PR[tid]
+    def _draw_normal_inv(v):
+        """m_initweap + m_initinv + saddle for allow_minvent=TRUE monsters."""
 
-    # S_KOBOLD: rn2(4) — vendor makemon.c:457
-    def _draw_kobold(v):
-        nv, _ = randint_jax(v, (), 0, 4)
-        return nv
-    vrng = jax.lax.cond(is_kobold, _draw_kobold, lambda v: v, vrng)
+        # --- 6. m_initweap cascade — vendor makemon.c:1382 + lines 182-558 ---
+        # Conservative fixed-cap: N=8 rn2(2) draws + trailing rn2(75).
+        # Cite: makemon.c:1441-1443
+        def _draw_initweap(vv):
+            def _body(_, vc):
+                new_v, _r = randint_jax(vc, (), 0, 2)
+                return new_v
+            v_after = jax.lax.fori_loop(0, _INITWEAP_CASCADE_CAP, _body, vv)
+            # Trailing offensive-item check — vendor makemon.c:556
+            #   if ((int) mtmp->m_lev > rn2(75)) (void) mongets(...)
+            v_after, _ = randint_jax(v_after, (), 0, 75)
+            return v_after
 
-    # S_GNOME: rn2(60) (outside mines; conservative upper bound used here
-    # since in_mklev && Is_earthlevel is False on Dlvl-1) — vendor line 778
-    def _draw_gnome(v):
-        nv, _ = randint_jax(v, (), 0, 60)
-        return nv
-    vrng = jax.lax.cond(is_gnome, _draw_gnome, lambda v: v, vrng)
+        v = jax.lax.cond(is_armed, _draw_initweap, lambda vv: vv, v)
 
-    # S_NYMPH: !rn2(2) mirror + !rn2(2) potion — vendor makemon.c:701,703
-    def _draw_nymph(v):
-        v1, _ = randint_jax(v,  (), 0, 2)
-        v2, _ = randint_jax(v1, (), 0, 2)
-        return v2
-    vrng = jax.lax.cond(is_nymph, _draw_nymph, lambda v: v, vrng)
+        # --- 6b. m_initinv per-class body — vendor makemon.c:589-788 ---
+        # Only classes with rn2() calls listed; others are 0 draws.
+        # Cite: makemon.c:1444  m_initinv(mtmp)
+        is_kobold    = _MLET_KOBOLD[tid]
+        is_gnome     = _MLET_GNOME[tid]
+        is_nymph     = _MLET_NYMPH[tid]
+        is_mummy     = _MLET_MUMMY[tid]
+        is_qmech     = _MLET_QUANTMECH[tid]
+        is_lep       = _MLET_LEPRECHAUN[tid]
+        is_demon_cls = _MLET_DEMON[tid]
+        is_giant_cls = _MLET_GIANT[tid]
+        is_lich_cls  = _MLET_LICH[tid]
+        is_hmerc     = _MLET_HUMAN_MERC[tid]
+        is_hsk       = _MLET_HUMAN_SK[tid]
+        is_hpr       = _MLET_HUMAN_PR[tid]
 
-    # S_MUMMY: rn2(7) — vendor makemon.c:741
-    def _draw_mummy(v):
-        nv, _ = randint_jax(v, (), 0, 7)
-        return nv
-    vrng = jax.lax.cond(is_mummy, _draw_mummy, lambda v: v, vrng)
+        # S_KOBOLD: rn2(4) — vendor makemon.c:457
+        def _draw_kobold(vv):
+            nv, _ = randint_jax(vv, (), 0, 4)
+            return nv
+        v = jax.lax.cond(is_kobold, _draw_kobold, lambda vv: vv, v)
 
-    # S_QUANTMECH: rn2(20) Schroedinger box gate — vendor makemon.c:745
-    def _draw_qmech(v):
-        nv, _ = randint_jax(v, (), 0, 20)
-        return nv
-    vrng = jax.lax.cond(is_qmech, _draw_qmech, lambda v: v, vrng)
+        # S_GNOME: rn2(60) — vendor makemon.c:778
+        def _draw_gnome(vv):
+            nv, _ = randint_jax(vv, (), 0, 60)
+            return nv
+        v = jax.lax.cond(is_gnome, _draw_gnome, lambda vv: vv, v)
 
-    # S_LEPRECHAUN: d(level_difficulty, 30) gold — vendor makemon.c:765
-    # d(n,s) consumes n draws of rn2(s); level_difficulty ≈ depth (1-30).
-    # Cap at _INITWEAP_CASCADE_CAP=8 to stay JIT-shape-fixed.
-    _LEP_DRAW_CAP = _INITWEAP_CASCADE_CAP
-    def _draw_lep(v):
+        # S_NYMPH: rn2(2) + rn2(2) — vendor makemon.c:701,703
+        def _draw_nymph(vv):
+            v1, _ = randint_jax(vv, (), 0, 2)
+            v2, _ = randint_jax(v1, (), 0, 2)
+            return v2
+        v = jax.lax.cond(is_nymph, _draw_nymph, lambda vv: vv, v)
+
+        # S_MUMMY: rn2(7) — vendor makemon.c:741
+        def _draw_mummy(vv):
+            nv, _ = randint_jax(vv, (), 0, 7)
+            return nv
+        v = jax.lax.cond(is_mummy, _draw_mummy, lambda vv: vv, v)
+
+        # S_QUANTMECH: rn2(20) — vendor makemon.c:745
+        def _draw_qmech(vv):
+            nv, _ = randint_jax(vv, (), 0, 20)
+            return nv
+        v = jax.lax.cond(is_qmech, _draw_qmech, lambda vv: vv, v)
+
+        # S_LEPRECHAUN: d(level,30) gold — vendor makemon.c:765; capped 8
+        _LEP_DRAW_CAP = _INITWEAP_CASCADE_CAP
+        def _draw_lep(vv):
+            def _body(_, vc):
+                nvc, _ = randint_jax(vc, (), 0, 30)
+                return nvc
+            return jax.lax.fori_loop(0, _LEP_DRAW_CAP, _body, vv)
+        v = jax.lax.cond(is_lep, _draw_lep, lambda vv: vv, v)
+
+        # S_DEMON: rn2(4) ice devil gate — vendor makemon.c:770
+        def _draw_demon_cls(vv):
+            nv, _ = randint_jax(vv, (), 0, 4)
+            return nv
+        v = jax.lax.cond(is_demon_cls, _draw_demon_cls, lambda vv: vv, v)
+
+        # S_GIANT: rn2(m_lev/2) gem-loop count — vendor makemon.c:711
+        def _draw_giant_cls(vv):
+            nv, _ = randint_jax(vv, (), 0, 50)
+            return nv
+        v = jax.lax.cond(is_giant_cls, _draw_giant_cls, lambda vv: vv, v)
+
+        # S_LICH: rn2(13) + rn2(7) — vendor makemon.c:728-737
+        def _draw_lich_cls(vv):
+            v1, _ = randint_jax(vv, (), 0, 13)
+            v2, _ = randint_jax(v1, (), 0, 7)
+            return v2
+        v = jax.lax.cond(is_lich_cls, _draw_lich_cls, lambda vv: vv, v)
+
+        # S_HUMAN / mercenary: chain rn2(5) — vendor makemon.c:622-671; cap 8
+        def _draw_hmerc(vv):
+            def _body(_, vc):
+                nvc, _ = randint_jax(vc, (), 0, 5)
+                return nvc
+            return jax.lax.fori_loop(0, _INITWEAP_CASCADE_CAP, _body, vv)
+        v = jax.lax.cond(is_hmerc, _draw_hmerc, lambda vv: vv, v)
+
+        # S_HUMAN / shopkeeper: rn2(4) — vendor makemon.c:675
+        def _draw_hsk(vv):
+            nv, _ = randint_jax(vv, (), 0, 4)
+            return nv
+        v = jax.lax.cond(is_hsk, _draw_hsk, lambda vv: vv, v)
+
+        # S_HUMAN / priest: rn2(7)+rn2(3)+rn2(10) — vendor makemon.c:691-695
+        def _draw_hpr(vv):
+            v1, _ = randint_jax(vv,  (), 0, 7)
+            v2, _ = randint_jax(v1, (), 0, 3)
+            v3, _ = randint_jax(v2, (), 0, 10)
+            return v3
+        v = jax.lax.cond(is_hpr, _draw_hpr, lambda vv: vv, v)
+
+        # --- 7. m_initinv unconditional tail — vendor makemon.c:794,796,798 ---
+        #   if (m_lev > rn2(50))  rnd_defensive_item
+        #   if (m_lev > rn2(100)) rnd_misc_item
+        #   if (likes_gold && !findgold && !rn2(5)) mkmonmoney
+        v, _ = randint_jax(v, (), 0, 50)
+        v, _ = randint_jax(v, (), 0, 100)
+        v, _ = randint_jax(v, (), 0, 5)
+
+        return v
+
+    def _draw_newcham(v):
+        """Consume RNG draws for newcham() + select_newcham_form().
+
+        Vendor: makemon.c:1367  newcham(mtmp, NULL, NO_NC_FLAGS)
+                mon.c::newcham (lines 5278-5440) calls select_newcham_form
+                which draws 1–4 rn2() calls depending on shapeshifter type,
+                then the do-loop retries up to 20 times until accept_newcham_form
+                succeeds (typically 1 try).  After selection:
+                  * mgender_from_permonst: 0–1 draws (rn2(10) for ambiguous sex)
+                  * newmonhp for the new form: up to 20 d8/d4 draws + rn4 tail
+
+        Conservative cap: 15 draws total (MAKEMON_DEEPER_AUDIT.md gap #8
+        states 5-15 draws; we use a fixed-shape fori_loop of 15 to cover
+        the upper bound without over-consuming for the common 1-try case).
+
+        Cite: vendor/nethack/src/mon.c::select_newcham_form lines 5157-5224;
+              vendor/nethack/src/mon.c::newcham lines 5278-5440;
+              vendor/nethack/src/mon.c::mgender_from_permonst lines 5254-5272;
+              vendor/nethack/src/makemon.c::newmonhp lines 1012-1054.
+        """
+        _NEWCHAM_DRAW_CAP = 15
         def _body(_, vc):
-            nvc, _ = randint_jax(vc, (), 0, 30)
-            return nvc
-        return jax.lax.fori_loop(0, _LEP_DRAW_CAP, _body, v)
-    vrng = jax.lax.cond(is_lep, _draw_lep, lambda v: v, vrng)
+            nv, _ = randint_jax(vc, (), 0, 8)
+            return nv
+        return jax.lax.fori_loop(0, _NEWCHAM_DRAW_CAP, _body, v)
 
-    # S_DEMON: rn2(4) gate for PM_ICE_DEVIL spear — vendor makemon.c:770
-    # Consumed unconditionally for all S_DEMON entries; only matters for
-    # ice devil but the draw fires in the ``if (ptr == PM_ICE_DEVIL)``
-    # branch, which evaluates rn2(4) only for that entry.  We conservatively
-    # consume 1 draw for all S_DEMON to stay stream-aligned for ice devil.
-    def _draw_demon_cls(v):
-        nv, _ = randint_jax(v, (), 0, 4)
-        return nv
-    vrng = jax.lax.cond(is_demon_cls, _draw_demon_cls, lambda v: v, vrng)
+    # Dispatch: shapechangers get newcham draws; others get initweap/initinv.
+    # Cite: vendor/nethack/src/makemon.c:1356-1368 + 1441-1444.
+    vrng = jax.lax.cond(
+        is_shapeshifter,
+        _draw_newcham,
+        _draw_normal_inv,
+        vrng,
+    )
 
-    # S_GIANT: rn2(m_lev/2) determines gem loop count — vendor makemon.c:711
-    # Minotaur takes a separate !rn2(3) branch (line 708); for all is_giant
-    # entries (which is_giant(ptr) catches), we consume the loop-count draw.
-    # Gem loop body draws are not modelled here (mksobj sub-cascade).
-    def _draw_giant_cls(v):
-        nv, _ = randint_jax(v, (), 0, 50)  # rn2(m_lev/2) range ≈ rn2(50)
-        return nv
-    vrng = jax.lax.cond(is_giant_cls, _draw_giant_cls, lambda v: v, vrng)
-
-    # S_LICH: master lich rn2(13) + possible rn2(7); arch lich rn2(3) + more.
-    # Fixed 2-draw cap covers both cases — vendor makemon.c:728-737.
-    def _draw_lich_cls(v):
-        v1, _ = randint_jax(v,  (), 0, 13)
-        v2, _ = randint_jax(v1, (), 0, 7)
-        return v2
-    vrng = jax.lax.cond(is_lich_cls, _draw_lich_cls, lambda v: v, vrng)
-
-    # S_HUMAN / mercenary: chain of rn2(5) armor draws — vendor line 622-671.
-    # Vendor draws up to 9 rn2() calls depending on mac thresholds; cap at 8.
-    def _draw_hmerc(v):
-        def _body(_, vc):
-            nvc, _ = randint_jax(vc, (), 0, 5)
-            return nvc
-        return jax.lax.fori_loop(0, _INITWEAP_CASCADE_CAP, _body, v)
-    vrng = jax.lax.cond(is_hmerc, _draw_hmerc, lambda v: v, vrng)
-
-    # S_HUMAN / shopkeeper: rn2(4) fallthrough — vendor makemon.c:675
-    def _draw_hsk(v):
-        nv, _ = randint_jax(v, (), 0, 4)
-        return nv
-    vrng = jax.lax.cond(is_hsk, _draw_hsk, lambda v: v, vrng)
-
-    # S_HUMAN / priest: rn2(7) robe + rn2(3) cloak + rn1(10,20) gold
-    # rn1(n,m) = rn2(n) + m = one rn2(n) draw — vendor makemon.c:691-695
-    def _draw_hpr(v):
-        v1, _ = randint_jax(v,  (), 0, 7)
-        v2, _ = randint_jax(v1, (), 0, 3)
-        v3, _ = randint_jax(v2, (), 0, 10)
-        return v3
-    vrng = jax.lax.cond(is_hpr, _draw_hpr, lambda v: v, vrng)
-
-    # --- 7. m_initinv unconditional tail — vendor makemon.c:794, 796, 798 ---
-    #   if ((int) mtmp->m_lev > rn2(50))  → rnd_defensive_item
-    #   if ((int) mtmp->m_lev > rn2(100)) → rnd_misc_item
-    #   if (likes_gold && !findgold && !rn2(5))  → mkmonmoney
-    vrng, _ = randint_jax(vrng, (), 0, 50)
+    # --- 8. saddle check — vendor makemon.c:1447-1454 ---
+    # ``!rn2(100) && is_domestic(ptr) && can_saddle(mtmp) && ...``
+    # C short-circuit: rn2(100) evaluated for EVERY monster (is_domestic
+    # checked only after).  Consume unconditionally for all monsters
+    # including shapechangers (saddle check is outside the allow_minvent
+    # block — it fires at line 1447, after the allow_minvent block ends at
+    # line 1445).  Cite: vendor/nethack/src/makemon.c:1447.
     vrng, _ = randint_jax(vrng, (), 0, 100)
-    vrng, _ = randint_jax(vrng, (), 0, 5)
-
-    # --- 8. saddle check — vendor makemon.c:1386 ---
-    #   if (!rn2(100) && is_domestic(ptr) && ...)
-    # C short-circuit: rn2(100) is the first operand and is evaluated for
-    # every monster regardless of is_domestic.  Consume unconditionally.
-    vrng, _ = randint_jax(vrng, (), 0, 100)
-    # The further `mksobj(SADDLE,...)` sub-cascade fires only when the
-    # rn2(100) rolled 0 AND is_domestic — covered separately by the
-    # mksobj draw audit and not modelled here.
     _ = is_dom  # retained for documentation / future saddle modelling.
 
     return vrng
@@ -1345,7 +1600,8 @@ def spawn_initial_monsters(
                 type_keys[i], depth, genocided=genocided, vendor_rng=vrng,
             )
             level = MONSTR_DIFFICULTIES[type_id]
-            vrng, hp = _roll_hp(hp_keys[i], level, vendor_rng=vrng)
+            vrng, hp = _roll_hp(hp_keys[i], level, vendor_rng=vrng,
+                                type_id=type_id)
             # Consume vendor makemon.c:1214-1386 post-newmonhp draws.
             # See _consume_makemon_post_hp_draws for the full cascade
             # (female / peace_minded / in_mklev sleep / long-worm /
@@ -1376,7 +1632,7 @@ def spawn_initial_monsters(
 
         type_id = pick_monster_for_level(type_keys[i], depth, genocided=genocided)
         level = MONSTR_DIFFICULTIES[type_id]
-        hp = _roll_hp(hp_keys[i], level)
+        hp = _roll_hp(hp_keys[i], level, type_id=type_id)
         pos = _pick_valid_tile(pos_keys[i], valid_tiles_mask, map_h, map_w)
 
         positions = positions.at[i].set(pos)
