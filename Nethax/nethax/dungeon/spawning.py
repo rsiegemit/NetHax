@@ -1770,26 +1770,58 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
         Vendor: makemon.c:1367  newcham(mtmp, NULL, NO_NC_FLAGS)
                 mon.c::newcham (lines 5278-5440) calls select_newcham_form
-                which draws 1–4 rn2() calls depending on shapeshifter type,
-                then the do-loop retries up to 20 times until accept_newcham_form
-                succeeds (typically 1 try).  After selection:
-                  * mgender_from_permonst: 0–1 draws (rn2(10) for ambiguous sex)
-                  * newmonhp for the new form: up to 20 d8/d4 draws + rn4 tail
+                then mgender_from_permonst, then newmonhp for the new form.
 
-        Conservative cap: 15 draws total (MAKEMON_DEEPER_AUDIT.md gap #8
-        states 5-15 draws; we use a fixed-shape fori_loop of 15 to cover
-        the upper bound without over-consuming for the common 1-try case).
+        Component breakdown (vendor mon.c:5157-5224):
+          select_newcham_form switch per cham type:
+            CHAMELEON    : rn2(3); if 0 -> pick_animal rn2(N); else fallback
+            DOPPELGANGER : rn2(7), rn2(3), optional rn2(3) or do-loop ×5
+            SANDESTIN    : rn2(7); if 0 -> fallback
+            VAMPIRE*     : pickvampshape = 1–2 draws; no fallback
+            NON_PM       : 0 draws; always fallback
+          fallback (lines 5214-5223): tryct=50 do-loop, typically 1–3 draws.
+          Outer newcham retry (line 5325): tryct=20; typically 1 iteration.
+          Model: SELECT_CAP=3 covers 1 switch draw + 2 typical fallback draws.
 
-        Cite: vendor/nethack/src/mon.c::select_newcham_form lines 5157-5224;
-              vendor/nethack/src/mon.c::newcham lines 5278-5440;
-              vendor/nethack/src/mon.c::mgender_from_permonst lines 5254-5272;
-              vendor/nethack/src/makemon.c::newmonhp lines 1012-1054.
+        mgender_from_permonst (lines 5254-5272):
+          rn2(10) fires when new form has ambiguous sex (most monsters).
+          Always consume 1 draw.
+
+        newmonhp for the new form (line 5373):
+          d(m_lev_new, 8) draws; m_lev_new is unknown at JIT time.
+          Modelled as fori_loop(0, MAX_NEW_FORM_LEVEL=20) matching the
+          _roll_hp MAX_LEVEL=20 scan convention — same over-consumption
+          tradeoff as the original-form HP scan.
+
+        Total: SELECT_CAP(3) + mgender(1) + MAX_NEW_FORM_LEVEL(20) = 24 draws.
+        Prior flat cap of 15 under-counted for target forms with m_lev > 11.
+
+        Cite: vendor/nethack/src/mon.c:5157-5224 (select_newcham_form);
+              vendor/nethack/src/mon.c:5254-5272 (mgender_from_permonst);
+              vendor/nethack/src/mon.c:5278-5440 (newcham);
+              vendor/nethack/src/makemon.c:1012-1054 (newmonhp).
         """
-        _NEWCHAM_DRAW_CAP = 15
-        def _body(_, vc):
-            nv, _ = randint_jax(vc, (), 0, 8)
+        _SELECT_CAP = 3          # 1 switch draw + ~2 typical fallback draws
+        _MAX_NEW_FORM_LEVEL = 20  # matches _roll_hp MAX_LEVEL cap
+
+        # --- select_newcham_form draws (switch + fallback) ---
+        def _sel_body(_, vc):
+            nv, _ = randint_jax(vc, (), 0, 50)
             return nv
-        return jax.lax.fori_loop(0, _NEWCHAM_DRAW_CAP, _body, v)
+        v = jax.lax.fori_loop(0, _SELECT_CAP, _sel_body, v)
+
+        # --- mgender_from_permonst: always 1 draw (rn2(10)) ---
+        v, _ = randint_jax(v, (), 0, 10)
+
+        # --- newmonhp for the new form: d(m_lev_new, 8) draws ---
+        # m_lev_new unknown; consume MAX_NEW_FORM_LEVEL draws (same convention
+        # as _roll_hp which always consumes MAX_LEVEL=20 draws via scan).
+        def _hp_body(_, vc):
+            nv, _ = randint_jax(vc, (), 1, 9)
+            return nv
+        v = jax.lax.fori_loop(0, _MAX_NEW_FORM_LEVEL, _hp_body, v)
+
+        return v
 
     # Dispatch: shapechangers get newcham draws; others get initweap/initinv.
     # Cite: vendor/nethack/src/makemon.c:1356-1368 + 1441-1444.
