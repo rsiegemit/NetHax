@@ -52,213 +52,248 @@ class ObjType:
     """Canonical NetHack object type IDs (otyp field).
 
     Partial list — only objects referenced in starting inventories.
-    Values are sequential within each class as they appear in objects.h.
+    All values match OBJECTS[i] index in Nethax/nethax/constants/objects.py,
+    which is vendor-index aligned with vendor/nle/src/objects.c.
     """
     # Weapons (WEAPON_CLASS = 2)
-    ARROW             = 1
-    ELVEN_ARROW       = 2
-    ORCISH_ARROW      = 3
-    SILVER_ARROW      = 4
-    YA                = 5
-    CROSSBOW_BOLT     = 6
-    DART              = 7
-    SHURIKEN          = 8
-    BOOMERANG         = 9
-    SPEAR             = 10
-    ELVEN_SPEAR       = 11
-    ORCISH_SPEAR      = 12
-    DWARVISH_SPEAR    = 13
-    SILVER_SPEAR      = 14
-    JAVELIN           = 15
-    TRIDENT           = 16
-    DAGGER            = 17
-    ELVEN_DAGGER      = 18
-    ORCISH_DAGGER     = 19
-    SILVER_DAGGER     = 20
-    SCALPEL           = 21
-    KNIFE             = 22
-    STILETTO          = 23
-    WORM_TOOTH        = 24
-    CRYSKNIFE         = 25
-    AXE               = 26  # single-handed axe (Barbarian_0)
-    BATTLE_AXE        = 27
-    SHORT_SWORD       = 28
-    ELVEN_SHORT_SWORD = 29
-    ORCISH_SHORT_SWORD= 30
-    DWARVISH_SHORT_SWORD=31
-    SABER             = 32
-    BROADSWORD        = 33
-    LONG_SWORD        = 34
-    TWO_HANDED_SWORD  = 35
-    KATANA            = 36
-    TSURUGI           = 37
-    MACE              = 38
-    MORNING_STAR      = 39
-    WAR_HAMMER        = 40
-    CLUB              = 41
-    RUBBER_HOSE       = 42
-    QUARTERSTAFF      = 43
-    AKLYS             = 44
-    LANCE             = 45
-    BULLWHIP          = 46
-    BOW               = 47
-    ELVEN_BOW         = 48
-    ORCISH_BOW        = 49
-    YUMI              = 50
-    SLING             = 51
-    CROSSBOW          = 52
-    PICK_AXE          = 53
+    # Canonical source: constants/objects.py indices 1-70
+    ARROW             = 1    # objects.py:202
+    ELVEN_ARROW       = 2    # objects.py:222
+    ORCISH_ARROW      = 3    # objects.py:242
+    SILVER_ARROW      = 4    # objects.py:262
+    YA                = 5    # objects.py:282
+    CROSSBOW_BOLT     = 6    # objects.py:302
+    DART              = 7    # objects.py:322
+    SHURIKEN          = 8    # objects.py:342
+    BOOMERANG         = 9    # objects.py:362
+    SPEAR             = 10   # objects.py:382
+    ELVEN_SPEAR       = 11   # objects.py:402
+    ORCISH_SPEAR      = 12   # objects.py:422
+    DWARVISH_SPEAR    = 13   # objects.py:442
+    SILVER_SPEAR      = 14   # objects.py:462
+    JAVELIN           = 15   # objects.py:482
+    TRIDENT           = 16   # objects.py:502
+    DAGGER            = 17   # objects.py:522
+    ELVEN_DAGGER      = 18   # objects.py:542
+    ORCISH_DAGGER     = 19   # objects.py:562
+    SILVER_DAGGER     = 20   # objects.py:582
+    # 21 = athame (not in starting inv)
+    SCALPEL           = 22   # objects.py:622
+    KNIFE             = 23   # objects.py:642
+    STILETTO          = 24   # objects.py:662
+    WORM_TOOTH        = 25   # objects.py:682
+    CRYSKNIFE         = 26   # objects.py:703
+    AXE               = 27   # objects.py:724  single-handed axe (Barbarian_0)
+    BATTLE_AXE        = 28   # objects.py:744
+    SHORT_SWORD       = 29   # objects.py:764
+    ELVEN_SHORT_SWORD = 30   # objects.py:784
+    ORCISH_SHORT_SWORD = 31  # objects.py:804
+    DWARVISH_SHORT_SWORD = 32  # objects.py:824
+    # 33 = scimitar (not in starting inv)
+    SABER             = 34   # objects.py:864  silver saber
+    BROADSWORD        = 35   # objects.py:884
+    # 36 = elven broadsword (not in starting inv)
+    LONG_SWORD        = 37   # objects.py:924
+    TWO_HANDED_SWORD  = 38   # objects.py:944
+    KATANA            = 39   # objects.py:964
+    TSURUGI           = 40   # objects.py:984
+    # 41 = runesword, 42-45 = pole arms (partisan/ranseur/spetum/glaive)
+    LANCE             = 46   # objects.py:1104
+    # 47-55 = halberd/bardiche/voulge/mattock/fauchard/guisarme/bill-guisarme/
+    #         lucern hammer/bec de corbin (not in starting inv)
+    MACE              = 56   # objects.py:1304
+    MORNING_STAR      = 57   # objects.py:1324
+    WAR_HAMMER        = 58   # objects.py:1344
+    CLUB              = 59   # objects.py:1364
+    RUBBER_HOSE       = 60   # objects.py:1384
+    QUARTERSTAFF      = 61   # objects.py:1404
+    AKLYS             = 62   # objects.py:1424
+    # 63 = flail (not in starting inv)
+    BULLWHIP          = 64   # objects.py:1464
+    BOW               = 65   # objects.py:1484
+    ELVEN_BOW         = 66   # objects.py:1504
+    ORCISH_BOW        = 67   # objects.py:1524
+    YUMI              = 68   # objects.py:1544
+    SLING             = 69   # objects.py:1564
+    CROSSBOW          = 70   # objects.py:1584
+    PICK_AXE          = 234  # objects.py:4864  WEPTOOL_CLASS
 
-    # Armor (ARMOR_CLASS = 3)
-    LEATHER_GLOVES    = 60
-    PADDED_ARMOR      = 61
-    LEATHER_ARMOR     = 113  # live-NLE otyp; vendor/nle/src/objects.c sequential count
-    LEATHER_JACKET    = 63
-    RING_MAIL         = 64
-    STUDDED_LEATHER_ARMOR = 65
-    CHAIN_MAIL        = 66
-    SCALE_MAIL        = 67
-    SPLINT_MAIL       = 68
-    BANDED_MAIL       = 69
-    DWARVISH_MITHRIL_COAT = 70
-    ELVEN_MITHRIL_COAT = 71
-    BRONZE_PLATE_MAIL = 72
-    PLATE_MAIL        = 73
-    CRYSTAL_PLATE_MAIL = 74
-    SMALL_SHIELD      = 75
-    ELVEN_SHIELD      = 76
-    URUK_HAI_SHIELD   = 77
-    ORCISH_SHIELD     = 78
-    DWARVISH_ROUNDSHIELD = 79
-    LARGE_SHIELD      = 80
-    DWARVISH_IRON_HELM = 81
-    ORCISH_HELM       = 82
-    HELMET            = 83
-    ELVEN_LEATHER_HELM = 84
-    FEDORA            = 85
-    LEATHER_HELM      = 86
-    LEVITATION_BOOTS  = 87
-    JUMPING_BOOTS     = 88
-    ELVEN_BOOTS       = 89
-    KICKING_BOOTS     = 90
-    FUMBLE_BOOTS      = 91
-    SPEED_BOOTS       = 92
-    IRON_SHOES        = 93
-    HIGH_BOOTS        = 94
-    CLOAK_OF_PROTECTION = 95
-    CLOAK_OF_INVISIBILITY = 96
-    OILSKIN_CLOAK     = 97
-    CLOAK_OF_MAGIC_RESISTANCE = 98
-    CLOAK_OF_DISPLACEMENT = 99
-    ELVEN_CLOAK       = 100
-    ROBE              = 101
-    ORCISH_CLOAK      = 102
-    HAWAIIAN_SHIRT    = 103
-    T_SHIRT           = 104
-    HELM_OF_BRILLIANCE        = 105
-    HELM_OF_OPPOSITE_ALIGNMENT = 106
-    HELM_OF_TELEPATHY         = 107
-    DUNCE_CAP                 = 108
-    CORNUTHAUM                = 109
-    TINFOIL_HAT               = 110
-    MUMMY_WRAPPING            = 111
-    GAUNTLETS_OF_FUMBLING     = 112
-    GAUNTLETS_OF_POWER        = 113
-    GAUNTLETS_OF_DEXTERITY    = 114
-    LOW_BOOTS                 = 115
-    WATER_WALKING_BOOTS       = 116
+    # Armor — Helms (ARMOR_CLASS = 3)
+    # Canonical source: constants/objects.py indices 71-81
+    ELVEN_LEATHER_HELM        = 71   # objects.py:1604
+    ORCISH_HELM               = 72   # objects.py:1624
+    DWARVISH_IRON_HELM        = 73   # objects.py:1644
+    FEDORA                    = 74   # objects.py:1664
+    CORNUTHAUM                = 75   # objects.py:1684
+    DUNCE_CAP                 = 76   # objects.py:1704
+    # 77 = dented pot (not in starting inv)
+    HELMET                    = 78   # objects.py:1744
+    HELM_OF_BRILLIANCE        = 79   # objects.py:1764
+    HELM_OF_OPPOSITE_ALIGNMENT = 80  # objects.py:1784
+    HELM_OF_TELEPATHY         = 81   # objects.py:1804
 
-    # Helm of caution (vendor/nethack/include/objects.h:479-481 — oc_oprop=WARNING)
-    HELM_OF_CAUTION           = 117
+    # Dragon scale mails: constants/objects.py indices 82-90
+    # NLE binary has 9 DSMs: gray/silver/red/white/orange/black/blue/green/yellow
+    # (no gold or shimmering — those are 3.7-only, absent from NLE objects table)
+    GRAY_DRAGON_SCALE_MAIL    = 82   # objects.py:1824  ANTIMAGIC
+    SILVER_DRAGON_SCALE_MAIL  = 83   # objects.py:1844  REFLECTING
+    RED_DRAGON_SCALE_MAIL     = 84   # objects.py:1864  FIRE_RES
+    WHITE_DRAGON_SCALE_MAIL   = 85   # objects.py:1884  COLD_RES
+    ORANGE_DRAGON_SCALE_MAIL  = 86   # objects.py:1904  SLEEP_RES
+    BLACK_DRAGON_SCALE_MAIL   = 87   # objects.py:1924  DISINT_RES
+    BLUE_DRAGON_SCALE_MAIL    = 88   # objects.py:1944  SHOCK_RES
+    GREEN_DRAGON_SCALE_MAIL   = 89   # objects.py:1964  POISON_RES
+    YELLOW_DRAGON_SCALE_MAIL  = 90   # objects.py:1984  ACID_RES
 
-    # Dragon scale mails (vendor/nethack/include/objects.h:502-526)
-    # Order mirrors vendor DRGN_ARMR block; powers from oc_oprop column.
-    GRAY_DRAGON_SCALE_MAIL    = 118   # ANTIMAGIC
-    GOLD_DRAGON_SCALE_MAIL    = 119   # (light source — no intrinsic)
-    SILVER_DRAGON_SCALE_MAIL  = 120   # REFLECTING
-    RED_DRAGON_SCALE_MAIL     = 121   # FIRE_RES
-    WHITE_DRAGON_SCALE_MAIL   = 122   # COLD_RES
-    ORANGE_DRAGON_SCALE_MAIL  = 123   # SLEEP_RES
-    BLACK_DRAGON_SCALE_MAIL   = 124   # DISINT_RES
-    BLUE_DRAGON_SCALE_MAIL    = 125   # SHOCK_RES
-    GREEN_DRAGON_SCALE_MAIL   = 126   # POISON_RES
-    YELLOW_DRAGON_SCALE_MAIL  = 127   # ACID_RES
+    # Dragon scales: constants/objects.py indices 91-99
+    GRAY_DRAGON_SCALES        = 91   # objects.py:2004  ANTIMAGIC
+    SILVER_DRAGON_SCALES      = 92   # objects.py:2024  REFLECTING
+    RED_DRAGON_SCALES         = 93   # objects.py:2044  FIRE_RES
+    WHITE_DRAGON_SCALES       = 94   # objects.py:2064  COLD_RES
+    ORANGE_DRAGON_SCALES      = 95   # objects.py:2084  SLEEP_RES
+    BLACK_DRAGON_SCALES       = 96   # objects.py:2104  DISINT_RES
+    BLUE_DRAGON_SCALES        = 97   # objects.py:2124  SHOCK_RES
+    GREEN_DRAGON_SCALES       = 98   # objects.py:2144  POISON_RES
+    YELLOW_DRAGON_SCALES      = 99   # objects.py:2164  ACID_RES
 
-    # Dragon scales (vendor/nethack/include/objects.h:530-553) — same powers
-    GRAY_DRAGON_SCALES        = 128   # ANTIMAGIC
-    GOLD_DRAGON_SCALES        = 129
-    SILVER_DRAGON_SCALES      = 130   # REFLECTING
-    RED_DRAGON_SCALES         = 131   # FIRE_RES
-    WHITE_DRAGON_SCALES       = 132   # COLD_RES
-    ORANGE_DRAGON_SCALES      = 133   # SLEEP_RES
-    BLACK_DRAGON_SCALES       = 134   # DISINT_RES
-    BLUE_DRAGON_SCALES        = 135   # SHOCK_RES
-    GREEN_DRAGON_SCALES       = 136   # POISON_RES
-    YELLOW_DRAGON_SCALES      = 137   # ACID_RES
+    # NLE-absent items: in vendor/nethack/include/objects.h 3.7 but NOT in NLE
+    # binary. Sentinel=0 (ILLOBJ/strange object) — can never be worn/matched.
+    GOLD_DRAGON_SCALE_MAIL    = 0    # absent from NLE objects table
+    GOLD_DRAGON_SCALES        = 0    # absent from NLE objects table
+    TINFOIL_HAT               = 0    # absent from NLE objects table
+    PADDED_ARMOR              = 0    # absent from NLE objects table
+    LEATHER_HELM              = 0    # absent from NLE objects table
+    HELM_OF_CAUTION           = 0    # absent from NLE objects table
+
+    # Body armor: constants/objects.py indices 100-116
+    PLATE_MAIL                = 100  # objects.py:2184
+    CRYSTAL_PLATE_MAIL        = 101  # objects.py:2204
+    BRONZE_PLATE_MAIL         = 102  # objects.py:2224
+    SPLINT_MAIL               = 103  # objects.py:2244
+    BANDED_MAIL               = 104  # objects.py:2264
+    DWARVISH_MITHRIL_COAT     = 105  # objects.py:2284
+    ELVEN_MITHRIL_COAT        = 106  # objects.py:2304
+    CHAIN_MAIL                = 107  # objects.py:2324
+    # 108 = orcish chain mail (not in starting inv)
+    SCALE_MAIL                = 109  # objects.py:2364
+    STUDDED_LEATHER_ARMOR     = 110  # objects.py:2384
+    RING_MAIL                 = 111  # objects.py:2404
+    # 112 = orcish ring mail (not in starting inv)
+    LEATHER_ARMOR             = 113  # objects.py:2444
+    LEATHER_JACKET            = 114  # objects.py:2464
+    HAWAIIAN_SHIRT            = 115  # objects.py:2484
+    T_SHIRT                   = 116  # objects.py:2504
+
+    # Cloaks: constants/objects.py indices 117-128
+    MUMMY_WRAPPING            = 117  # objects.py:2524
+    ELVEN_CLOAK               = 118  # objects.py:2544
+    ORCISH_CLOAK              = 119  # objects.py:2564
+    # 120 = dwarvish cloak (not in starting inv)
+    OILSKIN_CLOAK             = 121  # objects.py:2604
+    ROBE                      = 122  # objects.py:2624
+    # 123 = alchemy smock, 124 = leather cloak (not in starting inv)
+    CLOAK_OF_PROTECTION       = 125  # objects.py:2684
+    CLOAK_OF_INVISIBILITY     = 126  # objects.py:2704
+    CLOAK_OF_MAGIC_RESISTANCE = 127  # objects.py:2724
+    CLOAK_OF_DISPLACEMENT     = 128  # objects.py:2744
+
+    # Shields: constants/objects.py indices 129-134
+    SMALL_SHIELD              = 129  # objects.py:2764
+    ELVEN_SHIELD              = 130  # objects.py:2784
+    URUK_HAI_SHIELD           = 131  # objects.py:2804
+    ORCISH_SHIELD             = 132  # objects.py:2824
+    LARGE_SHIELD              = 133  # objects.py:2844
+    DWARVISH_ROUNDSHIELD      = 134  # objects.py:2864
+
+    # Gloves: constants/objects.py indices 136-139
+    LEATHER_GLOVES            = 136  # objects.py:2904
+    GAUNTLETS_OF_FUMBLING     = 137  # objects.py:2924
+    GAUNTLETS_OF_POWER        = 138  # objects.py:2944
+    GAUNTLETS_OF_DEXTERITY    = 139  # objects.py:2964
+
+    # Boots: constants/objects.py indices 140-149
+    LOW_BOOTS                 = 140  # objects.py:2984
+    IRON_SHOES                = 141  # objects.py:3004
+    HIGH_BOOTS                = 142  # objects.py:3024
+    SPEED_BOOTS               = 143  # objects.py:3044
+    WATER_WALKING_BOOTS       = 144  # objects.py:3064
+    JUMPING_BOOTS             = 145  # objects.py:3084
+    ELVEN_BOOTS               = 146  # objects.py:3104
+    KICKING_BOOTS             = 147  # objects.py:3124
+    FUMBLE_BOOTS              = 148  # objects.py:3144
+    LEVITATION_BOOTS          = 149  # objects.py:3164
 
     # Potions (POTION_CLASS = 8)
-    POT_WATER         = 200
-    POT_BOOZE         = 201
-    POT_SICKNESS      = 277  # live-NLE C enum otyp; vendor/nle/src/u_init.c:127
-    POT_CONFUSION     = 203
-    POT_EXTRA_HEALING = 204
-    POT_HEALING       = 205
-    POT_SPEED         = 206
-    POT_BLINDNESS     = 207
-    POT_GAIN_ENERGY   = 208
-    POT_LEVITATION    = 209
-    POT_HALLUCINATION = 210
-    POT_RESTORE_ABILITY = 211
-    POT_GAIN_LEVEL    = 212
-    POT_INVULNERABILITY = 213
-    POT_POLYMORPH     = 214
-    POT_OIL           = 215
-    POT_GAIN_STRENGTH = 216
-    POT_FULL_HEALING  = 217
-    POT_ENLIGHTENMENT = 218
-    POT_SEE_INVISIBLE = 219
-    POT_ACID          = 220
-    POT_SLEEPING      = 221
-    POT_PARALYSIS     = 222
+    # Canonical source: constants/objects.py indices 272-297
+    # 272 = gain ability (not in starting inv)
+    POT_RESTORE_ABILITY = 273  # objects.py:5644
+    POT_CONFUSION       = 274  # objects.py:5664
+    POT_BLINDNESS       = 275  # objects.py:5684
+    POT_PARALYSIS       = 276  # objects.py:5704
+    POT_SPEED           = 277  # objects.py:5724
+    POT_LEVITATION      = 278  # objects.py:5744
+    POT_HALLUCINATION   = 279  # objects.py:5764
+    # 280 = invisibility, 281 = see invisible (not in starting inv)
+    POT_HEALING         = 282  # objects.py:5824
+    POT_EXTRA_HEALING   = 283  # objects.py:5844
+    POT_GAIN_LEVEL      = 284  # objects.py:5864
+    POT_ENLIGHTENMENT   = 285  # objects.py:5884
+    # 286 = monster detection, 287 = object detection (not in starting inv)
+    POT_GAIN_ENERGY     = 288  # objects.py:5944
+    POT_SLEEPING        = 289  # objects.py:5964
+    POT_FULL_HEALING    = 290  # objects.py:5984
+    POT_POLYMORPH       = 291  # objects.py:6004
+    POT_BOOZE           = 292  # objects.py:6024
+    POT_SICKNESS        = 293  # objects.py:6044
+    # 294 = fruit juice (not in starting inv)
+    POT_ACID            = 295  # objects.py:6084
+    POT_OIL             = 296  # objects.py:6104
+    POT_WATER           = 297  # objects.py:6124
+    # NLE-absent potions (3.7-only, not in NLE objects table) — sentinel=0
+    POT_GAIN_STRENGTH   = 0    # absent from NLE objects table
+    POT_INVULNERABILITY = 0    # absent from NLE objects table
+    POT_SEE_INVISIBLE   = 0    # absent from NLE objects table
 
     # Scrolls (SCROLL_CLASS = 9)
-    SCR_MAGIC_MAPPING = 300
-    SCR_IDENTIFY      = 301
+    # Canonical source: constants/objects.py indices 298-312
+    SCR_IDENTIFY        = 311  # objects.py:6404
+    SCR_MAGIC_MAPPING   = 312  # objects.py:6424
 
     # Spellbooks (SPBOOK_CLASS = 10)
-    SPE_FORCE_BOLT    = 400
-    SPE_HEALING       = 401
-    SPE_EXTRA_HEALING = 402
-    SPE_STONE_TO_FLESH= 403
+    # Canonical source: constants/objects.py indices 340-379
+    SPE_FORCE_BOLT      = 350  # objects.py:7184
+    SPE_HEALING         = 348  # objects.py:7144
+    SPE_EXTRA_HEALING   = 365  # objects.py:7484
+    SPE_STONE_TO_FLESH  = 379  # objects.py:7764
 
     # Wands (WAND_CLASS = 11)
-    WAN_SLEEP         = 500
+    # Canonical source: constants/objects.py indices 383-406
+    WAN_SLEEP           = 404  # objects.py:8264
 
     # Tools (TOOL_CLASS = 6)
-    LOCK_PICK         = 600
-    SACK              = 601
-    TINNING_KIT       = 602
-    TOUCHSTONE        = 603
-    STETHOSCOPE       = 604
-    EXPENSIVE_CAMERA  = 605
-    CREDIT_CARD       = 606
-    MAGIC_MARKER      = 607
-    # BLINDFOLD vendor otyp = 208 (see subsystems/prayer.py:437).  Kept under
-    # the TOOL_CLASS bucket here because vendor classifies it as TOOL_CLASS in
-    # u_init.c::Blindfold[] (line 184).  The numeric value matches vendor.
-    BLINDFOLD         = 208
+    # Canonical source: constants/objects.py indices 192-217
+    SACK                = 192  # objects.py:4024
+    LOCK_PICK           = 197  # objects.py:4124
+    CREDIT_CARD         = 198  # objects.py:4144
+    EXPENSIVE_CAMERA    = 204  # objects.py:4264
+    # BLINDFOLD vendor otyp = 208 (objects.py:4344).
+    BLINDFOLD           = 208  # objects.py:4344
+    STETHOSCOPE         = 212  # objects.py:4424
+    TINNING_KIT         = 213  # objects.py:4444
+    MAGIC_MARKER        = 217  # objects.py:4524
+    TOUCHSTONE          = 444  # objects.py:9066  ROCK_CLASS
 
-    # Food (FOOD_CLASS = 7) — vendor otyp values (objects.py:252-268).
-    # Audit L #14-#26 references for starting inventory items.
-    APPLE             = 252   # objects.py:252
-    ORANGE            = 253   # objects.py:253
-    CARROT            = 257   # objects.py:257
-    SPRIG_OF_WOLFSBANE = 258  # objects.py:258
-    CLOVE_OF_GARLIC   = 259   # objects.py:259
-    FORTUNE_COOKIE    = 264   # objects.py:264
-    LEMBAS_WAFER      = 266   # objects.py:266
-    CRAM_RATION       = 267   # objects.py:267
-    FOOD_RATION       = 268   # objects.py:268
+    # Food (FOOD_CLASS = 7) — vendor otyp values
+    # Canonical source: constants/objects.py indices 252-268
+    APPLE             = 252   # objects.py:5224
+    ORANGE            = 253   # objects.py:5244
+    CARROT            = 257   # objects.py:5324
+    SPRIG_OF_WOLFSBANE = 258  # objects.py:5344
+    CLOVE_OF_GARLIC   = 259   # objects.py:5364
+    FORTUNE_COOKIE    = 264   # objects.py:5464
+    LEMBAS_WAFER      = 266   # objects.py:5504
+    CRAM_RATION       = 267   # objects.py:5524
+    FOOD_RATION       = 268   # objects.py:5544
 
 
 # ---------------------------------------------------------------------------
