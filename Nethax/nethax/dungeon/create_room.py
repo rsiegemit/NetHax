@@ -383,14 +383,27 @@ def _try_one_attempt(
 
     # ----- D2, D3: dx, dy -- sp_lev.c:1185-1192 ---------------------------
     # Vendor::
+    #     r1 = rnd_rect();
+    #     if (!r1) {                   /* No more free rectangles! */
+    #         debugpline0("No more rects...");
+    #         return FALSE;            /* hard return from create_room */
+    #     }
+    #     ...
     #     if (vault) dx = dy = 1;
     #     else {
     #         dx = 2 + rn2((hx - lx > 28) ? 12 : 8);
     #         dy = 2 + rn2(4);
     #         if (dx * dy > 50) dy = 50 / dx;
     #     }
-    # Short-circuit: vault path skips both draws.  Within !vault, both
-    # draws unconditionally happen (no inner short-circuit).
+    # Two short-circuits to honour:
+    #   (a) ``has_rect == False``  -> vendor's ``if (!r1) return FALSE``
+    #       at sp_lev.c:1177-1180 exits create_room entirely *before*
+    #       reaching the dx/dy assignment.  D2/D3 must NOT fire.
+    #   (b) ``vault == True``      -> vendor sp_lev.c:1185-1186 sets
+    #       ``dx = dy = 1`` without drawing.  D2/D3 must NOT fire.
+    # Previously D2/D3 fired whenever ``!vault`` even on the empty-pool
+    # branch -- one or two extra ISAAC64 bytes per stalled attempt.
+    # Citation: vendor/nle/src/sp_lev.c:1175-1192.
     def _draw_dxdy(carry):
         r = carry
         wide = (p_hx - p_lx) > jnp.int16(28)
@@ -412,7 +425,23 @@ def _try_one_attempt(
         r = carry
         return r, jnp.int16(1), jnp.int16(1)
 
-    rng, dx, dy = lax.cond(vault, _vault_dxdy, _draw_dxdy, rng)
+    def _skip_dxdy(carry):
+        # No rect from D1 -- vendor's ``if (!r1) return FALSE`` short-
+        # circuits before reaching the dx/dy block.  Zero RNG draws.
+        # sp_lev.c:1177-1180.
+        r = carry
+        return r, jnp.int16(0), jnp.int16(0)
+
+    # Honour both vault and no-rect short-circuits in one switch.
+    # vault branch only runs when has_rect (vendor reaches dx/dy assign
+    # only after the !r1 check); when !has_rect the whole function
+    # would have returned FALSE in vendor.
+    rng, dx, dy = lax.cond(
+        has_rect,
+        lambda r: lax.cond(vault, _vault_dxdy, _draw_dxdy, r),
+        _skip_dxdy,
+        rng,
+    )
 
     # ----- Borders -- sp_lev.c:1193-1194 ----------------------------------
     # xborder = (lx > 0 && hx < COLNO - 1) ? 2*xlim : xlim + 1
@@ -477,27 +506,36 @@ def _try_one_attempt(
     #         if (nroom < 4 && dy > 1) dy--;
     #     }
     #
-    # Three nested ``&&`` short-circuits to honour:
+    # C ``&&`` is left-associative + strictly left-to-right: the
+    # condition is ``(((A && B) && (C||D)) && E)`` where
+    #   A = (ly == 0), B = (hy >= ROWNO-1),
+    #   C = (!nroom),  D = (!rn2(nroom)),
+    #   E = (yabs + dy > ROWNO/2).
+    # Evaluation order: A; if A then B; if A&&B then (C||D); if true
+    # then E.  Crucially, ``rn2(nroom)`` (D6) is drawn when ``A && B``
+    # is true AND ``!C`` (i.e. nroom != 0) -- *before* E is evaluated.
+    # ``rn1(3,2)`` (D7) only fires when the *entire* condition is true.
     #
-    #   gate_outer:  can_place AND (ly == 0) AND (hy >= ROWNO-1)
-    #                AND (yabs + dy > ROWNO/2)
-    #   gate_d6:     gate_outer AND (nroom != 0)   -- D6 fires here
-    #   gate_d7:     gate_outer AND (nroom == 0 OR rn2(nroom) == 0)
-    #                                              -- D7 fires here
+    # Previously we (incorrectly) included E in the D6 draw gate, which
+    # under-drew rn2(nroom) on the (rare) attempts where A&&B&&!C held
+    # but E was false.  Fixed to drop E from the D6 gate.
+    # Citation: vendor/nle/src/sp_lev.c:1203-1208.
     #
-    # Subtlety: vendor's ``(!nroom || !rn2(nroom))`` is itself a short-
-    # circuit -- ``rn2(nroom)`` is *not* drawn when ``nroom == 0`` --
-    # so the D6 draw is conditional on ``nroom != 0`` even within the
-    # gate_outer ``True`` branch.
-    gate_outer = (
+    # Also: vendor only reaches this if-block after the rect-fits test
+    # at sp_lev.c:1195 passed (otherwise ``continue;`` jumps back to
+    # the while-test), so all gates also include ``can_place``.
+    gate_ab = (
         can_place
         & (p_ly == jnp.int16(0))
         & (p_hy >= jnp.int16(_ROWNO - 1))
-        & ((yabs + dy) > jnp.int16(_ROWNO // 2))
     )
+    gate_e = (yabs + dy) > jnp.int16(_ROWNO // 2)
+    gate_outer = gate_ab & gate_e
     nroom_pos = nroom > jnp.int32(0)
 
-    # D6 fires iff gate_outer AND nroom > 0.
+    # D6 fires iff gate_ab AND nroom > 0 -- E is evaluated AFTER the
+    # rn2(nroom) draw in vendor's left-to-right ``&&`` chain.
+    # sp_lev.c:1203.
     def _draw_d6(carry):
         r = carry
         r, v = rn2_jax(r, jnp.maximum(nroom, jnp.int32(1)))
@@ -508,12 +546,12 @@ def _try_one_attempt(
         return r, jnp.int32(0)
 
     rng, d6_val = lax.cond(
-        gate_outer & nroom_pos, _draw_d6, _skip_d6, rng
+        gate_ab & nroom_pos, _draw_d6, _skip_d6, rng
     )
 
     # The full predicate that triggers D7 (rn1(3, 2)) is::
-    #     gate_outer AND ((nroom == 0) OR (d6_val == 0))
-    d7_pred = gate_outer & ((~nroom_pos) | (d6_val == jnp.int32(0)))
+    #     gate_ab AND ((nroom == 0) OR (d6_val == 0)) AND gate_e
+    d7_pred = gate_ab & ((~nroom_pos) | (d6_val == jnp.int32(0))) & gate_e
 
     # D7: rn1(3, 2) -- sp_lev.c:1205.  Fires only when d7_pred is True.
     def _draw_d7(carry):
