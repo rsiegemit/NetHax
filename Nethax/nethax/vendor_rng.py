@@ -378,6 +378,48 @@ def init(seed: int) -> Isaac64State:
     )
 
 
+def reseed_random(state: "Isaac64State", has_strong_rngseed: bool = False) -> "Isaac64State":
+    """Vendor-parity ``reseed_random(fn)`` (hacklib.c:906-914).
+
+    Vendor pseudocode::
+
+        void reseed_random(fn) {
+            if (has_strong_rngseed)
+                init_random(fn);              /* re-seeds from sys_random_seed */
+        }
+
+    Under the NLE byte-parity validator configuration the env is created
+    with ``env.seed(seeds=(s, s), reseed=False)``
+    (vendor/nle/nle/env/base.py:441), which sets ``has_strong_rngseed`` to
+    ``False`` in ``init_random`` (vendor/nle/src/nle.c:412).  In that
+    case ``reseed_random`` is a NO-OP and the ISAAC64 stream is preserved
+    untouched across ``mklev()`` entry/exit and ``goto_level``.
+
+    This helper mirrors that semantics: when ``has_strong_rngseed`` is
+    False (the validator default), the input state is returned unchanged
+    — preserving byte parity across the four call sites:
+
+      * vendor/nle/src/mklev.c:996  ``reseed_random(rn2);``
+      * vendor/nle/src/mklev.c:997  ``reseed_random(rn2_on_display_rng);``
+      * vendor/nle/src/mklev.c:1034 ``reseed_random(rn2);``
+      * vendor/nle/src/mklev.c:1035 ``reseed_random(rn2_on_display_rng);``
+      * vendor/nle/src/do.c:1458    ``reseed_random(rn2_on_display_rng);``
+
+    When ``has_strong_rngseed`` is True, vendor calls ``init_random``
+    which fetches a fresh platform entropy word and ``set_random``-s the
+    stream.  We currently do not model that path — it is non-deterministic
+    in C and breaks byte parity by definition.  Passing ``True`` will
+    raise to make accidental use loud.
+    """
+    if has_strong_rngseed:
+        raise NotImplementedError(
+            "reseed_random with has_strong_rngseed=True draws from "
+            "sys_random_seed() which is non-deterministic; byte-parity "
+            "validator runs with reseed=False so this path is unused."
+        )
+    return state
+
+
 # ---------------------------------------------------------------------------
 # Host-side JAX wrappers — eager scalar draws used in non-JIT setup paths.
 #

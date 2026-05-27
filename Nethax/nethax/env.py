@@ -212,6 +212,23 @@ class NethaxEnv:
             messages=_emit_role_intro(state.messages, int(role)),
         )
 
+        # Vendor mklev() begins by reseeding BOTH streams (vendor
+        # mklev.c:996-997)::
+        #     reseed_random(rn2);
+        #     reseed_random(rn2_on_display_rng);
+        # Under the validator config (``reseed=False`` in env.seed,
+        # ``has_strong_rngseed=False``) both calls are no-ops, so the
+        # streams pass through unchanged.  Calling the helper explicitly
+        # keeps the structural correspondence with vendor C and gives a
+        # single hook to extend if a future run flips ``reseed=True``.
+        # Cite: vendor/nle/src/mklev.c:996-997
+        #       vendor/nle/src/hacklib.c:906-914 ``reseed_random``.
+        if use_vendor_rng():
+            state = state.replace(
+                vendor_rng=_vendor_rng.reseed_random(state.vendor_rng),
+                vendor_rng_disp=_vendor_rng.reseed_random(state.vendor_rng_disp),
+            )
+
         # Generate Main branch level 1 and write into the [branch=0, level=0]
         # slot.  This includes the per-room independent feature rolls
         # (fountain / altar / grave / traps) and the 2x2 detached vault —
@@ -264,6 +281,21 @@ class NethaxEnv:
         else:
             state = populate_level_with_monsters(
                 state, rng_monsters, n_monsters=n_monsters_vendor,
+            )
+
+        # Vendor mklev() ends by reseeding BOTH streams a second time
+        # (mklev.c:1034-1035)::
+        #     reseed_random(rn2);
+        #     reseed_random(rn2_on_display_rng);
+        # No-op under validator config (``has_strong_rngseed=False``) — see
+        # the matching entry hook above.  Mirroring the C structure here
+        # keeps Nethax wire-aligned with vendor for any future
+        # ``reseed=True`` parity run.
+        # Cite: vendor/nle/src/mklev.c:1034-1035.
+        if use_vendor_rng():
+            state = state.replace(
+                vendor_rng=_vendor_rng.reseed_random(state.vendor_rng),
+                vendor_rng_disp=_vendor_rng.reseed_random(state.vendor_rng_disp),
             )
 
         # Spawn starting pet adjacent to player — vendor/nethack/src/u_init.c::makedog.
