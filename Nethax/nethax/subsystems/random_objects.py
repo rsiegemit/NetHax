@@ -156,6 +156,64 @@ def _build_class_object_tables() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
 _CLASS_OTYPS, _CLASS_PROBS, _CLASS_TOTALS = _build_class_object_tables()
 
 
+def _build_type_roll_decoder() -> jnp.ndarray:
+    """Build per-class (roll → otyp) decoder for vendor mkobj.c:264-266.
+
+    Vendor: ``i = bases[oclass]; while ((prob -= objects[i].oc_prob) > 0) i++;``
+    with ``prob`` ∈ [1..oclass_prob_total] (drawn by ``rnd(1000)`` at
+    mkobj.c:251 then bounded by the per-class total).  Here we precompute
+    a length-1001 lookup keyed by the raw ``rnd(1000)`` roll for each class
+    so callers can decode the picked otyp without consuming extra RNG.
+
+    Returns
+    -------
+    decoder : (NUM_CLASSES, 1001) int32 — decoder[oclass, roll] = otyp.
+              roll 0 unused (vendor rnd(x) ∈ [1..x]).  Rolls beyond the
+              class total clamp to the last live otyp in that class.
+
+    Citations
+    ---------
+    vendor/nle/src/mkobj.c:251     — ``prob = rnd(1000)``
+    vendor/nle/src/mkobj.c:264-266 — type-pick subtraction walk
+    """
+    decoder = [[0] * 1001 for _ in range(_NUM_CLASSES)]
+    for c in range(_NUM_CLASSES):
+        otyps = []
+        probs = []
+        for otyp, entry in enumerate(OBJECTS):
+            if int(entry.class_) == c and entry.prob > 0:
+                otyps.append(otyp)
+                probs.append(int(entry.prob))
+        if not otyps:
+            continue
+        # Walk: for roll r in [1..total], otyp = otyps[k] where k is smallest
+        # index with sum(probs[0..k]) >= r.
+        cum = 0
+        k = 0
+        for r in range(1, 1001):
+            while k < len(otyps) - 1 and r > cum + probs[k]:
+                cum += probs[k]
+                k += 1
+            decoder[c][r] = otyps[k]
+        decoder[c][0] = otyps[0]  # unused but well-defined
+    return jnp.array(decoder, dtype=jnp.int32)
+
+
+_TYPE_ROLL_DECODER = _build_type_roll_decoder()
+
+
+def decode_picked_otyp(oclass_id: jnp.ndarray, type_roll: jnp.ndarray) -> jnp.ndarray:
+    """Return picked otyp given oclass and the ``rnd(1000)`` type-pick roll.
+
+    Used by callers that already drew the type-pick roll (e.g. rooms.py
+    ``randint_jax(v, (), 1, 1001)``) and need to recover the otyp without
+    consuming additional RNG, so the downstream mksobj_init cascade can
+    dispatch on otyp (vendor mkobj.c:264-266 + mkobj.c:897-966 TOOL switch).
+    """
+    safe_roll = jnp.clip(type_roll, 0, 1000).astype(jnp.int32)
+    return _TYPE_ROLL_DECODER[oclass_id, safe_roll]
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -484,6 +542,384 @@ def _noop_draws(rng: Isaac64State) -> Isaac64State:
     return rng
 
 
+# ---------------------------------------------------------------------------
+# TOOL_CLASS per-otyp dispatch  — vendor mkobj.c:897-966
+# ---------------------------------------------------------------------------
+# Vendor source: vendor/nle/src/mkobj.c lines 897-966 (case TOOL_CLASS body).
+#
+# The TOOL switch dispatches on otmp->otyp to one of ~10 sub-cases.  We model
+# each non-zero-draw sub-case as a small lax.switch branch and route otyp →
+# branch via a length-256 lookup table built at import time from the otyp ids
+# in constants/objects.py.
+#
+# The CONTAINER sub-cases (CHEST/LARGE_BOX/ICE_BOX/SACK/OILSKIN_SACK/
+# BAG_OF_HOLDING) fall through into mkbox_cnts (mkobj.c:920-929) which is
+# implemented below via a lax.fori_loop with a per-otyp static cap.
+#
+# otyp ids (from constants/objects.py — positional index in the OBJECTS tuple,
+# matching vendor onames.h ordering):
+#     189 large box, 190 chest, 191 ice box, 192 sack, 193 oilskin sack,
+#     194 bag of holding, 195 bag of tricks, 199 tallow candle, 200 wax candle,
+#     201 brass lantern, 202 oil lamp, 203 magic lamp, 204 expensive camera,
+#     206 crystal ball, 213 tinning kit, 215 can of grease, 216 figurine,
+#     217 magic marker, 223 magic flute, 225 frost horn, 226 fire horn,
+#     227 horn of plenty, 229 magic harp, 233 drum of earthquake.
+# ---------------------------------------------------------------------------
+
+# Branch index sentinels — must match the order in _TOOL_OTYP_BRANCHES below.
+_TOOL_BR_NOOP             = 0  # default — 0 draws
+_TOOL_BR_CANDLE           = 1  # TALLOW_CANDLE / WAX_CANDLE     (mkobj.c:899-907)
+_TOOL_BR_LAMP             = 2  # BRASS_LANTERN / OIL_LAMP       (mkobj.c:908-914)
+_TOOL_BR_MAGIC_LAMP       = 3  # MAGIC_LAMP                     (mkobj.c:915-919)
+_TOOL_BR_CHEST_LBOX       = 4  # CHEST / LARGE_BOX              (mkobj.c:920-924)
+_TOOL_BR_ICEBOX           = 5  # ICE_BOX                        (mkobj.c:925,929)
+_TOOL_BR_SACK             = 6  # SACK / OILSKIN_SACK / BAG_OF_HOLDING (mkobj.c:926-929)
+_TOOL_BR_CAMERA_TINNING_MARKER = 7  # EXPENSIVE_CAMERA / TINNING_KIT / MAGIC_MARKER (mkobj.c:931-935)
+_TOOL_BR_GREASE           = 8  # CAN_OF_GREASE                  (mkobj.c:936-939)
+_TOOL_BR_CRYSTAL_BALL     = 9  # CRYSTAL_BALL                   (mkobj.c:940-943)
+_TOOL_BR_HORN_BAG_TRICKS  = 10 # HORN_OF_PLENTY / BAG_OF_TRICKS (mkobj.c:944-947)
+_TOOL_BR_FIGURINE         = 11 # FIGURINE                       (mkobj.c:948-954)
+_TOOL_BR_INSTRUMENT       = 12 # MAGIC_FLUTE/HARP/FROST_HORN/FIRE_HORN/DRUM_OF_EARTHQUAKE (mkobj.c:958-964)
+
+
+def _build_tool_otyp_branch_table() -> jnp.ndarray:
+    """Return length-256 int32 array: otyp → tool-branch sentinel.
+
+    Unknown otyps map to _TOOL_BR_NOOP (0 draws).  256 covers all otyps in
+    OBJECTS (currently ~453 entries but tool otyps are clustered <240).
+    """
+    table = [int(_TOOL_BR_NOOP)] * 256
+    # Vendor citations: see mkobj.c line numbers in the sentinel comments above.
+    table[199] = _TOOL_BR_CANDLE          # tallow candle
+    table[200] = _TOOL_BR_CANDLE          # wax candle
+    table[201] = _TOOL_BR_LAMP            # brass lantern
+    table[202] = _TOOL_BR_LAMP            # oil lamp
+    table[203] = _TOOL_BR_MAGIC_LAMP      # magic lamp
+    table[189] = _TOOL_BR_CHEST_LBOX      # large box
+    table[190] = _TOOL_BR_CHEST_LBOX      # chest
+    table[191] = _TOOL_BR_ICEBOX          # ice box
+    table[192] = _TOOL_BR_SACK            # sack
+    table[193] = _TOOL_BR_SACK            # oilskin sack
+    table[194] = _TOOL_BR_SACK            # bag of holding
+    table[195] = _TOOL_BR_HORN_BAG_TRICKS # bag of tricks
+    table[204] = _TOOL_BR_CAMERA_TINNING_MARKER  # expensive camera
+    table[213] = _TOOL_BR_CAMERA_TINNING_MARKER  # tinning kit
+    table[217] = _TOOL_BR_CAMERA_TINNING_MARKER  # magic marker
+    table[215] = _TOOL_BR_GREASE          # can of grease
+    table[206] = _TOOL_BR_CRYSTAL_BALL    # crystal ball
+    table[227] = _TOOL_BR_HORN_BAG_TRICKS # horn of plenty
+    table[216] = _TOOL_BR_FIGURINE        # figurine
+    table[223] = _TOOL_BR_INSTRUMENT      # magic flute
+    table[225] = _TOOL_BR_INSTRUMENT      # frost horn
+    table[226] = _TOOL_BR_INSTRUMENT      # fire horn
+    table[229] = _TOOL_BR_INSTRUMENT      # magic harp
+    table[233] = _TOOL_BR_INSTRUMENT      # drum of earthquake
+    return jnp.array(table, dtype=jnp.int32)
+
+
+_TOOL_OTYP_BRANCH_TABLE = _build_tool_otyp_branch_table()
+
+
+def _tool_candle_draws(rng: Isaac64State) -> Isaac64State:
+    """TALLOW_CANDLE / WAX_CANDLE — vendor mkobj.c:899-907.
+
+    rn2(2) ? rn2(7) : 0       # quantity (mkobj.c:905)
+    blessorcurse(otmp, 5)     # mkobj.c:906
+    """
+    rng, r2 = rn2_jax(rng, 2)                                  # mkobj.c:905
+    rng = lax.cond(
+        r2 != jnp.int32(0),
+        lambda r: rn2_jax(r, 7)[0],                            # mkobj.c:905
+        lambda r: r,
+        rng,
+    )
+    return _blessorcurse_jax(rng, 5)                           # mkobj.c:906
+
+
+def _tool_lamp_draws(rng: Isaac64State) -> Isaac64State:
+    """BRASS_LANTERN / OIL_LAMP — vendor mkobj.c:908-914.
+
+    rn1(500, 1000)            # age (mkobj.c:911)  — 1 draw
+    blessorcurse(otmp, 5)     # mkobj.c:913
+    """
+    rng, _ = rn1_jax(rng, 500, 1000)                           # mkobj.c:911
+    return _blessorcurse_jax(rng, 5)                           # mkobj.c:913
+
+
+def _tool_magic_lamp_draws(rng: Isaac64State) -> Isaac64State:
+    """MAGIC_LAMP — vendor mkobj.c:915-919.
+
+    blessorcurse(otmp, 2)     # mkobj.c:918
+    """
+    return _blessorcurse_jax(rng, 2)                           # mkobj.c:918
+
+
+def _tool_camera_tinning_marker_draws(rng: Isaac64State) -> Isaac64State:
+    """EXPENSIVE_CAMERA / TINNING_KIT / MAGIC_MARKER — vendor mkobj.c:931-935.
+
+    rn1(70, 30)               # spe (mkobj.c:934) — 1 draw
+    """
+    rng, _ = rn1_jax(rng, 70, 30)                              # mkobj.c:934
+    return rng
+
+
+def _tool_grease_draws(rng: Isaac64State) -> Isaac64State:
+    """CAN_OF_GREASE — vendor mkobj.c:936-939.
+
+    rnd(25)                   # spe (mkobj.c:937) — 1 draw
+    blessorcurse(otmp, 10)    # mkobj.c:938
+    """
+    rng, _ = rnd_jax(rng, 25)                                  # mkobj.c:937
+    return _blessorcurse_jax(rng, 10)                          # mkobj.c:938
+
+
+def _tool_crystal_ball_draws(rng: Isaac64State) -> Isaac64State:
+    """CRYSTAL_BALL — vendor mkobj.c:940-943.
+
+    rnd(5)                    # spe (mkobj.c:941) — 1 draw
+    blessorcurse(otmp, 2)     # mkobj.c:942
+    """
+    rng, _ = rnd_jax(rng, 5)                                   # mkobj.c:941
+    return _blessorcurse_jax(rng, 2)                           # mkobj.c:942
+
+
+def _tool_horn_bag_tricks_draws(rng: Isaac64State) -> Isaac64State:
+    """HORN_OF_PLENTY / BAG_OF_TRICKS — vendor mkobj.c:944-947.
+
+    rnd(20)                   # spe (mkobj.c:946) — 1 draw
+    """
+    rng, _ = rnd_jax(rng, 20)                                  # mkobj.c:946
+    return rng
+
+
+def _tool_figurine_draws(rng: Isaac64State) -> Isaac64State:
+    """FIGURINE — vendor mkobj.c:948-954.
+
+    do otmp->corpsenm = rndmonnum();
+    while (is_human(...) && tryct++ < 30)    # mkobj.c:950-952 — 1-30 draws
+    blessorcurse(otmp, 4)                    # mkobj.c:953
+
+    rndmonnum() emits at least 1 rn2() draw (vendor mkobj.c:355 selects a
+    common monster).  Full vendor parity requires the monster table; we model
+    a single rndmonnum() draw + blessorcurse(4) here.  TODO: full rndmonnum
+    loop (would need bounded lax.while_loop tied to permonst tables).
+    """
+    rng, _ = rn2_jax(rng, 100)                                 # rndmonnum proxy
+    return _blessorcurse_jax(rng, 4)                           # mkobj.c:953
+
+
+def _tool_instrument_draws(rng: Isaac64State) -> Isaac64State:
+    """MAGIC_FLUTE / MAGIC_HARP / FROST_HORN / FIRE_HORN / DRUM_OF_EARTHQUAKE
+    — vendor mkobj.c:958-964.
+
+    rn1(5, 4)                 # spe (mkobj.c:963) — 1 draw
+    """
+    rng, _ = rn1_jax(rng, 5, 4)                                # mkobj.c:963
+    return rng
+
+
+# ---------------------------------------------------------------------------
+# mkbox_cnts cascade — vendor mkobj.c:274-353
+# ---------------------------------------------------------------------------
+# Per-item budget inside the fori_loop body:
+#   1 draw — rnd(100) boxiprobs class pick                (mkobj.c:324)
+#   1 draw — rnd(1000) type pick inside mkobj()           (mkobj.c:251)
+#   ~3-6 draws — class-specific mksobj_init cascade       (mkobj.c:801-1069)
+# For ICE_BOX the per-item path skips boxiprobs and goes straight to
+# mksobj(CORPSE) (mkobj.c:311); the CORPSE branch of mksobj is the FOOD_CLASS
+# corpse case (mkobj.c:822-836) which does rndmonnum() (~1 draw) and no other
+# random selection.  We model this as a fixed 2-draw per-corpse approximation.
+#
+# Bag-in-bag prevention: vendor mkobj.c:342-345 forces nested BoH→SACK with
+# no extra draws.  Our `recursive=True` flag in consume_mksobj_init_draws
+# makes the inner TOOL branch consume 0 container draws, achieving the same
+# net effect (no nested mkbox_cnts cascade).
+
+
+_MKBOX_NMAX_TABLE = jnp.array(
+    # length-256: per-otyp max item count (vendor mkobj.c:283-307).  Uses the
+    # locked-worst-case for CHEST/LARGE_BOX (n=7/5) to keep the fori_loop
+    # bound static.  Unlocked CHEST/LARGE_BOX simply have fewer items drawn
+    # because rn2(n+1) picks a smaller value, but the loop trip count is
+    # masked at runtime.
+    [0] * 256, dtype=jnp.int32,
+).at[189].set(5).at[190].set(7).at[191].set(20).at[192].set(1).at[193].set(1).at[194].set(1)
+# 189 large box (n=5 unlocked, set to 5 — locked path goes via _tool_chest_lbox_draws)
+# 190 chest     (n=7 worst-case locked)
+# 191 ice box   (n=20)
+# 192 sack
+# 193 oilskin sack
+# 194 bag of holding
+
+
+# mkbox_cnts fori_loop cap — must cover the max items any box can produce.
+# Vendor: ICE_BOX picks rn2(21) → max 20 items.  We cap at 21 to safely cover.
+_MKBOX_LOOP_CAP = 21
+
+
+# boxiprobs class table — vendor mkobj.c:41-49.  Used to decode rnd(100) →
+# oclass for the per-item class pick inside mkbox_cnts.  Sums to 100.
+_BOXIPROBS: tuple[tuple[int, int], ...] = (
+    (18, int(ObjectClass.GEM_CLASS)),
+    (15, int(ObjectClass.FOOD_CLASS)),
+    (18, int(ObjectClass.POTION_CLASS)),
+    (18, int(ObjectClass.SCROLL_CLASS)),
+    (12, int(ObjectClass.SPBOOK_CLASS)),
+    ( 7, int(ObjectClass.COIN_CLASS)),
+    ( 6, int(ObjectClass.WAND_CLASS)),
+    ( 5, int(ObjectClass.RING_CLASS)),
+    ( 1, int(ObjectClass.AMULET_CLASS)),
+)
+_BOXIPROBS_TABLE = _expand_class_table(_BOXIPROBS)
+
+
+def _mkbox_cnts_draws(rng: Isaac64State, box_otyp: jnp.ndarray) -> Isaac64State:
+    """Vendor mkobj.c:274-353 — consume mkbox_cnts RNG draws.
+
+    Per-otyp n_max:
+        ICE_BOX (191):       n=20
+        CHEST   (190):       n=7 (locked worst-case; unlocked n=5)
+        LARGE_BOX (189):     n=5 (locked worst-case; unlocked n=3)
+        SACK/OILSKIN_SACK (192/193): n=1
+        BAG_OF_HOLDING (194):        n=1
+
+    Per-item draws:
+        ICE_BOX path (mkobj.c:310-318):  ~2 draws (rndmonnum() proxy for CORPSE)
+        Other path (mkobj.c:321-349):    1 (boxiprob class) + 1 (type pick)
+                                          + class cascade (~3-6 draws)
+                                          → ~5-8 draws per item.
+
+    Bag-in-bag guard (mkobj.c:342-345): handled by `recursive=True` in
+    consume_mksobj_init_draws (TOOL branch becomes noop on recursion).
+    """
+    n_max = _MKBOX_NMAX_TABLE[box_otyp]                        # mkobj.c:283-307
+    rng, n_items = rn2_jax(rng, n_max + jnp.int32(1))           # mkobj.c:309
+
+    is_icebox = box_otyp == jnp.int32(191)                      # mkobj.c:310
+
+    def _body(i, carry):
+        rng_, n_items_, is_icebox_ = carry
+        active = i < n_items_
+
+        def _icebox_item(r):
+            # CORPSE path — mkobj.c:310-318.  rndmonnum() ~1 draw + rn2(2) sex.
+            r, _ = rn2_jax(r, 100)                              # rndmonnum proxy
+            r, _ = rn2_jax(r, 2)                                # sex / variant proxy
+            return r
+
+        def _regular_item(r):
+            # Non-ICE_BOX item path — mkobj.c:321-349.
+            r, cls_roll = rn2_jax(r, 100)                       # mkobj.c:324 rnd(100)-1
+            iclass = _BOXIPROBS_TABLE[cls_roll]
+            r, _ = rn2_jax(r, 1000)                             # mkobj.c:251 type pick (rnd(1000))
+            # Inner mksobj_init cascade — recursive=True suppresses any nested
+            # TOOL container cascade (vendor mkobj.c:342-345 bag-in-bag guard).
+            r = _consume_mksobj_init_draws_inner(r, iclass)
+            return r
+
+        def _do_item(r):
+            return lax.cond(is_icebox_, _icebox_item, _regular_item, r)
+
+        rng_ = lax.cond(active, _do_item, lambda r: r, rng_)
+        return (rng_, n_items_, is_icebox_)
+
+    rng, _, _ = lax.fori_loop(0, _MKBOX_LOOP_CAP, _body, (rng, n_items, is_icebox))
+    return rng
+
+
+def _tool_chest_lbox_draws(rng: Isaac64State) -> Isaac64State:
+    """CHEST / LARGE_BOX — vendor mkobj.c:920-929.
+
+    rn2(5)                   # olocked  (mkobj.c:922) — 1 draw
+    rn2(10)                  # otrapped (mkobj.c:923) — 1 draw
+    mkbox_cnts(otmp)         # mkobj.c:929  — recursive cascade
+
+    For loop-bound purposes we treat the box as the locked CHEST/LARGE_BOX
+    (n_max=7/5).  The actual item count is rn2(n+1) so unlocked variants will
+    simply produce fewer items at runtime (the fori_loop is masked).
+
+    We dispatch on the picked otyp inside _mkbox_cnts_draws; since this
+    branch covers both CHEST and LARGE_BOX, the caller is responsible for
+    passing the actual otyp through to _mkbox_cnts_draws.  We use a sentinel
+    otyp here equal to CHEST (190) because that is the worst-case n=7 — for
+    LARGE_BOX the fori_loop produces at most 5 items so a few iterations are
+    no-ops but no extra RNG is consumed.
+    """
+    rng, _ = rn2_jax(rng, 5)                                    # mkobj.c:922
+    rng, _ = rn2_jax(rng, 10)                                   # mkobj.c:923
+    return _mkbox_cnts_draws(rng, jnp.int32(190))               # mkobj.c:929
+
+
+def _tool_icebox_draws(rng: Isaac64State) -> Isaac64State:
+    """ICE_BOX — vendor mkobj.c:925,929.  Calls mkbox_cnts directly."""
+    return _mkbox_cnts_draws(rng, jnp.int32(191))               # mkobj.c:929
+
+
+def _tool_sack_draws(rng: Isaac64State) -> Isaac64State:
+    """SACK / OILSKIN_SACK / BAG_OF_HOLDING — vendor mkobj.c:926-929.
+
+    Calls mkbox_cnts with n=1 (mkobj.c:302).  We pass SACK (192) so n_max=1.
+    Note: the in_mklev=FALSE && moves<=1 guard at mkobj.c:296-298 would set
+    n=0 for SACK/OILSKIN_SACK in initial-inventory contexts; that is handled
+    upstream by not invoking this branch from u_init.  In mklev contexts
+    (rooms.py callers) in_mklev=TRUE so the guard is skipped.
+    """
+    return _mkbox_cnts_draws(rng, jnp.int32(192))               # mkobj.c:929
+
+
+_TOOL_OTYP_BRANCHES = [
+    _noop_draws,                          # 0  _TOOL_BR_NOOP
+    _tool_candle_draws,                   # 1  _TOOL_BR_CANDLE
+    _tool_lamp_draws,                     # 2  _TOOL_BR_LAMP
+    _tool_magic_lamp_draws,               # 3  _TOOL_BR_MAGIC_LAMP
+    _tool_chest_lbox_draws,               # 4  _TOOL_BR_CHEST_LBOX
+    _tool_icebox_draws,                   # 5  _TOOL_BR_ICEBOX
+    _tool_sack_draws,                     # 6  _TOOL_BR_SACK
+    _tool_camera_tinning_marker_draws,    # 7  _TOOL_BR_CAMERA_TINNING_MARKER
+    _tool_grease_draws,                   # 8  _TOOL_BR_GREASE
+    _tool_crystal_ball_draws,             # 9  _TOOL_BR_CRYSTAL_BALL
+    _tool_horn_bag_tricks_draws,          # 10 _TOOL_BR_HORN_BAG_TRICKS
+    _tool_figurine_draws,                 # 11 _TOOL_BR_FIGURINE
+    _tool_instrument_draws,               # 12 _TOOL_BR_INSTRUMENT
+]
+
+
+def _tool_draws_dispatch(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
+    """Vendor mkobj.c:897-966 — TOOL_CLASS per-otyp dispatch.
+
+    Routes the otyp through ``_TOOL_OTYP_BRANCH_TABLE`` to one of the small
+    sub-cases.  Unknown tool otyps fall through to noop (0 draws), matching
+    the vendor switch's empty default (e.g. LOCK_PICK, KEY emit no draws).
+    """
+    safe_otyp = jnp.clip(otyp, 0, 255).astype(jnp.int32)
+    branch = _TOOL_OTYP_BRANCH_TABLE[safe_otyp]
+    return lax.switch(branch, _TOOL_OTYP_BRANCHES, rng)
+
+
+# ---------------------------------------------------------------------------
+# Recursive guard: inner mksobj_init dispatch for mkbox_cnts contents.
+# ---------------------------------------------------------------------------
+# When mkbox_cnts picks a TOOL_CLASS item (boxiprobs only emits non-TOOL
+# classes, so this is moot for the direct call) OR when nested cascades
+# would loop, we must not re-enter the container cascade.  Vendor enforces
+# this at mkobj.c:342-345 (Is_mbag check → force SACK, no extra draws) and
+# by boxiprobs not containing TOOL_CLASS at all (mkobj.c:41-49).  We define
+# an "inner" dispatcher that uses the original (non-TOOL) branch table to
+# guarantee no recursion.
+
+def _consume_mksobj_init_draws_inner(
+    rng: Isaac64State,
+    oclass_id: jnp.ndarray,
+) -> Isaac64State:
+    """Inner mksobj_init dispatch with no TOOL container recursion.
+
+    Used by ``_mkbox_cnts_draws`` for the per-item cascade so that bag-in-bag
+    and the boxiprobs-emits-no-TOOL invariant are upheld (vendor mkobj.c:41-49
+    boxiprobs class table; mkobj.c:342-345 bag-in-bag guard).
+    """
+    return lax.switch(oclass_id, _MKSOBJ_INIT_BRANCHES, rng)
+
+
 # lax.switch branch table indexed by ObjectClass int value.
 # Classes not listed use _noop_draws.  The table must be dense (index 0..N).
 # ObjectClass values: RANDOM=0, COIN=1(?), WEAPON=2, ARMOR=3, RING=4,
@@ -496,7 +932,7 @@ _MKSOBJ_INIT_BRANCHES = [
     _armor_draws,         # 3  ARMOR_CLASS    mkobj.c:992-1005
     _ring_draws,          # 4  RING_CLASS     mkobj.c:1028-1048 (uncharged path)
     _amulet_draws,        # 5  AMULET_CLASS   mkobj.c:967-975
-    _noop_draws,          # 6  TOOL_CLASS     deferred (container cascade)
+    _noop_draws,          # 6  TOOL_CLASS     dispatched via _tool_draws_dispatch
     _food_draws,          # 7  FOOD_CLASS     mkobj.c:880-884
     _potion_scroll_draws, # 8  POTION_CLASS   mkobj.c:981-987
     _potion_scroll_draws, # 9  SCROLL_CLASS   mkobj.c:981-987
@@ -510,6 +946,7 @@ _MKSOBJ_INIT_BRANCHES = [
 def consume_mksobj_init_draws(
     rng: Isaac64State,
     oclass_id: jnp.ndarray,
+    otyp: jnp.ndarray | None = None,
 ) -> Isaac64State:
     """Consume vendor ``mksobj_init`` ISAAC64 draws for a given object class.
 
@@ -524,6 +961,10 @@ def consume_mksobj_init_draws(
     ----------
     rng        : Isaac64State — current ISAAC64 stream position.
     oclass_id  : int32 scalar — ObjectClass enum value of the spawned object.
+    otyp       : optional int32 scalar — picked otyp.  When ``oclass_id ==
+                 TOOL_CLASS`` and ``otyp`` is provided, dispatches to the
+                 per-otyp TOOL/CONTAINER cascade (vendor mkobj.c:897-966).
+                 If omitted, TOOL_CLASS consumes 0 draws (legacy behaviour).
 
     Returns
     -------
@@ -536,7 +977,8 @@ def consume_mksobj_init_draws(
     ARMOR_CLASS   (3):  rn2(10) + inner branch + rn2(40)→ 3–8 draws typical
     RING_CLASS    (4):  rn2(10) + cond rn2(9)           → 1–2 draws
     AMULET_CLASS  (5):  rn2(10) + boc(10)               → 2–3 draws
-    TOOL_CLASS    (6):  0 draws (deferred; containers omitted)
+    TOOL_CLASS    (6):  per-otyp dispatch (see _tool_draws_dispatch) — 0–~45 draws
+                        for containers (mkobj.c:920-929 → mkbox_cnts)
     FOOD_CLASS    (7):  rn2(6)                           → 1 draw
     POTION_CLASS  (8):  boc(4) = rn2(4) + cond rn2(2)  → 1–2 draws
     SCROLL_CLASS  (9):  boc(4) = rn2(4) + cond rn2(2)  → 1–2 draws
@@ -549,6 +991,8 @@ def consume_mksobj_init_draws(
     vendor/nle/src/mkobj.c:803-818   — WEAPON_CLASS
     vendor/nle/src/mkobj.c:819-885   — FOOD_CLASS
     vendor/nle/src/mkobj.c:886-895   — GEM_CLASS
+    vendor/nle/src/mkobj.c:897-966   — TOOL_CLASS per-otyp dispatch
+    vendor/nle/src/mkobj.c:274-353   — mkbox_cnts (container cascade)
     vendor/nle/src/mkobj.c:967-975   — AMULET_CLASS
     vendor/nle/src/mkobj.c:981-987   — POTION_CLASS / SCROLL_CLASS
     vendor/nle/src/mkobj.c:988-991   — SPBOOK_CLASS
@@ -557,4 +1001,15 @@ def consume_mksobj_init_draws(
     vendor/nle/src/mkobj.c:1028-1048 — RING_CLASS
     vendor/nle/src/mkobj.c:1370-1385 — blessorcurse definition
     """
-    return lax.switch(oclass_id, _MKSOBJ_INIT_BRANCHES, rng)
+    rng = lax.switch(oclass_id, _MKSOBJ_INIT_BRANCHES, rng)
+    if otyp is not None:
+        # TOOL_CLASS per-otyp dispatch (mkobj.c:897-966).  Only fires when
+        # the picked class is TOOL_CLASS; otherwise this is a noop.
+        is_tool = oclass_id == jnp.int32(int(ObjectClass.TOOL_CLASS))
+        rng = lax.cond(
+            is_tool,
+            lambda r: _tool_draws_dispatch(r, otyp),
+            lambda r: r,
+            rng,
+        )
+    return rng

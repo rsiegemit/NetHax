@@ -30,6 +30,11 @@ from flax import struct
 
 from Nethax.nethax.dungeon.branches import MAP_H, MAP_W
 from Nethax.nethax.vendor_rng import Isaac64State, randint_jax
+from Nethax.nethax.subsystems.random_objects import (
+    _MKOBJ_TABLE,
+    consume_mksobj_init_draws,
+    decode_picked_otyp,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -2077,8 +2082,12 @@ def fill_ordinary_rooms(
             vrng_in, _rmk, _cmk = somexy(vrng_in)
             vrng_in, cls_roll0 = randint_jax(vrng_in, (), 0, 100)  # rnd(100)-1 (mkobj.c:259)
             oclass0 = _MKOBJ_TABLE[cls_roll0]
-            vrng_in, _typ0 = randint_jax(vrng_in, (), 1, 1001)     # rnd(prob_total) (mkobj.c:265)
-            vrng_in = consume_mksobj_init_draws(vrng_in, oclass0)   # mkobj.c:801-1069
+            vrng_in, typ0 = randint_jax(vrng_in, (), 1, 1001)      # rnd(prob_total) (mkobj.c:265)
+            # Decode picked otyp from the type-roll so TOOL_CLASS can dispatch
+            # to its per-otyp cascade (mkobj.c:897-966 + mkbox_cnts).  Other
+            # classes ignore the otyp argument (legacy 0-draw fallback).
+            otyp0 = decode_picked_otyp(oclass0, typ0)              # mkobj.c:264-266
+            vrng_in = consume_mksobj_init_draws(vrng_in, oclass0, otyp0)  # mkobj.c:801-1069
             # Inner while (!rn2(5)) loop — cap=8 iters (vendor mklev.c:876-883).
             def _mkobj_step(carry, _):
                 vrng_s, cont = carry
@@ -2089,8 +2098,9 @@ def fill_ordinary_rooms(
                     v, _ro, _co = somexy(v)
                     v, cls_roll = randint_jax(v, (), 0, 100)        # rnd(100)-1 (mkobj.c:259)
                     oclass_i = _MKOBJ_TABLE[cls_roll]
-                    v, _typ = randint_jax(v, (), 1, 1001)           # rnd(prob_total) (mkobj.c:265)
-                    v = consume_mksobj_init_draws(v, oclass_i)      # mkobj.c:801-1069
+                    v, typ_i = randint_jax(v, (), 1, 1001)          # rnd(prob_total) (mkobj.c:265)
+                    otyp_i = decode_picked_otyp(oclass_i, typ_i)    # mkobj.c:264-266
+                    v = consume_mksobj_init_draws(v, oclass_i, otyp_i)  # mkobj.c:801-1069
                     return v
                 vrng_s = lax.cond(cont, _inner_true, lambda v: v, vrng_s)
                 return (vrng_s, cont), None
