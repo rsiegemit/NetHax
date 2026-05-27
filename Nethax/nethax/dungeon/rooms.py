@@ -1775,9 +1775,20 @@ def fill_ordinary_rooms(
             cx = jnp.clip(cx, 0, w_max)
             return vrng_in, ry, cx
 
-        # --- Sleeping monster: !rn2(3) + somexy (vendor line 974) ---
-        vrng, _sleep_roll = randint_jax(vrng, (), 0, 3)
-        vrng, _rs, _cs = somexy(vrng)
+        # --- Sleeping monster: !rn2(3) + somexy (vendor mklev.c:813-817) ---
+        # Vendor short-circuit:  if (u.uhave.amulet || !rn2(3)) {
+        #     x = somex(croom); y = somey(croom); makemon(...);
+        # }
+        # The rn2(3) gate + somex/somey draws + the full makemon cascade
+        # are now owned by :func:`populate_level_with_monsters` in the
+        # per-OROOM path (vendor mklev.c:813-817), which iterates the
+        # same active OROOM slots as this fill function.  Consolidating
+        # the draws into populate avoids the prior double-consumption
+        # (where fill_one_isaac drew rn2(3)+somexy without spawning and
+        # populate then ran a separate count-based loop unaware of those
+        # draws).  No ISAAC64 advance happens here — see
+        # _populate_per_oroom in spawning.py for the canonical draw site.
+        # Vendor cite: vendor/nle/src/mklev.c:813-817.
 
         # --- Traps: while (!rn2(trap_x)) — bounded loop ---
         MAX_TRAPS_PER_ROOM = 4
@@ -1788,136 +1799,131 @@ def fill_ordinary_rooms(
             [2, 6, 7, 13], dtype=jnp.int32  # WEAPON, TOOL, FOOD, GEM
         )
 
+        def _dead_pred_cascade(v, kind):
+            """Vendor mklev.c:1418-1533 — dead-predecessor item/corpse cascade.
+
+            Fires only when mktrap placed a trap AND ``lvl <= rnd(4)``.
+            Draws (in vendor order):
+
+              1. trap-item mksobj  (ARROW/DART/ROCK only — vendor 1436-1450)
+              2. possession do-while: rn2(4) class + rnd(1000) type
+                 + mksobj_init cascade; continue iff !rn2(5).
+              3. victim race rn2(15); SLP_GAS_TRAP elf guard rn2(2);
+                 GNOME victim → !rn2(10) candle gate + rn2(4) candle type.
+              4. mkcorpstat(CORPSE) → FOOD_CLASS rndmonnum draw.
+
+            Vendor cite: vendor/nle/src/mklev.c:1418-1533.
+            """
+            is_item_trap = (
+                (kind == jnp.int32(1)) | (kind == jnp.int32(2)) | (kind == jnp.int32(3))
+            )
+
+            def _item_true(vi):
+                # ARROW/DART → WEAPON_CLASS(2); ROCK → GEM_CLASS(13).
+                is_rock = kind == jnp.int32(3)
+                item_cls = jnp.where(is_rock, jnp.int32(13), jnp.int32(2))
+                vi, _ = randint_jax(vi, (), 1, 1001)  # rnd(1000) type-pick
+                vi = consume_mksobj_init_draws(vi, item_cls)
+                return vi
+            v = lax.cond(is_item_trap, _item_true, lambda vi: vi, v)
+
+            # Possession do-while (vendor mklev.c:1460-1490).
+            v, rn4_0 = randint_jax(v, (), 0, 4)
+            poss_cls_0 = _POSS_CLASS[rn4_0]
+            v, _ = randint_jax(v, (), 1, 1001)
+            v = consume_mksobj_init_draws(v, poss_cls_0)
+            v, rn5_0 = randint_jax(v, (), 0, 5)
+            cont0_p = rn5_0 == jnp.int32(0)
+            POSS_CAP = jnp.int32(100)
+
+            def _poss_cond(carry_p):
+                _vp, cont_p, iters_p = carry_p
+                return cont_p & (iters_p < POSS_CAP)
+
+            def _poss_body(carry_p):
+                vp, _cont_p, iters_p = carry_p
+                vp, rn4 = randint_jax(vp, (), 0, 4)
+                poss_cls = _POSS_CLASS[rn4]
+                vp, _ = randint_jax(vp, (), 1, 1001)
+                vp = consume_mksobj_init_draws(vp, poss_cls)
+                vp, rn5 = randint_jax(vp, (), 0, 5)
+                return (vp, rn5 == jnp.int32(0), iters_p + jnp.int32(1))
+
+            v, _, _ = lax.while_loop(
+                _poss_cond, _poss_body, (v, cont0_p, jnp.int32(1)),
+            )
+
+            # Victim race (vendor mklev.c:1493-1528).
+            v, rn15 = randint_jax(v, (), 0, 15)
+            is_gnome_victim = (rn15 >= jnp.int32(6)) & (rn15 <= jnp.int32(9))
+            is_elf_victim   = rn15 == jnp.int32(0)
+            SLP_GAS_TRAP = jnp.int32(10)
+
+            def _elf_slp_true(vi):
+                vi, _ = randint_jax(vi, (), 0, 2)
+                return vi
+            v = lax.cond(
+                is_elf_victim & (kind == SLP_GAS_TRAP),
+                _elf_slp_true, lambda vi: vi, v,
+            )
+
+            def _gnome_candle(vi):
+                vi, rn10 = randint_jax(vi, (), 0, 10)
+                def _candle_true(vic):
+                    vic, _ = randint_jax(vic, (), 0, 4)
+                    vic, _ = randint_jax(vic, (), 1, 1001)
+                    vic = consume_mksobj_init_draws(vic, jnp.int32(6))
+                    return vic
+                vi = lax.cond(
+                    rn10 == jnp.int32(0), _candle_true, lambda vic: vic, vi,
+                )
+                return vi
+            v = lax.cond(is_gnome_victim, _gnome_candle, lambda vi: vi, v)
+
+            # mkcorpstat(CORPSE) → rndmonnum (mklev.c:1529-1530).
+            v, _ = randint_jax(v, (), 1, 501)
+            return v
+
         def trap_step_isaac(carry, j):
             terrain_in, traps_in, continue_, vrng_in = carry
+            # Vendor:  while (!rn2(x)) mktrap(0, 0, croom, NULL);
+            # Each iter draws rn2(x) FIRST; mktrap (and ALL of its internal
+            # draws: traptype_rnd rnd(TRAPNUM-1), somexy placement, rnd(4)
+            # dead-predecessor gate, and the dead-pred cascade) only fire
+            # when the gate passes.  Previous code drew kind_raw + somexy
+            # + rnd(4) every iter — over-draws on miss path.
+            # Vendor cite: vendor/nle/src/mklev.c:825-826, 1274-1534.
             vrng_in, roll = randint_jax(vrng_in, (), 0, trap_x)
             hit = roll == jnp.int32(0)
-            # traptype_rnd: vendor mklev.c::traptype_rnd draws rnd(TRAPNUM-1)
-            # = uniform in [1, TRAPNUM-1] = randint(1, TRAPNUM).
-            vrng_in, kind_raw = randint_jax(vrng_in, (), 1, 26)
-            kind = _isaac_legalise_trap_kind(kind_raw, depth_i)
-            vrng_in, rt_r, rt_c = somexy(vrng_in)
             should_place = continue_ & hit & is_ordinary
-            new_terrain = terrain_in.at[rt_r, rt_c].set(
-                jnp.where(should_place, TRAP_TILE, terrain_in[rt_r, rt_c])
-            )
-            new_traps = traps_in.at[flat_lv, rt_r, rt_c].set(
-                jnp.where(should_place, kind.astype(jnp.int8),
-                          traps_in[flat_lv, rt_r, rt_c])
-            )
 
-            # --- Dead-predecessor cascade (vendor mklev.c:1418-1533) ---
-            # Gate: lvl <= rnd(4).  rnd(4) = randint(1,5); fires when
-            # depth_i <= result, i.e. result >= depth_i.  For shallow
-            # levels (Dlvl 1-4) this fires most of the time.
-            # Vendor cite: vendor/nle/src/mklev.c:1418-1533
-            def _dead_pred_true(v):
-                # mksobj draws for trap-item (ARROW/DART/ROCK or nothing).
-                # Vendor always calls mksobj for ARROW_TRAP/DART_TRAP/ROCKTRAP
-                # (mklev.c:1436-1450).  kind is already resolved; model the
-                # init draw for the weapon class (ARROW, DART are WEAPON_CLASS;
-                # ROCK is GEM_CLASS).  We draw unconditionally and treat the
-                # "no item" default as a zero-draw no-op — the three item
-                # cases use mksobj(init=TRUE) which emits mksobj_init draws.
-                # We approximate: rnd(1000) type-pick + weapon/gem init draws.
-                # For simplicity use lax.cond: kind in {1,2,3} triggers draws.
-                is_item_trap = (kind == jnp.int32(1)) | (kind == jnp.int32(2)) | (kind == jnp.int32(3))
-                def _item_true(vi):
-                    # ARROW/DART → WEAPON_CLASS(2); ROCK → GEM_CLASS(13).
-                    is_rock = kind == jnp.int32(3)
-                    item_cls = jnp.where(is_rock, jnp.int32(13), jnp.int32(2))
-                    vi, _ = randint_jax(vi, (), 1, 1001)  # rnd(1000) type-pick
-                    vi = consume_mksobj_init_draws(vi, item_cls)
-                    return vi
-                v = lax.cond(is_item_trap, _item_true, lambda vi: vi, v)
-
-                # Possession do-while (vendor mklev.c:1460-1490):
-                #   do { switch (rn2(4)) ...; mkobj(poss_class, FALSE); }
-                #   while (!rn2(5));
-                # First iter fires unconditionally; each subsequent iter
-                # continues iff rn2(5)==0 (~20% probability).  mkobj draws
-                # rnd(1000) for the per-class type pick, then mksobj_init
-                # cascade.  Replace the fixed-length cap=8 scan with
-                # lax.while_loop so only vendor-consumed draws fire
-                # (expected ≈ 1.25 iters vs 8 unconditional in prior scan).
-                # Vendor cite: mklev.c:1460-1490.
-                # Mandatory first iter (do-while semantics).
-                v, rn4_0 = randint_jax(v, (), 0, 4)
-                poss_cls_0 = _POSS_CLASS[rn4_0]
-                v, _ = randint_jax(v, (), 1, 1001)
-                v = consume_mksobj_init_draws(v, poss_cls_0)
-                v, rn5_0 = randint_jax(v, (), 0, 5)
-                cont0_p = rn5_0 == jnp.int32(0)
-                POSS_CAP = jnp.int32(100)
-
-                def _poss_cond(carry_p):
-                    _vp, cont_p, iters_p = carry_p
-                    return cont_p & (iters_p < POSS_CAP)
-
-                def _poss_body(carry_p):
-                    vp, _cont_p, iters_p = carry_p
-                    vp, rn4 = randint_jax(vp, (), 0, 4)       # rn2(4) class
-                    poss_cls = _POSS_CLASS[rn4]
-                    vp, _ = randint_jax(vp, (), 1, 1001)      # rnd(1000) type
-                    vp = consume_mksobj_init_draws(vp, poss_cls)
-                    vp, rn5 = randint_jax(vp, (), 0, 5)       # !rn2(5) gate
-                    return (vp, rn5 == jnp.int32(0), iters_p + jnp.int32(1))
-
-                v, _, _ = lax.while_loop(
-                    _poss_cond,
-                    _poss_body,
-                    (v, cont0_p, jnp.int32(1)),
+            def _mktrap_true(carry_m):
+                v, t_in, tr_in = carry_m
+                # traptype_rnd: rnd(TRAPNUM-1) = randint(1, TRAPNUM=26).
+                v, kind_raw = randint_jax(v, (), 1, 26)
+                kind_ = _isaac_legalise_trap_kind(kind_raw, depth_i)
+                # mktrap's do/while: somexy placement (single-attempt model).
+                v, rt_r_, rt_c_ = somexy(v)
+                new_t = t_in.at[rt_r_, rt_c_].set(TRAP_TILE)
+                new_tr = tr_in.at[flat_lv, rt_r_, rt_c_].set(
+                    kind_.astype(jnp.int8)
                 )
-
-                # Victim race: rn2(15).  Cases 6-9 (GNOME) also draw
-                # !rn2(10) candle gate + rn2(4) candle type (if gate fires).
-                # SLP_GAS_TRAP elf-guard: rn2(2) fires when kind==SLP_GAS_TRAP
-                # and victim is elf (rn2(15)==0).
-                # Vendor: mklev.c:1493-1528.
-                v, rn15 = randint_jax(v, (), 0, 15)
-                is_gnome_victim = (rn15 >= jnp.int32(6)) & (rn15 <= jnp.int32(9))
-                is_elf_victim   = rn15 == jnp.int32(0)
-                SLP_GAS_TRAP = jnp.int32(10)  # vendor trap enum value
-
-                # SLP_GAS_TRAP elf guard: rn2(2) drawn when elf & SLP_GAS_TRAP.
-                def _elf_slp_true(vi):
-                    vi, _ = randint_jax(vi, (), 0, 2)  # rn2(2) elf-sleep guard
-                    return vi
+                # Dead-predecessor gate: rnd(4) drawn AFTER mktrap fires.
+                v, rnd4_gate_ = randint_jax(v, (), 1, 5)  # rnd(4)
                 v = lax.cond(
-                    is_elf_victim & (kind == SLP_GAS_TRAP),
-                    _elf_slp_true, lambda vi: vi, v,
+                    depth_i <= rnd4_gate_,
+                    lambda vi: _dead_pred_cascade(vi, kind_),
+                    lambda vi: vi,
+                    v,
                 )
+                return (v, new_t, new_tr)
 
-                # Gnome candle: !rn2(10) gate + rn2(4) candle type if fires.
-                def _gnome_candle(vi):
-                    vi, rn10 = randint_jax(vi, (), 0, 10)  # !rn2(10) gate
-                    def _candle_true(vic):
-                        vic, _ = randint_jax(vic, (), 0, 4)  # rn2(4) candle type
-                        # mksobj(TALLOW/WAX_CANDLE, init=TRUE) → TOOL_CLASS(6)
-                        vic, _ = randint_jax(vic, (), 1, 1001)
-                        vic = consume_mksobj_init_draws(vic, jnp.int32(6))
-                        return vic
-                    vi = lax.cond(
-                        rn10 == jnp.int32(0), _candle_true, lambda vic: vic, vi,
-                    )
-                    return vi
-                v = lax.cond(is_gnome_victim, _gnome_candle, lambda vi: vi, v)
+            def _mktrap_false(carry_m):
+                return carry_m
 
-                # mkcorpstat(CORPSE, ...): mksobj_at(CORPSE, init=TRUE) →
-                # FOOD_CLASS; rndmonnum() → rndmonst() → rnd(choice_count)
-                # = 1 draw.  Vendor: mklev.c:1529-1530; mkobj.c:1524-1541.
-                v, _ = randint_jax(v, (), 1, 501)  # rnd(choice_count) ≤ 500
-                return v
-
-            def _dead_pred_false(v):
-                return v
-
-            # Outer gate: rnd(4) drawn unconditionally; cascade fires when
-            # depth_i <= result (shallow-level check).
-            vrng_in, rnd4_gate = randint_jax(vrng_in, (), 1, 5)  # rnd(4)
-            vrng_in = lax.cond(
-                should_place & (depth_i <= rnd4_gate),
-                _dead_pred_true, _dead_pred_false, vrng_in,
+            vrng_in, new_terrain, new_traps = lax.cond(
+                should_place, _mktrap_true, _mktrap_false,
+                (vrng_in, terrain_in, traps_in),
             )
 
             return (new_terrain, new_traps, continue_ & hit, vrng_in), None
@@ -1928,20 +1934,21 @@ def fill_ordinary_rooms(
             jnp.arange(MAX_TRAPS_PER_ROOM, dtype=jnp.int32),
         )
 
-        # --- Gold: !rn2(3) + somexy + mkgold internals (vendor line 986-987) ---
-        # Vendor mklev.c:986-987 calls mkgold(0L, somex, somey).
-        # mkgold(amount==0) draws two RNG values before mksobj_at:
-        #   mul  = rnd(30 / max(12 - depth, 2))    (mkobj.c:1493)
-        #   base = rnd(level_difficulty() + 2)      (mkobj.c:1495)
-        # mksobj_at(GOLD_PIECE, init=TRUE) → COIN_CLASS: 0 init draws.
-        # Vendor cite: vendor/nle/src/mkobj.c:1486-1504
+        # --- Gold: !rn2(3) + somex/somey + mkgold internals (vendor line 827-828) ---
+        # Vendor:  if (!rn2(3)) (void) mkgold(0L, somex(croom), somey(croom));
+        # Short-circuit: somex/somey AND mkgold internals only fire when
+        # rn2(3)==0.  Previous code drew somexy unconditionally — that's an
+        # over-draw on the ~66.7% miss path.
+        # Vendor cite: vendor/nle/src/mklev.c:827-828; mkobj.c:1486-1504.
         vrng, _gold_roll = randint_jax(vrng, (), 0, 3)
-        vrng, _rg, _cg = somexy(vrng)
         _gold_gate = (_gold_roll == jnp.int32(0)) & is_ordinary
 
         def _mkgold_true(v):
-            # mul = rnd(30 / max(12 - depth, 2)).
-            # depth_i is level_difficulty(); vendor depth is positive int.
+            # somex/somey are evaluated arguments to mkgold().
+            v, _rg, _cg = somexy(v)
+            # mkgold(amount==0) draws two RNG values inside (mkobj.c:1486-1504):
+            #   mul  = rnd(30 / max(12 - depth, 2))    (mkobj.c:1493)
+            #   base = rnd(level_difficulty() + 2)      (mkobj.c:1495)
             _denom = jnp.maximum(jnp.int32(12) - depth_i, jnp.int32(2))
             _hi = jnp.int32(30) // _denom          # rnd(30/denom) → [1, hi]
             v, _ = randint_jax(v, (), 1, _hi + jnp.int32(1))
@@ -1951,55 +1958,142 @@ def fill_ordinary_rooms(
 
         vrng = lax.cond(_gold_gate, _mkgold_true, lambda v: v, vrng)
 
-        # --- Fountain: !rn2(10) + somexy (vendor line 990-991) ---
+        # --- Fountain: !rn2(10) + mkfount internals (vendor mklev.c:831-832) ---
+        # Vendor:  if (!rn2(10)) mkfount(0, croom);
+        # mkfount (mklev.c:1571-1594) calls somexy() in a do/while, then on
+        # success draws rn2(7) for blessedftn.  All these draws fire ONLY
+        # when the !rn2(10) gate passes — the previous unconditional somexy
+        # was an over-draw on the 90% miss path.
+        # Vendor cite: vendor/nle/src/mklev.c:831-832, 1571-1594.
         vrng, fount_roll_v = randint_jax(vrng, (), 0, 10)
         fount_roll = fount_roll_v == jnp.int32(0)
-        vrng, rf, cf = somexy(vrng)
         place_fount = is_ordinary & fount_roll
-        terrain_ = terrain_.at[rf, cf].set(
-            jnp.where(place_fount, FOUNTAIN, terrain_[rf, cf])
+
+        def _fount_true(carry):
+            v, t = carry
+            # mkfount somexy (single attempt; vendor's tryct loop almost always
+            # succeeds on iter 1 — we model one somexy draw, matching vendor
+            # behaviour on open rooms).
+            v, rf_, cf_ = somexy(v)
+            # rn2(7) blessedftn (mklev.c:1590-1591).
+            v, _ = randint_jax(v, (), 0, 7)
+            new_t = t.at[rf_, cf_].set(FOUNTAIN)
+            return (v, new_t)
+
+        def _fount_false(carry):
+            return carry
+
+        vrng, terrain_ = lax.cond(
+            place_fount, _fount_true, _fount_false, (vrng, terrain_)
         )
 
-        # --- Sink: !rn2(60) + somexy (vendor line 992-993) ---
+        # --- Sink: !rn2(60) + mksink internals (vendor mklev.c:833-834) ---
+        # Vendor:  if (!rn2(60)) mksink(croom);
+        # mksink (mklev.c:1597-1614) calls somexy in a do/while (no further
+        # rolls on success).  Short-circuit: somexy only when gate passes.
+        # Vendor cite: vendor/nle/src/mklev.c:833-834, 1597-1614.
         vrng, _sink_roll = randint_jax(vrng, (), 0, 60)
-        vrng, _rsk, _csk = somexy(vrng)
+        _sink_gate = (_sink_roll == jnp.int32(0)) & is_ordinary
 
-        # --- Altar: !rn2(60) + somexy + induced_align (vendor 994-995) ---
-        # vendor mklev.c:994 → mkaltar (mkroom.c:557-595) → induced_align(80)
-        # (dungeon.c:1999-2014).  For ordinary dungeon rooms (no special-level
-        # or dungeon alignment flag), both ``if (rn2(100) < pct)`` guards are
-        # dead; execution falls straight to ``al = rn2(3) - 1``.  Vendor draws
-        # exactly ONE rn2(3) for normal rooms — NOT rn2(100).  The previous
-        # rn2(100) coin here was an over-draw; removed per audit Fix 4.
-        # Vendor cite: dungeon.c::induced_align lines 2001-2013.
+        def _sink_true(v):
+            v, _rsk, _csk = somexy(v)
+            return v
+
+        vrng = lax.cond(_sink_gate, _sink_true, lambda v: v, vrng)
+
+        # --- Altar: !rn2(60) + mkaltar internals (vendor mklev.c:835-836) ---
+        # Vendor:  if (!rn2(60)) mkaltar(croom);
+        # mkaltar (mklev.c:1616-1640) does:  somexy (do/while);  then on
+        # success draws al = rn2(3) - 1 for the altar alignment.
+        # Short-circuit: somexy + rn2(3) only fire on the hit path.
+        # Vendor cite: vendor/nle/src/mklev.c:835-836, 1616-1640.
         vrng, altar_roll_v = randint_jax(vrng, (), 0, 60)
         altar_roll = altar_roll_v == jnp.int32(0)
-        vrng, ra, ca = somexy(vrng)
-        # induced_align: vendor draws rn2(3) unconditionally for normal rooms.
-        vrng, alt_align = randint_jax(vrng, (), 0, 3)
-        induced = jnp.where(
-            altar_roll, alt_align, jnp.int32(player_align)
-        ).astype(jnp.int8)
         place_altar = is_ordinary & altar_roll
-        terrain_ = terrain_.at[ra, ca].set(
-            jnp.where(place_altar, ALTAR, terrain_[ra, ca])
-        )
-        features_aa = features_aa.at[flat_lv, ra, ca].set(
-            jnp.where(place_altar, induced, features_aa[flat_lv, ra, ca])
+
+        def _altar_true(carry):
+            v, t, aa = carry
+            v, ra_, ca_ = somexy(v)
+            # rn2(3) → al = rn2(3) - 1, ALawful+2 = 3 in vendor.
+            v, alt_align_ = randint_jax(v, (), 0, 3)
+            induced_ = alt_align_.astype(jnp.int8)
+            new_t = t.at[ra_, ca_].set(ALTAR)
+            new_aa = aa.at[flat_lv, ra_, ca_].set(induced_)
+            return (v, new_t, new_aa)
+
+        def _altar_false(carry):
+            return carry
+
+        vrng, terrain_, features_aa = lax.cond(
+            place_altar, _altar_true, _altar_false,
+            (vrng, terrain_, features_aa),
         )
 
-        # --- Grave: !rn2(grave_x) + somexy (vendor 996-1000) ---
+        # --- Grave: !rn2(grave_x) + mkgrave internals (vendor mklev.c:840-841) ---
+        # Vendor:  if (!rn2(x)) mkgrave(croom);
+        # mkgrave (mklev.c:1642-1693) — on hit it does:
+        #   dobell = !rn2(10);                      # FIRST draw
+        #   somexy (do/while);                       # placement
+        #   if (!rn2(3)) {                           # gold-fill gate
+        #       mksobj(GOLD_PIECE, TRUE, FALSE);    # COIN_CLASS init = 0 draws
+        #       quan = rnd(20) + level_diff*rnd(5); # 2 draws
+        #   }
+        #   for (tryct = rn2(5); tryct; tryct--)     # variable mkobj loop
+        #       mkobj(RANDOM_CLASS, TRUE);          # rnd(100)-1 + rnd(prob)
+        #                                              + mksobj_init cascade
+        #   if (dobell) mksobj_at(BELL, ...);       # TOOL_CLASS mksobj_init
+        # All draws short-circuited behind the !rn2(grave_x) gate.
+        # We model the leading dobell + somexy + gold-gate scalars; the
+        # tryct mkobj loop and bell mksobj_init are not yet modelled
+        # (potential under-draw on grave-hit; <1.25% probability per room).
+        # Vendor cite: vendor/nle/src/mklev.c:840-841, 1642-1693.
         vrng, grave_roll_v = randint_jax(vrng, (), 0, grave_x)
         grave_roll = grave_roll_v == jnp.int32(0)
-        vrng, rg2, cg2 = somexy(vrng)
         place_grave = is_ordinary & grave_roll
-        terrain_ = terrain_.at[rg2, cg2].set(
-            jnp.where(place_grave, GRAVE, terrain_[rg2, cg2])
+
+        def _grave_true(carry):
+            v, t = carry
+            v, _dobell = randint_jax(v, (), 0, 10)        # rn2(10) dobell
+            v, rg2_, cg2_ = somexy(v)                      # somexy placement
+            v, _gold_gate_g = randint_jax(v, (), 0, 3)    # rn2(3) gold-fill gate
+            # rnd(20) + level_diff*rnd(5) inside the gold-fill branch.
+            def _gold_grave_true(vi):
+                vi, _ = randint_jax(vi, (), 1, 21)        # rnd(20)
+                vi, _ = randint_jax(vi, (), 1, 6)         # rnd(5)
+                return vi
+            v = lax.cond(
+                _gold_gate_g == jnp.int32(0),
+                _gold_grave_true, lambda vi: vi, v,
+            )
+            # rn2(5) for tryct count (the loop body's mkobj cascade is
+            # NOT modelled — see comment above).  Drawing rn2(5) here
+            # consumes the loop-bound draw even when we elide the body.
+            v, _tryct = randint_jax(v, (), 0, 5)
+            new_t = t.at[rg2_, cg2_].set(GRAVE)
+            return (v, new_t)
+
+        def _grave_false(carry):
+            return carry
+
+        vrng, terrain_ = lax.cond(
+            place_grave, _grave_true, _grave_false, (vrng, terrain_)
         )
 
-        # --- Statue: !rn2(20) + somexy (vendor mklev.c:844-847) ---
+        # --- Statue: !rn2(20) + somex/somey (vendor mklev.c:844-847) ---
+        # Vendor: if (!rn2(20)) (void) mkcorpstat(STATUE, NULL, NULL,
+        #     somex(croom), somey(croom), CORPSTAT_INIT);
+        # somex/somey are evaluated arguments — only fire on the hit path.
+        # mkcorpstat(STATUE) calls mksobj_at(STATUE, init=TRUE) which has
+        # additional init draws (rnd(monster_count) etc.) not yet modelled.
+        # Vendor cite: vendor/nle/src/mklev.c:844-847; mkobj.c:1524-1567.
         vrng, _statue_roll = randint_jax(vrng, (), 0, 20)
-        vrng, _rst, _cst = somexy(vrng)
+        _statue_gate = (_statue_roll == jnp.int32(0)) & is_ordinary
+
+        def _statue_true(v):
+            v, _rst, _cst = somexy(v)
+            return v
+
+        vrng = lax.cond(_statue_gate, _statue_true, lambda v: v, vrng)
 
         # --- Box/chest: !rn2(nroom*5/2) gate (vendor mklev.c:853-855) ---
         # Short-circuit &&: rn2(3) chest/large and somexy only draw when gate
