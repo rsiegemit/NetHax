@@ -2116,18 +2116,40 @@ def fill_ordinary_rooms(
             place_grave, _grave_true, _grave_false, (vrng, terrain_)
         )
 
-        # --- Statue: !rn2(20) + somex/somey (vendor mklev.c:844-847) ---
+        # --- Statue: !rn2(20) + mkcorpstat cascade (vendor mklev.c:844-847) ---
         # Vendor: if (!rn2(20)) (void) mkcorpstat(STATUE, NULL, NULL,
         #     somex(croom), somey(croom), CORPSTAT_INIT);
-        # somex/somey are evaluated arguments — only fire on the hit path.
-        # mkcorpstat(STATUE) calls mksobj_at(STATUE, init=TRUE) which has
-        # additional init draws (rnd(monster_count) etc.) not yet modelled.
-        # Vendor cite: vendor/nle/src/mklev.c:844-847; mkobj.c:1524-1567.
+        # C evaluates somex/somey before the call, so both draws fire on the
+        # hit path only (short-circuit semantics honoured via lax.cond).
+        #
+        # mkcorpstat(STATUE, NULL, NULL, x, y, CORPSTAT_INIT) call chain
+        # (vendor/nle/src/mkobj.c::mkcorpstat lines 1524-1567):
+        #   → mksobj_at(STATUE, x, y, init=TRUE, ...)
+        #   → mksobj_init ROCK_CLASS/STATUE branch (mkobj.c:1052-1058):
+        #       (a) rndmonnum()  — selects random monster type:
+        #              rndmonst() draws rn2(7) quest-branch + rnd(choice_count)
+        #              modelled as a single proxy draw [1, 501).
+        #       (b) if (!verysmall(monster) && rn2(level_difficulty()/2+10) > 10)
+        #              add_to_container → mkobj(SPBOOK_CLASS) — spbook gate draw.
+        #              modulus = depth_i/2 + 10; drawn unconditionally as proxy
+        #              (verysmall branch unmodelled — proxy always consumes).
+        #   → post-init STATUE fallthrough (mkobj.c:1083-1090):
+        #       corpsenm already set by init branch → rndmonnum() skipped.
+        #   → set_corpsenm() — no rng draw.
+        # Vendor cite: vendor/nle/src/mkobj.c::mkcorpstat lines 1524-1567.
         vrng, _statue_roll = randint_jax(vrng, (), 0, 20)
         _statue_gate = (_statue_roll == jnp.int32(0)) & is_ordinary
 
         def _statue_true(v):
+            # somex(croom) / somey(croom) — placement draws.
             v, _rst, _cst = somexy(v)
+            # rndmonnum() proxy: rndmonst() rn2(7) + rnd(choice_count).
+            # Vendor mkobj.c:1054 (mksobj_init STATUE branch).
+            v, _ = randint_jax(v, (), 1, 501)
+            # Spbook gate: rn2(level_difficulty()/2 + 10).
+            # Vendor mkobj.c:1056 — always drawn; verysmall unmodelled.
+            spbook_mod = jnp.maximum(depth_i // jnp.int32(2) + jnp.int32(10), jnp.int32(1))
+            v, _ = randint_jax(v, (), 0, spbook_mod)
             return v
 
         vrng = lax.cond(_statue_gate, _statue_true, lambda v: v, vrng)
