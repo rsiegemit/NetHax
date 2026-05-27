@@ -1756,6 +1756,12 @@ def fill_ordinary_rooms(
         # --- Traps: while (!rn2(trap_x)) — bounded loop ---
         MAX_TRAPS_PER_ROOM = 4
 
+        # Possession-class lookup: rn2(4) → ObjectClass int used by
+        # consume_mksobj_init_draws.  Vendor mklev.c:1463-1476.
+        _POSS_CLASS = jnp.array(
+            [2, 6, 7, 13], dtype=jnp.int32  # WEAPON, TOOL, FOOD, GEM
+        )
+
         def trap_step_isaac(carry, j):
             terrain_in, traps_in, continue_, vrng_in = carry
             vrng_in, roll = randint_jax(vrng_in, (), 0, trap_x)
@@ -1773,6 +1779,111 @@ def fill_ordinary_rooms(
                 jnp.where(should_place, kind.astype(jnp.int8),
                           traps_in[flat_lv, rt_r, rt_c])
             )
+
+            # --- Dead-predecessor cascade (vendor mklev.c:1418-1533) ---
+            # Gate: lvl <= rnd(4).  rnd(4) = randint(1,5); fires when
+            # depth_i <= result, i.e. result >= depth_i.  For shallow
+            # levels (Dlvl 1-4) this fires most of the time.
+            # Vendor cite: vendor/nle/src/mklev.c:1418-1533
+            def _dead_pred_true(v):
+                # mksobj draws for trap-item (ARROW/DART/ROCK or nothing).
+                # Vendor always calls mksobj for ARROW_TRAP/DART_TRAP/ROCKTRAP
+                # (mklev.c:1436-1450).  kind is already resolved; model the
+                # init draw for the weapon class (ARROW, DART are WEAPON_CLASS;
+                # ROCK is GEM_CLASS).  We draw unconditionally and treat the
+                # "no item" default as a zero-draw no-op — the three item
+                # cases use mksobj(init=TRUE) which emits mksobj_init draws.
+                # We approximate: rnd(1000) type-pick + weapon/gem init draws.
+                # For simplicity use lax.cond: kind in {1,2,3} triggers draws.
+                is_item_trap = (kind == jnp.int32(1)) | (kind == jnp.int32(2)) | (kind == jnp.int32(3))
+                def _item_true(vi):
+                    # ARROW/DART → WEAPON_CLASS(2); ROCK → GEM_CLASS(13).
+                    is_rock = kind == jnp.int32(3)
+                    item_cls = jnp.where(is_rock, jnp.int32(13), jnp.int32(2))
+                    vi, _ = randint_jax(vi, (), 1, 1001)  # rnd(1000) type-pick
+                    vi = consume_mksobj_init_draws(vi, item_cls)
+                    return vi
+                v = lax.cond(is_item_trap, _item_true, lambda vi: vi, v)
+
+                # Possession loop: do { rn2(4) class + mkobj(poss_class) }
+                # while (!rn2(5)); cap=8 iterations.
+                # Vendor: mklev.c:1460-1490.  mkobj(poss_class, FALSE) calls
+                # mksobj(i, init=TRUE, artif=FALSE) so init draws DO fire.
+                # rnd(1000) picks type within class; then consume_mksobj_init.
+                def _poss_step(carry_p, _):
+                    vp, cont_p = carry_p
+                    vp, rn4 = randint_jax(vp, (), 0, 4)      # rn2(4) class
+                    poss_cls = _POSS_CLASS[rn4]
+                    vp, _ = randint_jax(vp, (), 1, 1001)     # rnd(1000) type
+                    vp = consume_mksobj_init_draws(vp, poss_cls)
+                    vp, rn5 = randint_jax(vp, (), 0, 5)      # !rn2(5) loop gate
+                    cont_p = cont_p & (rn5 == jnp.int32(0))
+                    return (vp, cont_p), None
+
+                # First iteration runs unconditionally (do-while semantics).
+                v, rn4_0 = randint_jax(v, (), 0, 4)
+                poss_cls_0 = _POSS_CLASS[rn4_0]
+                v, _ = randint_jax(v, (), 1, 1001)
+                v = consume_mksobj_init_draws(v, poss_cls_0)
+                v, rn5_0 = randint_jax(v, (), 0, 5)
+                # Remaining up to 7 iterations (cap=8 total).
+                (v, _), _ = lax.scan(
+                    _poss_step,
+                    (v, rn5_0 == jnp.int32(0)),
+                    xs=None, length=7,
+                )
+
+                # Victim race: rn2(15).  Cases 6-9 (GNOME) also draw
+                # !rn2(10) candle gate + rn2(4) candle type (if gate fires).
+                # SLP_GAS_TRAP elf-guard: rn2(2) fires when kind==SLP_GAS_TRAP
+                # and victim is elf (rn2(15)==0).
+                # Vendor: mklev.c:1493-1528.
+                v, rn15 = randint_jax(v, (), 0, 15)
+                is_gnome_victim = (rn15 >= jnp.int32(6)) & (rn15 <= jnp.int32(9))
+                is_elf_victim   = rn15 == jnp.int32(0)
+                SLP_GAS_TRAP = jnp.int32(10)  # vendor trap enum value
+
+                # SLP_GAS_TRAP elf guard: rn2(2) drawn when elf & SLP_GAS_TRAP.
+                def _elf_slp_true(vi):
+                    vi, _ = randint_jax(vi, (), 0, 2)  # rn2(2) elf-sleep guard
+                    return vi
+                v = lax.cond(
+                    is_elf_victim & (kind == SLP_GAS_TRAP),
+                    _elf_slp_true, lambda vi: vi, v,
+                )
+
+                # Gnome candle: !rn2(10) gate + rn2(4) candle type if fires.
+                def _gnome_candle(vi):
+                    vi, rn10 = randint_jax(vi, (), 0, 10)  # !rn2(10) gate
+                    def _candle_true(vic):
+                        vic, _ = randint_jax(vic, (), 0, 4)  # rn2(4) candle type
+                        # mksobj(TALLOW/WAX_CANDLE, init=TRUE) → TOOL_CLASS(6)
+                        vic, _ = randint_jax(vic, (), 1, 1001)
+                        vic = consume_mksobj_init_draws(vic, jnp.int32(6))
+                        return vic
+                    vi = lax.cond(
+                        rn10 == jnp.int32(0), _candle_true, lambda vic: vic, vi,
+                    )
+                    return vi
+                v = lax.cond(is_gnome_victim, _gnome_candle, lambda vi: vi, v)
+
+                # mkcorpstat(CORPSE, ...): mksobj_at(CORPSE, init=TRUE) →
+                # FOOD_CLASS; rndmonnum() → rndmonst() → rnd(choice_count)
+                # = 1 draw.  Vendor: mklev.c:1529-1530; mkobj.c:1524-1541.
+                v, _ = randint_jax(v, (), 1, 501)  # rnd(choice_count) ≤ 500
+                return v
+
+            def _dead_pred_false(v):
+                return v
+
+            # Outer gate: rnd(4) drawn unconditionally; cascade fires when
+            # depth_i <= result (shallow-level check).
+            vrng_in, rnd4_gate = randint_jax(vrng_in, (), 1, 5)  # rnd(4)
+            vrng_in = lax.cond(
+                should_place & (depth_i <= rnd4_gate),
+                _dead_pred_true, _dead_pred_false, vrng_in,
+            )
+
             return (new_terrain, new_traps, continue_ & hit, vrng_in), None
 
         (terrain_, traps_tt, _, vrng), _ = lax.scan(
@@ -1781,9 +1892,28 @@ def fill_ordinary_rooms(
             jnp.arange(MAX_TRAPS_PER_ROOM, dtype=jnp.int32),
         )
 
-        # --- Gold: !rn2(3) + somexy (vendor line 986-987) ---
+        # --- Gold: !rn2(3) + somexy + mkgold internals (vendor line 986-987) ---
+        # Vendor mklev.c:986-987 calls mkgold(0L, somex, somey).
+        # mkgold(amount==0) draws two RNG values before mksobj_at:
+        #   mul  = rnd(30 / max(12 - depth, 2))    (mkobj.c:1493)
+        #   base = rnd(level_difficulty() + 2)      (mkobj.c:1495)
+        # mksobj_at(GOLD_PIECE, init=TRUE) → COIN_CLASS: 0 init draws.
+        # Vendor cite: vendor/nle/src/mkobj.c:1486-1504
         vrng, _gold_roll = randint_jax(vrng, (), 0, 3)
         vrng, _rg, _cg = somexy(vrng)
+        _gold_gate = (_gold_roll == jnp.int32(0)) & is_ordinary
+
+        def _mkgold_true(v):
+            # mul = rnd(30 / max(12 - depth, 2)).
+            # depth_i is level_difficulty(); vendor depth is positive int.
+            _denom = jnp.maximum(jnp.int32(12) - depth_i, jnp.int32(2))
+            _hi = jnp.int32(30) // _denom          # rnd(30/denom) → [1, hi]
+            v, _ = randint_jax(v, (), 1, _hi + jnp.int32(1))
+            # base = rnd(level_difficulty() + 2) → [1, depth+2]
+            v, _ = randint_jax(v, (), 1, depth_i + jnp.int32(3))
+            return v
+
+        vrng = lax.cond(_gold_gate, _mkgold_true, lambda v: v, vrng)
 
         # --- Fountain: !rn2(10) + somexy (vendor line 990-991) ---
         vrng, fount_roll_v = randint_jax(vrng, (), 0, 10)
