@@ -112,7 +112,7 @@ class ObjType:
     # Armor (ARMOR_CLASS = 3)
     LEATHER_GLOVES    = 60
     PADDED_ARMOR      = 61
-    LEATHER_ARMOR     = 62
+    LEATHER_ARMOR     = 113  # live-NLE otyp; vendor/nle/src/objects.c sequential count
     LEATHER_JACKET    = 63
     RING_MAIL         = 64
     STUDDED_LEATHER_ARMOR = 65
@@ -199,7 +199,7 @@ class ObjType:
     # Potions (POTION_CLASS = 8)
     POT_WATER         = 200
     POT_BOOZE         = 201
-    POT_SICKNESS      = 202
+    POT_SICKNESS      = 277  # live-NLE C enum otyp; vendor/nle/src/u_init.c:127
     POT_CONFUSION     = 203
     POT_EXTRA_HEALING = 204
     POT_HEALING       = 205
