@@ -674,40 +674,62 @@ def dig_corridor(
     def body_fn(carry):
         r, g, xx, yy, dx, dy, cct, done, ok = carry
 
-        # cct++; early-bail gate (vendor sp_lev.c:2248).
+        # cct++; cap gate (vendor sp_lev.c:2248 — `if (cct++ > 500 ...)`).
+        # Vendor returns FALSE on cap with NO further draws this iteration.
         cct_new = cct + jnp.int32(1)
         cap_hit = cct_new > jnp.int32(500)
 
-        # rn2(35) early-bail: vendor sp_lev.c:2248 draws only when nxcor.
+        # rn2(35) early-bail: vendor sp_lev.c:2248 draws only when nxcor
+        # AND not already cap_hit (vendor's `||` short-circuits on cap_hit).
+        # Vendor returns FALSE on bail with NO further draws this iteration.
         def _draw_r35(r_): return rn2_jax(r_, jnp.int32(35))
-        r, r35 = lax.cond(nxcor, _draw_r35, lambda r_: (r_, jnp.int32(1)), r)
-        bail = nxcor & (r35 == jnp.int32(0))
+        r, r35 = lax.cond(nxcor & ~cap_hit, _draw_r35,
+                          lambda r_: (r_, jnp.int32(1)), r)
+        bail = nxcor & ~cap_hit & (r35 == jnp.int32(0))
 
-        # Step.
+        # Step (vendor sp_lev.c:2251-2252). xx_n/yy_n are the candidate cell;
+        # OOB check at vendor:2254-2255 returns FALSE with no further draws.
         xx_n = xx + dx
         yy_n = yy + dy
         oob = (xx_n >= COLNO - 1) | (xx_n <= 0) | (yy_n <= 0) | (yy_n >= ROWNO - 1)
 
-        # rn2(100) — SCORR vs CORR (vendor sp_lev.c:2259) — always drawn.
-        r, r100 = rn2_jax(r, jnp.int32(100))
-        # rn2(50) — boulder gate (vendor sp_lev.c:2261) — drawn only when nxcor.
-        def _draw_r50(r_): return rn2_jax(r_, jnp.int32(50))
-        r, _r50 = lax.cond(nxcor, _draw_r50, lambda r_: (r_, jnp.int32(0)), r)
-        del _r50
-
-        # Cell read & write decision (vendor:2257-2269).
+        # Vendor sp_lev.c:2257-2269 cell read.  rn2(100) is drawn ONLY when
+        # crm->typ == btyp (vendor line 2259). rn2(50) (boulder) is drawn
+        # ONLY when nxcor AND rn2(100) selected the ftyp branch (line 2261).
+        # When crm->typ is ftyp/SCORR, NO rn2 draws fire.  When crm->typ is
+        # strange (not btyp/ftyp/SCORR), vendor returns FALSE at line 2268
+        # with no further draws.
         crm_typ = g.typ[jnp.clip(xx_n, 0, COLNO - 1), jnp.clip(yy_n, 0, ROWNO - 1)]
         is_btyp = crm_typ == btyp_i
         is_ftyp = crm_typ == ftyp_i
         is_scorr = crm_typ == jnp.int8(VTILE_SCORR)
+        strange = ~is_btyp & ~is_ftyp & ~is_scorr & ~oob
 
-        # ftyp != CORR || rn2(100) — if either branch true, write ftyp;
-        # else SCORR.  ftyp==CORR statically here, so simplifies to rn2(100).
+        # Did vendor reach the rn2(100)/rn2(50) block this iter?
+        # Only when we are NOT short-circuiting at cap/bail/oob, AND the cell
+        # is btyp.  (Strange-cell path returns FALSE before any rn2.)
+        reached_btyp_block = ~cap_hit & ~bail & ~oob & is_btyp
+
+        def _draw_r100(r_): return rn2_jax(r_, jnp.int32(100))
+        r, r100 = lax.cond(reached_btyp_block, _draw_r100,
+                            lambda r_: (r_, jnp.int32(1)), r)
+
+        # ftyp != CORR || rn2(100) — vendor line 2259.  ftyp_i is static here
+        # but kept general; when ftyp==CORR the branch is purely r100!=0.
         write_ftyp = jnp.where(jnp.int8(ftyp_i) != jnp.int8(VTILE_CORR),
                                 jnp.bool_(True),
                                 r100 != jnp.int32(0))
+
+        # rn2(50) boulder: vendor 2261 — only when btyp-block AND nxcor AND
+        # write_ftyp (the SCORR branch at line 2264 does NOT draw rn2(50)).
+        r50_gate = reached_btyp_block & nxcor & write_ftyp
+        def _draw_r50(r_): return rn2_jax(r_, jnp.int32(50))
+        r, _r50 = lax.cond(r50_gate, _draw_r50,
+                            lambda r_: (r_, jnp.int32(0)), r)
+        del _r50
+
         new_tile = jnp.where(write_ftyp, ftyp_i, jnp.int8(VTILE_SCORR))
-        do_write = is_btyp & ~oob & ~bail & ~cap_hit & ~done
+        do_write = reached_btyp_block & ~done
 
         new_typ = lax.cond(
             do_write,
@@ -721,20 +743,17 @@ def dig_corridor(
             doorindex=g.doorindex, smeq=g.smeq,
         )
 
-        # If cell isn't btyp/ftyp/SCORR -> strange, fail.
-        strange = ~is_btyp & ~is_ftyp & ~is_scorr & ~oob
         fail_now = oob | strange | bail | cap_hit
 
         # ----- direction biasing (vendor sp_lev.c:2272-2279) ----------------
         # Vendor: ``if (dix > diy && diy) { if (!rn2(dix-diy+1)) ... }
         #          else if (diy > dix && dix) { if (!rn2(diy-dix+1)) ... }``
-        # The two branches are mutually exclusive (else-if), so only ONE draw
-        # fires per iteration.  We use nested lax.cond to mirror that.
+        # Only reached when none of the above returns FALSE fired.
         dix = jnp.abs(xx_n - tx_i)
         diy = jnp.abs(yy_n - ty_i)
 
-        cond_x = (dix > diy) & (diy != jnp.int32(0))
-        cond_y = (diy > dix) & (dix != jnp.int32(0))
+        cond_x = ~fail_now & (dix > diy) & (diy != jnp.int32(0))
+        cond_y = ~fail_now & (diy > dix) & (dix != jnp.int32(0))
 
         def _draw_rbx(r_):
             span = jnp.maximum(dix - diy + jnp.int32(1), jnp.int32(1))
