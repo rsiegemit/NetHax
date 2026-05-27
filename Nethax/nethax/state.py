@@ -58,6 +58,7 @@ from Nethax.nethax.dungeon.branches import (
 )
 from Nethax.nethax.dungeon.level_memory import LevelMemoryState, make_empty_level_memory
 from Nethax.nethax.vendor_rng import Isaac64State
+from Nethax.nethax.obs.glyph_shuffle import identity_descr_idx as _identity_descr_idx
 
 
 @struct.dataclass
@@ -340,6 +341,17 @@ class EnvState:
     #       vendor/nle/src/rnd.c (USE_ISAAC64 path).
     vendor_rng: Isaac64State
 
+    # ---- Object-description shuffle (NLE_BYTEPARITY mode) ---------------
+    # ``descr_idx[otyp]`` is the shuffled appearance index for canonical
+    # type ``otyp`` — mirrors vendor ``objects[otyp].oc_descr_idx`` after
+    # ``init_objects()``.  Set by env.reset() via
+    # obs.glyph_shuffle.compute_descr_shuffle() under NLE_BYTEPARITY,
+    # otherwise an identity permutation so ``shuffled_glyph()`` is a
+    # no-op in the default NLE / NETHACK modes.
+    # Cite: vendor/nle/src/o_init.c::shuffle_all (lines 240-266);
+    #       vendor/nle/win/rl/winrl.cc::shuffled_glyph (lines 80-87).
+    descr_idx: jax.Array
+
     @classmethod
     def default(
         cls,
@@ -476,6 +488,11 @@ class EnvState:
             # ISAAC64 vendor RNG — empty by default; populated by env.reset()
             # when parity_mode.use_vendor_rng() is True.
             vendor_rng=Isaac64State.empty(),
+            # Object-description shuffle — identity by default; replaced
+            # in env.reset() under NLE_BYTEPARITY via
+            # obs.glyph_shuffle.compute_descr_shuffle().  Cite:
+            # vendor/nle/src/o_init.c::shuffle_all (240-266).
+            descr_idx=_identity_descr_idx(),
         )
 
 

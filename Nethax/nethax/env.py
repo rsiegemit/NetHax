@@ -53,6 +53,7 @@ from Nethax.nethax.subsystems.mplayer import (
 )
 from Nethax.nethax.parity_mode import use_vendor_rng
 from Nethax.nethax import vendor_rng as _vendor_rng
+from Nethax.nethax.obs.glyph_shuffle import compute_descr_shuffle as _compute_descr_shuffle
 from Nethax.nethax.nle_action_map import maybe_remap_action as _maybe_remap_action
 
 
@@ -131,6 +132,18 @@ class NethaxEnv:
             # entirely and vmaps cleanly.
             seed_arr = jax.random.bits(rng, (), dtype=jnp.uint64)
             v_state = _vendor_rng.init(int(seed_arr))
+
+            # Replay vendor ``init_objects()`` BEFORE any dungeon-gen
+            # draws so the ISAAC64 stream stays byte-aligned with NLE.
+            # Vendor sequence: set_random (RNG seed) → init_objects
+            # (shuffle + GEM jitter + WAN_NOTHING coin) → role_init →
+            # init_dungeons → u_init → mklev.  We must consume the
+            # same ~200 ISAAC64 draws here.  Cite:
+            # vendor/nle/src/allmain.c::newgame lines 585-627;
+            # vendor/nle/src/o_init.c::init_objects (111-183).
+            v_state, descr_idx = _compute_descr_shuffle(v_state)
+            state = state.replace(descr_idx=descr_idx)
+
             v_state, rng_level = _vendor_draw_prngkey(v_state)
             v_state, rng_char = _vendor_draw_prngkey(v_state)
             v_state, rng_monsters = _vendor_draw_prngkey(v_state)

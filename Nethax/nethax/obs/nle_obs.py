@@ -937,20 +937,28 @@ def build_tty_colors(env_state) -> jnp.ndarray:
 def build_inv_glyphs(env_state) -> jnp.ndarray:
     """Glyph for each inventory slot. Shape (55,) int16.
 
-    Vendor parity (vendor/nle/win/rl/winrl.cc::observation_glyphs ~line 379):
-      Occupied slots  : glyph = GLYPH_OBJ_OFF + otyp
-      Empty slots     : NO_GLYPH (MAX_GLYPH = 5976)
+    Vendor parity (vendor/nle/win/rl/winrl.cc::observation_glyphs ~line 379
+    and update_inventory_method ~line 444): each occupied slot emits
+    ``shuffled_glyph(GLYPH_OBJ_OFF + otyp)`` so the player sees the
+    per-run appearance, not the canonical type.  The shuffle table
+    ``env_state.descr_idx`` is the identity permutation in default
+    ``ParityMode.NLE``, so this is a no-op there; under
+    ``NLE_BYTEPARITY`` it remaps every object glyph through the
+    vendor-replay shuffle (winrl.cc lines 80-87).
 
     Returns:
         int16[55]
     """
+    from Nethax.nethax.obs.glyph_shuffle import shuffled_glyph as _shuffled_glyph
     inv = jnp.full((55,), jnp.int16(NO_GLYPH & 0xFFFF), dtype=jnp.int16)
     items = env_state.inventory.items
     cat = items.category.astype(jnp.int16)
     typ = items.type_id.astype(jnp.int16)
+    canonical = jnp.int16(GLYPH_OBJ_OFF) + typ
+    shuffled = _shuffled_glyph(canonical, env_state.descr_idx)
     glyphs_52 = jnp.where(
         cat != 0,
-        jnp.int16(GLYPH_OBJ_OFF) + typ,
+        shuffled,
         jnp.int16(NO_GLYPH & 0xFFFF),
     )
     inv = inv.at[:52].set(glyphs_52)
@@ -1951,6 +1959,16 @@ def build_glyphs(env_state) -> jnp.ndarray:
                    (glyphs.astype(jnp.int32) < jnp.int32(GLYPH_CMAP_OFF))
     scramble_mask = is_obj_glyph & is_hallu
     glyphs = jnp.where(scramble_mask, scrambled_obj_glyphs, glyphs)
+
+    # Final pass: apply the vendor description shuffle so any object
+    # glyph in the map is mapped through ``descr_idx`` to its shuffled
+    # appearance.  Identity-permutation in default ParityMode.NLE,
+    # non-trivial under NLE_BYTEPARITY.  Cite:
+    # vendor/nle/win/rl/winrl.cc::shuffled_glyph (lines 80-87) +
+    # store_glyph (line 473) — every map glyph emit passes through
+    # shuffled_glyph before the obs array is written.
+    from Nethax.nethax.obs.glyph_shuffle import shuffled_glyph as _shuffled_glyph
+    glyphs = _shuffled_glyph(glyphs, env_state.descr_idx)
 
     return glyphs
 
