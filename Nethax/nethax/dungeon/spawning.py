@@ -919,6 +919,16 @@ def populate_level_with_monsters(
         # Vendor makemon.c sets mtmp->movement = NORMAL_SPEED so a freshly-
         # spawned monster can act on its very next tick.  Mirror that here.
         new_mp        = mai_carry.movement_points.at[i].set(jnp.int16(12))
+        # vendor mklev.c::mkmon + makemon.c::makemon set mtmp->msleeping=1
+        # on every level-gen monster (MM_ASLEEP flag).  Awakened via vendor
+        # disturb() on LoS/sound checks.  Without this, level-1 monsters are
+        # adjacent + active on turn 0 and kill low-HP roles in ~2 hits —
+        # explains the 3.5x death-rate divergence (DEATH_RATE_INVESTIGATION.md).
+        new_asleep = mai_carry.asleep.at[i].set(jnp.bool_(True))
+        # sleep_timer: persistent vendor msleeping flag (no expiry on its own);
+        # mirror with a large value so the timer doesn't run out before
+        # disturb() wakes the monster on LoS.
+        new_sleep_timer = mai_carry.sleep_timer.at[i].set(jnp.int8(127))
         # peace_minded lookup — vendor makemon.c::peace_minded.
         peace_bit = _PEACE_MINDED_TABLE[
             jnp.clip(type_id.astype(jnp.int32), 0, _PEACE_MINDED_TABLE.shape[0] - 1),
@@ -967,6 +977,8 @@ def populate_level_with_monsters(
             resists=new_resists,
             undead=new_undead,
             nonliving=new_nonliving,
+            asleep=new_asleep,
+            sleep_timer=new_sleep_timer,
         )
 
     new_mai = jax.lax.fori_loop(0, n_monsters, _write_slot, mai)
