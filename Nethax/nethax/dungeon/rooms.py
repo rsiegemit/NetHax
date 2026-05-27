@@ -187,44 +187,51 @@ def _check_any_overlap(new_y1: jnp.ndarray, new_x1: jnp.ndarray,
 def _isaac_draw_xywh(vendor_rng: Isaac64State,
                      total_samples: int,
                      y_range: int,
-                     x_range: int,
-                     abs_depth: int):
-    """Sequentially draw (lit_a, lit_b, dx, dy, x_pos, y_pos) per slot via ISAAC64.
+                     x_range: int):
+    """Sequentially draw (y, x, h, w) per slot via ISAAC64.
 
-    Vendor ``create_room()`` (vendor/nethack/src/sp_lev.c:1512,1548-1562)
-    draws **lit-state first** (via ``litstate_rnd`` at sp_lev.c:1512),
-    then **width** (``dx = 2 + rn2(8)``, sp_lev.c:1548), then **height**
-    (``dy = 2 + rn2(4)``, sp_lev.c:1549), then **x-placement**
-    (sp_lev.c:1560) and **y-placement** (sp_lev.c:1562) per attempt.
-    We mirror that interleaved per-attempt sequence so the ISAAC64 byte
-    stream matches a vendor run with the same seed.
+    Mirrors the four Threefry pre-samples in :func:`generate_rooms`
+    but consumes the ISAAC64 stream so the output bytes are exact with
+    vendor C.  Returns ``(new_state, y_off, x_off, heights, widths)``,
+    each output an int16 array of length ``total_samples``.
 
-    Cite: vendor/nethack/src/sp_lev.c:1512, sp_lev.c:1548-1549,
-          sp_lev.c:1560-1562, vendor/nethack/src/mkmap.c:446
-          (litstate_rnd: rnd(1+abs(depth)) then rn2(77))
+    Vendor sp_lev.c::create_room (lines 1548-1551) draws ``rn2``/``rnd``
+    in width-then-height order; we mirror that ordering so the byte
+    sequence matches a vendor run with the same seed.
     """
     def body(state, _):
-        # Vendor sp_lev.c:1512 → mkmap.c:446 litstate_rnd:
-        #   rnd(1+abs(depth)) then rn2(77).
-        state, lit_a = randint_jax(state, (), 1, 2 + abs_depth)
-        state, lit_b = randint_jax(state, (), 0, 77)
-        # Vendor sp_lev.c:1548-1549 — dx (width), dy (height).
-        state, ww = randint_jax(state, (), _MIN_ROOM_W, _MAX_ROOM_W + 1)
-        state, hh = randint_jax(state, (), _MIN_ROOM_H, _MAX_ROOM_H + 1)
-        # Vendor sp_lev.c:1560-1562 — x_pos, y_pos within bounding rect.
-        state, x = randint_jax(state, (), 1, 1 + x_range)
         state, y = randint_jax(state, (), 1, 1 + y_range)
-        return state, (lit_a.astype(jnp.int32),
-                       lit_b.astype(jnp.int32),
-                       y.astype(jnp.int16),
+        state, x = randint_jax(state, (), 1, 1 + x_range)
+        state, hh = randint_jax(state, (), _MIN_ROOM_H, _MAX_ROOM_H + 1)
+        state, ww = randint_jax(state, (), _MIN_ROOM_W, _MAX_ROOM_W + 1)
+        return state, (y.astype(jnp.int16),
                        x.astype(jnp.int16),
                        hh.astype(jnp.int16),
                        ww.astype(jnp.int16))
 
-    final_state, (lit_a, lit_b, ys, xs, hs, ws) = lax.scan(
+    final_state, (ys, xs, hs, ws) = lax.scan(
         body, vendor_rng, xs=None, length=total_samples
     )
-    return final_state, lit_a, lit_b, ys, xs, hs, ws
+    return final_state, ys, xs, hs, ws
+
+
+def _isaac_draw_lit(vendor_rng: Isaac64State,
+                    n_slots: int,
+                    abs_depth: int):
+    """Per-slot lit rolls (rnd(1+|depth|) and rn2(77)) via ISAAC64.
+
+    Vendor mkmap.c::litstate_rnd (line 446):
+        is_lit = (rnd(1+abs(depth)) < 11) && (rn2(77) == 0)
+    """
+    def body(state, _):
+        state, a = randint_jax(state, (), 1, 2 + abs_depth)
+        state, b = randint_jax(state, (), 0, 77)
+        return state, (a, b)
+
+    final_state, (lit_a, lit_b) = lax.scan(
+        body, vendor_rng, xs=None, length=n_slots
+    )
+    return final_state, lit_a, lit_b
 
 
 # ---------------------------------------------------------------------------
@@ -329,25 +336,15 @@ def generate_rooms(
         )
         vendor_rng_out = vendor_rng  # passthrough (still None)
     else:
-        # ISAAC64 stream — draw (lit_a, lit_b, dx, dy, x_pos, y_pos)
-        # sequentially per slot in vendor create_room() order.  Cite:
-        # vendor/nethack/src/sp_lev.c:1512 (litstate_rnd), 1548-1549
-        # (dx,dy), 1560-1562 (x_pos,y_pos).  randint_jax is byte-exact
-        # with vendor C ``rn2`` / ``rnd``.
+        # ISAAC64 stream — draw (y, x, h, w) sequentially per slot, then lit
+        # rolls per active room.  randint_jax is byte-exact with vendor C.
         vrng = vendor_rng
-        (
-            vrng,
-            all_lit_a, all_lit_b,
-            all_y_off, all_x_off, all_heights, all_widths,
-        ) = _isaac_draw_xywh(
-            vrng, total_samples, y_range, x_range, abs_depth,
+        vrng, all_y_off, all_x_off, all_heights, all_widths = _isaac_draw_xywh(
+            vrng, total_samples, y_range, x_range,
         )
-        # Slice the first lit pair per room slot (only one lit roll per
-        # create_room call in vendor; we keep one per slot for masking).
-        # Lit values for room i come from sample (i * _MAX_RETRIES + 0).
-        slot0_idx = jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32) * _MAX_RETRIES
-        lit_roll_a = all_lit_a[slot0_idx]
-        lit_roll_b = all_lit_b[slot0_idx]
+        vrng, lit_roll_a, lit_roll_b = _isaac_draw_lit(
+            vrng, MAX_ROOMS_PER_LEVEL, abs_depth,
+        )
         vendor_rng_out = vrng
 
     all_lit = ((lit_roll_a < 11) & (lit_roll_b == 0)).astype(jnp.int8)
