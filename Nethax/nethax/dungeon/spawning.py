@@ -73,7 +73,7 @@ from Nethax.nethax.subsystems.monster_ai import (
     _MONSTER_UNDEAD,
     _MONSTER_NONLIVING,
 )
-from Nethax.nethax.vendor_rng import Isaac64State, randint_jax
+from Nethax.nethax.vendor_rng import Isaac64State, randint_jax, isaac_weighted_choice
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +535,7 @@ def eligible_monsters_for_depth(depth: int, genocided=None) -> jnp.ndarray:
 # ---------------------------------------------------------------------------
 
 def pick_monster_for_level(rng: jax.Array, depth: int,
-                           genocided=None) -> jnp.ndarray:
+                           genocided=None, vendor_rng=None):
     """Sample one monster type index (int32) for the given dungeon depth.
 
     Vendor reference: ``makemon.c::rndmonst()`` / ``pm_gen()``.  Weights are
@@ -545,13 +545,26 @@ def pick_monster_for_level(rng: jax.Array, depth: int,
     and any species marked genocided in ``state.genocided_species``.
 
     Returns a scalar jnp.int32 in [0, NUMMONS).
+
+    Byte-replay path: when ``vendor_rng`` (Isaac64State) is supplied, the
+    weighted draw is routed through :func:`vendor_rng.isaac_weighted_choice`
+    so the chosen index is byte-exact with vendor C
+    ``rndmonst_inner`` (rn2(total) over cumsum buckets).  In that case the
+    return is ``(new_vendor_rng, monster_idx)``.  When ``vendor_rng is None``
+    the existing Threefry path is preserved and only ``monster_idx`` is
+    returned.
     """
     mask = eligible_monsters_for_depth(depth, genocided=genocided)
-    weights = jnp.where(mask, _GEN_FREQS, jnp.int32(0)).astype(jnp.float32)
+    weights = jnp.where(mask, _GEN_FREQS, jnp.int32(0)).astype(jnp.int32)
     # Guard: if all weights zero (very unusual depth), fall back to uniform over eligible.
     total = jnp.sum(weights)
-    weights = jnp.where(total > 0, weights, mask.astype(jnp.float32))
-    probs = weights / jnp.sum(weights)
+    weights = jnp.where(total > 0, weights, mask.astype(jnp.int32))
+
+    if vendor_rng is not None:
+        new_vrng, idx = isaac_weighted_choice(vendor_rng, weights)
+        return new_vrng, idx.astype(jnp.int32)
+
+    probs = weights.astype(jnp.float32) / jnp.sum(weights).astype(jnp.float32)
     return jax.random.choice(rng, NUMMONS, p=probs).astype(jnp.int32)
 
 
@@ -756,7 +769,10 @@ def spawn_initial_monsters(
         def _spawn_one_v(i, carry):
             positions, type_ids, hps, max_hps, vrng = carry
 
-            type_id = pick_monster_for_level(type_keys[i], depth, genocided=genocided)
+            # Byte-replay: thread ISAAC64 through the monster-type weighted draw.
+            vrng, type_id = pick_monster_for_level(
+                type_keys[i], depth, genocided=genocided, vendor_rng=vrng,
+            )
             level = MONSTR_DIFFICULTIES[type_id]
             vrng, hp = _roll_hp(hp_keys[i], level, vendor_rng=vrng)
             pos = _pick_valid_tile(pos_keys[i], valid_tiles_mask, map_h, map_w)
