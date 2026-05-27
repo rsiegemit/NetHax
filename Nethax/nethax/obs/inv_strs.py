@@ -454,6 +454,19 @@ _APP_USE_AN: jnp.ndarray = jnp.array(
     dtype=jnp.bool_,
 )  # bool[NUM_OBJECTS]
 
+# Per-BUC-status "use 'an'" flag.  Vendor doname_base (objnam.c:1686-1692)
+# calls just_an() on the first word in prefix after "a "; when BUC is shown
+# that first word is the BUC word itself, not the object name.
+# "cursed"   -> 'c' consonant -> False
+# "uncursed" -> 'u' vowel     -> True   (this is the divergence vs. the old
+#                                         hardcoded False for all BUC states)
+# "blessed"  -> 'b' consonant -> False
+# index 0 (UNKNOWN / not shown) is unused in the buc_known branch.
+_BUC_USE_AN: jnp.ndarray = jnp.array(
+    [_compute_use_an(s) for s in _BUC_STRS],
+    dtype=jnp.bool_,
+)  # bool[4]  — vendor objnam.c:1686-1692
+
 
 # Suffix-level irregular plurals (apply to compound words too:
 # crysknife -> crysknives, midwife -> midwives).
@@ -869,9 +882,14 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     buc_known = (buc_status != jnp.int32(BUCStatus.UNKNOWN)) & bknown
     buc_row   = jnp.clip(buc_status, 0, 3).astype(jnp.int32)
     show_app  = (~identified) & has_app
-    # BUC words are all consonant-initial -> use_an = False.
+    # Article is chosen based on the first word that follows "a/an":
+    #   - If BUC is shown, the BUC word is first ("uncursed" -> "an", etc.)
+    #   - Otherwise, the noun/appearance is first.
+    # Vendor: doname_base objnam.c:1686-1692 calls just_an() on the first
+    # non-article word in the prefix buffer (BUC word when present, else name).
     noun_use_an = jnp.where(show_app, _APP_USE_AN[safe_type], _OBJECT_USE_AN[safe_type])
-    article_use_an = jnp.where(buc_known, jnp.bool_(False), noun_use_an)
+    buc_use_an  = _BUC_USE_AN[buc_row]
+    article_use_an = jnp.where(buc_known, buc_use_an, noun_use_an)
 
     def render_nonempty(args):
         b, c = args
