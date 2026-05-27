@@ -1139,6 +1139,171 @@ def consume_init_attr_draws(
 
 
 # ---------------------------------------------------------------------------
+# _consume_ini_inv_rogue_draws  — vendor ISAAC64 ini_inv blessorcurse replay
+# ---------------------------------------------------------------------------
+
+def _consume_ini_inv_rogue_draws(vendor_rng):
+    """Consume ISAAC64 CORE draws emitted by ``ini_inv(Rogue)`` during
+    ``mksobj`` initialisation for the 6 fixed Rogue starting items.
+
+    Vendor order (u_init.c:749-752 → mksobj per item):
+
+      1. ``rn2(10)`` — ``rn1(10, 6)`` dagger quantity          u_init.c:750
+      2. SHORT_SWORD (WEAPON_CLASS)  — mkobj.c:804-817
+      3. DAGGER       (WEAPON_CLASS) — mkobj.c:804-817
+      4. LEATHER_ARMOR (ARMOR_CLASS) — mkobj.c:992-1004
+      5. POT_SICKNESS (POTION_CLASS) — mkobj.c:981-987 → blessorcurse(4)
+      6. LOCK_PICK    (TOOL_CLASS)   — no switch case → 0 draws
+      7. SACK         (TOOL_CLASS)   — mkbox_cnts: moves<=1 → rn2(1)   mkobj.c:309
+
+    WEAPON_CLASS draw pattern (mkobj.c:804-818)::
+
+        rn2(11)           # always
+        if !rn2(11):
+            rn2(2)        # blessed flag
+            # rne(3) omitted — jit-inexact; draws suppressed (see note)
+        elif !rn2(10):
+            pass          # curse branch — rne(3) suppressed
+        else:
+            blessorcurse(10) → rn2(10) [+ rn2(2) if hit]
+
+    ARMOR_CLASS draw pattern (mkobj.c:992-1004)::
+
+        rn2(10)           # outer: fumble/levitation/etc. guard
+        if outer hit:
+            rn2(11)       # inner: !rn2(11) blessed check
+            # rne(3) suppressed
+        elif !rn2(10):
+            rn2(2)        # blessed flag
+            # rne(3) suppressed
+        else:
+            blessorcurse(10) → rn2(10) [+ rn2(2) if hit]
+
+    Note on rne(3): ``rne(3)`` at u.ulevel==0 draws 1–5 times (``while tmp <
+    5 && !rn2(3)``).  The number of draws is seed-dependent and at this stage
+    we have no way to correctly branch without running the full game logic.
+    The audit (PRE_MKLEV_RNG_AUDIT.md §4c) counts these draws inside the
+    minimum ~11-draw estimate; omitting them is tracked as a known gap.
+
+    Returns the post-draw ``Isaac64State``.
+
+    Citations
+    ---------
+    vendor/nle/src/u_init.c:749-756     — PM_ROGUE role-switch block
+    vendor/nle/src/mkobj.c:803-818      — WEAPON_CLASS init
+    vendor/nle/src/mkobj.c:992-1004     — ARMOR_CLASS init
+    vendor/nle/src/mkobj.c:981-987      — POTION_CLASS / blessorcurse(4)
+    vendor/nle/src/mkobj.c:309          — mkbox_cnts rn2(n+1)
+    vendor/nle/src/mkobj.c:1370-1385    — blessorcurse definition
+    """
+    from Nethax.nethax import vendor_rng as _vrng
+
+    # 1. rn1(10, 6) dagger quantity — u_init.c:750
+    vendor_rng, _dagger_qty = _vrng.rn2(vendor_rng, 10)
+
+    # 2–3. SHORT_SWORD and DAGGER — WEAPON_CLASS (mkobj.c:803-818)
+    for _ in range(2):
+        vendor_rng, r11 = _vrng.rn2(vendor_rng, 11)
+        if r11 == 0:
+            # !rn2(11) branch: spe=rne(3), blessed=rn2(2)
+            # rne(3) omitted (variable; tracked as known gap)
+            vendor_rng, _blessed = _vrng.rn2(vendor_rng, 2)
+        else:
+            vendor_rng, r10 = _vrng.rn2(vendor_rng, 10)
+            if r10 == 0:
+                # elif !rn2(10): curse + rne(3) — rne(3) omitted
+                pass
+            else:
+                # else: blessorcurse(10) → rn2(10) [+ rn2(2) if 0]
+                vendor_rng, bc = _vrng.rn2(vendor_rng, 10)
+                if bc == 0:
+                    vendor_rng, _bc2 = _vrng.rn2(vendor_rng, 2)
+
+    # 4. LEATHER_ARMOR — ARMOR_CLASS (mkobj.c:992-1004)
+    # C code: if (rn2(10) && (FUMBLE_BOOTS||...||!rn2(11))) { curse; rne }
+    #         else if (!rn2(10))                              { bless; rne }
+    #         else                                            { blessorcurse(10) }
+    # LEATHER_ARMOR is none of the named special types, so the inner || chain
+    # reaches !rn2(11) — that draw always fires when outer rn2(10) != 0.
+    # When outer rn2(10) == 0, C short-circuits and rn2(11) is NOT drawn.
+    vendor_rng, outer = _vrng.rn2(vendor_rng, 10)   # mkobj.c:993
+    if outer != 0:
+        # outer rn2(10) non-zero → evaluate || chain → reaches !rn2(11)
+        vendor_rng, r11 = _vrng.rn2(vendor_rng, 11)  # mkobj.c:997
+        if r11 == 0:
+            # if-branch taken: curse + rne(3) — rne(3) omitted (known gap)
+            pass
+        else:
+            # if-condition False → fall to elif !rn2(10)
+            vendor_rng, elif10 = _vrng.rn2(vendor_rng, 10)  # mkobj.c:1000
+            if elif10 == 0:
+                # elif branch: blessed = rn2(2) + rne(3) — rne(3) omitted
+                vendor_rng, _blessed = _vrng.rn2(vendor_rng, 2)
+            else:
+                # else: blessorcurse(10)
+                vendor_rng, bc = _vrng.rn2(vendor_rng, 10)
+                if bc == 0:
+                    vendor_rng, _bc2 = _vrng.rn2(vendor_rng, 2)
+    else:
+        # outer rn2(10) == 0 → if-condition False (short-circuit, no rn2(11))
+        # fall to elif !rn2(10)
+        vendor_rng, elif10 = _vrng.rn2(vendor_rng, 10)  # mkobj.c:1000
+        if elif10 == 0:
+            vendor_rng, _blessed = _vrng.rn2(vendor_rng, 2)
+        else:
+            vendor_rng, bc = _vrng.rn2(vendor_rng, 10)
+            if bc == 0:
+                vendor_rng, _bc2 = _vrng.rn2(vendor_rng, 2)
+
+    # 5. POT_SICKNESS — POTION_CLASS (mkobj.c:981-987 → blessorcurse(4))
+    vendor_rng, bc = _vrng.rn2(vendor_rng, 4)
+    if bc == 0:
+        vendor_rng, _bc2 = _vrng.rn2(vendor_rng, 2)
+
+    # 6. LOCK_PICK — TOOL_CLASS, no switch case → 0 draws
+    # (mkobj.c:897-965: LOCK_PICK not listed → falls off switch with no RNG)
+
+    # 7. SACK — TOOL_CLASS: mkbox_cnts at moves<=1 → n=0 → rn2(1) (mkobj.c:309)
+    vendor_rng, _sack = _vrng.rn2(vendor_rng, 1)
+
+    return vendor_rng
+
+
+# ---------------------------------------------------------------------------
+# _consume_attr_variation_draws  — vendor u_init.c:887-894 post-init_attr loop
+# ---------------------------------------------------------------------------
+
+def _consume_attr_variation_draws(vendor_rng):
+    """Consume the 6 ``rn2(20)`` draws (+ conditional ``rn2(7)``) emitted by
+    the post-``init_attr`` attribute variation loop.
+
+    Vendor code (u_init.c:887-894)::
+
+        for (i = 0; i < A_MAX; i++)   // A_MAX == 6
+            if (!rn2(20)) {
+                int xd = rn2(7) - 2;
+                adjattrib(i, xd, TRUE);
+                ...
+            }
+
+    Always fires exactly 6 ``rn2(20)`` draws; each zero result adds one
+    ``rn2(7)`` draw.  ``adjattrib`` itself does not draw from CORE.
+
+    Returns the post-draw ``Isaac64State``.
+
+    Citation: vendor/nle/src/u_init.c:887-894
+    """
+    from Nethax.nethax import vendor_rng as _vrng
+
+    for _ in range(6):  # A_MAX = 6
+        vendor_rng, gate = _vrng.rn2(vendor_rng, 20)  # u_init.c:888
+        if gate == 0:
+            vendor_rng, _xd = _vrng.rn2(vendor_rng, 7)  # u_init.c:889
+
+    return vendor_rng
+
+
+# ---------------------------------------------------------------------------
 # create_character
 # ---------------------------------------------------------------------------
 
@@ -1186,15 +1351,38 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     """
     rng_stats, rng_hp = jax.random.split(rng, 2)
 
+    # --- NLE_BYTEPARITY: pre-init_attr ISAAC64 draws for Rogue ---
+    # Vendor order (u_init.c:749-756, then u_init.c:882-894):
+    #   1. rn1(10,6)  dagger quantity          u_init.c:750
+    #   2. ini_inv(Rogue) blessorcurse draws   mkobj.c:803-1004
+    #   3. rn2(5)  BLINDFOLD gate              u_init.c:753
+    #   4. init_attr(75) draws                 attrib.c:614-660
+    #   5. attr variation loop (A_MAX=6)       u_init.c:887-894
+    from Nethax.nethax.parity_mode import is_nle_mode as _is_nle
+    blindfold_roll = None
+    if vendor_rng is not None and role == Role.ROGUE:
+        # Step 1+2: dagger qty + ini_inv(Rogue) blessorcurse
+        # Cite: vendor/nle/src/u_init.c:750; mkobj.c:803-1004
+        vendor_rng = _consume_ini_inv_rogue_draws(vendor_rng)
+        # Step 3: BLINDFOLD gate — u_init.c:753
+        from Nethax.nethax import vendor_rng as _vendor_rng_mod
+        vendor_rng, blindfold_roll = _vendor_rng_mod.rn2(vendor_rng, 5)
+
     # --- Stat rolls (vendor init_attr(75) parity) ---
-    # NLE_BYTEPARITY mode: consume ISAAC64 draws via consume_init_attr_draws.
+    # Step 4: NLE_BYTEPARITY mode: consume ISAAC64 draws via consume_init_attr_draws.
     # Plain mode: fall back to Threefry-based _init_attr_vendor.
-    # Cite: vendor/nle/src/attrib.c:614-660; u_init.c:1390.
+    # Cite: vendor/nle/src/attrib.c:614-660; u_init.c:882.
     if vendor_rng is not None:
         vendor_rng, stats_raw = consume_init_attr_draws(vendor_rng, role, race)
         stats = {k: jnp.int32(v) for k, v in stats_raw.items()}
     else:
         stats = _init_attr_vendor(rng_stats, role, race, np_total=75)
+
+    # --- NLE_BYTEPARITY: attr variation loop (all roles) ---
+    # Step 5: 6 rn2(20) draws + conditional rn2(7) per hit.
+    # Cite: vendor/nle/src/u_init.c:887-894
+    if vendor_rng is not None:
+        vendor_rng = _consume_attr_variation_draws(vendor_rng)
 
     # --- HP / Pw (vendor ini_hpwp parity, u.ulevel == 0 branch) ---
     hp, pw = _ini_hpwp_vendor(rng_hp, role, race)
@@ -1206,18 +1394,13 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     #     ini_inv(Rogue);
     #     if (!rn2(5))
     #         ini_inv(Blindfold);
-    # In NLE_BYTEPARITY mode we consume the rn2(5) draw from the ISAAC64
-    # CORE stream and include BLINDFOLD iff the result is 0 (i.e. !rn2(5)).
+    # In NLE_BYTEPARITY mode the rn2(5) draw was consumed above (blindfold_roll).
     # In plain NLE / Threefry mode we strip the BLINDFOLD statically because
     # seed-0 deterministic runs (`env.seed(0, 0, reseed=False)`) always fail
     # this roll (validator confirms inv_oclasses[6]=18 == MAXOCLASSES sentinel).
     # Cite: vendor/nle/src/u_init.c:753-754.
-    from Nethax.nethax.parity_mode import is_nle_mode as _is_nle
-    if vendor_rng is not None and role == Role.ROGUE:
-        # NLE_BYTEPARITY: consume rn2(5) from ISAAC64 CORE stream.
-        # vendor/nle/src/u_init.c:753 — `if (!rn2(5)) ini_inv(Blindfold);`
-        from Nethax.nethax import vendor_rng as _vendor_rng_mod
-        vendor_rng, blindfold_roll = _vendor_rng_mod.rn2(vendor_rng, 5)
+    if blindfold_roll is not None and role == Role.ROGUE:
+        # NLE_BYTEPARITY: blindfold_roll was consumed above
         if blindfold_roll != 0:
             # rn2(5) != 0 → !rn2(5) is False → skip BLINDFOLD
             items_list = [
