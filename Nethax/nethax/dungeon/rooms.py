@@ -1987,8 +1987,8 @@ def fill_ordinary_rooms(
         def _fount_false(carry):
             return carry
 
-        vrng, terrain_ = lax.cond(
-            place_fount, _fount_true, _fount_false, (vrng, terrain_)
+        vrng, terrain_, features_aa = lax.cond(
+            place_fount, _fount_true, _fount_false, (vrng, terrain_, features_aa)
         )
 
         # --- Sink: !rn2(60) + mksink internals (vendor mklev.c:833-834) ---
