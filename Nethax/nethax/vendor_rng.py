@@ -52,12 +52,57 @@ JAX wrapper
 """
 from __future__ import annotations
 
+import os as _os
 from dataclasses import dataclass
 from typing import Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# RNG trace (NETHAX_RNG_TRACE=/path/to/file) — host-side draws only.
+#
+# Mirrors the vendor instrumentation in vendor/nle/src/isaac64.c + rnd.c so
+# we can diff sequence-by-sequence against the vendor stream.
+# ---------------------------------------------------------------------------
+_TRACE_FP = None
+_TRACE_OPS_FP = None
+_TRACE_ISAAC_COUNTER = 0
+_TRACE_OP_COUNTER = 0
+_TRACE_INITED = False
+
+
+def _trace_init():
+    global _TRACE_FP, _TRACE_OPS_FP, _TRACE_INITED
+    if _TRACE_INITED:
+        return
+    p = _os.environ.get("NETHAX_RNG_TRACE")
+    if p:
+        _TRACE_FP = open(p, "w")
+    p2 = _os.environ.get("NETHAX_RNG_TRACE_OPS")
+    if p2:
+        _TRACE_OPS_FP = open(p2, "w")
+    _TRACE_INITED = True
+
+
+def _trace_isaac(val: int):
+    global _TRACE_ISAAC_COUNTER
+    _trace_init()
+    if _TRACE_FP is not None:
+        _TRACE_FP.write(f"ISAAC {_TRACE_ISAAC_COUNTER} val={val:016x}\n")
+        _TRACE_FP.flush()
+        _TRACE_ISAAC_COUNTER += 1
+
+
+def _trace_op(op: str, modulus, result):
+    global _TRACE_OP_COUNTER
+    _trace_init()
+    if _TRACE_OPS_FP is not None:
+        _TRACE_OPS_FP.write(f"{_TRACE_OP_COUNTER} {op} mod={modulus} res={result}\n")
+        _TRACE_OPS_FP.flush()
+        _TRACE_OP_COUNTER += 1
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +284,7 @@ def next_uint64_py(
         n = ISAAC64_SZ
     n -= 1
     val = r[n]
+    _trace_isaac(val)
     return (m, r, a, b, c, n), val
 
 
@@ -254,13 +300,24 @@ def next_uint64_py(
 def rn2_py(state, x: int) -> tuple:
     """``rn2(x)`` -- ``isaac64_next_uint64() % x``."""
     state, v = next_uint64_py(state)
-    return state, v % x
+    result = v % x
+    _trace_op("rn2", x, result)
+    return state, result
 
 
 def rnd_py(state, x: int) -> tuple:
     """``rnd(x)`` -- ``rn2(x) + 1``."""
-    state, v = rn2_py(state, x)
-    return state, v + 1
+    # Direct draw so the op trace shows "rnd" not "rn2" — mirror vendor rnd.c
+    m, r, a, b, c, n = state
+    if n == 0:
+        a, b, c = _isaac64_update(m, r, a, b, c)
+        n = ISAAC64_SZ
+    n -= 1
+    val = r[n]
+    _trace_isaac(val)
+    result = (val % x) + 1
+    _trace_op("rnd", x, result)
+    return (m, r, a, b, c, n), result
 
 
 def rn1_py(state, n: int, x: int) -> tuple:

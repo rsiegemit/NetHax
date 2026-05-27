@@ -1935,33 +1935,32 @@ def fill_ordinary_rooms(
         mkobj_gate = (mkobj_gate_v == jnp.int32(0)) & is_ordinary
 
         def _mkobj_true(vrng_in):
-            # First mkobj_at call (vendor mklev.c:875):
-            #   somexy + mkobj(RANDOM_CLASS) body draws.
-            # mkobj(RANDOM_CLASS) → mksobj → mksobj_init vendor cascade
-            # (mkobj.c:1198): rnd(100) class-pick + rnd(oclass_prob_total)
-            # type-pick (both unconditional).  mksobj_init body is class-
-            # specific; we model 3 fixed proxy draws to cover the typical
-            # weapon/food/armor path (~3 minimum; real range 3-8 per class).
-            # Vendor cite: mkobj.c::mkobj lines 1170-1200; mksobj_init:869.
+            # First mkobj_at call (vendor mklev.c:875).
+            # Vendor mkobj(RANDOM_CLASS) draw order (mkobj.c:251-272):
+            #   1. rnd(100) - 1 → index into class-table (mkobj.c:259)
+            #   2. rnd(oclass_prob_total) — type pick within class (mkobj.c:265)
+            #   3. mksobj_init cascade — class-specific (mkobj.c:801-1069)
+            # _MKOBJ_TABLE is a length-100 jnp.array mapping roll→oclass;
+            # using it here decodes the class so consume_mksobj_init_draws
+            # dispatches the exact per-class draw count via lax.switch.
+            # Vendor cite: mkobj.c:251-272 (mkobj); mkobj.c:801-1069 (init).
             vrng_in, _rmk, _cmk = somexy(vrng_in)
-            vrng_in, _cls0 = randint_jax(vrng_in, (), 1, 101)   # rnd(100) class
-            vrng_in, _typ0 = randint_jax(vrng_in, (), 1, 101)   # rnd(prob_total)
-            vrng_in, _si0a = randint_jax(vrng_in, (), 0, 11)    # mksobj_init proxy draw 1
-            vrng_in, _si0b = randint_jax(vrng_in, (), 0, 10)    # mksobj_init proxy draw 2
-            vrng_in, _si0c = randint_jax(vrng_in, (), 0, 10)    # mksobj_init proxy draw 3
-            # Inner while (!rn2(5)) loop — cap=8 iters (vendor: tryct<=100).
+            vrng_in, cls_roll0 = randint_jax(vrng_in, (), 0, 100)  # rnd(100)-1 (mkobj.c:259)
+            oclass0 = _MKOBJ_TABLE[cls_roll0]
+            vrng_in, _typ0 = randint_jax(vrng_in, (), 1, 1001)     # rnd(prob_total) (mkobj.c:265)
+            vrng_in = consume_mksobj_init_draws(vrng_in, oclass0)   # mkobj.c:801-1069
+            # Inner while (!rn2(5)) loop — cap=8 iters (vendor mklev.c:876-883).
             def _mkobj_step(carry, _):
                 vrng_s, cont = carry
                 vrng_s, rn5 = randint_jax(vrng_s, (), 0, 5)
                 cont = cont & (rn5 == jnp.int32(0))
-                # Inner body: somexy + mkobj body draws (only when cont).
+                # Inner body: somexy + full mkobj draws (only when cont).
                 def _inner_true(v):
                     v, _ro, _co = somexy(v)
-                    v, _cls = randint_jax(v, (), 1, 101)   # rnd(100) class
-                    v, _typ = randint_jax(v, (), 1, 101)   # rnd(prob_total)
-                    v, _sia = randint_jax(v, (), 0, 11)    # mksobj_init proxy 1
-                    v, _sib = randint_jax(v, (), 0, 10)    # mksobj_init proxy 2
-                    v, _sic = randint_jax(v, (), 0, 10)    # mksobj_init proxy 3
+                    v, cls_roll = randint_jax(v, (), 0, 100)        # rnd(100)-1 (mkobj.c:259)
+                    oclass_i = _MKOBJ_TABLE[cls_roll]
+                    v, _typ = randint_jax(v, (), 1, 1001)           # rnd(prob_total) (mkobj.c:265)
+                    v = consume_mksobj_init_draws(v, oclass_i)      # mkobj.c:801-1069
                     return v
                 vrng_s = lax.cond(cont, _inner_true, lambda v: v, vrng_s)
                 return (vrng_s, cont), None
@@ -2056,48 +2055,53 @@ def maybe_create_vault(
     features,
     traps,
     flat_lv: int,
+    vendor_rng: "Isaac64State | None" = None,
 ):
     """Try to carve a 2x2 detached vault and record its centre + teleport trap.
 
     Vendor cite: vendor/nethack/src/mklev.c lines 404-410 (gate) +
-    lines 1316-1342 (placement) + line 1332 makevtele() teleport trap.
+    lines 1316-1342 (placement) + mklev.c:752 makevtele() teleport trap.
 
     Behavior:
       1. Gate: require at least ``MAXNROFROOMS // 6 = 6`` active ordinary
          rooms on the level, then a 50 % ``rn2(2)`` coin-flip — vendor
-         lines 404-410.  This deviates from the legacy TODO comment which
-         hypothesised an ``rn2(7)`` rate; the vendor source uses ``rn2(2)``
-         gated on the room count.
+         mklev.c:230 (already consumed in makerooms ISAAC64 stream).
       2. Pick a 2x2 area whose 4-tile bounding box (with 1-cell wall
          margin) overlaps no active room.  We sweep a small candidate
          set drawn from a fixed grid; the first non-adjacent candidate
          is chosen.
       3. Stamp all 4 interior tiles as FLOOR.
       4. Place TELEP_TRAP (TrapType=15) at the vault centre (the
-         vendor ``makevtele`` teleport trap — line 1332).  Vendor gates
-         this on a further ``!rn2(3)`` and ``!noteleport`` flag; we
-         apply both gates here.
+         vendor ``makevtele`` teleport trap — mklev.c:752).  Vendor gates
+         this on ``!rn2(3)`` and ``!noteleport``; we apply both gates here.
       5. Record ``features.vault_pos[flat_lv]`` = (centre_row, centre_col).
 
     JIT-safety: the candidate sweep is implemented as ``lax.scan`` over a
-    fixed candidate grid.  All RNG draws use ``jax.random.split`` — no
-    key reuse.
+    fixed candidate grid.  Threefry draws use ``jax.random.split``; when
+    ``vendor_rng`` is supplied the two gating draws come from ISAAC64 instead.
 
     Args:
-        rng:      jax.random.PRNGKey scalar.
-        rooms:    Room pytree.
-        active:   bool[MAX_ROOMS_PER_LEVEL] mask.
-        terrain:  int8[MAP_H, MAP_W].
-        features: FeaturesState (vault_pos is updated).
-        traps:    TrapState (TELEP_TRAP placed at centre).
-        flat_lv:  int — flattened level index.
+        rng:        jax.random.PRNGKey scalar (Threefry fallback).
+        rooms:      Room pytree.
+        active:     bool[MAX_ROOMS_PER_LEVEL] mask.
+        terrain:    int8[MAP_H, MAP_W].
+        features:   FeaturesState (vault_pos is updated).
+        traps:      TrapState (TELEP_TRAP placed at centre).
+        flat_lv:    int — flattened level index.
+        vendor_rng: optional Isaac64State.  When supplied (NLE_BYTEPARITY),
+                    the ``rn2(2)`` vault gate (mklev.c:230) and the
+                    ``rn2(3)`` makevtele gate (mklev.c:752) are drawn from
+                    the ISAAC64 stream.  Gated by rooms_ok to mirror the
+                    vendor ``&&``-short-circuit.  Otherwise Threefry is used.
 
     Returns:
-        (terrain, features, traps) — updated.  When the gate fails or no
-        non-adjacent 2x2 site exists, returns the inputs unchanged
-        (vault_pos remains (-1, -1)).
+        ``(terrain, features, traps, vendor_rng_out)`` — updated.  When the
+        gate fails or no non-adjacent 2x2 site exists, returns the inputs
+        unchanged (vault_pos remains (-1, -1)).  ``vendor_rng_out`` is the
+        advanced Isaac64State when ``vendor_rng`` was supplied, else ``None``.
     """
     from Nethax.nethax.constants.tiles import TileType
+    from Nethax.nethax.vendor_rng import rn2_jax as _rn2_jax
     FLOOR = jnp.int8(int(TileType.FLOOR))
     TELEP_TRAP = jnp.int8(15)  # vendor/nethack/include/trap.h TELEP_TRAP=15.
 
@@ -2110,8 +2114,21 @@ def maybe_create_vault(
     k_gate, k_coin, k_tele, k_pos = jax.random.split(rng, 4)
     # Gate 1: room count.
     rooms_ok = n_active >= MIN_ROOMS_FOR_VAULT
-    # Gate 2: rn2(2) — vendor line 404.
-    coin = jax.random.randint(k_coin, (), 0, 2, dtype=jnp.int32) == jnp.int32(0)
+
+    # Gate 2: rn2(2) — vendor mklev.c:230 (makerooms coin).
+    # ISAAC64 path: consume rn2(2) only when rooms_ok to mirror vendor &&.
+    # Threefry path: jax.random fallback (NLE default mode).
+    vrng = vendor_rng
+    if vendor_rng is not None:
+        def _draw_coin(v):
+            v_out, r = _rn2_jax(v, jnp.int32(2))
+            return v_out, r
+        def _skip_coin(v):
+            return v, jnp.int32(0)
+        vrng, coin_raw = lax.cond(rooms_ok, _draw_coin, _skip_coin, vrng)
+        coin = coin_raw != jnp.int32(0)
+    else:
+        coin = jax.random.randint(k_coin, (), 0, 2, dtype=jnp.int32) == jnp.int32(0)
     # Combined gate (drops the rn2(2) when room count not met).
     gate = rooms_ok & coin
 
@@ -2177,9 +2194,20 @@ def maybe_create_vault(
     terrain_out = stamp(terrain_out, 1, 1)
 
     # ---- Teleport trap at the centre (top-left of interior is conventional) ---
-    # Vendor's makevtele() places the trap at the vault centre; the
-    # interior is 2x2 so any cell is the centre.  We use (vy1, vx1).
-    tele_gate = jax.random.randint(k_tele, (), 0, 3, dtype=jnp.int32) == jnp.int32(0)
+    # Vendor's makevtele() → mklev.c:752: ``if (!noteleport && !rn2(3))``.
+    # ISAAC64 path: consume rn2(3) only when should_place (matches vendor
+    # short-circuit — makevtele only called when vault was filled).
+    # Threefry path: jax.random fallback.
+    if vrng is not None:
+        def _draw_tele(v):
+            v_out, r = _rn2_jax(v, jnp.int32(3))
+            return v_out, r
+        def _skip_tele(v):
+            return v, jnp.int32(1)  # non-zero → tele_gate False → no trap
+        vrng, tele_raw = lax.cond(should_place, _draw_tele, _skip_tele, vrng)
+        tele_gate = tele_raw == jnp.int32(0)
+    else:
+        tele_gate = jax.random.randint(k_tele, (), 0, 3, dtype=jnp.int32) == jnp.int32(0)
     place_trap = should_place & tele_gate
     new_tt = traps.trap_type.at[flat_lv, vy1, vx1].set(
         jnp.where(place_trap, TELEP_TRAP, traps.trap_type[flat_lv, vy1, vx1])
@@ -2196,7 +2224,8 @@ def maybe_create_vault(
 
     new_features = features.replace(vault_pos=new_vp)
     new_traps    = traps.replace(trap_type=new_tt)
-    return terrain_out, new_features, new_traps
+    vendor_rng_out = vrng  # None when Threefry path, Isaac64State when ISAAC64
+    return terrain_out, new_features, new_traps, vendor_rng_out
 
 
 # ---------------------------------------------------------------------------
