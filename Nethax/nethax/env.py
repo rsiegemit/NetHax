@@ -315,6 +315,15 @@ class NethaxEnv:
         )
         state = state.replace(explored=new_explored)
 
+        # Drain DISP for the per-obs vendor draws (visible-monster glyph
+        # selection + inventory slot ``obj_to_glyph``).  Mirrors
+        # vendor/nle/src/display.c:486-498 +
+        # vendor/nle/win/rl/winrl.cc:458 every observation cycle.  Under
+        # default ParityMode.NLE this is a no-op (use_vendor_rng() is False).
+        if use_vendor_rng():
+            from Nethax.nethax.obs.nle_obs import consume_disp_for_obs as _consume_disp
+            state = state.replace(vendor_rng_disp=_consume_disp(state))
+
         obs = build_nle_observation(state)
         return state, obs
 
@@ -882,6 +891,15 @@ def _step_impl(state, action, rng):
         return ns
 
     new_state = jax.lax.cond(already_done, lambda _: state, _do_step, operand=None)
+
+    # Drain DISP for the per-step obs draws (display.c:486-498 glyph
+    # selection + winrl.cc:458 inv glyph emit) — see env.reset() for
+    # rationale.  Host-side ``use_vendor_rng()`` flag selects the branch
+    # at JIT trace time, so this is a compile-time no-op under default
+    # ParityMode.NLE and a fixed-shape scan under NLE_BYTEPARITY.
+    if use_vendor_rng():
+        from Nethax.nethax.obs.nle_obs import consume_disp_for_obs as _consume_disp
+        new_state = new_state.replace(vendor_rng_disp=_consume_disp(new_state))
     obs = build_nle_observation(new_state)
     # Reward = score delta (NLE convention: vendor topten.c::u.urexp running
     # accumulator, surfaced as bl_score in blstats).  Already-done steps

@@ -597,6 +597,69 @@ def empty_nle_observation() -> dict[str, jnp.ndarray]:
     }
 
 
+def consume_disp_for_obs(env_state):
+    """Drain the DISP ISAAC64 stream for one observation-build pass.
+
+    Vendor NLE consumes ``rn2_on_display_rng`` (rnglist[DISP]) at two
+    obs-emit sites every time an observation is constructed:
+
+      1. ``glyphs`` channel — per visible alive monster, vendor's
+         ``map_object_or_mimic`` / ``display_warning`` chain at
+         vendor/nle/src/display.c:486-498 calls one of
+         ``mon_to_glyph`` / ``detected_mon_to_glyph`` / ``pet_to_glyph``,
+         each of which threads ``rn2_on_display_rng`` through
+         ``random_monster``.  One DISP draw fires per visible monster.
+
+      2. ``inv_glyphs`` channel — vendor's RL inventory callback at
+         vendor/nle/win/rl/winrl.cc:458 calls
+         ``obj_to_glyph(otmp, rn2_on_display_rng)`` once per occupied
+         inventory slot.
+
+    To preserve byte parity on these channels without polluting CORE,
+    Nethax draws the matching number of DISP words here and returns the
+    updated ISAAC64 state.  Each draw is the same scalar ``rn2_on_display_rng(2)``
+    call that vendor ``random_monster`` / ``obj_to_glyph`` ultimately bottom
+    out in (the modulus is irrelevant for stream advancement — what matters
+    is that exactly one ``isaac64_next_uint64()`` fires).
+
+    JIT-pure: uses ``jax.lax.scan`` over the fixed-size monster + inventory
+    arrays, conditionally advancing DISP via ``lax.cond`` on the per-slot
+    mask bit so only slots that vendor would actually emit consume a draw.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+
+    # 1. Per-visible-alive-monster DISP draws (glyphs channel).
+    mai = env_state.monster_ai
+    branch = jnp.int32(env_state.dungeon.current_branch)
+    level_idx = jnp.int32(env_state.dungeon.current_level) - 1
+    visible = env_state.visible[:21, :79]
+    rows_m = jnp.clip(mai.pos[:, 0].astype(jnp.int32), 0, 20)
+    cols_m = jnp.clip(mai.pos[:, 1].astype(jnp.int32), 0, 78)
+    tile_visible = visible[rows_m, cols_m]
+    mon_mask = (
+        mai.alive
+        & tile_visible
+        & (mai.entry_idx.astype(jnp.int32) >= jnp.int32(0))
+    )
+
+    def _maybe_draw(rng, mask_bit):
+        # When mask_bit is True, advance DISP by one uint64 draw;
+        # otherwise leave the stream untouched.  Mirrors vendor's
+        # per-slot ``if (visible) rn2_on_display_rng(...)`` gate.
+        drew_rng, _ = _vendor_rng.next_uint64_jax(rng)
+        return jax.lax.cond(mask_bit, lambda _: drew_rng, lambda _: rng, operand=None), None
+
+    rng_after_mon, _ = jax.lax.scan(_maybe_draw, env_state.vendor_rng_disp, mon_mask)
+
+    # 2. Per-occupied-inventory-slot DISP draws (inv_glyphs channel).
+    cat = env_state.inventory.items.category
+    inv_mask = (cat != jnp.int8(0))
+
+    rng_after_inv, _ = jax.lax.scan(_maybe_draw, rng_after_mon, inv_mask)
+
+    return rng_after_inv
+
+
 def build_nle_observation(env_state) -> dict[str, jnp.ndarray]:
     """Build an NLE-compatible observation dict from nethax EnvState.
 
