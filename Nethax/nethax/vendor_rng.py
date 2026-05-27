@@ -565,6 +565,22 @@ def rn1_jax(rng: "Isaac64State", x, base) -> Tuple["Isaac64State", jax.Array]:
     return new_rng, v + jnp.int32(base)
 
 
+def isaac_weighted_choice(rng: "Isaac64State", weights: jax.Array) -> Tuple["Isaac64State", jax.Array]:
+    """JIT-pure weighted choice consuming the ISAAC64 stream.
+
+    weights: int/float array, summed to compute total.
+    Returns (new_rng, chosen_index).  Mirrors vendor C
+    ``rndmonst_inner``: draw rn2(total), find first cumsum bucket > draw.
+    """
+    cdf = jnp.cumsum(weights.astype(jnp.uint64))
+    total = cdf[-1]
+    new_rng, draw = next_uint64_jax(rng)
+    sampled = (draw % total).astype(jnp.uint64)
+    # argmax(cdf > sampled) — first bucket whose cumulative weight exceeds the draw.
+    idx = jnp.argmax(cdf > sampled).astype(jnp.int32)
+    return new_rng, idx
+
+
 def randint_jax(rng: "Isaac64State", shape, minval, maxval) -> Tuple["Isaac64State", jax.Array]:
     """JAX-traceable drop-in for ``jax.random.randint(key, shape, minval, maxval)``.
 
