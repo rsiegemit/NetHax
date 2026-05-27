@@ -1391,7 +1391,7 @@ def populate_level_with_monsters(
         place_worm_tail_randomly as _place_tail,
         get_wormno as _get_wormno,
     )
-    PM_LONG_WORM = jnp.int32(118)
+    PM_LONG_WORM = jnp.int32(113)
 
     def _worm_init_slot(i, carry):
         st, key = carry
