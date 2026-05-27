@@ -211,9 +211,20 @@ class NethaxEnv:
             # audit must be revisited and explicit vendor_rng draws inserted
             # at this site to stay byte-aligned with allmain.c::newgame.
 
-            v_state, rng_level = _vendor_draw_prngkey(v_state)
-            v_state, rng_char = _vendor_draw_prngkey(v_state)
-            v_state, rng_monsters = _vendor_draw_prngkey(v_state)
+            # PARITY FIX: derive the three Threefry sub-keys from the input
+            # PRNGKey via jax.random.split, NOT from the ISAAC64 stream.
+            # Previously this called ``_vendor_draw_prngkey`` thrice, each of
+            # which consumed one raw uint64 from ``v_state`` (ISAAC64 CORE).
+            # Vendor C (vendor/nle/src/allmain.c:604-625, role.c:role_init)
+            # makes ZERO ISAAC64 draws between init_objects and init_dungeons
+            # for any deterministic role/race/alignment loadout, so those 3
+            # uint64s shifted the entire ISAAC64 stream by 3 words —
+            # producing the first divergence at op#196 (rn2(100)) in
+            # /tmp/vendor_rnd_trace_v2.txt vs /tmp/nethax_rnd_trace_jit.txt.
+            # Cite: vendor/nle/src/allmain.c:604-615; vendor/nle/src/role.c
+            # role_init for the deterministic-loadout RNG-zero audit at
+            # env.py:178-212.
+            rng_level, rng_char, rng_monsters = jax.random.split(rng, 3)
 
             # NOTE (Phase 3 — MKLEV_PORT_PLAN.md §1.4):
             #   Previously this block pre-drew rn2(5) + rn2(mc_upper) here

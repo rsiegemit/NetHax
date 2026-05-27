@@ -2281,15 +2281,23 @@ def consume_init_dungeons_draws(vendor_rng):
     vendor_rng, dod_levels = _vrng.rn2(vendor_rng, 5)   # rn1(5, 25)
     drawn["dod_levels"] = dod_levels + 25
 
-    # init_level rn2(100) gates — dungeon.c:548 — in dungeon.def order
+    # init_level rn2(100) gates — dungeon.c:548 — in dungeon.def order.
+    # PARITY FIX: dgn_comp.y's RNDLEVEL 1-INT production (lines 188-198) sets
+    # only ``rndlevs`` and leaves ``chance`` at the init_level() default of 100.
+    # Only ``bigrm`` (which has 2 INTs in dungeon.def) gets chance=40; medusa,
+    # minetn, minend, and the four soko levels all get chance=100 (always
+    # placed).  Verified by parsing the compiled
+    # vendor/nle/build/.../dat/dungeon binary: medusa.chance=100.
+    # Cite: vendor/nle/util/dgn_comp.y lines 188-209;
+    # vendor/nle/dat/dungeon.def medusa/minetn/minend/soko entries.
     vendor_rng, gate_rogue  = _vrng.rn2(vendor_rng, 100)  # rogue   chance=100 (LEVEL)
     vendor_rng, gate_oracle = _vrng.rn2(vendor_rng, 100)  # oracle  chance=100 (LEVEL)
-    vendor_rng, gate_bigrm  = _vrng.rn2(vendor_rng, 100)  # bigrm   chance=40  (RNDLEVEL)
-    vendor_rng, gate_medusa = _vrng.rn2(vendor_rng, 100)  # medusa  chance=4   (RNDLEVEL)
+    vendor_rng, gate_bigrm  = _vrng.rn2(vendor_rng, 100)  # bigrm   chance=40  (RNDLEVEL 2-int)
+    vendor_rng, gate_medusa = _vrng.rn2(vendor_rng, 100)  # medusa  chance=100 (RNDLEVEL 1-int → default)
     vendor_rng, gate_castle = _vrng.rn2(vendor_rng, 100)  # castle  chance=100 (LEVEL)
 
     bigrm_placed  = int(gate_bigrm)  < 40
-    medusa_placed = int(gate_medusa) < 4
+    medusa_placed = True  # chance=100 → always placed (1-INT RNDLEVEL default)
 
     drawn["gate_bigrm"]  = gate_bigrm
     drawn["gate_medusa"] = gate_medusa
@@ -2354,10 +2362,10 @@ def consume_init_dungeons_draws(vendor_rng):
 
     vendor_rng, _ = _vrng.rn2(vendor_rng, 3)             # dungeon.c:398 parent_dlevel num=3
 
-    vendor_rng, gate_minetn = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 minetn
-    vendor_rng, gate_minend = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 minend
-    minetn_placed = int(gate_minetn) < 7
-    minend_placed = int(gate_minend) < 3
+    vendor_rng, gate_minetn = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 minetn chance=100 (1-int RNDLEVEL)
+    vendor_rng, gate_minend = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 minend chance=100 (1-int RNDLEVEL)
+    minetn_placed = True  # chance=100 → always placed
+    minend_placed = True  # chance=100 → always placed
     drawn["gate_minetn"] = gate_minetn
     drawn["gate_minend"] = gate_minend
 
@@ -2394,14 +2402,14 @@ def consume_init_dungeons_draws(vendor_rng):
 
     vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:398 parent_dlevel num=1
 
-    vendor_rng, gate_soko1 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko1
-    vendor_rng, gate_soko2 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko2
-    vendor_rng, gate_soko3 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko3
-    vendor_rng, gate_soko4 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko4
-    soko1_placed = int(gate_soko1) < 2
-    soko2_placed = int(gate_soko2) < 2
-    soko3_placed = int(gate_soko3) < 2
-    soko4_placed = int(gate_soko4) < 2
+    vendor_rng, gate_soko1 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko1 chance=100 (1-int RNDLEVEL)
+    vendor_rng, gate_soko2 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko2 chance=100 (1-int RNDLEVEL)
+    vendor_rng, gate_soko3 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko3 chance=100 (1-int RNDLEVEL)
+    vendor_rng, gate_soko4 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko4 chance=100 (1-int RNDLEVEL)
+    soko1_placed = True  # chance=100 → always placed
+    soko2_placed = True  # chance=100 → always placed
+    soko3_placed = True  # chance=100 → always placed
+    soko4_placed = True  # chance=100 → always placed
     drawn["gate_soko1"] = gate_soko1
     drawn["gate_soko2"] = gate_soko2
     drawn["gate_soko3"] = gate_soko3

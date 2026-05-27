@@ -126,6 +126,33 @@ def _trace_op(op: str, modulus, result):
 
 
 # ---------------------------------------------------------------------------
+# JIT-aware trace: jax.debug.callback fires both during JIT tracing AND at
+# runtime inside lax.scan / lax.while_loop bodies, so this lets us see draws
+# that the host-only _trace_op misses.  Gated by env var so prod stays fast.
+# ---------------------------------------------------------------------------
+_JIT_TRACE_ENABLED = None  # cached env-var lookup
+
+
+def _jit_trace_enabled() -> bool:
+    global _JIT_TRACE_ENABLED
+    if _JIT_TRACE_ENABLED is None:
+        _JIT_TRACE_ENABLED = bool(_os.environ.get("NETHAX_RNG_TRACE_OPS_JIT"))
+    return _JIT_TRACE_ENABLED
+
+
+def _emit_op_callback(op_bytes, modulus, result):
+    """Concrete callback target — runs on host with concrete np arrays."""
+    op = op_bytes.decode() if isinstance(op_bytes, (bytes, bytearray)) else str(op_bytes)
+    try:
+        m = int(np.asarray(modulus))
+        r = int(np.asarray(result))
+    except Exception:
+        m = modulus
+        r = result
+    _trace_op(op, m, r)
+
+
+# ---------------------------------------------------------------------------
 # Constants (mirror vendor/nle/include/isaac64.h)
 # ---------------------------------------------------------------------------
 
@@ -707,19 +734,43 @@ def rn2_jax(rng: "Isaac64State", x) -> Tuple["Isaac64State", jax.Array]:
     ``isaac64_next_uint64() % x`` draw.  ``x`` must be a positive scalar.
     """
     new_rng, v = next_uint64_jax(rng)
-    return new_rng, (v % jnp.uint64(x)).astype(jnp.int32)
+    result = (v % jnp.uint64(x)).astype(jnp.int32)
+    if _jit_trace_enabled():
+        jax.debug.callback(
+            lambda mod, res: _emit_op_callback(b"rn2", mod, res),
+            jnp.asarray(x, dtype=jnp.int64), result,
+        )
+    return new_rng, result
 
 
 def rnd_jax(rng: "Isaac64State", x) -> Tuple["Isaac64State", jax.Array]:
     """JAX-traceable ``rnd(x)`` — returns ``(new_rng, int32 in [1, x])``."""
-    new_rng, v = rn2_jax(rng, x)
-    return new_rng, v + jnp.int32(1)
+    # Inline the draw so the trace records "rnd" not "rn2" (mirror vendor rnd.c).
+    new_rng, v = next_uint64_jax(rng)
+    result = (v % jnp.uint64(x)).astype(jnp.int32) + jnp.int32(1)
+    if _jit_trace_enabled():
+        jax.debug.callback(
+            lambda mod, res: _emit_op_callback(b"rnd", mod, res),
+            jnp.asarray(x, dtype=jnp.int64), result,
+        )
+    return new_rng, result
 
 
 def rn1_jax(rng: "Isaac64State", x, base) -> Tuple["Isaac64State", jax.Array]:
-    """JAX-traceable ``rn1(x, base)`` — ``base + rn2(x)`` (int32 result)."""
-    new_rng, v = rn2_jax(rng, x)
-    return new_rng, v + jnp.int32(base)
+    """JAX-traceable ``rn1(x, base)`` — ``base + rn2(x)`` (int32 result).
+
+    Inlines its own draw + trace so the trace line records the underlying
+    ``rn2(x)`` modulus/result (matching vendor RND macro expansion in
+    ``vendor/nethack/src/rnd.c::rn1``).
+    """
+    new_rng, v = next_uint64_jax(rng)
+    result = (v % jnp.uint64(x)).astype(jnp.int32)
+    if _jit_trace_enabled():
+        jax.debug.callback(
+            lambda mod, res: _emit_op_callback(b"rn2", mod, res),
+            jnp.asarray(x, dtype=jnp.int64), result,
+        )
+    return new_rng, result + jnp.int32(base)
 
 
 def rne_jax(rng: "Isaac64State", x, ulevel: int = 0) -> Tuple["Isaac64State", jax.Array]:
@@ -766,6 +817,12 @@ def isaac_weighted_choice(rng: "Isaac64State", weights: jax.Array) -> Tuple["Isa
     sampled = (draw % total).astype(jnp.uint64)
     # argmax(cdf > sampled) — first bucket whose cumulative weight exceeds the draw.
     idx = jnp.argmax(cdf > sampled).astype(jnp.int32)
+    if _jit_trace_enabled():
+        # Trace as rn2(total) — vendor rndmonst_inner.
+        jax.debug.callback(
+            lambda mod, res: _emit_op_callback(b"rn2", mod, res),
+            total.astype(jnp.int64), sampled.astype(jnp.int32),
+        )
     return new_rng, idx
 
 
@@ -786,4 +843,11 @@ def randint_jax(rng: "Isaac64State", shape, minval, maxval) -> Tuple["Isaac64Sta
     range_size = jnp.uint64(maxval) - jnp.uint64(minval)
     new_rng, v = next_uint64_jax(rng)
     sampled = (v % range_size).astype(jnp.int32) + jnp.int32(minval)
+    if _jit_trace_enabled():
+        # Trace as rn2 of the (maxval-minval) range — closest vendor analog.
+        jax.debug.callback(
+            lambda mod, res: _emit_op_callback(b"rn2", mod, res),
+            jnp.asarray(range_size, dtype=jnp.int64),
+            sampled - jnp.int32(minval),
+        )
     return new_rng, sampled
