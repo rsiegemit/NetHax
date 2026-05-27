@@ -36,6 +36,7 @@ from Nethax.nethax.dungeon.branches import (
     generate_main_branch_l1,
     generate_main_branch_l1_with_features,
     consume_init_dungeons_draws,
+    consume_init_dungeons_variable_draws,
 )
 from Nethax.nethax.dungeon.spawning import populate_level_with_monsters
 from Nethax.nethax.constants.roles import Role
@@ -243,6 +244,13 @@ class NethaxEnv:
         # Citation: vendor/nle/src/dungeon.c:714 init_dungeons.
         if use_vendor_rng():
             new_vrng, _dungeon_state = consume_init_dungeons_draws(state.vendor_rng)
+            # Consume the variable-count draws that follow the 18 fixed draws:
+            # place_level slot picks (dungeon.c:661) and parent_dlevel branch
+            # picks (dungeon.c:398), interleaved per dungeon in parse order.
+            # Citation: vendor/nle/src/dungeon.c:398, 502, 661, 772-913.
+            new_vrng, _var_state = consume_init_dungeons_variable_draws(
+                new_vrng, _dungeon_state
+            )
             state = state.replace(vendor_rng=new_vrng)
 
         # Vendor mklev() begins by reseeding BOTH streams (vendor

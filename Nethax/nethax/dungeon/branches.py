@@ -2242,6 +2242,247 @@ def consume_init_dungeons_draws(vendor_rng):
     return vendor_rng, dungeon_state
 
 
+def consume_init_dungeons_variable_draws(vendor_rng, dungeon_state):
+    """Replay the variable ISAAC64 draws of vendor ``init_dungeons``.
+
+    These follow immediately after the 18 fixed draws consumed by
+    ``consume_init_dungeons_draws`` and cover:
+
+    * ``place_level`` slot-picks — ``dungeon.c:661``
+      One ``rn2(npossible)`` per special level that is created (not gated
+      out).  Called once per dungeon in dungeon.def parse order, after the
+      dungeon's ``init_level`` pass.
+    * ``parent_dlevel`` branch-attachment picks — ``dungeon.c:398``
+      One ``rn2(num)`` per non-Main dungeon (``i > 0``) to pick where in the
+      parent dungeon the branch staircase lands.  Called via ``add_branch``
+      at ``dungeon.c:502`` before the dungeon's ``init_level``/``place_level``
+      pass.
+
+    Draw order exactly mirrors the vendor ``init_dungeons`` loop
+    (``dungeon.c:772-913``): for each dungeon ``i``:
+      1. ``add_branch`` → ``parent_dlevel`` rn2 (i > 0 only)  [dungeon.c:502,398]
+      2. ``place_level`` rn2 per created special level          [dungeon.c:661]
+
+    Conditional draws (RNDLEVEL gates and the Fort Ludios dungeon gate) use
+    the scalar gate values already drawn by the fixed phase: a level exists
+    iff its ``gate_draw < chance`` (vendor condition: ``chance <= rn2(100)``
+    skips, so placed when ``rn2(100) < chance``).
+
+    Standard NLE config draw count (per-dungeon breakdown):
+    ┌────────────────────────┬──────────┬───────────────────────────────────────────────────────────────┐
+    │ Dungeon                │  Fixed   │  Variable draws                                               │
+    │                        │ parent   │                                                               │
+    ├────────────────────────┼──────────┼───────────────────────────────────────────────────────────────┤
+    │ DoD (i=0)              │    —     │ rogue rn2(4) + oracle rn2(5) + [bigrm rn2(3)] +              │
+    │                        │          │ [medusa rn2(4)] + castle rn2(1)  = 3–5 draws                 │
+    │ Gehennom (i=1)         │  rn2(1)  │ valley rn2(1) + sanctum rn2(1) + juiblex rn2(4) +           │
+    │                        │          │ baalz rn2(4) + asmodeus rn2(6) + wizard1 rn2(6) +           │
+    │                        │          │ wizard2 rn2(1) + wizard3 rn2(1) + orcus rn2(6) +            │
+    │                        │          │ fakewiz1 rn2(4) + fakewiz2 rn2(3)  = 11 draws               │
+    │ Mines (i=2)            │  rn2(3)  │ [minetn rn2(2)] + [minend rn2(1)]  = 0–2 draws              │
+    │ Quest (i=3)            │  rn2(2)  │ x-strt rn2(1) + x-loca rn2(1) + x-goal rn2(1)  = 3 draws   │
+    │ Sokoban (i=4)          │  rn2(1)  │ [soko1 rn2(1)]+[soko2 rn2(1)]+[soko3 rn2(1)]+             │
+    │                        │          │ [soko4 rn2(1)]  = 0–4 draws                                 │
+    │ Fort Ludios (i=5)      │ [rn2(4)] │ [knox rn2(1)]  = 0–2 draws (gated by ludios_gate)          │
+    │ Vlad's Tower (i=6)     │  rn2(5)  │ tower1 rn2(1)+tower2 rn2(1)+tower3 rn2(1)  = 3 draws       │
+    │ Endgame (i=7)          │  rn2(1)  │ astral rn2(1)+water rn2(1)+fire rn2(1)+air rn2(1)+         │
+    │                        │          │ earth rn2(1)+dummy rn2(1)  = 6 draws                        │
+    ├────────────────────────┼──────────┼───────────────────────────────────────────────────────────────┤
+    │ Total (all gates pass) │  7 draws │  3-5 + 11 + 0-2 + 3 + 0-4 + 0-1 + 3 + 6  = 26–35 draws    │
+    │ Grand variable total   │          │  33–42 draws (parent_dlevel + place_level combined)           │
+    └────────────────────────┴──────────┴───────────────────────────────────────────────────────────────┘
+
+    Args:
+        vendor_rng:    Isaac64State carrying the ISAAC64 CORE stream, positioned
+                       immediately after the 18 fixed draws.
+        dungeon_state: dict returned by ``consume_init_dungeons_draws`` — provides
+                       the gate draw values needed to decide which RNDLEVEL and
+                       Fort Ludios levels were created.
+
+    Returns:
+        ``(new_vendor_rng, variable_state)`` where ``variable_state`` is an
+        informational dict of the drawn values.
+
+    Citations:
+        vendor/nle/src/dungeon.c:398   parent_dlevel — rn2(num)
+        vendor/nle/src/dungeon.c:502   add_branch calls parent_dlevel
+        vendor/nle/src/dungeon.c:661   place_level — rn2(npossible)
+        vendor/nle/src/dungeon.c:772   init_dungeons outer loop
+        vendor/nle/src/dungeon.c:845   add_branch called for i > 0
+        vendor/nle/src/dungeon.c:887-898  place_level called per dungeon
+    """
+    from Nethax.nethax import vendor_rng as _vrng
+
+    ds = dungeon_state  # shorthand
+
+    # Vendor gate condition: ``if (!wizard && tlevel->chance <= rn2(100)) return``
+    # Level is PLACED when the drawn value is LESS THAN chance.
+    bigrm_placed  = int(ds["gate_bigrm"])  < 40
+    medusa_placed = int(ds["gate_medusa"]) < 4
+    minetn_placed = int(ds["gate_minetn"]) < 7
+    minend_placed = int(ds["gate_minend"]) < 3
+    soko1_placed  = int(ds["gate_soko1"])  < 2
+    soko2_placed  = int(ds["gate_soko2"])  < 2
+    soko3_placed  = int(ds["gate_soko3"])  < 2
+    soko4_placed  = int(ds["gate_soko4"])  < 2
+
+    # Fort Ludios dungeon gate: vendor dungeon.c:775-776
+    #   ``if (!wizard && pd.tmpdungeon[i].chance && (pd.tmpdungeon[i].chance <= rn2(100)))``
+    # ludios_gate is the rn2(100) draw; Ludios is skipped when gate >= 10.
+    # (Fort Ludios chance field in compiled dungeon binary = 10.)
+    ludios_placed = int(ds["ludios_gate"]) < 10
+
+    drawn = {}
+
+    # -----------------------------------------------------------------------
+    # i=0: DoD — no add_branch; place_level draws for DoD special levels
+    # dungeon.def order: rogue, oracle, [bigrm], [medusa], castle
+    # vendor/nle/src/dungeon.c:887-898 (place_level after init_level loop)
+    # vendor/nle/src/dungeon.c:661     (rn2(npossible) inside place_level)
+    # -----------------------------------------------------------------------
+    vendor_rng, v = _vrng.rn2(vendor_rng, 4)   # dungeon.c:661 rogue @ (15,4) npossible=4
+    drawn["dod_rogue"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 5)   # dungeon.c:661 oracle @ (5,5) npossible=5
+    drawn["dod_oracle"] = v
+    if bigrm_placed:
+        vendor_rng, v = _vrng.rn2(vendor_rng, 3)  # dungeon.c:661 bigrm @ (10,3) npossible=3
+        drawn["dod_bigrm"] = v
+    if medusa_placed:
+        vendor_rng, v = _vrng.rn2(vendor_rng, 4)  # dungeon.c:661 medusa @ (-5,4) npossible=4
+        drawn["dod_medusa"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 castle @ (-1,0) npossible=1
+    drawn["dod_castle"] = v
+
+    # -----------------------------------------------------------------------
+    # i=1: Gehennom — add_branch first, then place_level draws
+    # parent_dlevel: CHAINBRANCH "castle"+(0,0) → level_range returns 1
+    # vendor/nle/src/dungeon.c:502,398
+    # dungeon.def order: valley, sanctum, juiblex, baalz, asmodeus,
+    #                    wizard1, wizard2, wizard3, orcus, fakewiz1, fakewiz2
+    # -----------------------------------------------------------------------
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:398 parent_dlevel Gehennom num=1
+    drawn["pdl_gehennom"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 valley @ (1,0) npossible=1
+    drawn["geh_valley"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 sanctum @ (-1,0) npossible=1
+    drawn["geh_sanctum"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 4)   # dungeon.c:661 juiblex @ (4,4) npossible=4
+    drawn["geh_juiblex"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 4)   # dungeon.c:661 baalz @ (6,4) npossible=4
+    drawn["geh_baalz"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 6)   # dungeon.c:661 asmodeus @ (2,6) npossible=6
+    drawn["geh_asmodeus"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 6)   # dungeon.c:661 wizard1 @ (11,6) npossible=6
+    drawn["geh_wizard1"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 wizard2 CHAINLEVEL+1 npossible=1
+    drawn["geh_wizard2"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 wizard3 CHAINLEVEL+2 npossible=1
+    drawn["geh_wizard3"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 6)   # dungeon.c:661 orcus @ (10,6) npossible=6
+    drawn["geh_orcus"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 4)   # dungeon.c:661 fakewiz1 @ (-6,4) npossible=4
+    drawn["geh_fakewiz1"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 3)   # dungeon.c:661 fakewiz2 @ (-6,4) npossible=3
+    drawn["geh_fakewiz2"] = v                   # npossible=3: range 4 minus fakewiz1 slot
+
+    # -----------------------------------------------------------------------
+    # i=2: Gnomish Mines — add_branch (BRANCH @ (2,3)), then place_level
+    # parent_dlevel: level_range returns min(3, dod_depth - 2 + 1); typical=3
+    # vendor/nle/src/dungeon.c:502,398
+    # -----------------------------------------------------------------------
+    vendor_rng, v = _vrng.rn2(vendor_rng, 3)   # dungeon.c:398 parent_dlevel Mines num=3
+    drawn["pdl_mines"] = v
+    if minetn_placed:
+        vendor_rng, v = _vrng.rn2(vendor_rng, 2)  # dungeon.c:661 minetn @ (3,2) npossible=2
+        drawn["mines_minetn"] = v
+    if minend_placed:
+        vendor_rng, v = _vrng.rn2(vendor_rng, 1)  # dungeon.c:661 minend @ (-1,0) npossible=1
+        drawn["mines_minend"] = v
+
+    # -----------------------------------------------------------------------
+    # i=3: The Quest — add_branch (CHAINBRANCH "oracle"+(6,2)), then place_level
+    # parent_dlevel: oracle_pos + [6,7], capped at dod end; npossible typically 2
+    # dungeon.def order: x-strt @ (1,1), x-loca @ (3,1), x-goal @ (-1,0)
+    # vendor/nle/src/dungeon.c:502,398
+    # -----------------------------------------------------------------------
+    vendor_rng, v = _vrng.rn2(vendor_rng, 2)   # dungeon.c:398 parent_dlevel Quest num=2
+    drawn["pdl_quest"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 x-strt @ (1,1) npossible=1
+    drawn["quest_strt"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 x-loca @ (3,1) npossible=1
+    drawn["quest_loca"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 x-goal @ (-1,0) npossible=1
+    drawn["quest_goal"] = v
+
+    # -----------------------------------------------------------------------
+    # i=4: Sokoban — add_branch (CHAINBRANCH "oracle"+(1,0)), then place_level
+    # parent_dlevel: oracle_pos + 1, npossible=1
+    # soko1-4 each RNDLEVEL @ (N,0) chance=2; rand=0 → npossible=1 if placed
+    # vendor/nle/src/dungeon.c:502,398
+    # -----------------------------------------------------------------------
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:398 parent_dlevel Sokoban num=1
+    drawn["pdl_sokoban"] = v
+    if soko1_placed:
+        vendor_rng, v = _vrng.rn2(vendor_rng, 1)  # dungeon.c:661 soko1 @ (1,0) npossible=1
+        drawn["soko_1"] = v
+    if soko2_placed:
+        vendor_rng, v = _vrng.rn2(vendor_rng, 1)  # dungeon.c:661 soko2 @ (2,0) npossible=1
+        drawn["soko_2"] = v
+    if soko3_placed:
+        vendor_rng, v = _vrng.rn2(vendor_rng, 1)  # dungeon.c:661 soko3 @ (3,0) npossible=1
+        drawn["soko_3"] = v
+    if soko4_placed:
+        vendor_rng, v = _vrng.rn2(vendor_rng, 1)  # dungeon.c:661 soko4 @ (4,0) npossible=1
+        drawn["soko_4"] = v
+
+    # -----------------------------------------------------------------------
+    # i=5: Fort Ludios — entire dungeon conditional on ludios_placed
+    # add_branch (BRANCH @ (18,4) in Main), npossible=4; knox LEVEL @ (-1,0)
+    # vendor/nle/src/dungeon.c:502,398
+    # -----------------------------------------------------------------------
+    if ludios_placed:
+        vendor_rng, v = _vrng.rn2(vendor_rng, 4)  # dungeon.c:398 parent_dlevel Ludios num=4
+        drawn["pdl_ludios"] = v
+        vendor_rng, v = _vrng.rn2(vendor_rng, 1)  # dungeon.c:661 knox @ (-1,0) npossible=1
+        drawn["ludios_knox"] = v
+
+    # -----------------------------------------------------------------------
+    # i=6: Vlad's Tower — add_branch (BRANCH @ (9,5) in Gehennom), npossible=5
+    # dungeon.def order: tower1 @ (1,0), tower2 @ (2,0), tower3 @ (3,0)
+    # vendor/nle/src/dungeon.c:502,398
+    # -----------------------------------------------------------------------
+    vendor_rng, v = _vrng.rn2(vendor_rng, 5)   # dungeon.c:398 parent_dlevel Vlad num=5
+    drawn["pdl_vlad"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 tower1 @ (1,0) npossible=1
+    drawn["vlad_tower1"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 tower2 @ (2,0) npossible=1
+    drawn["vlad_tower2"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 tower3 @ (3,0) npossible=1
+    drawn["vlad_tower3"] = v
+
+    # -----------------------------------------------------------------------
+    # i=7: The Elemental Planes (Endgame) — add_branch (BRANCH @ (1,0) in Main)
+    # parent_dlevel: num=1; astral-dummy all @ fixed slots npossible=1
+    # vendor/nle/src/dungeon.c:502,398
+    # -----------------------------------------------------------------------
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:398 parent_dlevel Endgame num=1
+    drawn["pdl_endgame"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 astral @ (1,0) npossible=1
+    drawn["end_astral"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 water @ (2,0) npossible=1
+    drawn["end_water"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 fire @ (3,0) npossible=1
+    drawn["end_fire"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 air @ (4,0) npossible=1
+    drawn["end_air"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 earth @ (5,0) npossible=1
+    drawn["end_earth"] = v
+    vendor_rng, v = _vrng.rn2(vendor_rng, 1)   # dungeon.c:661 dummy @ (6,0) npossible=1
+    drawn["end_dummy"] = v
+
+    return vendor_rng, drawn
+
+
 # ---------------------------------------------------------------------------
 # TODO blocks
 # ---------------------------------------------------------------------------
