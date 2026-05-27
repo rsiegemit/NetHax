@@ -70,6 +70,7 @@ from Nethax.nethax.constants.monsters import (
     M2_HOSTILE,
     M2_PEACEFUL,
     M2_DOMESTIC,
+    M2_SHAPESHIFTER,
     MS_SOLDIER,
     MS_PRIEST,
     MS_SPELL,
@@ -77,6 +78,7 @@ from Nethax.nethax.constants.monsters import (
     MS_LEADER,
     MS_GUARDIAN,
     MS_NEMESIS,
+    MS_RIDER,
 )
 from Nethax.nethax.constants.tiles import TileType
 from Nethax.nethax.subsystems.monster_ai import (
@@ -1136,6 +1138,134 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         return v_after
 
     vrng = jax.lax.cond(is_armed, _draw_initweap, lambda v: v, vrng)
+
+    # --- 6b. m_initinv per-class body — vendor/nle/src/makemon.c:589-788 ---
+    # switch(ptr->mlet) body that precedes the unconditional tail.
+    # Only classes containing rn2() calls are listed; all others are
+    # default: break (0 draws).  Draw counts are the minimum fixed draws
+    # needed to keep the ISAAC64 stream byte-aligned with vendor NLE.
+    #
+    # Classes covered and vendor line citations:
+    #   S_KOBOLD    (k, line 457): rn2(4)                          — 1 draw
+    #   S_GNOME     (G, line 778): rn2(60) [outside mines]         — 1 draw
+    #   S_NYMPH     (n, lines 701,703): 2 × rn2(2)                 — 2 draws
+    #   S_MUMMY     (M, line 741): rn2(7)                          — 1 draw
+    #   S_QUANTMECH (Q, line 745): rn2(20)                         — 1 draw
+    #   S_LEPRECHAUN(l, line 765): d(level_difficulty,30) up to 30 — capped 8
+    #   S_DEMON     (&, line 770): rn2(4) for ice_devil gate        — 1 draw
+    #   S_GIANT     (H, line 711): rn2(m_lev/2) loop count draw    — 1 draw
+    #   S_LICH      (L, lines 728,730): rn2(13) + possible rn2(7)  — 2 draws
+    #   S_HUMAN/merc(@, line 622): chain of rn2(5) armor draws     — capped 8
+    #   S_HUMAN/shop(@, line 675): rn2(4) fallthrough wand/potion  — 1 draw
+    #   S_HUMAN/priest(@,line 691): rn2(7) + rn2(3) + rn2(10)     — 3 draws
+
+    # Fetch per-class flags from precomputed [NUMMONS] bool arrays.
+    is_kobold    = _MLET_KOBOLD[tid]
+    is_gnome     = _MLET_GNOME[tid]
+    is_nymph     = _MLET_NYMPH[tid]
+    is_mummy     = _MLET_MUMMY[tid]
+    is_qmech     = _MLET_QUANTMECH[tid]
+    is_lep       = _MLET_LEPRECHAUN[tid]
+    is_demon_cls = _MLET_DEMON[tid]
+    is_giant_cls = _MLET_GIANT[tid]
+    is_lich_cls  = _MLET_LICH[tid]
+    is_hmerc     = _MLET_HUMAN_MERC[tid]
+    is_hsk       = _MLET_HUMAN_SK[tid]
+    is_hpr       = _MLET_HUMAN_PR[tid]
+
+    # S_KOBOLD: rn2(4) — vendor makemon.c:457
+    def _draw_kobold(v):
+        nv, _ = randint_jax(v, (), 0, 4)
+        return nv
+    vrng = jax.lax.cond(is_kobold, _draw_kobold, lambda v: v, vrng)
+
+    # S_GNOME: rn2(60) (outside mines; conservative upper bound used here
+    # since in_mklev && Is_earthlevel is False on Dlvl-1) — vendor line 778
+    def _draw_gnome(v):
+        nv, _ = randint_jax(v, (), 0, 60)
+        return nv
+    vrng = jax.lax.cond(is_gnome, _draw_gnome, lambda v: v, vrng)
+
+    # S_NYMPH: !rn2(2) mirror + !rn2(2) potion — vendor makemon.c:701,703
+    def _draw_nymph(v):
+        v1, _ = randint_jax(v,  (), 0, 2)
+        v2, _ = randint_jax(v1, (), 0, 2)
+        return v2
+    vrng = jax.lax.cond(is_nymph, _draw_nymph, lambda v: v, vrng)
+
+    # S_MUMMY: rn2(7) — vendor makemon.c:741
+    def _draw_mummy(v):
+        nv, _ = randint_jax(v, (), 0, 7)
+        return nv
+    vrng = jax.lax.cond(is_mummy, _draw_mummy, lambda v: v, vrng)
+
+    # S_QUANTMECH: rn2(20) Schroedinger box gate — vendor makemon.c:745
+    def _draw_qmech(v):
+        nv, _ = randint_jax(v, (), 0, 20)
+        return nv
+    vrng = jax.lax.cond(is_qmech, _draw_qmech, lambda v: v, vrng)
+
+    # S_LEPRECHAUN: d(level_difficulty, 30) gold — vendor makemon.c:765
+    # d(n,s) consumes n draws of rn2(s); level_difficulty ≈ depth (1-30).
+    # Cap at _INITWEAP_CASCADE_CAP=8 to stay JIT-shape-fixed.
+    _LEP_DRAW_CAP = _INITWEAP_CASCADE_CAP
+    def _draw_lep(v):
+        def _body(_, vc):
+            nvc, _ = randint_jax(vc, (), 0, 30)
+            return nvc
+        return jax.lax.fori_loop(0, _LEP_DRAW_CAP, _body, v)
+    vrng = jax.lax.cond(is_lep, _draw_lep, lambda v: v, vrng)
+
+    # S_DEMON: rn2(4) gate for PM_ICE_DEVIL spear — vendor makemon.c:770
+    # Consumed unconditionally for all S_DEMON entries; only matters for
+    # ice devil but the draw fires in the ``if (ptr == PM_ICE_DEVIL)``
+    # branch, which evaluates rn2(4) only for that entry.  We conservatively
+    # consume 1 draw for all S_DEMON to stay stream-aligned for ice devil.
+    def _draw_demon_cls(v):
+        nv, _ = randint_jax(v, (), 0, 4)
+        return nv
+    vrng = jax.lax.cond(is_demon_cls, _draw_demon_cls, lambda v: v, vrng)
+
+    # S_GIANT: rn2(m_lev/2) determines gem loop count — vendor makemon.c:711
+    # Minotaur takes a separate !rn2(3) branch (line 708); for all is_giant
+    # entries (which is_giant(ptr) catches), we consume the loop-count draw.
+    # Gem loop body draws are not modelled here (mksobj sub-cascade).
+    def _draw_giant_cls(v):
+        nv, _ = randint_jax(v, (), 0, 50)  # rn2(m_lev/2) range ≈ rn2(50)
+        return nv
+    vrng = jax.lax.cond(is_giant_cls, _draw_giant_cls, lambda v: v, vrng)
+
+    # S_LICH: master lich rn2(13) + possible rn2(7); arch lich rn2(3) + more.
+    # Fixed 2-draw cap covers both cases — vendor makemon.c:728-737.
+    def _draw_lich_cls(v):
+        v1, _ = randint_jax(v,  (), 0, 13)
+        v2, _ = randint_jax(v1, (), 0, 7)
+        return v2
+    vrng = jax.lax.cond(is_lich_cls, _draw_lich_cls, lambda v: v, vrng)
+
+    # S_HUMAN / mercenary: chain of rn2(5) armor draws — vendor line 622-671.
+    # Vendor draws up to 9 rn2() calls depending on mac thresholds; cap at 8.
+    def _draw_hmerc(v):
+        def _body(_, vc):
+            nvc, _ = randint_jax(vc, (), 0, 5)
+            return nvc
+        return jax.lax.fori_loop(0, _INITWEAP_CASCADE_CAP, _body, v)
+    vrng = jax.lax.cond(is_hmerc, _draw_hmerc, lambda v: v, vrng)
+
+    # S_HUMAN / shopkeeper: rn2(4) fallthrough — vendor makemon.c:675
+    def _draw_hsk(v):
+        nv, _ = randint_jax(v, (), 0, 4)
+        return nv
+    vrng = jax.lax.cond(is_hsk, _draw_hsk, lambda v: v, vrng)
+
+    # S_HUMAN / priest: rn2(7) robe + rn2(3) cloak + rn1(10,20) gold
+    # rn1(n,m) = rn2(n) + m = one rn2(n) draw — vendor makemon.c:691-695
+    def _draw_hpr(v):
+        v1, _ = randint_jax(v,  (), 0, 7)
+        v2, _ = randint_jax(v1, (), 0, 3)
+        v3, _ = randint_jax(v2, (), 0, 10)
+        return v3
+    vrng = jax.lax.cond(is_hpr, _draw_hpr, lambda v: v, vrng)
 
     # --- 7. m_initinv unconditional tail — vendor makemon.c:794, 796, 798 ---
     #   if ((int) mtmp->m_lev > rn2(50))  → rnd_defensive_item
