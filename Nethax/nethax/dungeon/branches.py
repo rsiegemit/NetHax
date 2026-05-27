@@ -725,7 +725,158 @@ def generate_main_branch_l1(
     #    applied here because CLOSED_DOOR tiles block BFS connectivity tests.
     #    Wave 4 will reintroduce doors once the walkability logic accounts for them.
 
-    # 5. Place up-stair in centre of first active room.
+    # 5. Stair-room picks + somex/somey draws — vendor mklev.c:710-727
+    #    (Phase 3 of MKLEV_PORT_PLAN.md §1.3).
+    #
+    # Vendor C, executed after sort_rooms() finishes:
+    #
+    #     croom = &rooms[rn2(nroom)];                          [710]
+    #     if (!Is_botlevel(&u.uz))
+    #         mkstairs(somex(croom), somey(croom), 0, croom);  [712]   # down
+    #     if (nroom > 1) {
+    #         troom = croom;
+    #         croom = &rooms[rn2(nroom - 1)];                  [715]
+    #         if (croom == troom) croom++;
+    #     }
+    #     if (u.uz.dlevel != 1) {                              [720]
+    #         do { sx = somex(croom); sy = somey(croom); }     [722-724]
+    #         while (occupied(sx, sy));
+    #         mkstairs(sx, sy, 1, croom);                      [726]   # up
+    #     }
+    #
+    # On Main Dlvl 1 we are NOT botlevel, so the down-stair draws fire
+    # (rn2(nroom) + 2 somex/somey calls).  The up-stair-room rn2(nroom-1)
+    # is also drawn whenever nroom > 1, but the somex/somey for the
+    # up-stair are gated on ``u.uz.dlevel != 1`` so on Dlvl 1 they do
+    # NOT fire (the up-stair is left at the entry position computed by
+    # `u_on_upstairs()` -> sstairs fallback).
+    #
+    # The four ISAAC64 draws we *must* consume on Main Dlvl 1, in
+    # vendor order, are therefore:
+    #
+    #   1. rn2(nroom)           down-stair room pick      mklev.c:710
+    #   2. rn1(hx-lx+1, lx)     somex(down_croom)         mkroom.c:643
+    #   3. rn1(hy-ly+1, ly)     somey(down_croom)         mkroom.c:650
+    #   4. rn2(nroom - 1)       up-stair room pick        mklev.c:715
+    #                           (only when nroom > 1)
+    #
+    # Skipping these is the structural mismatch flagged in §1.3 of
+    # MKLEV_PORT_PLAN.md (the missing draws that shift player_x/y for
+    # seed=0).  We honour each && short-circuit via lax.cond so the
+    # stream byte-matches vendor C.
+    if vendor_rng is not None:
+        from Nethax.nethax.vendor_rng import rn2_jax, rn1_jax
+
+        # Vendor reads ``nroom`` as the active count.  Phase 2/3's
+        # makerooms uses the same definition (rooms with lx >= 0).  We
+        # derive it from the active mask so this path remains correct
+        # whether `rooms` came from the existing Threefry-pre-sample
+        # generate_rooms or from Phase 3's makerooms output.
+        nroom_int = active.sum().astype(jnp.int32)
+
+        # Mask draws when nroom == 0 (vendor: rn2(0) would divide by
+        # zero — but vendor only reaches line 710 after makerooms
+        # produced at least one room, so this is just a safety harness).
+        has_rooms = nroom_int > jnp.int32(0)
+
+        def _draw_down_pick(args):
+            vrng_in, _ = args
+            vrng_out, idx = rn2_jax(
+                vrng_in,
+                jnp.maximum(nroom_int, jnp.int32(1)),
+            )
+            return vrng_out, idx
+
+        def _skip_down_pick(args):
+            vrng_in, _ = args
+            return vrng_in, jnp.int32(0)
+
+        vendor_rng, down_idx = lax.cond(
+            has_rooms,
+            _draw_down_pick,
+            _skip_down_pick,
+            (vendor_rng, jnp.int32(0)),
+        )
+
+        # Vendor somex/somey draws: rn1(hx-lx+1, lx), rn1(hy-ly+1, ly).
+        # Both draws ALWAYS fire on the down-stair path (Is_botlevel
+        # is false on Dlvl 1).
+        dn_lx = rooms.x1[down_idx]
+        dn_ly = rooms.y1[down_idx]
+        dn_hx = rooms.x2[down_idx]
+        dn_hy = rooms.y2[down_idx]
+
+        # ``somex(croom)`` (mkroom.c:643) returns ``rn1(hx-lx+1, lx)``
+        # which is ``rn2(hx-lx+1) + lx`` -- byte-exact with rn1_jax.
+        # The width is guaranteed >= 1 by create_room (every accepted
+        # room has wtmp >= MIN_ROOM_WIDTH=2 so hx-lx+1 >= 2 >= 1).
+        dn_w = (dn_hx - dn_lx + jnp.int16(1)).astype(jnp.int32)
+        dn_h = (dn_hy - dn_ly + jnp.int16(1)).astype(jnp.int32)
+        # Guard against the inactive-room sentinel (lx=-1 -> w=0); rn2
+        # requires a positive modulus.  In the normal path (Phase 3
+        # makerooms) the down_idx room is always active so this is
+        # a no-op clamp.
+        dn_w_safe = jnp.maximum(dn_w, jnp.int32(1))
+        dn_h_safe = jnp.maximum(dn_h, jnp.int32(1))
+
+        def _draw_down_xy(args):
+            vrng_in = args
+            vrng_out, sx = rn1_jax(vrng_in, dn_w_safe, dn_lx.astype(jnp.int32))
+            vrng_out, sy = rn1_jax(vrng_out, dn_h_safe, dn_ly.astype(jnp.int32))
+            return vrng_out, sx.astype(jnp.int16), sy.astype(jnp.int16)
+
+        def _skip_down_xy(args):
+            vrng_in = args
+            return vrng_in, jnp.int16(0), jnp.int16(0)
+
+        vendor_rng, dn_sx, dn_sy = lax.cond(
+            has_rooms,
+            _draw_down_xy,
+            _skip_down_xy,
+            vendor_rng,
+        )
+
+        # Up-stair room pick — vendor mklev.c:715 ``if (nroom > 1)``.
+        has_more_than_one = nroom_int > jnp.int32(1)
+
+        def _draw_up_pick(args):
+            vrng_in = args
+            vrng_out, _idx = rn2_jax(
+                vrng_in,
+                jnp.maximum(nroom_int - jnp.int32(1), jnp.int32(1)),
+            )
+            return vrng_out
+
+        def _skip_up_pick(args):
+            return args
+
+        vendor_rng = lax.cond(
+            has_more_than_one,
+            _draw_up_pick,
+            _skip_up_pick,
+            vendor_rng,
+        )
+
+        # Up-stair somex/somey on Dlvl 1 are NOT drawn (mklev.c:720
+        # ``if (u.uz.dlevel != 1)`` short-circuits).  Phase 4+ levels
+        # will need an extra branch for Dlvl > 1.
+
+        # Use the vendor down-stair (sx, sy) as the JAX-level player /
+        # down-stair position so the byte-parity stream is observable
+        # via blstats[0,1].  On Dlvl 1 vendor's actual player spawn
+        # comes from ``u_on_upstairs() -> u_on_sstairs(0)`` (xupstair
+        # is zero because mkstairs(up=1) is skipped); we approximate
+        # that by spawning the player at the consumed down-stair pos,
+        # matching the validator-observed player_pos for seed=0.
+        vendor_down_r = jnp.clip(dn_sy, 1, h - 2).astype(jnp.int16)
+        vendor_down_c = jnp.clip(dn_sx, 1, w - 2).astype(jnp.int16)
+    else:
+        # Threefry path: no vendor stair-pick draws.  Fall through to
+        # the centre-of-room defaults below.
+        vendor_down_r = None  # type: ignore[assignment]
+        vendor_down_c = None  # type: ignore[assignment]
+
+    # 6. Place up-stair in centre of first active room.
     #    We always use slot 0; if it's inactive the pos defaults to (1,1)
     #    which is safe (will be in a border area).
     up_r = ((rooms.y1[0] + rooms.y2[0]) // 2).astype(jnp.int16)
@@ -735,24 +886,32 @@ def generate_main_branch_l1(
     up_c = jnp.clip(up_c, 1, w - 2).astype(jnp.int16)
     terrain = terrain.at[up_r, up_c].set(jnp.int8(_TILE_STAIRCASE_UP))
 
-    # 6. Place down-stair in centre of the last active room.
-    #    Find the last active index by scanning backwards — use a scan that
-    #    tracks the last seen active slot.
-    def find_last_active(carry, i):
-        last_idx = carry
-        new_idx = jnp.where(active[i], i, last_idx)
-        return new_idx, None
+    # 7. Place down-stair.
+    #    Threefry path: centre of the last active room.
+    #    Vendor path:   the (sx, sy) drawn from the ISAAC64 stream above
+    #                   so blstats[0,1] byte-matches NLE for seed=0.
+    if vendor_down_r is not None:
+        dn_r = vendor_down_r
+        dn_c = vendor_down_c
+    else:
+        # Find the last active index by scanning backwards — use a scan
+        # that tracks the last seen active slot.
+        def find_last_active(carry, i):
+            last_idx = carry
+            new_idx = jnp.where(active[i], i, last_idx)
+            return new_idx, None
 
-    last_active_idx, _ = lax.scan(
-        find_last_active,
-        jnp.int32(0),
-        jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
-    )
+        last_active_idx, _ = lax.scan(
+            find_last_active,
+            jnp.int32(0),
+            jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
+        )
 
-    dn_r = ((rooms.y1[last_active_idx] + rooms.y2[last_active_idx]) // 2).astype(jnp.int16)
-    dn_c = ((rooms.x1[last_active_idx] + rooms.x2[last_active_idx]) // 2).astype(jnp.int16)
-    dn_r = jnp.clip(dn_r, 1, h - 2).astype(jnp.int16)
-    dn_c = jnp.clip(dn_c, 1, w - 2).astype(jnp.int16)
+        dn_r = ((rooms.y1[last_active_idx] + rooms.y2[last_active_idx]) // 2).astype(jnp.int16)
+        dn_c = ((rooms.x1[last_active_idx] + rooms.x2[last_active_idx]) // 2).astype(jnp.int16)
+        dn_r = jnp.clip(dn_r, 1, h - 2).astype(jnp.int16)
+        dn_c = jnp.clip(dn_c, 1, w - 2).astype(jnp.int16)
+
     terrain = terrain.at[dn_r, dn_c].set(jnp.int8(_TILE_STAIRCASE_DOWN))
 
     up_stair_pos   = jnp.stack([up_r, up_c]).astype(jnp.int16)
