@@ -205,7 +205,22 @@ class NethaxEnv:
             #   ``active.sum()``.
             state = state.replace(vendor_rng=v_state)
 
-        # Apply character creation (stats, inventory, AC).
+        # Vendor allmain.c order (lines 604-615):
+        #   init_objects → role_init → init_dungeons → init_artifacts → u_init → mklev
+        # So consume init_dungeons BEFORE create_character (which models u_init).
+        # The prior order was REVERSED — every ISAAC64 draw from position 195+
+        # was offset, causing the entire downstream dungeon-gen to mis-align.
+        # Citation: vendor/nle/src/allmain.c:604-615; vendor/nle/src/dungeon.c:714.
+        if use_vendor_rng():
+            new_vrng, _dungeon_state = consume_init_dungeons_draws(state.vendor_rng)
+            # Variable-count draws: place_level slot picks (dungeon.c:661) and
+            # parent_dlevel branch picks (dungeon.c:398).
+            new_vrng, _var_state = consume_init_dungeons_variable_draws(
+                new_vrng, _dungeon_state
+            )
+            state = state.replace(vendor_rng=new_vrng)
+
+        # Apply character creation (stats, inventory, AC) — vendor u_init.
         # In NLE_BYTEPARITY mode, thread the ISAAC64 CORE state through
         # create_character so it can consume the u_init rn2(5) BLINDFOLD
         # draw (vendor/nle/src/u_init.c:753-754) in byte-exact call order.
@@ -222,36 +237,10 @@ class NethaxEnv:
         state = state.replace(skills=init_skills(role))
 
         # Emit the role-specific NLE intro line on row 0 of the message line.
-        # Mirrors vendor/nethack/src/allmain.c::welcome lines 920-922 ::
-        #     pline("%s %s, welcome to NetHack!  You are a%s.",
-        #           Hello(), svp.plname, buf);
-        # The greeting prefix (Hello / Salutations / Konnichi wa / Aloha /
-        # Velkommen) is selected by role.c::Hello.  Without this the
-        # validator sees ``tty_chars row 0`` as blank while NLE shows the
-        # per-role welcome line.
         from Nethax.nethax.subsystems.messages import emit_role_intro as _emit_role_intro
         state = state.replace(
             messages=_emit_role_intro(state.messages, int(role)),
         )
-
-        # Consume the fixed ~18 ISAAC64 draws of vendor init_dungeons.
-        # Vendor sequence (allmain.c:610): init_dungeons fires AFTER u_init
-        # and BEFORE mklev.  The 18 fixed draws are:
-        #   4 × dungeon depth rn1 (dungeon.c:796-798)
-        #   1 × Fort Ludios chance gate rn2(100) (dungeon.c:775-776)
-        #   8 × RNDLEVEL chance gates rn2(100) (dungeon.c:548)
-        #   5 × tune rn2(7) (dungeon.c:917-918)
-        # Citation: vendor/nle/src/dungeon.c:714 init_dungeons.
-        if use_vendor_rng():
-            new_vrng, _dungeon_state = consume_init_dungeons_draws(state.vendor_rng)
-            # Consume the variable-count draws that follow the 18 fixed draws:
-            # place_level slot picks (dungeon.c:661) and parent_dlevel branch
-            # picks (dungeon.c:398), interleaved per dungeon in parse order.
-            # Citation: vendor/nle/src/dungeon.c:398, 502, 661, 772-913.
-            new_vrng, _var_state = consume_init_dungeons_variable_draws(
-                new_vrng, _dungeon_state
-            )
-            state = state.replace(vendor_rng=new_vrng)
 
         # Vendor mklev() begins by reseeding BOTH streams (vendor
         # mklev.c:996-997)::
