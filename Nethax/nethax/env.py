@@ -74,6 +74,7 @@ class NethaxEnv:
         role: "Role | None" = None,
         race: "Race | None" = None,
         alignment: int = 0,
+        disp_seed: int | None = None,
     ) -> Tuple[EnvState, Dict[str, jax.Array]]:
         """Return (initial_state, initial_observation).
 
@@ -83,6 +84,13 @@ class NethaxEnv:
         role      : Role enum value; defaults to VALKYRIE if None.
         race      : Race enum value; defaults to HUMAN if None.
         alignment : 0=lawful, 1=neutral, 2=chaotic; default 0.
+        disp_seed : Optional explicit DISP-stream seed.  When ``None``
+                    (the default), the DISP stream is seeded with the
+                    same integer as CORE — matching NLE's validator
+                    ``env.seed(seeds=(s, s))`` convention.
+                    Cite: vendor/nle/src/nle.c:530-532
+                          ``nle_set_seed(core, disp, reseed)`` seeds the
+                          two ``rnglist[]`` entries independently.
         """
         if role is None:
             role = Role.VALKYRIE
@@ -138,6 +146,21 @@ class NethaxEnv:
             seed_lo = jnp.uint64(rng[1])
             seed_arr = (seed_hi << jnp.uint64(32)) | seed_lo
             v_state = _vendor_rng.init(int(seed_arr))
+
+            # Seed the DISP stream (rnglist[DISP]) alongside CORE.  NLE's
+            # ``nle_set_seed`` takes BOTH integers and seeds the two
+            # ``rnglist[]`` entries via independent ``init_isaac64`` calls
+            # — so DISP's stream is wholly independent of CORE's even when
+            # both share the same numeric seed.  The validator default
+            # ``env.seed(seeds=(s, s), reseed=False)`` (vendor
+            # vendor/nle/nle/env/base.py:441) collapses both seeds to the
+            # same integer; we mirror that here unless the caller passes
+            # an explicit ``disp_seed`` override.
+            # Cite: vendor/nle/src/nle.c:530-532 ``set_random(core, rn2)``
+            #       and ``set_random(disp, rn2_on_display_rng)``.
+            disp_seed_val = int(seed_arr) if disp_seed is None else int(disp_seed)
+            v_state_disp = _vendor_rng.init(disp_seed_val)
+            state = state.replace(vendor_rng_disp=v_state_disp)
 
             # Replay vendor ``init_objects()`` BEFORE any dungeon-gen
             # draws so the ISAAC64 stream stays byte-aligned with NLE.
