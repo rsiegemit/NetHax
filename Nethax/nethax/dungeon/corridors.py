@@ -540,33 +540,53 @@ def dodoor(
     is_wall = (cur == jnp.int8(VTILE_HWALL)) | (cur == jnp.int8(VTILE_VWALL))
     type_is_door = is_door_kind | ~is_wall
 
-    # --- DOOR branch (rn2(3), rn2(5), rn2(6), rn2(25)) ---------------------
-    rng, r3   = rn2_jax(rng, jnp.int32(3))
-    rng, r5d  = rn2_jax(rng, jnp.int32(5))
-    rng, r6d  = rn2_jax(rng, jnp.int32(6))
-    rng, r25d = rn2_jax(rng, jnp.int32(25))
+    # --- DOOR branch (rn2(3), rn2(5), rn2(6)) — only drawn when type_is_door.
+    # Vendor mklev.c:395-447: the rn2(3)/rn2(5)/rn2(6) draws are inside the
+    # ``if (type == DOOR)`` block; rn2(25) is additionally gated by
+    # ``level_difficulty() >= 5`` which is false on Dlvl 1.
+    def _draw_door_branch(r):
+        r, r3_  = rn2_jax(r, jnp.int32(3))
+        r, r5d_ = rn2_jax(r, jnp.int32(5))
+        r, r6d_ = rn2_jax(r, jnp.int32(6))
+        # rn2(25) difficulty gate: false on Dlvl 1 — skip draw entirely.
+        return r, r3_, r5d_, r6d_
 
-    # Door mask under the DOOR branch.
+    rng, r3, r5d, r6d = lax.cond(
+        type_is_door,
+        _draw_door_branch,
+        lambda r: (r, jnp.int32(0), jnp.int32(0), jnp.int32(0)),
+        rng,
+    )
+
     door_path = r3 == jnp.int32(0)
     door_open = r5d == jnp.int32(0)
     door_lock = (~door_open) & (r6d == jnp.int32(0))
-    door_closed_only = (~door_open) & (~door_lock)
     door_mask_path = jnp.where(door_open, jnp.int8(DMASK_ISOPEN),
                      jnp.where(door_lock, jnp.int8(DMASK_LOCKED),
                                           jnp.int8(DMASK_CLOSED)))
     door_mask_nopath = jnp.where(shdoor, jnp.int8(DMASK_ISOPEN),
                                           jnp.int8(DMASK_NODOOR))
     door_mask_door = jnp.where(door_path, door_mask_path, door_mask_nopath)
-    # Trapped overlay only when difficulty>=5 and !shdoor — Phase 4 omits.
-    del r25d  # consumed for byte-parity, ignored as a flag (difficulty<5)
 
-    # --- SDOOR branch (rn2(5), rn2(20)) -----------------------------------
-    rng, r5s  = rn2_jax(rng, jnp.int32(5))
-    rng, r20s = rn2_jax(rng, jnp.int32(20))
+    # --- SDOOR branch (rn2(5), rn2(20)) — only drawn when !type_is_door.
+    # Vendor mklev.c:438-443: the rn2(5)/rn2(20) draws are inside
+    # ``else { /* SDOOR */ ... }``.  rn2(20) is additionally gated by
+    # ``level_difficulty() >= 4`` which is false on Dlvl 1 — skip draw.
+    def _draw_sdoor_branch(r):
+        r, r5s_ = rn2_jax(r, jnp.int32(5))
+        # rn2(20) difficulty gate: false on Dlvl 1 — skip draw entirely.
+        return r, r5s_
+
+    rng, r5s = lax.cond(
+        ~type_is_door,
+        _draw_sdoor_branch,
+        lambda r: (r, jnp.int32(0)),
+        rng,
+    )
+
     sdoor_locked = shdoor | (r5s == jnp.int32(0))
     door_mask_sdoor = jnp.where(sdoor_locked, jnp.int8(DMASK_LOCKED),
                                               jnp.int8(DMASK_CLOSED))
-    del r20s  # consumed for byte-parity, ignored as a flag (difficulty<4)
 
     new_typ_val = jnp.where(type_is_door, jnp.int8(VTILE_DOOR),
                                           jnp.int8(VTILE_SDOOR))
@@ -654,11 +674,13 @@ def dig_corridor(
     def body_fn(carry):
         r, g, xx, yy, dx, dy, cct, done, ok = carry
 
-        # cct++; early-bail gate (vendor:2248).
+        # cct++; early-bail gate (vendor sp_lev.c:2248).
         cct_new = cct + jnp.int32(1)
         cap_hit = cct_new > jnp.int32(500)
 
-        r, r35 = rn2_jax(r, jnp.int32(35))
+        # rn2(35) early-bail: vendor sp_lev.c:2248 draws only when nxcor.
+        def _draw_r35(r_): return rn2_jax(r_, jnp.int32(35))
+        r, r35 = lax.cond(nxcor, _draw_r35, lambda r_: (r_, jnp.int32(1)), r)
         bail = nxcor & (r35 == jnp.int32(0))
 
         # Step.
@@ -666,12 +688,12 @@ def dig_corridor(
         yy_n = yy + dy
         oob = (xx_n >= COLNO - 1) | (xx_n <= 0) | (yy_n <= 0) | (yy_n >= ROWNO - 1)
 
-        # rn2(100) — SCORR vs CORR (vendor:2259).
+        # rn2(100) — SCORR vs CORR (vendor sp_lev.c:2259) — always drawn.
         r, r100 = rn2_jax(r, jnp.int32(100))
-        # rn2(50) — boulder gate (vendor:2261).  We always draw for byte
-        # parity, but skip the mksobj_at (Phase 5 will wire mkobj into gs).
-        r, r50  = rn2_jax(r, jnp.int32(50))
-        del r50
+        # rn2(50) — boulder gate (vendor sp_lev.c:2261) — drawn only when nxcor.
+        def _draw_r50(r_): return rn2_jax(r_, jnp.int32(50))
+        r, _r50 = lax.cond(nxcor, _draw_r50, lambda r_: (r_, jnp.int32(0)), r)
+        del _r50
 
         # Cell read & write decision (vendor:2257-2269).
         crm_typ = g.typ[jnp.clip(xx_n, 0, COLNO - 1), jnp.clip(yy_n, 0, ROWNO - 1)]
@@ -703,17 +725,41 @@ def dig_corridor(
         strange = ~is_btyp & ~is_ftyp & ~is_scorr & ~oob
         fail_now = oob | strange | bail | cap_hit
 
-        # ----- direction biasing (vendor:2272-2279) -----------------------
+        # ----- direction biasing (vendor sp_lev.c:2272-2279) ----------------
+        # Vendor: ``if (dix > diy && diy) { if (!rn2(dix-diy+1)) ... }
+        #          else if (diy > dix && dix) { if (!rn2(diy-dix+1)) ... }``
+        # The two branches are mutually exclusive (else-if), so only ONE draw
+        # fires per iteration.  We use nested lax.cond to mirror that.
         dix = jnp.abs(xx_n - tx_i)
         diy = jnp.abs(yy_n - ty_i)
 
-        # rn2(dix-diy+1) when dix>diy && diy
-        r, rbx = rn2_jax(r, jnp.maximum(dix - diy + jnp.int32(1), jnp.int32(1)))
-        bias_x = (dix > diy) & (diy != jnp.int32(0)) & (rbx == jnp.int32(0))
+        cond_x = (dix > diy) & (diy != jnp.int32(0))
+        cond_y = (diy > dix) & (dix != jnp.int32(0))
 
-        # rn2(diy-dix+1) when diy>dix && dix
-        r, rby = rn2_jax(r, jnp.maximum(diy - dix + jnp.int32(1), jnp.int32(1)))
-        bias_y = (diy > dix) & (dix != jnp.int32(0)) & (rby == jnp.int32(0))
+        def _draw_rbx(r_):
+            span = jnp.maximum(dix - diy + jnp.int32(1), jnp.int32(1))
+            return rn2_jax(r_, span)
+
+        def _draw_rby(r_):
+            span = jnp.maximum(diy - dix + jnp.int32(1), jnp.int32(1))
+            return rn2_jax(r_, span)
+
+        # If cond_x: draw rbx, skip rby.
+        # Else if cond_y: skip rbx, draw rby.
+        # Else: skip both.
+        r, rbx, rby = lax.cond(
+            cond_x,
+            lambda r_: (lambda rr, rv: (rr, rv, jnp.int32(1)))(*_draw_rbx(r_)),
+            lambda r_: lax.cond(
+                cond_y,
+                lambda r2: (lambda rr, rv: (rr, jnp.int32(1), rv))(*_draw_rby(r2)),
+                lambda r2: (r2, jnp.int32(1), jnp.int32(1)),
+                r_,
+            ),
+            r,
+        )
+        bias_x = cond_x & (rbx == jnp.int32(0))
+        bias_y = cond_y & ~cond_x & (rby == jnp.int32(0))
 
         dix_eff = jnp.where(bias_x, jnp.int32(0), dix)
         diy_eff = jnp.where(bias_y, jnp.int32(0), diy)
