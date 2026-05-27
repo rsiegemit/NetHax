@@ -392,6 +392,60 @@ _HAS_FIXED_GENDER: jnp.ndarray = _compute_has_fixed_gender()  # [NUMMONS] bool
 _LIKES_GOLD:       jnp.ndarray = _compute_likes_gold()        # [NUMMONS] bool
 
 
+def _compute_initweap_draw_count() -> jnp.ndarray:
+    """Per-monster max rn2 draws inside vendor m_initweap's switch.
+
+    Cite: vendor/nle/src/makemon.c:182-554 (switch(ptr->mlet) body).
+    For each mlet branch the vendor code is straight-line conditional
+    rn2() calls; this table records the WORST-CASE rn2 draw count
+    (assuming every internal short-circuit branch is taken).  Used to
+    bound a while_loop that replaces the previous cap-8 fori_loop —
+    tighter per-monster upper bound than the static cap.
+
+    Non-armed monsters get 0 (the `is_armed` gate skips the whole call).
+    The trailing rn2(75) at vendor line 556 is NOT included (it's
+    handled separately after the switch).
+    """
+    # Per-mlet worst-case draw counts inside m_initweap switch body.
+    # Derived by counting straight-line rn2 calls in each case branch.
+    # Conservative (worst-case branch taken).
+    counts_by_mlet = {
+        int(MonsterSymbol.S_GIANT):     1,   # rn2(2)            line 184
+        int(MonsterSymbol.S_HUMAN):     7,   # elf branch peak; mercenary handled below
+        int(MonsterSymbol.S_ANGEL):     3,   # !rn2(20) + rn2(2) + rn2(4)  line 332-340
+        int(MonsterSymbol.S_HUMANOID):  6,   # dwarf worst case             line 367-386
+        int(MonsterSymbol.S_KOP):       3,   # !rn2(4) + !rn2(3) + rn2(2)   line 392-395
+        int(MonsterSymbol.S_ORC):       5,   # helm + orc-captain branch    line 397-432
+        int(MonsterSymbol.S_OGRE):      1,   # !rn2(N)                       line 434
+        int(MonsterSymbol.S_TROLL):     2,   # !rn2(2) + rn2(4)              line 440-454
+        int(MonsterSymbol.S_KOBOLD):    1,   # !rn2(4)                       line 457
+        int(MonsterSymbol.S_CENTAUR):   1,   # rn2(2)                        line 462
+        int(MonsterSymbol.S_WRAITH):    0,   # no rn2                         line 472-475
+        int(MonsterSymbol.S_ZOMBIE):    3,   # !rn2(4) + !rn2(4) + rn2(3)   line 477-481
+        int(MonsterSymbol.S_LIZARD):    2,   # salamander rn2(7) + rn2(3)   line 482-486
+        int(MonsterSymbol.S_DEMON):     1,   # rn2(4) trident-vs-bullwhip   line 497
+    }
+    default_count = 1  # default switch case: rnd(14-2*bias) — 1 draw
+
+    counts = []
+    for m in MONSTERS:
+        # Non-armed monsters skip m_initweap entirely; assign 0.
+        armed = False
+        for atk in (m.attacks or ()):
+            if int(atk[0]) == int(AttackType.AT_WEAP):
+                armed = True
+                break
+        if not armed:
+            counts.append(0)
+            continue
+        c = counts_by_mlet.get(int(m.symbol), default_count)
+        counts.append(c)
+    return jnp.array(counts, dtype=jnp.int32)
+
+
+_INITWEAP_DRAW_COUNT: jnp.ndarray = _compute_initweap_draw_count()  # [NUMMONS] int32
+
+
 # ---------------------------------------------------------------------------
 # HP-path classification arrays  (vendor makemon.c::newmonhp lines 1018-1044)
 # ---------------------------------------------------------------------------
@@ -1274,12 +1328,11 @@ def _pick_valid_tile(
 # We DO consume the matching ISAAC64 draws so the stream stays byte-aligned
 # with vendor NLE for downstream subsystems (env.step, traps, etc.).
 #
-# JIT shape: fixed-cap fori_loop with N=8 weapon-cascade draws (covers the
-# vendor median of 5-7 draws; over-consumes slightly for short branches but
-# stays deterministic per-call which is what byte-replay requires).
+# JIT shape: lax.while_loop bounded by per-monster _INITWEAP_DRAW_COUNT
+# (tighter mlet-specific upper bound vs the previous static cap-8).
+# Loop body draws rn2(2) per iteration; the count matches the worst-case
+# vendor branch within each mlet.
 # ---------------------------------------------------------------------------
-
-_INITWEAP_CASCADE_CAP = 8  # static upper bound on per-monster weapon draws
 
 
 def _consume_makemon_post_hp_draws(vrng, type_id,
@@ -1303,8 +1356,8 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         the LGROUP branch only fires when SGROUP is absent — so a monster
         consumes ONE of the two (never both).
       * lines 1382 + 182-558: ``m_initweap`` cascade if is_armed(ptr).
-        Capped at _INITWEAP_CASCADE_CAP=8 rn2(2) draws.
-        Plus the trailing ``rn2(75)`` at line 556.
+        Bounded by per-monster ``_INITWEAP_DRAW_COUNT`` table (per-mlet
+        vendor worst-case).  Plus the trailing ``rn2(75)`` at line 556.
       * lines 1383 + 794/796/798: ``m_initinv`` unconditional tail —
         three rn2 draws (rn2(50), rn2(100), rn2(5)).
       * line 1386: saddle check ``!rn2(100) && is_domestic(...)``.  Due
@@ -1434,13 +1487,41 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         """m_initweap + m_initinv + saddle for allow_minvent=TRUE monsters."""
 
         # --- 6. m_initweap cascade — vendor makemon.c:1382 + lines 182-558 ---
-        # Conservative fixed-cap: N=8 rn2(2) draws + trailing rn2(75).
-        # Cite: makemon.c:1441-1443
+        # Vendor m_initweap is a switch(ptr->mlet) of straight-line
+        # conditional rn2() calls.  There is no loop — the previous
+        # cap-8 fori_loop drew rn2(2) eight times unconditionally
+        # regardless of which mlet branch vendor would take.  Replace
+        # with a while_loop bounded by per-monster vendor-tracked worst
+        # case (_INITWEAP_DRAW_COUNT) so each species consumes at most
+        # its mlet's actual maximum.  Tighter bound than cap-8 for the
+        # vast majority of armed monsters (kobold=1, ogre=1, kop=3, …).
+        # Cite: makemon.c:182-554 (switch body), 1441-1443 (call site).
+        #
+        # NOTE: this is still an upper bound — vendor may draw fewer
+        # rn2 calls within a branch when inner short-circuits fire.
+        # Per-mlet exact short-circuit modelling is a follow-up.
+        initweap_n = _INITWEAP_DRAW_COUNT[tid]
+
         def _draw_initweap(vv):
-            def _body(_, vc):
+            def _cond(carry):
+                _, idx = carry
+                return idx < initweap_n
+
+            def _body(carry):
+                vc, idx = carry
+                # All m_initweap rn2 calls in vendor use the same shape;
+                # mlet branches use varying N (rn2(2), rn2(3), rn2(4),
+                # rn2(5), rn2(20), rn2(50)).  We use rn2(2) here as the
+                # dominant call (most branches use it).  This is the
+                # ISAAC64-byte-count approximation — bytes consumed are
+                # the SAME for any rn2(N) since vendor RNG yields a
+                # fixed 8-byte word and discards remainder.
                 new_v, _r = randint_jax(vc, (), 0, 2)
-                return new_v
-            v_after = jax.lax.fori_loop(0, _INITWEAP_CASCADE_CAP, _body, vv)
+                return (new_v, idx + jnp.int32(1))
+
+            v_after, _ = jax.lax.while_loop(
+                _cond, _body, (vv, jnp.int32(0))
+            )
             # Trailing offensive-item check — vendor makemon.c:556
             #   if ((int) mtmp->m_lev > rn2(75)) (void) mongets(...)
             v_after, _ = randint_jax(v_after, (), 0, 75)
@@ -1536,12 +1617,117 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             return v2
         v = jax.lax.cond(is_lich_cls, _draw_lich_cls, lambda vv: vv, v)
 
-        # S_HUMAN / mercenary: chain rn2(5) — vendor makemon.c:622-671; cap 8
+        # S_HUMAN / mercenary armor chain — vendor makemon.c:622-672.
+        # Straight-line conditional draws (no loop): up to 9 rn2 calls in
+        # worst case, but each block short-circuits on rn2 result.
+        # Vendor structure (mac starts type-specific and grows via mongets):
+        #   armor_block:  if (mac<-1 && rn2(5)) ...      [draw 1: rn2(5)]
+        #                     +rn2(5) plate-mail pick   [draw 2: rn2(5)]
+        #                 else if (mac<3 && rn2(5)) ... [draw if mac<3]
+        #                     +rn2(3) splint-vs-banded  [draw if branch fired]
+        #                 else if (rn2(5)) ...          [draw if both above 0]
+        #                     +rn2(3) ring-vs-studded   [draw if branch fired]
+        #                 else +leather                  [no draw]
+        #   helmet_block: if (mac<10 && rn2(3)) ... else if (mac<10 && rn2(2)) ...
+        #   shield_block: if (mac<10 && rn2(3)) ... else if (mac<10 && rn2(2)) ...
+        #   boots_block:  if (mac<10 && rn2(3)) ... else if (mac<10 && rn2(2)) ...
+        #   gloves_block: if (mac<10 && rn2(3)) ... else if (mac<10 && rn2(2)) ...
+        # The C && short-circuits: 2nd rn2 in each "else if" only fires
+        # when the first rn2 returned 0.  We honour every short-circuit
+        # via lax.cond.  Since spawn-time minvent is empty and mongets()
+        # success is tracked through mac monotonically, we model mac<10
+        # conservatively as TRUE for the helmet/shield/boots/gloves blocks
+        # (vendor reality: mac evolves but stays <10 for most types until
+        # late in the chain).  Per-type mac initial values from vendor
+        # 594-619 are abstracted to "mac < -1" / "mac < 3" gates picked
+        # from the type table — for initial-fill, all mercenary types
+        # start with mac in [-3, 3] so the first armor-block always fires
+        # at least one rn2(5) draw.  After that, mac < 10 always holds
+        # for the helmet/shield/boots/gloves blocks (each adds at most
+        # 2-3 to mac, starting from mac in [-3, 3+7]=[-3, 10]).
+        #
+        # Trace (worst case for a SOLDIER with mac=3): 9 rn2 draws.
+        # Trace (typical, e.g. LIEUTENANT mac=-2): 8 rn2 draws.
+        # The cap-8 fori_loop approximated this but ignored short-circuits.
+        # Replace with explicit vendor-faithful sequence.
         def _draw_hmerc(vv):
-            def _body(_, vc):
-                nvc, _ = randint_jax(vc, (), 0, 5)
-                return nvc
-            return jax.lax.fori_loop(0, _INITWEAP_CASCADE_CAP, _body, vv)
+            # Block 1: armor chain (rn2(5) gated cascade).
+            # mac<-1 first: a single rn2(5) draw fires unconditionally
+            # for any mercenary entering this branch.  If it succeeds
+            # (returned non-zero), inner rn2(5) for plate pick also fires.
+            v1, r_a1 = randint_jax(vv, (), 0, 5)
+
+            def _armor_branch_a(vc):
+                # mac<-1 branch took: pick plate vs crystal plate
+                nv, _ = randint_jax(vc, (), 0, 5)
+                return nv
+
+            def _armor_branch_skip_a(vc):
+                # mac<-1 outer was 0 OR mac>=−1: fall to next else-if.
+                # Always draw rn2(5) (mac<3 gate is type-specific; we
+                # assume mac<3 holds, which is true for all non-WATCH
+                # initial mercenaries except SOLDIER/WATCHMAN where the
+                # earlier branch's rn2(5) was zero).
+                nvc, r_a2 = randint_jax(vc, (), 0, 5)
+
+                def _armor_branch_b(vd):
+                    nv, _ = randint_jax(vd, (), 0, 3)
+                    return nv
+
+                def _armor_branch_skip_b(vd):
+                    # mac<3 inner zero → fall to "else if (rn2(5))".
+                    nv, r_a3 = randint_jax(vd, (), 0, 5)
+
+                    def _armor_branch_c(ve):
+                        new_v, _ = randint_jax(ve, (), 0, 3)
+                        return new_v
+
+                    return jax.lax.cond(
+                        r_a3 != jnp.int32(0),
+                        _armor_branch_c,
+                        lambda ve: ve,
+                        nv,
+                    )
+
+                return jax.lax.cond(
+                    r_a2 != jnp.int32(0),
+                    _armor_branch_b,
+                    _armor_branch_skip_b,
+                    nvc,
+                )
+
+            v_after_armor = jax.lax.cond(
+                r_a1 != jnp.int32(0),
+                _armor_branch_a,
+                _armor_branch_skip_a,
+                v1,
+            )
+
+            # Blocks 2-5: helmet / shield / boots / gloves-cloak.
+            # Each is: if (mac<10 && rn2(N)) X else if (mac<10 && rn2(M)) Y
+            # We model mac<10 as TRUE (vendor reality for initial spawn —
+            # see comment above).  The 2nd rn2 in the else-if fires only
+            # when the first rn2 returned 0 (C && short-circuit).
+            def _pair_block(vc, n_outer, n_inner):
+                nvc, r1 = randint_jax(vc, (), 0, n_outer)
+
+                def _inner_skip(vd):
+                    new_v, _ = randint_jax(vd, (), 0, n_inner)
+                    return new_v
+
+                return jax.lax.cond(
+                    r1 != jnp.int32(0),
+                    lambda vd: vd,        # first rn2 nonzero -> branch taken, no 2nd draw
+                    _inner_skip,
+                    nvc,
+                )
+
+            v_after_helm = _pair_block(v_after_armor, 3, 2)
+            v_after_shld = _pair_block(v_after_helm,  3, 2)
+            v_after_boot = _pair_block(v_after_shld,  3, 2)
+            v_after_glov = _pair_block(v_after_boot,  3, 2)
+            return v_after_glov
+
         v = jax.lax.cond(is_hmerc, _draw_hmerc, lambda vv: vv, v)
 
         # S_HUMAN / shopkeeper: rn2(4) — vendor makemon.c:675
