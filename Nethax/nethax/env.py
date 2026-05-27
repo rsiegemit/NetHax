@@ -176,25 +176,40 @@ class NethaxEnv:
             state = state.replace(descr_idx=descr_idx)
 
             # role_init (vendor/nle/src/role.c:2011-2137) sits between
-            # init_objects and init_dungeons in allmain.c::newgame.  For the
-            # pre-specified Rogue-Human-Chaotic-Male loadout it consumes ZERO
-            # ISAAC64 draws because every conditional RNG path is gated off:
-            #   - validrole(Rogue)=true   → skip randrole_filtered (role.c:2022-2027)
-            #   - validrace(Rogue,Human)=true → skip randrace        (role.c:2035-2036)
-            #   - validgend(Rogue,Human,Male)=true → skip both gender
-            #     fallbacks (role.c:2041-2046; Rogue.allow has ROLE_MALE at
-            #     role.c:347, Human.allow has ROLE_MALE, genders[0].allow OK)
-            #   - validalign(Rogue,Human,Chaotic)=true → skip randalign
-            #     (role.c:2049-2051; Rogue.allow has ROLE_CHAOTIC at role.c:347)
-            #   - quest leader rn2(100) (role.c:2070) skipped: PM_MASTER_OF_THIEVES
-            #     has M2_MALE → is_male(pm)=true (monst.c:2931)
-            #   - quest nemesis rn2(100) (role.c:2091) skipped: PM_MASTER_ASSASSIN
-            #     has M2_MALE → is_male(pm)=true (monst.c:3073)
-            #   - pantheon randrole loop (role.c:2095-2099) skipped: Rogue.lgod
-            #     = "Issek" is non-NULL (role.c:332), loop condition false
-            # Therefore no ISAAC64 byte-shift is needed here.  If the chosen
-            # role/race/gender/alignment ever becomes user-configurable, this
-            # audit must be revisited.
+            # init_objects and init_dungeons in allmain.c::newgame
+            # (vendor/nle/src/allmain.c:606-608).  For every pre-specified
+            # role/race/gender/alignment loadout used by Nethax callers it
+            # consumes ZERO ISAAC64 draws because every conditional RNG path
+            # is gated off.  Per-loadout audit:
+            #
+            # env.reset default = Valkyrie-Human-Lawful (env.py:97-100):
+            #   - validrole/validrace/validalign all true (Valkyrie.allow at
+            #     role.c:526 carries MH_HUMAN | ROLE_FEMALE | ROLE_LAWFUL)
+            #   - validgend(Val,Hum,Male)=false → flags.female=!flags.female
+            #     (role.c:2041-2042), deterministic flip, no rn2
+            #   - quest-leader rn2(100) at role.c:2070 skipped: PM_NORN has
+            #     M2_FEMALE → is_female(pm)=true (monst.c:2955)
+            #   - quest-nemesis rn2(100) at role.c:2091 skipped: PM_LORD_SURTUR
+            #     has M2_MALE → is_male(pm)=true (monst.c:3096)
+            #   - pantheon randrole loop at role.c:2095-2099 skipped:
+            #     Valkyrie.lgod = "Tyr" non-NULL (role.c:511)
+            #
+            # NLE-shim default = Monk-Human-Neutral-Male (nle_shim.py:78,
+            # mirrors vendor/nle/nle/env/base.py "mon-hum-neu-mal"):
+            #   - validrole/validrace/validgend/validalign all true (Monk.allow
+            #     at role.c:261 carries MH_HUMAN|ROLE_MALE|ROLE_FEMALE|all 3 alignments)
+            #   - quest-leader skipped: PM_GRAND_MASTER M2_MALE (monst.c:2902)
+            #   - quest-nemesis skipped: PM_MASTER_KAEN  M2_MALE (monst.c:3045)
+            #   - pantheon loop skipped: Monk.lgod = "Shan Lai Ching" (role.c:246)
+            #
+            # Prior-audit Rogue-Human-Chaotic-Male loadout (commit 2aa1252)
+            # also lands at 0 draws via the same gating chain.
+            #
+            # Therefore no ISAAC64 byte-shift is emitted here.  If a future
+            # caller passes a role whose lgod is NULL, or quest-leader/nemesis
+            # carries neither M2_MALE/FEMALE/NEUTER (so rn2(100) fires), this
+            # audit must be revisited and explicit vendor_rng draws inserted
+            # at this site to stay byte-aligned with allmain.c::newgame.
 
             v_state, rng_level = _vendor_draw_prngkey(v_state)
             v_state, rng_char = _vendor_draw_prngkey(v_state)
@@ -240,6 +255,20 @@ class NethaxEnv:
                 new_vrng, _dungeon_state
             )
             state = state.replace(vendor_rng=new_vrng)
+
+            # init_artifacts (vendor/nle/src/artifact.c:81-86) sits between
+            # init_dungeons and u_init in allmain.c::newgame (vendor
+            # vendor/nle/src/allmain.c:613-615).  It is RNG-neutral:
+            #   - artifact.c:83  memset(artiexist, 0, ...)   — no RNG
+            #   - artifact.c:84  memset(artidisco, 0, ...)   — no RNG
+            #   - artifact.c:85  hack_artifacts()            — pure static
+            #     config: fixes alignment/role fields on artilist[] entries
+            #     (artifact.c:57-77); no rn2/rnd/rne calls.
+            # Therefore no ISAAC64 draw is emitted at this site; this comment
+            # records the audit so the vendor-order skeleton stays visible.
+            # If $WIZKIT-style late artifact wishes are ever ported they must
+            # land between this hook and the u_init draws below to preserve
+            # byte alignment with allmain.c::newgame.
 
         # Apply character creation (stats, inventory, AC) — vendor u_init.
         # In NLE_BYTEPARITY mode, thread the ISAAC64 CORE state through
