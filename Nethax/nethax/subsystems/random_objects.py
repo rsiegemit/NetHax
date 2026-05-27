@@ -571,15 +571,16 @@ _TOOL_BR_NOOP             = 0  # default — 0 draws
 _TOOL_BR_CANDLE           = 1  # TALLOW_CANDLE / WAX_CANDLE     (mkobj.c:899-907)
 _TOOL_BR_LAMP             = 2  # BRASS_LANTERN / OIL_LAMP       (mkobj.c:908-914)
 _TOOL_BR_MAGIC_LAMP       = 3  # MAGIC_LAMP                     (mkobj.c:915-919)
-_TOOL_BR_CHEST_LBOX       = 4  # CHEST / LARGE_BOX              (mkobj.c:920-924)
-_TOOL_BR_ICEBOX           = 5  # ICE_BOX                        (mkobj.c:925,929)
-_TOOL_BR_SACK             = 6  # SACK / OILSKIN_SACK / BAG_OF_HOLDING (mkobj.c:926-929)
-_TOOL_BR_CAMERA_TINNING_MARKER = 7  # EXPENSIVE_CAMERA / TINNING_KIT / MAGIC_MARKER (mkobj.c:931-935)
-_TOOL_BR_GREASE           = 8  # CAN_OF_GREASE                  (mkobj.c:936-939)
-_TOOL_BR_CRYSTAL_BALL     = 9  # CRYSTAL_BALL                   (mkobj.c:940-943)
-_TOOL_BR_HORN_BAG_TRICKS  = 10 # HORN_OF_PLENTY / BAG_OF_TRICKS (mkobj.c:944-947)
-_TOOL_BR_FIGURINE         = 11 # FIGURINE                       (mkobj.c:948-954)
-_TOOL_BR_INSTRUMENT       = 12 # MAGIC_FLUTE/HARP/FROST_HORN/FIRE_HORN/DRUM_OF_EARTHQUAKE (mkobj.c:958-964)
+_TOOL_BR_CHEST            = 4  # CHEST                          (mkobj.c:920-924; n=7 locked worst-case)
+_TOOL_BR_LBOX             = 5  # LARGE_BOX                      (mkobj.c:920-924; n=5 locked worst-case)
+_TOOL_BR_ICEBOX           = 6  # ICE_BOX                        (mkobj.c:925,929)
+_TOOL_BR_SACK             = 7  # SACK / OILSKIN_SACK / BAG_OF_HOLDING (mkobj.c:926-929)
+_TOOL_BR_CAMERA_TINNING_MARKER = 8  # EXPENSIVE_CAMERA / TINNING_KIT / MAGIC_MARKER (mkobj.c:931-935)
+_TOOL_BR_GREASE           = 9  # CAN_OF_GREASE                  (mkobj.c:936-939)
+_TOOL_BR_CRYSTAL_BALL     = 10 # CRYSTAL_BALL                   (mkobj.c:940-943)
+_TOOL_BR_HORN_BAG_TRICKS  = 11 # HORN_OF_PLENTY / BAG_OF_TRICKS (mkobj.c:944-947)
+_TOOL_BR_FIGURINE         = 12 # FIGURINE                       (mkobj.c:948-954)
+_TOOL_BR_INSTRUMENT       = 13 # MAGIC_FLUTE/HARP/FROST_HORN/FIRE_HORN/DRUM_OF_EARTHQUAKE (mkobj.c:958-964)
 
 
 def _build_tool_otyp_branch_table() -> jnp.ndarray:
@@ -595,12 +596,12 @@ def _build_tool_otyp_branch_table() -> jnp.ndarray:
     table[201] = _TOOL_BR_LAMP            # brass lantern
     table[202] = _TOOL_BR_LAMP            # oil lamp
     table[203] = _TOOL_BR_MAGIC_LAMP      # magic lamp
-    table[189] = _TOOL_BR_CHEST_LBOX      # large box
-    table[190] = _TOOL_BR_CHEST_LBOX      # chest
-    table[191] = _TOOL_BR_ICEBOX          # ice box
-    table[192] = _TOOL_BR_SACK            # sack
-    table[193] = _TOOL_BR_SACK            # oilskin sack
-    table[194] = _TOOL_BR_SACK            # bag of holding
+    table[189] = _TOOL_BR_LBOX            # large box  (mkobj.c:319: n=locked?5:3)
+    table[190] = _TOOL_BR_CHEST           # chest      (mkobj.c:316: n=locked?7:5)
+    table[191] = _TOOL_BR_ICEBOX         # ice box
+    table[192] = _TOOL_BR_SACK           # sack
+    table[193] = _TOOL_BR_SACK           # oilskin sack
+    table[194] = _TOOL_BR_SACK           # bag of holding
     table[195] = _TOOL_BR_HORN_BAG_TRICKS # bag of tricks
     table[204] = _TOOL_BR_CAMERA_TINNING_MARKER  # expensive camera
     table[213] = _TOOL_BR_CAMERA_TINNING_MARKER  # tinning kit
@@ -745,8 +746,8 @@ _MKBOX_NMAX_TABLE = jnp.array(
     # runs exactly ``n`` times per vendor mkobj.c:309.
     [0] * 256, dtype=jnp.int32,
 ).at[189].set(5).at[190].set(7).at[191].set(20).at[192].set(1).at[193].set(1).at[194].set(1)
-# 189 large box (n=5 unlocked, set to 5 — locked path goes via _tool_chest_lbox_draws)
-# 190 chest     (n=7 worst-case locked)
+# 189 large box (vendor mkobj.c:319: n=locked?5:3; worst-case cap=5)
+# 190 chest     (vendor mkobj.c:316: n=locked?7:5; worst-case cap=7)
 # 191 ice box   (n=20)
 # 192 sack
 # 193 oilskin sack
@@ -831,23 +832,34 @@ def _mkbox_cnts_draws(rng: Isaac64State, box_otyp: jnp.ndarray) -> Isaac64State:
     return rng
 
 
-def _tool_chest_lbox_draws(rng: Isaac64State) -> Isaac64State:
-    """CHEST / LARGE_BOX — vendor mkobj.c:920-929.
+def _tool_chest_draws(rng: Isaac64State) -> Isaac64State:
+    """CHEST — vendor mkobj.c:315-316,920-924,929.
 
     rn2(5)                   # olocked  (mkobj.c:922) — 1 draw
     rn2(10)                  # otrapped (mkobj.c:923) — 1 draw
-    mkbox_cnts(otmp)         # mkobj.c:929  — recursive cascade
+    mkbox_cnts(otmp)         # mkobj.c:929 — n=locked?7:5; worst-case cap=7
 
-    For loop-bound purposes we treat the box as the locked CHEST (n_max=7).
-    The actual item count is ``rn2(n+1)``; the ``while_loop(i<n)`` body in
-    _mkbox_cnts_draws (mkobj.c:309) runs exactly that many times so no extra
-    RNG is consumed.  LARGE_BOX would have n_max=5 but the larger bound only
-    matters if rn2(8) picks values 6 or 7, which is acceptable here because
-    we lack box-otyp dispatch at the cascade-RNG layer.
+    vendor mkobj.c:316: ``n = box->olocked ? 7 : 5``
     """
     rng, _ = rn2_jax(rng, 5)                                    # mkobj.c:922
     rng, _ = rn2_jax(rng, 10)                                   # mkobj.c:923
-    return _mkbox_cnts_draws(rng, jnp.int32(190))               # mkobj.c:929
+    return _mkbox_cnts_draws(rng, jnp.int32(190))               # mkobj.c:929 CHEST n_max=7
+
+
+def _tool_lbox_draws(rng: Isaac64State) -> Isaac64State:
+    """LARGE_BOX — vendor mkobj.c:318-319,920-924,929.
+
+    rn2(5)                   # olocked  (mkobj.c:922) — 1 draw
+    rn2(10)                  # otrapped (mkobj.c:923) — 1 draw
+    mkbox_cnts(otmp)         # mkobj.c:929 — n=locked?5:3; worst-case cap=5
+
+    vendor mkobj.c:319: ``n = box->olocked ? 5 : 3``
+    Fixes cap-N: previously LARGE_BOX incorrectly used CHEST's n_max=7;
+    now uses its own n_max=5 (locked worst-case per vendor mkobj.c:319).
+    """
+    rng, _ = rn2_jax(rng, 5)                                    # mkobj.c:922
+    rng, _ = rn2_jax(rng, 10)                                   # mkobj.c:923
+    return _mkbox_cnts_draws(rng, jnp.int32(189))               # mkobj.c:929 LARGE_BOX n_max=5
 
 
 def _tool_icebox_draws(rng: Isaac64State) -> Isaac64State:
@@ -872,15 +884,16 @@ _TOOL_OTYP_BRANCHES = [
     _tool_candle_draws,                   # 1  _TOOL_BR_CANDLE
     _tool_lamp_draws,                     # 2  _TOOL_BR_LAMP
     _tool_magic_lamp_draws,               # 3  _TOOL_BR_MAGIC_LAMP
-    _tool_chest_lbox_draws,               # 4  _TOOL_BR_CHEST_LBOX
-    _tool_icebox_draws,                   # 5  _TOOL_BR_ICEBOX
-    _tool_sack_draws,                     # 6  _TOOL_BR_SACK
-    _tool_camera_tinning_marker_draws,    # 7  _TOOL_BR_CAMERA_TINNING_MARKER
-    _tool_grease_draws,                   # 8  _TOOL_BR_GREASE
-    _tool_crystal_ball_draws,             # 9  _TOOL_BR_CRYSTAL_BALL
-    _tool_horn_bag_tricks_draws,          # 10 _TOOL_BR_HORN_BAG_TRICKS
-    _tool_figurine_draws,                 # 11 _TOOL_BR_FIGURINE
-    _tool_instrument_draws,               # 12 _TOOL_BR_INSTRUMENT
+    _tool_chest_draws,                    # 4  _TOOL_BR_CHEST   (mkobj.c:316 n=locked?7:5)
+    _tool_lbox_draws,                     # 5  _TOOL_BR_LBOX    (mkobj.c:319 n=locked?5:3)
+    _tool_icebox_draws,                   # 6  _TOOL_BR_ICEBOX
+    _tool_sack_draws,                     # 7  _TOOL_BR_SACK
+    _tool_camera_tinning_marker_draws,    # 8  _TOOL_BR_CAMERA_TINNING_MARKER
+    _tool_grease_draws,                   # 9  _TOOL_BR_GREASE
+    _tool_crystal_ball_draws,             # 10 _TOOL_BR_CRYSTAL_BALL
+    _tool_horn_bag_tricks_draws,          # 11 _TOOL_BR_HORN_BAG_TRICKS
+    _tool_figurine_draws,                 # 12 _TOOL_BR_FIGURINE
+    _tool_instrument_draws,               # 13 _TOOL_BR_INSTRUMENT
 ]
 
 
