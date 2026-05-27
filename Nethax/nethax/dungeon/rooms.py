@@ -673,12 +673,17 @@ def makerooms(
          level_grid,
          nroom, tried_vault, alive) = carry
 
-        # --- Step A: rnd_rect() — vendor mklev.c:229 ``while (... && rnd_rect())``
-        # Vendor draws rn2(rect_cnt) iff rect_cnt > 0; if rect_cnt == 0
-        # the while-condition exits and no draw occurs.  ``rnd_rect``
-        # already encapsulates that ``rect_cnt > 0`` short-circuit, but
-        # we also gate on ``alive`` so iterations after the loop has
-        # exited consume zero bytes (matching vendor's terminated loop).
+        # --- Step A: rnd_rect() — vendor mklev.c:229 ``while (nroom <
+        # MAXNROFROOMS && rnd_rect())``.  C ``&&`` is strictly left-to-
+        # right: ``rnd_rect()`` is invoked *only* when ``nroom <
+        # MAXNROFROOMS`` first evaluates true.  Drawing rnd_rect when
+        # nroom has already saturated the cap would burn one extra
+        # ISAAC64 byte vs vendor on the post-saturation iteration --
+        # the kind of over-consumption this audit targets.  Citation:
+        # vendor/nle/src/mklev.c:229.
+        room_slot_free = nroom < jnp.int32(MAXNROFROOMS)
+        rnd_rect_gate = alive & room_slot_free
+
         def do_rnd_rect(args):
             vrng_in, pool_in = args
             pool_out, _lx, _ly, _hx, _hy, vrng_out, has = rnd_rect(pool_in, vrng_in)
@@ -689,25 +694,30 @@ def makerooms(
             return vrng_in, pool_in, jnp.bool_(False)
 
         vrng, pool, has_rect = lax.cond(
-            alive, do_rnd_rect, skip_rnd_rect, (vrng, pool),
+            rnd_rect_gate, do_rnd_rect, skip_rnd_rect, (vrng, pool),
         )
 
-        # Vendor's while-condition combines ``nroom < MAXNROFROOMS &&
-        # rnd_rect()``.  After the rnd_rect draw above (which itself
-        # honours rect_cnt > 0) we kill the loop if either side failed.
-        still_alive = alive & has_rect & (nroom < jnp.int32(MAXNROFROOMS))
+        # ``rnd_rect_gate`` already folds the ``nroom < MAXNROFROOMS``
+        # side of vendor's ``&&``; ``still_alive`` just adds the
+        # rect-found result.  Citation: vendor/nle/src/mklev.c:229.
+        still_alive = rnd_rect_gate & has_rect
 
         # --- Step B: rn2(2) vault gate — vendor mklev.c:230
         #     ``nroom >= MAXNROFROOMS/6 && rn2(2) && !tried_vault``
-        # The rn2(2) sits in the middle of the ``&&`` chain; vendor's
-        # C evaluator short-circuits both LHS (nroom >= threshold) and
-        # the post-roll ``!tried_vault`` test.  We must NOT draw rn2(2)
-        # unless the LHS gate is satisfied; otherwise every dlvl-1
-        # seed shifts by one ISAAC64 byte.
+        # C ``&&`` is strictly left-to-right.  Vendor evaluates the
+        # operands in order: (1) ``nroom >= MAXNROFROOMS/6``; if true,
+        # (2) ``rn2(2)`` is *drawn unconditionally* at that point; only
+        # if the roll yields non-zero does it then evaluate (3)
+        # ``!tried_vault``.  The ``tried_vault`` flag therefore does NOT
+        # short-circuit the rn2(2) draw -- vendor still burns the byte
+        # on every iteration after the vault has been tried, provided
+        # ``nroom >= threshold`` and the rect-pool still yields a rect.
+        # Previously we gated on ``~tried_vault`` and under-drew by one
+        # rn2(2) byte per post-vault iteration vs vendor.  Citation:
+        # vendor/nle/src/mklev.c:230.
         vault_gate_lhs = (
             still_alive
             & (nroom >= jnp.int32(_MAKEROOMS_VAULT_THRESHOLD))
-            & (~tried_vault)
         )
 
         def do_vault_roll(args):
@@ -723,12 +733,22 @@ def makerooms(
             vault_gate_lhs, do_vault_roll, skip_vault_roll, vrng,
         )
 
-        take_vault = vault_gate_lhs & (vault_roll != jnp.int32(0))
+        # Vendor's full ``&&`` chain only enters the if-branch (and thus
+        # only sets ``tried_vault = TRUE`` and runs ``create_vault()``)
+        # when all three operands are true: the LHS gate, ``rn2(2)!=0``,
+        # AND ``!tried_vault``.  The rn2(2) draw above honours C left-
+        # to-right evaluation; the post-roll ``!tried_vault`` short-
+        # circuit is applied here.  Citation: vendor/nle/src/mklev.c:
+        # 230-231.
+        take_vault = (
+            vault_gate_lhs & (vault_roll != jnp.int32(0)) & (~tried_vault)
+        )
 
-        # Vendor's ``tried_vault = TRUE;`` (mklev.c:231) fires inside the
-        # if-branch before checking the ``create_vault()`` return value,
-        # so a *taken* coin (rn2(2) returned non-zero) burns the one-shot
-        # flag regardless of whether the vault placement succeeded.
+        # Vendor's ``tried_vault = TRUE;`` (mklev.c:231) fires inside
+        # the if-branch before checking the ``create_vault()`` return
+        # value, so a *taken* coin (full ``&&`` chain held) burns the
+        # one-shot flag regardless of whether the vault placement
+        # succeeded.
         new_tried_vault = tried_vault | take_vault
 
         # --- Step C/D: create_room(...) — vendor mklev.c:232 / mklev.c:237
