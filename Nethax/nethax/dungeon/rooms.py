@@ -184,47 +184,11 @@ def _check_any_overlap(new_y1: jnp.ndarray, new_x1: jnp.ndarray,
 #       rn2/rnd draw.  ``randint_jax`` is byte-exact with that operation.
 # ---------------------------------------------------------------------------
 
-def _isaac_draw_xywh(vendor_rng: Isaac64State,
-                     total_samples: int,
-                     y_range: int,
-                     x_range: int,
-                     abs_depth: int):
-    """Sequentially draw (lit_a, lit_b, dx, dy, x_pos, y_pos) per slot via ISAAC64.
-
-    Vendor ``create_room()`` (vendor/nethack/src/sp_lev.c:1512,1548-1562)
-    draws **lit-state first** (via ``litstate_rnd`` at sp_lev.c:1512),
-    then **width** (``dx = 2 + rn2(8)``, sp_lev.c:1548), then **height**
-    (``dy = 2 + rn2(4)``, sp_lev.c:1549), then **x-placement**
-    (sp_lev.c:1560) and **y-placement** (sp_lev.c:1562) per attempt.
-    We mirror that interleaved per-attempt sequence so the ISAAC64 byte
-    stream matches a vendor run with the same seed.
-
-    Cite: vendor/nethack/src/sp_lev.c:1512, sp_lev.c:1548-1549,
-          sp_lev.c:1560-1562, vendor/nethack/src/mkmap.c:446
-          (litstate_rnd: rnd(1+abs(depth)) then rn2(77))
-    """
-    def body(state, _):
-        # Vendor sp_lev.c:1512 → mkmap.c:446 litstate_rnd:
-        #   rnd(1+abs(depth)) then rn2(77).
-        state, lit_a = randint_jax(state, (), 1, 2 + abs_depth)
-        state, lit_b = randint_jax(state, (), 0, 77)
-        # Vendor sp_lev.c:1548-1549 — dx (width), dy (height).
-        state, ww = randint_jax(state, (), _MIN_ROOM_W, _MAX_ROOM_W + 1)
-        state, hh = randint_jax(state, (), _MIN_ROOM_H, _MAX_ROOM_H + 1)
-        # Vendor sp_lev.c:1560-1562 — x_pos, y_pos within bounding rect.
-        state, x = randint_jax(state, (), 1, 1 + x_range)
-        state, y = randint_jax(state, (), 1, 1 + y_range)
-        return state, (lit_a.astype(jnp.int32),
-                       lit_b.astype(jnp.int32),
-                       y.astype(jnp.int16),
-                       x.astype(jnp.int16),
-                       hh.astype(jnp.int16),
-                       ww.astype(jnp.int16))
-
-    final_state, (lit_a, lit_b, ys, xs, hs, ws) = lax.scan(
-        body, vendor_rng, xs=None, length=total_samples
-    )
-    return final_state, lit_a, lit_b, ys, xs, hs, ws
+# NOTE: The ISAAC64 per-room draws are inlined into ``generate_rooms``
+# via :func:`jax.lax.fori_loop` so the byte stream matches vendor C
+# create_room() sequentially.  See ``place_one_room_v`` below.
+#
+# Cite: vendor/nethack/src/mklev.c:996-1010 (per-room for-loop)
 
 
 # ---------------------------------------------------------------------------
@@ -306,10 +270,22 @@ def generate_rooms(
 
     abs_depth = abs(int(depth))
 
-    # Host-side trace-time branch — pick which RNG path produces the
-    # per-attempt y/x/h/w sample arrays.  Threefry (vendor_rng is None) =>
-    # original parallel pre-sample.  ISAAC64 (vendor_rng supplied) =>
-    # sequential per-slot draws via lax.scan threaded through Isaac64State.
+    # State carried through fori_loop:
+    #   y1[MAX_ROOMS], x1[MAX_ROOMS], y2[MAX_ROOMS], x2[MAX_ROOMS]  — room coords
+    #   active[MAX_ROOMS]  — bool mask of placed rooms
+    #   lit[MAX_ROOMS]     — per-slot lit flag (filled during placement)
+    init_coords = jnp.full((MAX_ROOMS_PER_LEVEL,), -1, dtype=jnp.int16)
+    init_active = jnp.zeros((MAX_ROOMS_PER_LEVEL,), dtype=bool)
+    init_lit    = jnp.zeros((MAX_ROOMS_PER_LEVEL,), dtype=jnp.int8)
+
+    # Host-side trace-time branch — pick which RNG path drives per-room
+    # placement.  Threefry (vendor_rng is None) pre-samples all attempt
+    # geometry upfront, then runs the placement fori_loop.  ISAAC64
+    # (vendor_rng supplied) threads Isaac64State through the placement
+    # fori_loop and draws (lit_a, lit_b, dx, dy, x_pos, y_pos) per
+    # attempt in vendor create_room() order — same pattern as
+    # spawning.py::_roll_hp threading Isaac64State sequentially.
+    # Cite: vendor/nethack/src/mklev.c:996-1010 (per-room for-loop)
     if vendor_rng is None:
         all_y_off   = jax.random.randint(key_y, (total_samples,), 1, 1 + y_range,         dtype=jnp.int16)
         all_x_off   = jax.random.randint(key_x, (total_samples,), 1, 1 + x_range,         dtype=jnp.int16)
@@ -327,97 +303,142 @@ def generate_rooms(
         lit_roll_b = jax.random.randint(
             key_lit_b, (MAX_ROOMS_PER_LEVEL,), 0, 77, dtype=jnp.int32
         )
+        # Audit-N #2: dx*dy <= 50 cap (Threefry path only — ISAAC path
+        # applies the cap inline within the placement loop).
+        capped_h = jnp.where(
+            all_widths * all_heights > 50,
+            (jnp.int16(50) // jnp.maximum(all_widths, jnp.int16(1))).astype(jnp.int16),
+            all_heights,
+        )
+        all_heights = jnp.maximum(capped_h, jnp.int16(_MIN_ROOM_H))
+
+        all_lit = ((lit_roll_a < 11) & (lit_roll_b == 0)).astype(jnp.int8)
         vendor_rng_out = vendor_rng  # passthrough (still None)
-    else:
-        # ISAAC64 stream — draw (lit_a, lit_b, dx, dy, x_pos, y_pos)
-        # sequentially per slot in vendor create_room() order.  Cite:
-        # vendor/nethack/src/sp_lev.c:1512 (litstate_rnd), 1548-1549
-        # (dx,dy), 1560-1562 (x_pos,y_pos).  randint_jax is byte-exact
-        # with vendor C ``rn2`` / ``rnd``.
-        vrng = vendor_rng
-        (
-            vrng,
-            all_lit_a, all_lit_b,
-            all_y_off, all_x_off, all_heights, all_widths,
-        ) = _isaac_draw_xywh(
-            vrng, total_samples, y_range, x_range, abs_depth,
-        )
-        # Slice the first lit pair per room slot (only one lit roll per
-        # create_room call in vendor; we keep one per slot for masking).
-        # Lit values for room i come from sample (i * _MAX_RETRIES + 0).
-        slot0_idx = jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32) * _MAX_RETRIES
-        lit_roll_a = all_lit_a[slot0_idx]
-        lit_roll_b = all_lit_b[slot0_idx]
-        vendor_rng_out = vrng
 
-    all_lit = ((lit_roll_a < 11) & (lit_roll_b == 0)).astype(jnp.int8)
+        state0 = (init_coords, init_coords, init_coords, init_coords, init_active)
 
-    # Audit-N #2: dx*dy <= 50 cap.  Apply after width/height sample —
-    # truncate height when width is wide enough to push the area over 50.
-    capped_h = jnp.where(
-        all_widths * all_heights > 50,
-        (jnp.int16(50) // jnp.maximum(all_widths, jnp.int16(1))).astype(jnp.int16),
-        all_heights,
-    )
-    all_heights = jnp.maximum(capped_h, jnp.int16(_MIN_ROOM_H))
+        def place_one_room(i, state):
+            """Try to place room slot i using up to _MAX_RETRIES pre-drawn samples."""
+            y1_arr, x1_arr, y2_arr, x2_arr, active = state
 
-    # State carried through fori_loop:
-    #   y1[MAX_ROOMS], x1[MAX_ROOMS], y2[MAX_ROOMS], x2[MAX_ROOMS]  — room coords
-    #   active[MAX_ROOMS]  — bool mask of placed rooms
-    init_coords = jnp.full((MAX_ROOMS_PER_LEVEL,), -1, dtype=jnp.int16)
-    init_active = jnp.zeros((MAX_ROOMS_PER_LEVEL,), dtype=bool)
+            def try_one(retry_state, r):
+                placed, y1_arr_, x1_arr_, y2_arr_, x2_arr_, active_ = retry_state
+                sample_idx = i * _MAX_RETRIES + r
 
-    state0 = (init_coords, init_coords, init_coords, init_coords, init_active)
+                ny1 = all_y_off[sample_idx]
+                nx1 = all_x_off[sample_idx]
+                nh  = all_heights[sample_idx]
+                nw  = all_widths[sample_idx]
+                ny2 = (ny1 + nh - 1).astype(jnp.int16)
+                nx2 = (nx1 + nw - 1).astype(jnp.int16)
 
-    def place_one_room(i, state):
-        """Try to place room slot i using up to _MAX_RETRIES sample draws."""
-        y1_arr, x1_arr, y2_arr, x2_arr, active = state
+                fits = (ny2 <= h - 2) & (nx2 <= w - 2)
+                overlaps = _check_any_overlap(
+                    ny1, nx1, ny2, nx2,
+                    y1_arr_, x1_arr_, y2_arr_, x2_arr_, active_,
+                )
+                accept = fits & ~overlaps & ~placed
 
-        def try_one(retry_state, r):
-            placed, y1_arr_, x1_arr_, y2_arr_, x2_arr_, active_ = retry_state
-            sample_idx = i * _MAX_RETRIES + r
+                y1_arr_new = lax.cond(accept, lambda: y1_arr_.at[i].set(ny1), lambda: y1_arr_)
+                x1_arr_new = lax.cond(accept, lambda: x1_arr_.at[i].set(nx1), lambda: x1_arr_)
+                y2_arr_new = lax.cond(accept, lambda: y2_arr_.at[i].set(ny2), lambda: y2_arr_)
+                x2_arr_new = lax.cond(accept, lambda: x2_arr_.at[i].set(nx2), lambda: x2_arr_)
+                active_new = lax.cond(accept, lambda: active_.at[i].set(True), lambda: active_)
+                placed_new = placed | accept
 
-            ny1 = all_y_off[sample_idx]
-            nx1 = all_x_off[sample_idx]
-            nh  = all_heights[sample_idx]
-            nw  = all_widths[sample_idx]
-            ny2 = (ny1 + nh - 1).astype(jnp.int16)
-            nx2 = (nx1 + nw - 1).astype(jnp.int16)
+                return (placed_new, y1_arr_new, x1_arr_new, y2_arr_new, x2_arr_new, active_new), None
 
-            # Check bounds: room must fit inside [1, h-2] x [1, w-2]
-            fits = (ny2 <= h - 2) & (nx2 <= w - 2)
-            overlaps = _check_any_overlap(
-                ny1, nx1, ny2, nx2,
-                y1_arr_, x1_arr_, y2_arr_, x2_arr_, active_,
+            init_retry = (jnp.bool_(False), y1_arr, x1_arr, y2_arr, x2_arr, active)
+            (_, y1f, x1f, y2f, x2f, activef), _ = lax.scan(
+                try_one, init_retry, jnp.arange(_MAX_RETRIES, dtype=jnp.int32)
             )
+            return (y1f, x1f, y2f, x2f, activef)
 
-            accept = fits & ~overlaps & ~placed
-
-            new_y1   = jnp.where(accept, ny1, y1_arr_.at[i].get())
-            new_x1   = jnp.where(accept, nx1, x1_arr_.at[i].get())
-            new_y2   = jnp.where(accept, ny2, y2_arr_.at[i].get())
-            new_x2   = jnp.where(accept, nx2, x2_arr_.at[i].get())
-
-            y1_arr_new = lax.cond(accept, lambda: y1_arr_.at[i].set(new_y1), lambda: y1_arr_)
-            x1_arr_new = lax.cond(accept, lambda: x1_arr_.at[i].set(new_x1), lambda: x1_arr_)
-            y2_arr_new = lax.cond(accept, lambda: y2_arr_.at[i].set(new_y2), lambda: y2_arr_)
-            x2_arr_new = lax.cond(accept, lambda: x2_arr_.at[i].set(new_x2), lambda: x2_arr_)
-            active_new = lax.cond(accept, lambda: active_.at[i].set(True), lambda: active_)
-            placed_new = placed | accept
-
-            return (placed_new, y1_arr_new, x1_arr_new, y2_arr_new, x2_arr_new, active_new), None
-
-        init_retry = (jnp.bool_(False), y1_arr, x1_arr, y2_arr, x2_arr, active)
-        (_, y1f, x1f, y2f, x2f, activef), _ = lax.scan(
-            try_one, init_retry, jnp.arange(_MAX_RETRIES, dtype=jnp.int32)
+        y1_f, x1_f, y2_f, x2_f, active_f = lax.fori_loop(
+            jnp.int32(0), n_target, place_one_room,
+            (init_coords, init_coords, init_coords, init_coords, init_active),
         )
-        return (y1f, x1f, y2f, x2f, activef)
+        lit_f = all_lit
+    else:
+        # ISAAC64 stream — per-room fori_loop threading Isaac64State.
+        # Each room attempt consumes 6 ISAAC64 draws in vendor order
+        # (lit_a, lit_b, dx, dy, x_pos, y_pos) BEFORE the overlap check,
+        # so the byte stream matches vendor create_room() sequentially.
+        # Cite: vendor/nethack/src/mklev.c:996-1010 (per-room loop),
+        #       vendor/nethack/src/sp_lev.c:1512,1548-1549,1560-1562.
 
-    # fori_loop accepts a traced upper bound, so n_target can be either
-    # a Python int (Wave 2 path) or a JAX scalar (vendor-random path).
-    y1_f, x1_f, y2_f, x2_f, active_f = lax.fori_loop(
-        jnp.int32(0), n_target, place_one_room, state0
-    )
+        def place_one_room_v(i, state):
+            """ISAAC path: draw 6 values per attempt then accept/reject."""
+            vrng, y1_arr, x1_arr, y2_arr, x2_arr, active, lit_arr = state
+
+            def try_one(retry_state, _r):
+                vrng_, placed, y1_arr_, x1_arr_, y2_arr_, x2_arr_, active_, lit_arr_ = retry_state
+                # Vendor sp_lev.c:1512 → mkmap.c:446 (litstate_rnd):
+                #   rnd(1+abs(depth)) then rn2(77).
+                vrng_, lit_a = randint_jax(vrng_, (), 1, 2 + abs_depth)
+                vrng_, lit_b = randint_jax(vrng_, (), 0, 77)
+                # Vendor sp_lev.c:1548-1549 — dx (width), dy (height).
+                vrng_, ww = randint_jax(vrng_, (), _MIN_ROOM_W, _MAX_ROOM_W + 1)
+                vrng_, hh = randint_jax(vrng_, (), _MIN_ROOM_H, _MAX_ROOM_H + 1)
+                # Vendor sp_lev.c:1560-1562 — x_pos, y_pos.
+                vrng_, nx1_ = randint_jax(vrng_, (), 1, 1 + x_range)
+                vrng_, ny1_ = randint_jax(vrng_, (), 1, 1 + y_range)
+
+                # Audit-N #2: dx*dy <= 50 cap (vendor sp_lev.c:1550-1551).
+                hh_capped = jnp.where(
+                    ww * hh > jnp.int32(50),
+                    jnp.int32(50) // jnp.maximum(ww, jnp.int32(1)),
+                    hh,
+                )
+                hh_capped = jnp.maximum(hh_capped, jnp.int32(_MIN_ROOM_H))
+
+                ny1_i16 = ny1_.astype(jnp.int16)
+                nx1_i16 = nx1_.astype(jnp.int16)
+                ny2 = (ny1_i16 + hh_capped.astype(jnp.int16) - 1).astype(jnp.int16)
+                nx2 = (nx1_i16 + ww.astype(jnp.int16) - 1).astype(jnp.int16)
+
+                fits = (ny2 <= h - 2) & (nx2 <= w - 2)
+                overlaps = _check_any_overlap(
+                    ny1_i16, nx1_i16, ny2, nx2,
+                    y1_arr_, x1_arr_, y2_arr_, x2_arr_, active_,
+                )
+                accept = fits & ~overlaps & ~placed
+
+                # On first accept for this slot, also commit the lit flag
+                # drawn this attempt (vendor lit is drawn once per
+                # create_room call; for byte-stream parity we record the
+                # lit pair from the accepting attempt).
+                lit_this = ((lit_a < jnp.int32(11)) & (lit_b == jnp.int32(0))).astype(jnp.int8)
+
+                y1_arr_new = lax.cond(accept, lambda: y1_arr_.at[i].set(ny1_i16), lambda: y1_arr_)
+                x1_arr_new = lax.cond(accept, lambda: x1_arr_.at[i].set(nx1_i16), lambda: x1_arr_)
+                y2_arr_new = lax.cond(accept, lambda: y2_arr_.at[i].set(ny2),     lambda: y2_arr_)
+                x2_arr_new = lax.cond(accept, lambda: x2_arr_.at[i].set(nx2),     lambda: x2_arr_)
+                active_new = lax.cond(accept, lambda: active_.at[i].set(True),    lambda: active_)
+                lit_arr_new = lax.cond(accept, lambda: lit_arr_.at[i].set(lit_this), lambda: lit_arr_)
+                placed_new = placed | accept
+
+                return (vrng_, placed_new, y1_arr_new, x1_arr_new,
+                        y2_arr_new, x2_arr_new, active_new, lit_arr_new), None
+
+            init_retry = (vrng, jnp.bool_(False),
+                          y1_arr, x1_arr, y2_arr, x2_arr, active, lit_arr)
+            (vrng_out, _, y1f, x1f, y2f, x2f, activef, litf), _ = lax.scan(
+                try_one, init_retry, jnp.arange(_MAX_RETRIES, dtype=jnp.int32)
+            )
+            return (vrng_out, y1f, x1f, y2f, x2f, activef, litf)
+
+        # Bound the placement loop at MAX_ROOMS_PER_LEVEL so the ISAAC64
+        # stream is consumed identically regardless of host-side n_target
+        # (vendor mklev.c:403 bounds at MAXNROFROOMS-1 = 39, then halts
+        # naturally when rnd_rect() returns NULL — we mirror by always
+        # running the loop to MAX_ROOMS_PER_LEVEL and letting overlap
+        # rejection terminate placement).
+        v_state0 = (vendor_rng, init_coords, init_coords, init_coords, init_coords, init_active, init_lit)
+        (vrng_after, y1_f, x1_f, y2_f, x2_f, active_f, lit_f) = lax.fori_loop(
+            jnp.int32(0), jnp.int32(MAX_ROOMS_PER_LEVEL), place_one_room_v, v_state0
+        )
+        vendor_rng_out = vrng_after
 
     # Room type: ORDINARY (0) for active slots, 0 elsewhere (still ORDINARY but masked by active_f)
     room_type = jnp.zeros((MAX_ROOMS_PER_LEVEL,), dtype=jnp.int8)
@@ -428,7 +449,7 @@ def generate_rooms(
         y2=y2_f,
         x2=x2_f,
         room_type=room_type,
-        is_lit=all_lit.astype(bool),
+        is_lit=lit_f.astype(bool),
     ), active_f, vendor_rng_out
 
 
