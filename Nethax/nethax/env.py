@@ -360,18 +360,33 @@ class NethaxEnv:
         if use_vendor_rng() and vendor_rng_after_gen is not None:
             state = state.replace(vendor_rng=vendor_rng_after_gen)
 
-        # Populate level 1 with monsters after dungeon gen.  Under
-        # NLE_BYTEPARITY, thread the Isaac64State so per-monster HP rolls
-        # (newmonhp d(mlvl,8)) consume from the ISAAC64 stream and the
-        # updated state is written back into ``state.vendor_rng``.
+        # Populate level 1 with monsters after dungeon gen.  Vendor's
+        # sleeping-monster spawn is a per-OROOM loop, NOT a level-wide
+        # count loop — exactly one potential spawn per ordinary room,
+        # gated by ``!rn2(3)`` (vendor/nle/src/mklev.c:813-817).  The
+        # prior ``rnd((nroom>>1)+1)`` site cited here drove
+        # ``make_niches`` (mklev.c:551), not monsters.
+        #
+        # Pass the ``_rooms`` pytree + ``_active`` mask returned from
+        # generate_main_branch_l1_with_features so populate iterates
+        # active OROOM slots host-side and applies the vendor
+        # rn2(3)+somex/somey+makemon cascade per room.
+        #
+        # Under NLE_BYTEPARITY, thread the Isaac64State through the
+        # per-room rn2(3) gate, somex/somey draws, and the per-monster
+        # HP + makemon-post-HP cascade so the ISAAC64 byte stream
+        # matches vendor C; the updated state is written back into
+        # ``state.vendor_rng``.
         if use_vendor_rng():
             state = populate_level_with_monsters(
-                state, rng_monsters, n_monsters=n_monsters_vendor,
+                state, rng_monsters,
+                rooms=_rooms, active=_active,
                 vendor_rng=state.vendor_rng,
             )
         else:
             state = populate_level_with_monsters(
-                state, rng_monsters, n_monsters=n_monsters_vendor,
+                state, rng_monsters,
+                rooms=_rooms, active=_active,
             )
 
         # Vendor mklev() ends by reseeding BOTH streams a second time

@@ -1924,52 +1924,268 @@ def spawn_initial_monsters(
 # Populate level in EnvState
 # ---------------------------------------------------------------------------
 
+
+def _populate_per_oroom(state, rng: jax.Array, rooms, active, vendor_rng=None):
+    """Per-OROOM sleeping-monster spawn matching vendor mklev.c:813-817.
+
+    Iterates every active OROOM/THEMEROOM in ``rooms`` (host-side Python
+    loop — caller is env.reset, not JIT).  For each room:
+
+      1. Draw ``rn2(3)``.  When the gate passes (~33% per room), continue.
+      2. Draw ``somex(croom)`` then ``somey(croom)`` for the spawn cell.
+         Vendor mkroom.c::somex draws ``rn2(hx-lx+1)+lx``; somey is the
+         row equivalent.  Order: x first, then y (matches vendor C).
+      3. Pick a monster species via :func:`pick_monster_for_level` for
+         depth=1, roll HP via :func:`_roll_hp` (newmonhp), then consume
+         the makemon post-HP cascade via
+         :func:`_consume_makemon_post_hp_draws` (female/peace/sleep/
+         long-worm/group/initweap/initinv/saddle).
+      4. Write the spawn into the next free monster_ai slot, marking it
+         asleep (MM_ASLEEP, vendor mklev.c:817 flag).
+
+    Vendor cite: vendor/nle/src/mklev.c:813-817; makemon spawn cascade
+    at vendor/nle/src/makemon.c:1147-1400.
+    """
+    from Nethax.nethax.dungeon.rooms import RoomType  # avoid circular
+
+    terrain = state.terrain[0, 0]
+    map_h, map_w = terrain.shape
+
+    # Vendor only spawns into OROOM (RoomType.ORDINARY).  THEMEROOM (=1)
+    # also takes the per-room fill in vendor mklev.c:813 — the gate at
+    # line 805 checks ``croom->rtype != OROOM`` which excludes themed
+    # rooms in stock code; we conservatively mirror OROOM-only here.
+    OROOM_VAL = int(RoomType.ORDINARY)
+
+    # Pull room arrays to host (these are small int arrays of length
+    # MAX_ROOMS_PER_LEVEL=40 — no GPU sync hit in practice).
+    active_np = jax.device_get(active)
+    rtype_np  = jax.device_get(rooms.room_type)
+    y1_np     = jax.device_get(rooms.y1)
+    x1_np     = jax.device_get(rooms.x1)
+    y2_np     = jax.device_get(rooms.y2)
+    x2_np     = jax.device_get(rooms.x2)
+
+    player_align_py = int(state.player_align)
+    player_align_record_py = 0
+
+    # Slot allocator: monster_ai slots [0, MAX_MONSTERS_PER_LEVEL).
+    # Vendor uses fresh struct allocation; here we walk forward and
+    # take the next available slot for each successful spawn.
+    next_slot = 0
+
+    # Player alignment bucket for peace_minded lookup (vendor
+    # makemon.c::peace_minded line 2003-2042).
+    player_align_bucket_val = int(jnp.clip(
+        state.player_align.astype(jnp.int32) + jnp.int32(1),
+        0, _PEACE_MINDED_TABLE.shape[1] - 1,
+    ))
+
+    state_out = state
+
+    for i in range(len(active_np)):
+        if next_slot >= MAX_MONSTERS_PER_LEVEL:
+            break
+        if not bool(active_np[i]):
+            continue
+        rt = int(rtype_np[i])
+        if rt != OROOM_VAL:
+            continue
+
+        # Step 1: rn2(3) gate — vendor mklev.c:813.
+        if vendor_rng is not None:
+            vendor_rng, gate_arr = randint_jax(vendor_rng, (), 0, 3)
+            gate_pass = int(gate_arr) == 0
+        else:
+            rng, k_gate = jax.random.split(rng, 2)
+            gate_pass = int(jax.random.randint(k_gate, (), 0, 3)) == 0
+
+        if not gate_pass:
+            continue
+
+        # Step 2: somex/somey — vendor mklev.c:814-815.
+        # somex: rn2(hx - lx + 1) + lx; somey: rn2(hy - ly + 1) + ly.
+        lx = int(x1_np[i])
+        hx = int(x2_np[i])
+        ly = int(y1_np[i])
+        hy = int(y2_np[i])
+        x_lo, x_hi = lx, hx + 1
+        y_lo, y_hi = ly, hy + 1
+        if x_hi <= x_lo or y_hi <= y_lo:
+            continue
+
+        if vendor_rng is not None:
+            vendor_rng, sx_arr = randint_jax(vendor_rng, (), x_lo, x_hi)
+            vendor_rng, sy_arr = randint_jax(vendor_rng, (), y_lo, y_hi)
+            sx = int(sx_arr)
+            sy = int(sy_arr)
+        else:
+            rng, k_x, k_y = jax.random.split(rng, 3)
+            sx = int(jax.random.randint(k_x, (), x_lo, x_hi))
+            sy = int(jax.random.randint(k_y, (), y_lo, y_hi))
+        sx = max(0, min(sx, map_w - 1))
+        sy = max(0, min(sy, map_h - 1))
+
+        # Step 3: spawn pipeline — pick_monster + _roll_hp + cascade.
+        # Reuse spawn_initial_monsters' single-slot path with n_monsters=1
+        # by passing a single-cell valid mask centered on the somexy cell.
+        # This routes through the existing vendor-faithful HP roll +
+        # post-HP cascade (consume_makemon_post_hp_draws), so the
+        # ISAAC64 byte stream advances identically to vendor makemon().
+        valid_tiles_mask = jnp.zeros((map_h, map_w), dtype=jnp.bool_).at[sy, sx].set(True)
+
+        if vendor_rng is not None:
+            rng, sub_rng = jax.random.split(rng, 2)
+            (
+                vendor_rng, positions, type_ids, hps, max_hps, _count,
+            ) = spawn_initial_monsters(
+                sub_rng, depth=1, n_monsters=1,
+                valid_tiles_mask=valid_tiles_mask,
+                map_h=map_h, map_w=map_w,
+                genocided=state_out.genocided_species,
+                vendor_rng=vendor_rng,
+                player_align=player_align_py,
+                player_align_record=player_align_record_py,
+            )
+        else:
+            rng, sub_rng = jax.random.split(rng, 2)
+            (
+                positions, type_ids, hps, max_hps, _count,
+            ) = spawn_initial_monsters(
+                sub_rng, depth=1, n_monsters=1,
+                valid_tiles_mask=valid_tiles_mask,
+                map_h=map_h, map_w=map_w,
+                genocided=state_out.genocided_species,
+            )
+
+        # Step 4: write the spawn into next_slot of monster_ai.
+        # MM_ASLEEP — vendor mklev.c:817 passes the flag to makemon.
+        slot = next_slot
+        mai = state_out.monster_ai
+        tid = type_ids[0].astype(jnp.int32)
+        pos_v = positions[0]
+        hp_v = hps[0]
+        max_hp_v = max_hps[0]
+
+        kit_id = _MONSTER_KIT_BY_ENTRY[tid].astype(jnp.int32)
+        kit_cats = _KIT_CATS[kit_id]
+        kit_tids = _KIT_TIDS[kit_id]
+        kit_qtys = _KIT_QTYS[kit_id]
+        kit_chgs = _KIT_CHGS[kit_id]
+
+        peace_bit = _PEACE_MINDED_TABLE[
+            jnp.clip(tid, 0, _PEACE_MINDED_TABLE.shape[0] - 1),
+            player_align_bucket_val,
+        ]
+
+        new_mai = mai.replace(
+            pos=mai.pos.at[slot].set(pos_v),
+            hp=mai.hp.at[slot].set(hp_v),
+            hp_max=mai.hp_max.at[slot].set(max_hp_v),
+            alive=mai.alive.at[slot].set(jnp.bool_(True)),
+            ac=mai.ac.at[slot].set(_BASE_AC[tid]),
+            is_large=mai.is_large.at[slot].set(_IS_LARGE[tid]),
+            attack_dice_n=mai.attack_dice_n.at[slot].set(_ATK_DICE_N[tid]),
+            attack_dice_sides=mai.attack_dice_sides.at[slot].set(_ATK_DICE_S[tid]),
+            mstrategy=mai.mstrategy.at[slot].set(jnp.int8(0)),
+            entry_idx=mai.entry_idx.at[slot].set(tid.astype(jnp.int16)),
+            peaceful=mai.peaceful.at[slot].set(peace_bit),
+            # Vendor mklev.c:817 — MM_ASLEEP flag.  Mirrors prior
+            # behaviour (level-gen monsters always start asleep).
+            asleep=mai.asleep.at[slot].set(jnp.bool_(True)),
+            sleep_timer=mai.sleep_timer.at[slot].set(jnp.int8(127)),
+            movement_points=mai.movement_points.at[slot].set(jnp.int16(12)),
+            inv_category=mai.inv_category.at[slot].set(kit_cats),
+            inv_type_id=mai.inv_type_id.at[slot].set(kit_tids),
+            inv_quantity=mai.inv_quantity.at[slot].set(kit_qtys),
+            inv_charges=mai.inv_charges.at[slot].set(kit_chgs),
+            resists=mai.resists.at[slot].set(
+                jnp.take(_MONSTER_MRESISTS, tid, axis=0).astype(jnp.int32)),
+            undead=mai.undead.at[slot].set(
+                jnp.take(_MONSTER_UNDEAD, tid, axis=0).astype(jnp.bool_)),
+            nonliving=mai.nonliving.at[slot].set(
+                jnp.take(_MONSTER_NONLIVING, tid, axis=0).astype(jnp.bool_)),
+        )
+        state_out = state_out.replace(monster_ai=new_mai)
+        next_slot += 1
+
+    if vendor_rng is not None:
+        state_out = state_out.replace(vendor_rng=vendor_rng)
+    return state_out
+
+
 def populate_level_with_monsters(
     state,
     rng: jax.Array,
     n_monsters: int = 5,
     n_rooms: int | None = None,
     vendor_rng=None,
+    rooms=None,
+    active=None,
 ) -> object:
-    """Spawn monsters into state.monster_ai slots [0, n_monsters).
+    """Spawn sleeping monsters into ordinary rooms.
 
-    Reads terrain from state.terrain[branch=0, level=0] (current level).
-    Valid spawn tiles: FLOOR or CORRIDOR, not the player's starting position.
+    Vendor cite: vendor/nle/src/mklev.c:813-817 — the per-OROOM
+    sleeping-monster loop body::
 
-    Writes into the first n_monsters slots of state.monster_ai.
+        if (u.uhave.amulet || !rn2(3)) {
+            x = somex(croom);
+            y = somey(croom);
+            makemon(NULL, x, y, MM_NOGRP | MM_NOCOUNTBIRTH | MM_ASLEEP);
+        }
 
-    Audit-N #6 (mklev.c:804): when ``n_rooms`` is provided the monster
-    count is recomputed as ``rnd((nroom >> 1) + 1)`` instead of the fixed
-    ``n_monsters`` default.  ``rnd(N) = randint(1, N+1)`` is sampled from
-    a sub-key of ``rng``.
+    Vendor draws EXACTLY ONE potential spawn per OROOM, gated by
+    ``!rn2(3)`` (~33% chance per room).  There is no level-wide monster
+    count loop — the prior ``rnd((nroom>>1)+1)`` draw cited at this site
+    actually drives ``make_niches`` (mklev.c:551), not monster spawning.
+
+    Per-OROOM model (preferred path):
+      When ``rooms`` and ``active`` are supplied, this function iterates
+      every active OROOM/THEMEROOM, drawing the vendor rn2(3) gate +
+      somex/somey per room.  Each room that passes the gate produces at
+      most one monster (subject to the MAX_MONSTERS_PER_LEVEL slot cap).
+
+    Legacy count model (fallback for the threefry-only path):
+      When ``rooms``/``active`` are not supplied, falls back to the
+      pre-existing fixed ``n_monsters`` count for backwards
+      compatibility with tests that don't drive a real room table.
 
     Byte-replay path: when ``vendor_rng`` (Isaac64State) is supplied, the
-    monster-count roll and the per-monster HP rolls are routed through
-    :func:`vendor_rng.randint_jax`, and the returned state has its
-    ``vendor_rng`` field replaced with the updated Isaac64State.  This
-    function remains host-side (called from env.reset).
+    per-room rn2(3) gate, somex/somey, and the per-monster HP/inventory
+    cascade are routed through :func:`vendor_rng.randint_jax`, and the
+    returned state has its ``vendor_rng`` field replaced with the
+    updated Isaac64State.  This function is host-side (called from
+    env.reset).
 
     Args:
         state:      EnvState.
         rng:        JAX PRNG key.
-        n_monsters: fallback count when ``n_rooms`` is None (default 5).
-        n_rooms:    optional int — current-level active room count.  When
-                    set, ``ct = rnd((nroom >> 1) + 1)`` overrides
-                    ``n_monsters``.
+        n_monsters: fallback count when neither ``rooms`` nor ``active``
+                    are supplied (default 5).  Ignored in the per-OROOM
+                    path.
+        n_rooms:    deprecated — retained for the threefry legacy path
+                    only.  Per-OROOM path supersedes this argument.
         vendor_rng: optional Isaac64State for byte-exact NLE replay.
+        rooms:      optional Room pytree (length MAX_ROOMS_PER_LEVEL).
+                    When supplied with ``active``, switches to the
+                    vendor per-OROOM spawn model.
+        active:     optional bool[MAX_ROOMS_PER_LEVEL] mask of which
+                    slots are real rooms.
+
+    Vendor cite: vendor/nle/src/mklev.c:813-817 (sleeping-monster spawn);
+    vendor/nle/src/makemon.c:1147-1400 (makemon HP + cascade).
     """
-    if n_rooms is not None:
-        upper = max(int(n_rooms) >> 1, 0) + 1
-        if vendor_rng is not None:
-            # Byte-replay: rnd((nroom>>1)+1) via ISAAC64.  rnd(N)=randint(1,N+1).
-            vendor_rng, sampled_arr = randint_jax(vendor_rng, (), 1, upper + 1)
-            sampled = int(sampled_arr)
-        else:
-            rng_ct, rng = jax.random.split(rng, 2)
-            # rnd(N) = randint(1, N+1).  Per vendor mklev.c:804
-            # ct = rnd((svn.nroom >> 1) + 1).
-            sampled = int(jax.random.randint(rng_ct, (), 1, upper + 1))
-        n_monsters = max(min(sampled, n_monsters), 1)
+    # ------------------------------------------------------------------
+    # Per-OROOM model — vendor mklev.c:813-817.  Iterates active rooms;
+    # for each, draws rn2(3) + somex/somey; on pass, runs the full
+    # spawn pipeline (type pick, newmonhp, post-HP cascade).  At most
+    # one monster per room.
+    # ------------------------------------------------------------------
+    if rooms is not None and active is not None:
+        return _populate_per_oroom(
+            state, rng, rooms, active, vendor_rng=vendor_rng,
+        )
+
     terrain = state.terrain[0, 0]  # int8[MAP_H, MAP_W]
     map_h, map_w = terrain.shape
 
