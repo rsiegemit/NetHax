@@ -288,6 +288,25 @@ def _skill_freeze_rm() -> RewardManager:
     return rm
 
 
+def _skill_wod_kill_rm() -> RewardManager:
+    """Vendor WoD-Easy: reward_manager.add_kill_event("minotaur").
+
+    Only the *Easy* WoD variants attach a RewardManager
+    (vendor/minihack/minihack/envs/skills_wod.py:29-30 and :59-60); the
+    Medium / Hard / Pro variants use ``add_goal_pos`` with no RM, so they
+    fall back to sparse stairs/goal (vendor skills_wod.py:84-93, :138-148,
+    :210-221 — no ``reward_manager`` passed to ``MiniHackSkill``).
+    """
+    rm = RewardManager()
+    rm.add_kill_event(
+        "minotaur",
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
 def _exploremaze_rm() -> RewardManager:
     """Vendor ExploreMaze: shaping via add_eat_event("apple") plus stairs_down.
 
@@ -998,12 +1017,17 @@ def _wod_builder(difficulty: str) -> Callable[[LevelGenerator], None]:
         lg.add_room(x=1, y=1, w=15, h=8)
         lg.set_start_pos(2, 2)
         lg.add_stair_down(x=14, y=7)
-        # Drop the wand near the start.
+        # Drop the wand of death near the start.  Vendor places a blessed
+        # "death" wand (skills_wod.py:22-24,:86-88,:108-110,:142-143,:213).
         try:
-            lg.add_object("wand of death", "/", place=(3, 3))
+            lg.add_object("death", "/", place=(3, 3))
         except KeyError:
             lg.add_object("random", place=(3, 3))
-        if difficulty in ("medium", "hard", "pro"):
+        # Vendor always places a minotaur target (skills_wod.py:25, :89,
+        # :144, :212); the Easy RM rewards killing it by name.
+        try:
+            lg.add_monster("minotaur", place=(12, 6))
+        except (KeyError, TypeError):
             lg.add_monster()
         if difficulty == "hard":
             lg.add_monster()
@@ -1014,6 +1038,9 @@ def _wod_builder(difficulty: str) -> Callable[[LevelGenerator], None]:
 
 
 def _register_wod_envs(register_fn) -> None:
+    # Only the Easy variants carry a kill-event RewardManager in vendor
+    # (skills_wod.py:29-34, :59-60); Medium/Hard/Pro use add_goal_pos with
+    # no RM, i.e. sparse stairs/goal reward.
     for env_id, diff in [
         ("MiniHack-WoD-Easy-Full-v0",       "easy"),
         ("MiniHack-WoD-Easy-Restricted-v0", "easy"),
@@ -1025,7 +1052,9 @@ def _register_wod_envs(register_fn) -> None:
         ("MiniHack-WoD-Pro-Restricted-v0",  "pro"),
     ]:
         factory = _make_factory(_wod_builder(diff), w=17, h=10)
-        register_fn(env_id, factory, _default_goal_reward_manager(),
+        rm = (_skill_wod_kill_rm() if diff == "easy"
+              else _default_goal_reward_manager())
+        register_fn(env_id, factory, rm,
                     max_steps=200, category="WoD")
 
 
@@ -1165,11 +1194,18 @@ def _register_skill_simple_envs(register_fn) -> None:
     """
     item_specs = [
         # (basename, item, symbol, rm_factory)
-        ("Wield", "dagger",           ")", _skill_wield_rm),
-        ("Wear",  "leather armor",    "[", _skill_wear_rm),
+        # Item names/symbols mirror vendor skills_simple.py exactly so the
+        # vendor RM message predicate can fire on the correct object:
+        #   Wield -> "dagger", ")"            (skills_simple.py:62)
+        #   Wear  -> "robe", "["              (skills_simple.py:113)
+        #   PutOn -> "amulet of life saving", '"' (skills_simple.py:164)
+        #   Zap   -> "enlightenment", "/"     (skills_simple.py:215)
+        #   Read  -> "blank paper", "?"       (skills_simple.py:266)
+        ("Wield", "dagger",                ")", _skill_wield_rm),
+        ("Wear",  "robe",                  "[", _skill_wear_rm),
         ("PutOn", "amulet of life saving", '"', _skill_amulet_rm),
-        ("Zap",   "wand of striking", "/", _skill_zap_rm),
-        ("Read",  "scroll of mail",   "?", _skill_read_rm),
+        ("Zap",   "enlightenment",         "/", _skill_zap_rm),
+        ("Read",  "blank paper",           "?", _skill_read_rm),
     ]
     for base, item, symbol, rm_factory in item_specs:
         for suffix, distr, fixed in [
