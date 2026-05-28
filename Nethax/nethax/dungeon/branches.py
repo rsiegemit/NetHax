@@ -863,6 +863,11 @@ def generate_main_branch_l1(
             k_rooms, h, w, n_rooms=n_rooms, vendor_rng=vendor_rng,
         )
 
+    # Vendor-faithful ``levl[][]`` grid (rooms+walls+corridors+doors) for
+    # the post-fill ``mineralize`` STONE scan.  Populated only on the
+    # byte-parity (vendor_rng) path; ``None`` in the Threefry layout path.
+    vendor_levl_grid = None
+
     # 2. Carve rooms into blank terrain.
     terrain = jnp.zeros((h, w), dtype=jnp.int8)
     terrain = carve_rooms_into_terrain(terrain, rooms, active)
@@ -1074,9 +1079,16 @@ def generate_main_branch_l1(
             vendor_rng, _lgs, _rooms_box, nroom_int,
             depth=1, noteleport=False,
         )
-        # ``_lgs`` is discarded — its corridor/door cells live on a
-        # separate [COLNO, ROWNO] grid in vendor tile-type encoding.
-        # Phase 5 will rasterise it onto ``terrain``.
+        # ``_lgs.typ`` is the vendor-faithful ``levl[][]`` grid (rooms +
+        # walls + corridors + doors, in vendor tile-type encoding with
+        # STONE==0).  Vendor's ``mineralize`` (mklev.c:948-987) scans THIS
+        # grid for all-STONE 3x3 neighbourhoods, so we hand it forward to
+        # the mineralize call instead of the sparse JAX ``terrain`` (whose
+        # missing corridors/doors left ~4x too many all-STONE cells, over-
+        # drawing the rn2(1000) gold/gem scan).  Transpose [COLNO, ROWNO]
+        # → [ROWNO, COLNO] to match mineralize's row-major terrain layout.
+        # Vendor cite: vendor/nle/src/mklev.c:948-961 (levl[][] STONE scan).
+        vendor_levl_grid = jnp.transpose(_lgs.typ)  # [ROWNO, COLNO]
         del _lgs, _rooms_box
 
         # ------------------------------------------------------------------
@@ -1208,7 +1220,10 @@ def generate_main_branch_l1(
     up_stair_pos   = jnp.stack([up_r, up_c]).astype(jnp.int16)
     down_stair_pos = jnp.stack([dn_r, dn_c]).astype(jnp.int16)
 
-    return terrain, rooms, active, up_stair_pos, down_stair_pos, vendor_rng
+    return (
+        terrain, rooms, active, up_stair_pos, down_stair_pos, vendor_rng,
+        vendor_levl_grid,
+    )
 
 
 def generate_main_branch_l1_with_features(
@@ -1303,7 +1318,9 @@ def generate_main_branch_l1_with_features(
     # order: do_vault -> fill_ordinary_rooms -> mineralize.
     # ------------------------------------------------------------------
 
-    terrain, rooms, active, up_pos, dn_pos, vendor_rng = generate_main_branch_l1(
+    (
+        terrain, rooms, active, up_pos, dn_pos, vendor_rng, vendor_levl_grid,
+    ) = generate_main_branch_l1(
         k_level, static_params, n_rooms=n_rooms, vendor_rng=vendor_rng,
     )
 
@@ -1347,8 +1364,20 @@ def generate_main_branch_l1_with_features(
     # AFTER makelevel() returns, i.e. after fill_ordinary_rooms.  Thread
     # vendor_rng so the ISAAC64 draw sequence matches vendor C byte-for-byte.
     if vendor_rng is not None:
-        terrain, vendor_rng = _mineralize(
-            terrain, vendor_rng, depth=depth, dunlev=depth,
+        # Vendor's mineralize scans the real ``levl[][]`` (rooms + walls +
+        # corridors + doors) for all-STONE 3x3 neighbourhoods.  Use the
+        # vendor-faithful ``vendor_levl_grid`` built in
+        # generate_main_branch_l1 (via stamp_rooms_into_typ + makecorridors)
+        # rather than the sparse JAX ``terrain`` — the latter omits the
+        # vendor corridor/door network, leaving ~4x too many all-STONE
+        # cells and over-drawing the rn2(1000) scan.  ``mineralize`` treats
+        # value 0 as STONE, which is vendor STONE==0 in this grid.
+        # Vendor cite: vendor/nle/src/mklev.c:948-987.
+        _mineralize_grid = (
+            vendor_levl_grid if vendor_levl_grid is not None else terrain
+        )
+        _mineralize_grid, vendor_rng = _mineralize(
+            _mineralize_grid, vendor_rng, depth=depth, dunlev=depth,
         )
 
     # Threefry-only post-pass (NOT a vendor call): stamp fountain / sink /
