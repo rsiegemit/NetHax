@@ -571,6 +571,84 @@ _TILE_STAIRCASE_UP:  int = 6
 _TILE_STAIRCASE_DOWN: int = 7
 
 
+def _u_on_rndspot_dlvl1(vendor_rng, terrain, h, w):
+    """Port of vendor hero placement on Main Dlvl 1 (no up-stair, no branch).
+
+    At new-game start vendor runs ``mklev()`` then ``u_on_upstairs()``
+    (vendor/nle/src/allmain.c:627-628).  On Dlvl 1 ``mkstairs(up=1)`` is
+    skipped (mklev.c:1552-1554 — ``dunlev==1 && up`` returns early) so
+    ``xupstair == 0``; ``u_on_upstairs()`` (dungeon.c:1262) falls through to
+    ``u_on_sstairs(0)``.  Main Dlvl 1 is NOT a branch level (the Gnomish
+    Mines attach at Dlvl 2-3 — vendor/nle/dat/dungeon.def:19), so
+    ``sstairs.sx == 0`` and ``u_on_sstairs`` (dungeon.c:1252-1255) falls
+    through to ``u_on_rndspot(0)`` → ``place_lregion(0,0,0,0, 0,0,0,0,
+    LR_DOWNTELE, NULL)`` (dungeon.c:1239).
+
+    ``place_lregion`` (mkmaze.c:285-309) defaults the unspecified region to
+    the whole level (``lx=1, hx=COLNO-1=79, ly=0, hy=ROWNO-1=20``) then runs
+    a probabilistic rejection loop::
+
+        for (trycnt = 0; trycnt < 200; trycnt++) {
+            x = rn1((hx - lx) + 1, lx);   // rn1(79, 1) -> col in [1,79]
+            y = rn1((hy - ly) + 1, ly);   // rn1(21, 0) -> row in [0,20]
+            if (put_lregion_here(...)) return;   // accepts !bad_location
+        }
+
+    For ``LR_DOWNTELE`` ``bad_location`` (mkmaze.c) rejects unless
+    ``levl[x][y].typ == ROOM`` and the cell is not ``occupied()``
+    (trap/furniture).  In the JAX terrain encoding traps and furniture are
+    stamped as their own non-FLOOR tile types, so ``terrain[y, x] ==
+    _TILE_FLOOR`` is the faithful accept test.
+
+    Returns ``(vendor_rng, row, col)``.  ``col`` is NLE ``blstats[0]``
+    (player_x); ``row`` is ``blstats[1]`` (player_y).
+    """
+    from Nethax.nethax.vendor_rng import rn1_jax
+
+    # Whole-level region (mkmaze.c:295-298).  COLNO=80 -> hx=79; ROWNO=21
+    # -> hy=20.  rn1(span, base) == rn2(span) + base.
+    col_span = jnp.int32(w - 1)        # (hx - lx) + 1 = (79 - 1) + 1 = 79
+    col_base = jnp.int32(1)            # lx = 1
+    row_span = jnp.int32(h)            # (hy - ly) + 1 = (20 - 0) + 1 = 21
+    row_base = jnp.int32(0)            # ly = 0
+
+    MAX_TRY = 200  # mkmaze.c:304
+
+    def body(carry, _):
+        vrng, found, fr, fc = carry
+        vrng, x = rn1_jax(vrng, col_span, col_base)   # column (player_x)
+        vrng, y = rn1_jax(vrng, row_span, row_base)   # row    (player_y)
+        xi = jnp.clip(x.astype(jnp.int32), 0, w - 1)
+        yi = jnp.clip(y.astype(jnp.int32), 0, h - 1)
+        ok = (~found) & (terrain[yi, xi] == jnp.int8(_TILE_FLOOR))
+        new_fr = jnp.where(ok, yi.astype(jnp.int16), fr)
+        new_fc = jnp.where(ok, xi.astype(jnp.int16), fc)
+        return (vrng, found | ok, new_fr, new_fc), None
+
+    # Vendor's loop SHORT-CIRCUITS (returns) on the first accept, so it does
+    # NOT keep drawing once a spot is found.  We must replicate that draw
+    # count exactly: gate every iteration's draws behind ``~found`` via
+    # lax.cond so the ISAAC64 stream stops consuming after the accept.
+    def gated(carry, _):
+        vrng, found, fr, fc = carry
+
+        def draw(c):
+            return body(c, None)[0]
+
+        def skip(c):
+            return c
+
+        return lax.cond(found, skip, draw, (vrng, found, fr, fc)), None
+
+    (vendor_rng, _found, row, col), _ = lax.scan(
+        gated,
+        (vendor_rng, jnp.bool_(False), jnp.int16(0), jnp.int16(0)),
+        None,
+        length=MAX_TRY,
+    )
+    return vendor_rng, row, col
+
+
 # ---------------------------------------------------------------------------
 # Public functions
 # ---------------------------------------------------------------------------
@@ -1207,6 +1285,26 @@ def generate_main_branch_l1_with_features(
     # so niche features are observable.  Runs last so it does not disturb
     # the vendor_rng (ISAAC64) byte-parity stream.
     terrain = _place_niches(terrain, rooms, active, k_niche, n=2)
+
+    # Hero placement — vendor/nle/src/allmain.c:628 ``u_on_upstairs()`` runs
+    # immediately after ``mklev()`` returns (after mineralize).  On Main
+    # Dlvl 1 there is no up-stair and no branch, so the hero lands on a
+    # whole-level random spot via ``u_on_rndspot(0)`` ->
+    # ``place_lregion(.., LR_DOWNTELE, ..)``.  The room-centre ``up_pos``
+    # computed in generate_main_branch_l1 is the Threefry-mode default and
+    # does NOT match vendor; override it (and consume the rn1(79,1)/rn1(21,0)
+    # placement draws) when the ISAAC64 stream is live.  These draws come
+    # LAST in the reset RNG sequence, matching vendor's post-mklev order.
+    # Cite: vendor/nle/src/dungeon.c:1260-1266 (u_on_upstairs ->
+    #       u_on_sstairs -> u_on_rndspot), :1216-1245 (u_on_rndspot),
+    #       vendor/nle/src/mkmaze.c:285-309 (place_lregion loop).
+    if vendor_rng is not None:
+        h_map = static_params.map_h
+        w_map = static_params.map_w
+        vendor_rng, hero_r, hero_c = _u_on_rndspot_dlvl1(
+            vendor_rng, terrain, h_map, w_map,
+        )
+        up_pos = jnp.stack([hero_r, hero_c]).astype(jnp.int16)
 
     if state is not None:
         return terrain, rooms, active, up_pos, dn_pos, features, traps, vendor_rng, state
