@@ -2133,6 +2133,139 @@ def _populate_oroom_single(
     return state_out, rng, vendor_rng, next_slot + 1
 
 
+def spawn_oroom_monster_scanbody(
+    monster_ai,
+    vrng: "Isaac64State",
+    next_slot: jnp.ndarray,
+    rng: jax.Array,
+    is_active_oroom: jnp.ndarray,
+    y1: jnp.ndarray,
+    x1: jnp.ndarray,
+    y2: jnp.ndarray,
+    x2: jnp.ndarray,
+    genocided,
+    player_align: jnp.ndarray,
+    player_align_bucket: jnp.ndarray,
+    map_h: int,
+    map_w: int,
+):
+    """JIT-traceable per-OROOM sleeping-monster spawn — vendor mklev.c:813-817.
+
+    Scan-body-callable counterpart of :func:`_populate_oroom_single`.  All
+    arguments are traced JAX values so this can run as step 1 inside a
+    single ``lax.scan`` over rooms (no Python unroll → one JIT trace).
+
+    Threads ``(monster_ai, vrng, next_slot)`` and writes the spawned
+    monster into ``monster_ai`` slot ``next_slot`` (a traced int index —
+    ``.at[next_slot].set`` is fine in JAX).  Draw order matches
+    :func:`_populate_oroom_single` exactly:
+
+      1. ``rn2(3)`` gate (mklev.c:813) — drawn only when the room is an
+         active OROOM (vendor mklev.c:805 short-circuits non-OROOM before
+         reaching :813, so inactive/non-OROOM slots burn no ISAAC draws).
+      2. ``somex`` (rn2 x_lo..x_hi) then ``somey`` (rn2 y_lo..y_hi)
+         (mklev.c:814-815) — only on gate pass.
+      3. ``pick_monster_for_level`` + ``_roll_hp`` (newmonhp) +
+         ``_consume_makemon_post_hp_draws`` cascade — only on gate pass.
+      4. Write into ``monster_ai`` slot ``next_slot`` flagged asleep
+         (MM_ASLEEP, mklev.c:817); advance ``next_slot`` by 1.
+
+    The whole spawn is wrapped in ``lax.cond`` on the active-OROOM gate so
+    the ISAAC64 stream advances byte-exactly with vendor C (no phantom
+    draws on inactive/non-OROOM rooms).
+
+    Vendor cite: vendor/nle/src/mklev.c:813-817.
+    """
+    h_max = jnp.int32(map_h - 1)
+    w_max = jnp.int32(map_w - 1)
+    x_lo = x1.astype(jnp.int32)
+    x_hi = (x2 + jnp.int32(1)).astype(jnp.int32)
+    y_lo = y1.astype(jnp.int32)
+    y_hi = (y2 + jnp.int32(1)).astype(jnp.int32)
+    # Degenerate room bounds (x_hi<=x_lo etc.) would make rn2 illegal; the
+    # active-OROOM gate already excludes inactive slots, but guard the
+    # bounds so a malformed room cannot trigger a zero-width rn2.
+    valid_bounds = (x_hi > x_lo) & (y_hi > y_lo)
+    slot_free = next_slot < jnp.int32(MAX_MONSTERS_PER_LEVEL)
+    spawn_gate = is_active_oroom & valid_bounds & slot_free
+
+    def _do_spawn(carry):
+        mai_in, v_in, slot_in = carry
+
+        # Step 1: rn2(3) gate — vendor mklev.c:813.
+        v_in, gate = randint_jax(v_in, (), 0, 3)
+        gate_pass = gate == jnp.int32(0)
+
+        def _gate_true(carry_g):
+            mai_g, v_g, slot_g = carry_g
+            # Step 2: somex/somey — vendor mklev.c:814-815 (X first, then Y).
+            v_g, sx = randint_jax(v_g, (), x_lo, x_hi)
+            v_g, sy = randint_jax(v_g, (), y_lo, y_hi)
+            sx = jnp.clip(sx, 0, w_max)
+            sy = jnp.clip(sy, 0, h_max)
+
+            # Step 3: spawn pipeline.  valid_tiles_mask holds exactly the
+            # single placement cell so _pick_valid_tile resolves to (sy, sx).
+            valid_mask = jnp.zeros((map_h, map_w), dtype=jnp.bool_).at[sy, sx].set(True)
+            v_g, _positions, type_ids, hps, _max_hps, _count = spawn_initial_monsters(
+                rng, depth=1, n_monsters=1,
+                valid_tiles_mask=valid_mask,
+                map_h=map_h, map_w=map_w,
+                genocided=genocided,
+                vendor_rng=v_g,
+                player_align=player_align,
+                player_align_record=jnp.int32(0),
+            )
+
+            # Step 4: write spawn into monster_ai[slot].  Vendor mklev.c:817
+            # passes MM_ASLEEP — level-gen monsters always start asleep.
+            tid = type_ids[0].astype(jnp.int32)
+            hp_v = hps[0]
+            pos_v = jnp.stack([sy.astype(jnp.int16), sx.astype(jnp.int16)])
+
+            kit_id = _MONSTER_KIT_BY_ENTRY[tid].astype(jnp.int32)
+            peace_bit = _PEACE_MINDED_TABLE[
+                jnp.clip(tid, 0, _PEACE_MINDED_TABLE.shape[0] - 1),
+                player_align_bucket,
+            ]
+
+            mai_g = mai_g.replace(
+                pos=mai_g.pos.at[slot_g].set(pos_v),
+                hp=mai_g.hp.at[slot_g].set(hp_v),
+                hp_max=mai_g.hp_max.at[slot_g].set(hp_v),
+                alive=mai_g.alive.at[slot_g].set(jnp.bool_(True)),
+                ac=mai_g.ac.at[slot_g].set(_BASE_AC[tid]),
+                is_large=mai_g.is_large.at[slot_g].set(_IS_LARGE[tid]),
+                attack_dice_n=mai_g.attack_dice_n.at[slot_g].set(_ATK_DICE_N[tid]),
+                attack_dice_sides=mai_g.attack_dice_sides.at[slot_g].set(_ATK_DICE_S[tid]),
+                mstrategy=mai_g.mstrategy.at[slot_g].set(jnp.int8(0)),
+                entry_idx=mai_g.entry_idx.at[slot_g].set(tid.astype(jnp.int16)),
+                peaceful=mai_g.peaceful.at[slot_g].set(peace_bit),
+                asleep=mai_g.asleep.at[slot_g].set(jnp.bool_(True)),
+                sleep_timer=mai_g.sleep_timer.at[slot_g].set(jnp.int8(127)),
+                movement_points=mai_g.movement_points.at[slot_g].set(jnp.int16(12)),
+                inv_category=mai_g.inv_category.at[slot_g].set(_KIT_CATS[kit_id]),
+                inv_type_id=mai_g.inv_type_id.at[slot_g].set(_KIT_TIDS[kit_id]),
+                inv_quantity=mai_g.inv_quantity.at[slot_g].set(_KIT_QTYS[kit_id]),
+                inv_charges=mai_g.inv_charges.at[slot_g].set(_KIT_CHGS[kit_id]),
+                resists=mai_g.resists.at[slot_g].set(
+                    jnp.take(_MONSTER_MRESISTS, tid, axis=0).astype(jnp.int32)),
+                undead=mai_g.undead.at[slot_g].set(
+                    jnp.take(_MONSTER_UNDEAD, tid, axis=0).astype(jnp.bool_)),
+                nonliving=mai_g.nonliving.at[slot_g].set(
+                    jnp.take(_MONSTER_NONLIVING, tid, axis=0).astype(jnp.bool_)),
+            )
+            return mai_g, v_g, slot_g + jnp.int32(1)
+
+        return jax.lax.cond(
+            gate_pass, _gate_true, lambda c: c, (mai_in, v_in, slot_in),
+        )
+
+    return jax.lax.cond(
+        spawn_gate, _do_spawn, lambda c: c, (monster_ai, vrng, next_slot),
+    )
+
+
 def _populate_per_oroom(state, rng: jax.Array, rooms, active, vendor_rng=None):
     """Per-OROOM sleeping-monster spawn matching vendor mklev.c:813-817.
 

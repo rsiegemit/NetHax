@@ -1751,6 +1751,37 @@ def fill_ordinary_rooms(
         return (terrain_, features_aa, features_lit, traps_tt), None
 
     # -----------------------------------------------------------------
+    # Monster-spawn wiring for the ISAAC64 scan body.  When ``state`` is
+    # supplied (NLE_BYTEPARITY reset path) the per-OROOM sleeping-monster
+    # spawn (vendor mklev.c:813-817) runs as step 1 INSIDE the scan body
+    # via :func:`spawn_oroom_monster_scanbody`, threading the monster_ai
+    # state + a next-free-slot counter through the scan carry.  This keeps
+    # the whole per-room loop a SINGLE lax.scan (no Python unroll — one JIT
+    # trace).  When ``state`` is None the spawn is disabled and the carry
+    # threads dummy placeholders.
+    # Vendor cite: vendor/nle/src/mklev.c:813-817.
+    _spawn_monsters_flag = state is not None
+    if _spawn_monsters_flag:
+        from Nethax.nethax.dungeon.spawning import _PEACE_MINDED_TABLE
+        _init_monster_ai = state.monster_ai
+        _genocided = state.genocided_species
+        _player_align_arr = state.player_align.astype(jnp.int32)
+        _player_align_bucket_arr = jnp.clip(
+            state.player_align.astype(jnp.int32) + jnp.int32(1),
+            0, _PEACE_MINDED_TABLE.shape[1] - 1,
+        )
+        # Threefry key threaded into spawn_initial_monsters for the
+        # position pick (the ISAAC64 stream carries every parity-relevant
+        # draw; this key only seeds the single-cell _pick_valid_tile).
+        _monster_threefry_key = monster_rng if monster_rng is not None else rng
+    else:
+        _init_monster_ai = None
+        _genocided = None
+        _player_align_arr = jnp.int32(0)
+        _player_align_bucket_arr = jnp.int32(0)
+        _monster_threefry_key = rng
+
+    # -----------------------------------------------------------------
     # ISAAC64-threaded scan body (NLE_BYTEPARITY) — vendor cite mklev.c
     # ::fill_ordinary_room lines 968-1006.  Per-room rn2/somexy draws are
     # routed through randint_jax so the byte stream matches vendor C.
@@ -1771,8 +1802,9 @@ def fill_ordinary_rooms(
     # All draws fire unconditionally (placement still gated by mask) so
     # the trace length is fixed; this matches our Threefry path which
     # also fires every draw unconditionally.
-    def fill_one_isaac(state, i):
-        terrain_, features_aa, features_lit, traps_tt, vrng = state
+    def fill_one_isaac(carry, i):
+        terrain_, features_aa, features_lit, traps_tt, vrng, \
+            monster_ai_, next_slot_ = carry
         y1 = rooms.y1[i].astype(jnp.int32)
         x1 = rooms.x1[i].astype(jnp.int32)
         y2 = rooms.y2[i].astype(jnp.int32)
@@ -1816,16 +1848,31 @@ def fill_ordinary_rooms(
         # Vendor short-circuit:  if (u.uhave.amulet || !rn2(3)) {
         #     x = somex(croom); y = somey(croom); makemon(...);
         # }
-        # The rn2(3) gate + somex/somey draws + the full makemon cascade
-        # are now owned by :func:`populate_level_with_monsters` in the
-        # per-OROOM path (vendor mklev.c:813-817), which iterates the
-        # same active OROOM slots as this fill function.  Consolidating
-        # the draws into populate avoids the prior double-consumption
-        # (where fill_one_isaac drew rn2(3)+somexy without spawning and
-        # populate then ran a separate count-based loop unaware of those
-        # draws).  No ISAAC64 advance happens here — see
-        # _populate_per_oroom in spawning.py for the canonical draw site.
+        # This is the FIRST draw of each OROOM iteration, BEFORE the
+        # trap/gold/fountain/etc fills below.  When monster spawning is
+        # enabled (state supplied to fill_ordinary_rooms), it runs HERE as
+        # step 1 inside the scan body via the JIT-traceable
+        # :func:`spawn_oroom_monster_scanbody`, threading
+        # ``(monster_ai, vrng, next_slot)`` through the scan carry — a
+        # SINGLE lax.scan over rooms, no Python unroll.  When monster
+        # spawning is disabled (_spawn_monsters_flag False, e.g. legacy
+        # Threefry path) the draws are deferred to the caller and no
+        # ISAAC64 advance happens here.
         # Vendor cite: vendor/nle/src/mklev.c:813-817.
+        if _spawn_monsters_flag:
+            from Nethax.nethax.dungeon.spawning import spawn_oroom_monster_scanbody
+            # Spawn gate matches _populate_oroom_single exactly: active AND
+            # rtype == ORDINARY only (vendor mklev.c:805 short-circuits
+            # non-OROOM before reaching :813).  THEMEROOM is excluded here
+            # even though the feature-fill gate (is_ordinary) includes it.
+            is_active_oroom = act & (rt == jnp.int32(int(RoomType.ORDINARY)))
+            monster_ai_, vrng, next_slot_ = spawn_oroom_monster_scanbody(
+                monster_ai_, vrng, next_slot_,
+                _monster_threefry_key, is_active_oroom,
+                y1, x1, y2, x2,
+                _genocided, _player_align_arr, _player_align_bucket_arr,
+                terrain_.shape[0], terrain_.shape[1],
+            )
 
         # --- Traps: while (!rn2(trap_x)) — bounded loop ---
         MAX_TRAPS_PER_ROOM = 4
@@ -2365,7 +2412,10 @@ def fill_ordinary_rooms(
 
         vrng = lax.cond(mkobj_gate, _mkobj_true, _mkobj_false, vrng)
 
-        return (terrain_, features_aa, features_lit, traps_tt, vrng), None
+        return (
+            terrain_, features_aa, features_lit, traps_tt, vrng,
+            monster_ai_, next_slot_,
+        ), None
 
     if vendor_rng is None:
         init_state = (
@@ -2385,71 +2435,59 @@ def fill_ordinary_rooms(
         # Vendor cite: vendor/nle/src/mklev.c:813-817 — the per-OROOM
         # sleeping-monster spawn (line 813) is the FIRST draw of each
         # ``fill_ordinary_room`` iteration, before the trap/gold/
-        # fountain/etc fills (lines 825-883).  To preserve that draw
-        # order on the ISAAC64 byte stream, we drive the per-room loop
-        # host-side (Python ``for``) instead of ``lax.scan``, calling
-        # :func:`_populate_oroom_single` as step 1 and then the JIT'd
-        # ``fill_one_isaac`` body for steps 2-onwards (traps, gold,
-        # fountain, sink, altar, grave, statue, box, graffiti, mkobj).
-        # ``fill_one_isaac`` still JIT-compiles per call (the body is
-        # pure JAX ops on the threaded carry), so the only host-side
-        # work is the slot allocator + per-room dispatch.
-        if state is not None:
-            from Nethax.nethax.dungeon.spawning import (
-                _populate_oroom_single,
-                _PEACE_MINDED_TABLE,
+        # fountain/etc fills (lines 825-883).  The whole per-room loop —
+        # monster spawn (step 1) AND the trap/gold/fountain/etc fills
+        # (steps 2-onwards) — runs as a SINGLE ``lax.scan`` over rooms.
+        # The spawn threads ``(monster_ai, vrng, next_slot)`` through the
+        # scan carry (see :func:`spawn_oroom_monster_scanbody`), so there
+        # is exactly ONE JIT trace (no Python unroll) and the ISAAC64 byte
+        # stream still advances in vendor's per-OROOM draw order.
+        # Vendor cite: vendor/nle/src/mklev.c:813-817.
+        if _spawn_monsters_flag:
+            init_carry = (
+                terrain,
+                features.altar_alignment,
+                features.lit,
+                traps.trap_type,
+                vendor_rng,
+                _init_monster_ai,
+                jnp.int32(0),  # next free monster_ai slot
             )
-
-            # Pull room arrays to host (small int arrays of length 40).
-            active_np = jax.device_get(active)
-            rtype_np  = jax.device_get(rooms.room_type)
-            y1_np     = jax.device_get(rooms.y1)
-            x1_np     = jax.device_get(rooms.x1)
-            y2_np     = jax.device_get(rooms.y2)
-            x2_np     = jax.device_get(rooms.x2)
-            rooms_arrays = (active_np, rtype_np, y1_np, x1_np, y2_np, x2_np)
-
-            player_align_bucket_val = int(jnp.clip(
-                state.player_align.astype(jnp.int32) + jnp.int32(1),
-                0, _PEACE_MINDED_TABLE.shape[1] - 1,
-            ))
+            (
+                terrain_out, aa_out, lit_out, tt_out, vendor_rng_out,
+                monster_ai_out, _next_slot_out,
+            ), _ = lax.scan(
+                fill_one_isaac,
+                init_carry,
+                jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
+            )
+            state_out = state.replace(
+                monster_ai=monster_ai_out,
+                vendor_rng=vendor_rng_out,
+            )
         else:
-            rooms_arrays = None
-            player_align_bucket_val = 0
-
-        terrain_out = terrain
-        aa_out = features.altar_alignment
-        lit_out = features.lit
-        tt_out = traps.trap_type
-        vendor_rng_out = vendor_rng
-        state_out = state
-        next_slot = 0
-        m_rng = monster_rng if monster_rng is not None else rng
-
-        for i in range(MAX_ROOMS_PER_LEVEL):
-            # --- Step 1: sleeping-monster spawn (vendor mklev.c:813-817) ---
-            # Interleaved with each room's fill so the ISAAC64 byte stream
-            # matches vendor's per-OROOM draw order.  No-op when ``state``
-            # is None (legacy caller drives the spawn separately).
-            if state is not None:
-                (
-                    state_out, m_rng, vendor_rng_out, next_slot,
-                ) = _populate_oroom_single(
-                    state_out, m_rng, rooms_arrays, i, next_slot,
-                    player_align_bucket_val, vendor_rng=vendor_rng_out,
-                )
-
-            # --- Steps 2-onwards: traps/gold/fountain/sink/altar/grave/
-            # statue/box/graffiti/mkobj — vendor mklev.c:825-883.
-            (terrain_out, aa_out, lit_out, tt_out, vendor_rng_out), _ = (
-                fill_one_isaac(
-                    (terrain_out, aa_out, lit_out, tt_out, vendor_rng_out),
-                    jnp.int32(i),
-                )
+            # vendor_rng path WITHOUT monster spawning (e.g. non-env
+            # callers / tests).  Thread dummy monster placeholders through
+            # the carry; the spawn step inside fill_one_isaac is compiled
+            # out (Python-level ``if _spawn_monsters_flag`` is False).
+            init_carry = (
+                terrain,
+                features.altar_alignment,
+                features.lit,
+                traps.trap_type,
+                vendor_rng,
+                jnp.int32(0),  # monster_ai placeholder (unused)
+                jnp.int32(0),  # next_slot placeholder (unused)
             )
-
-        if state is not None:
-            state_out = state_out.replace(vendor_rng=vendor_rng_out)
+            (
+                terrain_out, aa_out, lit_out, tt_out, vendor_rng_out,
+                _ma_unused, _ns_unused,
+            ), _ = lax.scan(
+                fill_one_isaac,
+                init_carry,
+                jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
+            )
+            state_out = state
     new_features = features.replace(altar_alignment=aa_out, lit=lit_out)
     new_traps    = traps.replace(trap_type=tt_out)
     if state is None:

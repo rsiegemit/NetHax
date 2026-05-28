@@ -337,10 +337,12 @@ class NethaxEnv:
         # :func:`generate_main_branch_l1_with_features` so the monster
         # spawn interleaves with each room's fills inside
         # ``fill_ordinary_rooms`` — see
-        # :func:`Nethax.nethax.dungeon.spawning._populate_oroom_single`
-        # which is invoked as step 1 of each per-OROOM iteration.  The
-        # separate ``populate_level_with_monsters`` post-fill call is no
-        # longer required.
+        # :func:`Nethax.nethax.dungeon.spawning.spawn_oroom_monster_scanbody`
+        # which is invoked as step 1 of each per-OROOM iteration inside a
+        # SINGLE ``lax.scan`` (no Python unroll), threading monster_ai +
+        # next_slot through the scan carry.  The separate
+        # ``populate_level_with_monsters`` post-fill call is no longer
+        # required.
         if use_vendor_rng():
             (
                 terrain,
