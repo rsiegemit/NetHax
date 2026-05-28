@@ -746,6 +746,7 @@ def rn2_jax(rng: "Isaac64State", x) -> Tuple["Isaac64State", jax.Array]:
         jax.debug.callback(
             lambda mod, res: _emit_op_callback(b"rn2", mod, res),
             jnp.asarray(x, dtype=jnp.int64), result,
+            ordered=True,
         )
     return new_rng, result
 
@@ -759,6 +760,7 @@ def rnd_jax(rng: "Isaac64State", x) -> Tuple["Isaac64State", jax.Array]:
         jax.debug.callback(
             lambda mod, res: _emit_op_callback(b"rnd", mod, res),
             jnp.asarray(x, dtype=jnp.int64), result,
+            ordered=True,
         )
     return new_rng, result
 
@@ -776,6 +778,7 @@ def rn1_jax(rng: "Isaac64State", x, base) -> Tuple["Isaac64State", jax.Array]:
         jax.debug.callback(
             lambda mod, res: _emit_op_callback(b"rn2", mod, res),
             jnp.asarray(x, dtype=jnp.int64), result,
+            ordered=True,
         )
     return new_rng, result + jnp.int32(base)
 
@@ -829,6 +832,7 @@ def isaac_weighted_choice(rng: "Isaac64State", weights: jax.Array) -> Tuple["Isa
         jax.debug.callback(
             lambda mod, res: _emit_op_callback(b"rn2", mod, res),
             total.astype(jnp.int64), sampled.astype(jnp.int32),
+            ordered=True,
         )
     return new_rng, idx
 
@@ -856,5 +860,6 @@ def randint_jax(rng: "Isaac64State", shape, minval, maxval) -> Tuple["Isaac64Sta
             lambda mod, res: _emit_op_callback(b"rn2", mod, res),
             jnp.asarray(range_size, dtype=jnp.int64),
             sampled - jnp.int32(minval),
+            ordered=True,
         )
     return new_rng, sampled
