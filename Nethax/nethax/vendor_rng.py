@@ -100,7 +100,11 @@ def _trace_init():
     p = _os.environ.get("NETHAX_RNG_TRACE")
     if p:
         _TRACE_FP = open(p, "w")
-    p2 = _os.environ.get("NETHAX_RNG_TRACE_OPS")
+    # ``NETHAX_RNG_TRACE_OPS`` is the host-side op file; ``NETHAX_JIT_TRACE``
+    # is the JIT-aware alias (host + JIT-traced draws interleave here in
+    # program order — see ``_emit_op_callback`` / ``rn2_jax``).  When only
+    # the JIT var is set, route the unified stream to that path.
+    p2 = _os.environ.get("NETHAX_RNG_TRACE_OPS") or _os.environ.get("NETHAX_JIT_TRACE")
     if p2:
         _TRACE_OPS_FP = open(p2, "w")
     _TRACE_INITED = True
@@ -136,7 +140,10 @@ _JIT_TRACE_ENABLED = None  # cached env-var lookup
 def _jit_trace_enabled() -> bool:
     global _JIT_TRACE_ENABLED
     if _JIT_TRACE_ENABLED is None:
-        _JIT_TRACE_ENABLED = bool(_os.environ.get("NETHAX_RNG_TRACE_OPS_JIT"))
+        _JIT_TRACE_ENABLED = bool(
+            _os.environ.get("NETHAX_RNG_TRACE_OPS_JIT")
+            or _os.environ.get("NETHAX_JIT_TRACE")
+        )
     return _JIT_TRACE_ENABLED
 
 
