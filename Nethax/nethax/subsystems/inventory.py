@@ -436,6 +436,10 @@ class InventoryState:
                    alternate weapon (-1 = none).  Distinct from off_hand
                    so callers can preserve the bookkeeping that 'X' toggle
                    updates without disturbing off-hand wear semantics.
+    swap_weapon  : index into items for the uswapwep slot (-1 = none).
+                   vendor/nethack/src/wield.c::setuswapwep; doname emits
+                   " (alternate weapon; not wielded)" when set and
+                   !u.twoweap.  Cite: vendor/nethack/src/objnam.c:1613-1620.
     worn_armor   : int8[N_ARMOR_SLOTS] — items index per ArmorSlot (-1 = none).
     worn_armor_ac_bonus : int8[N_ARMOR_SLOTS] — cached AC bonus contribution
                    per worn armor slot.  Mirrors vendor/nethack/src/do_wear.c::
@@ -457,6 +461,7 @@ class InventoryState:
     wielded: jnp.ndarray           # scalar int8
     off_hand: jnp.ndarray          # scalar int8
     alternate_weapon_slot: jnp.ndarray  # scalar int8 (Wave 5)
+    swap_weapon: jnp.ndarray       # scalar int8 — uswapwep slot (-1=none)
     worn_armor: jnp.ndarray        # [N_ARMOR_SLOTS] int8
     worn_armor_ac_bonus: jnp.ndarray  # [N_ARMOR_SLOTS] int8 (Wave 5)
     armor_stat_bonus: jnp.ndarray  # [6] int8 — additive [str,dex,con,int,wis,cha]
@@ -491,6 +496,7 @@ class InventoryState:
             wielded=jnp.int8(-1),
             off_hand=jnp.int8(-1),
             alternate_weapon_slot=jnp.int8(-1),
+            swap_weapon=jnp.int8(-1),
             worn_armor=jnp.full((N_ARMOR_SLOTS,), -1, dtype=jnp.int8),
             worn_armor_ac_bonus=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.int8),
             armor_stat_bonus=jnp.zeros((6,), dtype=jnp.int8),
@@ -540,6 +546,7 @@ class InventoryState:
             wielded=jnp.int8(-1),
             off_hand=jnp.int8(-1),
             alternate_weapon_slot=jnp.int8(-1),
+            swap_weapon=jnp.int8(-1),
             worn_armor=jnp.full((N_ARMOR_SLOTS,), -1, dtype=jnp.int8),
             worn_armor_ac_bonus=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.int8),
             armor_stat_bonus=jnp.zeros((6,), dtype=jnp.int8),

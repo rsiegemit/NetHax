@@ -92,6 +92,7 @@ def _make_inv(items: Item, *, alt_slot: int = -1) -> InventoryState:
         wielded=jnp.int8(-1),
         off_hand=jnp.int8(-1),
         alternate_weapon_slot=jnp.int8(alt_slot),
+        swap_weapon=jnp.int8(-1),
         worn_armor=jnp.full((N_ARMOR_SLOTS,), -1, dtype=jnp.int8),
         worn_armor_ac_bonus=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.int8),
         armor_stat_bonus=jnp.zeros((6,), dtype=jnp.int8),
@@ -106,6 +107,7 @@ def _make_inv(items: Item, *, alt_slot: int = -1) -> InventoryState:
         worn_armor_welded=jnp.zeros((N_ARMOR_SLOTS,), dtype=jnp.bool_),
         worn_amulet_welded=jnp.bool_(False),
         worn_rings_welded=jnp.zeros((2,), dtype=jnp.bool_),
+        letters=jnp.zeros(MAX_INVENTORY_SLOTS, dtype=jnp.int8),
     )
 
 
@@ -267,8 +269,12 @@ def test_regular_plural_es_for_sh_ending():
 # ---------------------------------------------------------------------------
 
 def test_two_weapon_alternate_marker_when_toggled():
-    """When state.combat.two_weapon=True and alt_slot=X, slot X gets the marker."""
-    # vendor wield.c: marker is now "(alternate weapon; not wielded)" or "(alternate weapon)"
+    """swap_weapon set + two_weapon=False → '(alternate weapon; not wielded)'.
+
+    Vendor objnam.c:1613-1620: W_SWAPWEP && !u.twoweap emits the marker.
+    When two_weapon=True the equip-status renders '(wielded in left/right hand)'
+    via off_hand instead.
+    """
     from Nethax.nethax.obs.inv_strs import build_inv_strs
 
     type_id = _find_type_id_by_name("dagger")
@@ -277,8 +283,10 @@ def test_two_weapon_alternate_marker_when_toggled():
         type_id=type_id, category=int(ObjectClass.WEAPON_CLASS),
         identified=True, buc_status=BUCStatus.UNCURSED,
     )
-    inv = _make_inv(items, alt_slot=2)
-    state = _FakeState(inv, two_weapon=True)
+    # swap_weapon=2, two_weapon=False → should show "(alternate weapon; not wielded)"
+    inv = _make_inv(items, alt_slot=-1)
+    inv = inv.replace(swap_weapon=jnp.int8(2))
+    state = _FakeState(inv, two_weapon=False)
     result = build_inv_strs(state)
     s = _decode(result[2])
     assert "(alternate weapon" in s, f"expected '(alternate weapon' in: {s!r}"
@@ -295,17 +303,22 @@ def test_no_alternate_marker_when_two_weapon_off():
         type_id=type_id, category=int(ObjectClass.WEAPON_CLASS),
         identified=True, buc_status=BUCStatus.UNCURSED,
     )
-    inv = _make_inv(items, alt_slot=2)
+    # swap_weapon=-1 (not set) + two_weapon=False → no marker
+    inv = _make_inv(items, alt_slot=-1)
     state = _FakeState(inv, two_weapon=False)
     result = build_inv_strs(state)
     s = _decode(result[2])
     assert "(alternate weapon" not in s, (
-        f"should not show '(alternate weapon' when two_weapon=False: {s!r}"
+        f"should not show '(alternate weapon' when swap_weapon unset: {s!r}"
     )
 
 
 def test_alt_marker_only_on_alt_slot():
-    """The marker appears on the alt slot only, not on other occupied slots."""
+    """swap_weapon=1 + two_weapon=False → marker on slot 1 only, not slot 0.
+
+    Vendor objnam.c:1613-1620: W_SWAPWEP && !u.twoweap emits the marker only
+    on the swap-weapon slot.
+    """
     from Nethax.nethax.obs.inv_strs import build_inv_strs
 
     type_id = _find_type_id_by_name("dagger")
@@ -314,11 +327,11 @@ def test_alt_marker_only_on_alt_slot():
                       identified=True, buc_status=BUCStatus.UNCURSED)
     items = _set_slot(items, 1, type_id=type_id, category=int(ObjectClass.WEAPON_CLASS),
                       identified=True, buc_status=BUCStatus.UNCURSED)
-    inv = _make_inv(items, alt_slot=1)
-    state = _FakeState(inv, two_weapon=True)
+    inv = _make_inv(items, alt_slot=-1)
+    inv = inv.replace(swap_weapon=jnp.int8(1))
+    state = _FakeState(inv, two_weapon=False)
     result = build_inv_strs(state)
     s0 = _decode(result[0])
     s1 = _decode(result[1])
-    # vendor wield.c: marker prefix is "(alternate weapon" regardless of suffix
     assert "(alternate weapon" not in s0, f"slot 0 should not be marked: {s0!r}"
     assert "(alternate weapon" in s1, f"slot 1 should be marked: {s1!r}"

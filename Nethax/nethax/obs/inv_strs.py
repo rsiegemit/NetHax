@@ -287,6 +287,23 @@ _MONSTER_NAME_BYTES: jnp.ndarray = jnp.array(
     dtype=jnp.uint8,
 )  # uint8[NUM_MONSTERS, _MAX_MONSTER_NAME_LEN]
 
+# "empty " prefix — vendor objnam.c:1301-1316.
+# Emitted when cknown && Is_container(obj) && !Has_contents(obj).
+# We proxy cknown with item.identified (vendor u_init.c marks all starting
+# items identified; cknown is set alongside known for starting kits).
+# Is_container: vendor objects.h CONTAINER macro entries at otyp 189-195
+# (large box, chest, ice box, sack, oilskin sack, bag of holding, bag of tricks).
+# Cite: vendor/nethack/src/objnam.c:1301-1316.
+_CONTAINER_TYPE_IDS: frozenset = frozenset({189, 190, 191, 192, 193, 194, 195})
+_IS_CONTAINER: jnp.ndarray = jnp.array(
+    [i in _CONTAINER_TYPE_IDS for i in range(_MAX_OBJ)],
+    dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS] — True iff otyp is a container (vendor Is_container)
+
+_EMPTY_PREFIX_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("empty ", 7), dtype=jnp.uint8,
+)  # uint8[7]
+
 # Suffix/prefix byte constants for corpse and tin name rendering.
 _CORPSE_SUFFIX_BYTES: jnp.ndarray = jnp.array(
     _pad_bytes(" corpse", 8), dtype=jnp.uint8,
@@ -645,10 +662,14 @@ _APPEARANCE_BYTES_PADDED: jnp.ndarray = jnp.array(
 _NAMED_PREFIX_BYTES: jnp.ndarray = jnp.array(
     _pad_bytes(" named ", 8), dtype=jnp.uint8,
 )  # uint8[8]
-# Vendor objnam.c line 1619 emits " (alternate weapon; not wielded)".
+# Vendor objnam.c line 1619 emits " (alternate weapon%s; not wielded)"
+# where %s = plur(obj->quan): "s" for qty>1, "" for qty==1.
 _ALT_WEAPON_BYTES: jnp.ndarray = jnp.array(
     _pad_bytes(" (alternate weapon; not wielded)", 33), dtype=jnp.uint8,
-)  # uint8[33]
+)  # uint8[33]  — singular form (qty == 1)
+_ALT_WEAPONS_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes(" (alternate weapons; not wielded)", 34), dtype=jnp.uint8,
+)  # uint8[34]  — plural form   (qty  > 1)
 
 # Vendor objnam.c prefix tokens emitted into the ``prefix`` buffer before
 # erosion / enchant: ``greased`` (line 1371), WEAPON_CLASS ``poisoned``
@@ -842,7 +863,8 @@ def _equip_status_idx(inv_state, slot_idx: jax.Array,
 # ---------------------------------------------------------------------------
 
 def _render_slot(inv_state, id_state, slot_idx: jax.Array,
-                  two_weapon: jax.Array, alt_slot: jax.Array) -> jax.Array:
+                  two_weapon: jax.Array, alt_slot: jax.Array,
+                  swap_weapon: jax.Array) -> jax.Array:
     """Render one inventory slot as an 80-byte uint8 string.
 
     Empty slots (category == 0) return all-zero buffers.
@@ -966,6 +988,27 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             is_plural,
             lambda bc: _write_uint_space(bc[0], bc[1], quantity),
             lambda bc: _write_article_space(bc[0], bc[1], article_use_an),
+            (b, c),
+        )
+
+        # 2b. "empty " prefix for known-empty containers.
+        # Vendor objnam.c:1301-1316: Strcat(prefix, "empty ") when
+        #   cknown && Is_container(obj) && !Has_contents(obj).
+        # We proxy cknown with item.identified (vendor u_init.c sets
+        # otmp->cknown alongside known for all starting-inventory items).
+        # Starting sack has no contents (Has_contents == False).
+        # We use item.charges as a proxy for Has_contents: charges > 0
+        # only for bag-of-tricks/horn-of-plenty; plain containers (sack)
+        # always have charges == 0 and are empty at game start.
+        # Cite: vendor/nethack/src/objnam.c:1301-1316.
+        is_container = _IS_CONTAINER[safe_type]
+        # Use charges == 0 as proxy for !Has_contents (plain containers start
+        # empty; bag-of-tricks charges are non-zero and handled separately).
+        show_empty = identified & is_container & (charges == jnp.int32(0))
+        b, c = lax.cond(
+            show_empty,
+            lambda bc: _write_fixed(bc[0], bc[1], _EMPTY_PREFIX_BYTES, 7),
+            lambda bc: bc,
             (b, c),
         )
 
@@ -1140,13 +1183,24 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             (b, c),
         )
 
-        # 8. Two-weapon "(alternate weapon)" marker (Wave 6).  Emitted only
-        #    when state.combat.two_weapon is True AND this slot matches
-        #    state.inventory.alternate_weapon_slot.
-        is_alt = two_weapon & (slot_idx.astype(jnp.int32) == alt_slot.astype(jnp.int32))
+        # 8. Swap-weapon / two-weapon suffix.
+        # Vendor objnam.c:1613-1620: when obj->owornmask & W_SWAPWEP:
+        #   if u.twoweap  -> " (wielded in left/right hand)"  [handled by equip idx]
+        #   else          -> " (alternate weapon%s; not wielded)"
+        #                     where %s = plur(quan): "s" for qty>1, else "".
+        # We track uswapwep as inv_state.swap_weapon (scalar int8, -1=none).
+        # When two_weapon is True the equip-status index already emits the
+        # "(wielded in ... hand)" form via off_hand; we only need the
+        # "not wielded" branch here (i.e. swap_weapon set, two_weapon False).
+        # Cite: vendor/nethack/src/objnam.c:1613-1620.
+        is_swapwep = (
+            (swap_weapon.astype(jnp.int32) >= jnp.int32(0)) &
+            (slot_idx.astype(jnp.int32) == swap_weapon.astype(jnp.int32))
+        )
+        is_swap_not_twoweap = is_swapwep & ~two_weapon
         b, c = lax.cond(
-            is_alt,
-            lambda bc: _write_alt_weapon(bc[0], bc[1]),
+            is_swap_not_twoweap,
+            lambda bc: _write_alt_weapon_qty(bc[0], bc[1], quantity),
             lambda bc: bc,
             (b, c),
         )
@@ -1485,13 +1539,25 @@ def _write_user_name(buf, cursor, name_row):
 
 
 def _write_alt_weapon(buf, cursor):
-    """Append ' (alternate weapon; not wielded)' to the buffer.
-
-    Vendor objnam.c line 1619 emits ' (alternate weapon; not wielded)'.
-    Emitted when ``state.combat.two_weapon`` is True and the slot matches
-    ``state.inventory.alternate_weapon_slot``.
-    """
+    """Append ' (alternate weapon; not wielded)' (singular form)."""
     buf, cursor = _write_fixed(buf, cursor, _ALT_WEAPON_BYTES, 33)
+    return buf, cursor
+
+
+def _write_alt_weapon_qty(buf, cursor, quantity):
+    """Append ' (alternate weapon[s]; not wielded)' quantity-aware form.
+
+    Vendor objnam.c:1619: ConcatF1(bp, 0, " (alternate weapon%s; not wielded)",
+    plur(obj->quan)) — plur() returns "s" for quan>1, "" for quan==1.
+    Cite: vendor/nethack/src/objnam.c:1619.
+    """
+    is_plural = quantity > jnp.int32(1)
+    buf, cursor = lax.cond(
+        is_plural,
+        lambda bc: _write_fixed(bc[0], bc[1], _ALT_WEAPONS_BYTES, 34),
+        lambda bc: _write_fixed(bc[0], bc[1], _ALT_WEAPON_BYTES, 33),
+        (buf, cursor),
+    )
     return buf, cursor
 
 
@@ -1545,13 +1611,16 @@ def build_inv_strs(state) -> jnp.ndarray:
         two_weapon = combat_state.two_weapon
     alt_slot = getattr(inv_state, "alternate_weapon_slot", jnp.int8(-1))
     alt_slot_i32 = jnp.asarray(alt_slot).astype(jnp.int32)
+    swap_weapon = getattr(inv_state, "swap_weapon", jnp.int8(-1))
+    swap_weapon_i32 = jnp.asarray(swap_weapon).astype(jnp.int32)
 
     # vmap over slot indices [0..54]
     slot_indices = jnp.arange(NLE_INV_SLOTS, dtype=jnp.int32)
 
     # lax.map applies f sequentially (lower memory than vmap for large arrays)
     def render_one(slot_idx):
-        return _render_slot(inv_state, id_state, slot_idx, two_weapon, alt_slot_i32)
+        return _render_slot(inv_state, id_state, slot_idx, two_weapon,
+                            alt_slot_i32, swap_weapon_i32)
 
     result = lax.map(render_one, slot_indices)  # uint8[55, 80]
     return result

@@ -1459,6 +1459,15 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
             wielded = jnp.int8(0)
     inv_state = inv_state.replace(wielded=wielded)
 
+    # --- Set swap weapon (uswapwep) for Rogue ---
+    # Vendor u_init.c:R_DAGGERS (line 123): Rogue's daggers live at slot 1
+    # and are set as uswapwep via setuswapwep() after ini_inv.
+    # doname (objnam.c:1613-1620) emits " (alternate weapon%s; not wielded)"
+    # when obj->owornmask & W_SWAPWEP and !u.twoweap.
+    # Cite: vendor/nethack/src/u_init.c:123, vendor/nethack/src/objnam.c:1619.
+    if role == Role.ROGUE:
+        inv_state = inv_state.replace(swap_weapon=jnp.int8(1))
+
     # --- Wear starting armor ---
     worn_armor = jnp.full((7,), -1, dtype=jnp.int8)
     armor_map  = _WORN_ARMOR_BY_ROLE.get(role, {})
