@@ -1446,18 +1446,32 @@ def _makeniche(
                     use_sdoor = r5d != jnp.int32(0)
 
                     def _door_type(r3):
-                        r3, r3v  = rn2_jax(r3, jnp.int32(3))
-                        r3, r5v  = rn2_jax(r3, jnp.int32(5))
-                        r3, r6v  = rn2_jax(r3, jnp.int32(6))
-                        if depth >= 5:
-                            r3, _r25 = rn2_jax(r3, jnp.int32(25))
+                        # Vendor dosdoor DOOR branch — mklev.c:394-405.  The
+                        # locked/closed/doorway rolls (rn2(5), rn2(6)) and the
+                        # depth-gated rn2(25) trapped roll are drawn ONLY inside
+                        # the ``if (!rn2(3))`` true-branch.  When rn2(3)!=0 the
+                        # else-branch sets D_NODOOR and draws NOTHING.  Gate the
+                        # follow-on draws on the rn2(3) result so the ISAAC64
+                        # stream matches vendor exactly.
+                        r3, r3v = rn2_jax(r3, jnp.int32(3))
                         door_path = r3v == jnp.int32(0)
-                        door_open = r5v == jnp.int32(0)
-                        door_lock = (~door_open) & (r6v == jnp.int32(0))
-                        mask_d = jnp.where(door_open,  jnp.int8(DMASK_ISOPEN),
-                                 jnp.where(door_lock,  jnp.int8(DMASK_LOCKED),
-                                                       jnp.int8(DMASK_CLOSED)))
-                        mask_d = jnp.where(door_path, mask_d, jnp.int8(DMASK_NODOOR))
+
+                        def _doorway(rr):
+                            rr, r5v = rn2_jax(rr, jnp.int32(5))
+                            rr, r6v = rn2_jax(rr, jnp.int32(6))
+                            if depth >= 5:
+                                rr, _r25 = rn2_jax(rr, jnp.int32(25))
+                            door_open = r5v == jnp.int32(0)
+                            door_lock = (~door_open) & (r6v == jnp.int32(0))
+                            m = jnp.where(door_open, jnp.int8(DMASK_ISOPEN),
+                                jnp.where(door_lock, jnp.int8(DMASK_LOCKED),
+                                                     jnp.int8(DMASK_CLOSED)))
+                            return rr, m
+
+                        r3, mask_d = lax.cond(
+                            door_path, _doorway,
+                            lambda rr: (rr, jnp.int8(DMASK_NODOOR)), r3,
+                        )
                         return r3, mask_d
 
                     def _sdoor_type(r3):
