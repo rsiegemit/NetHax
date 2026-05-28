@@ -1068,30 +1068,46 @@ def join(
         first_gate = ok & ~nxcor_block
         r, g = lax.cond(first_gate, call_first_dodoor, lambda rg: rg, (r, g))
 
-        # dig_corridor — only fires if not nxcor_block.
+        # dig_corridor — only fires if not nxcor_block.  Capture its success
+        # flag: vendor ``if (!dig_corridor(...)) return;`` (mklev.c:304-306)
+        # aborts the join with NO second dodoor and NO smeq union when the
+        # dig fails — including the ``nxcor && !rn2(35)`` early-bail
+        # (sp_lev.c:2248), which consumes the rn2(35) draw but still returns
+        # FALSE.  Approximating success with ``~nxcor_block`` wrongly fired
+        # the second dodoor (an extra rn2(8)) after such a bail.
         def call_dig(rg):
             r_, g_ = rg
-            return dig_corridor(r_, g_, xx + dx, yy + dy, tx_adj, ty_adj, nxcor)[:2]
-        r, g = lax.cond(~nxcor_block, call_dig, lambda rg: rg, (r, g))
+            r_, g_, ok_ = dig_corridor(
+                r_, g_, xx + dx, yy + dy, tx_adj, ty_adj, nxcor)
+            return r_, g_, ok_
+        r, g, dig_ok = lax.cond(
+            ~nxcor_block,
+            call_dig,
+            lambda rg: (rg[0], rg[1], jnp.bool_(False)),
+            (r, g),
+        )
 
-        # Second dodoor (tt).  Vendor only calls when dig_corridor succeeded.
-        # We approximate "succeeded" with "not nxcor_block" — Phase 5 will
-        # carry the ok_out flag through.
+        # Second dodoor (tt) — vendor mklev.c:309-310, only when the dig
+        # succeeded (dig_ok) AND (okdoor(tt) || !nxcor).
         ok2 = okdoor(g, ttx, tty) | ~nxcor
-        second_gate = ok2 & ~nxcor_block
+        second_gate = dig_ok & ok2
 
         def call_second_dodoor(rg):
             r_, g_ = rg
             return dodoor(r_, g_, ttx, tty, depth=depth)
         r, g = lax.cond(second_gate, call_second_dodoor, lambda rg: rg, (r, g))
 
-        # smeq union (vendor:312-315) — no RNG.
-        new_smeq = _smeq_union(g.smeq, a, b)
-        g = LevelGenState(
-            typ=g.typ, doormask=g.doormask,
-            door_x=g.door_x, door_y=g.door_y,
-            doorindex=g.doorindex, smeq=new_smeq,
-        )
+        # smeq union (vendor mklev.c:312-315) — no RNG.  Also gated on
+        # dig_ok: vendor returns before this when the dig fails, so the
+        # union-find merge must not happen on a failed join.
+        def do_smeq(g_):
+            new_smeq = _smeq_union(g_.smeq, a, b)
+            return LevelGenState(
+                typ=g_.typ, doormask=g_.doormask,
+                door_x=g_.door_x, door_y=g_.door_y,
+                doorindex=g_.doorindex, smeq=new_smeq,
+            )
+        g = lax.cond(dig_ok, do_smeq, lambda g_: g_, g)
         return r, g
 
     rng_out, gs_out = lax.cond(skip, lambda rg: rg, do_join, (rng, gs))
