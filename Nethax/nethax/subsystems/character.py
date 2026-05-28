@@ -930,17 +930,16 @@ def _init_attr_vendor(
         values, remaining, tryct, idx = carry
         x = xs[idx]
 
-        # Walk attrdist to find target stat index i; mirror vendor:
-        #   i = 0
-        #   while i < 6:
-        #     x -= attrdist[i]
-        #     if x < 0: break
-        #     i += 1
+        # Walk attrdist to find target stat index i; mirror vendor exactly:
+        #   attrib.c:628 ``for (i=0; (i<A_MAX) && ((x -= attrdist[i]) > 0); i++)``
+        # The running subtraction stops at the first i where the result is
+        # <= 0, i.e. cumsum[i] >= original x.  ``cum >= x`` (NOT ``cum > x``):
+        # the strict form over-advances when x lands exactly on a cumulative
+        # boundary, selecting i+1 instead of i.
         # i ends in [0, 6]; i == 6 means "impossible" (skip this draw).
-        # Cumulative sum: i = first index where cumsum[i] > x; if none, 6.
         cum = jnp.cumsum(attrdist_arr)              # [6]
-        # found[k] is True iff cum[k] > x.  argmax over found returns first True.
-        found = cum > x
+        # found[k] is True iff cum[k] >= x.  argmax over found returns first True.
+        found = cum >= x
         any_found = jnp.any(found)
         i_idx = jnp.where(
             any_found,
@@ -1106,13 +1105,19 @@ def consume_init_attr_draws(
     tryct = 0
     while np > 0 and tryct < 100:
         vendor_rng, x = _vrng.rn2(vendor_rng, 100)  # attrib.c:627
-        # Walk attrdist: i = first index where cumulative attrdist > x.
-        # attrib.c:628-629: ``for (i=0; (i<A_MAX) && ((x -= attrdist[i]) > 0); i++)``
+        # Walk attrdist exactly like vendor:
+        #   attrib.c:628 ``for (i=0; (i<A_MAX) && ((x -= attrdist[i]) > 0); i++)``
+        # The C ``for`` subtracts attrdist[i] from x, then advances i only while
+        # the *result* is strictly > 0.  So the loop stops at the first i where
+        # the running subtraction reaches <= 0, i.e. cumsum[i] >= original x.
+        # (A naive ``x >= 0`` check over-advances when x lands exactly on a
+        # cumulative-sum boundary, consuming one fewer draw than vendor.)
         i = 0
-        while i < a_max_idx and x >= 0:
+        while i < a_max_idx:
             x -= attrdist[i]
-            if x >= 0:
-                i += 1
+            if not (x > 0):
+                break
+            i += 1
         if i >= a_max_idx:          # attrib.c:630-631 impossible branch
             continue                 # (never reached when attrdist sums to 100)
         if abase[i] >= attrmax[i]:  # attrib.c:633-636
@@ -1127,11 +1132,13 @@ def consume_init_attr_draws(
     tryct = 0
     while np < 0 and tryct < 100:
         vendor_rng, x = _vrng.rn2(vendor_rng, 100)  # attrib.c:646
+        # Same vendor walk as the distribute loop (attrib.c:647 ``> 0`` form).
         i = 0
-        while i < a_max_idx and x >= 0:
+        while i < a_max_idx:
             x -= attrdist[i]
-            if x >= 0:
-                i += 1
+            if not (x > 0):
+                break
+            i += 1
         if i >= a_max_idx:          # attrib.c:649-651
             continue
         if abase[i] <= attrmin[i]:  # attrib.c:652-655
