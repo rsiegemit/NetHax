@@ -90,7 +90,10 @@ from Nethax.nethax.subsystems.monster_ai import (
     _MONSTER_UNDEAD,
     _MONSTER_NONLIVING,
 )
-from Nethax.nethax.vendor_rng import Isaac64State, randint_jax, isaac_weighted_choice
+from Nethax.nethax.vendor_rng import (
+    Isaac64State, randint_jax, isaac_weighted_choice, isaac_rndmonst_choice,
+    rnd_jax, next_uint64_jax,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +266,60 @@ def _compute_difficulties() -> jnp.ndarray:
     return jnp.array(diffs, dtype=jnp.int32)
 
 
+def _compute_mlevels() -> jnp.ndarray:
+    """Build the base monster level array (vendor ``permonst.mlevel``).
+
+    This is the raw ``mons[i].mlevel`` (the PermonstEntry ``level`` field),
+    distinct from ``difficulty`` (the mstrength rating).  ``newmonhp`` uses
+    ``mon->m_lev = adj_lev(ptr)`` which derives from ``mlevel`` — NOT the
+    difficulty.  e.g. lichen has mlevel=0 (HP path = rnd(4)) but difficulty=1.
+    Cite: vendor/nle/src/makemon.c:989 (m_lev = adj_lev(ptr)).
+    """
+    return jnp.array([int(m.level) for m in MONSTERS], dtype=jnp.int32)
+
+
+def _adj_lev_jax(mlevel: jnp.ndarray, level_difficulty: int,
+                 ulevel: int) -> jnp.ndarray:
+    """JAX-traceable vendor ``adj_lev`` (makemon.c:1757-1790), common case.
+
+    Excludes the Wizard-of-Yendor special case (mklev never spawns him) and
+    the mlevel>49 special-demon clamp (no Dlvl-1 monster reaches that).  For
+    ordinary monsters::
+
+        tmp  = mlevel;
+        d    = level_difficulty() - tmp;
+        if (d < 0) tmp--; else tmp += d / 5;
+        u    = u.ulevel - mlevel;
+        if (u > 0) tmp += u / 4;
+        cap  = min(3*mlevel/2, 49);
+        return (tmp > cap) ? cap : (tmp > 0 ? tmp : 0);
+
+    Cite: vendor/nle/src/makemon.c:1757-1790.
+    """
+    tmp = mlevel.astype(jnp.int32)
+    ld = jnp.int32(level_difficulty)
+    ul = jnp.int32(ulevel)
+    d = ld - tmp
+    tmp = jnp.where(d < 0, tmp - jnp.int32(1), tmp + d // jnp.int32(5))
+    u = ul - mlevel.astype(jnp.int32)
+    tmp = jnp.where(u > 0, tmp + u // jnp.int32(4), tmp)
+    cap = jnp.minimum((jnp.int32(3) * mlevel.astype(jnp.int32)) // jnp.int32(2),
+                      jnp.int32(49))
+    return jnp.where(tmp > cap, cap, jnp.maximum(tmp, jnp.int32(0)))
+
+
 def _compute_gen_freqs() -> jnp.ndarray:
-    """Extract the low byte of generation_mask as generation frequency weight."""
-    freqs = [m.generation_mask & 0xFF for m in MONSTERS]
+    """Extract the generation frequency weight (vendor ``geno & G_FREQ``).
+
+    G_FREQ is the low 3 bits (0x0007) of ``permonst.geno`` — values 0..7
+    (vendor/nle/include/monflag.h:187).  The higher bits hold unrelated
+    generation flags (G_GENO/G_SGROUP/G_LGROUP/...), so masking the whole
+    low byte over-counts the frequency.  Vendor ``rndmonst`` weights each
+    eligible monster by exactly ``(ptr->geno & G_FREQ)`` (makemon.c:1570).
+    Cite: vendor/nle/include/monflag.h:187 (G_FREQ 0x0007);
+          vendor/nle/src/makemon.c:1570.
+    """
+    freqs = [m.generation_mask & 0x0007 for m in MONSTERS]
     return jnp.array(freqs, dtype=jnp.int32)
 
 
@@ -345,6 +399,7 @@ def _compute_primary_attack_dice() -> tuple[jnp.ndarray, jnp.ndarray]:
 
 # Build all constants once at import time.
 MONSTR_DIFFICULTIES: jnp.ndarray = _compute_difficulties()   # [NUMMONS] int32
+_MONSTER_MLEVEL: jnp.ndarray = _compute_mlevels()            # [NUMMONS] int32
 _GEN_FREQS: jnp.ndarray = _compute_gen_freqs()               # [NUMMONS] int32
 _IS_NOGEN: jnp.ndarray = _compute_nogen_mask()               # [NUMMONS] bool
 _IS_UNIQ: jnp.ndarray = _compute_uniq_mask()                 # [NUMMONS] bool
@@ -946,7 +1001,7 @@ _PEACE_MINDED_TABLE: jnp.ndarray = _compute_peace_minded_table()   # [NUMMONS, 3
 # Eligible-monster mask
 # ---------------------------------------------------------------------------
 
-def eligible_monsters_for_depth(depth: int, genocided=None) -> jnp.ndarray:
+def eligible_monsters_for_depth(depth: int, genocided=None, ulevel: int = 1) -> jnp.ndarray:
     """Return a bool mask [NUMMONS] of monsters that can spawn at ``depth``.
 
     Eligibility criteria (mirrors vendor makemon.c::pm_gen / rndmonst()):
@@ -974,10 +1029,23 @@ def eligible_monsters_for_depth(depth: int, genocided=None) -> jnp.ndarray:
     before invoking this helper — keeping it out here lets the function
     stay branch-only on the level-depth-derived window so it can be
     invoked from JITted call sites without an extra Inhell scalar.
+
+    Level band (vendor makemon.c:1546-1560)::
+
+        zlevel  = level_difficulty();            // == depth in the main dungeon
+        minmlev = zlevel / 6;
+        maxmlev = (zlevel + u.ulevel) / 2;
+        if (tooweak(mndx, minmlev) || toostrong(mndx, maxmlev)) continue;
+
+    where ``tooweak``/``toostrong`` reject ``difficulty < minmlev`` /
+    ``difficulty > maxmlev``.  ``ulevel`` is the hero experience level (1 at
+    game start, which is when mklev runs).  Cite: vendor/nle/src/makemon.c:
+    1546-1560; vendor/nle/src/makemon.c:30-31 (toostrong/tooweak).
     """
-    lo = jnp.int32(depth - 6)
-    hi = jnp.int32(depth + 5)
-    in_window = (MONSTR_DIFFICULTIES >= lo) & (MONSTR_DIFFICULTIES <= hi)
+    zlevel = depth
+    minmlev = jnp.int32(zlevel // 6)
+    maxmlev = jnp.int32((zlevel + ulevel) // 2)
+    in_window = (MONSTR_DIFFICULTIES >= minmlev) & (MONSTR_DIFFICULTIES <= maxmlev)
     # mon.gen_freq > 0 -- entries with a zero generation frequency are
     # never produced by rndmonst (vendor makemon.c pm_gen weighting).
     has_freq = _GEN_FREQS > jnp.int32(0)
@@ -1004,12 +1072,17 @@ def pick_monster_for_level(rng: jax.Array, depth: int,
     Returns a scalar jnp.int32 in [0, NUMMONS).
 
     Byte-replay path: when ``vendor_rng`` (Isaac64State) is supplied, the
-    weighted draw is routed through :func:`vendor_rng.isaac_weighted_choice`
-    so the chosen index is byte-exact with vendor C
-    ``rndmonst_inner`` (rn2(total) over cumsum buckets).  In that case the
-    return is ``(new_vendor_rng, monster_idx)``.  When ``vendor_rng is None``
-    the existing Threefry path is preserved and only ``monster_idx`` is
+    monster is picked by vendor ``rndmonst`` exactly: weight each eligible
+    monster by ``geno & G_FREQ`` (align_shift is 0 in the main dungeon,
+    whose alignment is AM_NONE), sum to ``choice_count``, draw
+    ``ct = rnd(choice_count)`` and walk the cumulative weights
+    (:func:`vendor_rng.isaac_rndmonst_choice`).  In that case the return is
+    ``(new_vendor_rng, monster_idx)``.  When ``vendor_rng is None`` the
+    existing Threefry path is preserved and only ``monster_idx`` is
     returned.
+
+    Cite: vendor/nle/src/makemon.c:1570 (ct = geno & G_FREQ + align_shift);
+          vendor/nle/src/makemon.c:1591-1594 (rnd(choice_count) walk).
     """
     mask = eligible_monsters_for_depth(depth, genocided=genocided)
     weights = jnp.where(mask, _GEN_FREQS, jnp.int32(0)).astype(jnp.int32)
@@ -1018,7 +1091,7 @@ def pick_monster_for_level(rng: jax.Array, depth: int,
     weights = jnp.where(total > 0, weights, mask.astype(jnp.int32))
 
     if vendor_rng is not None:
-        new_vrng, idx = isaac_weighted_choice(vendor_rng, weights)
+        new_vrng, idx = isaac_rndmonst_choice(vendor_rng, weights)
         return new_vrng, idx.astype(jnp.int32)
 
     probs = weights.astype(jnp.float32) / jnp.sum(weights).astype(jnp.float32)
@@ -1135,71 +1208,56 @@ def _roll_hp(rng: jax.Array, level: jnp.ndarray, vendor_rng=None,
 
     if vendor_rng is not None:
         # ---- Byte-replay path: consume ISAAC64 ----
-
-        # Golem: fixed HP, zero draws.  Thread vrng unchanged.
-        # Rider: d(10, 8) — always 10 draws regardless of level.
-        # Adult dragon: d(m_lev, 4) + 4*m_lev — m_lev draws of d4.
-        # Normal: d(m_lev, 8) — m_lev draws of d8.
-        # Level-0 normal: rnd(4) — 1 draw of d4.
         #
-        # We always consume MAX_LEVEL draws from the stream for each of
-        # the rider and normal paths (masked by die_idx < cap), then a
-        # final rnd(4) draw shared by the level-0-normal and dragon paths.
-        # This keeps the scan shape static for JIT.
+        # CRITICAL: vendor ``d(n, x)`` (rnd.c:208-224) loops ``tmp += RND(x)``
+        # n times, calling RND() directly — it does NOT route through rn2()/
+        # rnd(), so the ``g_rnd_call_counter`` trace records NO line for each
+        # die.  Only the level-0 ``rnd(4)`` path (makemon.c:1038) emits a
+        # trace op.  We therefore roll the d(n,x) dice with
+        # :func:`next_uint64_jax` (advances the ISAAC stream WITHOUT emitting
+        # a trace op) and consume EXACTLY n draws via lax.fori_loop (dynamic
+        # bound), so the stream stays byte-aligned while the trace stays
+        # line-aligned with vendor.
+        #
+        # Golem: fixed HP, zero draws.
+        # Rider: d(10, 8) — 10 untraced d8 draws.
+        # Adult dragon: 4*m_lev + d(m_lev, 4) — m_lev untraced d4 draws.
+        # Normal (m_lev>0): d(m_lev, 8) — m_lev untraced d8 draws.
+        # Normal (m_lev==0): rnd(4) — a single traced "rnd" draw.
+        # Cite: vendor/nle/src/rnd.c:208-224 (d); makemon.c:1037-1044.
 
-        RIDER_CAP = 10  # basehp=10 in vendor; exactly 10 dice
-
-        # Scan for rider d(10,8): consume 10 d8 draws.
-        def _rider_die_v(carry, die_idx):
-            vrng, total = carry
-            new_vrng, roll = randint_jax(vrng, (), 1, 9)
-            roll_masked = jnp.where(die_idx < jnp.int32(RIDER_CAP),
-                                    roll, jnp.int32(0))
-            return (new_vrng, total + roll_masked), None
-
-        # Scan for adult-dragon / normal d(m_lev, sides): MAX_LEVEL draws.
-        # sides=4 for dragons, sides=8 for normal; controlled by caller-side
-        # dispatch after we've decided which total to use.
-        def _d8_die_v(carry, die_idx):
-            vrng, total = carry
-            new_vrng, roll = randint_jax(vrng, (), 1, 9)   # 1..8
-            roll_masked = jnp.where(die_idx < level_i32, roll, jnp.int32(0))
-            return (new_vrng, total + roll_masked), None
-
-        def _d4_die_v(carry, die_idx):
-            vrng, total = carry
-            new_vrng, roll = randint_jax(vrng, (), 1, 5)   # 1..4
-            roll_masked = jnp.where(die_idx < level_i32, roll, jnp.int32(0))
-            return (new_vrng, total + roll_masked), None
-
-        # We must consume draws in a branch-free manner for JIT: run the
-        # scan branch that matches the monster type, the others are no-ops
-        # wrapped in jax.lax.cond so JAX traces only one live branch.
+        def _roll_dn(vrng, n, sides):
+            """Vendor d(n, sides): sum of n untraced RND(sides) draws."""
+            def _body(_i, carry):
+                v, total = carry
+                v, word = next_uint64_jax(v)        # RND(sides): no trace op
+                roll = (word % jnp.uint64(sides)).astype(jnp.int32) + jnp.int32(1)
+                return (v, total + roll)
+            v_out, total = jax.lax.fori_loop(
+                0, n, _body, (vrng, jnp.int32(0)),
+            )
+            return v_out, total
 
         def _run_rider(vrng):
-            (v2, total_r), _ = jax.lax.scan(
-                _rider_die_v, (vrng, jnp.int32(0)),
-                jnp.arange(RIDER_CAP, dtype=jnp.int32),
-            )
-            # Rider has no rnd(4) tail draw; vendor basehp boost check is
-            # handled by the min-hp guard below.
+            v2, total_r = _roll_dn(vrng, jnp.int32(10), jnp.int32(8))
             return v2, jnp.maximum(total_r, jnp.int32(1))
 
         def _run_dragon(vrng):
-            (v2, total_d), _ = jax.lax.scan(
-                _d4_die_v, (vrng, jnp.int32(0)),
-                jnp.arange(MAX_LEVEL, dtype=jnp.int32),
-            )
+            v2, total_d = _roll_dn(vrng, level_i32, jnp.int32(4))
             hp_d = jnp.int32(4) * level_i32 + total_d
             return v2, jnp.maximum(hp_d, jnp.int32(1))
 
         def _run_normal(vrng):
-            (v2, total_n), _ = jax.lax.scan(
-                _d8_die_v, (vrng, jnp.int32(0)),
-                jnp.arange(MAX_LEVEL, dtype=jnp.int32),
+            # m_lev==0 → single traced rnd(4); m_lev>0 → m_lev untraced d8.
+            def _lev0(v):
+                v, zero_roll = rnd_jax(v, 4)            # rnd(4): makemon.c:1038
+                return v, zero_roll
+            def _levN(v):
+                v, total_n = _roll_dn(v, level_i32, jnp.int32(8))
+                return v, total_n
+            v3, hp_n = jax.lax.cond(
+                level_i32 == jnp.int32(0), _lev0, _levN, vrng,
             )
-            v3, zero_roll = randint_jax(v2, (), 1, 5)
-            hp_n = jnp.where(level_i32 == jnp.int32(0), zero_roll, total_n)
             return v3, jnp.maximum(hp_n, jnp.int32(1))
 
         # Dispatch: golem → no draws; rider → rider scan; dragon → dragon
@@ -1337,7 +1395,8 @@ def _pick_valid_tile(
 
 def _consume_makemon_post_hp_draws(vrng, type_id,
                                    player_align=0, player_align_record=0,
-                                   in_mklev=True, level_difficulty=1):
+                                   in_mklev=True, level_difficulty=1,
+                                   mm_nogrp=False):
     """Consume the post-newmonhp RNG cascade for one monster.
 
     Mirrors vendor/nle/src/makemon.c lines 1214-1386 in draw order:
@@ -1451,11 +1510,18 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
     vrng = jax.lax.cond(is_lworm, _draw_lworm, lambda v: v, vrng)
 
-    # --- 5. group rolls — vendor makemon.c:1370-1376 ---
-    #   if (ptr->geno & G_SGROUP) && rn2(2)         → m_initsgrp
-    #   else if (ptr->geno & G_LGROUP) { rn2(3) ... }
-    # Mutually exclusive species-level branches; consume the matching
-    # single rn2 draw per branch.
+    # --- 5. group rolls — vendor makemon.c:1369-1378 ---
+    #   if (anymon && !(mmflags & MM_NOGRP)) {
+    #       if ((ptr->geno & G_SGROUP) && rn2(2))    → m_initsgrp
+    #       else if (ptr->geno & G_LGROUP) { rn2(3) ... }
+    #   }
+    # The WHOLE block is gated by !(mmflags & MM_NOGRP).  Level-gen OROOM
+    # sleeping monsters (mklev.c:816) pass MM_NOGRP, so the group rolls are
+    # SKIPPED entirely — no rn2(2)/rn2(3) draw.  Mutually exclusive
+    # species-level branches otherwise; consume the matching single draw.
+    # Cite: vendor/nle/src/makemon.c:1369-1378; mklev.c:816 (MM_NOGRP).
+    grp_allowed = not bool(mm_nogrp)
+
     def _draw_sgrp(v):
         new_v, _ = randint_jax(v, (), 0, 2)
         return new_v
@@ -1464,9 +1530,10 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         new_v, _ = randint_jax(v, (), 0, 3)
         return new_v
 
-    vrng = jax.lax.cond(is_sgrp, _draw_sgrp, lambda v: v, vrng)
-    # LGROUP branch only fires when SGROUP is absent (vendor "else if").
-    vrng = jax.lax.cond(is_lgrp & ~is_sgrp, _draw_lgrp, lambda v: v, vrng)
+    if grp_allowed:
+        vrng = jax.lax.cond(is_sgrp, _draw_sgrp, lambda v: v, vrng)
+        # LGROUP branch only fires when SGROUP is absent (vendor "else if").
+        vrng = jax.lax.cond(is_lgrp & ~is_sgrp, _draw_lgrp, lambda v: v, vrng)
 
     # --- 6/6b/7. initweap + initinv — gated by allow_minvent ---------------
     #
@@ -1860,6 +1927,7 @@ def spawn_initial_monsters(
     vendor_rng=None,
     player_align: int = 0,
     player_align_record: int = 0,
+    mm_nogrp: bool = False,
 ) -> tuple:
     """Spawn ``n_monsters`` monsters for dungeon level ``depth``.
 
@@ -1901,8 +1969,11 @@ def spawn_initial_monsters(
             vrng, type_id = pick_monster_for_level(
                 type_keys[i], depth, genocided=genocided, vendor_rng=vrng,
             )
-            level = MONSTR_DIFFICULTIES[type_id]
-            vrng, hp = _roll_hp(hp_keys[i], level, vendor_rng=vrng,
+            # newmonhp uses mon->m_lev = adj_lev(ptr), derived from the base
+            # mlevel — NOT the mstrength difficulty.  Cite: makemon.c:989.
+            m_lev = _adj_lev_jax(_MONSTER_MLEVEL[type_id],
+                                 level_difficulty=depth, ulevel=1)
+            vrng, hp = _roll_hp(hp_keys[i], m_lev, vendor_rng=vrng,
                                 type_id=type_id)
             # Consume vendor makemon.c:1214-1386 post-newmonhp draws.
             # See _consume_makemon_post_hp_draws for the full cascade
@@ -1914,6 +1985,7 @@ def spawn_initial_monsters(
                 player_align_record=player_align_record,
                 in_mklev=True,
                 level_difficulty=depth,
+                mm_nogrp=mm_nogrp,
             )
             pos = _pick_valid_tile(pos_keys[i], valid_tiles_mask, map_h, map_w)
 
@@ -2215,6 +2287,8 @@ def spawn_oroom_monster_scanbody(
                 vendor_rng=v_g,
                 player_align=player_align,
                 player_align_record=jnp.int32(0),
+                # mklev.c:816 spawns with MM_NOGRP → group rolls skipped.
+                mm_nogrp=True,
             )
 
             # Step 4: write spawn into monster_ai[slot].  Vendor mklev.c:817

@@ -837,6 +837,41 @@ def isaac_weighted_choice(rng: "Isaac64State", weights: jax.Array) -> Tuple["Isa
     return new_rng, idx
 
 
+def isaac_rndmonst_choice(rng: "Isaac64State", weights: jax.Array) -> Tuple["Isaac64State", jax.Array]:
+    """JIT-pure ``rndmonst`` monster pick consuming the ISAAC64 stream.
+
+    Mirrors vendor ``makemon.c::rndmonst`` lines 1591-1594 exactly::
+
+        ct = rnd(choice_count);                       // 1 <= ct <= choice_count
+        for (mndx = LOW_PM; mndx < SPECIAL_PM; mndx++)
+            if ((ct -= mchoices[mndx]) <= 0) break;
+
+    ``choice_count`` is the sum of ``weights`` (per-monster ``geno & G_FREQ``
+    plus ``align_shift``).  Drawing ``rnd(choice_count)`` (emitted as the
+    "rnd" op so the trace records the same modulus/value as vendor C) and
+    walking the cumulative weights is equivalent to ``argmax(cdf >= ct)``.
+
+    Unlike :func:`isaac_weighted_choice` (which draws ``rn2(total)``), this
+    draws ``rnd(choice_count)`` — the vendor draw at ``rndmonst+0x84``.
+
+    Cite: vendor/nle/src/makemon.c:1591-1594.
+    """
+    cdf = jnp.cumsum(weights.astype(jnp.uint64))
+    total = cdf[-1]
+    new_rng, v = next_uint64_jax(rng)
+    # ct = rnd(choice_count) = 1 + (uint64 % choice_count)  -> [1 .. total]
+    ct = (v % total).astype(jnp.int64) + jnp.int64(1)
+    # First mndx where (ct - running_sum) <= 0  <=>  cdf >= ct.
+    idx = jnp.argmax(cdf.astype(jnp.int64) >= ct).astype(jnp.int32)
+    if _jit_trace_enabled():
+        jax.debug.callback(
+            lambda mod, res: _emit_op_callback(b"rnd", mod, res),
+            total.astype(jnp.int64), ct.astype(jnp.int32),
+            ordered=True,
+        )
+    return new_rng, idx
+
+
 def randint_jax(rng: "Isaac64State", shape, minval, maxval) -> Tuple["Isaac64State", jax.Array]:
     """JAX-traceable drop-in for ``jax.random.randint(key, shape, minval, maxval)``.
 
