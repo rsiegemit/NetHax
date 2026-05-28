@@ -272,6 +272,72 @@ def _kelp_scan(
 
 
 # ---------------------------------------------------------------------------
+# bound_digging — vendor mkmaze.c:1247-1328 (called from mklev.c:1005 BEFORE
+# mineralize at :1006).  Marks every cell OUTSIDE the non-stone bounding box
+# (expanded by 2 on a non-maze level) as W_NONDIGGABLE; the mineralize
+# eligibility test (mklev.c:981 ``!(levl[x][y].wall_info & W_NONDIGGABLE)``)
+# then skips those cells.  Without this, Nethax treats the whole stone border
+# as eligible and over-draws the rn2(1000) gold/gem cluster (828 vs vendor's
+# 241 cells for seed 0 rog-hum-cha) -- the first ISAAC64 divergence at draw
+# 1781.  Citation: vendor/nle/src/mkmaze.c:1247-1328 (bound_digging),
+#           vendor/nle/src/mklev.c:1005-1006 (bound_digging then mineralize).
+# ---------------------------------------------------------------------------
+
+def _bound_digging_nondiggable(terrain: jnp.ndarray) -> jnp.ndarray:
+    """Return a bool[ROWNO, COLNO] mask of W_NONDIGGABLE cells.
+
+    Mirrors vendor ``bound_digging`` (mkmaze.c:1247-1328) for the regular
+    (non-maze, non-earth) level case where ``nonwall || !is_maze_lev`` is
+    always true, so every edge offset is 2 (the ``: 1`` maze branch never
+    applies on Main-branch Dlvl 1).
+
+    Vendor scans inward from each edge for the first column/row containing a
+    non-STONE cell.  Because each scan loop post-increments past the hit
+    column, the saved bound is one beyond the first non-stone column, then
+    nudged by 2::
+
+        xmin = (first non-stone column from left)  + 1 - 2  = first - 1
+        xmax = (first non-stone column from right) - 1 + 2  = first + 1
+        ymin = (first non-stone row from top)      + 1 - 2  = first - 1
+        ymax = (first non-stone row from bottom)   - 1 + 2  = first + 1
+
+    Cells with ``y <= ymin || y >= ymax || x <= xmin || x >= xmax`` are
+    marked non-diggable (mkmaze.c:1318-1327).  ``terrain`` uses STONE == 0
+    (``_TILE_VOID``); ``isok``-style clamping is unnecessary because the
+    fallback bounds collapse to the full map when the level is all stone.
+    """
+    non_stone = terrain != jnp.int8(0)            # [ROWNO, COLNO]
+    cols_any = jnp.any(non_stone, axis=0)         # [COLNO]
+    rows_any = jnp.any(non_stone, axis=1)         # [ROWNO]
+
+    col_idx = jnp.arange(_COLNO, dtype=jnp.int32)
+    row_idx = jnp.arange(_ROWNO, dtype=jnp.int32)
+
+    # First / last non-stone column and row (matches vendor's edge scans).
+    big = jnp.int32(1 << 15)
+    first_col = jnp.min(jnp.where(cols_any, col_idx, big))
+    last_col = jnp.max(jnp.where(cols_any, col_idx, -big))
+    first_row = jnp.min(jnp.where(rows_any, row_idx, big))
+    last_row = jnp.max(jnp.where(rows_any, row_idx, -big))
+
+    # Vendor offsets (non-maze => +/- 2), with the post-increment captured
+    # in first/last above.  xmin clamped to >= 0 (mkmaze.c:1271-1272); the
+    # other three have no explicit clamp in the regular case but the
+    # comparison handles out-of-range bounds harmlessly.
+    xmin = jnp.maximum(first_col - jnp.int32(1), jnp.int32(0))
+    xmax = last_col + jnp.int32(1)
+    ymin = first_row - jnp.int32(1)
+    ymax = last_row + jnp.int32(1)
+
+    ys = row_idx.reshape(_ROWNO, 1)
+    xs = col_idx.reshape(1, _COLNO)
+    nondiggable = (
+        (ys <= ymin) | (ys >= ymax) | (xs <= xmin) | (xs >= xmax)
+    )
+    return nondiggable
+
+
+# ---------------------------------------------------------------------------
 # Gold / gem mineral scan helper
 # ---------------------------------------------------------------------------
 
@@ -287,21 +353,28 @@ def _mineral_scan(
     Citation: vendor/nle/src/mklev.c:948-987
 
     For each cell (x, y) in scan range that is entirely surrounded by STONE
-    (8-neighbour + self, and not W_NONDIGGABLE — we ignore the diggable flag
-    since it's not tracked in our terrain array):
+    (8-neighbour + self, and not W_NONDIGGABLE):
       - Draw rn2(1000): if < goldprob → gold hit
         - On hit: draw rnd(goldprob*3) for quan, draw rn2(3) for burial/place
       - Draw rn2(1000): if < gemprob → gem hit
         - On hit: draw rnd(2 + dunlev//3) for count (cnt),
           then for each gem: draw rn2(3) for burial/place
 
-    The W_NONDIGGABLE gate is treated as always-clear (no wall_info in our
-    terrain), which is conservative: we may draw slightly more than vendor
-    on levels with non-diggable stone, but those don't occur on Dlvl 1.
+    The W_NONDIGGABLE gate (mklev.c:981) is honoured via
+    :func:`_bound_digging_nondiggable`, which replays vendor ``bound_digging``
+    (mkmaze.c:1247-1328, run at mklev.c:1005 immediately before mineralize).
+    The level's outer stone border is non-diggable, so without this gate the
+    scan over-counts eligible cells (828 vs vendor 241 for seed 0
+    rog-hum-cha) and over-draws the rn2(1000) cluster.
+    Citation: vendor/nle/src/mklev.c:981, vendor/nle/src/mkmaze.c:1318-1327.
     """
     gp = jnp.int32(goldprob)
     gemp = jnp.int32(gemprob)
     dl = jnp.int32(dunlev)
+
+    # W_NONDIGGABLE mask (vendor bound_digging) — cells outside the non-stone
+    # bounding box are skipped by the eligibility test below.
+    nondiggable = _bound_digging_nondiggable(terrain)
 
     # Maximum gems per hit: rnd(2 + dunlev//3).  For Dlvl 1: rnd(2) → max 2.
     # We need a fixed-iteration inner loop for JAX; use max_gems = 2 + 14//3
@@ -332,10 +405,12 @@ def _mineral_scan(
         # Vendor checks levl[x][y+1].typ != STONE first (the skip-2 guard),
         # then levl[x][y].typ != STONE (the skip-1 guard).
         # Under a fixed-iteration loop we simply check all neighbours:
-        # a cell is eligible iff self + all 8 neighbours are STONE.
-        # Citation: vendor/nle/src/mklev.c:950-961
+        # a cell is eligible iff self + all 8 neighbours are STONE AND the
+        # candidate cell is diggable (vendor mklev.c:981 W_NONDIGGABLE gate).
+        # Citation: vendor/nle/src/mklev.c:950-961, :981.
         eligible = (
-            _is_stone(cell)
+            (~nondiggable[yi, xi])
+            & _is_stone(cell)
             & _is_stone(cell_n)
             & _is_stone(cell_s)
             & _is_stone(cell_e)
