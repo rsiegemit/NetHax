@@ -550,16 +550,43 @@ def dodoor(
     is_wall = (cur == jnp.int8(VTILE_HWALL)) | (cur == jnp.int8(VTILE_VWALL))
     type_is_door = is_door_kind | ~is_wall
 
-    # --- DOOR branch (rn2(3), rn2(5), rn2(6)) — only drawn when type_is_door.
-    # Vendor mklev.c:395-447: the rn2(3)/rn2(5)/rn2(6) draws are inside the
-    # ``if (type == DOOR)`` block; rn2(25) is additionally gated by
-    # ``level_difficulty() >= 5`` which is false on Dlvl 1.
+    # --- DOOR branch — only drawn when type_is_door.  Vendor dosdoor
+    # (mklev.c:395-398):
+    #     if (!rn2(3)) {            /* doorway/closed/locked path */
+    #         if (!rn2(5)) D_ISOPEN;
+    #         else if (!rn2(6)) D_LOCKED;
+    #         else D_CLOSED;
+    #         ...
+    #     } else { D_NODOOR; }
+    # The rn2(5) is drawn ONLY when rn2(3)==0, and rn2(6) ONLY when
+    # additionally rn2(5)!=0.  We mirror that nesting with lax.cond so the
+    # ISAAC64 stream matches vendor's short-circuit exactly (an
+    # unconditional triple-draw over-consumes when rn2(3)!=0).
+    # rn2(25) is further gated by ``level_difficulty() >= 5`` (false on
+    # Dlvl 1) so its draw is skipped.
+    # Vendor cite: vendor/nle/src/mklev.c:394-404.
     def _draw_door_branch(r):
-        r, r3_  = rn2_jax(r, jnp.int32(3))
-        r, r5d_ = rn2_jax(r, jnp.int32(5))
-        r, r6d_ = rn2_jax(r, jnp.int32(6))
-        # rn2(25) difficulty gate: false on Dlvl 1 — skip draw entirely.
-        return r, r3_, r5d_, r6d_
+        r, r3_ = rn2_jax(r, jnp.int32(3))
+        # rn2(5) / rn2(6) only when rn2(3)==0 (the !rn2(3) "path" branch).
+        def _draw_path(rr):
+            rr, r5_ = rn2_jax(rr, jnp.int32(5))
+            # rn2(6) only when rn2(5)!=0 (the ``else if (!rn2(6))`` branch).
+            def _draw_lock(rrr):
+                return rn2_jax(rrr, jnp.int32(6))
+            rr, r6_ = lax.cond(
+                r5_ != jnp.int32(0),
+                _draw_lock,
+                lambda rrr: (rrr, jnp.int32(0)),
+                rr,
+            )
+            return rr, r5_, r6_
+        r, r5_, r6_ = lax.cond(
+            r3_ == jnp.int32(0),
+            _draw_path,
+            lambda rr: (rr, jnp.int32(0), jnp.int32(0)),
+            r,
+        )
+        return r, r3_, r5_, r6_
 
     rng, r3, r5d, r6d = lax.cond(
         type_is_door,
@@ -569,8 +596,8 @@ def dodoor(
     )
 
     door_path = r3 == jnp.int32(0)
-    door_open = r5d == jnp.int32(0)
-    door_lock = (~door_open) & (r6d == jnp.int32(0))
+    door_open = door_path & (r5d == jnp.int32(0))
+    door_lock = door_path & (~door_open) & (r6d == jnp.int32(0))
     door_mask_path = jnp.where(door_open, jnp.int8(DMASK_ISOPEN),
                      jnp.where(door_lock, jnp.int8(DMASK_LOCKED),
                                           jnp.int8(DMASK_CLOSED)))
