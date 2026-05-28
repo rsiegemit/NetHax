@@ -825,9 +825,21 @@ def _register_labyrinth_envs(register_fn) -> None:
 # ---------------------------------------------------------------------------
 def _river_builder(narrow: bool, lava: bool,
                    n_monster: int) -> Callable[[LevelGenerator], None]:
+    """Build a River level matching vendor ``river.py``.
+
+    Vendor ``MiniHackRiver`` (vendor/minihack/minihack/envs/river.py:6-61)
+    lays a 25x7 room with a vertical W/L water strip at cols 18-20, a goal
+    at (24,2), the start rect on the left, **and pre-places 5 pushable
+    boulders** in ``$boulder_area`` = rect (1,1)-(18,5).  Pushing those
+    boulders into the water to form a bridge is the whole task; the prior
+    Minihax builder omitted them entirely, so a River-trained agent's
+    boulder-bridging policy had nothing to push.
+    """
     def build(lg: LevelGenerator) -> None:
         lg.add_room(x=1, y=1, w=25, h=7)
-        # Water (or lava) strip
+        # Water (or lava) strip at cols 18-20 (vendor river.py map).  Narrow
+        # variant is 2 wide; the lava variant uses L instead of W.  The
+        # boulder-bridging mechanic is identical across variants.
         terrain = "L" if lava else "W"
         strip_width = 2 if narrow else 3
         x_start = 18
@@ -837,6 +849,13 @@ def _river_builder(narrow: bool, lava: bool,
         lg.add_stair_down(x=24, y=3)
         for _ in range(n_monster):
             lg.add_monster()
+        # Pre-place 5 boulders in the left "boulder area" (vendor river.py:51-57
+        # sets $boulder_area = fillrect (1,1)-(18,5) and drops 5 boulders).
+        # Spread them across the rows just left of the water so they can be
+        # pushed in to bridge; deterministic for reproducible resets.
+        boulder_cells = [(16, 1), (16, 3), (16, 5), (14, 2), (14, 4)]
+        for bx, by in boulder_cells:
+            lg.add_boulder(place=(bx, by))
     return build
 
 
