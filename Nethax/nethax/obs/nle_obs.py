@@ -177,36 +177,36 @@ NLE_OBSERVATION_DTYPES: dict[str, jnp.dtype] = {
 }
 
 # ---------------------------------------------------------------------------
-# Cmap lookup table: TileType -> NLE cmap index (S_* values from defsym.h)
+# Cmap lookup table: TileType -> NLE cmap index (S_* values from rm.h)
 #
 # TileType enum (from constants.py):
 #   VOID=0, FLOOR=1, CORRIDOR=2, WALL=3, CLOSED_DOOR=4, OPEN_DOOR=5,
 #   STAIRCASE_UP=6, STAIRCASE_DOWN=7, WATER=8, LAVA=9, ALTAR=10,
 #   FOUNTAIN=11, TRAP=12, HIDDEN_TRAP=13, THRONE=14, GRAVE=15, SHOP_FLOOR=16
 #
-# defsym.h cmap indices (idx, char, S_* name):
-#   0  ' '  S_stone       19 '.'  S_room        22 '#'  S_corr
-#   1  '|'  S_vwall       25 '<'  S_upstair     26 '>'  S_dnstair
-#   15 '+'  S_vcdoor      13 '-'  S_vodoor      33 '_'  S_altar
-#   34 '|'  S_grave       35 '\\' S_throne      37 '{'  S_fountain
-#   38 '}'  S_pool        40 '}'  S_lava        49 '^'  S_arrow_trap
+# vendor/nle/include/rm.h cmap indices (idx, char, S_* name):
+#   0  ' '  S_stone       19 '.'  S_room        21 '#'  S_corr
+#   1  '|'  S_vwall       23 '<'  S_upstair     24 '>'  S_dnstair
+#   15 '+'  S_vcdoor      13 '-'  S_vodoor      27 '_'  S_altar
+#   28 '|'  S_grave       29 '\\' S_throne      31 '{'  S_fountain
+#   32 '}'  S_pool        34 '}'  S_lava        42 '^'  S_arrow_trap
 # ---------------------------------------------------------------------------
 
 _S_stone    = 0
 _S_vwall    = 1
 _S_room     = 19
 _S_darkroom = 20
-_S_corr     = 22
-_S_litcorr  = 23
-_S_upstair  = 25
-_S_dnstair  = 26
-_S_altar    = 33
-_S_grave    = 34
-_S_throne   = 35
-_S_fountain = 37
-_S_pool     = 38
-_S_lava     = 40
-_S_trap     = 49   # S_arrow_trap — generic visible trap
+_S_corr     = 21   # vendor/nle/include/rm.h:138
+_S_litcorr  = 22   # vendor/nle/include/rm.h:139
+_S_upstair  = 23   # vendor/nle/include/rm.h:140
+_S_dnstair  = 24   # vendor/nle/include/rm.h:141
+_S_altar    = 27   # vendor/nle/include/rm.h:144
+_S_grave    = 28   # vendor/nle/include/rm.h:145
+_S_throne   = 29   # vendor/nle/include/rm.h:146
+_S_fountain = 31   # vendor/nle/include/rm.h:148
+_S_pool     = 32   # vendor/nle/include/rm.h:149
+_S_lava     = 34   # vendor/nle/include/rm.h:151
+_S_trap     = 42   # S_arrow_trap — vendor/nle/include/rm.h:162
 _S_vcdoor   = 15   # closed door (vertical)
 _S_vodoor   = 13   # open door (vertical)
 
