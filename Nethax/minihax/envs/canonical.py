@@ -545,48 +545,59 @@ def _register_hidenseek_envs(register_fn) -> None:
 # ---------------------------------------------------------------------------
 def _keyroom_builder(room_size: int, subroom_size: int,
                      lit: bool) -> Callable[[LevelGenerator], None]:
+    """Hand-coded KeyRoom that matches vendor ``key_and_door.des``.
+
+    Vendor layout (vendor/minihack/minihack/dat/key_and_door.des and
+    key_and_door_tmp.des):
+      * an outer ``ROOM`` holding the blessed skeleton key,
+      * a ``SUBROOM`` nested in a corner holding the down ``STAIR``,
+      * a **locked** ``DOOR`` / ``ROOMDOOR`` on the wall separating the two.
+
+    The prior Minihax builder carved the sub-room walls but never placed
+    the door, sealing the stairs off and — critically — letting an agent
+    that learned the key-use policy receive no benefit (the door was simply
+    absent).  We now nest the sub-room with a 1-cell gap inside the outer
+    room and stamp a ``locked`` door on the shared wall, mirroring vendor.
+    """
     def build(lg: LevelGenerator) -> None:
-        # Outer room with a sub-room holding the locked door + goal.
+        # Outer room: interior cols/rows 1..room_size.
         outer = lg.add_room(x=1, y=1, w=room_size, h=room_size, lit=lit)
-        # Sub-room placed top-right within the outer footprint.
-        sub_x = room_size - subroom_size
-        sub_y = 1
+        # Nest the sub-room in the top-right corner of the outer interior,
+        # leaving a 1-cell wall gap so its left + bottom walls border outer
+        # floor (matching vendor SUBROOM placement inside the parent ROOM).
+        outer_x2 = room_size            # outer interior right col
+        outer_y1 = 1                    # outer interior top row
+        sub_x = outer_x2 - subroom_size + 1   # sub interior left col
+        sub_y = outer_y1 + 1                  # sub interior top row (gap @ row 1)
         lg.add_room(x=sub_x, y=sub_y, w=subroom_size, h=subroom_size, lit=lit)
-        # Key placed in outer room; goal stair in the sub-room.
+        # Locked door on the sub-room's left wall, connecting sub-room interior
+        # to outer-room interior.  Vendor: ``DOOR:locked,(2,1)`` (relative to
+        # parent room) — a single locked door is the task's whole point.
+        door_x = sub_x - 1                    # shared wall column
+        door_y = sub_y                        # first sub-room interior row
+        lg.add_door(door_x, door_y, state="locked")
+        # Key in the outer room; goal stair inside the (sealed) sub-room.
         lg.add_object("skeleton key", "(", place=outer)
         lg.add_stair_down(x=sub_x, y=sub_y + subroom_size - 1)
         lg.set_start_pos(1, 1)
     return build
 
 
-def _keyroom_templated_des(room_size: int, subroom_size: int,
-                           lit: bool) -> Optional[str]:
-    """Render ``key_and_door_tmp.des`` with RS/SS substitutions.
-
-    Mirrors vendor ``KeyRoomGenerator`` (envs/keyroom.py:13-27).  Returns
-    ``None`` if the template is unreadable so the caller can keep the
-    procedural LG fallback.
-    """
-    try:
-        with open(_vendor_des_path("key_and_door_tmp.des"),
-                  "r", encoding="utf-8", errors="replace") as fh:
-            src = fh.read()
-    except OSError:
-        return None
-    src = src.replace("RS", str(room_size)).replace("SS", str(subroom_size))
-    if not lit:
-        src = src.replace("lit", "unlit")
-    return src
-
-
 def _register_keyroom_envs(register_fn) -> None:
     """Register all KeyRoom envs.
 
-    Fixed-S5 ships with the static ``key_and_door.des``
-    (vendor/minihack/minihack/envs/keyroom.py:82); the other variants are
-    materialised by ``KeyRoomGenerator`` from ``key_and_door_tmp.des``
-    with RS/SS/lit substitutions (envs/keyroom.py:13-27).  We render the
-    template ourselves and feed the resulting source to the des_parser.
+    Vendor Fixed-S5 ships ``key_and_door.des`` (envs/keyroom.py:82); the
+    sized variants are materialised by ``KeyRoomGenerator`` from
+    ``key_and_door_tmp.des`` with RS/SS/lit substitutions (keyroom.py:13-27).
+    Both vendor layouts place a **locked DOOR/ROOMDOOR** between the outer
+    room (holding the skeleton key) and the sub-room (holding the down
+    stair) — that locked door is the entire point of the task.
+
+    The des_parser path produced a degenerate map for these templates
+    (only the sub-room rendered: no outer room, no door, no key, no stair),
+    so we route every KeyRoom variant through the hand-coded
+    ``_keyroom_builder``, which mirrors the vendor structure and now stamps
+    the locked door into ``features.door_state`` (see level_generator.py).
     """
     variants = [
         # (env_id, room_size, subroom_size, lit, max_steps)
@@ -597,18 +608,10 @@ def _register_keyroom_envs(register_fn) -> None:
         ("MiniHack-KeyRoom-Dark-S15-v0", 15, 5, False, 400),
     ]
     for env_id, rs, ss, lit, ms in variants:
-        fallback = _make_factory(
+        factory = _make_factory(
             _keyroom_builder(rs, ss, lit),
             w=max(20, rs + 2), h=max(20, rs + 2), lit=lit,
         )
-        if env_id == "MiniHack-KeyRoom-Fixed-S5-v0":
-            factory = _des_factory("key_and_door.des", fallback=fallback)
-        else:
-            tmpl = _keyroom_templated_des(rs, ss, lit)
-            if tmpl is None:
-                factory = fallback
-            else:
-                factory = _des_factory_from_source(tmpl, fallback=fallback)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=ms, category="KeyRoom")
 
