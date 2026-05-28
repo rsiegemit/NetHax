@@ -1971,15 +1971,27 @@ def fill_ordinary_rooms(
         def trap_step_isaac(carry, j):
             terrain_in, traps_in, continue_, vrng_in = carry
             # Vendor:  while (!rn2(x)) mktrap(0, 0, croom, NULL);
-            # Each iter draws rn2(x) FIRST; mktrap (and ALL of its internal
-            # draws: traptype_rnd rnd(TRAPNUM-1), somexy placement, rnd(4)
-            # dead-predecessor gate, and the dead-pred cascade) only fire
-            # when the gate passes.  Previous code drew kind_raw + somexy
-            # + rnd(4) every iter — over-draws on miss path.
+            # The rn2(x) is the while-loop CONDITION: it is drawn once per
+            # iteration the loop is still live, INCLUDING the final draw that
+            # evaluates nonzero and exits.  So rn2(x) fires exactly
+            # (traps_placed + 1) times.  Once the loop has exited (a previous
+            # iteration drew nonzero, ``continue_`` False) NO further rn2(x)
+            # is drawn — gating the draw on ``continue_`` is required or the
+            # scan over-draws one rn2(x) per remaining iteration (the bug that
+            # diverged the ISAAC64 stream at draw 1192 on seed-0 Dlvl 1).
+            # mktrap and ALL of its internal draws (traptype_rnd rnd(TRAPNUM-1),
+            # somexy placement, rnd(4) dead-predecessor gate, dead-pred
+            # cascade) fire only when the rn2(x) gate evaluates 0.
             # Vendor cite: vendor/nle/src/mklev.c:825-826, 1274-1534.
-            vrng_in, roll = randint_jax(vrng_in, (), 0, trap_x)
-            hit = roll == jnp.int32(0)
-            should_place = continue_ & hit & is_ordinary
+            def _draw_roll(vi):
+                vi, r = randint_jax(vi, (), 0, trap_x)
+                return vi, r
+            vrng_in, roll = lax.cond(
+                continue_, _draw_roll,
+                lambda vi: (vi, jnp.int32(1)), vrng_in,
+            )
+            hit = continue_ & (roll == jnp.int32(0))
+            should_place = hit & is_ordinary
 
             def _mktrap_true(carry_m):
                 v, t_in, tr_in = carry_m
