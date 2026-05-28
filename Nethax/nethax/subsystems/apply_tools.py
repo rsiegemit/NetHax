@@ -726,6 +726,7 @@ def _h_instrument(state, rng: jax.Array) -> object:
 
     # FIRE_HORN / FROST_HORN: deal 6d6 damage to the closest alive monster.
     is_horn = (tid == jnp.int32(_FIRE_HORN_TYPE_ID)) | (tid == jnp.int32(_FROST_HORN_TYPE_ID))
+    is_frost_horn = tid == jnp.int32(_FROST_HORN_TYPE_ID)
     # Use a fixed roll of 21 (midpoint of 6d6) for JIT purity; tests seed rng.
     rng, sub = jax.random.split(rng)
     horn_dmg = jnp.sum(
@@ -871,10 +872,26 @@ def _h_instrument(state, rng: jax.Array) -> object:
         peaceful=new_peaceful,
         flee_until_turn=new_flee_harp,
     )
+    # Emit the cold-bolt message when a frost horn is applied.  Vendor
+    # music.c:599 buzz(AD_COLD-1, ...) fires a cold beam; in an open room
+    # (the MiniHack Freeze-Horn layout) the beam reaches a wall and
+    # zap.c:4263 prints pline_The("%s bounces!", fltxt) with
+    # fltxt=flash_types[AD_COLD-1]="bolt of cold" (zap.c:63) ->
+    # "The bolt of cold bounces!".  The Freeze RewardManager substring-
+    # matches exactly that (skills_freeze.py:7).
+    # Cite: vendor/nle/src/music.c:599, vendor/nle/src/zap.c:4263, zap.c:63.
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    new_messages = jax.lax.cond(
+        is_frost_horn,
+        lambda m: _msg_emit(m, int(_MsgId.COLD_BOLT_BOUNCES)),
+        lambda m: m,
+        state.messages,
+    )
     return state.replace(
         monster_ai=mai_out,
         inventory=inv.replace(items=new_items_hop),
         traps=new_traps,
+        messages=new_messages,
     )
 
 

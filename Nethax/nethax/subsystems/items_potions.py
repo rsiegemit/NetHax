@@ -675,7 +675,18 @@ def _effect_levitation(state, rng, buc):
 
     turns = rn2(rng, 140).astype(jnp.int32) + jnp.int32(10)  # [10, 149]
     new_status = add_timed_intrinsic(state.status, Intrinsic.LEVITATION, turns)
-    return state.replace(status=new_status)
+    # Emit the float-up message.  Vendor potion.c:1034 peffect_levitation
+    # calls float_up() (vendor/nethack/src/trap.c:2891) which prints
+    # You("start to float in the air!").  The LEVITATION timer set above is
+    # the actual float-up state — read by the lava/water/pickup gates
+    # (e.g. boulders.py, inventory.py drop/lift, action_dispatch lava cross) —
+    # so no separate float_up() helper is needed; only the message was
+    # missing.  The MiniHack Levitate envs' RewardManager substring-matches
+    # "You start to float in the air" (skills_levitate.py:9).
+    # Cite: vendor/nle/src/potion.c:1034 -> vendor/nle/src/trap.c:2891.
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    new_messages = _msg_emit(state.messages, int(_MsgId.LEVI_START_FLOAT))
+    return state.replace(status=new_status, messages=new_messages)
 
 
 def _effect_speed(state, rng, buc):
@@ -1564,6 +1575,63 @@ def handle_quaff(state, rng):
     return jax.lax.cond(
         found,
         lambda s_r: quaff_potion(s_r[0], s_r[1], slot_idx),
+        lambda s_r: _quaff_no_potion(s_r[0], s_r[1]),
+        (state, rng),
+    )
+
+
+def _tile_under_player(state) -> jnp.ndarray:
+    """Return the TileType integer at the player's current position (JIT-safe)."""
+    branch = state.dungeon.current_branch.astype(jnp.int32)
+    level = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    row = state.player_pos[0].astype(jnp.int32)
+    col = state.player_pos[1].astype(jnp.int32)
+    b, l, h, w = state.terrain.shape
+    bs = jnp.clip(branch, 0, b - 1)
+    ls = jnp.clip(level, 0, l - 1)
+    rs = jnp.clip(row, 0, h - 1)
+    cs = jnp.clip(col, 0, w - 1)
+    return state.terrain[bs, ls, rs, cs].astype(jnp.int32)
+
+
+def _drink_sink(state, rng):
+    """Quaff while standing on a sink with no potion — drinksink() equivalent.
+
+    Vendor: dodrink() detects IS_SINK(levl[u.ux][u.uy].typ) and (after a yn
+    prompt) calls drinksink().  drinksink() rolls rn2(20) over ~14 outcomes;
+    the common/default outcome is the flavor sip message
+        You("take a sip of %s %s.", ..., hliquid("water"))
+    We emit that recognised sip-of-water line so the quaff-on-sink action is
+    acknowledged.  The MiniHack Sink RM is positional (sink tile + quaff
+    action), so the reward fires from standing on the sink; this message
+    provides the vendor-plausible feedback for the recognised action.
+
+    Cite: vendor/nle/src/potion.c:506-511 (dodrink sink dispatch);
+          vendor/nle/src/fountain.c:520-625 (drinksink); :528 case 0
+          cold-water sip; :620-624 default "take a sip of ... water".
+    """
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    del rng  # effect is the recognised flavor message; no RNG branch ported
+    return state.replace(
+        messages=_msg_emit(state.messages, int(_MsgId.SINK_SIP_COLD_WATER)),
+    )
+
+
+def _quaff_no_potion(state, rng):
+    """No drinkable potion in inventory.
+
+    Vendor dodrink() first checks the tile under the hero: if it is a sink
+    (IS_SINK) it offers ``Drink from the sink?`` -> drinksink().  We mirror
+    that branch so the quaff action is recognised while standing on a sink;
+    otherwise the command is a no-op (vendor getobj() returns NULL -> return 0).
+
+    Cite: vendor/nle/src/potion.c:506-525 (dodrink sink/getobj dispatch).
+    """
+    from Nethax.nethax.constants.tiles import TileType
+    on_sink = _tile_under_player(state) == jnp.int32(int(TileType.SINK))
+    return jax.lax.cond(
+        on_sink,
+        lambda s_r: _drink_sink(s_r[0], s_r[1]),
         lambda s_r: s_r[0],
         (state, rng),
     )

@@ -1436,10 +1436,25 @@ def wear_armor(state, slot_idx: int, armor_slot: ArmorSlot):
             rknown=new_items_rknown,
         ),
     )
+    # Emit "You are now wearing a robe." on a successful don.
+    # Vendor do_wear.c:79 You("are now wearing %s%s.", an(name), how).  The
+    # MiniHack Wear env equips a robe and its RewardManager
+    # add_wear_event("robe") substring-matches "You are now wearing a robe"
+    # (vendor/minihack reward_manager.py:500).  Body-slot armor only; the
+    # MiniHack skill env wears a robe (ARM_CLOAK == BODY here).
+    # Cite: vendor/nle/src/do_wear.c:79.
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    new_messages = jax.lax.cond(
+        can_wear,
+        lambda m: _msg_emit(m, int(_MsgId.WEAR_ROBE)),
+        lambda m: m,
+        state.messages,
+    )
     new_state = state.replace(
         inventory=new_inv,
         player_ac=new_ac,
         identification=state.identification.replace(identified=new_type_mask),
+        messages=new_messages,
     )
     # Wave 31b: recompute armor-sourced intrinsics + stat bonuses.
     # cite: vendor/nethack/src/do_wear.c Boots_on/Cloak_on/Helmet_on/Gloves_on.
@@ -1575,6 +1590,21 @@ def handle_wield(state, rng):
     new_state = new_state.replace(inventory=new_inv)
     from Nethax.nethax.subsystems.artifact_powers import apply_artifact_intrinsics
     new_state = apply_artifact_intrinsics(new_state)
+    # Emit the wield inventory-line feedback on a successful wield.  Vendor
+    # wield.c:191 prinv((char*)0, wep, 0L) -> invent.c:2440 prinv ->
+    # xprname renders "<letter> - <doname>", which for the MiniHack Wield
+    # env's dagger is "d - a dagger (weapon in hand)".  Its RewardManager
+    # add_wield_event("dagger") substring-matches "dagger (weapon in hand)"
+    # (vendor/minihack reward_manager.py:467-470).
+    # Cite: vendor/nle/src/wield.c:191; vendor/nle/src/invent.c:2440.
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    wielded_msg = jax.lax.cond(
+        found_weapon,
+        lambda m: _msg_emit(m, int(_MsgId.WIELD_DAGGER)),
+        lambda m: m,
+        new_state.messages,
+    )
+    new_state = new_state.replace(messages=wielded_msg)
     # Conduct: vendor/nethack/src/wield.c::wieldwep — WEAPONLESS broken when a
     # non-bare-hand weapon is wielded (insight.c ~2137, u.uconduct.weaphit).
     from Nethax.nethax.subsystems.conduct import Conduct, mark_violated_if

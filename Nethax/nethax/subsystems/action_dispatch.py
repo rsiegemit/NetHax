@@ -134,6 +134,45 @@ from Nethax.nethax.subsystems.riding import (
     try_dismount as _riding_try_dismount,
 )
 from Nethax.nethax.subsystems.monster_ai import pet_follow_on_stair as _pet_follow_on_stair
+from Nethax.nethax.subsystems.items_jewelry import (
+    AmuletEffect as _AmuletEffect,
+    _AMULET_TO_INTRINSIC as _JEWELRY_AMULET_TO_INTRINSIC,
+    _AMULET_TO_TIMED as _JEWELRY_AMULET_TO_TIMED,
+)
+from Nethax.nethax.subsystems.status_effects import (
+    Intrinsic as _Intrinsic,
+    TimedStatus as _TimedStatus,
+)
+from Nethax.nethax.subsystems.armor_effects import recalc_worn_props as _recalc_worn_props
+
+
+# ---------------------------------------------------------------------------
+# PutOn-amulet (P command) JIT-safe effect tables.
+#
+# wear_amulet (items_jewelry.py:529) applies effects with Python int() on the
+# amulet's type_id, so it cannot run inside the lax.switch-traced dispatch.
+# We bake static [N_AMULETS] lookup vectors indexed by the (traced) amulet
+# type_id (which stores the AmuletEffect ordinal — see items_jewelry.py:547):
+#   _AMULET_INTRINSIC_VEC[eff]  -> Intrinsic index to grant, or -1 for none
+#   _AMULET_TIMED_ID_VEC[eff]   -> TimedStatus index to start, or -1 for none
+#   _AMULET_TIMED_TURNS_VEC[eff]-> turns for that timed status (0 if none)
+# Cite: vendor/nethack/src/do_wear.c::Amulet_on (lines 968-1062); the
+# AMULET_OF_* effect dispatch.  RESTFUL_SLEEP's random timer is applied
+# separately below (do_wear.c:1047-1054 rnd(98)+2).
+# ---------------------------------------------------------------------------
+_N_AMULETS_TBL = max(int(e) for e in _AmuletEffect) + 1
+_AMULET_INTRINSIC_VEC = jnp.asarray(
+    [int(_JEWELRY_AMULET_TO_INTRINSIC.get(i, -1)) for i in range(_N_AMULETS_TBL)],
+    dtype=jnp.int32,
+)
+_AMULET_TIMED_ID_VEC = jnp.asarray(
+    [int(_JEWELRY_AMULET_TO_TIMED.get(i, (-1, 0))[0]) for i in range(_N_AMULETS_TBL)],
+    dtype=jnp.int32,
+)
+_AMULET_TIMED_TURNS_VEC = jnp.asarray(
+    [int(_JEWELRY_AMULET_TO_TIMED.get(i, (-1, 0))[1]) for i in range(_N_AMULETS_TBL)],
+    dtype=jnp.int32,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1677,12 +1716,23 @@ def _handle_eat(state, rng):
     effective_corpse_idx = jnp.where(is_corpse_item, corpse_idx, jnp.int32(-1))
     new_state = _corpse_postfx(new_state, rng, effective_corpse_idx)
 
-    # Emit "You eat the food." when the action consumed something.
-    # Cite: vendor/nethack/src/eat.c::eatcorpse — pline("You eat ...").
+    # Emit the eat-feedback message when the action consumed something.
+    # Apple (type_id 252) -> the non-corpse comestible path renders
+    # "This apple is delicious!" (vendor/nethack/src/eat.c:2587 — the
+    # `pline("%s%s is delicious!")` tin/fruit branch); the MiniHack Eat env
+    # eats an apple and its RewardManager add_eat_event("apple") substring-
+    # matches "This apple is delicious" (vendor/minihack reward_manager.py:427).
+    # All other food keeps the generic "You eat the food." (eat.c::eatcorpse).
     from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    is_apple = found & (raw_type_id == jnp.int32(252))
+    eat_msg_id = jnp.where(
+        is_apple,
+        jnp.int32(int(_MsgId.EAT_APPLE_DELICIOUS)),
+        jnp.int32(int(_MsgId.EAT_FOOD)),
+    )
     new_messages = jax.lax.cond(
         found,
-        lambda m: _msg_emit(m, int(_MsgId.EAT_FOOD)),
+        lambda m: _msg_emit(m, eat_msg_id),
         lambda m: m,
         new_state.messages,
     )
@@ -2110,7 +2160,66 @@ def _handle_put_on(state, rng):
         worn_rings=new_worn_rings,
         worn_amulet=new_worn_amulet,
     )
-    return state.replace(inventory=new_inv)
+    state = state.replace(inventory=new_inv)
+
+    # --- Amulet effects (JIT-safe port of items_jewelry.wear_amulet). --------
+    # wear_amulet uses host-side int() on the amulet type_id so it cannot run
+    # inside this lax.switch-traced handler; we apply the same effects with
+    # traced table lookups instead.
+    # Cite: vendor/nethack/src/do_wear.c::Amulet_on (lines 968-1062).
+    amulet_type = state.inventory.items.type_id[amulet_slot].astype(jnp.int32)
+    amulet_eff = jnp.clip(amulet_type, 0, _N_AMULETS_TBL - 1)
+
+    # Grant intrinsic (if this amulet maps to one).
+    intr_id = _AMULET_INTRINSIC_VEC[amulet_eff]
+    intr_idx = jnp.clip(intr_id, 0, state.status.intrinsics.shape[0] - 1)
+    grant_intr = can_put_amulet & (intr_id >= jnp.int32(0))
+    new_intr_val = jnp.where(grant_intr, jnp.bool_(True),
+                             state.status.intrinsics[intr_idx])
+    new_intrinsics = state.status.intrinsics.at[intr_idx].set(new_intr_val)
+    state = state.replace(status=state.status.replace(intrinsics=new_intrinsics))
+
+    # Start fixed-duration timed status (STRANGULATION = 6t).
+    # Cite: vendor/nethack/src/do_wear.c Strangled = 6L.
+    timed_id = _AMULET_TIMED_ID_VEC[amulet_eff]
+    timed_turns = _AMULET_TIMED_TURNS_VEC[amulet_eff]
+    timed_slot = jnp.clip(timed_id, 0, state.status.timed_statuses.shape[0] - 1)
+    start_timed = can_put_amulet & (timed_id >= jnp.int32(0))
+    cur_timed = state.status.timed_statuses[timed_slot]
+    new_timed_val = jnp.where(start_timed,
+                              jnp.maximum(cur_timed, timed_turns),
+                              cur_timed)
+    new_timed = state.status.timed_statuses.at[timed_slot].set(new_timed_val)
+    state = state.replace(status=state.status.replace(timed_statuses=new_timed))
+
+    # RESTFUL_SLEEP: random nap timer rnd(98)+2 -> [2,100]; only lowered when
+    # newnap < oldnap or oldnap == 0.
+    # Cite: vendor/nethack/src/do_wear.c:1047-1054 case AMULET_OF_RESTFUL_SLEEP.
+    is_restful = can_put_amulet & (amulet_eff == jnp.int32(int(_AmuletEffect.RESTFUL_SLEEP)))
+    rng, nap_rng = jax.random.split(rng)
+    newnap = jax.random.randint(nap_rng, (), 2, 101, dtype=jnp.int32)
+    sleepy_idx = int(_TimedStatus.SLEEPY)
+    old_nap = state.status.timed_statuses[sleepy_idx]
+    do_update = is_restful & ((newnap < old_nap) | (old_nap == jnp.int32(0)))
+    new_nap_val = jnp.where(do_update, newnap, old_nap)
+    new_sleepy = state.status.timed_statuses.at[sleepy_idx].set(new_nap_val)
+    state = state.replace(status=state.status.replace(timed_statuses=new_sleepy))
+
+    # worn.c setworn extrinsic recalc (e.g. AMULET_OF_ESP -> TELEPAT range).
+    # Cite: vendor/nethack/src/worn.c lines 73-145 (setworn), 50-69 (recalc).
+    state = jax.lax.cond(can_put_amulet, _recalc_worn_props, lambda s: s, state)
+
+    # Emit the "<letter> - <amulet> (being worn)." feedback so the MiniHack
+    # add_amulet_event RewardManager (substring "amulet (being worn).") fires.
+    # Cite: vendor/nethack/src/do_wear.c:2061 prinv() -> invent.c:2447 xprname.
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    state = jax.lax.cond(
+        can_put_amulet,
+        lambda s: s.replace(messages=_msg_emit(s.messages, int(_MsgId.AMULET_BEING_WORN))),
+        lambda s: s,
+        state,
+    )
+    return state
 
 
 def _handle_remove(state, rng):

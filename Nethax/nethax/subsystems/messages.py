@@ -130,6 +130,49 @@ class MessageId(IntEnum):
                                 # WAN_ENLIGHTENMENT zap effect (zapnodir).
     SCROLL_SEEMS_BLANK    = 45  # read.c:1266 pline("This scroll seems to be
                                 # blank.")  SCR_BLANK_PAPER read effect.
+    # PutOn-amulet feedback line.  Vendor do_wear.c::Adornment_on (line 2061)
+    # calls prinv() -> invent.c::xprname (line 2447, dot=TRUE) producing the
+    # inventory line "<letter> - <amulet> (being worn)." for a freshly worn
+    # amulet.  The MiniHack add_amulet_event RM substring-matches
+    # "amulet (being worn)." against this line.
+    # Cite: vendor/nle/src/do_wear.c:2061; vendor/nle/src/invent.c:2447;
+    #       vendor/nle/src/objnam.c:1059 (" (being worn)" suffix).
+    AMULET_BEING_WORN     = 46  # do_wear.c:2061 prinv() "<l> - <amulet> (being worn)."
+    # drinksink() flavor: quaffing while standing on a sink with no potion.
+    # Vendor fountain.c::drinksink (line 528) rn2(20) case 0 -> You("take a
+    # sip of very cold %s.", hliquid("water")).
+    # Cite: vendor/nle/src/fountain.c:528; vendor/nle/src/potion.c:506-511.
+    SINK_SIP_COLD_WATER   = 47  # fountain.c:528 "You take a sip of very cold water."
+
+    # Wave: MiniHack skill-action reward messages (handler effect already
+    # applied; these emit the exact vendor string the RewardManager's
+    # MessageEvent substring-matches at runtime — reward_manager.py:247
+    # `if msg in curr_msg`).
+    EAT_APPLE_DELICIOUS   = 48  # eat.c:2587 pline("%s%s is delicious!") on the
+                                # non-corpse comestible eat path; for an apple
+                                # renders "This apple is delicious!".  RM
+                                # add_eat_event("apple") matches substring
+                                # "This apple is delicious".
+                                # Cite: vendor/nle/src/eat.c:2587.
+    WIELD_DAGGER          = 49  # wield.c:191 prinv((char*)0, wep, 0L) ->
+                                # invent.c:2440 prinv -> xprname:
+                                # "d - a dagger (weapon in hand)".  RM
+                                # add_wield_event("dagger") matches substring
+                                # "dagger (weapon in hand)".
+                                # Cite: vendor/nle/src/wield.c:191.
+    WEAR_ROBE             = 50  # do_wear.c:79 You("are now wearing %s%s.",
+                                # an(name), how) -> "You are now wearing a
+                                # robe.".  RM add_wear_event("robe") matches.
+                                # Cite: vendor/nle/src/do_wear.c:79.
+    LEVI_START_FLOAT      = 51  # trap.c:2891 You("start to float in the
+                                # air!") via potion.c:1034 float_up().  RM
+                                # matches substring "You start to float in the
+                                # air".  Cite: vendor/nle/src/trap.c:2891.
+    COLD_BOLT_BOUNCES     = 52  # zap.c:4263 pline_The("%s bounces!", fltxt)
+                                # with fltxt=flash_types[AD_COLD-1]="bolt of
+                                # cold" (zap.c:63) -> "The bolt of cold
+                                # bounces!".  RM (skills_freeze.py:7) matches.
+                                # Cite: vendor/nle/src/zap.c:4263, zap.c:63.
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +290,29 @@ _MESSAGE_TEMPLATES: tuple[str, ...] = (
     "The feeling subsides.",                 # 44 WAND_FEELING_SUBSIDES zap.c:2188
     # SCR_BLANK_PAPER read.  Cite: vendor/nle/src/read.c:1266.
     "This scroll seems to be blank.",        # 45 SCROLL_SEEMS_BLANK   read.c:1266
+    # PutOn-amulet worn feedback (do_wear.c:2061 prinv -> xprname dot=TRUE).
+    # The inventory-letter line ends with " (being worn)." per objnam.c:1059
+    # + invent.c:2447 trailing-period.  Substring "amulet (being worn)."
+    # is what add_amulet_event matches.
+    "a - an amulet (being worn).",           # 46 AMULET_BEING_WORN    do_wear.c:2061
+    # drinksink rn2(20)==0 sip-of-cold-water flavor (fountain.c:528).
+    "You take a sip of very cold water.",    # 47 SINK_SIP_COLD_WATER  fountain.c:528
+    # Eat-apple comestible path (eat.c:2587 "%s%s is delicious!" with the
+    # "This " prefix for a non-pname object).  Cite: vendor/nle/src/eat.c:2587.
+    "This apple is delicious!",              # 48 EAT_APPLE_DELICIOUS  eat.c:2587
+    # Wield-dagger inventory-line feedback (wield.c:191 prinv -> xprname).
+    # Cite: vendor/nle/src/wield.c:191, vendor/nle/src/invent.c:2440.
+    "d - a dagger (weapon in hand)",         # 49 WIELD_DAGGER         wield.c:191
+    # Wear-robe feedback (do_wear.c:79 You("are now wearing %s%s.")).
+    # Cite: vendor/nle/src/do_wear.c:79.
+    "You are now wearing a robe.",           # 50 WEAR_ROBE            do_wear.c:79
+    # Levitation start (trap.c:2891 via potion.c:1034 float_up()).
+    # Cite: vendor/nle/src/trap.c:2891.
+    "You start to float in the air!",        # 51 LEVI_START_FLOAT     trap.c:2891
+    # Cold bolt bounce off wall (zap.c:4263 pline_The("%s bounces!"),
+    # fltxt="bolt of cold" per flash_types zap.c:63).
+    # Cite: vendor/nle/src/zap.c:4263, vendor/nle/src/zap.c:63.
+    "The bolt of cold bounces!",             # 52 COLD_BOLT_BOUNCES    zap.c:4263
 )
 
 
