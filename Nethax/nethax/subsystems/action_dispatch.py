@@ -1927,6 +1927,29 @@ def _handle_zap(state, rng):
         ),
     )
 
+    # ---- WAN_ENLIGHTENMENT message (zap.c:2183-2190) ----
+    # The zapnodir WAN_ENLIGHTENMENT branch ends with
+    # pline_The("feeling subsides.") -> "The feeling subsides.".  WandState
+    # has no MessageState, so emit here where state.messages is available.
+    # The MiniHack Zap skill-envs reward on this exact message
+    # (minihack/envs/skills_simple.py:219).
+    # Cite: vendor/nle/src/zap.c:2188 pline_The("feeling subsides.").
+    from Nethax.nethax.subsystems.messages import (
+        emit as _msg_emit,
+        MessageId as _MsgId,
+    )
+    _WAN_ENLIGHTENMENT = jnp.int16(19)  # WandEffect.ENLIGHTENMENT ordinal
+    is_enlightenment = has_wand & (zapped_type_id == _WAN_ENLIGHTENMENT)
+    enlightened_msgs = _msg_emit(
+        final_state.messages, int(_MsgId.WAND_FEELING_SUBSIDES)
+    )
+    new_msgs = jax.tree.map(
+        lambda e, m: jnp.where(is_enlightenment, e, m),
+        enlightened_msgs,
+        final_state.messages,
+    )
+    final_state = final_state.replace(messages=new_msgs)
+
     return final_state
 
 

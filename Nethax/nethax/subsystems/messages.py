@@ -125,6 +125,12 @@ class MessageId(IntEnum):
     # "Aloha" (Tourist), "Velkommen" (Valkyrie), "Hello" otherwise.
     ROLE_INTRO           = 43  # allmain.c:920 per-role welcome pline()
 
+    # Wave: MiniHack skill-env reward messages.
+    WAND_FEELING_SUBSIDES = 44  # zap.c:2188 pline_The("feeling subsides.")
+                                # WAN_ENLIGHTENMENT zap effect (zapnodir).
+    SCROLL_SEEMS_BLANK    = 45  # read.c:1266 pline("This scroll seems to be
+                                # blank.")  SCR_BLANK_PAPER read effect.
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -231,6 +237,16 @@ _MESSAGE_TEMPLATES: tuple[str, ...] = (
     "You are turning into green slime.",     # 40 SLIME_TURNING_INTO  timeout.c:384
     "You float slightly lower.",             # 41 LEVI_FLOAT_LOWER    timeout.c:348
     "You wobble unsteadily in the air.",     # 42 LEVI_WOBBLE         timeout.c:349
+    # 43 ROLE_INTRO — rendered dynamically by emit_role_intro(); the static
+    # row is an unused placeholder kept so list index == msg_id for entries
+    # appended after it.  Cite: allmain.c:920 per-role welcome pline().
+    "",                                      # 43 ROLE_INTRO          allmain.c:920
+    # WAN_ENLIGHTENMENT zap: vendor renders pline_The("feeling subsides.")
+    # which capitalises the leading article -> "The feeling subsides."
+    # Cite: vendor/nle/src/zap.c:2188 (zapnodir WAN_ENLIGHTENMENT branch).
+    "The feeling subsides.",                 # 44 WAND_FEELING_SUBSIDES zap.c:2188
+    # SCR_BLANK_PAPER read.  Cite: vendor/nle/src/read.c:1266.
+    "This scroll seems to be blank.",        # 45 SCROLL_SEEMS_BLANK   read.c:1266
 )
 
 

@@ -1385,9 +1385,13 @@ def _effect_enlightenment(
 ) -> tuple[WandState, jax.Array]:
     """WAN_ENLIGHTENMENT — display intrinsics (no map change).
 
-    Cite: vendor/nethack/src/zap.c do_enlightenment: shows character
-    stats and intrinsics; does not alter the map.  We return state unchanged
-    to match this behaviour.
+    Vendor zap.c:2183-2190 (zapnodir WAN_ENLIGHTENMENT branch) shows the
+    character's attributes/intrinsics and then prints
+    pline_The("feeling subsides.") → "The feeling subsides.".  WandState
+    carries no MessageState slice, so the map/monster state is unchanged
+    here; the "The feeling subsides." pline is emitted at the EnvState
+    layer (action_dispatch._handle_zap) where state.messages is available.
+    Cite: vendor/nle/src/zap.c:2183-2190.
     """
     return state, rng
 

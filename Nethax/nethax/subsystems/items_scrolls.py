@@ -1507,12 +1507,20 @@ def _effect_mail(state, rng, buc):
 
 
 def _effect_blank_paper(state, rng, buc):
-    """scroll of blank paper — nothing happens.
+    """scroll of blank paper — no map/inventory change, but emits a message.
 
-    Canonical: seffect_blank_paper — "This scroll seems to be blank."
-    Wave 3: pure no-op.
+    Vendor: seffects() SCR_BLANK_PAPER case prints (when not Blind)
+    "This scroll seems to be blank." and returns 0 (scroll not used up).
+    Cite: vendor/nle/src/read.c:1262-1268.
+
+    The reward for the MiniHack Read skill-envs keys on this exact message
+    (minihack/envs/skills_simple.py:270 add_message_event), so emission
+    inside the JIT step is required for the RM to fire.
     """
-    return state
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    return state.replace(
+        messages=_msg_emit(state.messages, int(_MsgId.SCROLL_SEEMS_BLANK)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1724,6 +1732,16 @@ def read_scroll(state, rng, slot_idx):
         has_confused = _HAS_CONFUSED[effect_id]
         use_confused = confused & has_confused
 
+        # Emit "You read the scroll." BEFORE dispatching the effect so the
+        # per-scroll message printed inside seffects() (e.g. blank-paper's
+        # "This scroll seems to be blank.") is the final buffer content.
+        # Vendor order: read.c:387 doread() pline("You read the scroll.")
+        # runs first, then read.c:397 seffects() prints the effect line.
+        from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+        s = s.replace(
+            messages=_msg_emit(s.messages, int(_MsgId.YOU_READ_SCROLL)),
+        )
+
         # Run both branches (JIT requires static structure); select result.
         confused_state = jax.lax.switch(
             effect_id, _CONFUSED_BRANCHES, (s, rng, _slot_idx)
@@ -1773,13 +1791,10 @@ def read_scroll(state, rng, slot_idx):
             quantity=new_quantity, category=new_category
         )
         new_inv = new_state.inventory.replace(items=new_items)
-        # Emit "You read the scroll." message.
-        # Cite: vendor/nethack/src/read.c::doread — pline("You read ...").
-        from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
-        return new_state.replace(
-            inventory=new_inv,
-            messages=_msg_emit(new_state.messages, int(_MsgId.YOU_READ_SCROLL)),
-        )
+        # NOTE: "You read the scroll." was emitted before effect dispatch
+        # (vendor read.c:387 precedes seffects() at read.c:397), so the
+        # per-scroll effect message remains the current buffer line here.
+        return new_state.replace(inventory=new_inv)
 
     return jax.lax.cond(can_read, _do_read, lambda s: s, state)
 
