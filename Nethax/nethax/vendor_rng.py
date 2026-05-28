@@ -60,6 +60,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+# ISAAC64 is a 64-bit RNG (vendor/nle/src/isaac64.c); all internal state and
+# output values are uint64.  JAX defaults to x32 mode, which makes jnp.uint64
+# literals overflow at import time.  Enable x64 unconditionally here so that
+# this module is importable without the caller pre-setting JAX_ENABLE_X64.
+# This is a no-op when x64 is already enabled (e.g. in tests that set
+# JAX_ENABLE_X64=1 before importing JAX), so NLE byte-parity is unaffected.
+jax.config.update("jax_enable_x64", True)
+
 
 # ---------------------------------------------------------------------------
 # RNG trace (NETHAX_RNG_TRACE=/path/to/file) — host-side draws only.
