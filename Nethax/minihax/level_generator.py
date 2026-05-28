@@ -31,6 +31,7 @@ import jax.numpy as jnp
 from Nethax.nethax.constants.monsters import MONSTERS
 from Nethax.nethax.constants.objects import OBJECTS, ObjectClass, OBJECT_NAME_ALIASES
 from Nethax.nethax.constants.tiles import TileType
+from Nethax.nethax.subsystems.features import DoorState
 from Nethax.nethax.dungeon.spawning import (
     _ATK_DICE_N,
     _ATK_DICE_S,
@@ -90,6 +91,18 @@ TRAP_NAME_TO_TYPE: dict = {
     "teleport":        TrapType.TELEP_TRAP,
     "trap door":       TrapType.TRAPDOOR,
     "web":             TrapType.WEB,
+}
+
+
+#: MiniHack door-state string to nethax ``DoorState`` (vendor rm.h doormask).
+#: ``random`` is treated as ``closed`` here (deterministic) — the LG does not
+#: roll door states.  ``nodoor`` leaves the doorway as floor (state GONE).
+_DOOR_STATE_VALUE: dict = {
+    "open":   int(DoorState.OPEN),
+    "closed": int(DoorState.CLOSED),
+    "locked": int(DoorState.LOCKED),
+    "random": int(DoorState.CLOSED),
+    "nodoor": int(DoorState.GONE),
 }
 
 
@@ -239,6 +252,21 @@ class _MazeWalkDirective:
     x: int
     y: int
     direction: str
+
+
+@dataclasses.dataclass
+class _SetMapDirective:
+    """A literal ``MAP`` block from a vendor ``.des`` file.
+
+    Source: vendor des-file ``MAP ... ENDMAP`` grids.  Each ``row`` is one
+    terrain line in MiniHack ``(x=col, y=row)`` order; the level is stamped
+    starting at the top-left of the active ``(h, w)`` region.  Unlike the
+    default ``fill`` block, every cell — *including* spaces (which map to
+    ``VOID`` per ``TERRAIN_CHAR_TO_TILE``) — is written, so the MAP block
+    is authoritative and the level is correctly bounded by stone/void rather
+    than leaking open FLOOR into the rest of the 80x21 grid.
+    """
+    rows: Tuple[str, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +585,46 @@ class LevelGenerator:
             x=x, y=y, direction=str(dir),
         ))
 
+    def set_map(self, rows) -> None:
+        """Ingest a literal vendor ``MAP`` block.
+
+        Source: vendor des-file ``MAP ... ENDMAP`` grid (e.g.
+        ``vendor/minihack/minihack/dat/lava_crossing.des``).  ``rows`` is an
+        iterable of strings, one per terrain line, in MiniHack ``(x, y)`` =
+        (col, row) order.  The grid is stamped authoritatively at factory
+        time: every glyph — including spaces, which resolve to ``VOID`` —
+        is written into the terrain so the level is bounded by stone rather
+        than the LG's default open-FLOOR fill.
+        """
+        clean = tuple(str(r) for r in rows)
+        self._directives.append(_SetMapDirective(rows=clean))
+
+    def add_random_corridors(self) -> None:
+        """Vendor ``RANDOM_CORRIDORS`` directive (no-op stand-in).
+
+        Source: vendor des-file ``RANDOM_CORRIDORS`` (e.g.
+        ``vendor/minihack/minihack/dat/corridor2.des``) carves connecting
+        corridors between every declared room using NetHack's
+        ``join()``/``makecorridors`` (vendor/nethack/src/sp_lev.c).  nethax
+        room placement already lays floor; explicit corridor carving is left
+        to ``add_corridor`` directives.  This method exists so the des
+        emitter drives the real LevelGenerator instead of falling back.
+        """
+        # No directive emitted: rooms are already navigable floor regions.
+        return None
+
+    def mazewalk(self, row=None, col=None, direction: str = "east") -> None:
+        """Vendor ``MAZEWALK`` directive via row/col emitter kwargs.
+
+        Source: vendor des-file ``MAZEWALK: place,dir`` (e.g.
+        ``vendor/minihack/minihack/dat/mazewalk.des``).  Adapter passes
+        ``row``/``col`` (nethax convention); forward to ``add_mazewalk``
+        which records a recursive-backtracker carve directive.
+        """
+        x = 0 if col is None else int(col)
+        y = 0 if row is None else int(row)
+        self.add_mazewalk(coord=(x, y), dir=direction)
+
     # ---- Factory --------------------------------------------------------
 
     def get_factory(self) -> Callable[[jax.Array], EnvState]:
@@ -628,6 +696,10 @@ def _apply_directives(
     # the same tile stack into successive slots.
     stack_index: dict = {}
 
+    # Accumulate (row, col, DoorState) so doors get their open/closed/locked
+    # status written into ``state.features.door_state`` at commit time.
+    door_states: List[Tuple[int, int, int]] = []
+
     # Trap state buffer (we modify state.traps once at the end).
     trap_type_arr = jnp.asarray(state.traps.trap_type)
     # Trap state stores [num_levels, map_h, map_w] flattened across branches:
@@ -637,6 +709,20 @@ def _apply_directives(
 
     # Ground-items array (Item pytree).
     ground = state.ground_items
+
+    # Pass 0: stamp literal MAP blocks before anything else so subsequent
+    # directives (stairs, objects) write on top of the authoritative grid.
+    # Source: vendor des ``MAP ... ENDMAP`` (e.g. lava_crossing.des).  A MAP
+    # block is authoritative: clear the default open-FLOOR fill to VOID first
+    # (mirrors vendor ``INIT_MAP:solidfill,' '`` stone) so the level is bounded
+    # by stone, then stamp the grid on top.
+    has_map = any(isinstance(d, _SetMapDirective) for d in directives)
+    if has_map:
+        void_block = jnp.full((h, w), jnp.int8(int(TileType.VOID)), dtype=jnp.int8)
+        terrain_np = terrain_np.at[0, 0, :h, :w].set(void_block)
+        for d in directives:
+            if isinstance(d, _SetMapDirective):
+                terrain_np = _stamp_map_block(terrain_np, d.rows, w, h)
 
     # Pass 1: resolve rooms (room placements are needed before other directives
     # that reference them by id).
@@ -651,10 +737,22 @@ def _apply_directives(
     for d in directives:
         if isinstance(d, _RoomDirective):
             continue   # already handled
+        elif isinstance(d, _SetMapDirective):
+            continue   # stamped in pass 0
         elif isinstance(d, _CorridorDirective):
             terrain_np = _carve_corridor(terrain_np, d.src, d.dst, w, h)
         elif isinstance(d, _DoorDirective):
             terrain_np = _place_door(terrain_np, d, w, h)
+            # Record the door's open/closed/locked status so the engine
+            # treats it correctly.  Movement code reads
+            # ``state.features.door_state`` (DoorState enum) — NOT just the
+            # terrain tile — to decide whether a closed door is locked
+            # (vendor: rm.h D_CLOSED/D_LOCKED; engine action_dispatch.py:676).
+            # Without this the LG-authored locked doors in KeyRoom /
+            # MultiRoom-Locked / LockedDoor would default to D_NODOOR (0) and
+            # the agent could walk straight through.
+            if 0 <= d.y < h and 0 <= d.x < w:
+                door_states.append((d.y, d.x, _DOOR_STATE_VALUE[d.state]))
         elif isinstance(d, _FillTerrainDirective):
             terrain_np = _fill_terrain_rect(terrain_np, d, w, h)
         elif isinstance(d, _StairDirective):
@@ -748,6 +846,16 @@ def _apply_directives(
         ground_items=ground,
     )
 
+    # 4b. Commit door open/closed/locked status into the features overlay.
+    # Branch=0 level=0 flat index is 0 (same convention as traps above).
+    if door_states:
+        ds_arr = jnp.asarray(state.features.door_state)
+        for row, col, dval in door_states:
+            ds_arr = ds_arr.at[0, row, col].set(jnp.int8(dval))
+        state = state.replace(
+            features=state.features.replace(door_state=ds_arr),
+        )
+
     # 5. Apply player start position (default: any free floor tile).
     if lg.last_player_pos is not None:
         px, py = lg.last_player_pos
@@ -778,6 +886,36 @@ def _set_tile(
     if not (0 <= row < h and 0 <= col < w):
         return terrain_np
     return terrain_np.at[0, 0, row, col].set(jnp.int8(tile))
+
+
+def _stamp_map_block(
+    terrain_np: jax.Array, rows: Tuple[str, ...], w: int, h: int,
+) -> jax.Array:
+    """Write a literal vendor MAP grid into ``terrain[0, 0]``.
+
+    Source: vendor des ``MAP ... ENDMAP`` blocks.  Each character is mapped
+    through ``TERRAIN_CHAR_TO_TILE``; unknown glyphs (object/monster overlay
+    symbols that the des places via separate directives) fall back to FLOOR
+    so the tile is walkable.  Spaces resolve to ``VOID`` (vendor
+    ``INIT_MAP:solidfill,' '`` stone), giving the level a hard boundary
+    instead of the LG's default open-FLOOR fill.
+    """
+    floor = int(TileType.FLOOR)
+    for y, line in enumerate(rows):
+        if y >= h:
+            break
+        for x, ch in enumerate(line):
+            if x >= w:
+                break
+            tile = TERRAIN_CHAR_TO_TILE.get(ch)
+            if tile is None:
+                # Glyph is an object/monster placement char (e.g. '!', '/');
+                # the underlying terrain is open floor.
+                tile = floor
+            else:
+                tile = int(tile)
+            terrain_np = terrain_np.at[0, 0, y, x].set(jnp.int8(tile))
+    return terrain_np
 
 
 def _resolve_and_carve_room(

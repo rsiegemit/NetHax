@@ -1990,14 +1990,21 @@ class _RealLGAdapter:
         return int(col), int(row)
 
     def set_map(self, rows: List[str]) -> None:
-        # Real LG doesn't ingest MAP blocks directly; replay as
-        # fill_terrain calls for each non-fill character.
+        # Prefer the real LG's authoritative MAP ingestion (added so the des
+        # path stamps a correctly-bounded level instead of leaking open
+        # FLOOR).  Source: vendor des ``MAP ... ENDMAP`` blocks.  Fall back to
+        # per-cell fill_terrain only if the inner LG predates set_map.
         self._rec("set_map", (rows,), {})
-        # We can't bulk-set without violating dimensions; skip if too big.
         inner = self._inner
+        if _has(inner, "set_map"):
+            try:
+                inner.set_map(rows)
+                return
+            except Exception:
+                pass
         if not _has(inner, "fill_terrain"):
             return
-        # Map every recognised terrain glyph in each row.
+        # Legacy replay: map every recognised terrain glyph in each row.
         for y, line in enumerate(rows):
             for x, ch in enumerate(line):
                 if ch == " ":
