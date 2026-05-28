@@ -447,6 +447,21 @@ class NethaxEnv:
         # Seed the explored mask via FOV so the player can see their starting
         # room on the very first frame.  Without this the initial obs is all
         # NO_GLYPH and the UI shows an empty screen.
+        #
+        # ``build_glyphs`` renders an explored-but-not-visible cell from
+        # ``last_seen_terrain`` (vendor/nethack/src/display.c::lastseentyp
+        # ~line 850); a never-visible cell whose last_seen is the -1 sentinel
+        # falls back to S_stone (cmap_to_glyph(S_stone)=2359).  Seeding only
+        # ``explored`` therefore left the entire starting room rendering as
+        # stone, because at reset ``visible`` was all-False and
+        # ``last_seen_terrain`` was all -1.  Vendor's ``vision_recalc``
+        # (vendor/nle/src/vision.c::vision_recalc) runs at level entry and
+        # both marks the FOV tiles IN_SIGHT *and* stamps ``levl[x][y].glyph``
+        # so the starting room shows its floor (S_room, cmap 19 -> glyph 2378)
+        # and bounding walls (S_vwall/S_hwall/corners, cmap 1-6 -> 2360-2365).
+        # Mirror that here by also seeding ``visible`` and stamping
+        # ``last_seen_terrain`` for the FOV tiles — exactly as the per-step
+        # ``subsystems/action_dispatch.py::_apply_fov`` does after a move.
         from Nethax.nethax.fov import compute_fov
         vis = compute_fov(
             state.terrain[0, 0, :, :],
@@ -455,7 +470,15 @@ class NethaxEnv:
         new_explored = state.explored.at[0, 0].set(
             state.explored[0, 0] | vis
         )
-        state = state.replace(explored=new_explored)
+        # Stamp last_seen_terrain for the visible tiles (display.c lastseentyp).
+        terrain_l0 = state.terrain[0, 0]
+        old_lst = state.last_seen_terrain[0, 0]
+        new_lst = jnp.where(vis, terrain_l0.astype(jnp.int8), old_lst)
+        state = state.replace(
+            explored=new_explored,
+            visible=vis,
+            last_seen_terrain=state.last_seen_terrain.at[0, 0].set(new_lst),
+        )
 
         # Drain DISP for the per-obs vendor draws (visible-monster glyph
         # selection + inventory slot ``obj_to_glyph``).  Mirrors
