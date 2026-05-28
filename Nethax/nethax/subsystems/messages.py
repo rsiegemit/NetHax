@@ -546,7 +546,7 @@ def clear_message(state: MessageState) -> MessageState:
 # what the validator checks against ``tty_chars row 0``).
 # ---------------------------------------------------------------------------
 
-# Per-role greeting prefix from vendor role.c::Hello.
+# Per-role greeting prefix from vendor role.c::Hello (lines 2119-2140).
 _ROLE_HELLO: tuple[str, ...] = (
     "Hello",        # 0  ARCHEOLOGIST
     "Hello",        # 1  BARBARIAN
@@ -563,71 +563,170 @@ _ROLE_HELLO: tuple[str, ...] = (
     "Hello",        # 12 WIZARD
 )
 
-# Per-role role-name as used in vendor welcome buf (role.c::roles[].name.m).
+# Per-role name (vendor role.c::roles[].name.m).
 _ROLE_NAME: tuple[str, ...] = (
     "Archeologist", "Barbarian", "Caveman", "Healer", "Knight",
     "Monk", "Priest", "Ranger", "Rogue", "Samurai", "Tourist",
     "Valkyrie", "Wizard",
 )
 
+# Per-role female name (vendor role.c::roles[].name.f); None = same as .m.
+# Used when the player is female and the role has a distinct female name.
+# Cite: vendor/nethack/src/role.c roles[] table.
+_ROLE_NAME_F: tuple[str | None, ...] = (
+    None,           # 0  ARCHEOLOGIST  (no distinct f)
+    None,           # 1  BARBARIAN     (no distinct f)
+    "Cavewoman",    # 2  CAVEMAN       role.c: Cavewoman
+    None,           # 3  HEALER
+    None,           # 4  KNIGHT
+    None,           # 5  MONK
+    "Priestess",    # 6  PRIEST        role.c: Priestess
+    None,           # 7  RANGER
+    None,           # 8  ROGUE
+    None,           # 9  SAMURAI
+    None,           # 10 TOURIST
+    None,           # 11 VALKYRIE      (female-only role; name.f is NULL)
+    None,           # 12 WIZARD
+)
+
+# Roles that allow BOTH genders (ROLE_MALE | ROLE_FEMALE set in .allow).
+# Vendor role.c::roles[].allow — gender bit-field.  When BOTH bits are set
+# the sex adjective is shown in the welcome line for new games.
+# Cite: vendor/nethack/src/allmain.c::welcome lines 682-686.
+_ROLE_ALLOWS_BOTH_GENDERS: tuple[bool, ...] = (
+    True,   # 0  ARCHEOLOGIST
+    True,   # 1  BARBARIAN
+    True,   # 2  CAVEMAN
+    True,   # 3  HEALER
+    True,   # 4  KNIGHT
+    True,   # 5  MONK
+    True,   # 6  PRIEST
+    True,   # 7  RANGER
+    True,   # 8  ROGUE
+    False,  # 9  SAMURAI  (male-only)
+    True,   # 10 TOURIST
+    False,  # 11 VALKYRIE (female-only)
+    True,   # 12 WIZARD
+)
+
+# Alignment adjective strings — vendor role.c::aligns[].adj (lines 762-764).
+_ALIGN_ADJ: tuple[str, ...] = (
+    "lawful",    # 0  A_LAWFUL
+    "neutral",   # 1  A_NEUTRAL
+    "chaotic",   # 2  A_CHAOTIC
+)
+
+# Race adjective strings — vendor role.c::races[].adj.
+_RACE_ADJ: tuple[str, ...] = (
+    "human",    # 0  HUMAN
+    "elven",    # 1  ELF
+    "dwarven",  # 2  DWARF
+    "gnomish",  # 3  GNOME
+    "orcish",   # 4  ORC
+)
+
 # Number of roles (matches Nethax.nethax.constants.roles.N_ROLES = 13).
 _N_ROLES_INTRO: int = 13
 
+# NLE default player name — vendor/nle/nle/env/base.py:306 sets
+# ``playername="Agent-" + character``; nethack parses ``plname`` as the
+# substring before the first '-', yielding "Agent".
+# Cite: vendor/nle/nle/env/base.py line 306.
+_NLE_PLAYER_NAME: str = "Agent"
 
-def _bake_role_intro_table() -> jnp.ndarray:
-    """Pack per-role welcome lines into a [N_ROLES, MSG_BUF_LEN] uint8 array.
 
-    Each row layout matches the buffer contract used elsewhere:
-        row[0]        = MessageId.ROLE_INTRO
-        row[1..1+len] = ASCII bytes of the rendered line.
+def _build_role_intro_line(
+    role: int,
+    race: int = 0,
+    alignment: int = 0,
+    female: bool = False,
+) -> str:
+    """Build the vendor welcome pline text for the given character spec.
 
-    Player-name defaults to "Player" (matches the legacy header in
-    obs/nle_obs.py ``_S_NAME_PREFIX`` and tombstone NAME_LINE rendering).
+    Mirrors vendor/nethack/src/allmain.c::welcome (lines 679-691)::
+
+        *buf = '\\0';
+        if (new_game ...) Sprintf(eos(buf), " %s", align_str(...));
+        if (!urole.name.f && (urole.allow & ROLE_GENDMASK) == BOTH_GENDERS)
+            Sprintf(eos(buf), " %s", genders[currentgend].adj);
+        pline("... You are a%s %s %s.", buf, urace.adj, role.name);
+
+    Returns the rendered ASCII line (no trailing NUL).
     """
-    arr = _np.zeros((_N_ROLES_INTRO, MSG_BUF_LEN), dtype=_np.uint8)
-    msg_id = int(MessageId.ROLE_INTRO) & 0xFF
-    for r in range(_N_ROLES_INTRO):
-        hello = _ROLE_HELLO[r]
-        role_name = _ROLE_NAME[r]
-        line = f"{hello} Player, welcome to NetHack!  You are a {role_name}."
-        raw = line.encode("ascii")[: MSG_BUF_LEN - 1]
-        arr[r, 0] = msg_id
-        arr[r, 1 : 1 + len(raw)] = list(raw)
-    return jnp.asarray(arr, dtype=jnp.uint8)
+    r = max(0, min(role, _N_ROLES_INTRO - 1))
+    hello     = _ROLE_HELLO[r]
+    role_name = _ROLE_NAME[r]
+    # Use female role name when player is female and role defines one.
+    if female and _ROLE_NAME_F[r] is not None:
+        role_name = _ROLE_NAME_F[r]  # type: ignore[assignment]
+
+    align_adj = _ALIGN_ADJ[max(0, min(alignment, 2))]
+
+    race_r    = max(0, min(race, len(_RACE_ADJ) - 1))
+    race_adj  = _RACE_ADJ[race_r]
+
+    # buf = " <align>" [ + " <sex>" if role allows both genders and name.f is None ]
+    buf = f" {align_adj}"
+    if _ROLE_ALLOWS_BOTH_GENDERS[r] and _ROLE_NAME_F[r] is None:
+        sex_adj = "female" if female else "male"
+        buf += f" {sex_adj}"
+
+    return (
+        f"{hello} {_NLE_PLAYER_NAME}, welcome to NetHack!"
+        f"  You are a{buf} {race_adj} {role_name}."
+    )
 
 
-# Module-level constant; baked once at import.
-_ROLE_INTRO_MSG: jnp.ndarray = _bake_role_intro_table()
-
-
-def emit_role_intro(state: MessageState, role) -> MessageState:
+def emit_role_intro(
+    state: MessageState,
+    role: int,
+    race: int = 0,
+    alignment: int = 0,
+    female: bool = False,
+) -> MessageState:
     """Emit the role-specific game-start welcome line.
 
-    Mirrors vendor/nethack/src/allmain.c::welcome lines 920-922 — the
-    ``pline("%s %s, welcome to NetHack! ...", Hello(), plname, buf)`` call
-    that runs once at new-game start.  Implemented as a static-byte-table
-    lookup (``_ROLE_INTRO_MSG[role]``) so the message text is pre-rendered
-    and the function is JIT-pure / vmap-safe.
+    Mirrors vendor/nethack/src/allmain.c::welcome (lines 679-691) — the
+    ``pline("%s %s, welcome to NetHack!  You are a%s %s %s.", ...)`` call
+    fired once at new-game start.
+
+    The message text is built on the Python host (reset is not JIT-compiled)
+    so it can incorporate the full alignment + sex + race + role descriptor,
+    matching NLE's ``message`` obs byte-for-byte.
+
+    Cite: vendor/nethack/src/allmain.c::welcome lines 679-691;
+          vendor/nle/nle/env/base.py line 306 (plname = "Agent").
 
     Parameters
     ----------
-    state : MessageState
-    role  : int / jnp.int32 — Role enum value (clipped to [0, N_ROLES-1]).
+    state     : MessageState
+    role      : Role integer index (0..12).
+    race      : Race integer index (0=Human, 1=Elf, 2=Dwarf, 3=Gnome, 4=Orc).
+    alignment : 0=lawful, 1=neutral, 2=chaotic.
+    female    : True if the player is female.
 
     Returns
     -------
-    Updated MessageState with the role-specific welcome line in
-    ``message_buffer`` and the previous buffer rotated into ``message_history``.
+    Updated MessageState with the welcome line in ``message_buffer`` and the
+    previous buffer rotated into ``message_history``.
     """
-    # Rotate current buffer into history (same contract as ``emit``).
-    safe_idx = jnp.mod(state.history_index, jnp.int32(HISTORY_LEN))
-    new_history = state.message_history.at[safe_idx].set(state.message_buffer)
-    new_index = jnp.mod(state.history_index + jnp.int32(1), jnp.int32(HISTORY_LEN))
+    # Build the ASCII welcome line on the host.
+    line = _build_role_intro_line(role, race=race, alignment=alignment, female=female)
 
-    # Clip the role index so out-of-range values fall back to row 0.
-    role_i32 = jnp.int32(role)
-    safe_role = jnp.clip(role_i32, jnp.int32(0), jnp.int32(_N_ROLES_INTRO - 1))
-    new_buffer = _ROLE_INTRO_MSG[safe_role]
+    # Pack into the MSG_BUF_LEN buffer:
+    #   byte 0       = MessageId.ROLE_INTRO  (internal msg_id tag)
+    #   bytes 1..len = ASCII text
+    #   remainder    = zero-padded
+    arr = _np.zeros((MSG_BUF_LEN,), dtype=_np.uint8)
+    arr[0] = int(MessageId.ROLE_INTRO) & 0xFF
+    raw = line.encode("ascii")[: MSG_BUF_LEN - 1]
+    arr[1 : 1 + len(raw)] = list(raw)
+    new_buffer = jnp.asarray(arr, dtype=jnp.uint8)
+
+    # Rotate current buffer into history (same contract as ``emit``).
+    safe_idx    = jnp.mod(state.history_index, jnp.int32(HISTORY_LEN))
+    new_history = state.message_history.at[safe_idx].set(state.message_buffer)
+    new_index   = jnp.mod(state.history_index + jnp.int32(1), jnp.int32(HISTORY_LEN))
 
     return state.replace(
         message_buffer=new_buffer,

@@ -2039,18 +2039,25 @@ def build_glyphs(env_state) -> jnp.ndarray:
 def build_message(env_state) -> jnp.ndarray:
     """Return the current message buffer as a 256-byte uint8 array.
 
-    Wave 2: directly returns env_state.messages.message_buffer (already 256
-    uint8). Pads with zeros or truncates if somehow mismatched.
+    The internal message_buffer layout (messages.py::_bake_templates) stores
+    the msg_id integer at byte 0 and the ASCII text at bytes 1..255.  NLE's
+    ``message`` observation (vendor/nle/include/nleobs.h) is pure ASCII from
+    byte 0 — no leading msg_id byte.  We therefore strip byte 0 and return
+    bytes 1..256 as the 256-byte obs, matching NLE exactly.
+
+    Cite: vendor/nle/include/nleobs.h — message field is char[256] raw text;
+          vendor/nle/win/rl/pynethack.cc — copies WIN_MESSAGE text verbatim.
 
     Returns:
         uint8[256]
     """
-    buf = env_state.messages.message_buffer  # uint8[256]
-    # Ensure shape is exactly (256,) — pad with zeros if shorter, trim if longer
-    buf = buf[:256]
-    pad_len = 256 - buf.shape[0]
-    buf = jnp.concatenate([buf, jnp.zeros((pad_len,), dtype=jnp.uint8)]) if pad_len > 0 else buf
-    return buf.astype(jnp.uint8)
+    buf = env_state.messages.message_buffer  # uint8[256], byte 0 = msg_id
+    # Skip the msg_id prefix byte; text occupies bytes 1..255 (255 usable chars).
+    # Append one zero byte so the result is exactly 256 bytes wide.
+    text = buf[1:256]                                          # uint8[255]
+    return jnp.concatenate(
+        [text, jnp.zeros((1,), dtype=jnp.uint8)]
+    ).astype(jnp.uint8)                                       # uint8[256]
 
 
 def build_tty(env_state) -> dict[str, jnp.ndarray]:

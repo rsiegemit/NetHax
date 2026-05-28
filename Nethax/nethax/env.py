@@ -298,9 +298,19 @@ class NethaxEnv:
         state = state.replace(skills=init_skills(role))
 
         # Emit the role-specific NLE intro line on row 0 of the message line.
+        # Pass race + alignment so the full vendor welcome string is rendered:
+        #   "%s %s, welcome to NetHack!  You are a%s %s %s."
+        #   Hello()  plname           buf       race.adj  role.name
+        # Cite: vendor/nethack/src/allmain.c::welcome lines 679-691;
+        #       vendor/nle/nle/env/base.py:306 (plname = "Agent").
         from Nethax.nethax.subsystems.messages import emit_role_intro as _emit_role_intro
         state = state.replace(
-            messages=_emit_role_intro(state.messages, int(role)),
+            messages=_emit_role_intro(
+                state.messages,
+                int(role),
+                race=int(race),
+                alignment=int(alignment),
+            ),
         )
 
         # Vendor mklev() begins by reseeding BOTH streams (vendor
