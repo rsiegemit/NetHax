@@ -1919,9 +1919,18 @@ def build_glyphs(env_state) -> jnp.ndarray:
     # Terrain glyph IDs
     terrain_glyphs = (cmap_idx + jnp.int16(GLYPH_CMAP_OFF)).astype(jnp.int16)
 
-    # Unexplored tiles -> NO_GLYPH
-    no_glyph_val = jnp.int16(NO_GLYPH & 0xFFFF)                           # NO_GLYPH as int16
-    glyphs = jnp.where(explored, terrain_glyphs, no_glyph_val)
+    # Unexplored tiles -> cmap_to_glyph(S_stone) (= GLYPH_CMAP_OFF + 0 = 2359),
+    # NOT NO_GLYPH.  NLE's RL window seeds the entire `glyphs` obs array with
+    # `nul_glyph = cmap_to_glyph(S_stone)` and re-fills any never-seen/background
+    # cell with the same value; NO_GLYPH (== MAX_GLYPH == 5976) is reserved for
+    # inventory slots and internal sentinels and is never written into the map
+    # observation.  Vendor cite: vendor/nle/win/rl/winrl.cc:61
+    # (`const int nul_glyph = cmap_to_glyph(S_stone);`) + winrl.cc:250,304,646
+    # (`glyphs_.fill(nul_glyph)` / `std::fill_n(obs->glyphs, ..., nul_glyph)`)
+    # and vendor/nethack/src/display.c:436
+    # (`levl[x][y].glyph = cmap_to_glyph(S_stone); /* default val */`).
+    stone_glyph_val = jnp.int16(GLYPH_CMAP_OFF + _S_stone)               # 2359
+    glyphs = jnp.where(explored, terrain_glyphs, stone_glyph_val)
 
     # Overlay live monsters at their tile positions.  Each visible, alive
     # monster slot writes GLYPH_MON_OFF + entry_idx at its (row, col).

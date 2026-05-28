@@ -116,9 +116,11 @@ from Nethax.nethax.constants.glyphs import MAX_GLYPH
 def test_glyphs_in_valid_range(action):
     """All glyph values after any step must be in [0, MAX_GLYPH].
 
-    Vendor uses MAX_GLYPH (5976) as the "no glyph" / unexplored sentinel —
-    legitimately produced by obs builders for unseen cells.  Real tile
-    glyphs occupy 0..MAX_GLYPH-1 (5975); 5976 is the canonical empty marker.
+    Real tile glyphs occupy 0..MAX_GLYPH-1 (5975).  NO_GLYPH == MAX_GLYPH ==
+    5976 is reserved for inventory slots / internal sentinels only — the map
+    `glyphs` obs never contains it: NLE fills unseen cells with
+    cmap_to_glyph(S_stone) (= 2359), not NO_GLYPH (vendor winrl.cc:61,250).
+    This bound stays an inclusive upper limit regardless.
     """
     env = _ENV
     rng = jax.random.PRNGKey(action + 3000)

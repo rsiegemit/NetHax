@@ -139,8 +139,22 @@ class TestLastSeenTerrain:
             f"glyph {expected_open_glyph}"
         )
 
-    def test_unexplored_no_glyph(self):
-        """Unexplored tiles always render as NO_GLYPH regardless of last_seen."""
+    def test_unexplored_stone_glyph(self):
+        """Unexplored tiles render as cmap_to_glyph(S_stone) (= GLYPH_CMAP_OFF
+        + 0 = 2359), NOT NO_GLYPH.
+
+        NLE's RL window seeds the entire ``glyphs`` obs array with
+        ``nul_glyph = cmap_to_glyph(S_stone)`` and re-fills any never-seen /
+        background cell with the same value.  NO_GLYPH (== MAX_GLYPH == 5976)
+        is reserved for inventory slots / internal sentinels and is never
+        written into the map observation.
+
+        Vendor cite: vendor/nle/win/rl/winrl.cc:61
+        (``const int nul_glyph = cmap_to_glyph(S_stone);``) + winrl.cc:250,304,646
+        (``glyphs_.fill(nul_glyph)`` / ``std::fill_n(obs->glyphs, ..., nul_glyph)``)
+        and vendor/nethack/src/display.c:436
+        (``levl[x][y].glyph = cmap_to_glyph(S_stone); /* default val */``).
+        """
         state = _default_state()
 
         # Set some non-trivial values but do NOT mark explored
@@ -151,8 +165,14 @@ class TestLastSeenTerrain:
         glyphs = build_glyphs(state)
         glyph_val = int(glyphs[5, 5])
 
-        assert glyph_val == _no_glyph_val(), (
-            f"Unexplored tile should be NO_GLYPH ({_no_glyph_val()}), got {glyph_val}"
+        expected = GLYPH_CMAP_OFF  # cmap_to_glyph(S_stone), S_stone == 0
+        assert glyph_val == expected, (
+            f"Unexplored tile should be cmap_to_glyph(S_stone) ({expected}), "
+            f"got {glyph_val}"
+        )
+        assert glyph_val != _no_glyph_val(), (
+            "Unexplored map cell must NOT be NO_GLYPH; NLE writes nul_glyph "
+            "(S_stone) into the glyphs obs array, never NO_GLYPH."
         )
 
     def test_last_seen_sentinel_explored_not_visible(self):

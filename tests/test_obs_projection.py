@@ -175,16 +175,25 @@ def test_glyphs_player_not_zero():
     assert int(obs["glyphs"][5, 5]) != (NO_GLYPH & 0xFFFF)
 
 
-def test_glyphs_unexplored_is_no_glyph():
-    """Unexplored tiles (explored==False) should have NO_GLYPH value."""
+def test_glyphs_unexplored_is_stone_glyph():
+    """Unexplored tiles (explored==False) render as cmap_to_glyph(S_stone)
+    (= GLYPH_CMAP_OFF + 0 = 2359), NOT NO_GLYPH.
+
+    NLE fills the glyphs obs array with ``nul_glyph = cmap_to_glyph(S_stone)``
+    for every never-seen / background cell; NO_GLYPH (5976) is never written
+    into the map observation.  Vendor cite: vendor/nle/win/rl/winrl.cc:61,250,
+    304,646 + vendor/nethack/src/display.c:436.
+    """
+    from Nethax.nethax.constants.glyphs import GLYPH_CMAP_OFF
+
     state = _default_state()
     # Default state: explored array is all False; player at (0,0)
-    # Any tile NOT at player_pos should be NO_GLYPH
+    # Any tile NOT at player_pos should be the stone background glyph.
     obs = build_nle_observation(state)
     # Tile (5, 5) is not the player position (0,0) and is unexplored
     tile_val = int(obs["glyphs"][5, 5])
-    expected = int(jnp.int16(NO_GLYPH & 0xFFFF))
-    assert tile_val == expected
+    assert tile_val == GLYPH_CMAP_OFF  # cmap_to_glyph(S_stone), S_stone == 0
+    assert tile_val != int(jnp.int16(NO_GLYPH & 0xFFFF))
 
 
 def test_glyphs_shape_and_dtype():
