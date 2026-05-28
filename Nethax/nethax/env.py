@@ -45,6 +45,7 @@ from Nethax.nethax.constants import TileType
 from Nethax.nethax.subsystems.character import create_character, get_starting_pet
 from Nethax.nethax.subsystems.skills import init_skills
 from Nethax.nethax.subsystems.digging import dig_tick as _dig_tick
+from Nethax.nethax.subsystems.messages import clear_message as _clear_message
 from Nethax.nethax.subsystems.riding import tick_gallop as _tick_gallop
 from Nethax.nethax.subsystems.riding import tick_saddle as _tick_saddle
 from Nethax.nethax.subsystems.swallow import digest_tick as _digest_tick
@@ -814,8 +815,15 @@ def _step_impl(state, action, rng):
     prev_level  = state.dungeon.current_level.astype(jnp.int32)
 
     def _do_step(_):
+        # Pre-1. Clear message buffer — vendor topl.c / winrl.cc:353 zeros
+        # obs->message when ttyDisplay->toplin==0 (no new pline this turn).
+        # Without this the welcome line persists across every step.
+        # Cite: vendor/nle/win/rl/winrl.cc line 353 — std::memset(obs->message,
+        #       0, NLE_MESSAGE_SIZE) when toplin is false at obs-fill time.
+        ns0 = state.replace(messages=_clear_message(state.messages))
+
         # 1. Player action — allmain.c line 203 (svc.context.move).
-        ns = dispatch_action(state, action, rng_act)
+        ns = dispatch_action(ns0, action, rng_act)
 
         # 1a. Astral-Plane mplayer trigger — vendor mplayer.c::create_mplayers
         #     (lines 327-355) called from astral.lua MAP section on level
