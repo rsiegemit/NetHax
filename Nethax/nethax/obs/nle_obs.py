@@ -905,8 +905,14 @@ def build_screen_descriptions(env_state) -> jnp.ndarray:
     the first 80 bytes (null-padded) into screen_descriptions[r, c, :].
 
     Implementation: single fancy-index into the static _GLYPH_TO_DESCRIPTION_BYTES
-    lookup table built at module load.  Unexplored tiles (NO_GLYPH) yield zero
-    bytes naturally because the lookup table is zero-filled at NO_GLYPH.
+    lookup table built at module load.
+
+    Vendor parity (vendor/nle/win/rl/winrl.cc::store_screen_description, line
+    940-941): store_screen_description is only called inside show_glyph(), which
+    only fires for explored/visible cells.  The screen_descriptions buffer is
+    memset to 0 before each turn (winrl.cc:316-317, 651), so unexplored cells
+    (those that never had show_glyph called) remain all-zero.  We replicate
+    this by zeroing the description for any cell where explored==False.
 
     Reference: vendor/nethack/src/pager.c::do_screen_description and
                vendor/nle/win/rl/winrl.cc::store_screen_description.
@@ -917,7 +923,15 @@ def build_screen_descriptions(env_state) -> jnp.ndarray:
     glyphs = build_glyphs(env_state)  # int16[21,79]
     # Clamp index into [0, MAX_GLYPH-1] before fancy indexing.
     g_idx = jnp.clip(glyphs.astype(jnp.int32), 0, _GLYPH_TO_DESCRIPTION_BYTES.shape[0] - 1)
-    return _GLYPH_TO_DESCRIPTION_BYTES[g_idx]
+    desc = _GLYPH_TO_DESCRIPTION_BYTES[g_idx]  # uint8[21,79,80]
+
+    # Zero out descriptions for unexplored tiles — vendor only calls
+    # store_screen_description for cells that went through show_glyph().
+    branch = jnp.int32(env_state.dungeon.current_branch)
+    level_idx = jnp.int32(env_state.dungeon.current_level) - 1  # 0-based
+    explored = env_state.explored[branch, level_idx, :21, :79]  # bool[21,79]
+    # Broadcast explored[21,79] -> [21,79,1] to mask [21,79,80]
+    return jnp.where(explored[:, :, None], desc, jnp.zeros_like(desc))
 
 
 def build_program_state(env_state) -> jnp.ndarray:
