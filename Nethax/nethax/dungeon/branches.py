@@ -663,6 +663,34 @@ def enter_branch(state: DungeonState, branch_id: int) -> DungeonState:
     )
 
 
+def _sort_rooms_by_lx(rooms, active):
+    """Reorder rooms by ``lx`` ascending — vendor ``sort_rooms()``.
+
+    Vendor mklev.c:707 qsorts ``rooms[0..nroom)`` using ``do_comp``
+    (mklev.c:62-64), which compares the left edge ``lx`` only.  Every
+    post-makerooms consumer (stair picks, makecorridors' join(a, a+1)
+    walk, make_niches) then indexes the lx-sorted array, so the sort must
+    run before any of those draws to keep the ISAAC64 stream byte-exact.
+
+    Inactive slots carry the lx == -1 sentinel from makerooms.  We key
+    them to a large value (COLNO+1 = 81 > any real lx) so they land after
+    every active room, matching vendor's "sort only the first nroom
+    entries; leave the tail untouched" behaviour.  Stable sort (argsort)
+    handles equal-lx ties deterministically; distinct lx is the common
+    case for non-overlapping rooms.
+
+    Citation: vendor/nle/src/mklev.c:707 (sort_rooms),
+              vendor/nle/src/mklev.c:46-66 (do_comp keys on lx),
+              vendor/nle/src/mklev.c:98-107 (qsort by do_comp).
+    """
+    # Sort key: active rooms by lx; inactive sink to the back.
+    sort_key = jnp.where(active, rooms.x1.astype(jnp.int32), jnp.int32(81))
+    order = jnp.argsort(sort_key, stable=True)
+    sorted_rooms = jax.tree_util.tree_map(lambda f: f[order], rooms)
+    sorted_active = active[order]
+    return sorted_rooms, sorted_active
+
+
 def generate_main_branch_l1(
     rng: jnp.ndarray,
     static_params,  # StaticParams — imported lazily to avoid circular dep
@@ -734,6 +762,23 @@ def generate_main_branch_l1(
         vendor_rng, _pool, rooms, active, _nroom, _tried_vault = makerooms(
             vendor_rng, pool0, depth=1,
         )
+
+        # sort_rooms() — vendor mklev.c:707.  Vendor qsorts the rooms[]
+        # array by ``lx`` (do_comp at mklev.c:62-64 compares lx only) so
+        # that all subsequent indexing — the stair-room picks
+        # rooms[rn2(nroom)] (mklev.c:710,715), makecorridors' sequential
+        # join(a, a+1) walk (mklev.c:325), and make_niches — operate on
+        # the ascending-lx order.  makerooms produces rooms in placement
+        # order, NOT lx order, so without this sort the down-stair somex
+        # width (rn2(hx-lx+1)) is drawn from the wrong room and the
+        # ISAAC64 stream diverges at the first post-makerooms draw.
+        # Inactive slots carry the lx=-1 sentinel; we key them to a large
+        # value so they sort AFTER every active room (vendor only sorts
+        # the first ``nroom`` entries; the tail sentinels are untouched).
+        # Citation: vendor/nle/src/mklev.c:707 (sort_rooms),
+        #           vendor/nle/src/mklev.c:46-66 (do_comp, lx-only key),
+        #           vendor/nle/src/mklev.c:98-107 (qsort by do_comp).
+        rooms, active = _sort_rooms_by_lx(rooms, active)
     else:
         # Threefry layout path (non-parity): original rejection sampler.
         rooms, active, vendor_rng = generate_rooms(

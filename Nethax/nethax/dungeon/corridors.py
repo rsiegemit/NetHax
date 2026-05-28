@@ -516,9 +516,10 @@ def dodoor(
     """Vendor mklev.c:1249-1260 ``dodoor`` -> mklev.c:383-447 ``dosdoor``.
 
     Draws (in vendor order):
-        rn2(8)   — DOOR vs SDOOR (mklev.c:1259), only when depth > 2
-                   (vendor maybe_sdoor mklev.c:1793-1795 gates on depth>2;
-                   on Dlvl 1-2 this draw is SKIPPED and type is forced DOOR)
+        rn2(8)   — DOOR vs SDOOR (mklev.c:1259).  UNCONDITIONAL — vendor
+                   ``dodoor`` always calls ``dosdoor(x, y, aroom,
+                   rn2(8) ? DOOR : SDOOR)``; there is no ``maybe_sdoor``
+                   depth gate in this vendor tree.
         rn2(3)   — DOOR: locked/closed/open path vs NODOOR (mklev.c:395)
         rn2(5)   — DOOR&&path: open? (mklev.c:396)
         rn2(6)   — DOOR&&path&&!open: locked? (mklev.c:398)
@@ -534,17 +535,15 @@ def dodoor(
     For Phase 4 we expose a ``level_difficulty`` int parameter; defaults
     skip the trap rolls (Dlvl 1 behaviour).
 
-    Vendor cite: mklev.c:1793-1802 maybe_sdoor + dodoor.
+    Vendor cite: vendor/nle/src/mklev.c:1249-1260 dodoor + mklev.c:384-447
+    dosdoor.
     """
-    # rn2(8): DOOR (non-zero) vs SDOOR (zero).
-    # Vendor maybe_sdoor(8): only draws when depth > 2; returns FALSE
-    # (force DOOR) on shallow levels without consuming RNG.
-    # Vendor cite: vendor/nethack/src/mklev.c:1793-1795
-    if depth > 2:
-        rng, r8 = rn2_jax(rng, jnp.int32(8))
-        is_door_kind = r8 != jnp.int32(0)
-    else:
-        is_door_kind = jnp.bool_(True)  # forced DOOR, no draw
+    # rn2(8): DOOR (non-zero) vs SDOOR (zero).  Vendor ``dodoor``
+    # unconditionally evaluates ``rn2(8) ? DOOR : SDOOR`` — there is no
+    # depth gate, so this draw ALWAYS fires (even on Dlvl 1).
+    # Vendor cite: vendor/nle/src/mklev.c:1259.
+    rng, r8 = rn2_jax(rng, jnp.int32(8))
+    is_door_kind = r8 != jnp.int32(0)
 
     # Avoid SDOORs on already-made doors: if !IS_WALL(typ), force DOOR.
     cur = gs.typ[x, y]
