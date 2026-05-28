@@ -715,12 +715,30 @@ def generate_main_branch_l1(
         from Nethax.nethax.vendor_rng import rn2_jax as _rn2_jax
         vendor_rng, _medusa_r5 = _rn2_jax(vendor_rng, jnp.int32(5))
 
-    # 1. Place rooms.  When vendor_rng is supplied (NLE_BYTEPARITY) the
-    #    per-room y/x/h/w/lit draws come from the ISAAC64 stream so the
-    #    layout byte-matches vendor C; otherwise the original Threefry path.
-    rooms, active, vendor_rng = generate_rooms(
-        k_rooms, h, w, n_rooms=n_rooms, vendor_rng=vendor_rng,
-    )
+    # 1. Place rooms.
+    #
+    # Byte-parity path (vendor_rng supplied): vendor makelevel() calls
+    # init_rect() then makerooms() (mklev.c:705-706).  The legacy
+    # generate_rooms uses its own rejection-sampling draw order, which
+    # diverges from vendor's rnd_rect()/create_room() stream at the very
+    # first room draw (the makerooms while-loop rnd_rect = rn2(rect_cnt)).
+    # Route through the vendor-exact Phase-2/3 makerooms() so the ISAAC64
+    # byte stream matches vendor C from mklev's room generation onward.
+    # Citation: vendor/nle/src/mklev.c:705-706 (init_rect + makerooms),
+    #           vendor/nle/src/rect.c:28-35 (init_rect),
+    #           vendor/nle/src/rect.c:88-92 (rnd_rect = rn2(rect_cnt)).
+    if vendor_rng is not None:
+        from Nethax.nethax.dungeon.rooms import makerooms
+        from Nethax.nethax.dungeon.rect_pool import init_rect
+        pool0 = init_rect()
+        vendor_rng, _pool, rooms, active, _nroom, _tried_vault = makerooms(
+            vendor_rng, pool0, depth=1,
+        )
+    else:
+        # Threefry layout path (non-parity): original rejection sampler.
+        rooms, active, vendor_rng = generate_rooms(
+            k_rooms, h, w, n_rooms=n_rooms, vendor_rng=vendor_rng,
+        )
 
     # 2. Carve rooms into blank terrain.
     terrain = jnp.zeros((h, w), dtype=jnp.int8)
