@@ -29,7 +29,7 @@ import jax.lax as lax
 from flax import struct
 
 from Nethax.nethax.dungeon.branches import MAP_H, MAP_W
-from Nethax.nethax.vendor_rng import Isaac64State, randint_jax
+from Nethax.nethax.vendor_rng import Isaac64State, randint_jax, rnd_jax
 from Nethax.nethax.subsystems.random_objects import (
     _MKOBJ_TABLE,
     _mkbox_cnts_draws,
@@ -2179,9 +2179,9 @@ def fill_ordinary_rooms(
 
             def _tryct_body(idx, vi):
                 def _do_mkobj(vj):
-                    vj, cls_roll = randint_jax(vj, (), 0, 100)   # rnd(100)-1 mkobj.c:259
-                    oclass_g = _MKOBJ_TABLE[cls_roll]
-                    vj, typ_g = randint_jax(vj, (), 1, 1001)     # rnd(prob_total) mkobj.c:265
+                    vj, typ_g = rnd_jax(vj, 1000)                # prob = rnd(1000) mkobj.c:251
+                    vj, cls_roll = rnd_jax(vj, 100)              # tprob = rnd(100) mkobj.c:259
+                    oclass_g = _MKOBJ_TABLE[cls_roll - jnp.int32(1)]
                     otyp_g = decode_picked_otyp(oclass_g, typ_g) # mkobj.c:264-266
                     vj = consume_mksobj_init_draws(vj, oclass_g, otyp_g)  # mkobj.c:801-1069
                     return vj
@@ -2361,17 +2361,18 @@ def fill_ordinary_rooms(
         def _mkobj_true(vrng_in):
             # First mkobj_at call (vendor mklev.c:875).
             # Vendor mkobj(RANDOM_CLASS) draw order (mkobj.c:251-272):
-            #   1. rnd(100) - 1 → index into class-table (mkobj.c:259)
-            #   2. rnd(oclass_prob_total) — type pick within class (mkobj.c:265)
-            #   3. mksobj_init cascade — class-specific (mkobj.c:801-1069)
-            # _MKOBJ_TABLE is a length-100 jnp.array mapping roll→oclass;
-            # using it here decodes the class so consume_mksobj_init_draws
+            #   1. prob  = rnd(1000)              — drawn FIRST (mkobj.c:251)
+            #   2. tprob = rnd(100)               — class pick (mkobj.c:259)
+            #   3. mksobj_init cascade            — class-specific (mkobj.c:801-1069)
+            # ``prob`` is the type-pick roll; ``tprob`` indexes _MKOBJ_TABLE
+            # (a length-100 jnp.array mapping roll→oclass).  rnd(100) ∈ [1..100]
+            # so subtract 1 for the 0-based table index.  consume_mksobj_init_draws
             # dispatches the exact per-class draw count via lax.switch.
             # Vendor cite: mkobj.c:251-272 (mkobj); mkobj.c:801-1069 (init).
             vrng_in, _rmk, _cmk = somexy(vrng_in)
-            vrng_in, cls_roll0 = randint_jax(vrng_in, (), 0, 100)  # rnd(100)-1 (mkobj.c:259)
-            oclass0 = _MKOBJ_TABLE[cls_roll0]
-            vrng_in, typ0 = randint_jax(vrng_in, (), 1, 1001)      # rnd(prob_total) (mkobj.c:265)
+            vrng_in, typ0 = rnd_jax(vrng_in, 1000)                 # prob = rnd(1000) (mkobj.c:251)
+            vrng_in, cls_roll0 = rnd_jax(vrng_in, 100)             # tprob = rnd(100) (mkobj.c:259)
+            oclass0 = _MKOBJ_TABLE[cls_roll0 - jnp.int32(1)]
             # Decode picked otyp from the type-roll so TOOL_CLASS can dispatch
             # to its per-otyp cascade (mkobj.c:897-966 + mkbox_cnts).  Other
             # classes ignore the otyp argument (legacy 0-draw fallback).
@@ -2402,9 +2403,9 @@ def fill_ordinary_rooms(
 
                 def _inner_true(vi):
                     vi, _ro, _co = somexy(vi)
-                    vi, cls_roll = randint_jax(vi, (), 0, 100)       # rnd(100)-1 (mkobj.c:259)
-                    oclass_i = _MKOBJ_TABLE[cls_roll]
-                    vi, typ_i = randint_jax(vi, (), 1, 1001)         # rnd(prob_total) (mkobj.c:265)
+                    vi, typ_i = rnd_jax(vi, 1000)                    # prob = rnd(1000) (mkobj.c:251)
+                    vi, cls_roll = rnd_jax(vi, 100)                  # tprob = rnd(100) (mkobj.c:259)
+                    oclass_i = _MKOBJ_TABLE[cls_roll - jnp.int32(1)]
                     otyp_i = decode_picked_otyp(oclass_i, typ_i)     # mkobj.c:264-266
                     vi = consume_mksobj_init_draws(vi, oclass_i, otyp_i)  # mkobj.c:801-1069
                     return vi
