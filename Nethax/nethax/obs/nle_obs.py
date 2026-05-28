@@ -765,7 +765,7 @@ def build_specials(env_state) -> jnp.ndarray:
     nethax-current support:
       MG_CORPSE   : food category + corpse type_id on ground stack
       MG_OBJPILE  : 2+ ground stacks
-      MG_PET      : 1 if at least one pet exists at this tile (state.pets)
+      MG_PET      : tame alive monster on tile (monster_ai.tame & monster_ai.alive)
       MG_INVIS/MG_DETECT/MG_RIDDEN/MG_STATUE/MG_BW_LAVA: unset for now.
 
     Returns:
@@ -823,32 +823,23 @@ def build_specials(env_state) -> jnp.ndarray:
 def _pet_mask(env_state, branch, level_idx) -> jnp.ndarray:
     """Return a bool[21,79] mask of tiles occupied by a pet (tame monster).
 
-    Resilient to missing pet state — returns all False if pets aren't tracked.
+    Vendor cite: vendor/nle/src/mapglyph.c line 201-207 — the GLYPH_PET_OFF
+    branch sets ``special |= MG_PET`` for every tame monster glyph.  We mirror
+    that by marking any tile where an alive & tame monster (mai.tame[i] == True)
+    currently resides.
+
+    monster_ai holds all monsters for the *current* level only, so no
+    branch/level filtering is needed — the state is already level-local.
     """
-    pets = getattr(env_state, "pets", None)
-    if pets is None:
-        return jnp.zeros((21, 79), dtype=jnp.bool_)
-    # Common layout: pets.active is bool[N_PETS]; pets.pos is int16[N_PETS,2];
-    # pets.branch/pets.level identify which level each pet is on.
-    active = getattr(pets, "active", None)
-    pos = getattr(pets, "pos", None)
-    pet_branch = getattr(pets, "branch", None)
-    pet_level = getattr(pets, "level", None)
-    if active is None or pos is None:
-        return jnp.zeros((21, 79), dtype=jnp.bool_)
-    mask = jnp.zeros((21, 79), dtype=jnp.bool_)
-    n_pets = pos.shape[0]
-    for i in range(n_pets):
-        r = jnp.clip(jnp.int32(pos[i, 0]), 0, 20)
-        c = jnp.clip(jnp.int32(pos[i, 1]), 0, 78)
-        on_level = jnp.bool_(True)
-        if pet_branch is not None:
-            on_level = on_level & (jnp.int32(pet_branch[i]) == branch)
-        if pet_level is not None:
-            on_level = on_level & (jnp.int32(pet_level[i]) == (level_idx + 1))
-        is_here = jnp.bool_(active[i]) & on_level
-        mask = mask.at[r, c].set(mask[r, c] | is_here)
-    return mask
+    mai = env_state.monster_ai
+    rows = jnp.clip(mai.pos[:, 0].astype(jnp.int32), 0, 20)
+    cols = jnp.clip(mai.pos[:, 1].astype(jnp.int32), 0, 78)
+    is_pet = mai.alive & mai.tame                              # bool[N]
+    # Scatter: for each pet slot, set mask[r, c] = True.
+    flat_idx = rows * jnp.int32(79) + cols                    # int32[N]
+    flat_mask = jnp.zeros(21 * 79, dtype=jnp.bool_)
+    flat_mask = flat_mask.at[flat_idx].max(is_pet)
+    return flat_mask.reshape(21, 79)
 
 
 def build_internal(env_state) -> jnp.ndarray:
