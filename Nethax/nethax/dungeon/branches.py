@@ -1079,6 +1079,79 @@ def generate_main_branch_l1(
         # Phase 5 will rasterise it onto ``terrain``.
         del _lgs, _rooms_box
 
+        # ------------------------------------------------------------------
+        # place_branch(branchp, 0, 0) — vendor mklev.c:800.
+        #
+        # makelevel() places the multi-dungeon branch stairway AFTER
+        # make_niches() and the (Dlvl-1-noop) do_vault()/SHOPBASE blocks,
+        # immediately before the fill_ordinary_rooms loop.  On Main Dlvl 1
+        # ``branchp`` is the Mines branch (BR_STAIR) so place_branch falls
+        # into ``find_branch_room`` (mklev.c:1169-1172) which consumes:
+        #
+        #   1. rn2(nroom)         branch-room pick      mklev.c:1118
+        #                         (do/while retry excluding dnstairs_room /
+        #                          upstairs_room / non-OROOM, tryct < 100)
+        #   2. somex(croom) = rn1(hx-lx+1, lx)          mkroom.c:643
+        #   3. somey(croom) = rn1(hy-ly+1, ly)          mkroom.c:650
+        #                         (do/while retry while occupied or the cell
+        #                          is not CORR/ROOM — on a freshly generated
+        #                          level the first interior cell is unoccupied
+        #                          ROOM so a single somexy fires)
+        #
+        # The do_vault()/SHOPBASE blocks (mklev.c:738-796) draw NOTHING on
+        # seed-0 Main Dlvl 1 (vault_x == -1 so do_vault() is false, and
+        # every ``u_depth > N`` shop/court gate is false at depth 1), so
+        # emitting these draws here — before the wrapper's maybe_create_vault
+        # / fill_ordinary_rooms — is byte-identical to vendor's post-vault
+        # placement.  Confirmed against the instrumented NLE caller trace:
+        # vendor draw 1187 = rn2(5) @ find_branch_room+ (mklev.c:1118),
+        # draws 1188/1189 = rn2(3)/rn2(3) @ somex/somey (mkroom.c:643,650).
+        #
+        # ``upstairs_room`` is NULL on Dlvl 1 (mkstairs(up=1) is skipped by
+        # the dlevel!=1 gate at mklev.c:720), and ``dnstairs_room`` is the
+        # down-stair room ``down_idx``.  All Dlvl 1 rooms are OROOM, so the
+        # only exclusion that fires is ``croom == dnstairs_room``.
+        # Vendor cite: vendor/nle/src/mklev.c:800,1105-1132,1537-1563;
+        #              vendor/nle/src/mkroom.c:640-651.
+        from Nethax.nethax.vendor_rng import rn1_jax as _rn1_jax
+
+        # nroom > 2 path (mklev.c:1114): do/while redraw rn2(nroom) while the
+        # pick collides with the down-stair room.  tryct < 100 caps the loop.
+        def _branch_pick_cond(carry):
+            _vr, idx, tryct = carry
+            collide = (idx == down_idx) & has_rooms
+            return collide & (tryct < jnp.int32(100))
+
+        def _branch_pick_body(carry):
+            vr, _idx, tryct = carry
+            vr, idx = rn2_jax(vr, jnp.maximum(nroom_int, jnp.int32(1)))
+            return vr, idx, tryct + jnp.int32(1)
+
+        # First (unconditional) draw of the do/while, then redraw-on-collide.
+        vendor_rng, _br_idx0 = rn2_jax(
+            vendor_rng, jnp.maximum(nroom_int, jnp.int32(1)),
+        )
+        vendor_rng, branch_idx, _br_tryct = lax.while_loop(
+            _branch_pick_cond,
+            _branch_pick_body,
+            (vendor_rng, _br_idx0, jnp.int32(1)),
+        )
+
+        # somex(branch_croom) / somey(branch_croom) — single iteration on a
+        # fresh level (interior cell is unoccupied ROOM, mklev.c:1127-1129).
+        br_lx = rooms.x1[branch_idx]
+        br_ly = rooms.y1[branch_idx]
+        br_hx = rooms.x2[branch_idx]
+        br_hy = rooms.y2[branch_idx]
+        br_w = jnp.maximum(
+            (br_hx - br_lx + jnp.int16(1)).astype(jnp.int32), jnp.int32(1)
+        )
+        br_h = jnp.maximum(
+            (br_hy - br_ly + jnp.int16(1)).astype(jnp.int32), jnp.int32(1)
+        )
+        vendor_rng, _br_sx = _rn1_jax(vendor_rng, br_w, br_lx.astype(jnp.int32))
+        vendor_rng, _br_sy = _rn1_jax(vendor_rng, br_h, br_ly.astype(jnp.int32))
+
         # Use the vendor down-stair (sx, sy) as the JAX-level player /
         # down-stair position so the byte-parity stream is observable
         # via blstats[0,1].  On Dlvl 1 vendor's actual player spawn
