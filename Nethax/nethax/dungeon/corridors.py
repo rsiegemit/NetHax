@@ -349,6 +349,70 @@ def make_empty_level_gen_state() -> LevelGenState:
     )
 
 
+def stamp_rooms_into_typ(gs: "LevelGenState", rooms: "RoomsBox") -> "LevelGenState":
+    """Stamp each active room's walls + floor into ``gs.typ`` per vendor add_room.
+
+    Vendor ``add_room`` (mklev.c:160-182) writes the level grid BEFORE
+    makecorridors runs, so finddpos' ``okdoor`` check (which only accepts
+    HWALL/VWALL cells) and dig_corridor's ``passable`` reads (STONE is the
+    only diggable ``btyp``) see real room geometry.  Our LevelGenState
+    grid started all-STONE, so okdoor always failed and every finddpos
+    fell through to its ``(xl, yh)`` fallback — shifting door positions
+    and diverging the corridor walk's rn2(dix-diy+1) bias spans.
+
+    Vendor add_room stamping for a room (lowx,lowy)-(hix,hiy):
+        HWALL on rows  y = lowy-1 and y = hiy+1   (x in lowx-1..hix+1)
+        VWALL on cols  x = lowx-1 and x = hix+1   (y in lowy..hiy)
+        ROOM  on interior (x in lowx..hix, y in lowy..hiy)
+        corners (lowx-1,lowy-1) etc. = TLCORNER/.../BRCORNER
+    We encode corners as ROOM-equivalent non-stone, non-wall cells: that
+    is sufficient for okdoor (corners are not HWALL/VWALL -> rejected,
+    matching vendor) and for dig_corridor (corners are not STONE -> the
+    walker stops there, matching vendor TLCORNER != btyp/ftyp/SCORR).
+
+    Citation: vendor/nle/src/mklev.c:160-182 (add_room wall/floor stamp).
+    """
+    xs = jnp.arange(COLNO, dtype=jnp.int32)[:, None]   # [COLNO, 1]
+    ys = jnp.arange(ROWNO, dtype=jnp.int32)[None, :]   # [1, ROWNO]
+
+    typ = gs.typ
+
+    def stamp_one(typ_acc, i):
+        lx = rooms.lx[i].astype(jnp.int32)
+        ly = rooms.ly[i].astype(jnp.int32)
+        hx = rooms.hx[i].astype(jnp.int32)
+        hy = rooms.hy[i].astype(jnp.int32)
+        act = rooms.active[i]
+
+        # Wall band x in [lx-1, hx+1], y in [ly-1, hy+1].
+        in_wall_x = (xs >= lx - 1) & (xs <= hx + 1)
+        in_wall_y = (ys >= ly - 1) & (ys <= hy + 1)
+        # Interior x in [lx, hx], y in [ly, hy].
+        interior = (xs >= lx) & (xs <= hx) & (ys >= ly) & (ys <= hy)
+        # Top/bottom HWALL rows (within the wall-x band).
+        hwall = in_wall_x & ((ys == ly - 1) | (ys == hy + 1))
+        # Left/right VWALL cols (only for y in [ly, hy], NOT the corners).
+        vwall = ((xs == lx - 1) | (xs == hx + 1)) & (ys >= ly) & (ys <= hy)
+
+        # Vendor writes HWALL/VWALL/ROOM only on success; mask by `act`.
+        new = typ_acc
+        new = jnp.where(act & hwall, jnp.int8(VTILE_HWALL), new)
+        new = jnp.where(act & vwall, jnp.int8(VTILE_VWALL), new)
+        new = jnp.where(act & interior, jnp.int8(VTILE_ROOM), new)
+        # Corners: the four (lx-1,ly-1)/(hx+1,ly-1)/(lx-1,hy+1)/(hx+1,hy+1)
+        # cells fall in the wall band but are neither hwall (they ARE on the
+        # hwall rows) — vendor overwrites them with corner glyphs AFTER the
+        # HWALL pass.  Mark them ROOM-equivalent (non-stone, non-wall) so
+        # okdoor rejects them like vendor's TLCORNER.
+        corner = (((xs == lx - 1) | (xs == hx + 1))
+                  & ((ys == ly - 1) | (ys == hy + 1)))
+        new = jnp.where(act & corner, jnp.int8(VTILE_ROOM), new)
+        return new, None
+
+    typ, _ = lax.scan(stamp_one, typ, jnp.arange(MAXNROFROOMS, dtype=jnp.int32))
+    return gs.replace(typ=typ)
+
+
 # ---------------------------------------------------------------------------
 # Rooms input contract.
 #
@@ -687,11 +751,26 @@ def dig_corridor(
     headroom); when the walker reaches (tx, ty) we early-exit by marking
     ``done`` and short-circuiting later iterations.
     """
-    # Initial direction selection — vendor sp_lev.c:2234-2241.
-    dx0 = jnp.where(tx > ox, jnp.int32(1),
-          jnp.where(tx < ox, jnp.int32(-1), jnp.int32(0)))
-    dy0 = jnp.where(dx0 != jnp.int32(0), jnp.int32(0),
-          jnp.where(ty > oy, jnp.int32(1), jnp.int32(-1)))
+    # Initial direction selection — vendor sp_lev.c:2234-2241.  This is an
+    # if / else-if CHAIN, evaluated in order:
+    #     if (tx > xx)      dx = 1;
+    #     else if (ty > yy) dy = 1;
+    #     else if (tx < xx) dx = -1;
+    #     else              dy = -1;
+    # The earlier predicates short-circuit the later ones, so e.g. when
+    # ``tx < xx`` AND ``ty > yy`` vendor selects dy=1 (the second branch),
+    # NOT dx=-1.  A naive ``where(tx>ox,1,where(tx<ox,-1,0))`` for dx would
+    # wrongly fire the tx<xx branch in that case and pick the wrong walk
+    # direction, diverging the corridor path (and its rn2(dix-diy+1) bias
+    # spans).  Encode the chain faithfully.
+    b1 = ox.astype(jnp.int32) < tx.astype(jnp.int32)   # tx > xx -> dx=1
+    b2 = (~b1) & (oy.astype(jnp.int32) < ty.astype(jnp.int32))  # ty > yy -> dy=1
+    b3 = (~b1) & (~b2) & (tx.astype(jnp.int32) < ox.astype(jnp.int32))  # tx<xx -> dx=-1
+    # else -> dy=-1
+    dx0 = jnp.where(b1, jnp.int32(1),
+          jnp.where(b3, jnp.int32(-1), jnp.int32(0)))
+    dy0 = jnp.where(b2, jnp.int32(1),
+          jnp.where(b1 | b3, jnp.int32(0), jnp.int32(-1)))
 
     # vendor pre-decrements once before the loop (sp_lev.c:2243-2244).
     xx0 = ox.astype(jnp.int32) - dx0

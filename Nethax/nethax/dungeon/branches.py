@@ -954,6 +954,7 @@ def generate_main_branch_l1(
             makecorridors as _vendor_makecorridors,
             make_niches as _vendor_make_niches,
             make_empty_level_gen_state as _vendor_make_lgs,
+            stamp_rooms_into_typ as _vendor_stamp_rooms,
             RoomsBox as _VendorRoomsBox,
         )
 
@@ -973,6 +974,13 @@ def generate_main_branch_l1(
             active=active,
         )
         _lgs = _vendor_make_lgs()
+        # Stamp the (now lx-sorted) rooms' walls + floor into the level-gen
+        # grid BEFORE makecorridors, exactly as vendor add_room
+        # (mklev.c:160-182) populates levl[][] during makerooms.  Without
+        # this, finddpos' okdoor check never finds a wall and falls through
+        # to its (xl, yh) fallback, shifting every corridor door position
+        # and diverging the dig_corridor rn2(dix-diy+1) bias stream.
+        _lgs = _vendor_stamp_rooms(_lgs, _rooms_box)
         # mklev.c:734 — makecorridors(rooms, nroom).  ``depth=1`` on
         # Main Dlvl 1 gates maybe_sdoor: depth>2 is false so dodoor skips
         # the rn2(8) draw and forces DOOR on every corridor endpoint.
