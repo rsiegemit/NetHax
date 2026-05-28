@@ -1392,7 +1392,7 @@ def _makeniche(
             def _do_pn(rr):
                 rr, pok_, xx_, yy_, dy_ = _place_niche(rr, g, rooms, aidx)
                 return rr, pok_, xx_, yy_, dy_
-            r, pok, xx, yy, _dy = lax.cond(
+            r, pok, xx, yy, dy_niche = lax.cond(
                 ~gate_continue, _do_pn,
                 lambda rr: (rr, jnp.bool_(False), jnp.int32(0), jnp.int32(0), jnp.int32(0)),
                 r,
@@ -1517,12 +1517,21 @@ def _makeniche(
                 r_, g_ = lax.cond(has_door, _corr_door, _corr_inaccessible, (r_, g_))
                 return r_, g_
 
-            # Carve niche tile (vendor:511/518) — only on success.
+            # Carve niche tile at the pocket cell ONE STEP BEYOND the wall:
+            # vendor sets ``rm = &levl[xx][yy + dy]`` then ``rm->typ = SCORR``
+            # (mklev.c:503-505) or ``rm->typ = CORR`` (mklev.c:524).  The door
+            # itself is later stamped at (xx, yy) by dosdoor — these are two
+            # DISTINCT cells.  Writing the niche tile at (xx, yy) instead of
+            # (xx, yy+dy) left the pocket STONE, so mineralize's all-STONE 3x3
+            # scan counted those cells as eligible (over-drawing the rn2(1000)
+            # gold/gem stream by 2 cells -> 4 extra rn2(1000) draws on seed 0).
+            # Vendor cite: vendor/nle/src/mklev.c:503-505,524.
+            ny = jnp.clip(yy + dy_niche, 0, ROWNO - 1)
             new_tile = jnp.where(scorr_branch, jnp.int8(VTILE_SCORR), jnp.int8(VTILE_CORR))
             g = LevelGenState(
                 typ=lax.cond(
                     placed,
-                    lambda t: t.at[xx, yy].set(new_tile),
+                    lambda t: t.at[xx, ny].set(new_tile),
                     lambda t: t,
                     g.typ,
                 ),
