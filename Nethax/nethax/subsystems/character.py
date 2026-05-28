@@ -409,6 +409,8 @@ def _weapon(type_id: int, qty: int = 1, enchant: int = 0,
                               ObjType.SLING, ObjType.PICK_AXE)
     # wave17h P0: starting inventory is known to the player (vendor u_init.c
     # marks starting items with otmp->known = TRUE).
+    # vendor/nethack/src/u_init.c:1218 also sets dknown=bknown=rknown=1 so the
+    # BUC prefix ("uncursed"/"blessed") renders for the starting kit.
     return make_item(
         category=ItemCategory.WEAPON,
         type_id=type_id,
@@ -418,6 +420,7 @@ def _weapon(type_id: int, qty: int = 1, enchant: int = 0,
         enchantment=enchant,
         buc_status=buc,
         identified=True,
+        bknown=True, dknown=True, rknown=True,
     )
 
 
@@ -432,31 +435,36 @@ def _armor(type_id: int, enchant: int = 0, buc: int = _BUC_UNCURSED) -> "Item":
         enchantment=enchant,
         buc_status=buc,
         identified=True,
+        bknown=True, dknown=True, rknown=True,
     )
 
 
 def _potion(type_id: int, qty: int = 1, buc: int = _BUC_UNCURSED) -> "Item":
     from Nethax.nethax.subsystems.inventory import make_item
     return make_item(category=ItemCategory.POTION, type_id=type_id, quantity=qty,
-                     weight=20 * qty, buc_status=buc, identified=True)
+                     weight=20 * qty, buc_status=buc, identified=True,
+                     bknown=True, dknown=True, rknown=True)
 
 
 def _scroll(type_id: int, qty: int = 1, buc: int = _BUC_UNCURSED) -> "Item":
     from Nethax.nethax.subsystems.inventory import make_item
     return make_item(category=ItemCategory.SCROLL, type_id=type_id, quantity=qty,
-                     weight=5 * qty, buc_status=buc, identified=True)
+                     weight=5 * qty, buc_status=buc, identified=True,
+                     bknown=True, dknown=True, rknown=True)
 
 
 def _spellbook(type_id: int, buc: int = _BUC_UNCURSED) -> "Item":
     from Nethax.nethax.subsystems.inventory import make_item
     return make_item(category=ItemCategory.SPBOOK, type_id=type_id, quantity=1,
-                     weight=50, buc_status=buc, identified=True)
+                     weight=50, buc_status=buc, identified=True,
+                     bknown=True, dknown=True, rknown=True)
 
 
 def _tool(type_id: int, buc: int = _BUC_UNCURSED) -> "Item":
     from Nethax.nethax.subsystems.inventory import make_item
     return make_item(category=ItemCategory.TOOL, type_id=type_id, quantity=1,
-                     weight=30, buc_status=buc, identified=True)
+                     weight=30, buc_status=buc, identified=True,
+                     bknown=True, dknown=True, rknown=True)
 
 
 def _food(type_id: int, qty: int = 1, buc: int = _BUC_UNCURSED) -> "Item":
@@ -489,13 +497,15 @@ def _food(type_id: int, qty: int = 1, buc: int = _BUC_UNCURSED) -> "Item":
         weight=_FOOD_WEIGHT.get(type_id, 2) * qty,
         buc_status=buc,
         identified=True,
+        bknown=True, dknown=True, rknown=True,
     )
 
 
 def _wand(type_id: int, buc: int = _BUC_UNCURSED) -> "Item":
     from Nethax.nethax.subsystems.inventory import make_item
     return make_item(category=ItemCategory.WAND, type_id=type_id, quantity=1,
-                     weight=7, buc_status=buc, identified=True)
+                     weight=7, buc_status=buc, identified=True,
+                     bknown=True, dknown=True, rknown=True)
 
 
 # ---------------------------------------------------------------------------

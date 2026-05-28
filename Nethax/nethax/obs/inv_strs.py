@@ -239,6 +239,42 @@ _OBJECT_IS_CHARGED: jnp.ndarray = jnp.array(
     dtype=jnp.bool_,
 )  # bool[NUM_OBJECTS] — True iff ring has oc_charged (vendor objnam.c:1500)
 
+# Tools with oc_charged==1 (vendor/nethack/include/objects.h TOOL/CONTAINER
+# macro ``chg`` arg).  vendor/nethack/src/objnam.c:1480-1486 only emits the
+# " (recharged:spe)" charge suffix for a TOOL_CLASS item when
+# ``objects[obj->otyp].oc_charged`` is set; plain tools (lock pick, sack,
+# mirror, etc.) must NOT show "(0:0)".  ObjectEntry.oc_charge (max charges)
+# is non-zero for exactly the oc_charged tools/containers — bag of tricks,
+# expensive camera, crystal ball, tinning kit, can of grease, magic marker,
+# magic flute/harp, frost/fire horn, horn of plenty, drum of earthquake — so
+# we reuse it as the oc_charged gate. Cite: vendor/nethack/src/objnam.c:1480.
+_OBJECT_IS_CHARGED_TOOL: jnp.ndarray = jnp.array(
+    [
+        (obj.class_ == ObjectClass.TOOL_CLASS) and (obj.oc_charge > 0)
+        for obj in OBJECTS
+    ],
+    dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS] — True iff tool has oc_charged (vendor objnam.c:1480)
+
+# Full per-type oc_charged bit (vendor/nethack/include/objects.h BITS ``chrg``
+# arg).  Per the class macros: WEAPON / ARMOR / WAND always set chrg=1; RING
+# sets chrg=spec (the charged-ring set); TOOL/CONTAINER set chrg per-entry
+# (reused via oc_charge>0); all other classes (potion/scroll/spellbook/
+# amulet/food/gem/coin/rock) have chrg=0.  Used by the implicit-uncursed
+# suppression rule in step 3 (vendor objnam.c:1328-1348): for identified
+# items, "uncursed" is omitted when the item is oc_charged and NOT armor/ring
+# (i.e. weapons, wands, and charged tools whose +/- or charges are shown).
+_OBJECT_OC_CHARGED: jnp.ndarray = jnp.array(
+    [
+        (obj.class_ in (ObjectClass.WEAPON_CLASS, ObjectClass.ARMOR_CLASS,
+                        ObjectClass.WAND_CLASS))
+        or (obj.class_ == ObjectClass.RING_CLASS and obj.name in _CHARGED_RING_NAMES)
+        or (obj.class_ == ObjectClass.TOOL_CLASS and obj.oc_charge > 0)
+        for obj in OBJECTS
+    ],
+    dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS] — full oc_charged (vendor objects.h BITS chrg arg)
+
 # Monster name byte table — for corpse/tin rendering.
 # vendor/nethack/src/objnam.c:1824 (corpse_xname), eat.c:1456 (tin monster meat).
 _MAX_MONSTER_NAME_LEN = 32
@@ -889,7 +925,21 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     # non-article word in the prefix buffer (BUC word when present, else name).
     noun_use_an = jnp.where(show_app, _APP_USE_AN[safe_type], _OBJECT_USE_AN[safe_type])
     buc_use_an  = _BUC_USE_AN[buc_row]
-    article_use_an = jnp.where(buc_known, buc_use_an, noun_use_an)
+    # Implicit-uncursed suppression (vendor objnam.c:1328-1348): omit the
+    # "uncursed" word for an identified oc_charged item that is NOT armor/ring
+    # (weapons, charged wands/tools), since the shown +/- or charge count
+    # already implies uncursed.  "cursed"/"blessed" always render, so this
+    # only gates the uncursed case.  Computed here (not just at step 3) so the
+    # a/an article picks the noun rather than the suppressed BUC word.
+    # Cite: vendor/nethack/src/objnam.c:1339-1347.
+    is_oc_charged = _OBJECT_OC_CHARGED[safe_type]
+    is_armor_cls  = category == jnp.int32(_ARMOR_CLASS_VAL)
+    is_ring_cls   = category == jnp.int32(_RING_CLASS_VAL)
+    is_uncursed   = buc_status == jnp.int32(BUCStatus.UNCURSED)
+    show_uncursed_word = (~identified) | (~is_oc_charged) | is_armor_cls | is_ring_cls
+    suppress_uncursed = is_uncursed & ~show_uncursed_word
+    buc_shown = buc_known & ~suppress_uncursed
+    article_use_an = jnp.where(buc_shown, buc_use_an, noun_use_an)
 
     def render_nonempty(args):
         b, c = args
@@ -932,7 +982,11 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
              (buc_status == jnp.int32(BUCStatus.CURSED)))
         )
         is_coin = category == jnp.int32(_COIN_CLASS_VAL)
-        show_buc = buc_known & ~is_water_special & ~is_coin
+        # Implicit-uncursed suppression precomputed above (vendor objnam.c:
+        # 1328-1348): ``suppress_uncursed`` is True for identified oc_charged
+        # weapons / charged wands & tools where the shown +/- or charges imply
+        # uncursed.  "cursed"/"blessed" are unaffected.
+        show_buc = buc_known & ~is_water_special & ~is_coin & ~suppress_uncursed
         b, c = lax.cond(
             show_buc,
             lambda bc: _write_buc(bc[0], bc[1], buc_row),
@@ -1069,11 +1123,15 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             (b, c),
         )
 
-        # 7. Charges "(recharged:charges)" for wands/tools, only if identified.
-        # vendor/nethack/src/objnam.c:1486
+        # 7. Charges "(recharged:charges)" for wands and oc_charged tools, only
+        # if identified.  vendor/nethack/src/objnam.c:1480-1486 — WAND_CLASS
+        # always reaches the ``charges:`` label, but TOOL_CLASS only when
+        # ``objects[obj->otyp].oc_charged`` is set (line 1480).  Plain tools
+        # (lock pick, sack, mirror, ...) must NOT render "(0:0)".
+        is_charged_tool = _OBJECT_IS_CHARGED_TOOL[safe_type]
         show_charges = identified & (
             (obj_class == jnp.uint8(_WAND_CLASS_VAL)) |
-            (obj_class == jnp.uint8(_TOOL_CLASS_VAL))
+            ((obj_class == jnp.uint8(_TOOL_CLASS_VAL)) & is_charged_tool)
         )
         b, c = lax.cond(
             show_charges,

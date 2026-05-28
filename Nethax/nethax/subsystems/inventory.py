@@ -248,12 +248,20 @@ def make_item(
     corpse_creation_turn: int = -1,
     tin_poisoned: bool = False,
     identified: bool = False,
+    bknown: bool = False,
+    dknown: bool = False,
+    rknown: bool = False,
 ) -> Item:
     """Construct a concrete Item with given fields (Python-side helper).
 
     wave17h P0 (IDENTIFICATION #3): default identified=False to match vendor
     starting-item behavior (cite invent.c:2637-2647). Existing callers that
     rely on starting inventory being identified can pass identified=True.
+
+    bknown/dknown/rknown default False (freshly-generated objects).  Vendor
+    marks starting inventory with ``obj->dknown = obj->bknown = obj->rknown
+    = 1`` (vendor/nethack/src/u_init.c:1218); starting-item helpers pass
+    these True so the BUC prefix ("uncursed"/"blessed") renders.
     """
     return Item(
         category=jnp.int8(category),
@@ -270,15 +278,15 @@ def make_item(
         oeroded=jnp.int8(oeroded),
         oeroded2=jnp.int8(oeroded2),
         oerodeproof=jnp.bool_(oerodeproof),
-        bknown=jnp.bool_(False),
+        bknown=jnp.bool_(bknown),
         lamplit=jnp.bool_(False),
         olocked=jnp.bool_(False),
         corpse_entry_idx=jnp.int16(corpse_entry_idx),
         recharged=jnp.int8(0),
         corpse_creation_turn=jnp.int32(corpse_creation_turn),
         tin_poisoned=jnp.bool_(tin_poisoned),
-        dknown=jnp.bool_(False),
-        rknown=jnp.bool_(False),
+        dknown=jnp.bool_(dknown),
+        rknown=jnp.bool_(rknown),
         age=jnp.int32(0),
         artifact_idx=jnp.int8(-1),
         oeaten=jnp.int8(0),
