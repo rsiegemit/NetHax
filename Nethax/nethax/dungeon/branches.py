@@ -1083,33 +1083,52 @@ def generate_main_branch_l1(
         br_h = jnp.maximum(
             (br_hy - br_ly + jnp.int16(1)).astype(jnp.int32), jnp.int32(1)
         )
-        vendor_rng, _br_sx = _rn1_jax(vendor_rng, br_w, br_lx.astype(jnp.int32))
-        vendor_rng, _br_sy = _rn1_jax(vendor_rng, br_h, br_ly.astype(jnp.int32))
+        vendor_rng, br_sx = _rn1_jax(vendor_rng, br_w, br_lx.astype(jnp.int32))
+        vendor_rng, br_sy = _rn1_jax(vendor_rng, br_h, br_ly.astype(jnp.int32))
 
-        # Use the vendor down-stair (sx, sy) as the JAX-level player /
-        # down-stair position so the byte-parity stream is observable
-        # via blstats[0,1].  On Dlvl 1 vendor's actual player spawn
-        # comes from ``u_on_upstairs() -> u_on_sstairs(0)`` (xupstair
-        # is zero because mkstairs(up=1) is skipped); we approximate
-        # that by spawning the player at the consumed down-stair pos,
-        # matching the validator-observed player_pos for seed=0.
+        # The down-stair (>) glyph stays at the down-stair (sx, sy) drawn
+        # above (vendor mklev.c:710-712).
         vendor_down_r = jnp.clip(dn_sy, 1, h - 2).astype(jnp.int16)
         vendor_down_c = jnp.clip(dn_sx, 1, w - 2).astype(jnp.int16)
+
+        # Hero spawn — vendor places the hero on Dlvl 1 via
+        # ``u_on_upstairs() -> u_on_sstairs(0)`` (dungeon.c:1260-1265).
+        # ``xupstair`` is 0 (mkstairs(up=1) skipped by the dlevel!=1 gate),
+        # so it falls to ``u_on_sstairs(0)`` which spawns the hero on the
+        # branch staircase ``(sstairs.sx, sstairs.sy)`` placed by
+        # ``place_branch() -> find_branch_room()`` (mklev.c:800,1105-1131).
+        # That is the (br_sx, br_sy) cell drawn just above — NOT the
+        # down-stair.  Placing the hero here makes blstats[0,1] (player
+        # x,y) byte-match NLE for seed=0.  Cite: vendor/nle/src/dungeon.c:
+        # 1249-1265 (u_on_sstairs/u_on_upstairs), mklev.c:1190-1191
+        # (sstairs.sx/sy = branch cell).
+        vendor_hero_r = jnp.clip(br_sy, 1, h - 2).astype(jnp.int16)
+        vendor_hero_c = jnp.clip(br_sx, 1, w - 2).astype(jnp.int16)
     else:
         # Threefry path: no vendor stair-pick draws.  Fall through to
         # the centre-of-room defaults below.
+        vendor_hero_r = None  # type: ignore[assignment]
+        vendor_hero_c = None  # type: ignore[assignment]
         vendor_down_r = None  # type: ignore[assignment]
         vendor_down_c = None  # type: ignore[assignment]
 
-    # 6. Place up-stair in centre of first active room.
-    #    We always use slot 0; if it's inactive the pos defaults to (1,1)
-    #    which is safe (will be in a border area).
-    up_r = ((rooms.y1[0] + rooms.y2[0]) // 2).astype(jnp.int16)
-    up_c = ((rooms.x1[0] + rooms.x2[0]) // 2).astype(jnp.int16)
-    # Clamp to [1, h-2] x [1, w-2] for safety.
-    up_r = jnp.clip(up_r, 1, h - 2).astype(jnp.int16)
-    up_c = jnp.clip(up_c, 1, w - 2).astype(jnp.int16)
-    terrain = terrain.at[up_r, up_c].set(jnp.int8(_TILE_STAIRCASE_UP))
+    # 6. Hero spawn / up-stair.
+    #    Vendor path (Dlvl 1): the hero spawns on the branch staircase
+    #    (vendor_hero_r/c, from place_branch->find_branch_room).  Vendor
+    #    creates NO up-stair (<) on Dlvl 1 — mkstairs(up=1) is skipped by
+    #    the ``dlevel!=1`` gate (mklev.c:720) — so we stamp none.
+    #    Threefry path: place an up-stair (<) in the centre of room[0]
+    #    for playability (no vendor byte-parity constraint).
+    if vendor_hero_r is not None:
+        up_r = vendor_hero_r
+        up_c = vendor_hero_c
+    else:
+        up_r = ((rooms.y1[0] + rooms.y2[0]) // 2).astype(jnp.int16)
+        up_c = ((rooms.x1[0] + rooms.x2[0]) // 2).astype(jnp.int16)
+        # Clamp to [1, h-2] x [1, w-2] for safety.
+        up_r = jnp.clip(up_r, 1, h - 2).astype(jnp.int16)
+        up_c = jnp.clip(up_c, 1, w - 2).astype(jnp.int16)
+        terrain = terrain.at[up_r, up_c].set(jnp.int8(_TILE_STAIRCASE_UP))
 
     # 7. Place down-stair.
     #    Threefry path: centre of the last active room.
@@ -1311,29 +1330,21 @@ def generate_main_branch_l1_with_features(
     terrain = _place_niches(terrain, rooms, active, k_niche, n=2)
 
     # Hero placement — vendor/nle/src/allmain.c:628 ``u_on_upstairs()`` runs
-    # immediately after ``mklev()`` returns (after mineralize).  On Main
-    # Dlvl 1 the hero is placed on the down-stair location and **consumes ZERO
-    # ISAAC64 draws**: the instrumented NLE reset stream for seed=0
-    # rog-hum-cha goes directly from the last mineralize ``rn2(1000)``
-    # (draw 1780) to ``makedog() -> pet_type()``'s ``rn2(2)`` (draw 1781,
-    # vendor/nle/src/dog.c:66) with no intervening placement draw.  Vendor's
-    # ``u_on_upstairs() -> u_on_sstairs(0) -> u_on_newpos()`` therefore lands
-    # the hero deterministically on the down-stair (xdnstair, ydnstair) —
-    # the only stair on Dlvl 1, since ``mkstairs(up=1)`` is gated out by the
-    # ``dunlev==1 && up`` early-return (vendor/nle/src/mklev.c:720, :1554).
-    #
-    # The previous implementation ran a ``place_lregion`` rejection loop
-    # (``rn1(79,1)`` / ``rn1(21,0)`` per try) which is NOT in vendor's stream
-    # for this level: it over-drew 28 ISAAC64 words right after mineralize,
-    # diverging the stream at draw 1781.  Place the hero on the down-stair
-    # with no draws so the stream continues into makedog byte-aligned.
-    # Cite: vendor/nle/src/allmain.c:628 (u_on_upstairs after mklev),
-    #       vendor/nle/src/dungeon.c:1252-1255,1259-1266 (u_on_upstairs ->
-    #       u_on_sstairs -> u_on_newpos on the down-stair),
-    #       vendor/nle/src/mklev.c:712,720,1554 (down-stair created on Dlvl 1,
-    #       up-stair skipped), vendor/nle/src/dog.c:66 (next draw = pet_type).
-    if vendor_rng is not None:
-        up_pos = dn_pos.astype(jnp.int16)
+    # immediately after ``mklev()`` returns (after mineralize) and **consumes
+    # ZERO ISAAC64 draws**: the NLE reset stream for seed=0 rog-hum-cha goes
+    # directly from the last mineralize ``rn2(1000)`` (draw 1780) to
+    # ``makedog()->pet_type()``'s ``rn2(2)`` (draw 1781) with no intervening
+    # placement draw.  On Main Dlvl 1 there is no up-stair (mkstairs(up=1) is
+    # skipped by the ``dlevel!=1`` gate, mklev.c:720), so ``u_on_upstairs() ->
+    # u_on_sstairs(0)`` (dungeon.c:1260-1265) spawns the hero on the branch
+    # staircase ``(sstairs.sx, sstairs.sy)`` that ``place_branch() ->
+    # find_branch_room()`` (mklev.c:800,1105-1131) placed earlier in the
+    # stream (draws 1187-1189).  ``up_pos`` already carries that branch cell
+    # (generate_main_branch_l1 set up_r/up_c = vendor_hero_r/c), so no
+    # override is needed.  The previous code overrode ``up_pos = dn_pos``,
+    # spawning the hero on the down-stair (col 40) instead of the branch
+    # staircase (col 71) — a divergence in blstats player_x.
+    # Cite: vendor/nle/src/dungeon.c:1249-1265, mklev.c:1190-1191.
 
     if state is not None:
         return terrain, rooms, active, up_pos, dn_pos, features, traps, vendor_rng, state
