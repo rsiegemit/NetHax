@@ -39,6 +39,7 @@ from Nethax.nethax.constants.glyphs import (
     GLYPH_WARNING_OFF, GLYPH_STATUE_OFF, MAX_GLYPH, NO_GLYPH,
 )
 from Nethax.nethax.constants import NUM_TILE_TYPES
+from Nethax.nethax.constants import cmap_indices as _cmap
 
 
 # ---------------------------------------------------------------------------
@@ -177,39 +178,38 @@ NLE_OBSERVATION_DTYPES: dict[str, jnp.dtype] = {
 }
 
 # ---------------------------------------------------------------------------
-# Cmap lookup table: TileType -> NLE cmap index (S_* values from rm.h)
+# Cmap lookup table: TileType -> NLE cmap index.
 #
 # TileType enum (from constants.py):
 #   VOID=0, FLOOR=1, CORRIDOR=2, WALL=3, CLOSED_DOOR=4, OPEN_DOOR=5,
 #   STAIRCASE_UP=6, STAIRCASE_DOWN=7, WATER=8, LAVA=9, ALTAR=10,
 #   FOUNTAIN=11, TRAP=12, HIDDEN_TRAP=13, THRONE=14, GRAVE=15, SHOP_FLOOR=16
 #
-# vendor/nle/include/rm.h cmap indices (idx, char, S_* name):
-#   0  ' '  S_stone       19 '.'  S_room        21 '#'  S_corr
-#   1  '|'  S_vwall       23 '<'  S_upstair     24 '>'  S_dnstair
-#   15 '+'  S_vcdoor      13 '-'  S_vodoor      27 '_'  S_altar
-#   28 '|'  S_grave       29 '\\' S_throne      31 '{'  S_fountain
-#   32 '}'  S_pool        34 '}'  S_lava        42 '^'  S_arrow_trap
+# All cmap (S_*) indices come from Nethax.nethax.constants.cmap_indices, which
+# resolves the active layout (NLE 3.x by default, NetHack 5.x when
+# NETHAX_VENDOR_TREE=nethack_5x).  Cite:
+#   - vendor/nle/include/rm.h:116-227         (3.x default)
+#   - vendor/nethack/include/defsym.h:90-183  (5.x alternate)
 # ---------------------------------------------------------------------------
 
-_S_stone    = 0
-_S_vwall    = 1
-_S_room     = 19
-_S_darkroom = 20
-_S_corr     = 21   # vendor/nle/include/rm.h:138
-_S_litcorr  = 22   # vendor/nle/include/rm.h:139
-_S_upstair  = 23   # vendor/nle/include/rm.h:140
-_S_dnstair  = 24   # vendor/nle/include/rm.h:141
-_S_altar    = 27   # vendor/nle/include/rm.h:144
-_S_grave    = 28   # vendor/nle/include/rm.h:145
-_S_throne   = 29   # vendor/nle/include/rm.h:146
-_S_fountain = 31   # vendor/nle/include/rm.h:148
-_S_pool     = 32   # vendor/nle/include/rm.h:149
-_S_lava     = 34   # vendor/nle/include/rm.h:151
-_S_trap     = 42   # S_arrow_trap — vendor/nle/include/rm.h:162
-_S_vcdoor   = 15   # closed door (vertical)
-_S_vodoor   = 13   # open door (vertical)
-_S_ndoor    = 12   # doorless doorway (char '.') — vendor/nle/include/rm.h:135
+_S_stone    = _cmap.S_stone
+_S_vwall    = _cmap.S_vwall
+_S_room     = _cmap.S_room
+_S_darkroom = _cmap.S_darkroom
+_S_corr     = _cmap.S_corr
+_S_litcorr  = _cmap.S_litcorr
+_S_upstair  = _cmap.S_upstair
+_S_dnstair  = _cmap.S_dnstair
+_S_altar    = _cmap.S_altar
+_S_grave    = _cmap.S_grave
+_S_throne   = _cmap.S_throne
+_S_fountain = _cmap.S_fountain
+_S_pool     = _cmap.S_pool
+_S_lava     = _cmap.S_lava
+_S_trap     = _cmap.S_arrow_trap   # generic trap base
+_S_vcdoor   = _cmap.S_vcdoor
+_S_vodoor   = _cmap.S_vodoor
+_S_ndoor    = _cmap.S_ndoor
 
 # Indexed by TileType integer value; must cover indices 0..NUM_TILE_TYPES-1
 _TILE_TO_CMAP: jnp.ndarray = jnp.array([
@@ -247,166 +247,32 @@ _TILE_TO_CMAP: jnp.ndarray = jnp.array([
 ], dtype=jnp.int16)
 
 # ---------------------------------------------------------------------------
-# TTY char lookup table: cmap index -> ASCII character
+# TTY char lookup table: cmap index -> ASCII character.
 #
-# Derived from defsym.h PCHAR entries (idx, char, ...).  Only the indices
-# used by _TILE_TO_CMAP need to be correct; others default to ' '.
-# The full 49+ entry table is kept for completeness.
+# Built from Nethax.nethax.constants.cmap_indices.CMAP_TO_CHAR (which derives
+# from the active layout's symbolic dict, so the same symbol always renders
+# the same char regardless of whether NLE 3.x or NetHack 5.x is selected).
+# We slice to 64 entries (the table size this module historically promised);
+# all indices used by _TILE_TO_CMAP fall inside that window in both layouts.
 # ---------------------------------------------------------------------------
 
-# Build a 64-entry table covering all cmap indices we use (max index is 49).
-_CMAP_TO_CHAR: jnp.ndarray = jnp.array([
-    ord(' '),  # 0  S_stone
-    ord('|'),  # 1  S_vwall
-    ord('-'),  # 2  S_hwall
-    ord('-'),  # 3  S_tlcorn
-    ord('-'),  # 4  S_trcorn
-    ord('-'),  # 5  S_blcorn
-    ord('-'),  # 6  S_brcorn
-    ord('-'),  # 7  S_crwall
-    ord('-'),  # 8  S_tuwall
-    ord('-'),  # 9  S_tdwall
-    ord('|'),  # 10 S_tlwall
-    ord('|'),  # 11 S_trwall
-    ord('.'),  # 12 S_ndoor
-    ord('-'),  # 13 S_vodoor
-    ord('|'),  # 14 S_hodoor
-    ord('+'),  # 15 S_vcdoor
-    ord('+'),  # 16 S_hcdoor
-    ord('#'),  # 17 S_bars
-    ord('#'),  # 18 S_tree
-    ord('.'),  # 19 S_room
-    ord('.'),  # 20 S_darkroom
-    ord('`'),  # 21 S_engroom
-    ord('#'),  # 22 S_corr
-    # NLE 3.x cmap layout (vendor/nle/include/rm.h:140-141): index 23 =
-    # S_upstair, 24 = S_dnstair.  5.x has S_litcorr/S_engrcorr at 23-24 and
-    # shifts the staircase block to 25-26 — Nethax targets NLE 3.x so we use
-    # the 3.x mapping here.  The _S_upstair / _S_dnstair constants above are
-    # already 23/24 (3.x).  Indices 25-28 below carry the 5.x labels for
-    # legacy reasons; they happen to render the same char so they're left
-    # in place to avoid churn.
-    ord('<'),  # 23 S_upstair  (NLE 3.x — was '#' as 5.x S_litcorr; wrong here)
-    ord('>'),  # 24 S_dnstair  (NLE 3.x — was '#' as 5.x S_engrcorr; wrong here)
-    ord('<'),  # 25 S_upstair
-    ord('>'),  # 26 S_dnstair
-    ord('<'),  # 27 S_upladder
-    ord('>'),  # 28 S_dnladder
-    ord('<'),  # 29 S_brupstair
-    ord('>'),  # 30 S_brdnstair
-    ord('<'),  # 31 S_brupladder
-    ord('>'),  # 32 S_brdnladder
-    ord('_'),  # 33 S_altar
-    ord('|'),  # 34 S_grave
-    ord('\\'), # 35 S_throne
-    ord('{'),  # 36 S_sink
-    ord('{'),  # 37 S_fountain
-    ord('}'),  # 38 S_pool
-    ord('.'),  # 39 S_ice
-    ord('}'),  # 40 S_lava
-    ord('}'),  # 41 S_lavawall
-    ord('.'),  # 42 S_vodbridge
-    ord('.'),  # 43 S_hodbridge
-    ord('#'),  # 44 S_vcdbridge
-    ord('#'),  # 45 S_hcdbridge
-    ord(' '),  # 46 S_air
-    ord('#'),  # 47 S_cloud
-    ord('}'),  # 48 S_water
-    ord('^'),  # 49 S_arrow_trap (generic trap char)
-    ord('^'),  # 50 S_dart_trap
-    ord('^'),  # 51 S_falling_rock_trap
-    ord('^'),  # 52 S_squeaky_board
-    ord('^'),  # 53 S_bear_trap
-    ord('^'),  # 54 S_land_mine
-    ord('^'),  # 55 S_rolling_boulder_trap
-    ord('^'),  # 56 S_sleeping_gas_trap
-    ord('^'),  # 57 S_rust_trap
-    ord('^'),  # 58 S_fire_trap
-    ord('^'),  # 59 S_pit
-    ord('^'),  # 60 S_spiked_pit
-    ord('^'),  # 61 S_hole
-    ord(' '),  # 62 padding
-    ord(' '),  # 63 padding
-], dtype=jnp.uint8)
+_CMAP_TO_CHAR: jnp.ndarray = jnp.asarray(_cmap.CMAP_TO_CHAR[:64], dtype=jnp.uint8)
 
 # ---------------------------------------------------------------------------
-# ANSI color lookup table: cmap index -> ANSI color (0-15)
+# ANSI color lookup table: cmap index -> ANSI color (0-15).
 #
-# Derived from vendor/nethack/include/defsym.h PCHAR2() entries.
-# CLR_* values from vendor/nethack/include/color.h:
+# Built from Nethax.nethax.constants.cmap_indices.CMAP_TO_COLOR (which derives
+# from the active layout's symbolic dict).  CLR_* values from
+# vendor/nethack/include/color.h:
 #   CLR_BLACK=0 CLR_RED=1 CLR_GREEN=2 CLR_BROWN=3 CLR_BLUE=4 CLR_MAGENTA=5
 #   CLR_CYAN=6  CLR_GRAY=7 NO_COLOR=8→7  CLR_ORANGE=9 CLR_BRIGHT_GREEN=10
 #   CLR_YELLOW=11 CLR_BRIGHT_BLUE=12 CLR_BRIGHT_MAGENTA=13 CLR_BRIGHT_CYAN=14
 #   CLR_WHITE=15
-# NO_COLOR is treated as CLR_GRAY (7) — same as NLE's fallback rendering.
+# Sliced to 64 entries to match the historical _CMAP_TO_COLOR table size; all
+# active indices fall inside that window in both layouts.
 # ---------------------------------------------------------------------------
 
-_CMAP_TO_COLOR: jnp.ndarray = jnp.array([
-    0,   # 0  S_stone       NO_COLOR → black (invisible)
-    7,   # 1  S_vwall       CLR_GRAY
-    7,   # 2  S_hwall       CLR_GRAY
-    7,   # 3  S_tlcorn      CLR_GRAY
-    7,   # 4  S_trcorn      CLR_GRAY
-    7,   # 5  S_blcorn      CLR_GRAY
-    7,   # 6  S_brcorn      CLR_GRAY
-    7,   # 7  S_crwall      CLR_GRAY
-    7,   # 8  S_tuwall      CLR_GRAY
-    7,   # 9  S_tdwall      CLR_GRAY
-    7,   # 10 S_tlwall      CLR_GRAY
-    7,   # 11 S_trwall      CLR_GRAY
-    7,   # 12 S_ndoor       CLR_GRAY
-    3,   # 13 S_vodoor      CLR_BROWN
-    3,   # 14 S_hodoor      CLR_BROWN
-    3,   # 15 S_vcdoor      CLR_BROWN
-    3,   # 16 S_hcdoor      CLR_BROWN
-    7,   # 17 S_bars        CLR_GRAY (no explicit color in defsym.h; default)
-    2,   # 18 S_tree        CLR_GREEN
-    7,   # 19 S_room        CLR_GRAY
-    0,   # 20 S_darkroom    CLR_BLACK
-    7,   # 21 S_engroom     CLR_GRAY (no explicit; default)
-    7,   # 22 S_corr        CLR_GRAY
-    7,   # 23 S_litcorr     CLR_GRAY
-    7,   # 24 S_engrcorr    CLR_GRAY (no explicit; default)
-    7,   # 25 S_upstair     CLR_GRAY
-    7,   # 26 S_dnstair     CLR_GRAY
-    3,   # 27 S_upladder    CLR_BROWN
-    3,   # 28 S_dnladder    CLR_BROWN
-    11,  # 29 S_brupstair   CLR_YELLOW
-    11,  # 30 S_brdnstair   CLR_YELLOW
-    11,  # 31 S_brupladder  CLR_YELLOW
-    11,  # 32 S_brdnladder  CLR_YELLOW
-    7,   # 33 S_altar       CLR_GRAY
-    15,  # 34 S_grave       CLR_WHITE
-    7,   # 35 S_throne      CLR_GRAY (no explicit in snippet; default gray)
-    15,  # 36 S_sink        CLR_WHITE
-    12,  # 37 S_fountain    CLR_BRIGHT_BLUE
-    4,   # 38 S_pool        CLR_BLUE
-    6,   # 39 S_ice         CLR_CYAN
-    1,   # 40 S_lava        CLR_RED
-    9,   # 41 S_lavawall    CLR_ORANGE
-    3,   # 42 S_vodbridge   CLR_BROWN
-    3,   # 43 S_hodbridge   CLR_BROWN
-    3,   # 44 S_vcdbridge   CLR_BROWN
-    3,   # 45 S_hcdbridge   CLR_BROWN
-    6,   # 46 S_air         CLR_CYAN
-    7,   # 47 S_cloud       CLR_GRAY
-    12,  # 48 S_water       CLR_BRIGHT_BLUE
-    7,   # 49 S_arrow_trap  CLR_GRAY
-    7,   # 50 S_dart_trap   CLR_GRAY
-    7,   # 51 S_falling_rock_trap  CLR_GRAY
-    3,   # 52 S_squeaky_board      CLR_BROWN
-    1,   # 53 S_bear_trap   CLR_RED (no explicit; use red for danger)
-    1,   # 54 S_land_mine   CLR_RED
-    7,   # 55 S_rolling_boulder_trap  CLR_GRAY
-    7,   # 56 S_sleeping_gas_trap  CLR_GRAY (no explicit)
-    4,   # 57 S_rust_trap   CLR_BLUE
-    9,   # 58 S_fire_trap   CLR_ORANGE
-    0,   # 59 S_pit         CLR_BLACK
-    0,   # 60 S_spiked_pit  CLR_BLACK
-    3,   # 61 S_hole        CLR_BROWN
-    3,   # 62 S_trap_door   CLR_BROWN
-    5,   # 63 S_teleportation_trap  CLR_MAGENTA
-], dtype=jnp.uint8)
+_CMAP_TO_COLOR: jnp.ndarray = jnp.asarray(_cmap.CMAP_TO_COLOR[:64], dtype=jnp.uint8)
 
 # ---------------------------------------------------------------------------
 # Inventory letter table: slot index (0-54) -> ASCII byte
@@ -470,33 +336,13 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
 
     colors = _np.zeros((_MAX,), dtype=_np.uint8)
     desc = _np.zeros((_MAX, 80), dtype=_np.uint8)
-    # CMAP description table (TileType-ish names, keyed by cmap index)
-    # Indices and chosen description strings follow vendor/nethack/src/drawing.c
-    # default_showsyms[] / def_oc_syms[] and pager.c::lookat() outputs.
-    cmap_desc = {
-        0: "dark part of a room",
-        1: "wall", 2: "wall", 3: "wall", 4: "wall", 5: "wall",
-        6: "wall", 7: "wall", 8: "wall", 9: "wall", 10: "wall", 11: "wall",
-        12: "doorway", 13: "open door", 14: "open door",
-        15: "closed door", 16: "closed door",
-        17: "iron bars", 18: "tree",
-        19: "floor of a room", 20: "dark part of a room",
-        21: "engraving", 22: "corridor", 23: "lit corridor", 24: "engraving",
-        25: "staircase up", 26: "staircase down",
-        27: "ladder up", 28: "ladder down",
-        29: "branch staircase up", 30: "branch staircase down",
-        31: "branch ladder up", 32: "branch ladder down",
-        33: "altar", 34: "grave", 35: "throne", 36: "sink",
-        37: "fountain", 38: "water", 39: "ice", 40: "molten lava",
-        41: "wall of lava",
-        42: "drawbridge", 43: "drawbridge", 44: "drawbridge", 45: "drawbridge",
-        46: "air", 47: "cloud", 48: "water",
-        49: "arrow trap", 50: "dart trap", 51: "falling rock trap",
-        52: "squeaky board", 53: "bear trap", 54: "land mine",
-        55: "rolling boulder trap", 56: "sleeping gas trap",
-        57: "rust trap", 58: "fire trap", 59: "pit", 60: "spiked pit",
-        61: "hole", 62: "trap door", 63: "teleportation trap",
-    }
+    # CMAP description table (TileType-ish names, keyed by cmap index).
+    # Built from Nethax.nethax.constants.cmap_indices.CMAP_DESC, which
+    # indexes per-symbol descriptions through the active layout — so
+    # "staircase up" lands at 23 under NLE 3.x and 25 under NetHack 5.x.
+    # Cite: vendor/nethack/src/drawing.c default_showsyms[],
+    #       vendor/nethack/src/pager.c::lookat() outputs.
+    cmap_desc = dict(_cmap.CMAP_DESC)
 
     def _bytes_for(s) -> _np.ndarray:
         # Wave 6 parity-fix: allow None (shuffled appearance slots in OBJECTS).
