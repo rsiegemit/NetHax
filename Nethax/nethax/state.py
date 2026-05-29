@@ -328,7 +328,19 @@ class EnvState:
 
     # ---- Game-loop bookkeeping ----
     rng: Any                    # jax.random.PRNGKey
-    timestep: jax.Array         # int32
+    timestep: jax.Array         # int32  monotonic env-step clock (timer deadlines, hashes)
+    # Vendor ``moves`` turn counter (decl.c:195 ``moves = 1L``).  Distinct from
+    # ``timestep``: ``moves`` advances ONLY on time-consuming actions, so a
+    # blocked move (walking into a wall, which takes zero game time) does not
+    # bump it.  This is the source for blstats BL_TIME.  Cite:
+    # vendor/nle/src/allmain.c::moveloop ``svm.moves++`` (line 244) — only
+    # reached for turns that consumed time; hack.c::domove returns early on a
+    # blocked move without advancing moves.
+    game_moves: jax.Array       # int32
+    # Per-step "did the player's action consume a game turn" flag, written by
+    # the action handlers (default True) and read by env._step_impl to gate the
+    # game_moves increment.  A wall-bump (blocked move) clears it to False.
+    action_consumed_turn: jax.Array  # bool
     done: jax.Array             # bool
 
     # ---- ISAAC64 vendor RNG state (NLE_BYTEPARITY mode) -----------------
@@ -501,6 +513,8 @@ class EnvState:
             # game loop
             rng=rng,
             timestep=jnp.int32(0),
+            game_moves=jnp.int32(0),
+            action_consumed_turn=jnp.bool_(True),
             done=jnp.bool_(False),
             # ISAAC64 vendor RNG — empty by default; populated by env.reset()
             # when parity_mode.use_vendor_rng() is True.

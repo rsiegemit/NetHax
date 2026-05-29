@@ -1391,6 +1391,24 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     )
     state_final = state_final.replace(messages=_new_messages)
 
+    # Turn-consumption signal for the BL_TIME (game_moves) counter.  A move
+    # that is fully blocked — the hero stayed put and no door was opened —
+    # consumes ZERO game time, so vendor ``moves`` does not advance (the early
+    # return in hack.c::domove / test_move never reaches moveloop's
+    # ``svm.moves++``).  Clearing ``action_consumed_turn`` here makes
+    # env._step_impl skip the game_moves bump for this step.  Opening a door
+    # on bump (open_on_bump) DOES consume a turn, so it stays True.
+    # Cite: vendor/nle/src/hack.c::domove blocked-move early return;
+    #       vendor/nle/src/allmain.c::moveloop:244.
+    _move_blocked_no_time = (~can_move) & (~open_on_bump)
+    state_final = state_final.replace(
+        action_consumed_turn=jnp.where(
+            _move_blocked_no_time,
+            jnp.bool_(False),
+            state_final.action_consumed_turn,
+        ),
+    )
+
     return _apply_fov(state_final)
 
 

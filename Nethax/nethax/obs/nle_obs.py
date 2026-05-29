@@ -1721,8 +1721,11 @@ def build_blstats(env_state) -> jnp.ndarray:
     result = result.at[BL_XP].set(jnp.int64(env_state.player_xl))
     result = result.at[BL_EXP].set(jnp.int64(env_state.player_xp))
 
-    # Game time (turn counter)
-    result = result.at[BL_TIME].set(jnp.int64(env_state.timestep))
+    # Game time (turn counter) — vendor ``moves`` (BL_TIME).  Sourced from
+    # game_moves, which advances only on time-consuming actions; a blocked
+    # wall-bump takes zero game time and does not tick it.  (Distinct from
+    # env_state.timestep, the monotonic per-env-step clock.)
+    result = result.at[BL_TIME].set(jnp.int64(env_state.game_moves))
 
     # Hunger state (int8 enum from status_effects.HungerState)
     result = result.at[BL_HUNGER].set(jnp.int64(env_state.status.hunger_state))
@@ -1987,7 +1990,17 @@ def build_glyphs(env_state) -> jnp.ndarray:
     write_mask = (
         mon_alive & tile_visible & (mon_entry >= jnp.int32(0)) & (~mon_oncol0)
     )
-    mon_glyphs = (jnp.int32(GLYPH_MON_OFF) + mon_entry).astype(jnp.int16)
+    # Tame monsters render at GLYPH_PET_OFF + entry, NOT GLYPH_MON_OFF.
+    # Vendor display.c:599-603: `if (mon->mtame && !Hallucination) num =
+    # pet_to_glyph(mon, ...)`, and pet_to_glyph adds GLYPH_PET_OFF.  Hostile /
+    # peaceful (non-tame) monsters use the plain GLYPH_MON_OFF base.  The
+    # Hallucination branch below overrides both with random GLYPH_MON_OFF
+    # glyphs (vendor skips pet_to_glyph when Hallu), so only the non-hallu
+    # base distinguishes pets here.
+    mon_tame = mai.tame                                            # bool[N]
+    mon_base = jnp.where(mon_tame, jnp.int32(GLYPH_PET_OFF),
+                         jnp.int32(GLYPH_MON_OFF))                 # int32[N]
+    mon_glyphs = (mon_base + mon_entry).astype(jnp.int16)
 
     # Hallucination scramble — vendor/nethack/src/display.c:599 randomizes
     # the monster glyph each render when Hallu.  We use a per-(timestep,row,col)

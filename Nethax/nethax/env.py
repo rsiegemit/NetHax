@@ -108,9 +108,14 @@ class NethaxEnv:
         # observation after newgame already reports moves==1; the per-step
         # ``svm.moves++`` (allmain.c:244) then advances it to 2, 3, ....  Our
         # ``EnvState.default`` seeds ``timestep=0``, so without this the
-        # blstats BL_TIME field (nle_obs.py reads ``env_state.timestep``)
-        # lags NLE by exactly 1 at every step.  Cite: vendor/nle/src/decl.c:195.
-        state = state.replace(timestep=jnp.int32(1))
+        # blstats BL_TIME field lags NLE by exactly 1 at every step.  Cite:
+        # vendor/nle/src/decl.c:195.  ``timestep`` (the monotonic env-step
+        # clock used for timer deadlines / hashes) and ``game_moves`` (the
+        # vendor ``moves`` turn counter surfaced as BL_TIME) both start at 1.
+        # They diverge thereafter: ``timestep`` advances every env step while
+        # ``game_moves`` only advances on time-consuming actions (a blocked
+        # wall-bump takes zero game time, so vendor ``moves`` does not tick).
+        state = state.replace(timestep=jnp.int32(1), game_moves=jnp.int32(1))
 
         # NLE_BYTEPARITY: seed ISAAC64 from the host-side integer derived
         # from the incoming PRNGKey.  Vendor NLE seeds each rnglist[] entry
@@ -852,7 +857,14 @@ def _step_impl(state, action, rng):
         # Without this the welcome line persists across every step.
         # Cite: vendor/nle/win/rl/winrl.cc line 353 — std::memset(obs->message,
         #       0, NLE_MESSAGE_SIZE) when toplin is false at obs-fill time.
-        ns0 = state.replace(messages=_clear_message(state.messages))
+        # Also reset the per-step "did this action consume a game turn" flag to
+        # True; handlers (e.g. a blocked wall-bump in action_dispatch
+        # ``_move_branch``) clear it to False when the action took zero game
+        # time, which gates the game_moves (BL_TIME) increment below.
+        ns0 = state.replace(
+            messages=_clear_message(state.messages),
+            action_consumed_turn=jnp.bool_(True),
+        )
 
         # 1. Player action — allmain.c line 203 (svc.context.move).
         ns = dispatch_action(ns0, action, rng_act)
@@ -882,7 +894,19 @@ def _step_impl(state, action, rng):
         ns = _tick_stinking_cloud(ns)
 
         # 3. Increment turn counter — allmain.c line 244 (svm.moves++).
+        #    ``timestep`` is the monotonic env-step clock (timer deadlines,
+        #    hallucination hash, monster-AI cadence) and advances every env
+        #    step regardless of whether the action consumed game time.
         ns = ns.replace(timestep=ns.timestep + jnp.int32(1))
+        #    ``game_moves`` is the vendor ``moves`` turn counter (BL_TIME
+        #    source).  Vendor only reaches ``svm.moves++`` in moveloop for a
+        #    time-consuming turn; a blocked move (wall-bump) returns early from
+        #    domove without ticking it.  Gate on the per-step flag the action
+        #    handlers set, so a wall-bump leaves game_moves unchanged.
+        ns = ns.replace(
+            game_moves=ns.game_moves
+            + jnp.where(ns.action_consumed_turn, jnp.int32(1), jnp.int32(0))
+        )
 
         # 4. Status-effect tick — allmain.c line 273 (nh_timeout),
         #    inclusive of regen_hp (line 294) and regen_pw (line 305).
