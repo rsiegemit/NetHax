@@ -631,9 +631,12 @@ STARTING_INVENTORY: dict = {
     #   POT_SICKNESS, LOCK_PICK, SACK — then ``if (!rn2(5)) ini_inv(Blindfold)``
     #   appends BLINDFOLD as a 7th item.  NLE seed 0 rolls the lucky branch,
     #   so for byte-exact parity we include the BLINDFOLD slot.  Vendor DAGGER
-    #   qty is ``6..15`` random; we keep the static 10 (median) until per-init
-    #   random ranges are threaded.  BODY-armor slot index (2) is preserved
-    #   so ``_WORN_ARMOR_BY_ROLE[ROGUE]`` still maps to LEATHER_ARMOR.
+    #   qty is ``rn1(10, 6)`` (= 6..15 random); the static 10 here is a
+    #   placeholder — in NLE_BYTEPARITY mode create_character() overrides it
+    #   with the rolled rn1(10, 6) value (14 for seed 0) using the already-
+    #   consumed rn2(10) draw, so no extra ISAAC64 draw is made.  BODY-armor
+    #   slot index (2) is preserved so ``_WORN_ARMOR_BY_ROLE[ROGUE]`` still
+    #   maps to LEATHER_ARMOR.
     Role.ROGUE: [
         _weapon(ObjType.SHORT_SWORD),
         _weapon(ObjType.DAGGER, 10),
@@ -1208,7 +1211,11 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
     trspe=0 but the weapon-class branch also calls rne when rn2(11)==0 or
     rn2(10)==0 — those draws are now included.
 
-    Returns the post-draw ``Isaac64State``.
+    Returns ``(post-draw Isaac64State, dagger_qty)`` where ``dagger_qty`` is
+    the vendor ``rn1(10, 6) = 6 + rn2(10)`` dagger stack count (the same draw
+    is consumed regardless; we now surface its value instead of discarding it
+    so the DAGGER stack matches vendor — no extra draw, byte-stream unchanged).
+    Cite: vendor/nle/src/u_init.c:750; rnd.c::rn1 (rn1(x,y)=rn2(x)+y).
 
     Citations
     ---------
@@ -1224,7 +1231,10 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
     from Nethax.nethax import vendor_rng as _vrng
 
     # 1. rn1(10, 6) dagger quantity — u_init.c:750
-    vendor_rng, _dagger_qty = _vrng.rn2(vendor_rng, 10)
+    # rn1(x, y) == rn2(x) + y, so trquan = rn2(10) + 6 ∈ [6, 15].
+    # Cite: vendor/nle/src/rnd.c::rn1.
+    vendor_rng, _dagger_roll = _vrng.rn2(vendor_rng, 10)
+    dagger_qty = _dagger_roll + 6
 
     # 2–3. SHORT_SWORD and DAGGER — WEAPON_CLASS (mkobj.c:803-818)
     # trspe=0 for both → rne draws only if rn2(11)==0 or rn2(10)==0 branches hit.
@@ -1299,7 +1309,7 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
     # 7. SACK — TOOL_CLASS: mkbox_cnts at moves<=1 → n=0 → rn2(1) (mkobj.c:309)
     vendor_rng, _sack = _vrng.rn2(vendor_rng, 1)
 
-    return vendor_rng
+    return vendor_rng, dagger_qty
 
 
 # ---------------------------------------------------------------------------
@@ -1441,10 +1451,11 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     #   5. attr variation loop (A_MAX=6)       u_init.c:887-894
     from Nethax.nethax.parity_mode import is_nle_mode as _is_nle
     blindfold_roll = None
+    dagger_qty = None
     if vendor_rng is not None and role == Role.ROGUE:
         # Step 1+2: dagger qty + ini_inv(Rogue) blessorcurse
         # Cite: vendor/nle/src/u_init.c:750; mkobj.c:803-1004
-        vendor_rng = _consume_ini_inv_rogue_draws(vendor_rng)
+        vendor_rng, dagger_qty = _consume_ini_inv_rogue_draws(vendor_rng)
         # Step 3: BLINDFOLD gate — u_init.c:753
         from Nethax.nethax import vendor_rng as _vendor_rng_mod
         vendor_rng, blindfold_roll = _vendor_rng_mod.rn2(vendor_rng, 5)
@@ -1476,6 +1487,18 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
 
     # --- Build inventory ---
     items_list = STARTING_INVENTORY[role]
+    # Rogue DAGGER stack quantity is vendor rn1(10, 6) (u_init.c:750), not the
+    # static placeholder 10.  In NLE_BYTEPARITY mode the rn2(10) was already
+    # consumed by _consume_ini_inv_rogue_draws above (no new draw); we now use
+    # its value (6 + rn2(10)) to rebuild the DAGGER item.  Byte-stream unchanged.
+    # Cite: vendor/nle/src/u_init.c:750; rnd.c::rn1.
+    if dagger_qty is not None and role == Role.ROGUE:
+        items_list = [
+            _weapon(ObjType.DAGGER, int(dagger_qty))
+            if int(it.type_id) == int(ObjType.DAGGER)
+            else it
+            for it in items_list
+        ]
     # Rogue's BLINDFOLD slot is gated `!rn2(5)` in vendor u_init.c:753-754:
     #     Rogue[R_DAGGERS].trquan = rn1(10, 6);
     #     ini_inv(Rogue);
