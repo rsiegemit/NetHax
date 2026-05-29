@@ -242,6 +242,78 @@ def compute_fov(
     return visible
 
 
+def lit_room_flood(
+    player_pos: jnp.ndarray,
+    room_x1: jnp.ndarray,
+    room_y1: jnp.ndarray,
+    room_x2: jnp.ndarray,
+    room_y2: jnp.ndarray,
+    room_active: jnp.ndarray,
+    room_lit: jnp.ndarray,
+    h: int,
+    w: int,
+) -> jnp.ndarray:
+    """Flood-visibility mask for the hero's containing LIT room.
+
+    Vendor ``vision_recalc`` (vendor/nethack/src/vision.c:320-335): when the
+    hero stands inside a room, the whole room region — interior cells PLUS the
+    one-cell bounding wall ring ``[lx-1..hx+1] x [ly-1..hy+1]`` — is set
+    ``COULD_SEE | IN_SIGHT`` and the walls are stamped ``seenv = SVALL`` *iff*
+    the room is lit (``rooms[rnum].rlit``).  A dark room only gets ``COULD_SEE``
+    (no IN_SIGHT flood); its visible tiles come from the per-step LOS / adjacent
+    cells instead.  This helper returns the IN_SIGHT flood for the lit case so
+    the caller can OR it into the Bresenham LOS visibility — Bresenham still
+    handles corridors and dark areas, this only adds the far walls/corners of a
+    lit room that rays can't reach.
+
+    Containing-room test mirrors vendor ``inside_room`` (mkroom.c:653):
+        lx-1 <= px <= hx+1  &&  ly-1 <= py <= hy+1
+    on the interior bounding box (Room.x1/x2/y1/y2).
+
+    All inputs are fixed-size arrays over ``MAX_ROOMS_PER_LEVEL`` so this stays
+    JIT-pure: no Python branches on traced values, vectorised over the rooms.
+
+    Args:
+        player_pos: int[2] (row, col).
+        room_x1/y1/x2/y2: int arrays [n_rooms] — interior bounding box.
+        room_active: bool[n_rooms] — placed-room mask.
+        room_lit:    bool[n_rooms] — per-room lit flag (rlit).
+        h, w: map dimensions (static).
+
+    Returns:
+        bool[h, w] mask, True for cells flooded by the hero's lit room.
+    """
+    pr = player_pos[0].astype(jnp.int32)
+    pc = player_pos[1].astype(jnp.int32)
+
+    x1 = room_x1.astype(jnp.int32)
+    y1 = room_y1.astype(jnp.int32)
+    x2 = room_x2.astype(jnp.int32)
+    y2 = room_y2.astype(jnp.int32)
+
+    # inside_room (mkroom.c:653) over the wall-inclusive ring; gate on active+lit.
+    contains = (
+        room_active
+        & room_lit
+        & (pc >= x1 - 1) & (pc <= x2 + 1)
+        & (pr >= y1 - 1) & (pr <= y2 + 1)
+    )  # bool[n_rooms]
+
+    rows = jnp.arange(h, dtype=jnp.int32)[:, None]   # (h, 1)
+    cols = jnp.arange(w, dtype=jnp.int32)[None, :]   # (1, w)
+
+    def room_mask(i):
+        # Cells of room i's wall-inclusive ring, only if it contains the hero.
+        in_box = (
+            (cols >= x1[i] - 1) & (cols <= x2[i] + 1)
+            & (rows >= y1[i] - 1) & (rows <= y2[i] + 1)
+        )
+        return in_box & contains[i]
+
+    masks = jax.vmap(room_mask)(jnp.arange(x1.shape[0]))  # (n_rooms, h, w)
+    return jnp.any(masks, axis=0)
+
+
 def update_explored(
     explored: jnp.ndarray,
     fov: jnp.ndarray,

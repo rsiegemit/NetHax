@@ -476,11 +476,26 @@ class NethaxEnv:
         # Mirror that here by also seeding ``visible`` and stamping
         # ``last_seen_terrain`` for the FOV tiles — exactly as the per-step
         # ``subsystems/action_dispatch.py::_apply_fov`` does after a move.
-        from Nethax.nethax.fov import compute_fov
+        from Nethax.nethax.fov import compute_fov, lit_room_flood
+        terrain_l0_full = state.terrain[0, 0, :, :]
         vis = compute_fov(
-            state.terrain[0, 0, :, :],
+            terrain_l0_full,
             state.player_pos.astype(jnp.int32),
         )                                                  # bool[MAP_H, MAP_W]
+        # Lit-room flood (vendor vision.c:320-335): when the hero stands in a
+        # LIT room, vision_recalc makes the whole room region visible at once —
+        # the interior PLUS the one-cell bounding wall ring — not just the
+        # Bresenham LOS subset.  OR that flood into the raycast visibility so
+        # the far walls/corners of the starting lit room render on turn 0.
+        # Dark rooms / corridors still rely on the LOS rays above.
+        _h, _w = terrain_l0_full.shape
+        lit_flood = lit_room_flood(
+            state.player_pos.astype(jnp.int32),
+            _rooms.x1, _rooms.y1, _rooms.x2, _rooms.y2,
+            _active, _rooms.is_lit,
+            _h, _w,
+        )                                                  # bool[MAP_H, MAP_W]
+        vis = vis | lit_flood
         new_explored = state.explored.at[0, 0].set(
             state.explored[0, 0] | vis
         )
