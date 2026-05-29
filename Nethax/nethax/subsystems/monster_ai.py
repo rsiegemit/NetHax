@@ -4384,14 +4384,20 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
         return s.replace(monster_ai=_m.replace(mon_xp=new_xp))
 
     def _follow_player(s):
-        """FOLLOW mode: BFS pathfind toward player (mfndpos).
+        """FOLLOW mode: vendor-faithful ISAAC64 dog_move.
 
-        Vendor: dogmove.c::dog_move uses mfndpos for path-finding.  Confused
-        pets randomise their step (vendor mfndpos mon.c:2199-2202 sets
-        ``flag |= ALLOW_ALL`` and dochug degenerates pursuit to a random
-        adjacent square).
-        Cite: vendor/nethack/src/monmove.c::mfndpos lines 2199-2202.
+        Under NLE_BYTEPARITY: dispatch to ``vendor_pet_dog_move`` (see
+        ``Nethax/nethax/subsystems/pet_dog_move.py``) which reproduces the
+        distfleeck + wanderer + mfndpos + scoring-loop draw order against
+        ``state.vendor_rng``.  Otherwise: fall back to the legacy BFS step.
+
+        Cite: vendor/nle/src/dogmove.c lines 862-1126 (dog_move body) and
+              vendor/nle/src/monmove.c lines 320, 578 (prelude draws).
         """
+        if _use_vendor_rng():
+            from Nethax.nethax.subsystems.pet_dog_move import vendor_pet_dog_move
+            new_s, new_vrng = vendor_pet_dog_move(s, s.vendor_rng, idx)
+            return new_s.replace(vendor_rng=new_vrng)
         _mai = s.monster_ai
         step_delta = pathfind_step(s, idx)
         _rng_conf_pet = jax.random.fold_in(rng, jnp.int32(0x636F6E66))  # "conf"
