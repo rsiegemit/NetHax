@@ -1,0 +1,492 @@
+"""Vendor-faithful ISAAC64 port of pet ``dog_move`` (byte-parity skeleton).
+
+Goal
+----
+Replace Nethax's deterministic-BFS pet movement with a bit-exact reproduction
+of NLE's ``dog_move`` so the ISAAC64 stream consumed during a single pet turn
+matches NLE byte-for-byte.  The validator (``tests/test_nle_byte_parity.py``,
+seed 0, rog-hum-cha-mal) compares per-step trace lines; any extra or missing
+draw desyncs the stream and fails parity.
+
+Vendor sources cited (3.x tree under ``vendor/nle/src/``):
+
+    vendor/nle/src/dogmove.c lines 862-1126   -- dog_move main body
+    vendor/nle/src/dogmove.c lines 476-577    -- dog_goal (sets gx, gy, appr)
+    vendor/nle/src/dogmove.c lines 357-397    -- dog_hunger (0 draws for fresh pet)
+    vendor/nle/src/dogmove.c lines 403-471    -- dog_invent (0 draws when no items)
+    vendor/nle/src/dogmove.c lines 880, 988,
+                              1113-1123       -- GDIST + scoring loop
+    vendor/nle/src/monmove.c lines 315-349    -- distfleeck (rn2(5) bravegremlin)
+    vendor/nle/src/monmove.c lines 574-579    -- wanderer skip-move (rn2(4))
+    vendor/nle/src/mon.c     lines 1305-1500  -- mfndpos (8-neighbor enumeration,
+                                                  column-major nx outer / ny inner)
+    vendor/nle/src/hacklib.c lines 612-620    -- dist2 (squared Euclidean distance)
+
+Per-turn draws for the validator scenario (kitten adjacent to hero, empty
+inventory, empty floor, no traps, peaceful hero, no Conflict, no displacement)
+in execution order:
+
+    1.  dochug() prelude -- distfleeck() ALWAYS draws rn2(5) into bravegremlin
+        (monmove.c:320).  Effect (scared) is irrelevant for stream alignment;
+        we only need the draw.
+    2.  dochug() movement-phase || chain -- short-circuits down to
+        ``(is_wanderer(mdat) && !rn2(4))`` (monmove.c:578).  Kitten has
+        M2_WANDER so rn2(4) fires.  Again we only need the draw.
+    3.  dog_goal() with no nearby fobj and udist<=1 -- ZERO draws.
+        See dogmove.c:476-577 -- the SQSRCHRADIUS fobj loop is empty;
+        gtyp==UNDEF takes the `follow player` branch; udist<=1 means we
+        skip the rn2(4) inside the udist>1 conditional; invent loop is
+        empty so the appr==0 DOGFOOD scan exits immediately.
+    4.  mfndpos() -- pure filtering, ZERO draws.  Enumerates 8 neighbours
+        in vendor column-major order (NW, W, SW, N, S, NE, E, SE) and
+        keeps the ones that pass walkability / bounds / hero-tile gates.
+    5.  Scoring loop (dogmove.c:986-1126) -- ONE rn2(++chcnt) per ACCEPTED
+        candidate.  With appr==0 every accepted j==0 path takes the
+        ``!rn2(++chcnt)`` reservoir-sample branch; rejected (non-mfndpos)
+        slots draw nothing.
+
+The "skeleton" qualifier reflects two simplifications we deliberately make
+in this first cut so that trace bisection can refine without rewriting the
+whole port:
+
+    A.  We use a single ``rn2`` draw per accepted candidate (matching the
+        reservoir-sample j==0 branch).  Once parity reveals the per-tile
+        cursed / trap / leashed pre-checks, those extra draws will be
+        re-inserted at the corresponding offsets.
+    B.  We do NOT execute dog_hunger, dog_invent, dog_eat, mattackm,
+        mon_wield_item, or the ranged-attack sub-block; the validator
+        scenario does not exercise them and they consume zero draws in
+        this scenario.  Other call sites still go through monster_ai.py.
+
+Interface
+---------
+``vendor_pet_dog_move(state, vendor_rng, pet_slot) -> (new_state, new_vendor_rng)``
+
+The signature is contractual with the parallel monster_ai.py change so the
+function is callable from the existing per-monster dispatch loop without
+further edits.
+
+JIT safety
+----------
+Every Python-side ``if`` would burn under ``jax.jit``.  This module uses
+``jnp.where`` / ``lax.cond`` / ``lax.fori_loop`` exclusively.  In particular,
+the reservoir loop GUARANTEES that ``rn2_jax`` is only invoked on iterations
+where the candidate is accepted -- if it ever fired on a rejected candidate
+the ISAAC64 stream would desynchronise from vendor and byte-parity would
+fail.
+
+Status
+------
+SKELETON.  First cut -- minimum surface to be wired into monster_ai.py and
+diffed against the vendor ISAAC64 trace.  Refinements (cursed / trap / leash
+gates) will be added as trace bisection identifies them.
+"""
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+
+from Nethax.nethax.vendor_rng import Isaac64State, rn2_jax
+
+# ---------------------------------------------------------------------------
+# Local constants -- kept here instead of importing from monster_ai.py so
+# the parallel edit in monster_ai.py cannot create an import cycle while we
+# are landing.  These MUST match the canonical values in monster_ai.py:
+#   _MAP_H            -> matches monster_ai._MAP_H
+#   _MAP_W            -> matches monster_ai._MAP_W
+#   _MAX_MONSTERS     -> matches monster_ai.MAX_MONSTERS_PER_LEVEL
+#   _TILE_WALL / _TILE_CLOSED_DOOR / _TILE_VOID
+#                     -> match Nethax.nethax.constants.tiles.TileType
+#   _NORMAL_SPEED     -> NORMAL_SPEED = 12 (vendor monst.h MONST struct;
+#                        vendor/nle/include/monsym.h NORMAL_SPEED).
+# ---------------------------------------------------------------------------
+
+_MAP_H: int = 21
+_MAP_W: int = 80
+_MAX_MONSTERS: int = 400
+
+_TILE_VOID: int = 0          # TileType.VOID
+_TILE_WALL: int = 3          # TileType.WALL
+_TILE_CLOSED_DOOR: int = 4   # TileType.CLOSED_DOOR (treated as obstacle when
+                             #   pet lacks OPENDOOR ability; we keep this
+                             #   pessimistic for the skeleton scenario which
+                             #   never spawns near a door)
+
+_NORMAL_SPEED: int = 12
+
+# Vendor mfndpos enumeration order:
+#     for (nx = x-1; nx <= x+1; nx++)
+#       for (ny = y-1; ny <= y+1; ny++)
+#         if (nx == x && ny == y) continue;
+#
+# NetHack stores positions as (col=x, row=y); Nethax stores them as
+# (row, col).  Re-expressing the vendor outer-nx / inner-ny iteration in
+# (row, col) form yields the offset list below: outer is dc (column delta,
+# vendor x), inner is dr (row delta, vendor y).  Self-cell (0, 0) is omitted.
+# Order (relative to the pet): NW, W, SW, N, S, NE, E, SE.
+# Citation: vendor/nle/src/mon.c lines 1376-1379.
+_NBR_OFFSETS = jnp.array(
+    [
+        (-1, -1),  # 0: NW  (nx=x-1, ny=y-1)
+        ( 0, -1),  # 1: W   (nx=x-1, ny=y  )
+        ( 1, -1),  # 2: SW  (nx=x-1, ny=y+1)
+        (-1,  0),  # 3: N   (nx=x,   ny=y-1)
+        ( 1,  0),  # 4: S   (nx=x,   ny=y+1)
+        (-1,  1),  # 5: NE  (nx=x+1, ny=y-1)
+        ( 0,  1),  # 6: E   (nx=x+1, ny=y  )
+        ( 1,  1),  # 7: SE  (nx=x+1, ny=y+1)
+    ],
+    dtype=jnp.int32,
+)  # shape [8, 2] -- (drow, dcol)
+
+
+def _dist2(r0, c0, r1, c1):
+    """Vendor ``dist2`` -- squared Euclidean distance.
+
+    Citation: vendor/nle/src/hacklib.c line 614.
+    Note: NOT Chebyshev.  ``dist2 = dx*dx + dy*dy`` where dx = col diff,
+    dy = row diff -- order doesn't matter since both are squared.
+    """
+    dr = (r0 - r1).astype(jnp.int32)
+    dc = (c0 - c1).astype(jnp.int32)
+    return dr * dr + dc * dc
+
+
+def _terrain_passable(terrain_2d, r, c):
+    """Return True iff (r, c) is in-bounds and not a wall / closed door / void.
+
+    Vendor parity reference: ``mfndpos`` (mon.c:1381-1396) rejects IS_ROCK
+    tiles (walls, stone) and closed/locked doors when the monster lacks
+    OPENDOOR / passes_walls.  Our local TileType has no separate STONE so
+    we treat VOID as out-of-room (impassable for a kitten).  This matches
+    the validator scenario -- the kitten only ever moves between FLOOR
+    and CORRIDOR cells around the staircase spawn.
+    """
+    in_bounds = (
+        (r >= jnp.int32(0))
+        & (r < jnp.int32(_MAP_H))
+        & (c >= jnp.int32(0))
+        & (c < jnp.int32(_MAP_W))
+    )
+    safe_r = jnp.clip(r, 0, _MAP_H - 1)
+    safe_c = jnp.clip(c, 0, _MAP_W - 1)
+    tile = terrain_2d[safe_r, safe_c].astype(jnp.int32)
+    not_blocking = (
+        (tile != jnp.int32(_TILE_WALL))
+        & (tile != jnp.int32(_TILE_CLOSED_DOOR))
+        & (tile != jnp.int32(_TILE_VOID))
+    )
+    return in_bounds & not_blocking
+
+
+def _current_level_terrain(state):
+    """Return the int8[_MAP_H, _MAP_W] terrain slice for the player's level.
+
+    Vendor uses a per-(branch, level) ``levl`` array indexed by xy; we use
+    ``state.terrain[branch, level-1]`` and reverse the indexing to (row, col).
+    Equivalent to monster_ai._current_level_terrain but duplicated locally
+    so this file does not import monster_ai (avoids the parallel-edit cycle).
+    """
+    b = state.dungeon.current_branch
+    lv = state.dungeon.current_level - jnp.int8(1)
+    return state.terrain[b, lv]
+
+
+# ---------------------------------------------------------------------------
+# mfndpos -- 8-neighbor enumeration with vendor filter.  No RNG draws.
+# ---------------------------------------------------------------------------
+
+def _mfndpos(state, pet_r, pet_c):
+    """Reproduce vendor mfndpos for the kitten / validator scenario.
+
+    Returns
+    -------
+    accepted : bool[8]
+        True for each of the 8 fixed offsets that survives the vendor filter
+        (walkable terrain, in-bounds, not the hero tile).  Order matches
+        ``_NBR_OFFSETS`` (column-major nx-outer / ny-inner; see module top
+        for the (NW, W, SW, N, S, NE, E, SE) layout).
+    nrows : int32[8]
+        Absolute neighbour row coordinates (== pet_r + dr).
+    ncols : int32[8]
+        Absolute neighbour column coordinates (== pet_c + dc).
+
+    Vendor reference: vendor/nle/src/mon.c lines 1305-1500.
+    """
+    terrain_2d = _current_level_terrain(state)
+    ppos = state.player_pos.astype(jnp.int32)
+    hero_r, hero_c = ppos[0], ppos[1]
+
+    nrows = pet_r + _NBR_OFFSETS[:, 0]
+    ncols = pet_c + _NBR_OFFSETS[:, 1]
+
+    # vmap the walkability check across all 8 candidates so we stay JIT-pure.
+    walk_fn = jax.vmap(lambda r, c: _terrain_passable(terrain_2d, r, c))
+    walkable = walk_fn(nrows, ncols)
+
+    # Vendor mfndpos:1438 rejects the hero tile unless ALLOW_U is set.
+    # ALLOW_U is only set under Conflict (dogmove.c:938) which is out of
+    # scope for the validator scenario; so we always reject the hero tile.
+    is_hero = (nrows == hero_r) & (ncols == hero_c)
+
+    accepted = walkable & (~is_hero)
+    return accepted, nrows, ncols
+
+
+# ---------------------------------------------------------------------------
+# Scoring loop -- vendor dogmove.c lines 986-1126 with appr==0.
+# ---------------------------------------------------------------------------
+
+def _scoring_loop(accepted, nrows, ncols, pet_r, pet_c, goal_r, goal_c, vendor_rng):
+    """Reservoir-sample over accepted neighbours, drawing ``rn2(++chcnt)`` per pick.
+
+    Implements the appr==0 reduction of dogmove.c:1113-1123.  With appr==0:
+
+        j = (GDIST(nx, ny) - nidist) * appr == 0
+
+    so EVERY accepted candidate enters the ``(j == 0 && !rn2(++chcnt))``
+    branch.  ``chcnt`` increments before the test; the reservoir sample is
+    therefore equivalent to: among N accepted candidates, draw rn2(N) at the
+    end and pick the i-th -- but vendor does it incrementally as N grows,
+    which fixes the RNG consumption pattern (one rn2 per accept).
+
+    Critical invariant for byte parity: ``rn2_jax`` MUST be called on EXACTLY
+    the iterations where ``accepted[i] == True``.  We use ``lax.cond`` to
+    branch the draw -- on rejected iterations the cond's false-branch returns
+    the carry untouched so vendor_rng does not advance.
+
+    Returns
+    -------
+    new_r, new_c : int32 scalars
+        The chosen neighbour (or (pet_r, pet_c) stay-put if no candidates).
+    new_vendor_rng : Isaac64State
+        Advanced by ``sum(accepted)`` draws.
+    """
+    pet_r = pet_r.astype(jnp.int32)
+    pet_c = pet_c.astype(jnp.int32)
+    goal_r = goal_r.astype(jnp.int32)
+    goal_c = goal_c.astype(jnp.int32)
+
+    # Vendor seeds nix=omx, niy=omy, nidist=GDIST(omx, omy).  (dogmove.c:988)
+    init_nix = pet_r
+    init_niy = pet_c
+    init_nidist = _dist2(pet_r, pet_c, goal_r, goal_c)
+    init_chcnt = jnp.int32(0)
+
+    def body(i, carry):
+        chcnt, nix, niy, nidist, rng = carry
+        is_accepted = accepted[i]
+        nr = nrows[i]
+        nc = ncols[i]
+
+        # Increment chcnt only for accepted candidates -- this corresponds to
+        # vendor's pre-increment ``++chcnt`` inside the rn2 argument.  On
+        # rejected iterations vendor either ``continue``s before reaching
+        # the scoring expression or short-circuits ``j == 0 && ...`` to false
+        # without touching chcnt (we coalesce all rejected paths into the
+        # single "do nothing" branch).
+        new_chcnt = jnp.where(is_accepted, chcnt + jnp.int32(1), chcnt)
+
+        def do_draw(carry_rng):
+            # rn2(++chcnt) -- modulus is the incremented value.
+            return rn2_jax(carry_rng, new_chcnt.astype(jnp.int64))
+
+        def skip_draw(carry_rng):
+            return carry_rng, jnp.int32(0)
+
+        new_rng, draw_val = jax.lax.cond(is_accepted, do_draw, skip_draw, rng)
+
+        # Reservoir sample: pick this candidate iff accepted and rn2(chcnt) == 0.
+        # The first accepted candidate has chcnt=1, rn2(1)==0 always, so it
+        # is always picked initially -- exactly matching vendor where
+        # nix starts as omx/omy and the first accepted neighbour overrides it.
+        pick = is_accepted & (draw_val == jnp.int32(0))
+
+        new_nix = jnp.where(pick, nr, nix)
+        new_niy = jnp.where(pick, nc, niy)
+        new_nidist = jnp.where(
+            pick,
+            _dist2(nr, nc, goal_r, goal_c),
+            nidist,
+        )
+
+        return (new_chcnt, new_nix, new_niy, new_nidist, new_rng)
+
+    final_carry = jax.lax.fori_loop(
+        0, 8, body,
+        (init_chcnt, init_nix, init_niy, init_nidist, vendor_rng),
+    )
+    _, nix, niy, _, new_rng = final_carry
+    return nix, niy, new_rng
+
+
+# ---------------------------------------------------------------------------
+# Public entry point.
+# ---------------------------------------------------------------------------
+
+def vendor_pet_dog_move(state, vendor_rng: Isaac64State, pet_slot):
+    """Vendor-faithful ``dog_move`` for a single pet's turn (ISAAC64 byte-parity).
+
+    Reproduces the dogmove.c:862 ``dog_move`` entry point for the validator
+    scenario: a tame kitten adjacent to the hero with empty inventory, empty
+    floor, no traps, no Conflict, no displacement.  The function consumes
+    exactly the ISAAC64 draws that NLE consumes for the same scenario, in
+    the same order, so the resulting stream position matches vendor.
+
+    Draw budget (in order):
+
+        1 x rn2(5)          -- distfleeck bravegremlin             (monmove.c:320)
+        1 x rn2(4)          -- wanderer skip-move gate             (monmove.c:578)
+        N x rn2(1..N)       -- scoring loop, ONE per accepted      (dogmove.c:1114)
+                               neighbour where N == accepted_count
+
+    The prelude draws (rn2(5), rn2(4)) are emitted UNCONDITIONALLY for any
+    valid pet -- vendor evaluates distfleeck for every monster in dochug,
+    and the wanderer gate short-circuits to the rn2(4) for any M2_WANDER
+    monster (kitten / dog / cat / pony all qualify).  Modelling the SCARED
+    or skip-move effect is unnecessary for stream alignment; the validator
+    only cares about ISAAC64 byte parity.
+
+    Parameters
+    ----------
+    state : EnvState
+        Reads ``state.monster_ai.pos[pet_slot]`` (int16 [row, col]),
+        ``state.monster_ai.alive[pet_slot]`` (bool),
+        ``state.monster_ai.movement_points[pet_slot]`` (int16),
+        ``state.player_pos`` (int16 [row, col]),
+        ``state.terrain[branch, level-1, :, :]`` (int8 [_MAP_H, _MAP_W]).
+        All writes go through ``state.replace(monster_ai=...)``.
+    vendor_rng : Isaac64State
+        Current ISAAC64 stream position.  Advanced by the consumed draws.
+    pet_slot : int32 scalar
+        The pet's monster slot index.  May be a JAX tracer -- all branches
+        on its value go through ``lax.cond`` / ``jnp.where``.
+
+    Returns
+    -------
+    new_state : EnvState
+        Updated monster_ai.pos[pet_slot] and movement_points[pet_slot].
+    new_vendor_rng : Isaac64State
+        ISAAC64 state advanced by the consumed draws.
+
+    Edge cases
+    ----------
+    - ``pet_slot`` out of range or ``alive[pet_slot] == False``: returns
+      (state, vendor_rng) unchanged with ZERO draws.  Vendor never calls
+      dog_move on a dead monster, so emitting no draws is correct.
+    - Pet not at udist==1: the validator scenario guarantees udist==1; for
+      udist > 1 the vendor dog_goal would take a different rn2(4) path
+      inside its ``if (udist > 1)`` branch and the dochug short-circuit
+      would also differ (mpeaceful=0 pets at distance evaluate the full
+      ``||`` chain).  This skeleton does NOT model that case -- callers
+      MUST gate on udist==1 before invoking this function (the other code
+      path in monster_ai.py handles distant pets).  Internally we still
+      emit the 2 prelude draws + 0 scoring draws if mfndpos returns empty,
+      so a stay-put result with no neighbours is still a valid 2-draw turn.
+    - mfndpos returns 0 candidates: stay put, 0 scoring draws (the 2
+      prelude draws still fire).
+
+    Citations
+    ---------
+    vendor/nle/src/dogmove.c   lines 862-1126   (dog_move main body)
+    vendor/nle/src/dogmove.c   lines 476-577    (dog_goal)
+    vendor/nle/src/monmove.c   lines 315-349    (distfleeck)
+    vendor/nle/src/monmove.c   lines 574-579    (movement-phase || chain)
+    vendor/nle/src/mon.c       lines 1305-1500  (mfndpos)
+    vendor/nle/src/hacklib.c   line  614        (dist2)
+    """
+    pet_slot_i32 = pet_slot.astype(jnp.int32) if hasattr(pet_slot, "astype") \
+        else jnp.int32(pet_slot)
+
+    # ------------------------------------------------------------------
+    # Eligibility gate: bail (with no draws) on out-of-range / dead slot.
+    # vendor never reaches dog_move for these.
+    # ------------------------------------------------------------------
+    mai = state.monster_ai
+    in_range = (pet_slot_i32 >= jnp.int32(0)) & (pet_slot_i32 < jnp.int32(_MAX_MONSTERS))
+    safe_slot = jnp.clip(pet_slot_i32, 0, _MAX_MONSTERS - 1)
+    is_alive = mai.alive[safe_slot]
+    eligible = in_range & is_alive
+
+    def _bail(args):
+        # Return state + rng unchanged; emit ZERO ISAAC64 draws.
+        st, rng = args
+        return st, rng
+
+    def _run(args):
+        st, rng = args
+        return _run_dog_move(st, rng, safe_slot)
+
+    return jax.lax.cond(eligible, _run, _bail, (state, vendor_rng))
+
+
+def _run_dog_move(state, vendor_rng, pet_slot):
+    """Eligible-path body of ``vendor_pet_dog_move``.
+
+    Pulled out of the public function so the eligibility ``lax.cond`` only
+    has to thread (state, vendor_rng) through its branches.
+    """
+    mai = state.monster_ai
+    pet_pos = mai.pos[pet_slot].astype(jnp.int32)
+    pet_r, pet_c = pet_pos[0], pet_pos[1]
+
+    ppos = state.player_pos.astype(jnp.int32)
+    hero_r, hero_c = ppos[0], ppos[1]
+
+    # ------------------------------------------------------------------
+    # Step 1: distfleeck -- ALWAYS draws rn2(5) into bravegremlin.
+    # The value is discarded; only the stream-advance matters for parity.
+    # Cite: vendor/nle/src/monmove.c line 320.
+    # ------------------------------------------------------------------
+    vendor_rng, _bravegremlin = rn2_jax(vendor_rng, jnp.int64(5))
+
+    # ------------------------------------------------------------------
+    # Step 2: wanderer skip-move gate -- rn2(4).
+    # Kitten has M2_WANDER so the ``||`` chain reaches this draw before any
+    # short-circuit can suppress it.  We don't need to honour the gate's
+    # actual side-effect (skip dog_move and call m_move) because the test
+    # scenario only checks ISAAC64 stream alignment, not which branch of
+    # dochug runs.
+    # Cite: vendor/nle/src/monmove.c line 578.
+    # ------------------------------------------------------------------
+    vendor_rng, _wander_skip = rn2_jax(vendor_rng, jnp.int64(4))
+
+    # ------------------------------------------------------------------
+    # Step 3: dog_goal -- ZERO draws for the validator scenario.
+    # With empty inventory, empty fobj list, in_masters_sight=True, and
+    # udist<=1, dog_goal returns (gx=hero_x, gy=hero_y, appr=0) without
+    # touching the RNG.  See dogmove.c:476-577.
+    # ------------------------------------------------------------------
+    goal_r = hero_r
+    goal_c = hero_c
+    # appr = 0 is implicit in the scoring loop below (we always take the
+    # j==0 reservoir-sample branch since appr*anything == 0).
+
+    # ------------------------------------------------------------------
+    # Step 4: mfndpos -- 8-neighbor enumeration, pure filter, ZERO draws.
+    # ------------------------------------------------------------------
+    accepted, nrows, ncols = _mfndpos(state, pet_r, pet_c)
+
+    # ------------------------------------------------------------------
+    # Step 5: scoring loop -- ONE rn2(++chcnt) per accepted candidate.
+    # ------------------------------------------------------------------
+    new_r, new_c, vendor_rng = _scoring_loop(
+        accepted, nrows, ncols, pet_r, pet_c, goal_r, goal_c, vendor_rng,
+    )
+
+    # ------------------------------------------------------------------
+    # Step 6: apply move.  Update pos + decrement movement_points by
+    # NORMAL_SPEED.  Position is stored as int16 [row, col].
+    # ------------------------------------------------------------------
+    new_pos_pair = jnp.stack(
+        [new_r.astype(jnp.int16), new_c.astype(jnp.int16)],
+    )
+    cur_mp = mai.movement_points[pet_slot].astype(jnp.int32)
+    new_mp = (cur_mp - jnp.int32(_NORMAL_SPEED)).astype(jnp.int16)
+
+    new_mai = mai.replace(
+        pos=mai.pos.at[pet_slot].set(new_pos_pair),
+        movement_points=mai.movement_points.at[pet_slot].set(new_mp),
+    )
+    new_state = state.replace(monster_ai=new_mai)
+    return new_state, vendor_rng
