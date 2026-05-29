@@ -1365,15 +1365,19 @@ def generate_main_branch_l1(
         vendor_down_c = None  # type: ignore[assignment]
 
     # 6. Hero spawn / up-stair.
-    #    Vendor path (Dlvl 1): the hero spawns on the branch staircase
-    #    (vendor_hero_r/c, from place_branch->find_branch_room).  Vendor
-    #    creates NO up-stair (<) on Dlvl 1 — mkstairs(up=1) is skipped by
-    #    the ``dlevel!=1`` gate (mklev.c:720) — so we stamp none.
-    #    Threefry path: place an up-stair (<) in the centre of room[0]
-    #    for playability (no vendor byte-parity constraint).
+    #    Vendor path (Dlvl 1): the hero spawns on the branch staircase.
+    #    `mkstairs(up=1)` is correctly skipped on Dlvl 1 (mklev.c:720), but
+    #    vendor's `place_branch()` (mklev.c:1190-1198) DOES stamp a STAIRS
+    #    tile at the branch cell: `levl[x][y].typ = STAIRS; ladder = LA_UP`.
+    #    `back_to_glyph` (display.c:1753-1755) maps STAIRS+LA_UP → S_upstair
+    #    (cmap 23, glyph 2382, char '<').  We must mirror that here so the
+    #    obs reveals '<' under the hero after they step off the cell.
+    #    Threefry path: place an up-stair in the centre of room[0] for
+    #    playability (no vendor byte-parity constraint).
     if vendor_hero_r is not None:
         up_r = vendor_hero_r
         up_c = vendor_hero_c
+        terrain = terrain.at[up_r, up_c].set(jnp.int8(_TILE_STAIRCASE_UP))
     else:
         up_r = ((rooms.y1[0] + rooms.y2[0]) // 2).astype(jnp.int16)
         up_c = ((rooms.x1[0] + rooms.x2[0]) // 2).astype(jnp.int16)
