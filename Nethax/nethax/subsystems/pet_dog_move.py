@@ -341,7 +341,6 @@ def vendor_pet_dog_move(state, vendor_rng: Isaac64State, pet_slot):
 
     Draw budget (in order):
 
-        1 x rn2(5)          -- distfleeck bravegremlin             (monmove.c:320)
         1 x rn2(4)          -- wanderer skip-move gate             (monmove.c:578)
         0..1 x rn2(4)       -- dog_goal stay-in-room check, only   (dogmove.c:565)
                                when udist > 1 (hero IS in a room
@@ -350,12 +349,16 @@ def vendor_pet_dog_move(state, vendor_rng: Isaac64State, pet_slot):
         N x rn2(1..N)       -- scoring loop, ONE per accepted      (dogmove.c:1114)
                                neighbour where N == accepted_count
 
-    The prelude draws (rn2(5), rn2(4)) are emitted UNCONDITIONALLY for any
-    valid pet -- vendor evaluates distfleeck for every monster in dochug,
-    and the wanderer gate short-circuits to the rn2(4) for any M2_WANDER
-    monster (kitten / dog / cat / pony all qualify).  Modelling the SCARED
-    or skip-move effect is unnecessary for stream alignment; the validator
-    only cares about ISAAC64 byte parity.
+    The distfleeck ``rn2(5)`` bravegremlin draw is now emitted by the
+    per-fmon scan body in ``monsters_step_all`` (one per valid & alive
+    fmon entry, pet included), so the vendor_rng stream advances even
+    when the pet is asleep or out of movement_points.  Emitting it here
+    would double-draw.  The wanderer ``rn2(4)`` is still emitted here
+    because non-pet monsters' M2_WANDER gate isn't yet portable to the
+    scan body — an accepted parity gap for steps 3+ until non-pet
+    wanderer emission is wired in.  Modelling the SCARED or skip-move
+    effect is unnecessary for stream alignment; the validator only cares
+    about ISAAC64 byte parity.
 
     Parameters
     ----------

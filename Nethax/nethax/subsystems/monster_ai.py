@@ -6086,6 +6086,27 @@ def monsters_step_all(state, rng: jax.Array) -> object:
             alive_s = mi.alive[safe_slot]
             may_act = valid & alive_s & (mp_pre >= NS)
 
+            # ---- distfleeck rn2(5) per fmon entry (vendor monmove.c:315-320) ----
+            # Vendor's dochug prelude unconditionally calls distfleeck, which
+            # draws rn2(5) into the `bravegremlin` local BEFORE any sleeping /
+            # awake gating.  Emit one rn2(5) per alive fmon entry so the
+            # vendor_rng stream advances even when may_act is False (asleep /
+            # no movement_points).  Skip empty fmon slots (fmon_order[k] == -1).
+            # Cite: vendor/nle/src/monmove.c::distfleeck lines 315-320
+            #       (bravegremlin = rn2(5)).
+            need_distfleeck = valid & alive_s
+
+            def _draw_distfleeck(vr):
+                return _vendor_rng_mod.rn2_jax(vr, jnp.int32(5))
+
+            def _no_draw(vr):
+                return vr, jnp.int32(0)
+
+            vrng_pre = carry.vendor_rng
+            vrng_post, _bravegremlin = jax.lax.cond(
+                need_distfleeck, _draw_distfleeck, _no_draw, vrng_pre,
+            )
+
             # Deduct NORMAL_SPEED on action (vendor movemon).  Do this
             # BEFORE the turn body so monster_turn sees the post-deduct value.
             new_mp_val = jnp.where(may_act, mp_pre - NS, mp_pre).astype(jnp.int16)
@@ -6095,7 +6116,7 @@ def monsters_step_all(state, rng: jax.Array) -> object:
                 mi.movement_points,
             )
             mi_pre = mi.replace(movement_points=new_mp_arr)
-            carry_pre = carry.replace(monster_ai=mi_pre)
+            carry_pre = carry.replace(monster_ai=mi_pre, vendor_rng=vrng_post)
 
             def _do_turn(s):
                 return monster_turn(s, key, safe_slot)
