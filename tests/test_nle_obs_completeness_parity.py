@@ -140,11 +140,14 @@ def test_tty_chars_status_rows_22_23(env_state_obs):
 # ---------------------------------------------------------------------------
 
 def test_tty_cursor_at_player_pos(env_state_obs):
-    """tty_cursor[0] == player_map_row + 1, tty_cursor[1] == player_col.
+    """tty_cursor[0] == player_map_row + 1, tty_cursor[1] == player_col - 1.
 
     Map rows 1-21 in tty correspond to map rows 0-20; row 0 is the message
-    line.  Citation: nle.c:110-111 writes cur->r, cur->c from the VT terminal
-    cursor, which NLE positions at the player after each render step.
+    line.  NLE drops NetHack's unused internal column 0, so the displayed
+    (tty / obs) column is the internal column minus 1 — the cursor follows
+    the same convention (vendor tty_curs does ``--x``).  Citation:
+    nle.c:110-111 writes cur->r, cur->c from the VT terminal cursor, which
+    NLE positions at the player after each render step.
     """
     _, state, obs = env_state_obs
     cur = np.array(obs["tty_cursor"])
@@ -154,8 +157,9 @@ def test_tty_cursor_at_player_pos(env_state_obs):
     assert cur[0] == pr + 1, (
         f"tty_cursor row {cur[0]} != player_map_row+1 ({pr+1})"
     )
-    assert cur[1] == pc, (
-        f"tty_cursor col {cur[1]} != player_col ({pc})"
+    # Internal col pc -> displayed col pc-1 (NLE drops internal column 0).
+    assert cur[1] == pc - 1, (
+        f"tty_cursor col {cur[1]} != player_col-1 ({pc - 1})"
     )
 
 

@@ -722,19 +722,21 @@ def build_colors(env_state) -> jnp.ndarray:
     branch = jnp.int32(env_state.dungeon.current_branch)
     level_idx = jnp.int32(env_state.dungeon.current_level) - 1
 
-    tile = env_state.terrain[branch, level_idx, :21, :79]
+    # Drop internal column 0 (obs col c = internal col c+1), matching NLE.
+    tile = env_state.terrain[branch, level_idx, :21, 1:80]
     tile_idx = jnp.clip(tile.astype(jnp.int16), 0, NUM_TILE_TYPES - 1)
     cmap_idx = _TILE_TO_CMAP[tile_idx]  # int16[21,79]
     cmap_clamped = jnp.clip(cmap_idx, 0, len(_CMAP_TO_COLOR) - 1)
     colors = _CMAP_TO_COLOR[cmap_clamped]  # uint8[21,79]
 
     # Unexplored tiles -> color 0 (black)
-    explored = env_state.explored[branch, level_idx, :21, :79]
+    explored = env_state.explored[branch, level_idx, :21, 1:80]
     colors = jnp.where(explored, colors, jnp.uint8(0))
 
-    # Player tile -> bright yellow (15)
+    # Player tile -> bright yellow (15).  player_pos[1] is a STATE column; the
+    # obs map drops internal column 0, so the obs column is player_pos[1] - 1.
     pr = jnp.int32(env_state.player_pos[0])
-    pc = jnp.clip(jnp.int32(env_state.player_pos[1]), 0, 78)
+    pc = jnp.clip(jnp.int32(env_state.player_pos[1]) - jnp.int32(1), 0, 78)
     colors = colors.at[pr, pc].set(jnp.uint8(15))
 
     return colors
@@ -776,8 +778,9 @@ def build_specials(env_state) -> jnp.ndarray:
 
     # Ground items: category[branch, level, row, col, stack] (int8)
     # stack dim is MAX_GROUND_STACK = 8; non-zero means item present.
-    gi_cat = env_state.ground_items.category[branch, level_idx, :21, :79, :]
-    gi_typ = env_state.ground_items.type_id[branch, level_idx, :21, :79, :]
+    # Drop internal column 0 (obs col c = internal col c+1), matching NLE.
+    gi_cat = env_state.ground_items.category[branch, level_idx, :21, 1:80, :]
+    gi_typ = env_state.ground_items.type_id[branch, level_idx, :21, 1:80, :]
 
     occupied = gi_cat != 0
     stack_count = jnp.sum(occupied.astype(jnp.int32), axis=-1)
@@ -812,7 +815,8 @@ def build_specials(env_state) -> jnp.ndarray:
     # NLE conveys hero position via blstats[0,1] instead.
     if is_nethack_mode():
         pr = jnp.clip(jnp.int32(env_state.player_pos[0]), 0, 20)
-        pc = jnp.clip(jnp.int32(env_state.player_pos[1]), 0, 78)
+        # STATE column -> obs column (drop internal col 0).
+        pc = jnp.clip(jnp.int32(env_state.player_pos[1]) - jnp.int32(1), 0, 78)
         hero_mask = jnp.zeros((21, 79), dtype=jnp.uint8).at[pr, pc].set(
             jnp.uint8(bits.MG_HERO)
         )
@@ -833,8 +837,12 @@ def _pet_mask(env_state, branch, level_idx) -> jnp.ndarray:
     """
     mai = env_state.monster_ai
     rows = jnp.clip(mai.pos[:, 0].astype(jnp.int32), 0, 20)
-    cols = jnp.clip(mai.pos[:, 1].astype(jnp.int32), 0, 78)
-    is_pet = mai.alive & mai.tame                              # bool[N]
+    # Convert STATE column (0..79) to obs column (state_col - 1, 0..78); pets on
+    # internal column 0 fall off the left edge of the obs map and are dropped.
+    state_cols = mai.pos[:, 1].astype(jnp.int32)
+    oncol0 = state_cols <= jnp.int32(0)
+    cols = jnp.clip(state_cols - jnp.int32(1), 0, 78)
+    is_pet = mai.alive & mai.tame & (~oncol0)                  # bool[N]
     # Scatter: for each pet slot, set mask[r, c] = True.
     flat_idx = rows * jnp.int32(79) + cols                    # int32[N]
     flat_mask = jnp.zeros(21 * 79, dtype=jnp.bool_)
@@ -929,7 +937,8 @@ def build_screen_descriptions(env_state) -> jnp.ndarray:
     # store_screen_description for cells that went through show_glyph().
     branch = jnp.int32(env_state.dungeon.current_branch)
     level_idx = jnp.int32(env_state.dungeon.current_level) - 1  # 0-based
-    explored = env_state.explored[branch, level_idx, :21, :79]  # bool[21,79]
+    # Drop internal column 0 to match build_glyphs / NLE obs layout.
+    explored = env_state.explored[branch, level_idx, :21, 1:80]  # bool[21,79]
     # Broadcast explored[21,79] -> [21,79,1] to mask [21,79,80]
     return jnp.where(explored[:, :, None], desc, jnp.zeros_like(desc))
 
@@ -1648,8 +1657,14 @@ def build_blstats(env_state) -> jnp.ndarray:
     """
     result = jnp.zeros((27,), dtype=jnp.int64)
 
-    # Position (col, row)
-    result = result.at[BL_X].set(jnp.int64(env_state.player_pos[1]))
+    # Position (col, row).  NLE reports blstats[BL_X] = u.ux - 1 (the hero's
+    # INTERNAL column minus 1), because NLE drops unused map column 0 from its
+    # observations.  player_pos[1] is the internal column (1..79); subtract 1
+    # and clamp so it can't go negative.  BL_Y = row is left unchanged (rows are
+    # not dropped; ROWNO=21 maps 1:1).  Cite: vendor/nle/win/rl/winrl.cc.
+    result = result.at[BL_X].set(
+        jnp.maximum(jnp.int64(env_state.player_pos[1]) - jnp.int64(1), jnp.int64(0))
+    )
     result = result.at[BL_Y].set(jnp.int64(env_state.player_pos[0]))
 
     # Strength: NLE stores the clamped display value [3..25] at BL_STR25
@@ -1903,14 +1918,18 @@ def build_glyphs(env_state) -> jnp.ndarray:
     level_idx = jnp.int32(env_state.dungeon.current_level) - 1  # 0-based
 
     # terrain shape: [N_BRANCHES, MAX_LEVELS_PER_BRANCH, MAP_H=21, MAP_W=80]
-    # NLE glyphs shape: [21, 79] — trim last column
-    level_terrain = env_state.terrain[branch, level_idx, :21, :79]         # int8[21,79]
-    last_seen = env_state.last_seen_terrain[branch, level_idx, :21, :79]   # int8[21,79]
+    # NLE glyphs shape: [21, 79].  NLE DROPS NetHack internal column 0 (always
+    # blank) — obs column c (0..78) is NetHack internal column c+1 (1..79).  We
+    # mirror that by slicing state cols 1..79 (``[:21, 1:80]``) rather than the
+    # old cols 0..78 (``[:21, :79]``), which had the whole map shifted +1 right
+    # of NLE.  Cite: vendor/nle/win/rl/winrl.cc store_glyph drops levl col 0.
+    level_terrain = env_state.terrain[branch, level_idx, :21, 1:80]        # int8[21,79]
+    last_seen = env_state.last_seen_terrain[branch, level_idx, :21, 1:80]  # int8[21,79]
 
     # For explored-but-not-visible tiles use last_seen_terrain; sentinel -1
     # (never seen) falls back to 0 (VOID/stone) which renders as NO_GLYPH anyway.
-    visible = env_state.visible[:21, :79]                                   # bool[21,79]
-    explored = env_state.explored[branch, level_idx, :21, :79]             # bool[21,79]
+    visible = env_state.visible[:21, 1:80]                                  # bool[21,79]
+    explored = env_state.explored[branch, level_idx, :21, 1:80]            # bool[21,79]
 
     # Pick the terrain source per cell.
     display_terrain = jnp.where(
@@ -1956,10 +1975,18 @@ def build_glyphs(env_state) -> jnp.ndarray:
     mon_entry = mai.entry_idx.astype(jnp.int32)  # int32[N]
 
     rows = jnp.clip(mon_pos[:, 0].astype(jnp.int32), 0, 20)
-    cols = jnp.clip(mon_pos[:, 1].astype(jnp.int32), 0, 78)
+    # Monster positions are in STATE column space (0..79).  The obs map drops
+    # internal column 0, so obs_col = state_col - 1 (0..78).  Monsters sitting
+    # on internal column 0 fall off the left edge of the obs map and are not
+    # drawn (mon_oncol0 mask below).
+    state_cols = mon_pos[:, 1].astype(jnp.int32)
+    mon_oncol0 = state_cols <= jnp.int32(0)
+    cols = jnp.clip(state_cols - jnp.int32(1), 0, 78)
     # Only overlay monsters that are alive AND on visible tiles.
     tile_visible = visible[rows, cols]
-    write_mask = mon_alive & tile_visible & (mon_entry >= jnp.int32(0))
+    write_mask = (
+        mon_alive & tile_visible & (mon_entry >= jnp.int32(0)) & (~mon_oncol0)
+    )
     mon_glyphs = (jnp.int32(GLYPH_MON_OFF) + mon_entry).astype(jnp.int16)
 
     # Hallucination scramble — vendor/nethack/src/display.c:599 randomizes
@@ -1997,8 +2024,9 @@ def build_glyphs(env_state) -> jnp.ndarray:
     #   uses `u.umonnum` (the player's current monster type).
     player_row = jnp.int32(env_state.player_pos[0])
     player_col = jnp.int32(env_state.player_pos[1])
-    # Clamp col to [0,78] since glyphs is 79 wide, terrain is 80 wide.
-    player_col_clamped = jnp.clip(player_col, 0, 78)
+    # player_col is a STATE column (1..79); the obs map drops internal column 0,
+    # so the obs column is player_col - 1.  Clamp to [0,78] (glyphs is 79 wide).
+    player_col_clamped = jnp.clip(player_col - jnp.int32(1), 0, 78)
 
     # Race -> base monster index in MONSTERS.  Order matches Race enum:
     #   HUMAN=0, ELF=1, DWARF=2, GNOME=3, ORC=4
@@ -2132,9 +2160,15 @@ def build_tty(env_state) -> dict[str, jnp.ndarray]:
     tty = tty.at[22, :].set(row22)
     tty = tty.at[23, :].set(row23)
 
-    # --- Cursor: row = player_row + 1 (offset for message line), col = player_col ---
+    # --- Cursor: row = player_row + 1 (offset for the message line at row 0),
+    # col = player_x - 1.  Vendor places the tty cursor at (player_y + 1,
+    # player_x - 1) because the tty windowport decrements x by one (tty_curs
+    # --x) so internal column 1 lands at tty column 0.  player_pos[1] is the
+    # internal column (1..79).  Cite: TTY_LAYOUT_DIFF.md Cursor + D8.
     player_row = jnp.uint8(jnp.clip(env_state.player_pos[0], 0, 20) + 1)
-    player_col = jnp.uint8(jnp.clip(env_state.player_pos[1], 0, 78))
+    player_col = jnp.uint8(
+        jnp.clip(jnp.int32(env_state.player_pos[1]) - jnp.int32(1), 0, 78)
+    )
 
     return {
         "tty_chars":  tty,
