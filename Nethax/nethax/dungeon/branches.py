@@ -572,6 +572,134 @@ _TILE_STAIRCASE_DOWN: int = 7
 
 
 # ---------------------------------------------------------------------------
+# Vendor levl.typ -> internal TileType lookup (byte-parity render path).
+#
+# The byte-parity reset path builds ``vendor_levl_grid`` (a [ROWNO, COLNO]
+# int8 array in vendor ``levl[][].typ`` encoding, via corridors.py's
+# ``stamp_rooms_into_typ`` + ``makecorridors`` + ``make_niches``).  The codes
+# that actually appear in that grid for Main Dlvl 1 are:
+#   STONE=0, VWALL=1, HWALL=2, ROOM=11, CORR=13, SCORR=14, DOOR=15
+# (corridors.py uses CUSTOM small codes here, NOT vendor rm.h values — see
+# Nethax/nethax/dungeon/corridors.py:272-281).  We also map the corner codes
+# (3..6, in case stamp_rooms ever emits them), SDOOR(16) and IRONBARS(21) for
+# completeness.  Mapping rationale (target = TileType):
+#   STONE   (0)  -> VOID(0)       unexplored / rock
+#   VWALL   (1)  -> WALL(3)       \
+#   HWALL   (2)  -> WALL(3)        > all wall codes block + render as wall;
+#   TLCORN..BRCORN (3..6) -> WALL  / _apply_wall_angle derives the variant.
+#   ROOM    (11) -> FLOOR(1)      room floor
+#   CORR    (13) -> CORRIDOR(2)   open corridor
+#   SCORR   (14) -> VOID(0)       SECRET corridor: vendor back_to_glyph renders
+#                                 it as S_stone and it is not walkable until
+#                                 found, so VOID (not CORRIDOR) is both render-
+#                                 and movement-correct.  Cite: rm.h SCORR is a
+#                                 secret type; vendor/nethack/src/display.c
+#                                 back_to_glyph maps SCORR->S_stone.
+#   DOOR    (15) -> CLOSED_DOOR(4) safe default (door state refinement deferred;
+#                                 the LevelGenState doormask is dropped on the
+#                                 transpose, so open/broken state is not
+#                                 trivially distinguishable here).
+#   SDOOR   (16) -> WALL(3)       secret door looks like a wall until found.
+#   IRONBARS(21) -> WALL(3)       no IRONBARS TileType; closest blocking tile.
+# Corner cells in this grid are encoded as ROOM (corridors.py stamp_rooms emits
+# ROOM, not a corner code) so a separate geometric corner-promotion pass below
+# turns the room-coded corner cells into WALL so _apply_wall_angle can pick the
+# correct S_tlcorn/S_trcorn/S_blcorn/S_brcorn variant.
+# ---------------------------------------------------------------------------
+_VTILE_STONE:    int = 0
+_VTILE_VWALL:    int = 1
+_VTILE_HWALL:    int = 2
+_VTILE_ROOM:     int = 11
+_VTILE_CORR:     int = 13
+_VTILE_SCORR:    int = 14
+_VTILE_DOOR:     int = 15
+
+_TILE_VOID:        int = 0
+_TILE_CORRIDOR:    int = 2
+_TILE_WALL:        int = 3
+_TILE_CLOSED_DOOR: int = 4
+
+# Static index-by-grid lookup (length 32 covers STONE..IRONBARS=21, clamped).
+_VTYP_TO_TILE: jnp.ndarray = jnp.array(
+    [
+        _TILE_VOID,         # 0  STONE
+        _TILE_WALL,         # 1  VWALL
+        _TILE_WALL,         # 2  HWALL
+        _TILE_WALL,         # 3  TLCORNER
+        _TILE_WALL,         # 4  TRCORNER
+        _TILE_WALL,         # 5  BLCORNER
+        _TILE_WALL,         # 6  BRCORNER
+        _TILE_WALL,         # 7  (CROSSWALL-ish, unused here)
+        _TILE_WALL,         # 8  (TUWALL-ish)
+        _TILE_WALL,         # 9  (TDWALL-ish)
+        _TILE_WALL,         # 10 (TLWALL-ish)
+        _TILE_FLOOR,        # 11 ROOM
+        _TILE_WALL,         # 12 (DBWALL-ish)
+        _TILE_CORRIDOR,     # 13 CORR
+        _TILE_VOID,         # 14 SCORR (secret -> renders as stone)
+        _TILE_CLOSED_DOOR,  # 15 DOOR
+        _TILE_WALL,         # 16 SDOOR (secret door -> looks like wall)
+        _TILE_VOID,         # 17 (unused)
+        _TILE_VOID,         # 18 (unused)
+        _TILE_VOID,         # 19 (unused)
+        _TILE_VOID,         # 20 (unused)
+        _TILE_WALL,         # 21 IRONBARS -> closest blocking tile
+        _TILE_VOID,         # 22 (clamp tail)
+        _TILE_VOID, _TILE_VOID, _TILE_VOID, _TILE_VOID, _TILE_VOID,
+        _TILE_VOID, _TILE_VOID, _TILE_VOID, _TILE_VOID,
+    ],
+    dtype=jnp.int8,
+)
+
+
+def _vendor_grid_to_terrain(vendor_levl_grid: jnp.ndarray) -> jnp.ndarray:
+    """Map a vendor ``levl.typ`` grid ([ROWNO, COLNO]) to internal TileType.
+
+    Steps (all JIT-safe, no Python branches on traced values):
+      1. Static lookup ``_VTYP_TO_TILE[clip(grid, 0, 31)]`` -> base TileType.
+      2. Corner-promotion: corridors.py's ``stamp_rooms_into_typ`` encodes the
+         four room corners as ROOM (not a corner code), so step 1 leaves them
+         as FLOOR.  Re-derive the true outer corners geometrically: a ROOM cell
+         is an outer corner iff it has an HWALL neighbour to the E *or* W AND a
+         VWALL neighbour to the N *or* S.  Interior floor cells adjacent to the
+         wall ring fail this test (their HWALL neighbour is N/S, their VWALL
+         neighbour is E/W), so only the meeting-point corners are promoted to
+         WALL.  This lets the obs ``_apply_wall_angle`` pass pick the correct
+         S_tlcorn / S_trcorn / S_blcorn / S_brcorn variant from the 4-neighbour
+         wall pattern.
+
+    Args:
+        vendor_levl_grid: int8[ROWNO, COLNO] in corridors.py VTILE_* encoding.
+
+    Returns:
+        int8[ROWNO, COLNO] internal TileType array.
+    """
+    grid = vendor_levl_grid.astype(jnp.int32)
+    idx = jnp.clip(grid, 0, _VTYP_TO_TILE.shape[0] - 1)
+    terrain = _VTYP_TO_TILE[idx].astype(jnp.int8)
+
+    # --- Corner promotion (ROOM-coded corners -> WALL). ---
+    is_hwall = grid == jnp.int32(_VTILE_HWALL)
+    is_vwall = grid == jnp.int32(_VTILE_VWALL)
+    is_room = grid == jnp.int32(_VTILE_ROOM)
+
+    H, W = grid.shape
+    false_row = jnp.zeros((1, W), dtype=jnp.bool_)
+    false_col = jnp.zeros((H, 1), dtype=jnp.bool_)
+
+    # HWALL neighbour to the E or W (horizontal direction).
+    hwall_w = jnp.concatenate([false_col, is_hwall[:, :-1]], axis=1)
+    hwall_e = jnp.concatenate([is_hwall[:, 1:], false_col], axis=1)
+    # VWALL neighbour to the N or S (vertical direction).
+    vwall_n = jnp.concatenate([false_row, is_vwall[:-1, :]], axis=0)
+    vwall_s = jnp.concatenate([is_vwall[1:, :], false_row], axis=0)
+
+    is_corner = is_room & (hwall_w | hwall_e) & (vwall_n | vwall_s)
+    terrain = jnp.where(is_corner, jnp.int8(_TILE_WALL), terrain)
+    return terrain
+
+
+# ---------------------------------------------------------------------------
 # Public functions
 # ---------------------------------------------------------------------------
 
@@ -1012,6 +1140,24 @@ def generate_main_branch_l1(
         # Vendor cite: vendor/nle/src/mklev.c:948-961 (levl[][] STONE scan).
         vendor_levl_grid = jnp.transpose(_lgs.typ)  # [ROWNO, COLNO]
         del _lgs, _rooms_box
+
+        # ------------------------------------------------------------------
+        # Materialise the RENDERED terrain from the vendor-exact level grid.
+        #
+        # Until now ``terrain`` carried the LEGACY Threefry ``connect_rooms``
+        # corridor layout (carved above at the ``connect_rooms`` call), which
+        # diverges from vendor ``makecorridors``.  The vendor-faithful surface
+        # is ``vendor_levl_grid`` (rooms + walls + corridors + doors, byte-exact
+        # ISAAC64 RNG).  Replace the obs/gameplay terrain with the grid-derived
+        # TileType array so the rendered dungeon (glyphs/chars/colors/
+        # screen_descriptions) byte-matches NLE.  The down-stair and niche
+        # features are stamped ON TOP of this terrain below / in the wrapper,
+        # so this must run before those overlays.  Vendor cite: the rooms in
+        # ``vendor_levl_grid`` are the makerooms output (byte-exact) and the
+        # corridors are makecorridors (vendor/nle/src/mklev.c:734), so the
+        # whole walkable surface is vendor-consistent.  Threefry (non-vendor)
+        # path is untouched and keeps using ``connect_rooms``.
+        terrain = _vendor_grid_to_terrain(vendor_levl_grid)
 
         # ------------------------------------------------------------------
         # place_branch(branchp, 0, 0) — vendor mklev.c:800.
