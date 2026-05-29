@@ -6122,7 +6122,13 @@ def monsters_step_all(state, rng: jax.Array) -> object:
             pre = pre_round[safe_slot]
             adj = pre % NS
             floored = pre - adj
-            need_draw = valid & alive_s & (adj > jnp.int32(0))
+            # Vendor mon.c::mcalcmove (lines 1126-1167): the `rn2(NORMAL_SPEED)`
+            # in `if (rn2(NORMAL_SPEED) < mmove_adj)` is UNCONDITIONALLY drawn
+            # whenever this function is entered (C has no short-circuit on
+            # function call arguments).  Gate only on slot validity + alive,
+            # NOT on (adj > 0).  When adj == 0 the draw still fires but the
+            # comparison `v < 0` is always false, so add_pts == floored == pre.
+            need_draw = valid & alive_s
 
             def _draw(vr):
                 return _vendor_rng_mod.rn2_jax(vr, NS)
