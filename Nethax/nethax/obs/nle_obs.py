@@ -2029,23 +2029,32 @@ def build_glyphs(env_state) -> jnp.ndarray:
     )
 
     # Overlay player at player_pos (row, col).
-    # The player's display glyph is their race's monster type (human=256,
-    # elf=260, dwarf=43, gnome=162, orc=71 in our MONSTERS table), unless
-    # they are polymorphed (then it's the polymorph form).
-    #
-    # Citation: vendor/nethack/src/display.c::display_self / show_glyph
-    #   uses `u.umonnum` (the player's current monster type).
+    # The player's display glyph is `u.umonnum`, which (when not polymorphed)
+    # vendor sets to the ROLE's player-monster `urole.malenum`, NOT the race.
+    # Cite: vendor/nle/src/u_init.c:628
+    #   `u.umonnum = u.umonster = ... urole.malenum;`
+    # and vendor/nethack/src/display.c::display_self / show_glyph which renders
+    # GLYPH_MON_OFF + u.umonnum.  Each role's malenum is a distinct entry in the
+    # mons[] table (e.g. PM_ROGUE -> mons index 337 "rogue", PM_VALKYRIE -> 340),
+    # so a Human Rogue renders glyph 337 — the player-monster, not "human" (256).
     player_row = jnp.int32(env_state.player_pos[0])
     player_col = jnp.int32(env_state.player_pos[1])
     # player_col is a STATE column (1..79); the obs map drops internal column 0,
     # so the obs column is player_col - 1.  Clamp to [0,78] (glyphs is 79 wide).
     player_col_clamped = jnp.clip(player_col - jnp.int32(1), 0, 78)
 
-    # Race -> base monster index in MONSTERS.  Order matches Race enum:
-    #   HUMAN=0, ELF=1, DWARF=2, GNOME=3, ORC=4
-    _RACE_TO_MON_IDX = jnp.array([256, 260, 43, 162, 71], dtype=jnp.int32)
-    race_idx = jnp.clip(jnp.int32(env_state.player_race), 0, 4)
-    base_mon = _RACE_TO_MON_IDX[race_idx]
+    # Role -> player-monster index in the NLE mons[] table.  Order matches the
+    # Role enum (ARCHEOLOGIST=0 .. WIZARD=12).  Values are the `urole.malenum`
+    # monster indices verified against NLE permonst() by name.
+    #   ARCHEOLOGIST=327 BARBARIAN=328 CAVEMAN=329 HEALER=331 KNIGHT=332
+    #   MONK=333 PRIEST=334 RANGER=336 ROGUE=337 SAMURAI=338 TOURIST=339
+    #   VALKYRIE=340 WIZARD=341
+    _ROLE_TO_MON_IDX = jnp.array(
+        [327, 328, 329, 331, 332, 333, 334, 336, 337, 338, 339, 340, 341],
+        dtype=jnp.int32,
+    )
+    role_idx = jnp.clip(jnp.int32(env_state.player_role), 0, 12)
+    base_mon = _ROLE_TO_MON_IDX[role_idx]
 
     # If polymorphed, use the polymorph form instead.
     is_poly = env_state.polymorph.is_polymorphed
