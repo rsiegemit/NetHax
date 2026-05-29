@@ -622,10 +622,14 @@ _VTILE_SCORR:    int = 14
 _VTILE_DOOR:     int = 15
 _VTILE_SDOOR:    int = 16
 
-# Vendor door masks (vendor/nle/include/rm.h): a DOOR cell's ``doormask`` says
-# whether it is a doorless opening, broken, open, closed, or locked.  We test
-# the CLOSED/LOCKED bits to decide whether a DOOR renders as a closed-door
-# glyph ('+') or a walkable opening (D_NODOOR / D_BROKEN / D_ISOPEN).
+# Vendor door masks (vendor/nle/include/rm.h:323-327): a DOOR cell's
+# ``doormask`` says whether it is a doorless opening, broken, open, closed, or
+# locked.  Vendor display.c::back_to_glyph renders each mask distinctly:
+#   D_NODOOR / D_BROKEN -> S_ndoor   (doorless gap, char '.')  -> DOORWAY
+#   D_ISOPEN            -> S_vodoor  (open door, '|'/'-')       -> OPEN_DOOR
+#   D_CLOSED / D_LOCKED -> S_vcdoor  (shut door, '+')           -> CLOSED_DOOR
+_DMASK_BROKEN: int = 1   # D_BROKEN  — broken door, doorless opening ('.')
+_DMASK_ISOPEN: int = 2   # D_ISOPEN  — open door ('|'/'-')
 _DMASK_CLOSED: int = 4   # D_CLOSED  — shut door ('+')
 _DMASK_LOCKED: int = 8   # D_LOCKED  — locked shut door ('+')
 
@@ -634,6 +638,7 @@ _TILE_CORRIDOR:    int = 2
 _TILE_WALL:        int = 3
 _TILE_CLOSED_DOOR: int = 4
 _TILE_OPEN_DOOR:   int = 5
+_TILE_DOORWAY:     int = 23  # doorless doorway (D_NODOOR / D_BROKEN); S_ndoor
 # _TILE_FLOOR (= 1) is defined above (module-level tile constants).
 
 # Static index-by-grid lookup (length 32 covers STONE..IRONBARS=21, clamped).
@@ -751,10 +756,17 @@ def _vendor_grid_to_terrain(
         dmask = door_mask_grid.astype(jnp.int32)
         is_door_cell = grid == jnp.int32(_VTILE_DOOR)
         shut = (dmask & jnp.int32(_DMASK_CLOSED | _DMASK_LOCKED)) != jnp.int32(0)
-        # Everything that is not explicitly shut (D_NODOOR / D_BROKEN /
-        # D_ISOPEN) -> OPEN_DOOR: passable + wall-ish (keeps neighbour corners).
+        is_open = (dmask & jnp.int32(_DMASK_ISOPEN)) != jnp.int32(0)
+        # Three-way (vendor display.c back_to_glyph door masks):
+        #   D_CLOSED / D_LOCKED -> CLOSED_DOOR ('+')
+        #   D_ISOPEN            -> OPEN_DOOR   ('|'/'-')
+        #   D_NODOOR / D_BROKEN -> DOORWAY     (S_ndoor doorless gap, '.')
+        # DOORWAY is passable + counts as wall-ish in _apply_wall_angle, so the
+        # adjacent BL corner still resolves to S_blcorn.
         door_tile = jnp.where(
-            shut, jnp.int8(_TILE_CLOSED_DOOR), jnp.int8(_TILE_OPEN_DOOR),
+            shut,
+            jnp.int8(_TILE_CLOSED_DOOR),
+            jnp.where(is_open, jnp.int8(_TILE_OPEN_DOOR), jnp.int8(_TILE_DOORWAY)),
         )
         terrain = jnp.where(is_door_cell, door_tile, terrain)
 

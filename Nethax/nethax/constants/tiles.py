@@ -55,6 +55,17 @@ class TileType(IntEnum):
                        # We use local index 22 to stay contiguous with the
                        # other TileType entries; VendorTileType.SINK (line
                        # 102 below) preserves the vendor 30.
+    DOORWAY = 23       # Doorless doorway — a DOOR cell whose doormask is
+                       # D_NODOOR or D_BROKEN (an open gap in a wall with no
+                       # actual door leaf).  Vendor renders this as S_ndoor
+                       # (cmap 12, char '.', glyph 2371), distinct from an
+                       # open door (S_vodoor/S_hodoor).  It is WALKABLE and
+                       # TRANSPARENT exactly like OPEN_DOOR, but counts as a
+                       # wall-continuation for corner-variant resolution.
+                       # Citation: vendor/nethack/include/rm.h door masks
+                       #            (D_NODOOR / D_BROKEN); vendor/nethack/src/
+                       #            display.c::back_to_glyph (D_NODOOR ->
+                       #            S_ndoor).
 
 
 NUM_TILE_TYPES: int = len(TileType)

@@ -209,6 +209,7 @@ _S_lava     = 34   # vendor/nle/include/rm.h:151
 _S_trap     = 42   # S_arrow_trap — vendor/nle/include/rm.h:162
 _S_vcdoor   = 15   # closed door (vertical)
 _S_vodoor   = 13   # open door (vertical)
+_S_ndoor    = 12   # doorless doorway (char '.') — vendor/nle/include/rm.h:135
 
 # Indexed by TileType integer value; must cover indices 0..NUM_TILE_TYPES-1
 _TILE_TO_CMAP: jnp.ndarray = jnp.array([
@@ -229,6 +230,20 @@ _TILE_TO_CMAP: jnp.ndarray = jnp.array([
     _S_throne,   # 14 THRONE
     _S_grave,    # 15 GRAVE
     _S_room,     # 16 SHOP_FLOOR (same floor tile)
+    # Indices 17..22 (DRAWBRIDGE_UP, ICE_FLOOR, POOL, TREE, HOLE, SINK) were
+    # never enumerated before this row was added; the lookup clamps the tile
+    # index to NUM_TILE_TYPES-1 (now 23) and JAX out-of-bounds gather used to
+    # pin them to the final entry (_S_room).  To keep the table total now that
+    # DOORWAY=23 must be reachable we fill 17..22 with _S_room, exactly
+    # preserving that prior implicit behaviour (no render change for those
+    # tiles), and add the real DOORWAY entry at index 23.
+    _S_room,     # 17 DRAWBRIDGE_UP  (prior implicit clamp value)
+    _S_room,     # 18 ICE_FLOOR      (prior implicit clamp value)
+    _S_room,     # 19 POOL           (prior implicit clamp value)
+    _S_room,     # 20 TREE           (prior implicit clamp value)
+    _S_room,     # 21 HOLE           (prior implicit clamp value)
+    _S_room,     # 22 SINK           (prior implicit clamp value)
+    _S_ndoor,    # 23 DOORWAY        S_ndoor (doorless gap, char '.')
 ], dtype=jnp.int16)
 
 # ---------------------------------------------------------------------------
@@ -1978,10 +1993,13 @@ def _apply_wall_angle(display_terrain: jnp.ndarray,
     WALL = jnp.int16(int(TileType.WALL))
     CLOSED = jnp.int16(int(TileType.CLOSED_DOOR))
     OPEN = jnp.int16(int(TileType.OPEN_DOOR))
+    DOORWAY = jnp.int16(int(TileType.DOORWAY))
 
-    # A neighbour counts as a wall-continuation when it is WALL or a door.
-    # Vendor check_pos() treats walls + doors as connected segments.
-    is_wallish = (t == WALL) | (t == CLOSED) | (t == OPEN)
+    # A neighbour counts as a wall-continuation when it is WALL or any door
+    # (closed, open, or a doorless DOORWAY).  Vendor check_pos() treats walls +
+    # doors as connected segments, so a doorless doorway carved into a wall run
+    # still lets the adjacent room corner resolve to the correct corner variant.
+    is_wallish = (t == WALL) | (t == CLOSED) | (t == OPEN) | (t == DOORWAY)
 
     H, W = is_wallish.shape
 
