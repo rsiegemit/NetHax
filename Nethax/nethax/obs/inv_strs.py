@@ -662,14 +662,13 @@ _APPEARANCE_BYTES_PADDED: jnp.ndarray = jnp.array(
 _NAMED_PREFIX_BYTES: jnp.ndarray = jnp.array(
     _pad_bytes(" named ", 8), dtype=jnp.uint8,
 )  # uint8[8]
-# Vendor objnam.c line 1619 emits " (alternate weapon%s; not wielded)"
-# where %s = plur(obj->quan): "s" for qty>1, "" for qty==1.
+# NLE's bundled doname hardcodes the singular form regardless of quantity:
+# vendor/nle/src/objnam.c:1211 ``Strcat(bp, " (alternate weapon; not wielded)")``
+# (the newer vendor/nethack/src/objnam.c:1619 adds plur(obj->quan), but NLE —
+# the byte-parity ground truth — does not). Only the singular form is emitted.
 _ALT_WEAPON_BYTES: jnp.ndarray = jnp.array(
     _pad_bytes(" (alternate weapon; not wielded)", 33), dtype=jnp.uint8,
-)  # uint8[33]  — singular form (qty == 1)
-_ALT_WEAPONS_BYTES: jnp.ndarray = jnp.array(
-    _pad_bytes(" (alternate weapons; not wielded)", 34), dtype=jnp.uint8,
-)  # uint8[34]  — plural form   (qty  > 1)
+)  # uint8[33]  — singular form (always; matches NLE)
 
 # Vendor objnam.c prefix tokens emitted into the ``prefix`` buffer before
 # erosion / enchant: ``greased`` (line 1371), WEAPON_CLASS ``poisoned``
@@ -1184,15 +1183,19 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         )
 
         # 8. Swap-weapon / two-weapon suffix.
-        # Vendor objnam.c:1613-1620: when obj->owornmask & W_SWAPWEP:
-        #   if u.twoweap  -> " (wielded in left/right hand)"  [handled by equip idx]
-        #   else          -> " (alternate weapon%s; not wielded)"
-        #                     where %s = plur(quan): "s" for qty>1, else "".
+        # NLE (the byte-parity ground truth) bundles an OLDER NetHack source
+        # tree whose doname emits a HARDCODED singular suffix here:
+        #   vendor/nle/src/objnam.c:1207-1211: when obj->owornmask & W_SWAPWEP:
+        #     if u.twoweap  -> " (wielded in other %s)"  [handled by equip idx]
+        #     else          -> " (alternate weapon; not wielded)"  (no plur()!)
+        # The newer vendor/nethack/src/objnam.c:1619 pluralizes via
+        # plur(obj->quan), but NLE does NOT — so a stack of 14 daggers still
+        # renders "(alternate weapon; not wielded)" (singular). Match NLE.
         # We track uswapwep as inv_state.swap_weapon (scalar int8, -1=none).
         # When two_weapon is True the equip-status index already emits the
         # "(wielded in ... hand)" form via off_hand; we only need the
         # "not wielded" branch here (i.e. swap_weapon set, two_weapon False).
-        # Cite: vendor/nethack/src/objnam.c:1613-1620.
+        # Cite: vendor/nle/src/objnam.c:1207-1211.
         is_swapwep = (
             (swap_weapon.astype(jnp.int32) >= jnp.int32(0)) &
             (slot_idx.astype(jnp.int32) == swap_weapon.astype(jnp.int32))
@@ -1200,7 +1203,7 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         is_swap_not_twoweap = is_swapwep & ~two_weapon
         b, c = lax.cond(
             is_swap_not_twoweap,
-            lambda bc: _write_alt_weapon_qty(bc[0], bc[1], quantity),
+            lambda bc: _write_alt_weapon(bc[0], bc[1]),
             lambda bc: bc,
             (b, c),
         )
@@ -1539,25 +1542,12 @@ def _write_user_name(buf, cursor, name_row):
 
 
 def _write_alt_weapon(buf, cursor):
-    """Append ' (alternate weapon; not wielded)' (singular form)."""
-    buf, cursor = _write_fixed(buf, cursor, _ALT_WEAPON_BYTES, 33)
-    return buf, cursor
+    """Append ' (alternate weapon; not wielded)' (singular form).
 
-
-def _write_alt_weapon_qty(buf, cursor, quantity):
-    """Append ' (alternate weapon[s]; not wielded)' quantity-aware form.
-
-    Vendor objnam.c:1619: ConcatF1(bp, 0, " (alternate weapon%s; not wielded)",
-    plur(obj->quan)) — plur() returns "s" for quan>1, "" for quan==1.
-    Cite: vendor/nethack/src/objnam.c:1619.
+    NLE's bundled doname hardcodes the singular suffix regardless of stack
+    quantity (vendor/nle/src/objnam.c:1211), so this is the only form emitted.
     """
-    is_plural = quantity > jnp.int32(1)
-    buf, cursor = lax.cond(
-        is_plural,
-        lambda bc: _write_fixed(bc[0], bc[1], _ALT_WEAPONS_BYTES, 34),
-        lambda bc: _write_fixed(bc[0], bc[1], _ALT_WEAPON_BYTES, 33),
-        (buf, cursor),
-    )
+    buf, cursor = _write_fixed(buf, cursor, _ALT_WEAPON_BYTES, 33)
     return buf, cursor
 
 
