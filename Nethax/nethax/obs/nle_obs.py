@@ -473,7 +473,7 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
         12: "doorway", 13: "open door", 14: "open door",
         15: "closed door", 16: "closed door",
         17: "iron bars", 18: "tree",
-        19: "floor", 20: "dark part of a room",
+        19: "floor of a room", 20: "dark part of a room",
         21: "engraving", 22: "corridor", 23: "lit corridor", 24: "engraving",
         25: "staircase up", 26: "staircase down",
         27: "ladder up", 28: "ladder down",
@@ -509,15 +509,24 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
     n_mon = len(MONSTERS)
     n_obj = len(OBJECTS)
 
-    # Monsters & pets & detected & ridden — share name + color
+    # Monsters & pets & detected & ridden — share name + color.  Pets get a
+    # "tame " prefix: a GLYPH_PET_OFF glyph is, by construction, always a tame
+    # monster, so the prefix is glyph-deterministic.  Vendor pager.c::lookat ->
+    # look_at_monster (line 438) prepends "tame " (else "peaceful " for
+    # mpeaceful) to distant_monnam() before storing firstmatch.
     for i, m in enumerate(MONSTERS):
         c = int(m.color) & 0xFF
         nm = _bytes_for(m.name)
-        for base in (_MON, _PET, _DET, _RID):
+        pet_nm = _bytes_for(f"tame {m.name}")
+        for base in (_MON, _DET, _RID):
             g = base + i
             if 0 <= g < _MAX:
                 colors[g] = c
                 desc[g] = nm
+        g = _PET + i
+        if 0 <= g < _MAX:
+            colors[g] = c
+            desc[g] = pet_nm
         # Bodies (corpses)
         g = _BOD + i
         if 0 <= g < _MAX:
@@ -748,8 +757,41 @@ def build_colors(env_state) -> jnp.ndarray:
     explored = env_state.explored[branch, level_idx, :21, 1:80]
     colors = jnp.where(explored, colors, jnp.uint8(0))
 
+    # Monster-color overlay.  Mirror the monster-glyph overlay in build_glyphs:
+    # every visible, alive monster cell takes the monster's own display color
+    # (vendor permonst.mcolor), NOT the terrain color underneath.  Pets are NOT
+    # specially recolored here — pet-ness is conveyed via the specials MG_PET
+    # bit; the cell simply shows the monster's own color (e.g. kitten = 15).
+    # Cite: vendor/nle/src/mapglyph.c — the GLYPH_MON_OFF / GLYPH_PET_OFF
+    # branches set `color = mons[mnum].mcolor`.  We read the per-entry color
+    # from the same MONSTERS-derived table build_glyphs uses for glyphs
+    # (_GLYPH_TO_COLOR[GLYPH_MON_OFF + entry] == MONSTERS[entry].color).
+    visible = env_state.visible[:21, 1:80]                         # bool[21,79]
+    mai = env_state.monster_ai
+    mon_entry = mai.entry_idx.astype(jnp.int32)                    # int32[N]
+    rows = jnp.clip(mai.pos[:, 0].astype(jnp.int32), 0, 20)
+    state_cols = mai.pos[:, 1].astype(jnp.int32)
+    mon_oncol0 = state_cols <= jnp.int32(0)
+    cols = jnp.clip(state_cols - jnp.int32(1), 0, 78)
+    tile_visible = visible[rows, cols]
+    write_mask = (
+        mai.alive & tile_visible & (mon_entry >= jnp.int32(0)) & (~mon_oncol0)
+    )
+    # Per-monster display color from the MONSTERS table (clamp index to table).
+    glyph_idx = jnp.clip(
+        jnp.int32(GLYPH_MON_OFF) + mon_entry,
+        0, _GLYPH_TO_COLOR.shape[0] - 1,
+    )
+    mon_colors = _GLYPH_TO_COLOR[glyph_idx]                        # uint8[N]
+    # Vectorized scatter: only overwrite where write_mask is True (later writes
+    # naturally win for duplicate cells, matching build_glyphs).
+    colors = colors.at[rows, cols].set(
+        jnp.where(write_mask, mon_colors, colors[rows, cols])
+    )
+
     # Player tile -> bright yellow (15).  player_pos[1] is a STATE column; the
     # obs map drops internal column 0, so the obs column is player_pos[1] - 1.
+    # Applied AFTER the monster overlay so the hero cell always wins.
     pr = jnp.int32(env_state.player_pos[0])
     pc = jnp.clip(jnp.int32(env_state.player_pos[1]) - jnp.int32(1), 0, 78)
     colors = colors.at[pr, pc].set(jnp.uint8(15))
@@ -955,7 +997,22 @@ def build_screen_descriptions(env_state) -> jnp.ndarray:
     # Drop internal column 0 to match build_glyphs / NLE obs layout.
     explored = env_state.explored[branch, level_idx, :21, 1:80]  # bool[21,79]
     # Broadcast explored[21,79] -> [21,79,1] to mask [21,79,80]
-    return jnp.where(explored[:, :, None], desc, jnp.zeros_like(desc))
+    desc = jnp.where(explored[:, :, None], desc, jnp.zeros_like(desc))
+
+    # Hero-tile override: self_lookat() yields "<race-adj> <role-mon> called
+    # <name>" (vendor pager.c:116), richer than the bare role-monster name the
+    # glyph table produces.  Skip when polymorphed — the poly-form name from the
+    # glyph table is closer there (self_lookat drops the race prefix).  The hero
+    # tile is always explored, so this survives the mask above.
+    is_poly = env_state.polymorph.is_polymorphed
+    role_idx = jnp.clip(jnp.int32(env_state.player_role), 0, _HERO_DESC_BYTES.shape[0] - 1)
+    race_idx = jnp.clip(jnp.int32(env_state.player_race), 0, _HERO_DESC_BYTES.shape[1] - 1)
+    hero_bytes = _HERO_DESC_BYTES[role_idx, race_idx]            # uint8[80]
+    pr = jnp.int32(env_state.player_pos[0])
+    pc = jnp.clip(jnp.int32(env_state.player_pos[1]) - jnp.int32(1), 0, 78)
+    new_row = jnp.where(is_poly, desc[pr, pc, :], hero_bytes)    # uint8[80]
+    desc = desc.at[pr, pc, :].set(new_row)
+    return desc
 
 
 def build_program_state(env_state) -> jnp.ndarray:
@@ -1363,6 +1420,41 @@ _NLE_PLAYER_NAME = "Agent"
 # Legacy fallback header — retained when the (role, xlevel) -> rank lookup
 # yields no usable title.
 _S_NAME_PREFIX  = _str_to_bytes(f"{_NLE_PLAYER_NAME} the Adventurer")
+
+
+def _build_hero_desc_bytes():  # pragma: no cover — runs once at import
+    """self_lookat() hero description bytes per (role, race), shape [13,5,80].
+
+    NLE stores the hero tile's screen_description via lookat()->self_lookat()
+    (vendor/nethack/src/pager.c:116):
+        Sprintf(outbuf, "%s%s%s called %s",
+                invis?, urace.adj+" ", pmname(mons[u.umonnum]), plname);
+    When not invisible / not polymorphed this is
+    "<race-adj> <role-monster-name> called <plname>", e.g. a Human Rogue named
+    "Agent" -> "human rogue called Agent".  This is richer than the bare
+    role-monster name ("rogue") the glyph->description table yields, so the
+    hero cell needs a per-tile override.
+
+    role-monster index order matches the Role enum (ARCHEOLOGIST=0..WIZARD=12),
+    same urole.malenum values build_glyphs uses.  race-adj order matches the
+    Race enum (HUMAN=0..ORC=4); strings are vendor races[].adj (role.c).
+    """
+    import numpy as _np
+    from Nethax.nethax.constants.monsters import MONSTERS
+    role_mon_idx = [327, 328, 329, 331, 332, 333, 334, 336, 337, 338, 339, 340, 341]
+    race_adj = ["human", "elven", "dwarvish", "gnomish", "orcish"]
+    out = _np.zeros((len(role_mon_idx), len(race_adj), 80), dtype=_np.uint8)
+    for r, midx in enumerate(role_mon_idx):
+        role_name = MONSTERS[midx].name
+        for rc, adj in enumerate(race_adj):
+            enc = f"{adj} {role_name} called {_NLE_PLAYER_NAME}".encode(
+                "ascii", errors="ignore"
+            )[:79]
+            out[r, rc, : len(enc)] = _np.frombuffer(enc, dtype=_np.uint8)
+    return jnp.asarray(out, dtype=jnp.uint8)
+
+
+_HERO_DESC_BYTES = _build_hero_desc_bytes()
 
 
 # ---------------------------------------------------------------------------
