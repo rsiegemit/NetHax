@@ -1200,10 +1200,59 @@ def role_rank_title(role_idx: int, xlevel: int) -> str:
 
 _DIGITS = jnp.array([ord('0') + i for i in range(10)], dtype=jnp.uint8)
 
+# Sentinel byte used to mark *real* (literal) separator spaces while building a
+# status row.  Numeric fields are emitted at a fixed max width and right-padded
+# with ASCII space (0x20); literal separators (" ", labels, "(", ")") never
+# contain 0x20 — they use this sentinel for any space they want to keep.  After
+# the field stream is assembled, ``_compact_pad_spaces`` deletes every 0x20
+# (the numeric trailing pad) and converts the sentinel back to a real space,
+# yielding the natural-width, single-separator layout NLE's tty status engine
+# produces (e.g. "St:14 Dx:18 ... Ch:9", "HP:12(12)").  0x1F is the ASCII unit
+# separator — it never appears in a status line.
+_SEP = 0x1F
+
 
 def _str_to_bytes(s: str) -> jnp.ndarray:
     """Precompute a uint8 byte-array for a literal string (module load only)."""
     return jnp.array([ord(c) for c in s], dtype=jnp.uint8)
+
+
+def _sep_bytes(s: str) -> jnp.ndarray:
+    """Like ``_str_to_bytes`` but every ASCII space becomes the ``_SEP`` sentinel.
+
+    Use for status-row *separator/label* literals so their spaces survive the
+    ``_compact_pad_spaces`` pass (which strips numeric trailing-pad 0x20s).
+    """
+    return jnp.array([(_SEP if c == ' ' else ord(c)) for c in s], dtype=jnp.uint8)
+
+
+def _compact_pad_spaces(buf: jnp.ndarray, out_w: int) -> jnp.ndarray:
+    """Delete numeric trailing-pad spaces and restore separator sentinels.
+
+    Stable left-compaction that removes every ASCII space (0x20) from ``buf``
+    (these are the right-pad bytes emitted by fixed-width numeric renderers),
+    keeps all other bytes in order, then rewrites the ``_SEP`` sentinel back to
+    a real space.  The result is right-padded with spaces to ``out_w``.
+
+    JIT-safe: uses a stable argsort to gather kept bytes to the front (no data-
+    dependent control flow, static shapes throughout).
+    """
+    n = buf.shape[0]
+    keep = buf != jnp.uint8(0x20)                       # bool[n]
+    # Stable partition: kept bytes first (in original order), dropped after.
+    # rank = position among kept bytes; dropped bytes get pushed past the end.
+    kept_rank = jnp.cumsum(keep.astype(jnp.int32)) - 1  # 0-based index per kept
+    n_kept = jnp.sum(keep.astype(jnp.int32))
+    dest = jnp.where(keep, kept_rank, jnp.int32(n))     # dropped -> sentinel slot
+    # Scatter into an oversized buffer (n+1 slots; slot n collects all drops).
+    compacted = jnp.full((n + 1,), jnp.uint8(0x20), dtype=jnp.uint8)
+    compacted = compacted.at[dest].set(buf, mode="drop")
+    compacted = compacted[:n]
+    # Restore separator sentinels to real spaces; blank everything past n_kept.
+    idx = jnp.arange(n, dtype=jnp.int32)
+    compacted = jnp.where(compacted == jnp.uint8(_SEP), jnp.uint8(0x20), compacted)
+    compacted = jnp.where(idx < n_kept, compacted, jnp.uint8(0x20))
+    return _pad_to(compacted, out_w)
 
 
 def _uint_to_bytes(value, width):
@@ -1290,26 +1339,35 @@ def _uint_to_bytes_left(value, max_w: int):
 
 
 # Precomputed static byte sequences for status rows (module-load).
-# Legacy "Player the Adventurer" header — retained as a fallback when the
-# (role, xlevel) -> rank lookup yields no usable title.  Cite: vendor
-# botl.c::do_statusline1 line 51 ("%s the %s", plname, rank_of(...)).
-_S_NAME_PREFIX  = _str_to_bytes("Player the Adventurer")
+# Player name used on the status line.  NLE forces playername = "Agent" for
+# every character spec (vendor/nle/nle/env/base.py:306 sets plname = "Agent-"
+# + role/race/...), so the botl header reads "Agent the <Title>".  Cite:
+# vendor/nethack/src/botl.c::do_statusline1 lines 57-59 (Strcpy(newbot1,
+# svp.plname) then capitalise first letter -> "Agent").
+_NLE_PLAYER_NAME = "Agent"
+# Legacy fallback header — retained when the (role, xlevel) -> rank lookup
+# yields no usable title.
+_S_NAME_PREFIX  = _str_to_bytes(f"{_NLE_PLAYER_NAME} the Adventurer")
 
 
 # ---------------------------------------------------------------------------
-# Wave17i parity: precomputed (role, rank) -> "Player the <Title>" byte rows.
-# Each row is padded to 27 bytes (the header column the status line allocates
-# before the stats group "St:NN Dx:NN ...").
-# Cite: vendor/nethack/src/botl.c::do_statusline1 — header is
-#   sprintf(newbot, "%s the %s", plname, rank_of(u.ulevel, ..., u.ufemale)).
+# Precomputed (role, rank) -> "Agent the <Title>" byte rows.
+# Each row is padded to _HEADER_PAD_W bytes — the fixed column at which NLE's
+# tty status engine starts the stats group ("St:NN Dx:NN ...").  Instrumenting
+# NLE (reset rog-hum-cha-mal, seed 0) shows "St:" begins at tty col 31, so the
+# header field is exactly 31 bytes wide.  (Vendor do_statusline1's
+# ``i = gm.mrank_sz + 15`` pad formula does not reconcile with the observed
+# column under NLE's tty window port; we match NLE's measured layout directly.)
+# Cite: vendor/nethack/src/botl.c::do_statusline1 lines 57-83 (name + " the " +
+#   rank() + space-pad before "St:").
 # ---------------------------------------------------------------------------
 
-_HEADER_PAD_W = 27   # status row 1 reserves cols 0..26 for "<Name> the <Title>".
+_HEADER_PAD_W = 31   # status row 1 reserves cols 0..30 for "<Name> the <Title>".
 
 def _build_role_header_table() -> jnp.ndarray:
     """Return uint8[N_ROLES, N_RANKS, _HEADER_PAD_W] of header bytes.
 
-    For role r, xlevel-rank k the row is "Player the <title>" left-justified,
+    For role r, xlevel-rank k the row is "Agent the <title>" left-justified,
     right-padded with spaces to _HEADER_PAD_W bytes.
     """
     n_roles = len(_ROLE_RANK_TITLES)
@@ -1318,7 +1376,7 @@ def _build_role_header_table() -> jnp.ndarray:
     for r in range(n_roles):
         for k in range(n_ranks):
             title = _ROLE_RANK_TITLES[r][k]
-            s = f"Player the {title}"[:_HEADER_PAD_W]
+            s = f"{_NLE_PLAYER_NAME} the {title}"[:_HEADER_PAD_W]
             s = s.ljust(_HEADER_PAD_W)
             rows.append([ord(c) & 0xFF for c in s])
     arr = jnp.array(rows, dtype=jnp.uint8)
@@ -1326,7 +1384,7 @@ def _build_role_header_table() -> jnp.ndarray:
 
 # Default fallback row (matches the legacy hardcoded header).
 _DEFAULT_HEADER_ROW = jnp.array(
-    [ord(c) & 0xFF for c in "Player the Adventurer".ljust(_HEADER_PAD_W)],
+    [ord(c) & 0xFF for c in f"{_NLE_PLAYER_NAME} the Adventurer".ljust(_HEADER_PAD_W)],
     dtype=jnp.uint8,
 )
 
@@ -1361,24 +1419,32 @@ def _role_header_bytes(role_idx, xlevel) -> jnp.ndarray:
     rank = _xlev_to_rank_jax(xlevel)
     candidate = _ROLE_HEADER_TABLE[safe_r, rank]
     return jnp.where(in_range, candidate, _DEFAULT_HEADER_ROW)
-_S_ST           = _str_to_bytes("St:")
-_S_SP_DX        = _str_to_bytes(" Dx:")
-_S_SP_CO        = _str_to_bytes(" Co:")
-_S_SP_IN        = _str_to_bytes(" In:")
-_S_SP_WI        = _str_to_bytes(" Wi:")
-_S_SP_CH        = _str_to_bytes(" Ch:")
-_S_ALIGN_LAW    = _str_to_bytes("  Lawful ")
-_S_ALIGN_NEU    = _str_to_bytes("  Neutral")
-_S_ALIGN_CHA    = _str_to_bytes("  Chaotic")
+# Status-row separator/label literals.  Spaces here are *real* separators that
+# must survive the trailing-pad compaction (``_compact_pad_spaces``), so they
+# use the ``_SEP`` sentinel via ``_sep_bytes``.  Every value field placed
+# between these is emitted at a fixed max width and right-padded with ASCII
+# space (0x20); the compaction step deletes that pad, leaving single-separator,
+# natural-width fields (e.g. "St:14 Dx:18 ... Ch:9").  Alignment uses a single
+# leading separator space to match NLE's observed layout ("Ch:9 Chaotic").
+_S_ST           = _sep_bytes("St:")
+_S_SP_DX        = _sep_bytes(" Dx:")
+_S_SP_CO        = _sep_bytes(" Co:")
+_S_SP_IN        = _sep_bytes(" In:")
+_S_SP_WI        = _sep_bytes(" Wi:")
+_S_SP_CH        = _sep_bytes(" Ch:")
+_S_ALIGN_LAW    = _sep_bytes(" Lawful")
+_S_ALIGN_NEU    = _sep_bytes(" Neutral")
+_S_ALIGN_CHA    = _sep_bytes(" Chaotic")
 
-_S_DLVL         = _str_to_bytes("Dlvl:")
-_S_SP_DOLLAR    = _str_to_bytes(" $:")
-_S_SP_HP        = _str_to_bytes(" HP:")
-_S_OPEN         = _str_to_bytes("(")
-_S_CLOSE_SP_PW  = _str_to_bytes(") Pw:")
-_S_CLOSE_SP_AC  = _str_to_bytes(") AC:")
-_S_SP_XP        = _str_to_bytes(" Xp:")
-_S_SP_T         = _str_to_bytes(" T:")
+_S_DLVL         = _sep_bytes("Dlvl:")
+_S_SP_DOLLAR    = _sep_bytes(" $:")
+_S_SP_HP        = _sep_bytes(" HP:")
+_S_OPEN         = _sep_bytes("(")
+_S_CLOSE_SP_PW  = _sep_bytes(") Pw:")
+_S_CLOSE_SP_AC  = _sep_bytes(") AC:")
+_S_SP_XP        = _sep_bytes(" Xp:")
+_S_SLASH        = _sep_bytes("/")
+_S_SP_T         = _sep_bytes(" T:")
 _S_PAD80        = jnp.full((80,), ord(' '), dtype=jnp.uint8)
 
 
@@ -1389,70 +1455,78 @@ def _pad_to(arr: jnp.ndarray, n: int) -> jnp.ndarray:
     return jnp.concatenate([arr, jnp.full((n - arr.shape[0],), ord(' '), dtype=jnp.uint8)])
 
 
-_S_SP_S = _str_to_bytes(" S:")
+_S_SP_S = _sep_bytes(" S:")
 
 
 def _build_status_row1(env_state, blstats) -> jnp.ndarray:
-    """Render row 22 of tty_chars — vendor do_statusline1 format.
+    """Render row 22 of tty_chars — NLE tty status line 1.
 
-    Format: "Player the Adventurer    St:NN Dx:NN Co:NN In:NN Wi:NN Ch:NN  <Align>[ S:<score>]"
+    Observed NLE layout (reset rog-hum-cha-mal, seed 0):
+        "Agent the Footpad              St:14 Dx:18 Co:14 In:11 Wi:10 Ch:9 Chaotic S:0"
+         ^col 0                         ^col 31
 
-    The trailing ``" S:<score>"`` field is emitted only when the running
-    score is > 0 — mirrors vendor botl.c lines 93-96 (``#ifdef SCORE_ON_BOTL``
-    + ``if (flags.showscore)``).  See TTY_LAYOUT_DIFF.md D4.
+    Layout rules matched against instrumented NLE:
+      * Header "Agent the <RankTitle>" left-justified, padded to col 31
+        (where the "St:" stats group begins).
+      * Stats are single-space joined with *natural width* numbers
+        (vendor "%-1d"): "St:14 Dx:18 Co:14 In:11 Wi:10 Ch:9" — note "Ch:9"
+        is one digit, NOT zero-padded to two.
+      * Alignment follows with a single leading space: " Chaotic".
+      * Score tail " S:<n>" is always present (flags.showscore is on), shown
+        even when the score is 0.
 
-    Citation: vendor/nethack/src/botl.c::do_statusline1 (lines 48-98).
+    Implementation: every numeric field is rendered at a fixed max width
+    (right-padded with 0x20) and joined with sentinel-space separators; the
+    header stays verbatim while the stats stream is fed through
+    ``_compact_pad_spaces`` to collapse the numeric trailing-pad into the
+    natural-width, single-separator NLE form.
+
+    Citation: vendor/nethack/src/botl.c::do_statusline1 (lines 48-98) supplies
+    the field order; NLE's tty window port supplies the exact column layout.
     """
     al = blstats[BL_ALIGN]
-    # Select alignment bytes (length 9).
+    # Select alignment bytes (all length 8: " Lawful"=7, " Neutral"=8,
+    # " Chaotic"=8 -> pad shorter to 8 so jnp.where shapes match; trailing 0x20
+    # pad is stripped by compaction).
     is_chaotic = (al == jnp.int64(-1))
     is_neutral = (al == jnp.int64(0))
     align_bytes = jnp.where(
-        is_chaotic, _S_ALIGN_CHA,
-        jnp.where(is_neutral, _S_ALIGN_NEU, _S_ALIGN_LAW),
+        is_chaotic, _pad_to(_S_ALIGN_CHA, 8),
+        jnp.where(is_neutral, _pad_to(_S_ALIGN_NEU, 8), _pad_to(_S_ALIGN_LAW, 8)),
     )
 
-    # Header: "Player the <RankTitle>" left-padded to col 27.
-    # Wave17i parity: use the role-aware rank title (botl.c::rank_of) instead
-    # of the legacy hardcoded "Adventurer" suffix.  ``player_role`` is the
-    # Role enum int8; ``player_xl`` (u.ulevel) drives xlev_to_rank.
+    # Header: "Agent the <RankTitle>" padded to col 31 (verbatim — its layout
+    # spaces are kept, NOT compacted).  ``player_role`` is the Role enum int8;
+    # ``player_xl`` (u.ulevel) drives xlev_to_rank.
     header = _role_header_bytes(env_state.player_role, env_state.player_xl)
 
-    # Stats fragment.  Strength uses vendor botl.c::get_strength_str format
-    # (see Nethax.nethax.obs.strength_format) — fixed 5-byte field so
-    # downstream column offsets stay deterministic across the [3..125] range.
+    # Strength uses vendor get_strength_str format (fixed 5-byte field,
+    # right-padded with 0x20 — the pad is stripped by compaction).
     from Nethax.nethax.obs.strength_format import render_strength_bytes
-    # Score-on-botl tail: " S:%ld" gated on score > 0.  Width 7 covers the
-    # vanilla scoring range comfortably; trailing spaces pad the buffer when
-    # the score is shorter or when the score is zero (entire field becomes
-    # spaces).
+    # Score-on-botl tail: " S:%ld", always shown (flags.showscore on in NLE).
     score = blstats[BL_SCORE]
-    score_active = score > jnp.int64(0)
-    score_field = jnp.concatenate([
-        _S_SP_S,
-        _uint_to_bytes_left(score, 7),
-    ])
-    score_blank = jnp.full(score_field.shape, jnp.uint8(ord(' ')), dtype=jnp.uint8)
-    score_bytes = jnp.where(score_active, score_field, score_blank)
 
-    parts = [
-        header,
-        _S_ST,                                       # 3
-        render_strength_bytes(blstats[BL_STR125]),
+    # Stats stream (everything after the header).  Numeric fields are
+    # max-width, right-padded; separators carry the _SEP sentinel.
+    stats_parts = [
+        _S_ST,                                       # "St:"
+        render_strength_bytes(blstats[BL_STR125]),   # width 5, 0x20 padded
         _S_SP_DX,
-        _uint_to_bytes(blstats[BL_DEX], 2),
+        _uint_to_bytes_left(blstats[BL_DEX], 2),
         _S_SP_CO,
-        _uint_to_bytes(blstats[BL_CON], 2),
+        _uint_to_bytes_left(blstats[BL_CON], 2),
         _S_SP_IN,
-        _uint_to_bytes(blstats[BL_INT], 2),
+        _uint_to_bytes_left(blstats[BL_INT], 2),
         _S_SP_WI,
-        _uint_to_bytes(blstats[BL_WIS], 2),
+        _uint_to_bytes_left(blstats[BL_WIS], 2),
         _S_SP_CH,
-        _uint_to_bytes(blstats[BL_CHA], 2),
+        _uint_to_bytes_left(blstats[BL_CHA], 2),
         align_bytes,
-        score_bytes,
+        _S_SP_S,                                     # " S:"
+        _uint_to_bytes_left(score, 7),
     ]
-    row = jnp.concatenate(parts)
+    stats = _compact_pad_spaces(jnp.concatenate(stats_parts), 80 - _HEADER_PAD_W)
+    row = jnp.concatenate([header, stats])
     return _pad_to(row, 80)
 
 
@@ -1468,7 +1542,14 @@ def _build_status_row1(env_state, blstats) -> jnp.ndarray:
 # ---------------------------------------------------------------------------
 
 def _kw_bytes(s: str, width: int) -> jnp.ndarray:
-    arr = list(s.encode("ascii")) + [ord(' ')] * (width - len(s))
+    """Build a fixed-width keyword chunk for the row-23 conditions tail.
+
+    The keyword's *leading separator space* uses the ``_SEP`` sentinel so it
+    survives ``_compact_pad_spaces``; trailing pad (0x20) is stripped.  Keyword
+    names themselves contain no interior spaces.
+    """
+    raw = list(s.encode("ascii"))
+    arr = [(_SEP if b == ord(' ') else b) for b in raw] + [ord(' ')] * (width - len(s))
     return jnp.array(arr[:width], dtype=jnp.uint8)
 
 
@@ -1604,35 +1685,44 @@ def build_status_conditions(env_state) -> jnp.ndarray:
 
 
 def _build_status_row2(env_state, blstats) -> jnp.ndarray:
-    """Render row 23 of tty_chars — vendor do_statusline2 format.
+    """Render row 23 of tty_chars — NLE tty status line 2.
 
-    Format (botl.c::do_statusline2 lines 130, 143, 152-159):
-        "Dlvl:%-2d $:%-2ld HP:%d(%d) Pw:%d(%d) AC:%-2d Xp:%d T:%ld <conds>"
+    Observed NLE layout (reset rog-hum-cha-mal, seed 0):
+        "Dlvl:1 $:0 HP:12(12) Pw:2(2) AC:7 Xp:1/0 T:1"
 
-    Every numeric field is LEFT-aligned (vendor uses ``%d`` / ``%-Nd``) — see
-    TTY_LAYOUT_DIFF.md D3 for the rationale.  ``_uint_to_bytes_left`` writes
-    digits at position 0 and pads the tail with ASCII spaces; the per-field
-    ``max_w`` accommodates the worst-case digit count.
+    Format (vendor botl.c::do_statusline2 lines 130, 143, 152, 159):
+        "Dlvl:%-2d $:%-2ld HP:%d(%d) Pw:%d(%d) AC:%-2d Xp:%d/%-1ld T:%ld <conds>"
+
+    Layout rules matched against instrumented NLE:
+      * Single-space separators, natural-width numbers (no field padding).
+      * "HP:12(12)" / "Pw:2(2)" — no space between value and parens.
+      * "AC:7" — positive AC carries no sign and no leading space; negative
+        AC keeps its '-'.
+      * "Xp:1/0" — experience LEVEL "/" experience POINTS (BL_XP / BL_EXP).
+
+    Implementation: numeric fields are emitted at fixed max width (0x20
+    right-padded), separators/parens carry the _SEP sentinel, and the whole
+    stream (including the conditions tail) is fed through
+    ``_compact_pad_spaces`` to collapse trailing pad into the natural-width,
+    single-separator NLE form.
 
     The ``<conditions>`` suffix is the keyword tail produced by
-    ``build_status_conditions``.
+    ``build_status_conditions`` (sentinel-separated; inactive keywords blank
+    to 0x20 and are stripped by compaction).
 
     Citation: vendor/nethack/src/botl.c::do_statusline2 (lines 100-249).
     """
     ac = blstats[BL_AC]
     neg = ac < 0
     abs_ac = jnp.abs(ac)
+    # Sign byte: '-' when negative, else 0x20 (stripped by compaction so
+    # positive AC renders "AC:7" with no leading space).
     sign_byte = jnp.where(neg, jnp.uint8(ord('-')), jnp.uint8(ord(' '))).reshape(1)
 
-    # Per-field max widths chosen to bound the worst-case digit count while
-    # keeping the row <= 80 bytes once the conditions tail is appended:
-    #   Dlvl: max 2 digits (depth ≤ 60 in vanilla)             → 2
-    #   $:    max 6 digits (vendor caps gold at 999999)        → 6
-    #   HP:   max 4 digits (vendor caps at 9999)               → 4
-    #   Pw:   max 4 digits (vendor caps at 9999)               → 4
-    #   AC:   max 2 digits (range roughly [-128, 127])         → 2 + sign
-    #   Xp:   max 2 digits (xlevel 1..30)                      → 2
-    #   T:    max 7 digits (turn counter — vendor uses %ld)    → 7
+    # Per-field max widths bound the worst-case digit count; trailing 0x20 pad
+    # is stripped by compaction:
+    #   Dlvl: 2  $: 6  HP/Pw: 4  AC: 2(+sign)  Xp(level): 2  Xp(points): 8
+    #   T: 7
     parts = [
         _S_DLVL,                                                # "Dlvl:"
         _uint_to_bytes_left(blstats[BL_DEPTH], 2),
@@ -1650,12 +1740,14 @@ def _build_status_row2(env_state, blstats) -> jnp.ndarray:
         sign_byte,
         _uint_to_bytes_left(abs_ac, 2),
         _S_SP_XP,                                               # " Xp:"
-        _uint_to_bytes_left(blstats[BL_XP], 2),
+        _uint_to_bytes_left(blstats[BL_XP], 2),                 # experience level
+        _S_SLASH,                                               # "/"
+        _uint_to_bytes_left(blstats[BL_EXP], 8),                # experience points
         _S_SP_T,                                                # " T:"
         _uint_to_bytes_left(blstats[BL_TIME], 7),
         build_status_conditions(env_state),
     ]
-    row = jnp.concatenate(parts)
+    row = _compact_pad_spaces(jnp.concatenate(parts), 80)
     return _pad_to(row, 80)
 
 
