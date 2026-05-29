@@ -475,18 +475,17 @@ def _run_dog_move(state, vendor_rng, pet_slot):
     )
 
     # ------------------------------------------------------------------
-    # Step 6: apply move.  Update pos + decrement movement_points by
-    # NORMAL_SPEED.  Position is stored as int16 [row, col].
+    # Step 6: apply move (position only).  Movement-point deduction is the
+    # caller's responsibility — vendor `movemon_singlemon` (mon.c:1254)
+    # deducts NORMAL_SPEED in the OUTER loop before calling dochug; dog_move
+    # itself does not touch mtmp->movement.  Doubling up here would
+    # double-decrement.  Position is stored as int16 [row, col].
     # ------------------------------------------------------------------
     new_pos_pair = jnp.stack(
         [new_r.astype(jnp.int16), new_c.astype(jnp.int16)],
     )
-    cur_mp = mai.movement_points[pet_slot].astype(jnp.int32)
-    new_mp = (cur_mp - jnp.int32(_NORMAL_SPEED)).astype(jnp.int16)
-
     new_mai = mai.replace(
         pos=mai.pos.at[pet_slot].set(new_pos_pair),
-        movement_points=mai.movement_points.at[pet_slot].set(new_mp),
     )
     new_state = state.replace(monster_ai=new_mai)
     return new_state, vendor_rng
