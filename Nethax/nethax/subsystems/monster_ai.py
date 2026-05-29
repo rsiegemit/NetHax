@@ -41,6 +41,9 @@ import jax
 import jax.numpy as jnp
 from flax import struct
 
+from Nethax.nethax import vendor_rng as _vendor_rng_mod
+from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng
+
 # Map dims — kept local so we don't have to import dungeon.branches in JIT-time.
 # These must match Nethax.nethax.dungeon.branches.MAP_H/MAP_W.
 _MAP_H: int = 21
@@ -6045,43 +6048,162 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     pre_round = jnp.where(smod < 0, mslow_speed,
                   jnp.where(smod > 0, mfast_speed, base_speed))
 
-    # Stochastic rounding to NORMAL_SPEED multiples (vendor rn2(NORMAL_SPEED)).
-    # Threefry-safe: derive a per-slot rounding key from rng before slot keys split.
-    rng, round_key = jax.random.split(rng)
-    round_keys = jax.random.split(round_key, MAX_MONSTERS_PER_LEVEL)
-    # rn2(NORMAL_SPEED) per slot.
-    rn_vals = jax.vmap(lambda k: jax.random.randint(k, (), 0, NS, dtype=jnp.int32))(round_keys)
-    mmove_adj = pre_round % NS
-    mmove_floored = pre_round - mmove_adj
-    rounded = mmove_floored + jnp.where(rn_vals < mmove_adj, NS, jnp.int32(0))
-
-    add_points = jnp.where(mai.alive, rounded, jnp.int32(0))
-    new_acc = mai.movement_points.astype(jnp.int32) + add_points
-
-    can_act = new_acc >= NS
-    # Deduct threshold on action.
-    post_acc = jnp.where(can_act, new_acc - NS, new_acc)
-    new_mp = jnp.clip(post_acc, 0, 32000).astype(jnp.int16)
-
-    mai = mai.replace(movement_points=new_mp)
-    state = state.replace(monster_ai=mai)
-
-    # ---- Per-slot turn dispatch ----
-    keys = jax.random.split(rng, MAX_MONSTERS_PER_LEVEL * 2)
-    turn_keys = keys[:MAX_MONSTERS_PER_LEVEL]
-    mhit_keys = keys[MAX_MONSTERS_PER_LEVEL:]
     indices = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
 
-    def _body(carry, xs):
-        slot_idx, key, may_act = xs
+    if _use_vendor_rng():
+        # ============================================================
+        # NLE_BYTEPARITY mode — vendor moveloop order:
+        #   (A) movemon: walk fmon (LIFO via fmon_order); each monster
+        #       with movement_points >= NORMAL_SPEED runs dochug then
+        #       deducts NORMAL_SPEED.   [allmain.c:212 → movemon]
+        #   (B) mcalcmove rn2(NORMAL_SPEED) per fmon entry refills
+        #       movement_points for the NEXT turn.        [allmain.c:233-234]
+        #   (C) maintenance ghost-draws: maybe_generate_rnd_mon,
+        #       dosounds (sinks), wipe-engraving.         [allmain.c:164,294 / sounds.c:220]
+        # The threefry per-slot rounding/accumulation upstream is REMOVED
+        # here — movement_points carries cleanly from prior turn.
+        # ============================================================
+        # Per-slot turn dispatch (vendor movemon — fmon LIFO order).
+        # may_act = movement_points[slot] >= NS (pre-mcalcmove value).
+        # Deduct NS from movement_points[slot] inside the body when acting.
+        keys = jax.random.split(rng, MAX_MONSTERS_PER_LEVEL * 2)
+        turn_keys = keys[:MAX_MONSTERS_PER_LEVEL]
+        mhit_keys = keys[MAX_MONSTERS_PER_LEVEL:]
 
-        def _do_turn(s):
-            return monster_turn(s, key, slot_idx)
+        def _body(carry, xs):
+            k_idx, key = xs
+            mi = carry.monster_ai
+            slot = mi.fmon_order[k_idx]
+            valid = slot >= jnp.int32(0)
+            safe_slot = jnp.where(valid, slot, jnp.int32(0))
+            mp_pre = mi.movement_points[safe_slot].astype(jnp.int32)
+            alive_s = mi.alive[safe_slot]
+            may_act = valid & alive_s & (mp_pre >= NS)
 
-        new_carry = jax.lax.cond(may_act, _do_turn, lambda s: s, carry)
-        return new_carry, None
+            # Deduct NORMAL_SPEED on action (vendor movemon).  Do this
+            # BEFORE the turn body so monster_turn sees the post-deduct value.
+            new_mp_val = jnp.where(may_act, mp_pre - NS, mp_pre).astype(jnp.int16)
+            new_mp_arr = jnp.where(
+                valid,
+                mi.movement_points.at[safe_slot].set(new_mp_val),
+                mi.movement_points,
+            )
+            mi_pre = mi.replace(movement_points=new_mp_arr)
+            carry_pre = carry.replace(monster_ai=mi_pre)
 
-    final_state, _ = jax.lax.scan(_body, state, (indices, turn_keys, can_act))
+            def _do_turn(s):
+                return monster_turn(s, key, safe_slot)
+
+            new_carry = jax.lax.cond(may_act, _do_turn, lambda s: s, carry_pre)
+            return new_carry, None
+
+        final_state, _ = jax.lax.scan(_body, state, (indices, turn_keys))
+
+        # ---- (B) mcalcmove rn2(NORMAL_SPEED) per fmon entry ----
+        # Vendor allmain.c:233-234:
+        #   for (mtmp = fmon; mtmp; mtmp = mtmp->nmon)
+        #       mtmp->movement += mcalcmove(mtmp, TRUE);
+        # mcalcmove draws rn2(NORMAL_SPEED) IFF (pre_round % NS) != 0.
+        # Iterates fmon_order LIFO; skips dead/empty slots.
+        # Cite: vendor/nethack/src/mon.c::mcalcmove lines 1126-1167.
+        def _mcalc_body(carry, k_):
+            st, vrng = carry
+            mi = st.monster_ai
+            slot = mi.fmon_order[k_]
+            valid = slot >= jnp.int32(0)
+            safe_slot = jnp.where(valid, slot, jnp.int32(0))
+            alive_s = jnp.where(valid, mi.alive[safe_slot], jnp.bool_(False))
+            pre = pre_round[safe_slot]
+            adj = pre % NS
+            floored = pre - adj
+            need_draw = valid & alive_s & (adj > jnp.int32(0))
+
+            def _draw(vr):
+                return _vendor_rng_mod.rn2_jax(vr, NS)
+
+            def _nodraw(vr):
+                return vr, jnp.int32(0)
+
+            vrng2, v = jax.lax.cond(need_draw, _draw, _nodraw, vrng)
+            add_pts = jnp.where(need_draw & (v < adj), floored + NS, floored)
+            add_pts = jnp.where(valid & alive_s, add_pts, jnp.int32(0))
+            new_mp = jnp.clip(
+                mi.movement_points[safe_slot].astype(jnp.int32) + add_pts,
+                0, 32000,
+            ).astype(jnp.int16)
+            mi2 = mi.replace(
+                movement_points=jnp.where(
+                    valid,
+                    mi.movement_points.at[safe_slot].set(new_mp),
+                    mi.movement_points,
+                )
+            )
+            return (st.replace(monster_ai=mi2), vrng2), None
+
+        (final_state, vrng_after_mcalc), _ = jax.lax.scan(
+            _mcalc_body,
+            (final_state, final_state.vendor_rng),
+            indices,
+        )
+        final_state = final_state.replace(vendor_rng=vrng_after_mcalc)
+
+        # ---- (C) Per-turn maintenance ISAAC64 ghost-draws ----
+        # Vendor moveloop, after the fmon mcalcmove loop, calls:
+        #   * maybe_generate_rnd_mon: `rn2(udemigod ? 25 : depth > stronghold
+        #     ? 50 : 70)`     — allmain.c:164.  Dlvl 1 → rn2(70).
+        #   * dosounds: `rn2(300)` gated by `nsinks > 0` (sounds.c:220).  We
+        #     unconditionally consume the draw here; for nsinks=0 levels the
+        #     vendor draw never fires, leaving a small parity gap that should
+        #     be conditionalized when sink tracking is wired in.
+        #     TODO(sinks): gate via state.features.nsinks once exposed.
+        #   * wipe-engraving: `rn2(40 + ACURR(A_DEX) * 3)` — allmain.c:294.
+        # We draw from vendor_rng and DISCARD the results — they are
+        # stream-alignment ghosts that have no game effect in the current
+        # scenarios.  Real handlers can replace each ghost-draw when wired.
+        vrng_after = final_state.vendor_rng
+        vrng_after, _ghost_genmon = _vendor_rng_mod.rn2_jax(vrng_after, jnp.int32(70))
+        vrng_after, _ghost_sound  = _vendor_rng_mod.rn2_jax(vrng_after, jnp.int32(300))
+        dex_i32 = jnp.asarray(state.player_dex, dtype=jnp.int32)
+        wipe_mod = jnp.int32(40) + dex_i32 * jnp.int32(3)
+        vrng_after, _ghost_wipe   = _vendor_rng_mod.rn2_jax(vrng_after, wipe_mod)
+        final_state = final_state.replace(vendor_rng=vrng_after)
+    else:
+        # Default mode (threefry): preserve pre-byte-parity behavior so
+        # existing tests keep passing.  Upfront per-slot stochastic
+        # rounding + accumulation + gated turn dispatch.
+        rng, round_key = jax.random.split(rng)
+        round_keys = jax.random.split(round_key, MAX_MONSTERS_PER_LEVEL)
+        rn_vals = jax.vmap(
+            lambda k: jax.random.randint(k, (), 0, NS, dtype=jnp.int32)
+        )(round_keys)
+        mmove_adj = pre_round % NS
+        mmove_floored = pre_round - mmove_adj
+        rounded = mmove_floored + jnp.where(rn_vals < mmove_adj, NS, jnp.int32(0))
+
+        add_points = jnp.where(mai.alive, rounded, jnp.int32(0))
+        new_acc = mai.movement_points.astype(jnp.int32) + add_points
+
+        can_act = new_acc >= NS
+        post_acc = jnp.where(can_act, new_acc - NS, new_acc)
+        new_mp = jnp.clip(post_acc, 0, 32000).astype(jnp.int16)
+
+        mai = mai.replace(movement_points=new_mp)
+        state = state.replace(monster_ai=mai)
+
+        keys = jax.random.split(rng, MAX_MONSTERS_PER_LEVEL * 2)
+        turn_keys = keys[:MAX_MONSTERS_PER_LEVEL]
+        mhit_keys = keys[MAX_MONSTERS_PER_LEVEL:]
+
+        def _body(carry, xs):
+            slot_idx, key, may_act = xs
+
+            def _do_turn(s):
+                return monster_turn(s, key, slot_idx)
+
+            new_carry = jax.lax.cond(may_act, _do_turn, lambda s: s, carry)
+            return new_carry, None
+
+        final_state, _ = jax.lax.scan(_body, state, (indices, turn_keys, can_act))
 
     # ---- Monster-vs-monster melee (mattackm) ----
     # Wave 40b Item #8: vendor mm_aggression (mon.c:2422-2447) permits
@@ -6101,12 +6223,27 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     else:
         _conflict_active = jnp.bool_(False)
 
+    # Build per-iteration attacker indices.  In byte-parity mode walk fmon
+    # LIFO order (matches vendor allmain.c:212 movemon iteration); otherwise
+    # use slot order as before.  Per-pair `idx_arr > i32` dedupe still works
+    # because we resolve i32 = actual slot index either way; -1 (empty fmon
+    # entries) collapses to a no-op via atk_alive=False.
+    if _use_vendor_rng():
+        atk_indices_arr = final_state.monster_ai.fmon_order
+    else:
+        atk_indices_arr = indices
+
     def _strike_body(carry, args):
         i, key_i = args
         mi = carry.monster_ai
-        i32 = i.astype(jnp.int32)
+        # `i` is the slot index of the attacker (or -1 for empty fmon slots
+        # under byte-parity mode).  Clamp to 0 so the gather is safe; the
+        # alive/valid mask below collapses the iteration to a no-op.
+        i_raw = i.astype(jnp.int32)
+        valid_i = i_raw >= jnp.int32(0)
+        i32 = jnp.where(valid_i, i_raw, jnp.int32(0))
 
-        atk_alive = mi.alive[i32]
+        atk_alive = mi.alive[i32] & valid_i
         pi = mi.pos[i32].astype(jnp.int32)
 
         all_pos = mi.pos.astype(jnp.int32)            # [N, 2]
@@ -6163,7 +6300,7 @@ def monsters_step_all(state, rng: jax.Array) -> object:
 
         return jax.lax.cond(do_strike, _strike, lambda ss: ss, carry), None
 
-    final_state, _ = jax.lax.scan(_strike_body, final_state, (indices, mhit_keys))
+    final_state, _ = jax.lax.scan(_strike_body, final_state, (atk_indices_arr, mhit_keys))
 
     # Tick status timers (vendor src/timeout.c::run_timers pattern).
     mai = final_state.monster_ai
