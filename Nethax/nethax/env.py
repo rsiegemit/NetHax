@@ -455,24 +455,50 @@ class NethaxEnv:
         if use_vendor_rng():
             state, new_vrng = _spawn_starting_pet(state, role, vendor_rng=state.vendor_rng)
             state = state.replace(vendor_rng=new_vrng)
-            # Vendor makedog (NLE 3.x dog.c) continues past the rn2(2) pet-type
-            # coin flip with 6 more ISAAC64 draws (saddle / gender / HP roll /
-            # ... / rndencode) before moveloop starts.  Nethax doesn't model
-            # those side-effects, but byte parity for step 1+ pet movement
-            # requires the stream POSITION to match — so consume 6 ghost draws
-            # with the exact moduli vendor uses, in order.  Reference: the
-            # vendor reset trace .test_runs/vendor_step0.trace lines 1783-1788:
-            #   rn2(4), rn2(2), rn2(50), rn2(100), rn2(100), rnd(9000).
-            # Cite Nethax↔NLE 3.x trace diff (Memory: byte-parity-progress
-            # "draws 1782+ = makedog body").
+            # Vendor makedog (NLE 3.x dog.c::makedog → makemon → ... → moveloop)
+            # continues past the rn2(2) pet-type coin flip (dog.c:66) with the
+            # following ISAAC64 stream consumption (kitten case; little dog is
+            # analogous via the same m_lev=1 → d(1,8) → m_initinv path):
+            #
+            #   makemon body:
+            #     enexto_core (teleport.c:215)        rn2(N)        TRACED  -> trace pos 1782
+            #     mtmp->female = rn2(2) (makemon.c:1226)            TRACED  -> trace pos 1783
+            #     [SILENT 1 uint64 — empirically required to align trace pos 1784+;
+            #      most likely d(n,x) bypass via RND() inline (vendor rnd.c:75-79
+            #      / rnd.c:222 — d() calls RND() directly, skipping the rn2/rnd
+            #      op-trace hook).  Candidate sources: newmonhp d(m_lev,8) for
+            #      kitten, m_initweap/d_dowear default paths, mksobj/mkobj internals.
+            #      The exact site is academic — the trace-driven byte-parity proof
+            #      shows ISAAC bytes [X+0, X+1, X+2 (silent), X+3, X+4, X+5, X+6]
+            #      land on vendor trace positions [1782, 1783, _, 1784, 1785, 1786,
+            #      1787] respectively, so consuming exactly one silent uint64
+            #      between trace pos 1783 and 1784 restores byte parity.]
+            #   m_initinv (makemon.c:794-797):
+            #     rn2(50)                                           TRACED  -> trace pos 1784
+            #     rn2(100)                                          TRACED  -> trace pos 1785
+            #   makemon trailer (makemon.c:1386):
+            #     rn2(100) for is_domestic saddle gate              TRACED  -> trace pos 1786
+            #   moveloop entry (allmain.c:67):
+            #     context.rndencode = rnd(9000)                     TRACED  -> trace pos 1787
+            #
+            # Previously this block emitted six op-traced draws assuming each
+            # vendor trace position corresponded to a single ISAAC draw — but
+            # vendor's d(n,x) is a SILENT consumer (rnd.c:208-224 calls RND(x)
+            # directly, bypassing the rn2/rnd trace hook).  Missing the silent
+            # draw shifted Nethax's ISAAC stream one uint64 EARLY starting at
+            # trace pos 1784, so every subsequent uint64 was off-by-one
+            # (Nethax 1785 mirrored vendor 1784, etc).  Cite vendor/nle/src/
+            # rnd.c:75-79 (RND inline) and the diagnostic in
+            # .test_runs/ghost_draw_eager_check.py.
             from Nethax.nethax import vendor_rng as _vrng_mod
             v = state.vendor_rng
-            v, _ = _vrng_mod.rn2_jax(v, 4)
-            v, _ = _vrng_mod.rn2_jax(v, 2)
-            v, _ = _vrng_mod.rn2_jax(v, 50)
-            v, _ = _vrng_mod.rn2_jax(v, 100)
-            v, _ = _vrng_mod.rn2_jax(v, 100)
-            v, _ = _vrng_mod.rnd_jax(v, 9000)
+            v, _ = _vrng_mod.rn2_jax(v, 4)            # enexto_core
+            v, _ = _vrng_mod.rn2_jax(v, 2)            # mtmp->female = rn2(2)
+            v, _ = _vrng_mod.next_uint64_jax(v)       # silent draw (see comment block above)
+            v, _ = _vrng_mod.rn2_jax(v, 50)           # m_initinv rnd_defensive_item gate
+            v, _ = _vrng_mod.rn2_jax(v, 100)          # m_initinv rnd_misc_item gate
+            v, _ = _vrng_mod.rn2_jax(v, 100)          # is_domestic saddle gate
+            v, _ = _vrng_mod.rnd_jax(v, 9000)         # moveloop: context.rndencode
             state = state.replace(vendor_rng=v)
         else:
             state = _spawn_starting_pet(state, role)
