@@ -455,6 +455,25 @@ class NethaxEnv:
         if use_vendor_rng():
             state, new_vrng = _spawn_starting_pet(state, role, vendor_rng=state.vendor_rng)
             state = state.replace(vendor_rng=new_vrng)
+            # Vendor makedog (NLE 3.x dog.c) continues past the rn2(2) pet-type
+            # coin flip with 6 more ISAAC64 draws (saddle / gender / HP roll /
+            # ... / rndencode) before moveloop starts.  Nethax doesn't model
+            # those side-effects, but byte parity for step 1+ pet movement
+            # requires the stream POSITION to match — so consume 6 ghost draws
+            # with the exact moduli vendor uses, in order.  Reference: the
+            # vendor reset trace .test_runs/vendor_step0.trace lines 1783-1788:
+            #   rn2(4), rn2(2), rn2(50), rn2(100), rn2(100), rnd(9000).
+            # Cite Nethax↔NLE 3.x trace diff (Memory: byte-parity-progress
+            # "draws 1782+ = makedog body").
+            from Nethax.nethax import vendor_rng as _vrng_mod
+            v = state.vendor_rng
+            v, _ = _vrng_mod.rn2_jax(v, 4)
+            v, _ = _vrng_mod.rn2_jax(v, 2)
+            v, _ = _vrng_mod.rn2_jax(v, 50)
+            v, _ = _vrng_mod.rn2_jax(v, 100)
+            v, _ = _vrng_mod.rn2_jax(v, 100)
+            v, _ = _vrng_mod.rnd_jax(v, 9000)
+            state = state.replace(vendor_rng=v)
         else:
             state = _spawn_starting_pet(state, role)
 
