@@ -1366,6 +1366,31 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         state_final,
     )
 
+    # --- mention_walls bump feedback (vendor hack.c:768-772) ---
+    # NLE enables iflags.mention_walls (vendor/nle/nle/nethack/nethack.py:57),
+    # so a move blocked by a solid non-door tile prints "It's <a wall|a
+    # tree|solid stone>."  In Nethax the bump-blocking solid tiles (per
+    # _IS_SOLID) are WALL and VOID (unexplored rock); closed doors emit their
+    # own door-bump feedback and are excluded here.  Cite:
+    # vendor/nle/src/hack.c:768-772 (test_move DO_MOVE solid-tile else branch).
+    from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
+    _bump_wall = in_bounds & is_solid & ~target_is_closed_door
+    _is_wall_tile = tile_val == jnp.int32(int(TileType.WALL))
+    # tree-bump is impossible in current terrain (TREE not in _IS_SOLID) but
+    # kept for vendor parity; default solid -> "solid stone." (VOID rock).
+    _bump_msg_id = jnp.where(
+        _is_wall_tile,
+        jnp.int32(int(_MsgId.ITS_A_WALL)),
+        jnp.int32(int(_MsgId.ITS_SOLID_STONE)),
+    )
+    _new_messages = jax.lax.cond(
+        _bump_wall,
+        lambda m: _msg_emit(m, _bump_msg_id),
+        lambda m: m,
+        state_final.messages,
+    )
+    state_final = state_final.replace(messages=_new_messages)
+
     return _apply_fov(state_final)
 
 

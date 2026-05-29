@@ -174,6 +174,18 @@ class MessageId(IntEnum):
                                 # bounces!".  RM (skills_freeze.py:7) matches.
                                 # Cite: vendor/nle/src/zap.c:4263, zap.c:63.
 
+    # Wall/tree/stone bump feedback (mention_walls option enabled by NLE).
+    # When a move is blocked by a non-diggable solid tile, vendor prints
+    #     pline("It's %s.", IS_WALL||SDOOR ? "a wall"
+    #                       : IS_TREE      ? "a tree"
+    #                       : "solid stone");
+    # NLE enables iflags.mention_walls (vendor/nle/nle/nethack/nethack.py:57),
+    # so this fires whenever the hero bumps into a wall/tree/stone.
+    # Cite: vendor/nle/src/hack.c:768-772 (test_move DO_MOVE block branch).
+    ITS_A_WALL            = 53  # hack.c:770 "It's a wall."
+    ITS_A_TREE            = 54  # hack.c:771 "It's a tree."
+    ITS_SOLID_STONE       = 55  # hack.c:772 "It's solid stone."
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -313,6 +325,10 @@ _MESSAGE_TEMPLATES: tuple[str, ...] = (
     # fltxt="bolt of cold" per flash_types zap.c:63).
     # Cite: vendor/nle/src/zap.c:4263, vendor/nle/src/zap.c:63.
     "The bolt of cold bounces!",             # 52 COLD_BOLT_BOUNCES    zap.c:4263
+    # Wall/tree/stone bump feedback (mention_walls).  Cite: hack.c:768-772.
+    "It's a wall.",                          # 53 ITS_A_WALL           hack.c:770
+    "It's a tree.",                          # 54 ITS_A_TREE           hack.c:771
+    "It's solid stone.",                     # 55 ITS_SOLID_STONE      hack.c:772
 )
 
 
