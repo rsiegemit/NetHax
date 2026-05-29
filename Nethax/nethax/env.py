@@ -103,6 +103,15 @@ class NethaxEnv:
         rng_state, rng_level, rng_char, rng_monsters = jax.random.split(rng, 4)
         state = EnvState.default(rng=rng_state, static=self.static)
 
+        # Vendor NetHack starts the move counter at 1, not 0 (the game begins
+        # on turn 1).  ``decl.c:195`` initialises ``moves = 1L`` and the first
+        # observation after newgame already reports moves==1; the per-step
+        # ``svm.moves++`` (allmain.c:244) then advances it to 2, 3, ....  Our
+        # ``EnvState.default`` seeds ``timestep=0``, so without this the
+        # blstats BL_TIME field (nle_obs.py reads ``env_state.timestep``)
+        # lags NLE by exactly 1 at every step.  Cite: vendor/nle/src/decl.c:195.
+        state = state.replace(timestep=jnp.int32(1))
+
         # NLE_BYTEPARITY: seed ISAAC64 from the host-side integer derived
         # from the incoming PRNGKey.  Vendor NLE seeds each rnglist[] entry
         # via ``init_isaac64(seed)`` where ``seed`` is the platform unsigned

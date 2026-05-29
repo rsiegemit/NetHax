@@ -1306,34 +1306,82 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
 # _consume_attr_variation_draws  — vendor u_init.c:887-894 post-init_attr loop
 # ---------------------------------------------------------------------------
 
-def _consume_attr_variation_draws(vendor_rng):
+def _consume_attr_variation_draws(vendor_rng, stats, role: Role, race: Race):
     """Consume the 6 ``rn2(20)`` draws (+ conditional ``rn2(7)``) emitted by
-    the post-``init_attr`` attribute variation loop.
+    the post-``init_attr`` attribute variation loop *and apply* the biased
+    ``adjattrib`` variation to the stat values.
 
-    Vendor code (u_init.c:887-894)::
+    Vendor code (u_init.c:886-894)::
 
         for (i = 0; i < A_MAX; i++)   // A_MAX == 6
             if (!rn2(20)) {
-                int xd = rn2(7) - 2;
-                adjattrib(i, xd, TRUE);
-                ...
+                register int xd = rn2(7) - 2;   // biased variation
+                (void) adjattrib(i, xd, TRUE);
+                if (ABASE(i) < AMAX(i))
+                    AMAX(i) = ABASE(i);
             }
 
     Always fires exactly 6 ``rn2(20)`` draws; each zero result adds one
-    ``rn2(7)`` draw.  ``adjattrib`` itself does not draw from CORE.
+    ``rn2(7)`` draw, then calls ``adjattrib(i, xd, TRUE)`` which mutates the
+    attribute.  Earlier versions of this helper consumed the draws but
+    discarded ``xd`` — that dropped the +1 CON bump on seed 0 Rogue/Human
+    (NLE CON 14 vs Nethax 13).
 
-    Returns the post-draw ``Isaac64State``.
+    ``adjattrib(ndx, incr, TRUE)`` (attrib.c:114-188):
+      * ``incr == 0`` → no-op, returns FALSE (no extra draw).
+      * ``incr > 0`` → ABASE += incr, clamped up to ATTRMAX(ndx).  No draw.
+      * ``incr < 0`` → ABASE += incr; only if it falls *below* ATTRMIN does
+        vendor draw ``rn2(ATTRMIN - ABASE + 1)`` to reduce AMAX — at character
+        init the floors are 7+ so a single biased ``xd`` (range -2..+4) never
+        sends a stat below its race ATTRMIN(=3), so this extra draw never
+        fires here.  We replicate it defensively so the byte stream stays
+        exact if a future role/seed lands a deep negative variation.
+      * the DUNCE_CAP / Fixed_abil gates are inactive at character creation.
 
-    Citation: vendor/nle/src/u_init.c:887-894
+    Parameters
+    ----------
+    vendor_rng : Isaac64State
+    stats      : ``{stat_name: int}`` post-init_attr values (mutated copy
+                 returned, never in place).
+    role, race : for ATTRMIN/ATTRMAX clamps.
+
+    Returns ``(vendor_rng, stats)``.
+
+    Citation: vendor/nle/src/u_init.c:886-894; vendor/nle/src/attrib.c:114-188.
     """
     from Nethax.nethax import vendor_rng as _vrng
 
-    for _ in range(6):  # A_MAX = 6
+    race_entry = get_race(race)
+    attrmin = [int(v) for v in race_entry.attrmin]  # [6] STR INT WIS DEX CON CHA
+    attrmax = [int(v) for v in race_entry.attrmax]
+    out = dict(stats)
+
+    for i in range(6):  # A_MAX = 6
         vendor_rng, gate = _vrng.rn2(vendor_rng, 20)  # u_init.c:888
         if gate == 0:
-            vendor_rng, _xd = _vrng.rn2(vendor_rng, 7)  # u_init.c:889
+            vendor_rng, xd_raw = _vrng.rn2(vendor_rng, 7)  # u_init.c:889
+            xd = int(xd_raw) - 2  # biased variation, range -2..+4
+            if xd == 0:
+                continue  # adjattrib no-op, no further draw
+            name = _STAT_NAMES[i]
+            base = int(out[name])
+            new_base = base + xd
+            if xd > 0:
+                # clamp up to race ATTRMAX (attrib.c:131-138)
+                if new_base > attrmax[i]:
+                    new_base = attrmax[i]
+            else:
+                # incr < 0: only draw + adjust AMAX when below ATTRMIN
+                # (attrib.c:140-165).  Never reached at init for the
+                # current parity targets, but keep the draw for safety.
+                if new_base < attrmin[i]:
+                    vendor_rng, _decr = _vrng.rn2(
+                        vendor_rng, attrmin[i] - new_base + 1
+                    )
+                    new_base = attrmin[i]
+            out[name] = new_base
 
-    return vendor_rng
+    return vendor_rng, out
 
 
 # ---------------------------------------------------------------------------
@@ -1412,10 +1460,16 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         stats = _init_attr_vendor(rng_stats, role, race, np_total=75)
 
     # --- NLE_BYTEPARITY: attr variation loop (all roles) ---
-    # Step 5: 6 rn2(20) draws + conditional rn2(7) per hit.
-    # Cite: vendor/nle/src/u_init.c:887-894
+    # Step 5: 6 rn2(20) draws + conditional rn2(7) per hit, applying the
+    # biased adjattrib() variation to the stat values.  Cite:
+    # vendor/nle/src/u_init.c:886-894.
     if vendor_rng is not None:
-        vendor_rng = _consume_attr_variation_draws(vendor_rng)
+        # consume_init_attr_draws returns Python ints; vary on those then
+        # re-wrap as int32 so the downstream EnvState fields stay typed.
+        vendor_rng, stats_raw = _consume_attr_variation_draws(
+            vendor_rng, stats_raw, role, race,
+        )
+        stats = {k: jnp.int32(v) for k, v in stats_raw.items()}
 
     # --- HP / Pw (vendor ini_hpwp parity, u.ulevel == 0 branch) ---
     hp, pw = _ini_hpwp_vendor(rng_hp, role, race)
