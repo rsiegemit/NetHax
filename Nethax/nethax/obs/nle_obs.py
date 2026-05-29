@@ -279,8 +279,15 @@ _CMAP_TO_CHAR: jnp.ndarray = jnp.array([
     ord('.'),  # 20 S_darkroom
     ord('`'),  # 21 S_engroom
     ord('#'),  # 22 S_corr
-    ord('#'),  # 23 S_litcorr
-    ord('#'),  # 24 S_engrcorr
+    # NLE 3.x cmap layout (vendor/nle/include/rm.h:140-141): index 23 =
+    # S_upstair, 24 = S_dnstair.  5.x has S_litcorr/S_engrcorr at 23-24 and
+    # shifts the staircase block to 25-26 — Nethax targets NLE 3.x so we use
+    # the 3.x mapping here.  The _S_upstair / _S_dnstair constants above are
+    # already 23/24 (3.x).  Indices 25-28 below carry the 5.x labels for
+    # legacy reasons; they happen to render the same char so they're left
+    # in place to avoid churn.
+    ord('<'),  # 23 S_upstair  (NLE 3.x — was '#' as 5.x S_litcorr; wrong here)
+    ord('>'),  # 24 S_dnstair  (NLE 3.x — was '#' as 5.x S_engrcorr; wrong here)
     ord('<'),  # 25 S_upstair
     ord('>'),  # 26 S_dnstair
     ord('<'),  # 27 S_upladder
