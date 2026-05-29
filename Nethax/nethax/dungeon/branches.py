@@ -595,10 +595,17 @@ _TILE_STAIRCASE_DOWN: int = 7
 #                                 and movement-correct.  Cite: rm.h SCORR is a
 #                                 secret type; vendor/nethack/src/display.c
 #                                 back_to_glyph maps SCORR->S_stone.
-#   DOOR    (15) -> CLOSED_DOOR(4) safe default (door state refinement deferred;
-#                                 the LevelGenState doormask is dropped on the
-#                                 transpose, so open/broken state is not
-#                                 trivially distinguishable here).
+#   DOOR    (15) -> by door MASK (see below).  When the per-cell ``doormask``
+#                                 is threaded in, a DOOR cell maps as:
+#                                   D_NODOOR / D_BROKEN / D_ISOPEN -> OPEN_DOOR
+#                                       (a passable, wall-ish door tile; vendor
+#                                       renders a doorless gap as S_ndoor '.',
+#                                       which the obs cmap table cannot express
+#                                       — see the S_ndoor caveat in the
+#                                       door-mask block below)
+#                                   D_CLOSED / D_LOCKED -> CLOSED_DOOR ('+')
+#                                 With no doormask (legacy path) DOOR falls back
+#                                 to CLOSED_DOOR, the prior safe default.
 #   SDOOR   (16) -> WALL(3)       secret door looks like a wall until found.
 #   IRONBARS(21) -> WALL(3)       no IRONBARS TileType; closest blocking tile.
 # Corner cells in this grid are encoded as ROOM (corridors.py stamp_rooms emits
@@ -613,11 +620,21 @@ _VTILE_ROOM:     int = 11
 _VTILE_CORR:     int = 13
 _VTILE_SCORR:    int = 14
 _VTILE_DOOR:     int = 15
+_VTILE_SDOOR:    int = 16
+
+# Vendor door masks (vendor/nle/include/rm.h): a DOOR cell's ``doormask`` says
+# whether it is a doorless opening, broken, open, closed, or locked.  We test
+# the CLOSED/LOCKED bits to decide whether a DOOR renders as a closed-door
+# glyph ('+') or a walkable opening (D_NODOOR / D_BROKEN / D_ISOPEN).
+_DMASK_CLOSED: int = 4   # D_CLOSED  — shut door ('+')
+_DMASK_LOCKED: int = 8   # D_LOCKED  — locked shut door ('+')
 
 _TILE_VOID:        int = 0
 _TILE_CORRIDOR:    int = 2
 _TILE_WALL:        int = 3
 _TILE_CLOSED_DOOR: int = 4
+_TILE_OPEN_DOOR:   int = 5
+# _TILE_FLOOR (= 1) is defined above (module-level tile constants).
 
 # Static index-by-grid lookup (length 32 covers STONE..IRONBARS=21, clamped).
 _VTYP_TO_TILE: jnp.ndarray = jnp.array(
@@ -652,7 +669,10 @@ _VTYP_TO_TILE: jnp.ndarray = jnp.array(
 )
 
 
-def _vendor_grid_to_terrain(vendor_levl_grid: jnp.ndarray) -> jnp.ndarray:
+def _vendor_grid_to_terrain(
+    vendor_levl_grid: jnp.ndarray,
+    door_mask_grid: jnp.ndarray = None,
+) -> jnp.ndarray:
     """Map a vendor ``levl.typ`` grid ([ROWNO, COLNO]) to internal TileType.
 
     Steps (all JIT-safe, no Python branches on traced values):
@@ -660,16 +680,42 @@ def _vendor_grid_to_terrain(vendor_levl_grid: jnp.ndarray) -> jnp.ndarray:
       2. Corner-promotion: corridors.py's ``stamp_rooms_into_typ`` encodes the
          four room corners as ROOM (not a corner code), so step 1 leaves them
          as FLOOR.  Re-derive the true outer corners geometrically: a ROOM cell
-         is an outer corner iff it has an HWALL neighbour to the E *or* W AND a
-         VWALL neighbour to the N *or* S.  Interior floor cells adjacent to the
-         wall ring fail this test (their HWALL neighbour is N/S, their VWALL
-         neighbour is E/W), so only the meeting-point corners are promoted to
-         WALL.  This lets the obs ``_apply_wall_angle`` pass pick the correct
-         S_tlcorn / S_trcorn / S_blcorn / S_brcorn variant from the 4-neighbour
-         wall pattern.
+         is an outer corner iff it has a HORIZONTAL-wall segment neighbour to
+         the E *or* W AND a VERTICAL-wall segment neighbour to the N *or* S.
+         A horizontal-wall segment is HWALL *or a DOOR* (a doorway carved into
+         a horizontal wall is still part of that wall run); a vertical-wall
+         segment is VWALL *or a DOOR*.  Doors must count as wall continuations
+         because makecorridors can punch a doorway into the wall *adjacent* to
+         a corner — e.g. seed-0's hero room has a doorless doorway (DOOR) in
+         the left VWALL at (69,10) directly N of the bottom-left corner
+         (69,11); with a VWALL-only test that corner's vertical neighbour is
+         the door, so it was wrongly left as FLOOR (rendering S_room instead
+         of S_blcorn).  Treating the door as a vertical-wall segment promotes
+         it correctly.  Interior floor cells still fail the test: a true
+         interior cell never simultaneously has a horizontal-wall segment E/W
+         AND a vertical-wall segment N/S (only the four meeting-point corners
+         do), so only the corners are promoted to WALL.  This matches the obs
+         ``_apply_wall_angle`` pass, which likewise treats doors as wall
+         continuations, so it then picks the correct S_tlcorn / S_trcorn /
+         S_blcorn / S_brcorn variant from the 4-neighbour wall pattern.
+
+      3. Door-mask refinement (only when ``door_mask_grid`` is supplied):
+         step 1 maps every DOOR cell to CLOSED_DOOR, but vendor ``dosdoor``
+         assigns a per-cell door MASK (D_NODOOR / D_BROKEN / D_ISOPEN /
+         D_CLOSED / D_LOCKED — vendor/nle/include/rm.h).  Only D_CLOSED /
+         D_LOCKED render as a shut door ('+'); a D_NODOOR / D_BROKEN / D_ISOPEN
+         doorway is passable and maps to OPEN_DOOR.  We map by mask so e.g.
+         seed-0's hero-room left-wall doorway at (69,10) — which vendor leaves
+         D_NODOOR — no longer renders as a spurious closed door.  See the
+         door-mask block below for the S_ndoor caveat (the obs cmap table has
+         no S_ndoor TileType; OPEN_DOOR is used because it is both passable and
+         wall-ish so the neighbouring room corner still resolves to S_blcorn).
 
     Args:
         vendor_levl_grid: int8[ROWNO, COLNO] in corridors.py VTILE_* encoding.
+        door_mask_grid:   optional int8[ROWNO, COLNO] vendor ``doormask`` grid
+                          (same orientation as ``vendor_levl_grid``).  When
+                          None, every DOOR keeps the step-1 CLOSED_DOOR default.
 
     Returns:
         int8[ROWNO, COLNO] internal TileType array.
@@ -678,23 +724,63 @@ def _vendor_grid_to_terrain(vendor_levl_grid: jnp.ndarray) -> jnp.ndarray:
     idx = jnp.clip(grid, 0, _VTYP_TO_TILE.shape[0] - 1)
     terrain = _VTYP_TO_TILE[idx].astype(jnp.int8)
 
+    # --- Door-mask refinement (only when the doormask is threaded in). ---
+    # Re-map DOOR cells from the CLOSED_DOOR default to the mask-appropriate
+    # tile.  Pure geometry/lookup — no RNG, JIT-safe.
+    #
+    # RENDER-TABLE CAVEAT (S_ndoor): vendor renders a D_NODOOR / D_BROKEN
+    # doorway as S_ndoor (cmap 12, '.').  The obs ``_TILE_TO_CMAP``
+    # (nle_obs.py, owned elsewhere) has NO TileType that maps to S_ndoor, and
+    # the obs ``_apply_wall_angle`` pass treats ONLY WALL / CLOSED_DOOR /
+    # OPEN_DOOR as wall-continuations when deriving corner variants.  A
+    # doorless doorway therefore cannot be both (a) rendered as S_ndoor and
+    # (b) counted as the wall-segment that lets its neighbouring room corner
+    # resolve to S_blcorn — those two facts both require an nle_obs change
+    # (add a DOORWAY TileType -> S_ndoor AND include it in is_wallish).
+    #
+    # Within this file we keep the corner correct (the fully-achievable win):
+    # a D_NODOOR / D_BROKEN / D_ISOPEN doorway maps to OPEN_DOOR — a *passable*
+    # door tile that is wall-ish in _apply_wall_angle, so the adjacent corner
+    # still resolves to S_blcorn.  Only D_CLOSED / D_LOCKED render as a shut
+    # door ('+').  This is strictly closer to vendor than the old
+    # unconditional CLOSED_DOOR (a doorless opening no longer shows '+'); the
+    # exact S_ndoor glyph for the doorway cell awaits the nle_obs DOORWAY
+    # TileType.  Vendor cite: vendor/nle/include/rm.h door masks; display.c
+    # back_to_glyph (D_NODOOR -> S_ndoor).
+    if door_mask_grid is not None:
+        dmask = door_mask_grid.astype(jnp.int32)
+        is_door_cell = grid == jnp.int32(_VTILE_DOOR)
+        shut = (dmask & jnp.int32(_DMASK_CLOSED | _DMASK_LOCKED)) != jnp.int32(0)
+        # Everything that is not explicitly shut (D_NODOOR / D_BROKEN /
+        # D_ISOPEN) -> OPEN_DOOR: passable + wall-ish (keeps neighbour corners).
+        door_tile = jnp.where(
+            shut, jnp.int8(_TILE_CLOSED_DOOR), jnp.int8(_TILE_OPEN_DOOR),
+        )
+        terrain = jnp.where(is_door_cell, door_tile, terrain)
+
     # --- Corner promotion (ROOM-coded corners -> WALL). ---
-    is_hwall = grid == jnp.int32(_VTILE_HWALL)
-    is_vwall = grid == jnp.int32(_VTILE_VWALL)
+    is_door = (grid == jnp.int32(_VTILE_DOOR)) | (grid == jnp.int32(_VTILE_SDOOR))
+    # Horizontal-wall segment = HWALL or a door punched into a horizontal wall.
+    # Vertical-wall segment   = VWALL or a door punched into a vertical wall.
+    # A door can sit immediately beside a corner (e.g. the doorless doorway in
+    # the left wall directly N of the bottom-left corner), so doors must count
+    # as wall continuations or that corner is missed.
+    is_hseg = (grid == jnp.int32(_VTILE_HWALL)) | is_door
+    is_vseg = (grid == jnp.int32(_VTILE_VWALL)) | is_door
     is_room = grid == jnp.int32(_VTILE_ROOM)
 
     H, W = grid.shape
     false_row = jnp.zeros((1, W), dtype=jnp.bool_)
     false_col = jnp.zeros((H, 1), dtype=jnp.bool_)
 
-    # HWALL neighbour to the E or W (horizontal direction).
-    hwall_w = jnp.concatenate([false_col, is_hwall[:, :-1]], axis=1)
-    hwall_e = jnp.concatenate([is_hwall[:, 1:], false_col], axis=1)
-    # VWALL neighbour to the N or S (vertical direction).
-    vwall_n = jnp.concatenate([false_row, is_vwall[:-1, :]], axis=0)
-    vwall_s = jnp.concatenate([is_vwall[1:, :], false_row], axis=0)
+    # Horizontal-wall-segment neighbour to the E or W.
+    hseg_w = jnp.concatenate([false_col, is_hseg[:, :-1]], axis=1)
+    hseg_e = jnp.concatenate([is_hseg[:, 1:], false_col], axis=1)
+    # Vertical-wall-segment neighbour to the N or S.
+    vseg_n = jnp.concatenate([false_row, is_vseg[:-1, :]], axis=0)
+    vseg_s = jnp.concatenate([is_vseg[1:, :], false_row], axis=0)
 
-    is_corner = is_room & (hwall_w | hwall_e) & (vwall_n | vwall_s)
+    is_corner = is_room & (hseg_w | hseg_e) & (vseg_n | vseg_s)
     terrain = jnp.where(is_corner, jnp.int8(_TILE_WALL), terrain)
     return terrain
 
@@ -1139,6 +1225,12 @@ def generate_main_branch_l1(
         # → [ROWNO, COLNO] to match mineralize's row-major terrain layout.
         # Vendor cite: vendor/nle/src/mklev.c:948-961 (levl[][] STONE scan).
         vendor_levl_grid = jnp.transpose(_lgs.typ)  # [ROWNO, COLNO]
+        # Per-cell vendor ``doormask`` (D_NODOOR / D_BROKEN / D_ISOPEN /
+        # D_CLOSED / D_LOCKED) in the same [ROWNO, COLNO] orientation.  Threaded
+        # into _vendor_grid_to_terrain so DOOR cells render by mask (a doorless
+        # opening no longer shows as a spurious '+').  Vendor cite:
+        # vendor/nle/src/mklev.c::dosdoor sets rm.doormask per door.
+        vendor_door_mask_grid = jnp.transpose(_lgs.doormask)  # [ROWNO, COLNO]
         del _lgs, _rooms_box
 
         # ------------------------------------------------------------------
@@ -1157,7 +1249,9 @@ def generate_main_branch_l1(
         # corridors are makecorridors (vendor/nle/src/mklev.c:734), so the
         # whole walkable surface is vendor-consistent.  Threefry (non-vendor)
         # path is untouched and keeps using ``connect_rooms``.
-        terrain = _vendor_grid_to_terrain(vendor_levl_grid)
+        terrain = _vendor_grid_to_terrain(
+            vendor_levl_grid, door_mask_grid=vendor_door_mask_grid,
+        )
 
         # ------------------------------------------------------------------
         # place_branch(branchp, 0, 0) — vendor mklev.c:800.
