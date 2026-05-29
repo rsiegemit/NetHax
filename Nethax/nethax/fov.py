@@ -155,6 +155,7 @@ def compute_fov(
     player_pos: jnp.ndarray,
     sight_radius: int = DEFAULT_SIGHT_RADIUS,
     opaque_overlay: jnp.ndarray | None = None,
+    lit_mask: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """Compute field-of-view mask via Bresenham-line raycast.
 
@@ -169,6 +170,18 @@ def compute_fov(
             ``D_LOCKED|D_TRAPPED|D_SECRET`` (vendor vision.c:167-168) that
             are not already encoded in the TileType enum.  Defaults to an
             all-False mask (terrain-only opacity, current behaviour).
+        lit_mask: optional bool[H, W] mask of LIT cells.  When provided, the
+            raycast result is gated so a cell is kept visible only if it is
+            LIT *or* within the hero's light radius (Chebyshev distance <= 1).
+            This mirrors vendor ``vision_recalc`` / ``recheck_pos`` dark-cell
+            handling: a DARK cell (unlit corridor / dark-room tile) is shown
+            only when adjacent to the hero (inside the light radius) — being on
+            a line of sight through a doorway is NOT enough.  Cite:
+            vendor/nethack/src/vision.c::vision_recalc lines 320-335 (rlit gates
+            IN_SIGHT) and the per-cell could-see-but-unlit case.  When ``None``
+            the gate is skipped entirely (terrain-only LOS — current behaviour),
+            so existing callers (the per-step ``_apply_fov`` path, which already
+            limits reach via ``sight_radius``) are unaffected.
 
     Returns:
         bool[H, W] mask, True where player can see this turn.
@@ -239,6 +252,19 @@ def compute_fov(
     rr, cc = jnp.meshgrid(rows_all, cols_all, indexing="ij")
     chebyshev = jnp.maximum(jnp.abs(rr - pr), jnp.abs(cc - pc))
     visible = visible & (chebyshev <= sight_radius_i32)
+
+    # Dark-cell gate (vendor vision.c::vision_recalc dark-tile handling).
+    # When a per-cell ``lit_mask`` is supplied, a cell that the Bresenham rays
+    # reached is only actually SEEN if it is LIT or sits within the hero's own
+    # light radius (Chebyshev distance <= 1).  A far DARK corridor / dark-room
+    # cell on a line of sight through a doorway is NOT seen until the hero steps
+    # adjacent to it — vendor only sets IN_SIGHT for unlit cells inside the
+    # light radius, not for every couldsee() cell.  Without this gate the raycast
+    # over-reveals dark corridor tiles distal to the hero at level entry.
+    # Cite: vendor/nethack/src/vision.c:320-335 (rlit gate) + recheck_pos.
+    if lit_mask is not None:
+        within_light = chebyshev <= jnp.int32(1)
+        visible = visible & (lit_mask | within_light)
     return visible
 
 
