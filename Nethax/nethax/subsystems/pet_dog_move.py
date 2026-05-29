@@ -32,11 +32,17 @@ in execution order:
     2.  dochug() movement-phase || chain -- short-circuits down to
         ``(is_wanderer(mdat) && !rn2(4))`` (monmove.c:578).  Kitten has
         M2_WANDER so rn2(4) fires.  Again we only need the draw.
-    3.  dog_goal() with no nearby fobj and udist<=1 -- ZERO draws.
+    3.  dog_goal() with no nearby fobj -- 0..1 rn2(4) stay-in-room draw.
         See dogmove.c:476-577 -- the SQSRCHRADIUS fobj loop is empty;
-        gtyp==UNDEF takes the `follow player` branch; udist<=1 means we
-        skip the rn2(4) inside the udist>1 conditional; invent loop is
-        empty so the appr==0 DOGFOOD scan exits immediately.
+        gtyp==UNDEF takes the `follow player` branch.  Inside that branch
+        the ``if (udist > 1)`` guard (dogmove.c:564) wraps a 4-clause
+        ``||`` whose second clause is ``!rn2(4)`` (dogmove.c:565); the
+        first clause ``!IS_ROOM(levl[u.ux][u.uy].typ)`` is false when
+        the hero is in a room (validator scenario), so C short-circuit
+        advances and the rn2(4) fires.  Pet at udist <= 1 (cardinal-
+        adjacent or co-located) skips the whole block and draws nothing.
+        Diagonal-adjacent pet has udist == 2 so the draw DOES fire.
+        Invent loop is empty so the appr==0 DOGFOOD scan exits immediately.
     4.  mfndpos() -- pure filtering, ZERO draws.  Enumerates 8 neighbours
         in vendor column-major order (NW, W, SW, N, S, NE, E, SE) and
         keeps the ones that pass walkability / bounds / hero-tile gates.
@@ -337,6 +343,10 @@ def vendor_pet_dog_move(state, vendor_rng: Isaac64State, pet_slot):
 
         1 x rn2(5)          -- distfleeck bravegremlin             (monmove.c:320)
         1 x rn2(4)          -- wanderer skip-move gate             (monmove.c:578)
+        0..1 x rn2(4)       -- dog_goal stay-in-room check, only   (dogmove.c:565)
+                               when udist > 1 (hero IS in a room
+                               so first OR-clause is false and
+                               C short-circuit reaches rn2(4)).
         N x rn2(1..N)       -- scoring loop, ONE per accepted      (dogmove.c:1114)
                                neighbour where N == accepted_count
 
@@ -434,11 +444,14 @@ def _run_dog_move(state, vendor_rng, pet_slot):
     hero_r, hero_c = ppos[0], ppos[1]
 
     # ------------------------------------------------------------------
-    # Step 1: distfleeck -- ALWAYS draws rn2(5) into bravegremlin.
-    # The value is discarded; only the stream-advance matters for parity.
-    # Cite: vendor/nle/src/monmove.c line 320.
+    # Step 1: distfleeck -- rn2(5) for bravegremlin is now emitted by the
+    # per-fmon scan body in ``monsters_step_all`` (gated on valid & alive),
+    # so EVERY fmon entry advances the vendor_rng stream once per turn —
+    # not just the pet.  Emitting it here would double-draw for the pet
+    # path.
+    # Cite: vendor/nle/src/monmove.c lines 315-320 (distfleeck bravegremlin);
+    #       Nethax/nethax/subsystems/monster_ai.py::monsters_step_all _body.
     # ------------------------------------------------------------------
-    vendor_rng, _bravegremlin = rn2_jax(vendor_rng, jnp.int64(5))
 
     # ------------------------------------------------------------------
     # Step 2: wanderer skip-move gate -- rn2(4).
@@ -452,15 +465,48 @@ def _run_dog_move(state, vendor_rng, pet_slot):
     vendor_rng, _wander_skip = rn2_jax(vendor_rng, jnp.int64(4))
 
     # ------------------------------------------------------------------
-    # Step 3: dog_goal -- ZERO draws for the validator scenario.
-    # With empty inventory, empty fobj list, in_masters_sight=True, and
-    # udist<=1, dog_goal returns (gx=hero_x, gy=hero_y, appr=0) without
-    # touching the RNG.  See dogmove.c:476-577.
+    # Step 3: dog_goal -- emit the udist>1 stay-in-room rn2(4) draw.
+    # With empty inventory, empty fobj list, in_masters_sight=True, the
+    # `follow player` branch (dogmove.c:557) is taken and gx=hero, gy=hero.
+    # Inside that branch the vendor checks
+    #     if (udist > 1) {
+    #         if (!IS_ROOM(levl[u.ux][u.uy].typ) || !rn2(4) || whappr
+    #             || (dog_has_minvent && rn2(edog->apport)))
+    #             appr = 1;
+    #     }
+    # Cite: vendor/nle/src/dogmove.c line 565 (stay-in-room check).
+    #
+    # For the validator scenario the hero IS in a room, so the first
+    # clause `!IS_ROOM(...)` is false and C short-circuit evaluation
+    # advances to the `!rn2(4)` clause -- consuming one ISAAC64 draw.
+    # `dog_has_minvent` is false (empty pet inventory), so the trailing
+    # `rn2(edog->apport)` is suppressed by short-circuit and draws nothing.
+    #
+    # Gate: the entire `if (udist > 1)` block is skipped when the pet is
+    # cardinally adjacent (udist == 1) or co-located (udist == 0); in
+    # those cases no draw fires.  Diagonal-adjacent pet has udist == 2
+    # (dist2 = 1+1) which IS > 1, so the draw fires for the validator
+    # kitten at (9,70) with hero at (10,71).
     # ------------------------------------------------------------------
     goal_r = hero_r
     goal_c = hero_c
     # appr = 0 is implicit in the scoring loop below (we always take the
     # j==0 reservoir-sample branch since appr*anything == 0).
+
+    udist = _dist2(pet_r, pet_c, hero_r, hero_c)
+    needs_room_check = udist > jnp.int32(1)
+
+    def _emit_room_rn2(rng):
+        # rn2(4) -- value discarded; only stream-advance matters for parity.
+        new_rng, _ = rn2_jax(rng, jnp.int64(4))
+        return new_rng
+
+    def _skip_room_rn2(rng):
+        return rng
+
+    vendor_rng = jax.lax.cond(
+        needs_room_check, _emit_room_rn2, _skip_room_rn2, vendor_rng,
+    )
 
     # ------------------------------------------------------------------
     # Step 4: mfndpos -- 8-neighbor enumeration, pure filter, ZERO draws.
