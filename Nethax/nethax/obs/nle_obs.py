@@ -984,16 +984,28 @@ def build_tty_colors(env_state) -> jnp.ndarray:
     """Terminal color grid. Shape (24, 80) int8.
 
     Layout mirrors build_tty():
-      Row 0:     message line — white (7)
+      Row 0:     message line — CLR_GRAY (7) on text, 0 on blanks
       Rows 1-21: map area — colors from build_colors(), padded to 80 cols
-      Row 22-23: status lines — white (7)
+      Row 22-23: status lines — CLR_GRAY (7) on text, 0 on blanks
+
+    NLE's tty_colors come from libtmt's virtual terminal: only cells the
+    windowport actually *wrote a glyph to* carry a color attribute; every
+    untouched (ASCII-space) cell stays color 0.  This holds uniformly across
+    the whole 24x80 grid — verified against vendor NLE (rog-hum-cha-mal seed 0,
+    reset + North steps): for every cell, ``tty_colors == 0`` iff
+    ``tty_chars == ' '`` (0x20).  We therefore build the base color grid and
+    then zero out any cell whose tty_chars byte is a space.
+
+    Cite: vendor/nle/src/nle.c::nle_vt_callback (libtmt) — color attributes
+          only set on written cells; vendor/nethack/win/tty draws toplines /
+          status lines via tty_putsym which emits color only for glyph cells.
 
     Returns:
         int8[24, 80]
     """
     tty_colors = jnp.zeros((24, 80), dtype=jnp.int8)
 
-    # Row 0: message line -> white (7)
+    # Row 0: message line -> CLR_GRAY (7) base (masked to 0 on blanks below).
     tty_colors = tty_colors.at[0, :].set(jnp.int8(7))
 
     # Rows 1-21: map colors, padded to 80 cols
@@ -1004,9 +1016,17 @@ def build_tty_colors(env_state) -> jnp.ndarray:
     )  # int8[21,80]
     tty_colors = tty_colors.at[1:22, :].set(map_colors_80)
 
-    # Rows 22-23: status lines -> white (7)
+    # Rows 22-23: status lines -> CLR_GRAY (7) base (masked to 0 on blanks).
     tty_colors = tty_colors.at[22, :].set(jnp.int8(7))
     tty_colors = tty_colors.at[23, :].set(jnp.int8(7))
+
+    # Universal blank mask: any tty cell rendered as ASCII space gets color 0,
+    # matching NLE's libtmt (unwritten cells carry no color attribute).  The
+    # map region already zeroes unexplored tiles via build_colors, but its
+    # padding column and the message / status blanks need the same treatment.
+    tty_chars = _build_tty_chars(env_state)                     # uint8[24,80]
+    is_blank = (tty_chars == jnp.uint8(ord(' ')))
+    tty_colors = jnp.where(is_blank, jnp.int8(0), tty_colors)
 
     return tty_colors
 
@@ -2124,25 +2144,20 @@ def build_message(env_state) -> jnp.ndarray:
     ).astype(jnp.uint8)                                       # uint8[256]
 
 
-def build_tty(env_state) -> dict[str, jnp.ndarray]:
-    """Render the 24x80 TTY terminal grid.
+def _build_tty_chars(env_state) -> jnp.ndarray:
+    """Render the 24x80 TTY char grid (no colors / cursor).
+
+    Shared by build_tty (which adds cursor + colors) and build_tty_colors
+    (which masks colors to 0 on blank cells).  Kept separate to avoid a
+    build_tty <-> build_tty_colors recursion.
 
     Layout:
-      Row 0:     message line (env_state.messages.message_buffer[:80])
+      Row 0:     message line (message_buffer[1:81], msg_id byte stripped)
       Rows 1-21: map area (glyphs converted to ASCII chars)
-      Row 22:    status line 1 (St/Dx/Co/In/Wi/Ch  Dlvl:n  HP  Pw  AC  XP)
-      Row 23:    status line 2 (Dlvl: n  T: n)
-
-    Colors are zeros in Wave 2 (Wave 3 implements color tables).
-    Cursor is at player position offset by +1 row (message row 0 occupies row 0).
+      Row 22-23: status lines (botl do_statusline1 / do_statusline2)
 
     Returns:
-        dict with keys:
-          tty_chars  : uint8[24, 80]
-          tty_colors : int8[24, 80]   (zeros in Wave 2)
-          tty_cursor : uint8[2]       (row, col)
-
-    JIT-compatible: all operations use jnp.where / at[].set().
+        uint8[24, 80]
     """
     # NLE's libtmt virtual terminal initialises every cell to ASCII space
     # (0x20) — see vendor/nle/src/nle.c::nle_vt_callback (TMT_MSG_UPDATE) and
@@ -2151,10 +2166,16 @@ def build_tty(env_state) -> dict[str, jnp.ndarray]:
     tty = jnp.full((24, 80), jnp.uint8(ord(' ')), dtype=jnp.uint8)
 
     # --- Row 0: message line ---
+    # message_buffer byte 0 holds the msg_id sentinel (messages.py: "Byte 0 is
+    # msg_id; bytes 1.. hold the rendered ASCII line").  NLE's tty row 0 is the
+    # raw toplines text starting at column 0, with NO leading sentinel — so we
+    # skip byte 0 and copy bytes 1..80 (same stripping build_message does).
+    # Previously we copied [:80] including the msg_id byte, which shifted the
+    # whole message one column right and left a stray glyph at tty col 0.
     # message_buffer is zero-padded after the message text; vendor outputs
     # ASCII space in the tail (terminal default), so rewrite NULs to space.
-    # Cite: TTY_LAYOUT_DIFF.md D2.
-    msg = env_state.messages.message_buffer[:80].astype(jnp.uint8)
+    # Cite: TTY_LAYOUT_DIFF.md D2; subsystems/messages.py:339-340.
+    msg = env_state.messages.message_buffer[1:81].astype(jnp.uint8)
     msg = jnp.where(msg == jnp.uint8(0), jnp.uint8(ord(' ')), msg)
     tty = tty.at[0, :].set(msg)
 
@@ -2181,6 +2202,29 @@ def build_tty(env_state) -> dict[str, jnp.ndarray]:
     row23 = _build_status_row2(env_state, blstats)
     tty = tty.at[22, :].set(row22)
     tty = tty.at[23, :].set(row23)
+    return tty
+
+
+def build_tty(env_state) -> dict[str, jnp.ndarray]:
+    """Render the 24x80 TTY terminal grid.
+
+    Layout:
+      Row 0:     message line (message_buffer[1:81], msg_id byte stripped)
+      Rows 1-21: map area (glyphs converted to ASCII chars)
+      Row 22:    status line 1 (St/Dx/Co/In/Wi/Ch  Dlvl:n  HP  Pw  AC  XP)
+      Row 23:    status line 2 (Dlvl: n  T: n)
+
+    Cursor is at player position offset by +1 row (message row 0 occupies row 0).
+
+    Returns:
+        dict with keys:
+          tty_chars  : uint8[24, 80]
+          tty_colors : int8[24, 80]
+          tty_cursor : uint8[2]       (row, col)
+
+    JIT-compatible: all operations use jnp.where / at[].set().
+    """
+    tty = _build_tty_chars(env_state)
 
     # --- Cursor: row = player_row + 1 (offset for the message line at row 0),
     # col = player_x - 1.  Vendor places the tty cursor at (player_y + 1,
