@@ -744,8 +744,15 @@ def _spawn_starting_pet(state, role: Role, vendor_rng=None):
     dummy_rng = jr.PRNGKey(0)
     hp_val = _roll_hp(dummy_rng, jnp.int32(pet_level))
 
-    # Write pet into slot 5 (first slot after the 5 wild monsters).
-    PET_SLOT = 5
+    # Pet slot = first free slot AFTER all live wild monsters, so it lands
+    # on top of the vendor fmon LIFO stack.  Vendor `makedog` runs after
+    # `mklev` (allmain.c:813-820), and each `makemon` prepends to fmon
+    # (NLE 3.x: vendor/nle/src/makemon.c — `mtmp->nmon = fmon; fmon = mtmp`),
+    # so the pet ends up at the head of the list.  We mirror that with
+    # `pet_slot = n_wild` and build `fmon_order` below.  Cite Agent F's
+    # fmon-order audit.
+    n_wild = jnp.sum(state.monster_ai.alive.astype(jnp.int32))
+    PET_SLOT = n_wild
     pm_i16 = jnp.int16(pet_pm)
     mai = state.monster_ai.replace(
         alive=state.monster_ai.alive.at[PET_SLOT].set(True),
@@ -765,6 +772,23 @@ def _spawn_starting_pet(state, role: Role, vendor_rng=None):
             _ATK_DICE_S[pet_pm]
         ),
     )
+    # Build the vendor fmon LIFO iteration order:
+    #   fmon_order[0]      = pet_slot                (newest, prepended last)
+    #   fmon_order[1..n_wild] = n_wild-1, n_wild-2, ..., 0  (wilds newest→oldest)
+    #   fmon_order[n_wild+1..]  = -1                  (empty)
+    # This is the order vendor `for (mtmp=fmon; mtmp; mtmp=mtmp->nmon)` walks.
+    from Nethax.nethax.subsystems.monster_ai import MAX_MONSTERS_PER_LEVEL as _MAX
+    k_arr = jnp.arange(_MAX, dtype=jnp.int32)
+    fmon_order = jnp.where(
+        k_arr == jnp.int32(0),
+        PET_SLOT.astype(jnp.int32),
+        jnp.where(
+            (k_arr >= jnp.int32(1)) & (k_arr <= n_wild),
+            (n_wild - k_arr).astype(jnp.int32),
+            jnp.int32(-1),
+        ),
+    )
+    mai = mai.replace(fmon_order=fmon_order)
     new_state = state.replace(monster_ai=mai)
     if vendor_rng is not None:
         return new_state, vendor_rng

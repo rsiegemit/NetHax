@@ -725,6 +725,18 @@ class MonsterAIState:
     #       vendor/nethack/src/dbridge.c::e_died lines 401-480.
     death_cause: jnp.ndarray       # [MAX_MONSTERS_PER_LEVEL]  int8 (DeathCause)
 
+    # ---- Vendor fmon-iteration order (NLE 3.x: vendor/nle/src/makemon.c
+    # mtmp->nmon = fmon; fmon = mtmp;  -- prepend, so iteration is LIFO).
+    # ``fmon_order[k]`` is the slot index of the k-th monster in vendor's
+    # for(mtmp=fmon; mtmp; mtmp=mtmp->nmon) walk (newest insertion first,
+    # oldest last); -1 marks an empty fmon position.  Required for byte-exact
+    # ISAAC64 parity: per-turn mcalcmove rn2(12) draws and per-monster dochug
+    # draws fire in this order, NOT slot index order.  The Nethax slot
+    # indexing happens to be FIFO (M0 first), the reverse of vendor.
+    # Cite: vendor/nle/src/makemon.c (prepend); allmain.c:233-234 (mcalcmove
+    # iteration).
+    fmon_order: jnp.ndarray        # [MAX_MONSTERS_PER_LEVEL]  int32
+
 
 def make_monster_ai_state() -> MonsterAIState:
     """Return a zero-initialized MonsterAIState for one level."""
@@ -790,6 +802,11 @@ def make_monster_ai_state() -> MonsterAIState:
         apparent_entry=jnp.full((n,), -1, dtype=jnp.int16),
         # Per-slot death cause; default DeathCause.DIED (0).
         death_cause=jnp.zeros(n, dtype=jnp.int8),
+        # Vendor fmon LIFO iteration order; -1 == empty.  Identity-permutation
+        # by default (matches the pre-port slot-order behaviour); rebuilt to
+        # vendor LIFO by env.py at spawn so per-turn monster-AI draws fire in
+        # vendor order under NLE_BYTEPARITY.
+        fmon_order=jnp.full((n,), -1, dtype=jnp.int32),
     )
 
 
