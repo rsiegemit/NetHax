@@ -2256,7 +2256,15 @@ def _effect_level_teleport(state: dict, rng: jax.Array) -> dict:
     branch_levels = dungeon.branch_levels  # int8 array per-branch caps
     cur_b_idx = jnp.clip(cur_b.astype(jnp.int32), 0, branch_levels.shape[0] - 1)
     max_depth = branch_levels[cur_b_idx].astype(jnp.int32)
-    max_depth = jnp.maximum(max_depth, jnp.int32(1))
+    # Vendor level_tele picks across the WHOLE dungeon, not just discovered
+    # levels.  If the branch cap hasn't been populated yet (Nethax default
+    # state has ``branch_levels`` zero-initialised), use the static dungeon
+    # depth ceiling so the rn2 pick has spread instead of collapsing to 1.
+    max_depth = jnp.where(
+        max_depth <= jnp.int32(0),
+        jnp.int32(MAX_LEVELS_PER_BRANCH),
+        max_depth,
+    )
 
     # Gehennom: clamp positive newlev to deepest - 1 unless invocation done.
     # We have no u.uevent.invoked flag in state yet, so treat as not-invoked
