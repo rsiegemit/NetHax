@@ -125,6 +125,15 @@ class MessageId(IntEnum):
     # "Aloha" (Tourist), "Velkommen" (Valkyrie), "Hello" otherwise.
     ROLE_INTRO           = 43  # allmain.c:920 per-role welcome pline()
 
+    # Moveloop preamble messages (allmain.c:53-66): emitted AFTER the welcome
+    # banner and BEFORE pickup(1), so they overwrite the welcome in NLE's
+    # message obs whenever the wallclock condition is met.  Wallclock-driven
+    # via phase_of_the_moon() / friday_13th() (hacklib.c:1098-1119) — NOT
+    # seed-driven.  Cite: vendor/nle/src/allmain.c lines 53-66.
+    MOON_FULL_LUCKY      = 56  # "You are lucky!  Full moon tonight."
+    MOON_NEW_CAREFUL     = 57  # "Be careful!  New moon tonight."
+    FRIDAY_13_WATCHOUT   = 58  # "Watch out!  Bad things can happen on Friday the 13th."
+
     # Wave: MiniHack skill-env reward messages.
     WAND_FEELING_SUBSIDES = 44  # zap.c:2188 pline_The("feeling subsides.")
                                 # WAN_ENLIGHTENMENT zap effect (zapnodir).
@@ -831,6 +840,81 @@ def emit_role_intro(
         message_history=new_history,
         history_index=new_index,
     )
+
+
+def emit_moonphase_message(state: MessageState):
+    """Emit vendor's moveloop preamble lunar / Friday-13 message, if any.
+
+    Vendor moveloop (allmain.c:53-66) runs once per game start:
+        flags.moonphase = phase_of_the_moon();
+        if FULL_MOON: You("are lucky!  Full moon tonight.");  change_luck(+1);
+        else if NEW_MOON: pline("Be careful!  New moon tonight.");
+        if friday_13th(): pline("Watch out!..."); change_luck(-1);
+
+    These plines fire AFTER the welcome banner and BEFORE pickup(1), so they
+    overwrite the welcome in NLE's message obs whenever the wallclock
+    condition triggers.  phase_of_the_moon() (hacklib.c:1098-1110) is purely
+    a function of ``localtime().tm_yday`` and ``localtime().tm_year`` —
+    NOT seed-driven — so the validator's step-0 obs depends on the calendar.
+
+    Returns
+    -------
+    (new_state, luck_delta) where luck_delta is -1 / 0 / +1 to be added
+    to ``EnvState.player_luck`` by the caller.  Friday-13 fires AFTER moon
+    in vendor, so when both apply the Friday-13 line wins the message buffer
+    but BOTH luck deltas accumulate.
+    """
+    import time as _time
+
+    lt = _time.localtime()
+    # phase_of_the_moon — hacklib.c:1098-1110.
+    diy   = lt.tm_yday - 1                 # vendor tm_yday is 0-indexed
+    goldn = (lt.tm_year - 1900) % 19 + 1
+    epact = (11 * goldn + 18) % 30
+    if (epact == 25 and goldn > 11) or epact == 24:
+        epact += 1
+    phase = ((((diy + epact) * 6) + 11) % 177 // 22) & 7  # 0..7
+
+    FULL_MOON = 4
+    NEW_MOON  = 0
+    friday13  = (lt.tm_wday == 4 and lt.tm_mday == 13)  # tm_wday: Mon=0..Sun=6
+
+    luck_delta = 0
+    text = None
+    msg_id = MessageId.ROLE_INTRO   # default sentinel — unchanged path
+
+    if phase == FULL_MOON:
+        text   = "You are lucky!  Full moon tonight."
+        msg_id = MessageId.MOON_FULL_LUCKY
+        luck_delta += 1
+    elif phase == NEW_MOON:
+        text   = "Be careful!  New moon tonight."
+        msg_id = MessageId.MOON_NEW_CAREFUL
+
+    if friday13:
+        text   = "Watch out!  Bad things can happen on Friday the 13th."
+        msg_id = MessageId.FRIDAY_13_WATCHOUT
+        luck_delta -= 1
+
+    if text is None:
+        return state, 0
+
+    arr = _np.zeros((MSG_BUF_LEN,), dtype=_np.uint8)
+    arr[0] = int(msg_id) & 0xFF
+    raw = text.encode("ascii")[: MSG_BUF_LEN - 1]
+    arr[1 : 1 + len(raw)] = list(raw)
+    new_buffer = jnp.asarray(arr, dtype=jnp.uint8)
+
+    safe_idx    = jnp.mod(state.history_index, jnp.int32(HISTORY_LEN))
+    new_history = state.message_history.at[safe_idx].set(state.message_buffer)
+    new_index   = jnp.mod(state.history_index + jnp.int32(1), jnp.int32(HISTORY_LEN))
+
+    new_state = state.replace(
+        message_buffer=new_buffer,
+        message_history=new_history,
+        history_index=new_index,
+    )
+    return new_state, luck_delta
 
 
 # ---------------------------------------------------------------------------

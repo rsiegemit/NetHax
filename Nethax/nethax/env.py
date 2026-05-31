@@ -318,7 +318,10 @@ class NethaxEnv:
         #   Hello()  plname           buf       race.adj  role.name
         # Cite: vendor/nethack/src/allmain.c::welcome lines 679-691;
         #       vendor/nle/nle/env/base.py:306 (plname = "Agent").
-        from Nethax.nethax.subsystems.messages import emit_role_intro as _emit_role_intro
+        from Nethax.nethax.subsystems.messages import (
+            emit_role_intro     as _emit_role_intro,
+            emit_moonphase_message as _emit_moonphase_message,
+        )
         state = state.replace(
             messages=_emit_role_intro(
                 state.messages,
@@ -327,6 +330,25 @@ class NethaxEnv:
                 alignment=int(alignment),
             ),
         )
+
+        # Vendor moveloop preamble (allmain.c:53-66):
+        #     flags.moonphase = phase_of_the_moon();
+        #     if FULL_MOON:  pline(...); change_luck(+1);
+        #     else if NEW_MOON: pline(...);
+        #     if friday_13th(): pline(...); change_luck(-1);
+        # Fires AFTER the welcome banner, BEFORE pickup(1) — so the lunar /
+        # Friday-13 line overwrites the welcome in NLE's message obs whenever
+        # the wallclock condition triggers.  phase_of_the_moon() is
+        # wallclock-driven (hacklib.c:1098-1110), not seed-driven; without
+        # this port, Nethax's step-0 obs diverges on full / new moon /
+        # Friday-13 days.
+        new_msgs, _luck_delta = _emit_moonphase_message(state.messages)
+        state = state.replace(messages=new_msgs)
+        if _luck_delta != 0:
+            state = state.replace(
+                player_luck=(state.player_luck.astype(jnp.int8)
+                             + jnp.int8(_luck_delta)),
+            )
 
         # Vendor mklev() begins by reseeding BOTH streams (vendor
         # mklev.c:996-997)::
