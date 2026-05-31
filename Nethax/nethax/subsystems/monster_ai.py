@@ -6087,14 +6087,16 @@ def monsters_step_all(state, rng: jax.Array) -> object:
             may_act = valid & alive_s & (mp_pre >= NS)
 
             # ---- distfleeck rn2(5) per fmon entry (vendor monmove.c:315-320) ----
-            # Vendor's dochug prelude unconditionally calls distfleeck, which
-            # draws rn2(5) into the `bravegremlin` local BEFORE any sleeping /
-            # awake gating.  Emit one rn2(5) per alive fmon entry so the
-            # vendor_rng stream advances even when may_act is False (asleep /
-            # no movement_points).  Skip empty fmon slots (fmon_order[k] == -1).
+            # distfleeck is the first call inside dochug (mon.c).  dochug
+            # only runs when movemon dispatches it, gated on mtmp->movement
+            # >= NORMAL_SPEED (allmain.c:108-110).  So distfleeck only fires
+            # when may_act is True (mp >= NS).  On step 1, no monster has
+            # accumulated MP (mtmp->movement starts at 0 — calloc default;
+            # only youmonst gets NORMAL_SPEED at allmain.c:85), so vendor
+            # emits ZERO distfleeck draws on step 1.
             # Cite: vendor/nle/src/monmove.c::distfleeck lines 315-320
-            #       (bravegremlin = rn2(5)).
-            need_distfleeck = valid & alive_s
+            #       (bravegremlin = rn2(5)); vendor/nle/src/mon.c::dochug entry.
+            need_distfleeck = may_act
 
             def _draw_distfleeck(vr):
                 return _vendor_rng_mod.rn2_jax(vr, jnp.int32(5))

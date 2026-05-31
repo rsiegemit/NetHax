@@ -2189,7 +2189,13 @@ def _populate_oroom_single(
         peaceful=mai.peaceful.at[slot].set(peace_bit),
         asleep=mai.asleep.at[slot].set(jnp.bool_(True)),
         sleep_timer=mai.sleep_timer.at[slot].set(jnp.int8(127)),
-        movement_points=mai.movement_points.at[slot].set(jnp.int16(12)),
+        # Vendor mtmp->movement starts at 0 (struct calloc default — see
+        # vendor/nle/src/makemon.c: no explicit init).  Only youmonst gets
+        # movement = NORMAL_SPEED at allmain.c:85.  Initializing to 12 was
+        # making monsters act on step 1 (dochug fires when mp >= NS) which
+        # spawned spurious distfleeck rn2(5) draws and misaligned the
+        # ISAAC stream.  Cite: vendor/nle/src/allmain.c:85.
+        movement_points=mai.movement_points.at[slot].set(jnp.int16(0)),
         inv_category=mai.inv_category.at[slot].set(kit_cats),
         inv_type_id=mai.inv_type_id.at[slot].set(kit_tids),
         inv_quantity=mai.inv_quantity.at[slot].set(kit_qtys),
@@ -2317,7 +2323,9 @@ def spawn_oroom_monster_scanbody(
                 peaceful=mai_g.peaceful.at[slot_g].set(peace_bit),
                 asleep=mai_g.asleep.at[slot_g].set(jnp.bool_(True)),
                 sleep_timer=mai_g.sleep_timer.at[slot_g].set(jnp.int8(127)),
-                movement_points=mai_g.movement_points.at[slot_g].set(jnp.int16(12)),
+                # Vendor: mtmp->movement starts at 0; see allmain.c:85 (only
+                # youmonst gets NORMAL_SPEED).
+                movement_points=mai_g.movement_points.at[slot_g].set(jnp.int16(0)),
                 inv_category=mai_g.inv_category.at[slot_g].set(_KIT_CATS[kit_id]),
                 inv_type_id=mai_g.inv_type_id.at[slot_g].set(_KIT_TIDS[kit_id]),
                 inv_quantity=mai_g.inv_quantity.at[slot_g].set(_KIT_QTYS[kit_id]),
@@ -2518,9 +2526,12 @@ def populate_level_with_monsters(
         new_atk_s     = mai_carry.attack_dice_sides.at[i].set(_ATK_DICE_S[type_id])
         new_strategy  = mai_carry.mstrategy.at[i].set(jnp.int8(0))  # NONE until awakened
         new_entry     = mai_carry.entry_idx.at[i].set(type_id.astype(jnp.int16))
-        # Vendor makemon.c sets mtmp->movement = NORMAL_SPEED so a freshly-
-        # spawned monster can act on its very next tick.  Mirror that here.
-        new_mp        = mai_carry.movement_points.at[i].set(jnp.int16(12))
+        # Vendor mtmp->movement starts at 0 (calloc default — makemon.c has
+        # no explicit movement init; only youmonst gets NORMAL_SPEED at
+        # allmain.c:85).  Starting at NORMAL_SPEED was making monsters dochug
+        # on step 1, emitting spurious distfleeck rn2(5) draws and
+        # misaligning the ISAAC stream.
+        new_mp        = mai_carry.movement_points.at[i].set(jnp.int16(0))
         # vendor mklev.c::mkmon + makemon.c::makemon set mtmp->msleeping=1
         # on every level-gen monster (MM_ASLEEP flag).  Awakened via vendor
         # disturb() on LoS/sound checks.  Without this, level-1 monsters are
@@ -2739,7 +2750,8 @@ def makemon(state, rng: jax.Array, entry_idx: jnp.ndarray,
             jnp.take(_MONSTER_UNDEAD, eidx, axis=0).astype(jnp.bool_))
         new_nonliv = mai_in.nonliving.at[slot].set(
             jnp.take(_MONSTER_NONLIVING, eidx, axis=0).astype(jnp.bool_))
-        new_mp     = mai_in.movement_points.at[slot].set(jnp.int16(12))
+        # Vendor mtmp->movement starts at 0 — see allmain.c:85.
+        new_mp     = mai_in.movement_points.at[slot].set(jnp.int16(0))
         # Mongets inventory kit.
         new_ic = mai_in.inv_category.at[slot].set(kit_cats)
         new_it = mai_in.inv_type_id.at[slot].set(kit_tids)
