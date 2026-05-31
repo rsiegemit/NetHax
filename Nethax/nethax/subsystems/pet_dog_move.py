@@ -120,6 +120,15 @@ _TILE_CLOSED_DOOR: int = 4   # TileType.CLOSED_DOOR (treated as obstacle when
 
 _NORMAL_SPEED: int = 12
 
+# dog_goal SQSRCHRADIUS — pet scans a square bounding box of half-width 5
+# (vendor dogmove.c:503 ``#define SQSRCHRADIUS 5``) for nearby objects.
+_SQSRCHRADIUS: int = 5
+
+# Per-tile ground stack depth.  Mirrors
+# ``Nethax.nethax.subsystems.inventory.MAX_GROUND_STACK`` (=8); duplicated
+# here so this module does not import inventory (and risk a cycle).
+_MAX_GROUND_STACK: int = 8
+
 # Vendor mfndpos enumeration order:
 #     for (nx = x-1; nx <= x+1; nx++)
 #       for (ny = y-1; ny <= y+1; ny++)
@@ -196,6 +205,108 @@ def _current_level_terrain(state):
     b = state.dungeon.current_branch
     lv = state.dungeon.current_level - jnp.int8(1)
     return state.terrain[b, lv]
+
+
+# ---------------------------------------------------------------------------
+# dog_goal SQSRCHRADIUS fobj scan -- one rn2(100) per in-range object.
+# ---------------------------------------------------------------------------
+
+def _emit_dog_goal_fobj_scan(state, vendor_rng, pet_r, pet_c):
+    """Emit one ``rn2(100)`` per ground object within Chebyshev radius 5 of the pet.
+
+    Reproduces the ISAAC64 draws consumed by the vendor ``dog_goal`` fobj scan:
+
+        for (obj = fobj; obj; obj = obj->nobj) {
+            nx = obj->ox; ny = obj->oy;
+            if (nx in [min_x..max_x] && ny in [min_y..max_y]) {
+                otyp = dogfood(mtmp, obj);
+                ...
+            }
+        }
+
+    Inside ``dogfood`` (vendor dog.c:744) the first check is:
+
+        if (is_quest_artifact(obj) || obj_resists(obj, 0, 95))
+            return obj->cursed ? TABU : APPORT;
+
+    ``is_quest_artifact`` is a pure tag check.  When it is false (the common
+    case, and ALWAYS true on Dlvl 1 of the validator scenario where no quest
+    artifacts can spawn), ``obj_resists(obj, 0, 95)`` fires ``rn2(100)``
+    (vendor/nle/src/zap.c:1191 ``int chance = rn2(100);``).  So every
+    in-range non-quest object contributes EXACTLY ONE ``rn2(100)`` draw to
+    the ISAAC64 stream, regardless of subsequent dogfood logic.
+
+    For byte parity we therefore need to:
+
+        1. Find every non-empty ground-stack slot whose tile sits inside
+           the pet's [pet_r ± 5, pet_c ± 5] Chebyshev box.
+        2. Emit one ``rn2(100)`` per such slot, in any fixed order (the
+           draws are identical so the total count is what advances the
+           stream to vendor parity).
+
+    We iterate the bounding box and ground-stack depth with a JIT-safe
+    ``lax.fori_loop`` of fixed extent (11 * 11 * MAX_GROUND_STACK = 968
+    iterations) and use ``lax.cond`` to gate the draw on
+    (in-bounds & non-empty-slot).  Order is row-major (dr outer, dc inner,
+    stack innermost) — irrelevant for parity since each draw has the same
+    modulus.
+
+    Quest-artifact filter: deliberately omitted.  The validator scenario
+    cannot reach Dlvl 1 with a quest artifact on the floor (those only
+    spawn deep in their owning branch), and no Nethax state field flags
+    a ground item as a quest artifact at present.  When per-object quest
+    filtering is needed, gate the ``do_draw`` branch on a future
+    ``is_quest_artifact`` predicate.
+
+    Citations
+    ---------
+    vendor/nle/src/dogmove.c  lines 502-553  (SQSRCHRADIUS fobj scan loop)
+    vendor/nle/src/dog.c      line  744      (``dogfood`` -> ``obj_resists``)
+    vendor/nle/src/zap.c      line  1191     (``obj_resists`` -> ``rn2(100)``)
+    """
+    pet_r = pet_r.astype(jnp.int32)
+    pet_c = pet_c.astype(jnp.int32)
+
+    b  = state.dungeon.current_branch.astype(jnp.int32)
+    lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+
+    # category[branch, level, :, :, :] -> [H, W, MAX_GROUND_STACK]; 0 = empty.
+    cat_slab = state.ground_items.category[b, lv].astype(jnp.int32)
+
+    side = 2 * _SQSRCHRADIUS + 1   # 11
+    box_cells = side * side        # 121
+    total_iters = box_cells * _MAX_GROUND_STACK  # 968
+
+    def body(i, rng):
+        # Decode (dr, dc, s) from the flat index.
+        ds = i % jnp.int32(_MAX_GROUND_STACK)
+        cell = i // jnp.int32(_MAX_GROUND_STACK)
+        dc = (cell % jnp.int32(side)) - jnp.int32(_SQSRCHRADIUS)
+        dr = (cell // jnp.int32(side)) - jnp.int32(_SQSRCHRADIUS)
+        r = pet_r + dr
+        c = pet_c + dc
+
+        in_bounds = (
+            (r >= jnp.int32(0))
+            & (r < jnp.int32(_MAP_H))
+            & (c >= jnp.int32(0))
+            & (c < jnp.int32(_MAP_W))
+        )
+        safe_r = jnp.clip(r, 0, _MAP_H - 1)
+        safe_c = jnp.clip(c, 0, _MAP_W - 1)
+        cat = cat_slab[safe_r, safe_c, ds]
+        has_obj = in_bounds & (cat != jnp.int32(0))
+
+        def do_draw(carry_rng):
+            new_rng, _ = rn2_jax(carry_rng, jnp.int64(100))
+            return new_rng
+
+        def skip_draw(carry_rng):
+            return carry_rng
+
+        return jax.lax.cond(has_obj, do_draw, skip_draw, rng)
+
+    return jax.lax.fori_loop(0, total_iters, body, vendor_rng)
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +453,12 @@ def vendor_pet_dog_move(state, vendor_rng: Isaac64State, pet_slot):
     Draw budget (in order):
 
         1 x rn2(4)          -- wanderer skip-move gate             (monmove.c:578)
+        K x rn2(100)        -- dog_goal SQSRCHRADIUS=5 fobj scan,  (dogmove.c:502-553,
+                               ONE per in-range non-quest object   dog.c:744,
+                               (K = count of ground-stack slots    zap.c:1191)
+                               with category != 0 whose tile sits
+                               in the pet's [pet ± 5] Chebyshev
+                               bounding box).
         0..1 x rn2(4)       -- dog_goal stay-in-room check, only   (dogmove.c:565)
                                when udist > 1 (hero IS in a room
                                so first OR-clause is false and
@@ -466,6 +583,24 @@ def _run_dog_move(state, vendor_rng, pet_slot):
     # Cite: vendor/nle/src/monmove.c line 578.
     # ------------------------------------------------------------------
     vendor_rng, _wander_skip = rn2_jax(vendor_rng, jnp.int64(4))
+
+    # ------------------------------------------------------------------
+    # Step 2b: dog_goal SQSRCHRADIUS=5 fobj scan -- one rn2(100) per object.
+    # Vendor dog_goal (dogmove.c:502-553) iterates the global ``fobj`` list,
+    # tests each object's tile against the [pet ± SQSRCHRADIUS] bounding
+    # box, and calls ``dogfood(mtmp, obj)`` for each in-range hit.  The
+    # first line of ``dogfood`` (dog.c:744) is
+    #     if (is_quest_artifact(obj) || obj_resists(obj, 0, 95)) ...
+    # and ``obj_resists`` draws ``rn2(100)`` at zap.c:1191 once per call
+    # when the object is not a quest artifact.  For the validator scenario
+    # (Dlvl 1, no quest items can spawn) every in-range object therefore
+    # contributes exactly one ``rn2(100)`` to the ISAAC64 stream.
+    #
+    # Cite: vendor/nle/src/dogmove.c lines 502-553 (SQSRCHRADIUS fobj scan);
+    #       vendor/nle/src/dog.c     line  744      (dogfood obj_resists call);
+    #       vendor/nle/src/zap.c     line  1191     (obj_resists rn2(100)).
+    # ------------------------------------------------------------------
+    vendor_rng = _emit_dog_goal_fobj_scan(state, vendor_rng, pet_r, pet_c)
 
     # ------------------------------------------------------------------
     # Step 3: dog_goal -- emit the udist>1 stay-in-room rn2(4) draw.
