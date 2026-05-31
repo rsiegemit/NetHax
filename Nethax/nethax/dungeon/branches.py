@@ -2767,6 +2767,124 @@ def apply_branch_graph_to_dungeon(
 
 
 # ---------------------------------------------------------------------------
+# place_level recursion (faithful port of vendor dungeon.c::place_level)
+# ---------------------------------------------------------------------------
+
+def _place_dungeon_levels(vendor_rng, num_dunlevs, protos):
+    """Faithful Python port of ``vendor/nle/src/dungeon.c::place_level``.
+
+    Replays ``rn2(npossible)`` draws with backtracking semantics identical to
+    the vendor C code (lines 637-679).  Backtracking matters because for some
+    seeds the natural pick collides with a CHAINLEVEL constraint that requires
+    a sibling proto's slot — vendor falls back and re-picks until placement
+    succeeds.
+
+    Args:
+        vendor_rng: Isaac64State.
+        num_dunlevs: int — ``dungeons[dgn].num_dunlevs`` for this dungeon
+            (sets the legal range [1, num_dunlevs] for slots).
+        protos: list of dicts with keys::
+            name (str, debug only)
+            base (int)          — vendor lev.base (negative = from end)
+            rand (int)          — vendor lev.rand (-1 = to end; 0 = single)
+            chain_idx (int|None)— index into ``protos`` of a CHAINLEVEL parent
+            created (bool)      — False if init_level gate dropped this proto
+                                  (then no place_level draw fires; slot=None)
+
+    Returns:
+        ``(new_vendor_rng, slots)`` where ``slots[i]`` is the picked slot for
+        ``protos[i]`` or ``None`` if not created.
+    """
+    from Nethax.nethax.vendor_rng import rn2 as _rn2
+
+    n = len(protos)
+    slots: list[int | None] = [None] * n
+
+    def _level_range(idx):
+        """Port of vendor ``level_range`` (dungeon.c:350-382).
+
+        Returns ``(start, count)`` for proto ``idx`` based on currently
+        committed slots.
+        """
+        p = protos[idx]
+        base = p["base"]
+        randc = p["rand"]
+        chain = p["chain_idx"]
+        if chain is not None:
+            base = base + slots[chain]
+        else:
+            if base < 0:
+                base = num_dunlevs + base + 1
+        # base must be in [1, num_dunlevs]
+        if randc == -1:
+            count = num_dunlevs - base + 1
+        elif randc:
+            count = num_dunlevs - base + 1 if (base + randc - 1) > num_dunlevs else randc
+        else:
+            count = 1
+        return base, count
+
+    def _possible_places(idx):
+        """Port of vendor ``possible_places`` (dungeon.c:573-602).
+
+        Returns boolean map array (length num_dunlevs+1, indices 1..num_dunlevs
+        valid) of slots available for proto ``idx``.
+        """
+        m = [False] * (num_dunlevs + 2)
+        start, count = _level_range(idx)
+        for s in range(start, start + count):
+            if 1 <= s <= num_dunlevs:
+                m[s] = True
+        # Mark off slots taken by prior placements in this dungeon
+        # (vendor: ``for (i = pd->start; i < idx; i++)``).
+        for j in range(idx):
+            if slots[j] is not None and m[slots[j]]:
+                m[slots[j]] = False
+        return m
+
+    def _pick_nth(map_arr, nth):
+        """Port of vendor ``pick_level`` (dungeon.c:606-616).
+
+        Return the ``nth`` (0-based) TRUE entry in ``map_arr``.
+        """
+        for i in range(1, num_dunlevs + 1):
+            if map_arr[i]:
+                if nth == 0:
+                    return i
+                nth -= 1
+        # vendor panics here; we return 0 to match (should never hit in practice).
+        return 0
+
+    def _place(idx, vrng):
+        """Recursive port of ``place_level`` (dungeon.c:637-679).
+
+        Returns ``(new_vrng, success)``.
+        """
+        if idx == n:
+            return vrng, True
+        if not protos[idx]["created"]:
+            return _place(idx + 1, vrng)
+        m = _possible_places(idx)
+        npossible = sum(1 for s in range(1, num_dunlevs + 1) if m[s])
+        while npossible > 0:
+            vrng, pick = _rn2(vrng, npossible)
+            chosen = _pick_nth(m, int(pick))
+            slots[idx] = chosen
+            vrng, ok = _place(idx + 1, vrng)
+            if ok:
+                return vrng, True
+            # this choice didn't work — drop it and retry
+            m[chosen] = False
+            slots[idx] = None
+            npossible -= 1
+        return vrng, False
+
+    vendor_rng, ok = _place(0, vendor_rng)
+    # Vendor panics on failure; if we hit it the data is malformed.
+    return vendor_rng, slots
+
+
+# ---------------------------------------------------------------------------
 # init_dungeons fixed ISAAC64 pre-draws
 # ---------------------------------------------------------------------------
 
@@ -2852,14 +2970,16 @@ def consume_init_dungeons_draws(vendor_rng):
     drawn["gate_bigrm"]  = gate_bigrm
     drawn["gate_medusa"] = gate_medusa
 
-    # place_level rn2(npossible) — dungeon.c:661 — one per CREATED level
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 4)             # rogue  (15,4) → npossible=4
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 5)             # oracle (5,5)  → npossible=5
-    if bigrm_placed:
-        vendor_rng, _ = _vrng.rn2(vendor_rng, 3)         # bigrm  (10,3) → npossible=3
-    if medusa_placed:
-        vendor_rng, _ = _vrng.rn2(vendor_rng, 4)         # medusa (-5,4) → npossible=4
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # castle (-1,0) → npossible=1
+    # place_level recursion — dungeon.c:637-679.  See ``_place_dungeon_levels``.
+    dod_num_dunlevs = int(dod_levels) + 25
+    dod_protos = [
+        {"name": "rogue",  "base": 15, "rand": 4, "chain_idx": None, "created": True},
+        {"name": "oracle", "base": 5,  "rand": 5, "chain_idx": None, "created": True},
+        {"name": "bigrm",  "base": 10, "rand": 3, "chain_idx": None, "created": bigrm_placed},
+        {"name": "medusa", "base": -5, "rand": 4, "chain_idx": None, "created": medusa_placed},
+        {"name": "castle", "base": -1, "rand": 0, "chain_idx": None, "created": True},
+    ]
+    vendor_rng, _ = _place_dungeon_levels(vendor_rng, dod_num_dunlevs, dod_protos)
 
     # =======================================================================
     # i = 1 : "Gehennom" (20, 5)
@@ -2888,56 +3008,28 @@ def consume_init_dungeons_draws(vendor_rng):
     vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 fakewiz1
     vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 fakewiz2
 
-    # place_level slot picks — dungeon.c:661.  npossible is dynamic:
-    # ``possible_places`` (dungeon.c:574) returns the level-range count
-    # MINUS slots already taken by prior placements in this dungeon.
-    # We simulate the pick sequence so npossible reflects collisions.
-    # Cite: vendor/nle/src/dungeon.c::possible_places (line 574),
-    #       pick_level (line 606), place_level (line 640).
+    # place_level recursion — dungeon.c:637-679.
+    # Gehennom has CHAINLEVEL entries (wizard2/wizard3 chain to wizard1), which
+    # can force backtracking when wizard1's chosen slot leaves no room for the
+    # chained slots.  The recursive helper handles this correctly.
     geh_num_dunlevs = int(geh_levels) + 20
-    geh_placed_slots: set[int] = set()
-
-    def _geh_place(base, rand, chain_slot=None):
-        """Apply one place_level draw and record the slot chosen.
-
-        chain_slot, if set, is the slot of a CHAINLEVEL parent — the new
-        slot is parent_slot + base (CHAINLEVEL only has rand=0 here so
-        npossible always reduces to 1 after subtracting the parent).
-        """
-        nonlocal vendor_rng
-        if chain_slot is not None:
-            # CHAINLEVEL: range is [parent+base, parent+base+rand]
-            start = chain_slot + base
-        elif base < 0:
-            start = geh_num_dunlevs + base + 1
-        else:
-            start = base
-        # span = rand or 1 (RNDLEVEL with rand=-1 means "to end")
-        if rand == -1:
-            span = geh_num_dunlevs - start + 1
-        elif rand:
-            span = min(rand, geh_num_dunlevs - start + 1)
-        else:
-            span = 1
-        # subtract slots already placed within [start, start+span)
-        avail = [s for s in range(start, start + span) if s not in geh_placed_slots]
-        npossible = len(avail)
-        vendor_rng, pick = _vrng.rn2(vendor_rng, max(npossible, 1))
-        chosen = avail[int(pick)] if avail else start
-        geh_placed_slots.add(chosen)
-        return chosen
-
-    valley_slot   = _geh_place(1, 0)            # valley   (1, 0)
-    sanctum_slot  = _geh_place(-1, 0)           # sanctum  (-1, 0)
-    juiblex_slot  = _geh_place(4, 4)            # juiblex  (4, 4)
-    baalz_slot    = _geh_place(6, 4)            # baalz    (6, 4)
-    asmodeus_slot = _geh_place(2, 6)            # asmodeus (2, 6)
-    wizard1_slot  = _geh_place(11, 6)           # wizard1  (11, 6)
-    wizard2_slot  = _geh_place(1, 0, chain_slot=wizard1_slot)  # wizard2 +1
-    wizard3_slot  = _geh_place(2, 0, chain_slot=wizard1_slot)  # wizard3 +2
-    orcus_slot    = _geh_place(10, 6)           # orcus    (10, 6)
-    fakewiz1_slot = _geh_place(-6, 4)           # fakewiz1 (-6, 4)
-    fakewiz2_slot = _geh_place(-6, 4)           # fakewiz2 (-6, 4)
+    # local proto indices: 0=valley, 1=sanctum, 2=juiblex, 3=baalz, 4=asmodeus,
+    # 5=wizard1, 6=wizard2 (CHAIN→5), 7=wizard3 (CHAIN→5), 8=orcus,
+    # 9=fakewiz1, 10=fakewiz2.
+    geh_protos = [
+        {"name": "valley",   "base": 1,   "rand": 0, "chain_idx": None, "created": True},
+        {"name": "sanctum",  "base": -1,  "rand": 0, "chain_idx": None, "created": True},
+        {"name": "juiblex",  "base": 4,   "rand": 4, "chain_idx": None, "created": True},
+        {"name": "baalz",    "base": 6,   "rand": 4, "chain_idx": None, "created": True},
+        {"name": "asmodeus", "base": 2,   "rand": 6, "chain_idx": None, "created": True},
+        {"name": "wizard1",  "base": 11,  "rand": 6, "chain_idx": None, "created": True},
+        {"name": "wizard2",  "base": 1,   "rand": 0, "chain_idx": 5,    "created": True},
+        {"name": "wizard3",  "base": 2,   "rand": 0, "chain_idx": 5,    "created": True},
+        {"name": "orcus",    "base": 10,  "rand": 6, "chain_idx": None, "created": True},
+        {"name": "fakewiz1", "base": -6,  "rand": 4, "chain_idx": None, "created": True},
+        {"name": "fakewiz2", "base": -6,  "rand": 4, "chain_idx": None, "created": True},
+    ]
+    vendor_rng, _ = _place_dungeon_levels(vendor_rng, geh_num_dunlevs, geh_protos)
 
     # =======================================================================
     # i = 2 : "The Gnomish Mines" (8, 2)
@@ -2957,10 +3049,12 @@ def consume_init_dungeons_draws(vendor_rng):
     drawn["gate_minetn"] = gate_minetn
     drawn["gate_minend"] = gate_minend
 
-    if minetn_placed:
-        vendor_rng, _ = _vrng.rn2(vendor_rng, 2)          # dungeon.c:661 minetn (3,2) npossible=2
-    if minend_placed:
-        vendor_rng, _ = _vrng.rn2(vendor_rng, 1)          # dungeon.c:661 minend (-1,0) npossible=1
+    mines_num_dunlevs = int(mines_levels) + 8
+    mines_protos = [
+        {"name": "minetn", "base": 3,  "rand": 2, "chain_idx": None, "created": minetn_placed},
+        {"name": "minend", "base": -1, "rand": 0, "chain_idx": None, "created": minend_placed},
+    ]
+    vendor_rng, _ = _place_dungeon_levels(vendor_rng, mines_num_dunlevs, mines_protos)
 
     # =======================================================================
     # i = 3 : "The Quest" (5, 2)
@@ -2977,9 +3071,13 @@ def consume_init_dungeons_draws(vendor_rng):
     vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 x-loca
     vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 x-goal
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 x-strt (1,1) npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 x-loca (3,1) npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 x-goal (-1,0) npossible=1
+    quest_num_dunlevs = int(quest_levels) + 5
+    quest_protos = [
+        {"name": "x-strt", "base": 1,  "rand": 1, "chain_idx": None, "created": True},
+        {"name": "x-loca", "base": 3,  "rand": 1, "chain_idx": None, "created": True},
+        {"name": "x-goal", "base": -1, "rand": 0, "chain_idx": None, "created": True},
+    ]
+    vendor_rng, _ = _place_dungeon_levels(vendor_rng, quest_num_dunlevs, quest_protos)
 
     # =======================================================================
     # i = 4 : "Sokoban" (4, 0)
@@ -3003,14 +3101,14 @@ def consume_init_dungeons_draws(vendor_rng):
     drawn["gate_soko3"] = gate_soko3
     drawn["gate_soko4"] = gate_soko4
 
-    if soko1_placed:
-        vendor_rng, _ = _vrng.rn2(vendor_rng, 1)         # dungeon.c:661 soko1 npossible=1
-    if soko2_placed:
-        vendor_rng, _ = _vrng.rn2(vendor_rng, 1)         # dungeon.c:661 soko2 npossible=1
-    if soko3_placed:
-        vendor_rng, _ = _vrng.rn2(vendor_rng, 1)         # dungeon.c:661 soko3 npossible=1
-    if soko4_placed:
-        vendor_rng, _ = _vrng.rn2(vendor_rng, 1)         # dungeon.c:661 soko4 npossible=1
+    soko_num_dunlevs = 4  # Sokoban (4, 0) — lev.rand=0 → fixed
+    soko_protos = [
+        {"name": "soko1", "base": 1, "rand": 0, "chain_idx": None, "created": soko1_placed},
+        {"name": "soko2", "base": 2, "rand": 0, "chain_idx": None, "created": soko2_placed},
+        {"name": "soko3", "base": 3, "rand": 0, "chain_idx": None, "created": soko3_placed},
+        {"name": "soko4", "base": 4, "rand": 0, "chain_idx": None, "created": soko4_placed},
+    ]
+    vendor_rng, _ = _place_dungeon_levels(vendor_rng, soko_num_dunlevs, soko_protos)
 
     # =======================================================================
     # i = 5 : "Fort Ludios" (1, 0)
@@ -3026,7 +3124,10 @@ def consume_init_dungeons_draws(vendor_rng):
 
     vendor_rng, _ = _vrng.rn2(vendor_rng, 4)         # dungeon.c:398 parent_dlevel num=4
     vendor_rng, _ = _vrng.rn2(vendor_rng, 100)       # dungeon.c:548 knox
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)         # dungeon.c:661 knox npossible=1
+    knox_protos = [
+        {"name": "knox", "base": -1, "rand": 0, "chain_idx": None, "created": True},
+    ]
+    vendor_rng, _ = _place_dungeon_levels(vendor_rng, 1, knox_protos)
 
     # =======================================================================
     # i = 6 : "Vlad's Tower" (3, 0)
@@ -3040,9 +3141,12 @@ def consume_init_dungeons_draws(vendor_rng):
     vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 tower2
     vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 tower3
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 tower1 npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 tower2 npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 tower3 npossible=1
+    vlad_protos = [
+        {"name": "tower1", "base": 1, "rand": 0, "chain_idx": None, "created": True},
+        {"name": "tower2", "base": 2, "rand": 0, "chain_idx": None, "created": True},
+        {"name": "tower3", "base": 3, "rand": 0, "chain_idx": None, "created": True},
+    ]
+    vendor_rng, _ = _place_dungeon_levels(vendor_rng, 3, vlad_protos)
 
     # =======================================================================
     # i = 7 : "The Elemental Planes" (6, 0)
@@ -3059,12 +3163,15 @@ def consume_init_dungeons_draws(vendor_rng):
     vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 earth
     vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 dummy
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 astral npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 water  npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 fire   npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 air    npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 earth  npossible=1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:661 dummy  npossible=1
+    planes_protos = [
+        {"name": "astral", "base": 1, "rand": 0, "chain_idx": None, "created": True},
+        {"name": "water",  "base": 2, "rand": 0, "chain_idx": None, "created": True},
+        {"name": "fire",   "base": 3, "rand": 0, "chain_idx": None, "created": True},
+        {"name": "air",    "base": 4, "rand": 0, "chain_idx": None, "created": True},
+        {"name": "earth",  "base": 5, "rand": 0, "chain_idx": None, "created": True},
+        {"name": "dummy",  "base": 6, "rand": 0, "chain_idx": None, "created": True},
+    ]
+    vendor_rng, _ = _place_dungeon_levels(vendor_rng, 6, planes_protos)
 
     # =======================================================================
     # After the per-dungeon loop: tune string — dungeon.c:917-918
