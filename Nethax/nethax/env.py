@@ -990,7 +990,21 @@ def _step_impl(state, action, rng):
         ns = _dig_tick(ns, rng_act)
 
         # 2. Monster turn — allmain.c line 212 (movemon).
-        ns = _monster_ai_step(ns, rng_monsters)
+        # Vendor moveloop only enters the per-turn block (movemon + mcalcmove
+        # + maintenance) when "actual time passed" — i.e. the player's action
+        # consumed a turn.  A wall-bump returns early from domove without
+        # decrementing ``youmonst.movement``, so the do-while at allmain.c:103
+        # short-circuits and monsters do not act.  Gate the call on
+        # ``action_consumed_turn`` so wall-bump turns leave monsters AND the
+        # vendor_rng stream untouched.  Without this gate Nethax monsters
+        # drift relative to vendor on every non-time-consuming step.
+        # Cite: vendor/nle/src/allmain.c lines 88-112 (do-while turn loop).
+        ns = jax.lax.cond(
+            ns.action_consumed_turn,
+            lambda s: _monster_ai_step(s, rng_monsters),
+            lambda s: s,
+            ns,
+        )
 
         # 2b. Per-turn region tick — vendor/nethack/src/region.c::run_regions
         #     (line 414).  Ages every active region by 1 and applies
