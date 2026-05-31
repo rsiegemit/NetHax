@@ -351,8 +351,22 @@ def _apply_fov(state):
     )
     opaque_overlay = boulder_plane | door_block
 
+    # Per-cell ``lit_mask`` for the dark-cell gate (fov.py:265-267).  Without
+    # this, Bresenham rays through a doorway over-reveal dark corridor cells
+    # distal to the hero — vendor vision.c only sets IN_SIGHT for unlit cells
+    # within the hero's light radius (Chebyshev <= 1).  ``state.features.lit``
+    # is the persisted per-tile lit grid (stamped at room placement time in
+    # rooms.py:1630-1633 from rooms.is_lit), so its current-level slice is
+    # semantically equivalent to the lit_room_flood result for the dark-cell
+    # gate purpose.  Reset path (env.py:538-549) builds the flood from rooms
+    # rects because Room pytrees are local to dungeon-gen and not in EnvState;
+    # at step time we read the already-stamped per-tile mask directly.
+    # Cite: vendor/nethack/src/vision.c:320-335 (rlit gate) + the @857 audit
+    # in .test_runs/step1_857_audit.md.
+    lit_mask = state.features.lit[flat_lv]
     new_visible = compute_fov(terrain_2d, state.player_pos, sight_radius,
-                              opaque_overlay=opaque_overlay)
+                              opaque_overlay=opaque_overlay,
+                              lit_mask=lit_mask)
 
     b  = state.dungeon.current_branch
     lv = state.dungeon.current_level - 1
