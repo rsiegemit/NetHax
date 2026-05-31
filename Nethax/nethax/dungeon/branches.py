@@ -1573,9 +1573,39 @@ def generate_main_branch_l1_with_features(
         _mineralize_grid = (
             vendor_levl_grid if vendor_levl_grid is not None else terrain
         )
-        _mineralize_grid, vendor_rng = _mineralize(
-            _mineralize_grid, vendor_rng, depth=depth, dunlev=depth,
-        )
+        # Phase 2 of the mineralize port: emit gold + gem placements into
+        # ``state.ground_items`` so downstream consumers (e.g. dog_goal's
+        # SQSRCHRADIUS fobj scan — pet_dog_move._emit_dog_goal_fobj_scan,
+        # vendor/nle/src/dogmove.c:502-553) see the same on-floor object
+        # set as vendor.  Without this the orange-glass gem at (col 67,
+        # row 12) on seed-0 Dlvl 1 is missing from ground_items, the dog
+        # scan draws one fewer rn2(100), and the ISAAC stream misaligns
+        # from step 2.  Cite: .test_runs/room_12_67_audit.md.
+        _br = int(flat_lv) // MAX_LEVELS_PER_BRANCH
+        _lv = int(flat_lv) %  MAX_LEVELS_PER_BRANCH
+        if state is not None:
+            _gcat = state.ground_items.category
+            _gtyp = state.ground_items.type_id
+            _gqty = state.ground_items.quantity
+            (
+                _mineralize_grid, vendor_rng, _gcat, _gtyp, _gqty,
+            ) = _mineralize(
+                _mineralize_grid, vendor_rng, depth=depth, dunlev=depth,
+                gi_category=_gcat,
+                gi_type_id=_gtyp,
+                gi_quantity=_gqty,
+                branch_idx=_br,
+                level_idx=_lv,
+            )
+            state = state.replace(
+                ground_items=state.ground_items.replace(
+                    category=_gcat, type_id=_gtyp, quantity=_gqty,
+                ),
+            )
+        else:
+            _mineralize_grid, vendor_rng = _mineralize(
+                _mineralize_grid, vendor_rng, depth=depth, dunlev=depth,
+            )
 
     # Threefry-only post-pass (NOT a vendor call): stamp fountain / sink /
     # grave / throne tiles onto random FLOOR cells.  Vendor's make_niches

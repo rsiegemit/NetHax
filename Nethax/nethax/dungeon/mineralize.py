@@ -68,6 +68,7 @@ import jax.lax as lax
 from Nethax.nethax.vendor_rng import Isaac64State, rn2_jax, rnd_jax, rn1_jax
 from Nethax.nethax.subsystems.random_objects import decode_picked_otyp
 from Nethax.nethax.constants.objects import ObjectClass
+from Nethax.nethax.subsystems.inventory import ItemCategory, MAX_GROUND_STACK
 
 # ---------------------------------------------------------------------------
 # Map geometry — vendor/nle/include/global.h:327-328
@@ -111,6 +112,23 @@ _OTYP_ROCK: jnp.int32 = jnp.int32(446)
 # Citation: vendor/nle/src/mkobj.c:892 ``else if (otmp->otyp != LUCKSTONE && !rn2(6))``
 _OTYP_LUCKSTONE: jnp.int32 = jnp.int32(442)
 
+# GOLD_PIECE otyp (vendor onames.h: GOLD_PIECE = 410 for seed-0 rog-hum-cha).
+# Citation: vendor floor-object dump at .test_runs/room_12_67_audit.md §3.
+_OTYP_GOLD_PIECE: jnp.int32 = jnp.int32(410)
+
+# Maximum gems per cell: rnd(2 + dunlev//3).  For dunlev up to ~14 → rnd(2+4)=6
+# max.  Stack slot 7 is reserved for the gold-piece placement, keeping gems
+# in slots 0..6 disjoint from gold.
+# Citation: vendor/nle/src/mklev.c:974.
+_MAX_GEMS: int = 7
+
+# Stack slot assignment within ground_items[..., MAX_GROUND_STACK=8].
+#   slots 0..6 → gem placements (one per gem in cnt order)
+#   slot   7   → gold placement
+# Disjoint slots avoid per-cell scatter collisions and let the first-empty-slot
+# allocator in rooms.py (mkobj_at) continue to work alongside this writer.
+_GOLD_STACK_SLOT: int = MAX_GROUND_STACK - 1  # 7
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -134,7 +152,13 @@ def mineralize(
     kelp_moat: int = -1,
     goldprob: int = -1,
     gemprob: int = -1,
-) -> Tuple[jnp.ndarray, Isaac64State]:
+    *,
+    gi_category: jnp.ndarray | None = None,
+    gi_type_id: jnp.ndarray | None = None,
+    gi_quantity: jnp.ndarray | None = None,
+    branch_idx: int = 0,
+    level_idx: int = 0,
+):
     """Replay vendor ``mineralize(-1,-1,-1,-1,FALSE)`` over the ISAAC64 stream.
 
     This function consumes the exact same sequence of rn2 draws as the
@@ -160,9 +184,14 @@ def mineralize(
                    -1 triggers vendor default computation (mklev.c:903-930).
 
     Returns:
-        (terrain, updated_vendor_rng) — terrain is unchanged (mineral
-        placements affect the object layer, not terrain tiles), but
-        vendor_rng has been advanced by the correct number of draws.
+        If ``gi_category`` is None: ``(terrain, updated_vendor_rng)`` —
+        terrain is unchanged but vendor_rng is advanced.
+        Else: ``(terrain, updated_vendor_rng, gi_category', gi_type_id',
+        gi_quantity')`` with mineralize-placed gold + gem objects scattered
+        into the ground_items slabs at ``[branch_idx, level_idx, y, x, slot]``.
+
+        Vendor cite: mklev.c:962-987 (place_object on gold/gem hits);
+                     mkobj.c::place_object (insert into level.objects[][]).
     """
     # --- Resolve defaults (mklev.c:903-930) ---
     if kelp_pool < 0:
@@ -170,9 +199,13 @@ def mineralize(
     if kelp_moat < 0:
         kelp_moat = 30
 
+    emit_objects = gi_category is not None
+
     # Early-exit gate: endgame (mklev.c:909-910).
     # For normal levels (in_endgame=False) this does not fire.
     if not skip_lvl_checks and in_endgame:
+        if emit_objects:
+            return terrain, vendor_rng, gi_category, gi_type_id, gi_quantity
         return terrain, vendor_rng
 
     # Kelp scan: x in [2, COLNO-2), y in [1, ROWNO-1).
@@ -189,6 +222,8 @@ def mineralize(
         in_hell or in_vtower or is_rogue or arboreal
         or is_special_non_oracle_non_mines_town
     ):
+        if emit_objects:
+            return terrain, vendor_rng, gi_category, gi_type_id, gi_quantity
         return terrain, vendor_rng
 
     # Resolve gold/gem probabilities (mklev.c:926-941).
@@ -207,8 +242,18 @@ def mineralize(
 
     # Gold/gem scan (mklev.c:948-987).
     # Citation: vendor/nle/src/mklev.c:948-987
-    vendor_rng = _mineral_scan(terrain, vendor_rng, goldprob, gemprob, dunlev)
+    if emit_objects:
+        vendor_rng, gi_category, gi_type_id, gi_quantity = _mineral_scan(
+            terrain, vendor_rng, goldprob, gemprob, dunlev,
+            gi_category=gi_category,
+            gi_type_id=gi_type_id,
+            gi_quantity=gi_quantity,
+            branch_idx=branch_idx,
+            level_idx=level_idx,
+        )
+        return terrain, vendor_rng, gi_category, gi_type_id, gi_quantity
 
+    vendor_rng = _mineral_scan(terrain, vendor_rng, goldprob, gemprob, dunlev)
     return terrain, vendor_rng
 
 
@@ -347,7 +392,13 @@ def _mineral_scan(
     goldprob: int,
     gemprob: int,
     dunlev: int,
-) -> Isaac64State:
+    *,
+    gi_category: jnp.ndarray | None = None,
+    gi_type_id: jnp.ndarray | None = None,
+    gi_quantity: jnp.ndarray | None = None,
+    branch_idx: int = 0,
+    level_idx: int = 0,
+):
     """Consume rn2/rnd draws for the gold+gem placement loop.
 
     Citation: vendor/nle/src/mklev.c:948-987
@@ -372,15 +423,11 @@ def _mineral_scan(
     gemp = jnp.int32(gemprob)
     dl = jnp.int32(dunlev)
 
+    emit_objects = gi_category is not None
+
     # W_NONDIGGABLE mask (vendor bound_digging) — cells outside the non-stone
     # bounding box are skipped by the eligibility test below.
     nondiggable = _bound_digging_nondiggable(terrain)
-
-    # Maximum gems per hit: rnd(2 + dunlev//3).  For Dlvl 1: rnd(2) → max 2.
-    # We need a fixed-iteration inner loop for JAX; use max_gems = 2 + 14//3
-    # = 6 (upper bound across all normal dungeon levels to level 14).
-    # This over-iterates but gates non-existent draws via lax.cond on cnt.
-    _MAX_GEMS: int = 7  # conservative upper bound
 
     # "Solid stone" in our terrain = TileType.VOID (0).
     _VOID = jnp.int8(0)
@@ -388,13 +435,28 @@ def _mineral_scan(
     def _is_stone(ty: jnp.int8) -> jnp.ndarray:
         return ty == _VOID
 
-    def body(flat_i, vrng):
+    # Per-cell placement carriers — populated inside the fori_loop and scattered
+    # into ground_items after.  ROCK gems are discarded (no floor placement);
+    # buried gold/gems also skip place_object (added to inv_chain via
+    # add_to_buried).  We track the placement flag explicitly so the scatter
+    # writes zero into ground_items for the discarded entries.
+    # Vendor cite: vendor/nle/src/mklev.c:968 add_to_buried (gold),
+    #              :977 dealloc_obj (rock), :981 add_to_buried (gem).
+    gold_place = jnp.zeros((_SCAN_N,), dtype=jnp.bool_)
+    gold_qty   = jnp.zeros((_SCAN_N,), dtype=jnp.int32)
+    gem_place  = jnp.zeros((_SCAN_N, _MAX_GEMS), dtype=jnp.bool_)
+    gem_otyp   = jnp.zeros((_SCAN_N, _MAX_GEMS), dtype=jnp.int32)
+    gem_qty    = jnp.zeros((_SCAN_N, _MAX_GEMS), dtype=jnp.int32)
+
+    def body(flat_i, carry):
+        vrng, gpl, gq, gmp, go, gmq = carry
+
         xi = flat_i // _SCAN_H + _X_LO
         yi = flat_i %  _SCAN_H + _Y_LO
 
         cell     = terrain[yi,     xi    ]
-        cell_n   = terrain[yi - 1, xi    ]  # y-1
-        cell_s   = terrain[yi + 1, xi    ]  # y+1 (== levl[x][y+1] in C)
+        cell_n   = terrain[yi - 1, xi    ]
+        cell_s   = terrain[yi + 1, xi    ]
         cell_e   = terrain[yi,     xi + 1]
         cell_w   = terrain[yi,     xi - 1]
         cell_ne  = terrain[yi - 1, xi + 1]
@@ -402,12 +464,8 @@ def _mineral_scan(
         cell_se  = terrain[yi + 1, xi + 1]
         cell_sw  = terrain[yi + 1, xi - 1]
 
-        # Vendor checks levl[x][y+1].typ != STONE first (the skip-2 guard),
-        # then levl[x][y].typ != STONE (the skip-1 guard).
-        # Under a fixed-iteration loop we simply check all neighbours:
-        # a cell is eligible iff self + all 8 neighbours are STONE AND the
-        # candidate cell is diggable (vendor mklev.c:981 W_NONDIGGABLE gate).
-        # Citation: vendor/nle/src/mklev.c:950-961, :981.
+        # Vendor cite: vendor/nle/src/mklev.c:950-961, :981 — eligibility =
+        # diggable + self + 8 neighbours STONE.
         eligible = (
             (~nondiggable[yi, xi])
             & _is_stone(cell)
@@ -421,89 +479,223 @@ def _mineral_scan(
             & _is_stone(cell_sw)
         )
 
-        def do_eligible(v):
+        def do_eligible(c):
+            v, gpl, gq, gmp, go, gmq = c
+
             # --- Gold draw: rn2(1000) --- Citation: mklev.c:962
             v, gold_roll = rn2_jax(v, jnp.int32(1000))
+            gold_hit = gold_roll < gp
 
-            def on_gold_hit(vv):
+            def on_gold_hit(cc):
+                vv, gpl_in, gq_in = cc
                 # rnd(goldprob*3): Citation mklev.c:965
-                vv, _quan = rnd_jax(vv, gp * jnp.int32(3))
+                vv, quan = rnd_jax(vv, gp * jnp.int32(3))
+                # vendor mklev.c:965 ``otmp->quan = 1L + rnd(goldprob*3)``.
+                quan_full = quan + jnp.int32(1)
                 # rn2(3): burial coin   Citation mklev.c:967
-                vv, _coin = rn2_jax(vv, jnp.int32(3))
-                return vv
+                vv, coin = rn2_jax(vv, jnp.int32(3))
+                # Place on floor iff coin != 0 (vendor: !rn2(3) → buried).
+                placed = coin != jnp.int32(0)
+                gpl_in = gpl_in.at[flat_i].set(placed)
+                gq_in  = gq_in.at[flat_i].set(quan_full)
+                return (vv, gpl_in, gq_in)
 
-            v = lax.cond(gold_roll < gp, on_gold_hit, lambda vv: vv, v)
+            v, gpl, gq = lax.cond(
+                gold_hit, on_gold_hit, lambda cc: cc, (v, gpl, gq)
+            )
 
             # --- Gem draw: rn2(1000) --- Citation: mklev.c:973
             v, gem_roll = rn2_jax(v, jnp.int32(1000))
+            gem_hit = gem_roll < gemp
 
-            def on_gem_hit(vv):
+            def on_gem_hit(cc):
+                vv, gmp_in, go_in, gmq_in = cc
                 # cnt = rnd(2 + dunlev//3)  Citation mklev.c:974
                 vv, cnt = rnd_jax(vv, jnp.int32(2) + dl // jnp.int32(3))
 
-                # Per-gem cascade mirrors vendor mkobj(GEM_CLASS, FALSE) +
-                # mklev.c:975-984 placement logic.
-                #
-                # Vendor sequence per gem (Citation: vendor/nle/src/mklev.c:975-984,
-                #                          vendor/nle/src/mkobj.c:251,886-895):
-                #   1. rnd(1000)       — type pick inside mkobj()  [mkobj.c:251]
-                #   2. decode otyp via weighted walk on GEM_CLASS objects
-                #   3a. if ROCK:       rn1(6,6) quantity           [mkobj.c:891]
-                #                      discard (no rn2(3))         [mklev.c:976-977]
-                #   3b. if LUCKSTONE:  no quantity draw             [mkobj.c:892]
-                #                      rn2(3) for burial/place     [mklev.c:980]
-                #   3c. else:          rn2(6) quantity check        [mkobj.c:892]
-                #                      rn2(3) for burial/place     [mklev.c:980]
-                def gem_body(i, inner_v):
-                    def do_gem(iv):
-                        # 1. rnd(1000) type pick — Citation: vendor/nle/src/mkobj.c:251
-                        iv, type_roll = rnd_jax(iv, jnp.int32(1000))
-                        # 2. decode otyp
+                # Per-gem cascade — vendor mklev.c:975-984 + mkobj.c:251,886-895.
+                def gem_body(i, inner):
+                    iv, gmp_inner, go_inner, gmq_inner = inner
+
+                    def do_gem(g):
+                        iv2, gmp2, go2, gmq2 = g
+                        # 1. rnd(1000) type pick — vendor mkobj.c:251
+                        iv2, type_roll = rnd_jax(iv2, jnp.int32(1000))
                         otyp = decode_picked_otyp(
                             jnp.int32(_GEM_CLASS_ID), type_roll
                         )
                         is_rock      = otyp == _OTYP_ROCK
                         is_luckstone = otyp == _OTYP_LUCKSTONE
 
-                        def rock_branch(rv):
-                            # rn1(6,6) quantity; no placement draw
-                            # Citation: vendor/nle/src/mkobj.c:891
-                            rv, _ = rn1_jax(rv, 6, 6)
-                            return rv
+                        def rock_branch(rb):
+                            iv3, gmp3, go3, gmq3 = rb
+                            # rn1(6,6) quantity — vendor mkobj.c:891
+                            iv3, _q = rn1_jax(iv3, 6, 6)
+                            # ROCK is dealloc'd — no floor placement (cite:
+                            # vendor/nle/src/mklev.c:976-977).  Leave per-gem
+                            # slot as the zero default (not placed).
+                            return (iv3, gmp3, go3, gmq3)
 
-                        def non_rock_branch(rv):
-                            # rn2(6) quantity (skipped for luckstone)
-                            # Citation: vendor/nle/src/mkobj.c:892
-                            rv = lax.cond(
-                                is_luckstone,
-                                lambda r: r,
-                                lambda r: rn2_jax(r, jnp.int32(6))[0],
-                                rv,
+                        def non_rock_branch(rb):
+                            iv3, gmp3, go3, gmq3 = rb
+                            # Vendor mkobj.c:892:
+                            #   if (otmp->otyp != LUCKSTONE && !rn2(6))
+                            #       otmp->quan = 2L;
+                            # i.e. for non-luckstone gems draw rn2(6); the
+                            # quantity is 2 iff that draw == 0, else 1.
+                            # Luckstone skips the draw entirely and keeps the
+                            # mksobj default quan = 1.
+                            def lucky(r):
+                                return (r, jnp.int32(1))
+
+                            def gem_quan(r):
+                                r2, k = rn2_jax(r, jnp.int32(6))
+                                q = jnp.where(
+                                    k == jnp.int32(0),
+                                    jnp.int32(2),
+                                    jnp.int32(1),
+                                )
+                                return (r2, q)
+
+                            iv3, gem_q = lax.cond(
+                                is_luckstone, lucky, gem_quan, iv3
                             )
-                            # rn2(3) burial/place draw
-                            # Citation: vendor/nle/src/mklev.c:980
-                            rv, _ = rn2_jax(rv, jnp.int32(3))
-                            return rv
+                            # rn2(3) burial/place draw — vendor mklev.c:980.
+                            iv3, coin = rn2_jax(iv3, jnp.int32(3))
+                            placed = coin != jnp.int32(0)
+                            gmp3 = gmp3.at[flat_i, i].set(placed)
+                            go3  = go3.at[flat_i, i].set(otyp)
+                            gmq3 = gmq3.at[flat_i, i].set(gem_q)
+                            return (iv3, gmp3, go3, gmq3)
 
-                        iv = lax.cond(is_rock, rock_branch, non_rock_branch, iv)
-                        return iv
+                        return lax.cond(
+                            is_rock, rock_branch, non_rock_branch,
+                            (iv2, gmp2, go2, gmq2),
+                        )
 
-                    # Only draw when i < cnt (mirrors vendor's for-loop)
-                    inner_v = lax.cond(
+                    return lax.cond(
                         jnp.int32(i) < cnt,
                         do_gem,
-                        lambda iv: iv,
-                        inner_v,
+                        lambda g: g,
+                        (iv, gmp_inner, go_inner, gmq_inner),
                     )
-                    return inner_v
 
-                vv = lax.fori_loop(0, _MAX_GEMS, gem_body, vv)
-                return vv
+                vv, gmp_in, go_in, gmq_in = lax.fori_loop(
+                    0, _MAX_GEMS, gem_body,
+                    (vv, gmp_in, go_in, gmq_in),
+                )
+                return (vv, gmp_in, go_in, gmq_in)
 
-            v = lax.cond(gem_roll < gemp, on_gem_hit, lambda vv: vv, v)
-            return v
+            v, gmp, go, gmq = lax.cond(
+                gem_hit, on_gem_hit, lambda cc: cc,
+                (v, gmp, go, gmq),
+            )
 
-        vrng = lax.cond(eligible, do_eligible, lambda v: v, vrng)
-        return vrng
+            return (v, gpl, gq, gmp, go, gmq)
 
-    return lax.fori_loop(0, _SCAN_N, body, vendor_rng)
+        return lax.cond(
+            eligible,
+            do_eligible,
+            lambda c: c,
+            (vrng, gpl, gq, gmp, go, gmq),
+        )
+
+    (vrng_out, gold_place, gold_qty, gem_place, gem_otyp, gem_qty) = (
+        lax.fori_loop(
+            0, _SCAN_N, body,
+            (vendor_rng, gold_place, gold_qty, gem_place, gem_otyp, gem_qty),
+        )
+    )
+
+    if not emit_objects:
+        return vrng_out
+
+    # ------------------------------------------------------------------
+    # Scatter placement results into ground_items[branch_idx, level_idx,
+    # y, x, slot].
+    #
+    # Per-cell flat scan order: xi = idx // _SCAN_H + _X_LO,
+    #                            yi = idx %  _SCAN_H + _Y_LO.  Each (yi, xi)
+    # appears exactly once in the scan so .at[].set() has no scatter
+    # conflicts.  Gold writes go into stack slot _GOLD_STACK_SLOT (=7);
+    # gem writes go into stack slots 0.._MAX_GEMS-1 (0..6) keyed by the
+    # per-cell gem index.
+    # Vendor cite: vendor/nle/src/mklev.c:962-984 (place_object on gold/gem
+    # hits); vendor/nle/src/mkobj.c::place_object inserts the object into
+    # level.objects[x][y] at the head of the chain.
+    # ------------------------------------------------------------------
+    flat_idx = jnp.arange(_SCAN_N, dtype=jnp.int32)
+    xis = flat_idx // _SCAN_H + jnp.int32(_X_LO)
+    yis = flat_idx %  _SCAN_H + jnp.int32(_Y_LO)
+
+    # --- Gold scatter ---
+    gold_cat_writes = jnp.where(
+        gold_place, jnp.int8(int(ItemCategory.COIN)), jnp.int8(0)
+    )
+    gold_typ_writes = jnp.where(
+        gold_place, jnp.int16(int(_OTYP_GOLD_PIECE)), jnp.int16(0)
+    )
+    gold_qty_writes = jnp.where(
+        gold_place,
+        jnp.clip(gold_qty, 0, jnp.iinfo(jnp.int16).max).astype(jnp.int16),
+        jnp.int16(0),
+    )
+
+    # Use ``mode='drop'`` semantics implicitly: each (yis, xis) is unique so
+    # .at[].set is fine.  Only WRITE where gold_place is True — for
+    # non-place cells, set() back to the current value to avoid corrupting
+    # other writers (rooms.py's mkobj_at scatter ran earlier and may have
+    # written to slot 7 of a room cell; mineralize cells are STONE so room
+    # cells never collide, but be defensive).
+    existing_cat = gi_category[branch_idx, level_idx, yis, xis, _GOLD_STACK_SLOT]
+    existing_typ = gi_type_id [branch_idx, level_idx, yis, xis, _GOLD_STACK_SLOT]
+    existing_qty = gi_quantity[branch_idx, level_idx, yis, xis, _GOLD_STACK_SLOT]
+    gold_cat_writes = jnp.where(gold_place, gold_cat_writes, existing_cat)
+    gold_typ_writes = jnp.where(gold_place, gold_typ_writes, existing_typ)
+    gold_qty_writes = jnp.where(gold_place, gold_qty_writes, existing_qty)
+    gi_category = gi_category.at[
+        branch_idx, level_idx, yis, xis, _GOLD_STACK_SLOT
+    ].set(gold_cat_writes)
+    gi_type_id = gi_type_id.at[
+        branch_idx, level_idx, yis, xis, _GOLD_STACK_SLOT
+    ].set(gold_typ_writes)
+    gi_quantity = gi_quantity.at[
+        branch_idx, level_idx, yis, xis, _GOLD_STACK_SLOT
+    ].set(gold_qty_writes)
+
+    # --- Gem scatter (one stack slot per gem index 0.._MAX_GEMS-1) ---
+    for slot in range(_MAX_GEMS):
+        place_slot = gem_place[:, slot]
+        otyp_slot  = gem_otyp[:, slot]
+        qty_slot   = gem_qty[:, slot]
+
+        cat_w = jnp.where(
+            place_slot, jnp.int8(int(ItemCategory.GEM)), jnp.int8(0)
+        )
+        typ_w = jnp.where(
+            place_slot,
+            jnp.clip(otyp_slot, 0, jnp.iinfo(jnp.int16).max).astype(jnp.int16),
+            jnp.int16(0),
+        )
+        qty_w = jnp.where(
+            place_slot,
+            jnp.clip(qty_slot, 0, jnp.iinfo(jnp.int16).max).astype(jnp.int16),
+            jnp.int16(0),
+        )
+        exist_cat = gi_category[branch_idx, level_idx, yis, xis, slot]
+        exist_typ = gi_type_id [branch_idx, level_idx, yis, xis, slot]
+        exist_qty = gi_quantity[branch_idx, level_idx, yis, xis, slot]
+        cat_w = jnp.where(place_slot, cat_w, exist_cat)
+        typ_w = jnp.where(place_slot, typ_w, exist_typ)
+        qty_w = jnp.where(place_slot, qty_w, exist_qty)
+        gi_category = gi_category.at[
+            branch_idx, level_idx, yis, xis, slot
+        ].set(cat_w)
+        gi_type_id = gi_type_id.at[
+            branch_idx, level_idx, yis, xis, slot
+        ].set(typ_w)
+        gi_quantity = gi_quantity.at[
+            branch_idx, level_idx, yis, xis, slot
+        ].set(qty_w)
+
+    return vrng_out, gi_category, gi_type_id, gi_quantity
