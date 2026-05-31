@@ -20,14 +20,23 @@ _RNG = jax.random.PRNGKey(0)
 
 
 def _make_open_state(blind: bool = False):
-    """State on an all-FLOOR map, player at (10, 10), optionally blind."""
+    """State on an all-FLOOR map, player at (10, 10), optionally blind.
+
+    The floor is stamped LIT so the dark-cell gate in `_apply_fov`
+    (state.features.lit slice) doesn't restrict visible cells to a 3x3
+    around the hero — vendor vision.c only sets IN_SIGHT for unlit
+    cells within Chebyshev <= 1 (the hero's intrinsic light radius).
+    """
     state = EnvState.default(_RNG)
-    # Fill level 0 terrain with FLOOR so FOV is unobstructed.
     floor_terrain = jnp.full(
         state.terrain[0, 0].shape, TileType.FLOOR, dtype=state.terrain.dtype
     )
+    lit_slab = jnp.ones_like(state.features.lit[0], dtype=jnp.bool_)
     state = state.replace(
         terrain=state.terrain.at[0, 0].set(floor_terrain),
+        features=state.features.replace(
+            lit=state.features.lit.at[0].set(lit_slab),
+        ),
         player_pos=jnp.array([10, 10], dtype=jnp.int16),
     )
     if blind:

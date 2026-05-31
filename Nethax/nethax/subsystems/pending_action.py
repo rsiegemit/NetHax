@@ -56,6 +56,7 @@ from enum import IntEnum
 
 import jax
 import jax.numpy as jnp
+import numpy as _np
 
 
 class PendingActionKind(IntEnum):
@@ -168,29 +169,41 @@ _OPENERS_LETTER_THEN_DIR = frozenset(PROMPT_OPENERS_LETTER_THEN_DIR)
 def is_inv_letter_opener_table() -> jax.Array:
     """Return a uint8[256] mask: 1 if action int opens an inv-letter prompt."""
     mask = [1 if i in _OPENERS_INV_LETTER else 0 for i in range(256)]
-    return jnp.array(mask, dtype=jnp.uint8)
+    return jnp.asarray(_np.array(mask, dtype=_np.uint8))
 
 
 def is_letter_then_dir_opener_table() -> jax.Array:
     """Return a uint8[256] mask: 1 if action opens a letter-then-dir prompt."""
     mask = [1 if i in _OPENERS_LETTER_THEN_DIR else 0 for i in range(256)]
-    return jnp.array(mask, dtype=jnp.uint8)
+    return jnp.asarray(_np.array(mask, dtype=_np.uint8))
 
 
-_INV_LETTER_OPENER_MASK = is_inv_letter_opener_table()
-_LETTER_THEN_DIR_OPENER_MASK = is_letter_then_dir_opener_table()
+# Use numpy at module-load so the tables are concrete arrays even when the
+# module is lazy-imported inside a JIT trace context (e.g. from
+# action_dispatch.dispatch_action).  Otherwise the jnp.array call inside a
+# tracer scope creates a DynamicJaxprTracer that "leaks" when the trace
+# exits — see UnexpectedTracerError in pytest's
+# test_step_impl_vmap_compile_within_5min.
+_INV_LETTER_OPENER_MASK_NP   = _np.array(
+    [1 if i in _OPENERS_INV_LETTER else 0 for i in range(256)],
+    dtype=_np.uint8,
+)
+_LETTER_THEN_DIR_OPENER_MASK_NP = _np.array(
+    [1 if i in _OPENERS_LETTER_THEN_DIR else 0 for i in range(256)],
+    dtype=_np.uint8,
+)
 
 
 def action_opens_inv_letter_prompt(action_val: jax.Array) -> jax.Array:
     """True if `action_val` is one of WEAR/WIELD/QUAFF/EAT/READ/PUT_ON/TAKE_OFF."""
     safe = jnp.clip(action_val.astype(jnp.int32), 0, 255)
-    return _INV_LETTER_OPENER_MASK[safe] != jnp.uint8(0)
+    return jnp.asarray(_INV_LETTER_OPENER_MASK_NP)[safe] != jnp.uint8(0)
 
 
 def action_opens_letter_then_dir_prompt(action_val: jax.Array) -> jax.Array:
     """True if `action_val` is one of ZAP/THROW/APPLY (the two-step actions)."""
     safe = jnp.clip(action_val.astype(jnp.int32), 0, 255)
-    return _LETTER_THEN_DIR_OPENER_MASK[safe] != jnp.uint8(0)
+    return jnp.asarray(_LETTER_THEN_DIR_OPENER_MASK_NP)[safe] != jnp.uint8(0)
 
 
 def is_pending(state) -> jax.Array:
