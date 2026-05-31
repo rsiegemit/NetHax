@@ -702,8 +702,26 @@ def create_room_random(
 
     # ------------------------------------------------------------------
     # Pre-loop lit draws (sp_lev.c:1153-1154) -- ONCE per create_room.
+    #
+    # Vendor only draws lit_A/lit_B when ``rlit == -1`` (random) -- the
+    # ``create_vault`` macro at mklev.c:38 passes ``rlit = TRUE`` so the
+    # vault branch SKIPS these two draws entirely.  Forgetting this skip
+    # caused Nethax to consume 2 extra ISAAC64 bytes per vault attempt
+    # vs vendor on seed=1 (first divergence: draw 425).  Citation:
+    # vendor/nle/src/mklev.c:38, vendor/nle/src/sp_lev.c:1153.
     # ------------------------------------------------------------------
-    rng, rlit = _draw_rlit(rng, depth)
+    def _draw_rlit_fn(args):
+        r, d = args
+        return _draw_rlit(r, d)
+
+    def _skip_rlit_fn(args):
+        r, _d = args
+        # Vault path: rlit is hard-wired TRUE (lit) per create_vault macro.
+        return r, jnp.bool_(True)
+
+    rng, rlit = lax.cond(
+        vault, _skip_rlit_fn, _draw_rlit_fn, (rng, depth),
+    )
 
     # ------------------------------------------------------------------
     # do-while (trycnt <= 100) loop (sp_lev.c:1161-1277).

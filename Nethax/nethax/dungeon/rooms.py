@@ -566,7 +566,15 @@ def _invoke_create_room(
         lambda a: a,
         rooms_lit,
     )
-    new_nroom = jnp.where(success, nroom + jnp.int32(1), nroom)
+    # Vendor only increments nroom on the OROOM branch (sp_lev.c:1284
+    # ``add_room`` -> ``smeq[nroom] = nroom; ++nroom``); the VAULT branch
+    # sets ``rooms[nroom].lx/ly`` and (in mklev.c:235) ``rooms[nroom].hx =
+    # -1`` *without* incrementing nroom.  Forgetting this caused nroom to
+    # drift +1 vs vendor immediately after a vault placement (seed=1 first
+    # observed at draw 797 = rn2(nroom) for down-stair room pick).
+    # Citation: vendor/nle/src/sp_lev.c:1283-1290 (add_room only on !vault).
+    incremented = success & (~vault)
+    new_nroom = jnp.where(incremented, nroom + jnp.int32(1), nroom)
 
     # On success, stamp the room footprint into level_grid so the next
     # create_room call's check_room scan (sp_lev.c:1099-1113) sees the
