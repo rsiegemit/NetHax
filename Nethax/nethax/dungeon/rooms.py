@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import jax.lax as lax
 from flax import struct
 
-from Nethax.nethax.dungeon.branches import MAP_H, MAP_W
+from Nethax.nethax.dungeon.branches import MAP_H, MAP_W, MAX_LEVELS_PER_BRANCH
 from Nethax.nethax.vendor_rng import Isaac64State, randint_jax, rnd_jax
 from Nethax.nethax.subsystems.random_objects import (
     _MKOBJ_TABLE,
@@ -36,6 +36,7 @@ from Nethax.nethax.subsystems.random_objects import (
     consume_mksobj_init_draws,
     decode_picked_otyp,
 )
+from Nethax.nethax.subsystems.inventory import MAX_GROUND_STACK
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1782,6 +1783,49 @@ def fill_ordinary_rooms(
         _monster_threefry_key = rng
 
     # -----------------------------------------------------------------
+    # Per-room mkobj ground-items wiring.  Vendor mklev.c:875 places the
+    # decoded random object on the floor via ``mkobj_at`` (which inserts
+    # the new obj into ``level.objlist`` / ``level.objects[x][y]``); the
+    # downstream ``dog_goal`` SQSRCHRADIUS fobj scan
+    # (vendor/nle/src/dogmove.c:502-553) iterates that list and draws one
+    # ``rn2(100)`` per in-range non-quest object.  We mirror this by
+    # threading 3 ground_items slabs (category / type_id / quantity) of
+    # the current level through the scan carry; ``_mkobj_true`` writes
+    # the decoded (oclass, otyp) into the first empty stack slot at the
+    # somexy cell.
+    #
+    # When ``state`` is None (legacy / non-env callers) the slabs are
+    # zero placeholders and discarded after the scan — no observable
+    # effect on the rest of the dungeon-gen pipeline.
+    #
+    # Vendor cite: vendor/nle/src/mklev.c:875 (mkobj_at on outer gate);
+    #              vendor/nle/src/dogmove.c:502-553 (fobj scan);
+    #              audit: .test_runs/missing_floor_object_audit.md.
+    branch_idx = jnp.int32(int(flat_lv) // MAX_LEVELS_PER_BRANCH)
+    level_idx  = jnp.int32(int(flat_lv) %  MAX_LEVELS_PER_BRANCH)
+    if state is not None:
+        _init_gcat = state.ground_items.category
+        _init_gtyp = state.ground_items.type_id
+        _init_gqty = state.ground_items.quantity
+    else:
+        # Zero placeholders shaped to match the empty Item slabs.  Caller
+        # path doesn't read them back.  Use a tiny [1,1,H,W,STACK] proxy
+        # to keep the trace lightweight when there's no state.
+        _init_gcat = jnp.zeros(
+            (1, 1, MAP_H, MAP_W, MAX_GROUND_STACK), dtype=jnp.int8
+        )
+        _init_gtyp = jnp.zeros(
+            (1, 1, MAP_H, MAP_W, MAX_GROUND_STACK), dtype=jnp.int16
+        )
+        _init_gqty = jnp.zeros(
+            (1, 1, MAP_H, MAP_W, MAX_GROUND_STACK), dtype=jnp.int16
+        )
+        # Force the writes into the dummy [0, 0, ...] slice so they're
+        # safely discarded.
+        branch_idx = jnp.int32(0)
+        level_idx  = jnp.int32(0)
+
+    # -----------------------------------------------------------------
     # ISAAC64-threaded scan body (NLE_BYTEPARITY) — vendor cite mklev.c
     # ::fill_ordinary_room lines 968-1006.  Per-room rn2/somexy draws are
     # routed through randint_jax so the byte stream matches vendor C.
@@ -1804,7 +1848,7 @@ def fill_ordinary_rooms(
     # also fires every draw unconditionally.
     def fill_one_isaac(carry, i):
         terrain_, features_aa, features_lit, traps_tt, vrng, \
-            monster_ai_, next_slot_ = carry
+            monster_ai_, next_slot_, gcat_, gtyp_, gqty_ = carry
         y1 = rooms.y1[i].astype(jnp.int32)
         x1 = rooms.x1[i].astype(jnp.int32)
         y2 = rooms.y2[i].astype(jnp.int32)
@@ -1892,13 +1936,17 @@ def fill_ordinary_rooms(
         # Vendor cite: vendor/nle/src/mklev.c:803-805 (loop bound + OROOM
         # continue), :825-883 (per-OROOM fill draws).
         def _fill_features(fill_carry):
-            terrain_, traps_tt, features_aa, vrng = fill_carry
-            return _fill_features_body(terrain_, traps_tt, features_aa, vrng)
+            terrain_, traps_tt, features_aa, vrng, gcat_, gtyp_, gqty_ = fill_carry
+            return _fill_features_body(
+                terrain_, traps_tt, features_aa, vrng, gcat_, gtyp_, gqty_
+            )
 
         def _skip_features(fill_carry):
             return fill_carry
 
-        def _fill_features_body(terrain_, traps_tt, features_aa, vrng):
+        def _fill_features_body(
+            terrain_, traps_tt, features_aa, vrng, gcat_, gtyp_, gqty_,
+        ):
             # --- Traps: while (!rn2(trap_x)) — bounded loop ---
             MAX_TRAPS_PER_ROOM = 4
 
@@ -2383,7 +2431,8 @@ def fill_ordinary_rooms(
             vrng, mkobj_gate_v = randint_jax(vrng, (), 0, 3)
             mkobj_gate = (mkobj_gate_v == jnp.int32(0)) & is_ordinary
 
-            def _mkobj_true(vrng_in):
+            def _mkobj_true(carry):
+                vrng_in, gcat_in, gtyp_in, gqty_in = carry
                 # First mkobj_at call (vendor mklev.c:875).
                 # Vendor mkobj(RANDOM_CLASS) draw order (mkobj.c:251-272):
                 #   1. prob  = rnd(1000)              — drawn FIRST (mkobj.c:251)
@@ -2403,6 +2452,40 @@ def fill_ordinary_rooms(
                 # classes ignore the otyp argument (legacy 0-draw fallback).
                 otyp0 = decode_picked_otyp(oclass0, typ0)              # mkobj.c:264-266
                 vrng_in = consume_mksobj_init_draws(vrng_in, oclass0, otyp0)  # mkobj.c:801-1069
+                # Persist the decoded item into ground_items at the somexy
+                # position.  Vendor mklev.c:875 ``mkobj_at(0, somex, somey,
+                # TRUE)`` places the freshly-decoded object on the floor;
+                # without this write the per-room RNG draws are correct but
+                # downstream consumers (e.g. ``dog_goal``'s SQSRCHRADIUS fobj
+                # scan that draws one ``rn2(100)`` per in-range object — see
+                # ``pet_dog_move._emit_dog_goal_fobj_scan``) see an empty
+                # floor and the ISAAC64 stream runs ahead of vendor.
+                #
+                # Slot allocation: pick the first empty stack slot at
+                # (_rmk, _cmk) via argmax-on-empty.  When all 8 slots are
+                # full (theoretical only — fresh dungeon starts at 0) the
+                # write falls into slot MAX_GROUND_STACK-1 (overwriting
+                # the last) — acceptable for the validator because
+                # dog_goal only checks ``category != 0``.
+                # Audit cite: .test_runs/missing_floor_object_audit.md.
+                # Vendor cite: vendor/nle/src/mklev.c:875.
+                cell_cats = gcat_in[branch_idx, level_idx, _rmk, _cmk]
+                empty_mask = cell_cats == jnp.int8(0)
+                # jnp.argmax returns 0 when no True → safe fallback.
+                slot_idx = jnp.argmax(empty_mask.astype(jnp.int32))
+                slot_idx = slot_idx.astype(jnp.int32)
+                new_cat_val = oclass0.astype(jnp.int8)
+                new_typ_val = otyp0.astype(jnp.int16)
+                new_gcat = gcat_in.at[
+                    branch_idx, level_idx, _rmk, _cmk, slot_idx
+                ].set(new_cat_val)
+                new_gtyp = gtyp_in.at[
+                    branch_idx, level_idx, _rmk, _cmk, slot_idx
+                ].set(new_typ_val)
+                new_gqty = gqty_in.at[
+                    branch_idx, level_idx, _rmk, _cmk, slot_idx
+                ].set(jnp.int16(1))
+                gcat_in, gtyp_in, gqty_in = new_gcat, new_gtyp, new_gqty
                 # Vendor inner loop (mklev.c:877-883):
                 #   while (!rn2(5)) {
                 #       if (++tryct > 100) { impossible; break; }
@@ -2418,53 +2501,80 @@ def fill_ordinary_rooms(
                 MKOBJ_CAP = jnp.int32(100)
 
                 def _mko_cond(carry):
-                    _v, cont, iters = carry
+                    _v, _gc, _gt, _gq, cont, iters = carry
                     return cont & (iters < MKOBJ_CAP)
 
                 def _mko_body(carry):
-                    v, _cont, iters = carry
+                    v, gc, gt, gq, _cont, iters = carry
                     v, rn5 = randint_jax(v, (), 0, 5)
                     cont_next = rn5 == jnp.int32(0)
 
-                    def _inner_true(vi):
+                    def _inner_true(inner_carry):
+                        vi, gci, gti, gqi = inner_carry
                         vi, _ro, _co = somexy(vi)
                         vi, typ_i = rnd_jax(vi, 1000)                    # prob = rnd(1000) (mkobj.c:251)
                         vi, cls_roll = rnd_jax(vi, 100)                  # tprob = rnd(100) (mkobj.c:259)
                         oclass_i = _MKOBJ_TABLE[cls_roll - jnp.int32(1)]
                         otyp_i = decode_picked_otyp(oclass_i, typ_i)     # mkobj.c:264-266
                         vi = consume_mksobj_init_draws(vi, oclass_i, otyp_i)  # mkobj.c:801-1069
-                        return vi
+                        # Persist inner mkobj_at placement to ground_items
+                        # (vendor mklev.c:882).  Same first-empty-slot
+                        # allocation as the outer placement above.
+                        cell_cats_i = gci[branch_idx, level_idx, _ro, _co]
+                        empty_mask_i = cell_cats_i == jnp.int8(0)
+                        slot_i = jnp.argmax(empty_mask_i.astype(jnp.int32))
+                        slot_i = slot_i.astype(jnp.int32)
+                        gci = gci.at[
+                            branch_idx, level_idx, _ro, _co, slot_i
+                        ].set(oclass_i.astype(jnp.int8))
+                        gti = gti.at[
+                            branch_idx, level_idx, _ro, _co, slot_i
+                        ].set(otyp_i.astype(jnp.int16))
+                        gqi = gqi.at[
+                            branch_idx, level_idx, _ro, _co, slot_i
+                        ].set(jnp.int16(1))
+                        return (vi, gci, gti, gqi)
 
-                    v = lax.cond(cont_next, _inner_true, lambda vi: vi, v)
-                    return (v, cont_next, iters + jnp.int32(1))
+                    v, gc, gt, gq = lax.cond(
+                        cont_next, _inner_true,
+                        lambda inner_carry: inner_carry,
+                        (v, gc, gt, gq),
+                    )
+                    return (v, gc, gt, gq, cont_next, iters + jnp.int32(1))
 
-                vrng_in, _, _ = lax.while_loop(
+                vrng_in, gcat_in, gtyp_in, gqty_in, _, _ = lax.while_loop(
                     _mko_cond,
                     _mko_body,
-                    (vrng_in, jnp.bool_(True), jnp.int32(0)),
+                    (
+                        vrng_in, gcat_in, gtyp_in, gqty_in,
+                        jnp.bool_(True), jnp.int32(0),
+                    ),
                 )
-                return vrng_in
+                return (vrng_in, gcat_in, gtyp_in, gqty_in)
 
-            def _mkobj_false(vrng_in):
-                return vrng_in
+            def _mkobj_false(carry):
+                return carry
 
-            vrng = lax.cond(mkobj_gate, _mkobj_true, _mkobj_false, vrng)
+            vrng, gcat_, gtyp_, gqty_ = lax.cond(
+                mkobj_gate, _mkobj_true, _mkobj_false,
+                (vrng, gcat_, gtyp_, gqty_),
+            )
 
-            return (terrain_, traps_tt, features_aa, vrng)
+            return (terrain_, traps_tt, features_aa, vrng, gcat_, gtyp_, gqty_)
 
         # Gate the entire feature-fill draw cascade on is_ordinary so
         # inactive / non-OROOM slots consume ZERO ISAAC64 draws, matching
         # vendor's mklev.c:803-805 loop bound + OROOM `continue`.
-        (terrain_, traps_tt, features_aa, vrng) = lax.cond(
+        (terrain_, traps_tt, features_aa, vrng, gcat_, gtyp_, gqty_) = lax.cond(
             is_ordinary,
             _fill_features,
             _skip_features,
-            (terrain_, traps_tt, features_aa, vrng),
+            (terrain_, traps_tt, features_aa, vrng, gcat_, gtyp_, gqty_),
         )
 
         return (
             terrain_, features_aa, features_lit, traps_tt, vrng,
-            monster_ai_, next_slot_,
+            monster_ai_, next_slot_, gcat_, gtyp_, gqty_,
         ), None
 
     if vendor_rng is None:
@@ -2502,18 +2612,26 @@ def fill_ordinary_rooms(
                 vendor_rng,
                 _init_monster_ai,
                 jnp.int32(0),  # next free monster_ai slot
+                _init_gcat, _init_gtyp, _init_gqty,
             )
             (
                 terrain_out, aa_out, lit_out, tt_out, vendor_rng_out,
                 monster_ai_out, _next_slot_out,
+                gcat_out, gtyp_out, gqty_out,
             ), _ = lax.scan(
                 fill_one_isaac,
                 init_carry,
                 jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
             )
+            new_ground_items = state.ground_items.replace(
+                category=gcat_out,
+                type_id=gtyp_out,
+                quantity=gqty_out,
+            )
             state_out = state.replace(
                 monster_ai=monster_ai_out,
                 vendor_rng=vendor_rng_out,
+                ground_items=new_ground_items,
             )
         else:
             # vendor_rng path WITHOUT monster spawning (e.g. non-env
@@ -2528,16 +2646,26 @@ def fill_ordinary_rooms(
                 vendor_rng,
                 jnp.int32(0),  # monster_ai placeholder (unused)
                 jnp.int32(0),  # next_slot placeholder (unused)
+                _init_gcat, _init_gtyp, _init_gqty,
             )
             (
                 terrain_out, aa_out, lit_out, tt_out, vendor_rng_out,
                 _ma_unused, _ns_unused,
+                gcat_out, gtyp_out, gqty_out,
             ), _ = lax.scan(
                 fill_one_isaac,
                 init_carry,
                 jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
             )
-            state_out = state
+            if state is not None:
+                new_ground_items = state.ground_items.replace(
+                    category=gcat_out,
+                    type_id=gtyp_out,
+                    quantity=gqty_out,
+                )
+                state_out = state.replace(ground_items=new_ground_items)
+            else:
+                state_out = state
     new_features = features.replace(altar_alignment=aa_out, lit=lit_out)
     new_traps    = traps.replace(trap_type=tt_out)
     if state is None:
