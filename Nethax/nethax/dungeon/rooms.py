@@ -2506,14 +2506,14 @@ def fill_ordinary_rooms(
                 # rn2(3): 0 → CHEST, 1/2 → LARGE_BOX  (vendor mklev.c:854)
                 vrng_in, _box_type = randint_jax(vrng_in, (), 0, 3)
                 vrng_in, _rbx, _cbx = somexy(vrng_in)
-                # mksobj_init TOOL_CLASS for CHEST/LARGE_BOX (mkobj.c:1012-1021):
-                #   rn2(5)   → olocked
-                #   rn2(10)  → otrapped
-                #   rn2(100) → tknown (obvious trap check)
-                # Vendor cite: mkobj.c::mksobj_init lines 1012-1014.
+                # mksobj_init TOOL_CLASS for CHEST/LARGE_BOX (mkobj.c:920-924):
+                #   rn2(5)   → olocked   (mkobj.c:922)
+                #   rn2(10)  → otrapped  (mkobj.c:923)
+                # No tknown draw — vendor's switch falls through directly into
+                # mkbox_cnts (mkobj.c:929) with no further pre-cascade draws.
+                # Vendor cite: vendor/nle/src/mkobj.c:920-929.
                 vrng_in, _locked  = randint_jax(vrng_in, (), 0, 5)
                 vrng_in, _trapped = randint_jax(vrng_in, (), 0, 10)
-                vrng_in, _tknown  = randint_jax(vrng_in, (), 0, 100)
                 # mkbox_cnts cascade — vendor mkobj.c:274-353.
                 # box_otyp: rn2(3)==0 → CHEST (190), else → LARGE_BOX (189).
                 # Vendor cite: mkobj.c:274-353 (mkbox_cnts).
