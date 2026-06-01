@@ -695,6 +695,9 @@ def makerooms(
         jnp.int32(0),         # nroom
         jnp.bool_(False),     # tried_vault
         jnp.bool_(False),     # vault_success
+        jnp.int16(-1),        # vault_x — captured when vault create_room
+        jnp.int16(-1),        # vault_y    succeeds; survives the next-OROOM
+                              #            overwrite of the vault slot.
         jnp.bool_(True),      # alive
     )
 
@@ -702,7 +705,7 @@ def makerooms(
         (vrng, pool,
          rlx, rly, rhx, rhy, rlit,
          level_grid,
-         nroom, tried_vault, vault_success, alive) = carry
+         nroom, tried_vault, vault_success, vault_x, vault_y, alive) = carry
 
         # --- Step A: rnd_rect() — vendor mklev.c:229 ``while (nroom <
         # MAXNROFROOMS && rnd_rect())``.  C ``&&`` is strictly left-to-
@@ -856,17 +859,33 @@ def makerooms(
         # block draws and the nroom bump (mklev.c:738-762).
         new_vault_success = vault_success | (take_vault & cr_success)
 
+        # Capture vault_x/vault_y from the slot that create_room just wrote.
+        # When ``take_vault & cr_success``, the slot index is ``nroom``
+        # (vault path does NOT increment nroom; the OROOM-overwrite later
+        # WILL overwrite rlx/rly at this slot, but our captured copies
+        # survive).  Vendor mklev.c:234-235 sets static ``vault_x``,
+        # ``vault_y`` at this exact point and uses them in the
+        # do_vault block (mklev.c:738) independent of the sentinel ``hx=-1``
+        # that gets overwritten by the next OROOM iteration.  Without this
+        # capture, Nethax's branches.py vault gate based on
+        # ``rooms.x2 == -1`` mis-skips the vault grid stamp on every seed
+        # where the vault was overwritten — the seed=2 layout divergence.
+        capture_vault = take_vault & cr_success
+        new_vault_x = jnp.where(capture_vault, rlx[nroom], vault_x)
+        new_vault_y = jnp.where(capture_vault, rly[nroom], vault_y)
+
         return (
             vrng, pool,
             rlx, rly, rhx, rhy, rlit,
             level_grid,
-            nroom, new_tried_vault, new_vault_success, new_alive,
+            nroom, new_tried_vault, new_vault_success,
+            new_vault_x, new_vault_y, new_alive,
         )
 
     (vrng, pool,
      rlx, rly, rhx, rhy, rlit,
      _level_grid,
-     nroom, tried_vault, vault_success, _alive) = lax.fori_loop(
+     nroom, tried_vault, vault_success, vault_x, vault_y, _alive) = lax.fori_loop(
         0, MAXNROFROOMS, body, carry0,
     )
 
@@ -882,7 +901,7 @@ def makerooms(
         room_type=room_type,
         is_lit=rlit.astype(bool),
     )
-    return vrng, pool, rooms, active, nroom, tried_vault, vault_success
+    return vrng, pool, rooms, active, nroom, tried_vault, vault_success, vault_x, vault_y
 
 
 # ---------------------------------------------------------------------------

@@ -906,3 +906,131 @@ def randint_jax(rng: "Isaac64State", shape, minval, maxval) -> Tuple["Isaac64Sta
             ordered=True,
         )
     return new_rng, sampled
+
+
+# ---------------------------------------------------------------------------
+# JAX-traceable ISAAC64 init — usable inside @jax.jit and @jax.vmap.
+#
+# Mirrors ``isaac64_init`` + ``isaac64_reseed`` (vendor isaac64.c:114-155)
+# for the NLE 8-byte little-endian seed packing used by ``init_random``
+# (vendor/nle/src/hacklib.c:854-868 → packs seed as sizeof(unsigned long)=8
+# bytes LE on LP64).  The host-side ``init(seed: int)`` above remains the
+# eager path; ``init_jax`` is the traceable counterpart for vmap/jit.
+#
+# Verified bit-exact against ``init_py`` for seeds 0..1000 (see commit log).
+# ---------------------------------------------------------------------------
+
+# isaac64_mix SHIFT table (vendor isaac64.c:100).
+_MIX_SHIFT = (9, 9, 23, 15, 14, 20, 17, 14)
+
+
+def _isaac64_mix_jax(x: jax.Array) -> jax.Array:
+    """JAX-traceable ``isaac64_mix`` — mirrors ``_isaac64_mix`` (Python ref).
+
+    The vendor C ``for(i=0;i<8;i++)`` runs 4 outer iterations (i = 0,2,4,6)
+    because the body contains an explicit ``i++`` between two inner steps.
+    The first step uses ``SHIFT[i]`` with ``>>``; the second uses
+    ``SHIFT[i+1]`` with ``<<``.  See ``_isaac64_mix`` (lines 189-201 of this
+    module) for the byte-exact Python reference we match here.
+    """
+    xs = [x[i] for i in range(8)]
+
+    def step_shr(i: int, shift: int) -> None:
+        # x[i]            -= x[(i+4) & 7]
+        # x[(i+5) & 7]    ^= x[(i+7) & 7] >> shift
+        # x[(i+7) & 7]    += x[i]
+        xs[i] = (xs[i] - xs[(i + 4) & 7]) & _MASK64_U
+        xs[(i + 5) & 7] = xs[(i + 5) & 7] ^ jnp.right_shift(
+            xs[(i + 7) & 7], jnp.uint64(shift)
+        )
+        xs[(i + 7) & 7] = (xs[(i + 7) & 7] + xs[i]) & _MASK64_U
+
+    def step_shl(i: int, shift: int) -> None:
+        # Same as step_shr but the XOR uses LEFT shift.
+        xs[i] = (xs[i] - xs[(i + 4) & 7]) & _MASK64_U
+        xs[(i + 5) & 7] = xs[(i + 5) & 7] ^ (
+            jnp.left_shift(xs[(i + 7) & 7], jnp.uint64(shift)) & _MASK64_U
+        )
+        xs[(i + 7) & 7] = (xs[(i + 7) & 7] + xs[i]) & _MASK64_U
+
+    # Outer i = 0, 2, 4, 6; first step uses SHIFT[i] (>>), second SHIFT[i+1] (<<).
+    for i in (0, 2, 4, 6):
+        step_shr(i, _MIX_SHIFT[i])
+        step_shl(i + 1, _MIX_SHIFT[i + 1])
+
+    return jnp.stack(xs)
+
+
+def init_jax(seed: jax.Array) -> "Isaac64State":
+    """JAX-traceable ISAAC64 init.
+
+    Mirrors ``init(seed: int)`` / ``isaac64_init`` (vendor isaac64.c:114-155)
+    with the NLE seed packing (``seed & MASK64`` → 8 LE bytes, packed into
+    ``r[0]``).  All scalar/array operations are pure JAX so this works
+    inside ``@jax.jit`` and ``@jax.vmap``.
+
+    Bit-exact with ``init(seed)`` for any uint64 seed (verified on seeds
+    0..1000).  Use this when seeding under vmap (per-replica seeds) or
+    inside JIT-compiled reset paths; the host-side ``init`` remains the
+    eager fallback.
+    """
+    # 1. r[] starts all-zero; r[0] = seed (since seed packs into 8 LE bytes
+    #    and only r[0] is touched for an 8-byte seed).
+    seed_u64 = jnp.asarray(seed, dtype=jnp.uint64) & _MASK64_U
+    r0 = jnp.zeros((ISAAC64_SZ,), dtype=jnp.uint64).at[0].set(seed_u64)
+
+    # 2. x[0..7] = GOLDEN; 4 priming mix rounds (no input).
+    x = jnp.full((8,), jnp.uint64(GOLDEN), dtype=jnp.uint64)
+    for _ in range(4):
+        x = _isaac64_mix_jax(x)
+
+    # 3. First pass: for i in 0..256 step 8: x[j] += r[i+j]; mix(x); m[i..i+8] = x.
+    m0 = jnp.zeros((ISAAC64_SZ,), dtype=jnp.uint64)
+
+    def first_pass_body(carry, blk):
+        x_c, m_c = carry
+        r_slice = jax.lax.dynamic_slice(r0, (blk * jnp.uint32(8),), (8,))
+        x_n = (x_c + r_slice) & _MASK64_U
+        x_n = _isaac64_mix_jax(x_n)
+        m_n = jax.lax.dynamic_update_slice(m_c, x_n, (blk * jnp.uint32(8),))
+        return (x_n, m_n), None
+
+    (x, m1), _ = jax.lax.scan(
+        first_pass_body, (x, m0), jnp.arange(ISAAC64_SZ // 8, dtype=jnp.uint32)
+    )
+
+    # 4. Second pass: same shape but mixing in m[i..i+8] (now populated).
+    def second_pass_body(carry, blk):
+        x_c, m_c = carry
+        m_slice = jax.lax.dynamic_slice(m_c, (blk * jnp.uint32(8),), (8,))
+        x_n = (x_c + m_slice) & _MASK64_U
+        x_n = _isaac64_mix_jax(x_n)
+        m_n = jax.lax.dynamic_update_slice(m_c, x_n, (blk * jnp.uint32(8),))
+        return (x_n, m_n), None
+
+    (_x, m2), _ = jax.lax.scan(
+        second_pass_body, (x, m1), jnp.arange(ISAAC64_SZ // 8, dtype=jnp.uint32)
+    )
+
+    # 5. One isaac64_update — reuse the existing JAX-traceable refill.
+    pre = Isaac64State(
+        m=m2,
+        r=r0,
+        a=jnp.uint64(0),
+        b=jnp.uint64(0),
+        c=jnp.uint64(0),
+        n=jnp.int32(0),
+        draws=jnp.zeros((), dtype=jnp.int64),
+    )
+    refilled = _isaac64_refill_jax(pre)
+
+    # 6. n = ISAAC64_SZ (refill already sets this).  Zero draws.
+    return Isaac64State(
+        m=refilled.m,
+        r=refilled.r,
+        a=refilled.a,
+        b=refilled.b,
+        c=refilled.c,
+        n=jnp.int32(ISAAC64_SZ),
+        draws=jnp.zeros((), dtype=jnp.int64),
+    )

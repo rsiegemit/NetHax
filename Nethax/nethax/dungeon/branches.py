@@ -889,7 +889,7 @@ def enter_branch(state: DungeonState, branch_id: int) -> DungeonState:
     )
 
 
-def _sort_rooms_by_lx(rooms, active):
+def _sort_rooms_by_lx(rooms, active, nroom=None):
     """Reorder rooms by ``lx`` ascending — vendor ``sort_rooms()``.
 
     Vendor mklev.c:707 qsorts ``rooms[0..nroom)`` using ``do_comp``
@@ -898,19 +898,42 @@ def _sort_rooms_by_lx(rooms, active):
     walk, make_niches) then indexes the lx-sorted array, so the sort must
     run before any of those draws to keep the ISAAC64 stream byte-exact.
 
+    CRITICAL: vendor sorts ONLY the first ``nroom`` entries (the OROOM
+    range).  When a vault was created in makerooms, the vault slot sits
+    at index ``nroom`` (just past the OROOM range) with a sentinel
+    ``hx=-1``, and is NOT touched by the sort.  If we pass the vault
+    slot through the sort key, the vault's real ``lx`` interleaves it
+    among the OROOMs and every downstream room-index shifts — the
+    seed=2 structural divergence cause.
+
     Inactive slots carry the lx == -1 sentinel from makerooms.  We key
-    them to a large value (COLNO+1 = 81 > any real lx) so they land after
-    every active room, matching vendor's "sort only the first nroom
-    entries; leave the tail untouched" behaviour.  Stable sort (argsort)
-    handles equal-lx ties deterministically; distinct lx is the common
-    case for non-overlapping rooms.
+    them — AND the vault slot when ``nroom`` is supplied — to a large
+    value (COLNO+1 = 81 > any real lx) so they land after every active
+    room, matching vendor's "sort only the first nroom entries; leave
+    the tail untouched" behaviour.  Stable sort (argsort) handles equal-
+    lx ties deterministically; distinct lx is the common case for non-
+    overlapping rooms.
+
+    Args:
+        rooms: Room pytree.
+        active: bool[MAX_ROOMS_PER_LEVEL] — slots with lx >= 0.
+        nroom: int32 scalar or None — vendor's pre-vault nroom (the
+            OROOM count from makerooms).  When supplied, only slots
+            with index < nroom participate in the sort; slots at or
+            beyond nroom (including the vault) sink to the tail.  When
+            ``None`` (Threefry path or legacy callers), every active
+            slot is sorted.
 
     Citation: vendor/nle/src/mklev.c:707 (sort_rooms),
               vendor/nle/src/mklev.c:46-66 (do_comp keys on lx),
               vendor/nle/src/mklev.c:98-107 (qsort by do_comp).
     """
-    # Sort key: active rooms by lx; inactive sink to the back.
-    sort_key = jnp.where(active, rooms.x1.astype(jnp.int32), jnp.int32(81))
+    if nroom is not None:
+        slot_idx = jnp.arange(rooms.x1.shape[0], dtype=jnp.int32)
+        sort_eligible = active & (slot_idx < nroom.astype(jnp.int32))
+    else:
+        sort_eligible = active
+    sort_key = jnp.where(sort_eligible, rooms.x1.astype(jnp.int32), jnp.int32(81))
     order = jnp.argsort(sort_key, stable=True)
     sorted_rooms = jax.tree_util.tree_map(lambda f: f[order], rooms)
     sorted_active = active[order]
@@ -985,7 +1008,7 @@ def generate_main_branch_l1(
         from Nethax.nethax.dungeon.rooms import makerooms
         from Nethax.nethax.dungeon.rect_pool import init_rect
         pool0 = init_rect()
-        vendor_rng, _pool, rooms, active, _nroom, _tried_vault, _vault_success = makerooms(
+        vendor_rng, _pool, rooms, active, _nroom, _tried_vault, _vault_success, _mk_vault_x, _mk_vault_y = makerooms(
             vendor_rng, pool0, depth=1,
         )
 
@@ -1030,7 +1053,13 @@ def generate_main_branch_l1(
         # Citation: vendor/nle/src/mklev.c:707 (sort_rooms),
         #           vendor/nle/src/mklev.c:46-66 (do_comp, lx-only key),
         #           vendor/nle/src/mklev.c:98-107 (qsort by do_comp).
-        rooms, active = _sort_rooms_by_lx(rooms, active)
+        # Pass _nroom (vendor's pre-vault OROOM count) so the vault slot
+        # at index _nroom is excluded from the sort, matching vendor's
+        # "sort only rooms[0..nroom)" semantics (mklev.c:707).  Without
+        # this, the vault's real lx interleaves it among the OROOMs and
+        # every downstream room-index shifts — the seed=2 layout
+        # divergence cause.
+        rooms, active = _sort_rooms_by_lx(rooms, active, nroom=_nroom)
     else:
         # Threefry layout path (non-parity): original rejection sampler.
         rooms, active, vendor_rng = generate_rooms(
@@ -1095,12 +1124,30 @@ def generate_main_branch_l1(
     if vendor_rng is not None:
         from Nethax.nethax.vendor_rng import rn2_jax, rn1_jax
 
-        # Vendor reads ``nroom`` as the active count.  Phase 2/3's
-        # makerooms uses the same definition (rooms with lx >= 0).  We
-        # derive it from the active mask so this path remains correct
-        # whether `rooms` came from the existing Threefry-pre-sample
-        # generate_rooms or from Phase 3's makerooms output.
-        nroom_int = active.sum().astype(jnp.int32)
+        # Vendor's stair-pick / makecorridors / make_niches all use
+        # ``nroom`` as it stood at the END of makerooms — which is the
+        # OROOM count, EXCLUDING the vault.  Vendor's add_room(VAULT) in
+        # the do_vault block (mklev.c:746) bumps nroom by +1, but that
+        # runs AFTER the stair picks (mklev.c:710-727) and after
+        # makecorridors+make_niches (mklev.c:734-736).  So pre-vault
+        # nroom is what we want here.
+        #
+        # ``active.sum()`` (the old computation) INCLUDED the vault slot
+        # when the sentinel hx=-1 survived the makerooms loop (which
+        # happens when makerooms exits right after the vault attempt
+        # with no subsequent OROOM overwriting the slot).  In that case
+        # active.sum() = _nroom + 1, producing a +1 modulus mismatch on
+        # every post-makerooms rn2(nroom) draw — the seed=2 structural
+        # divergence cause.  Use the makerooms-returned ``_nroom``
+        # directly: that's the OROOM-increment counter (rooms.py: vault
+        # path explicitly does NOT increment nroom, see
+        # ``incremented = success & ~vault``), so it always reflects the
+        # vendor pre-vault nroom regardless of whether the vault slot
+        # was overwritten or survived.
+        # Vendor cite: vendor/nle/src/mklev.c:200 (add_room nroom++),
+        #              vendor/nle/src/mklev.c:710 (stair-pick rn2(nroom),
+        #              runs BEFORE do_vault at line 738).
+        nroom_int = _nroom.astype(jnp.int32)
 
         # Mask draws when nroom == 0 (vendor: rn2(0) would divide by
         # zero — but vendor only reaches line 710 after makerooms
@@ -1346,6 +1393,16 @@ def generate_main_branch_l1(
         # The vault slot is identified post-sort_rooms by the hx=-1 sentinel
         # written in _invoke_create_room (rooms.py:542) on a successful
         # vault create_room.  We use the slot's (x1, y1) as vault_x, vault_y.
+        # NOTE: when the vault slot is overwritten by a subsequent OROOM in
+        # makerooms, the sentinel is lost.  The makerooms-captured
+        # _mk_vault_x/_mk_vault_y survive this overwrite, but switching
+        # branches.py to use them unconditionally REGRESSED seed=1 (vault
+        # topology intersected downstream draws that previously avoided it
+        # because no stamping happened).  Keeping the sentinel-based gate
+        # here matches the pre-vault_x/y behavior; the makerooms
+        # vault_x/vault_y carry is available for future use but is not
+        # currently consumed.  TODO: investigate why seed=1 regresses when
+        # vault stamping fires unconditionally.
         _vault_slot_active = active & (rooms.x2 == jnp.int16(-1))
         _vault_present = _vault_slot_active.any() & _vault_created_in_makerooms
         # Find first vault slot index; argmax of bool returns the first True.
