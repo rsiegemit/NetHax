@@ -35,6 +35,52 @@ import jax.numpy as jnp
 import jax.lax as lax
 
 from Nethax.nethax.dungeon.branches import MAP_H, MAP_W
+from Nethax.nethax.vendor_rng import Isaac64State, rn2_jax
+
+
+# ---------------------------------------------------------------------------
+# RNG dispatch helper — supports BOTH JAX PRNG keys (Threefry, legacy) and
+# vendor ISAAC64 state (byte-exact, future Mines/Sokoban byteparity).
+# ---------------------------------------------------------------------------
+#
+# Existing callers (branches.py Gehennom path, ~Dlvl 24+) pass a JAX PRNG
+# key; those code paths never run on Dlvl 1, so byteparity at seed=0 is
+# unaffected.  When a future caller threads through ``Isaac64State`` (the
+# vendor ISAAC64 stream consumed in branches.py mklev/mkmaze paths), the
+# dispatch routes every draw through ``rn2_jax`` so the byte ordering of
+# the ISAAC64 stream matches vendor C exactly.
+#
+# The branch is a Python-level ``isinstance`` check (resolved at trace time,
+# not by a tracer), so JIT/vmap see only one specialised path per call site.
+# ---------------------------------------------------------------------------
+
+
+def _is_vendor_rng(rng) -> bool:
+    """Trace-time test: is ``rng`` a vendor ``Isaac64State`` or a JAX PRNG key?
+
+    Resolved at Python time (no tracer involvement), so the resulting code
+    has a single specialised branch under JIT.
+    """
+    return isinstance(rng, Isaac64State)
+
+
+def _draw_rn2(rng, n):
+    """Draw a uniform int in ``[0, n)`` from ``rng``; return ``(new_rng, val)``.
+
+    Vendor path (Isaac64State): one ``rn2_jax(rng, n)`` draw — byte-exact
+        vs vendor ``rnd.c::rn2`` under USE_ISAAC64.
+    Legacy path (JAX PRNGKey): ``jax.random.split`` + ``randint`` — preserves
+        prior Threefry behaviour for the existing Gehennom caller.
+
+    ``n`` may be a Python int or a JAX scalar (must be > 0 either way).
+    """
+    if _is_vendor_rng(rng):
+        return rn2_jax(rng, n)
+    new_rng, sub = jax.random.split(rng)
+    val = jax.random.randint(sub, (), 0, n, dtype=jnp.int32)
+    return new_rng, val
+
+
 
 # ---------------------------------------------------------------------------
 # Tile constants (int8 values for map arrays)
@@ -219,9 +265,10 @@ def walkfrom_vendor(
 
         def do_push(s):
             r_, t_, st_, p_ = s
-            # rn2(q): uniform int in [0, q).
-            r_, sub = jax.random.split(r_)
-            i = jax.random.randint(sub, (), 0, q, dtype=jnp.int32)
+            # rn2(q): uniform int in [0, q).  Vendor mkmaze.c:1247 draws
+            # exactly one ISAAC64 word via rn2(q); _draw_rn2 dispatches to
+            # rn2_jax for vendor RNG state or Threefry for legacy callers.
+            r_, i = _draw_rn2(r_, q)
             dir_ = dirs[i]
             dy = _DIR_DY[dir_]
             dx = _DIR_DX[dir_]
@@ -282,11 +329,21 @@ def generate_maze_kruskal(
     # Pick a random odd starting cell — vendor maze0xy() (mkmaze.c:309-314)
     # selects from `3 + 2*rn2(...)`; we use 1 + 2*rn2(...) since our maze
     # boundary lives at row/col 0 (vendor reserves rows 0-2 / cols 0-2).
-    rng, sub_y, sub_x = jax.random.split(rng, 3)
+    # Vendor draw order: maze0xy makes two sequential rn2 calls -- one for
+    # y, one for x -- which the dispatch below honours for ISAAC64 callers.
+    # Legacy Threefry callers keep their original 3-way split for backward
+    # compatibility (existing Gehennom layouts).
     n_cell_rows = max((h - 2) // 2, 1)
     n_cell_cols = max((w - 2) // 2, 1)
-    sy = 1 + 2 * jax.random.randint(sub_y, (), 0, n_cell_rows, dtype=jnp.int32)
-    sx = 1 + 2 * jax.random.randint(sub_x, (), 0, n_cell_cols, dtype=jnp.int32)
+    if _is_vendor_rng(rng):
+        rng, ry = _draw_rn2(rng, jnp.int32(n_cell_rows))
+        rng, rx = _draw_rn2(rng, jnp.int32(n_cell_cols))
+        sy = jnp.int32(1) + jnp.int32(2) * ry
+        sx = jnp.int32(1) + jnp.int32(2) * rx
+    else:
+        rng, sub_y, sub_x = jax.random.split(rng, 3)
+        sy = 1 + 2 * jax.random.randint(sub_y, (), 0, n_cell_rows, dtype=jnp.int32)
+        sx = 1 + 2 * jax.random.randint(sub_x, (), 0, n_cell_cols, dtype=jnp.int32)
 
     terrain = jnp.zeros((h, w), dtype=jnp.int8)  # all walls
     _rng_out, terrain_out = walkfrom_vendor(rng, terrain, sy, sx)
@@ -443,12 +500,21 @@ def generate_maze_dfs(
         (map_array, h, w) — int8[h, w]; TILE_WALL=0, TILE_FLOOR=1.
     """
     # Vendor maze0xy picks a random odd-coord starting cell; we mirror by
-    # picking from the odd-cell grid inside the boundary.
-    rng, sub_y, sub_x = jax.random.split(rng, 3)
+    # picking from the odd-cell grid inside the boundary.  Vendor-RNG
+    # callers consume the ISAAC64 stream via two sequential rn2 draws
+    # (matching maze0xy's two-rn2 pattern); legacy Threefry callers keep
+    # the original 3-way split for backward compatibility.
     n_cell_rows = max((h - 2) // 2, 1)
     n_cell_cols = max((w - 2) // 2, 1)
-    sy = 1 + 2 * jax.random.randint(sub_y, (), 0, n_cell_rows, dtype=jnp.int32)
-    sx = 1 + 2 * jax.random.randint(sub_x, (), 0, n_cell_cols, dtype=jnp.int32)
+    if _is_vendor_rng(rng):
+        rng, ry = _draw_rn2(rng, jnp.int32(n_cell_rows))
+        rng, rx = _draw_rn2(rng, jnp.int32(n_cell_cols))
+        sy = jnp.int32(1) + jnp.int32(2) * ry
+        sx = jnp.int32(1) + jnp.int32(2) * rx
+    else:
+        rng, sub_y, sub_x = jax.random.split(rng, 3)
+        sy = 1 + 2 * jax.random.randint(sub_y, (), 0, n_cell_rows, dtype=jnp.int32)
+        sx = 1 + 2 * jax.random.randint(sub_x, (), 0, n_cell_cols, dtype=jnp.int32)
 
     terrain = jnp.zeros((h, w), dtype=jnp.int8)
     _rng_out, terrain_out = walkfrom_vendor(rng, terrain, sy, sx)
