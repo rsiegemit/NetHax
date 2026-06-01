@@ -1293,6 +1293,18 @@ def generate_main_branch_l1(
         # vault path was taken in makerooms (``tried_vault`` AND an active
         # slot carries the hx=-1 sentinel), vendor performs:
         #
+        #   check_room(vault_x, w=1, vault_y, h=1, TRUE)  — sp_lev.c:1063
+        #     Scans cells in the area [vault_x-xlim .. vault_x+1+xlim] x
+        #     [vault_y-ylim .. vault_y+1+ylim] (xlim=ylim=XLIM/YLIM+1=5).
+        #     For each non-stone cell encountered, draws rn2(3).  On Main
+        #     Dlvl 1 with a typical vault placement chosen by makerooms'
+        #     create_vault (which uses rnd_rect and avoids existing rooms),
+        #     the vault area is fully stone and check_room consumes ZERO
+        #     RNG draws, returning TRUE immediately.  (If makecorridors had
+        #     cut through the vault footprint, check_room would draw and
+        #     potentially fail, falling through to the retry path at line
+        #     754 — which is a separate code path with its own draws.)
+        #
         #   fill_room(&rooms[nroom-1], FALSE)        — sp_lev.c:2447-2452
         #     for each of 4 vault interior tiles:
         #         mkgold(rn1(abs(depth) * 100, 51), x, y)
@@ -1305,9 +1317,98 @@ def generate_main_branch_l1(
         #   if (!noteleport && !rn2(3)) makevtele();  — mklev.c:752
         #     noteleport=0 on Dlvl 1 (mklev.c:622); 1 rn2(3) is drawn.
         #
-        # Net for Dlvl 1 vault path: 4 rn2(100) + 1 rn2(3) = 5 draws.
+        # Net for Dlvl 1 vault path (check_room success on first try):
+        # 4 rn2(100) + 1 rn2(3) = 5 draws.
         # ------------------------------------------------------------------
         from Nethax.nethax.vendor_rng import rn2_jax as _rn2_jax_do_vault
+
+        # Stamp the vault footprint into vendor_levl_grid so that mineralize's
+        # all-STONE 3x3 neighbourhood scan sees the placed vault cells as
+        # non-stone (vendor cite: mklev.c:746-750 add_room+fill_room places
+        # VAULT walls + ROOM interior into levl[][]).  Without this, the
+        # mineralize STONE scan would draw extra rn2(1000) gold/gem rolls on
+        # cells that vendor has already converted to non-stone, over-drawing
+        # the ISAAC64 stream by ~76 bytes for a 2x2 vault footprint (vault
+        # walls block ~38 candidate cells × 2 rn2(1000) per cell).
+        #
+        # Vendor's add_room writes:
+        #   HWALL on (lx-1..hx+1) × (ly-1, hy+1)
+        #   VWALL on (lx-1, hx+1) × (ly..hy)
+        #   ROOM  on interior (lx..hx) × (ly..hy)
+        # where for vault: w=h=1 so interior is 2x2 at (vault_x..vault_x+1)
+        # × (vault_y..vault_y+1), and walls extend one cell outward.
+        #
+        # The vault slot is identified post-sort_rooms by the hx=-1 sentinel
+        # written in _invoke_create_room (rooms.py:542) on a successful
+        # vault create_room.  We use the slot's (x1, y1) as vault_x, vault_y.
+        _vault_slot_active = active & (rooms.x2 == jnp.int16(-1))
+        _vault_present = _vault_slot_active.any() & _vault_created_in_makerooms
+        # Find first vault slot index; argmax of bool returns the first True.
+        _v_idx = jnp.argmax(_vault_slot_active.astype(jnp.int32))
+        _vault_x = rooms.x1[_v_idx].astype(jnp.int32)
+        _vault_y = rooms.y1[_v_idx].astype(jnp.int32)
+        # Vault interior bounds (w=h=1 → interior is 2 cells wide/tall):
+        #   lx = vault_x, hx = vault_x + 1
+        #   ly = vault_y, hy = vault_y + 1
+        _v_lx = _vault_x
+        _v_hx = _vault_x + jnp.int32(1)
+        _v_ly = _vault_y
+        _v_hy = _vault_y + jnp.int32(1)
+
+        # Stamp vault walls + interior into vendor_levl_grid (which is in
+        # [ROWNO, COLNO] orientation, i.e. [y, x] with VTILE_STONE=0,
+        # VTILE_HWALL=2, VTILE_VWALL=1, VTILE_ROOM=11).  Only stamp when
+        # the vault was actually created.
+        from Nethax.nethax.dungeon.corridors import (
+            VTILE_HWALL as _V_H, VTILE_VWALL as _V_V, VTILE_ROOM as _V_R,
+        )
+        _vh, _vw = vendor_levl_grid.shape  # [ROWNO, COLNO]
+        _y_axis = jnp.arange(_vh, dtype=jnp.int32)[:, None]  # rows
+        _x_axis = jnp.arange(_vw, dtype=jnp.int32)[None, :]  # cols
+        # Wall band: x ∈ [lx-1, hx+1], y ∈ [ly-1, hy+1].
+        _wall_x = (_x_axis >= _v_lx - 1) & (_x_axis <= _v_hx + 1)
+        _wall_y = (_y_axis >= _v_ly - 1) & (_y_axis <= _v_hy + 1)
+        _interior = (
+            (_x_axis >= _v_lx) & (_x_axis <= _v_hx)
+            & (_y_axis >= _v_ly) & (_y_axis <= _v_hy)
+        )
+        # Top/bottom HWALL rows (within wall-x band).
+        _hwall = _wall_x & ((_y_axis == _v_ly - 1) | (_y_axis == _v_hy + 1))
+        # Left/right VWALL cols (only for y ∈ [ly, hy], NOT the corners).
+        _vwall = (
+            ((_x_axis == _v_lx - 1) | (_x_axis == _v_hx + 1))
+            & (_y_axis >= _v_ly) & (_y_axis <= _v_hy)
+        )
+        _corner = (
+            ((_x_axis == _v_lx - 1) | (_x_axis == _v_hx + 1))
+            & ((_y_axis == _v_ly - 1) | (_y_axis == _v_hy + 1))
+        )
+        _gate = _vault_present
+        _new_grid = vendor_levl_grid
+        _new_grid = jnp.where(_gate & _hwall, jnp.int8(_V_H), _new_grid)
+        _new_grid = jnp.where(_gate & _vwall, jnp.int8(_V_V), _new_grid)
+        _new_grid = jnp.where(_gate & _interior, jnp.int8(_V_R), _new_grid)
+        # Corners stamped as ROOM-equivalent (matching stamp_rooms_into_typ).
+        _new_grid = jnp.where(_gate & _corner, jnp.int8(_V_R), _new_grid)
+        vendor_levl_grid = _new_grid
+
+        # Also stamp the vault FLOOR into the rendered ``terrain`` array so
+        # the obs/gameplay surface shows the 2x2 vault interior (vendor's
+        # fill_room emits gold there; we don't materialise the gold but the
+        # FLOOR tiles need to be present for any future hero teleport into
+        # the vault to be playable).  ``terrain`` is in [ROWNO, COLNO] using
+        # TileType.FLOOR=1.
+        from Nethax.nethax.constants.tiles import TileType as _TT_v
+        _FLOOR = jnp.int8(int(_TT_v.FLOOR))
+        _WALL  = jnp.int8(int(_TT_v.WALL))
+        terrain = jnp.where(_gate & _interior, _FLOOR, terrain)
+        # Stamp walls so the rendered terrain shows the vault perimeter.
+        # NOTE: do NOT overwrite if cell is already FLOOR/CORRIDOR — but
+        # since the vault placement is gated on check_room (no overlap),
+        # the wall band is on STONE, so a simple where(_gate & wall, WALL)
+        # is safe.
+        _wall_cells = (_hwall | _vwall | _corner)
+        terrain = jnp.where(_gate & _wall_cells, _WALL, terrain)
 
         def _do_vault_draws(v):
             v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 0

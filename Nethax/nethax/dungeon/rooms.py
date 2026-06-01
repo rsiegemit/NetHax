@@ -3064,20 +3064,25 @@ def maybe_create_vault(
     # the moment vendor's makerooms loop fires (mklev.c:230), AND the
     # do_vault fill_room + makevtele draws (4×rn2(100) + rn2(3)) are emitted
     # INSIDE :func:`generate_main_branch_l1` BEFORE place_branch (matching
-    # vendor mklev.c:738-762 → 800 order).  So this wrapper must NOT emit
-    # another rn2(2) here — doing so over-draws the ISAAC64 stream and
-    # shifts every subsequent vendor draw by one byte.  Use the makerooms-
-    # produced ``tried_vault`` flag instead (threaded via state pytree once
-    # the wrapper rewires); for now, gate purely on rooms_ok so the
-    # candidate sweep + stamping always runs when possible.
+    # vendor mklev.c:738-762 → 800 order).  Furthermore, the vault terrain
+    # stamping (walls + 2x2 FLOOR interior) is now done INSIDE
+    # ``generate_main_branch_l1`` at the actual vendor-chosen ``vault_x,
+    # vault_y`` (read from the post-sort_rooms vault slot with hx==-1
+    # sentinel).  So on the vendor_rng path this wrapper must NOT stamp a
+    # second Threefry-chosen vault into ``terrain`` — that would either
+    # double-stamp (corrupt obs) or stamp at a non-vendor location.  We
+    # therefore force ``gate=False`` on the vendor_rng path, leaving the
+    # vault placement entirely to the upstream byte-exact code.
     # Threefry path: jax.random fallback (NLE default mode).
     vrng = vendor_rng
     if vendor_rng is not None:
-        coin = jnp.bool_(True)  # post-makerooms: assume vault gate already fired
+        # Vendor placement is handled upstream in generate_main_branch_l1's
+        # do_vault block — skip the Threefry fallback stamping here.
+        gate = jnp.bool_(False)
     else:
         coin = jax.random.randint(k_coin, (), 0, 2, dtype=jnp.int32) == jnp.int32(0)
-    # Combined gate (drops the rn2(2) when room count not met).
-    gate = rooms_ok & coin
+        # Combined gate (drops the rn2(2) when room count not met).
+        gate = rooms_ok & coin
 
     # ---- Candidate sweep -----------------------------------------------------
     # We tile the map with 2x2 candidate slots on a 4-cell stride to ensure
