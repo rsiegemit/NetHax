@@ -985,27 +985,32 @@ def generate_main_branch_l1(
         from Nethax.nethax.dungeon.rooms import makerooms
         from Nethax.nethax.dungeon.rect_pool import init_rect
         pool0 = init_rect()
-        vendor_rng, _pool, rooms, active, _nroom, _tried_vault = makerooms(
+        vendor_rng, _pool, rooms, active, _nroom, _tried_vault, _vault_success = makerooms(
             vendor_rng, pool0, depth=1,
         )
 
-        # Save tried_vault so we can emit do_vault block draws AFTER make_niches
+        # Save vault_success so we can emit do_vault block draws AFTER make_niches
         # but BEFORE place_branch (matching vendor mklev.c:738-762 → 800 order).
-        # Use tried_vault as the proxy for vault creation; if create_room itself
-        # failed in the vault attempt, the fill_room body never runs in vendor
-        # — but if the rn2(2) gate fires AND vendor create_vault succeeds, the
-        # do_vault block runs.  For now, use tried_vault as a coarse gate and
-        # check empirically; refine to (tried_vault & vault_success) if needed.
-        # Vendor's do_vault block calls ``add_room(...VAULT)`` which BOTH
-        # fills a rooms[] slot AND increments nroom (mklev.c:200 in add_room).
-        # So when vault succeeds, vendor's nroom is bumped by 1 at do_vault
-        # time; all subsequent ``rn2(nroom)`` calls (place_branch, etc.) use
-        # the bumped value.  Nethax's makerooms vault path does NOT increment
+        # Vendor's do_vault block (mklev.c:738) is gated on ``vault_x != -1``
+        # which is set inside ``create_vault()`` ONLY when create_room(vault)
+        # returned success (mklev.c:233 ``if (create_vault())`` branch).  So
+        # ``tried_vault`` alone is insufficient: a seed that *attempted* a
+        # vault and FAILED create_room would burn ``tried_vault`` but NOT run
+        # the do_vault block — vendor draws 0 do_vault bytes in that case.
+        # Use ``vault_success`` (returned from makerooms, computed as
+        # ``take_vault & cr_success`` in the body) to gate the 5 do_vault
+        # draws + nroom bump.  Vendor's do_vault block calls
+        # ``add_room(...VAULT)`` which BOTH fills a rooms[] slot AND
+        # increments nroom (mklev.c:200 in add_room).  So when vault
+        # succeeds, vendor's nroom is bumped by 1 at do_vault time; all
+        # subsequent ``rn2(nroom)`` calls (place_branch, etc.) use the
+        # bumped value.  Nethax's makerooms vault path does NOT increment
         # nroom (rooms.py:577 ``incremented = success & ~vault``), so we
         # manually bump it here before place_branch.  Vendor cite:
         # vendor/nle/src/mklev.c:200 (add_room nroom++);
+        # vendor/nle/src/mklev.c:233-235 (create_vault success branch);
         # vendor/nle/src/mklev.c:738-762 (do_vault block calls add_room).
-        _vault_created_in_makerooms = _tried_vault
+        _vault_created_in_makerooms = _vault_success
         _nroom_post_vault = jnp.where(
             _vault_created_in_makerooms, _nroom + jnp.int32(1), _nroom,
         )

@@ -642,16 +642,24 @@ def makerooms(
                     abs(depth))`` for the vault lit roll.
 
     Returns:
-        ``(vendor_rng, rect_pool, rooms, active, nroom, tried_vault)``::
+        ``(vendor_rng, rect_pool, rooms, active, nroom, tried_vault, vault_success)``::
 
-          vendor_rng  : updated Isaac64State
-          rect_pool   : updated RectPool (Phase 2 mutates via split_rects)
-          rooms       : Room pytree of length MAX_ROOMS_PER_LEVEL.  Phase
-                        2 fills coordinate slots; in the stub path every
-                        slot is sentinel -1.
-          active      : bool[MAX_ROOMS_PER_LEVEL] mask
-          nroom       : int32 — number of placed rooms
-          tried_vault : bool — whether the vault side-attempt was made
+          vendor_rng    : updated Isaac64State
+          rect_pool     : updated RectPool (Phase 2 mutates via split_rects)
+          rooms         : Room pytree of length MAX_ROOMS_PER_LEVEL.  Phase
+                          2 fills coordinate slots; in the stub path every
+                          slot is sentinel -1.
+          active        : bool[MAX_ROOMS_PER_LEVEL] mask
+          nroom         : int32 — number of placed rooms
+          tried_vault   : bool — whether the vault side-attempt was made
+          vault_success : bool — whether the vault create_room actually
+                          succeeded.  Vendor only runs do_vault block and
+                          bumps nroom when create_vault() returns success
+                          (mklev.c:233 ``if (create_vault())`` branch).
+                          tried_vault alone overcounts on seeds where the
+                          attempt was made but create_room failed —
+                          producing 5 extra ISAAC64 draws (4 rn2(100) +
+                          1 rn2(3)) of stream drift downstream.
     """
     from Nethax.nethax.dungeon.rect_pool import rnd_rect
     from Nethax.nethax.vendor_rng import rn2_jax
@@ -659,15 +667,19 @@ def makerooms(
     abs_depth = abs(int(depth))
 
     # Carry layout (kept flat so lax.fori_loop sees a simple pytree).
-    #   vrng        : Isaac64State
-    #   pool        : RectPool
-    #   rooms_lx..  : int16[MAX_ROOMS_PER_LEVEL]
-    #   rooms_lit   : int8[MAX_ROOMS_PER_LEVEL]
-    #   nroom       : int32 scalar
-    #   tried_vault : bool scalar
-    #   alive       : bool scalar — once False, every remaining iteration
-    #                 short-circuits all draws to mirror vendor's early
-    #                 exit from the ``while`` loop.
+    #   vrng          : Isaac64State
+    #   pool          : RectPool
+    #   rooms_lx..    : int16[MAX_ROOMS_PER_LEVEL]
+    #   rooms_lit     : int8[MAX_ROOMS_PER_LEVEL]
+    #   nroom         : int32 scalar
+    #   tried_vault   : bool scalar — sticky one-shot flag (matches vendor)
+    #   vault_success : bool scalar — sticky flag; True only when an actual
+    #                   create_room(...vault=True) returned success.  Used
+    #                   downstream (branches.py do_vault block) to gate the
+    #                   5 do_vault draws and the nroom bump.
+    #   alive         : bool scalar — once False, every remaining iteration
+    #                   short-circuits all draws to mirror vendor's early
+    #                   exit from the ``while`` loop.
     init_coords = jnp.full((MAX_ROOMS_PER_LEVEL,), -1, dtype=jnp.int16)
     init_lit    = jnp.zeros((MAX_ROOMS_PER_LEVEL,), dtype=jnp.int8)
     # int8[ROWNO, COLNO] non-stone bitmap consumed by create_room's
@@ -682,6 +694,7 @@ def makerooms(
         init_level_grid,
         jnp.int32(0),         # nroom
         jnp.bool_(False),     # tried_vault
+        jnp.bool_(False),     # vault_success
         jnp.bool_(True),      # alive
     )
 
@@ -689,7 +702,7 @@ def makerooms(
         (vrng, pool,
          rlx, rly, rhx, rhy, rlit,
          level_grid,
-         nroom, tried_vault, alive) = carry
+         nroom, tried_vault, vault_success, alive) = carry
 
         # --- Step A: rnd_rect() — vendor mklev.c:229 ``while (nroom <
         # MAXNROFROOMS && rnd_rect())``.  C ``&&`` is strictly left-to-
@@ -835,17 +848,25 @@ def makerooms(
         oroom_failed = do_create_branch & (~take_vault) & (~cr_success)
         new_alive = still_alive & (~oroom_failed)
 
+        # Sticky vault_success flag: True iff the vault create_room actually
+        # placed the slot.  ``take_vault`` is the post-check_room success
+        # gate from vendor mklev.c:233 ``if (create_vault())``; combined
+        # with ``cr_success`` from _invoke_create_room it yields the true
+        # vendor success condition.  Used downstream to gate the do_vault
+        # block draws and the nroom bump (mklev.c:738-762).
+        new_vault_success = vault_success | (take_vault & cr_success)
+
         return (
             vrng, pool,
             rlx, rly, rhx, rhy, rlit,
             level_grid,
-            nroom, new_tried_vault, new_alive,
+            nroom, new_tried_vault, new_vault_success, new_alive,
         )
 
     (vrng, pool,
      rlx, rly, rhx, rhy, rlit,
      _level_grid,
-     nroom, tried_vault, _alive) = lax.fori_loop(
+     nroom, tried_vault, vault_success, _alive) = lax.fori_loop(
         0, MAXNROFROOMS, body, carry0,
     )
 
@@ -861,7 +882,7 @@ def makerooms(
         room_type=room_type,
         is_lit=rlit.astype(bool),
     )
-    return vrng, pool, rooms, active, nroom, tried_vault
+    return vrng, pool, rooms, active, nroom, tried_vault, vault_success
 
 
 # ---------------------------------------------------------------------------
