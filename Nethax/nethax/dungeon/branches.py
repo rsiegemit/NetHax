@@ -3144,8 +3144,251 @@ def _place_dungeon_levels(vendor_rng, num_dunlevs, protos):
 
 
 # ---------------------------------------------------------------------------
-# init_dungeons fixed ISAAC64 pre-draws
+# JAX-traceable place_level (lax.while_loop port of the recursive backtrack)
 # ---------------------------------------------------------------------------
+
+# Static upper bounds.  Largest dungeon in dungeon.def is Gehennom (11 protos);
+# largest num_dunlevs is DoD lev.rand=5 base=25 -> max 30.  Sized with headroom.
+_PL_MAX_PROTOS = 11
+_PL_MAX_SLOTS = 32        # slot indices 0..31; valid range 1..num_dunlevs (<=30)
+
+
+def _place_dungeon_levels_jax(vendor_rng, num_dunlevs, protos, created_dyn=None):
+    """JAX-traceable port of ``_place_dungeon_levels`` / vendor ``place_level``.
+
+    Bit-exact draw-stream equivalent to the host recursive version: emits the
+    SAME sequence of ``rn2(npossible)`` draws including backtracking re-picks.
+    Uses ``lax.while_loop`` over an explicit ``(idx, slots, mask, phase)``
+    state machine so it is JIT- and vmap-safe.
+
+    Args:
+        vendor_rng: Isaac64State (traced).
+        num_dunlevs: int32 scalar (traced or static) — the dungeon depth cap.
+        protos: list of dicts with keys ``base``, ``rand``, ``chain_idx``,
+            ``created`` (all Python-static).  ``len(protos) <= _PL_MAX_PROTOS``.
+        created_dyn: optional traced bool array of shape ``(n_protos,)``
+            overriding the per-proto ``created`` field.  Used when ``created``
+            depends on a traced RNG gate (e.g. ``bigrm_placed = rn2(100) < 40``).
+            If ``None``, the static ``proto["created"]`` value is used.
+
+    Returns:
+        ``(new_vendor_rng, slots)`` where ``slots`` is an int32 array of
+        shape ``(_PL_MAX_PROTOS,)`` (valid entries at indices ``[0, len(protos))``;
+        unused entries are 0).
+    """
+    n_protos = len(protos)
+    assert n_protos <= _PL_MAX_PROTOS, f"need _PL_MAX_PROTOS >= {n_protos}"
+
+    # ---- Static proto tables (Python ints; baked into the trace) --------
+    bases = jnp.asarray(
+        [p["base"] for p in protos] + [0] * (_PL_MAX_PROTOS - n_protos),
+        dtype=jnp.int32,
+    )
+    rands = jnp.asarray(
+        [p["rand"] for p in protos] + [0] * (_PL_MAX_PROTOS - n_protos),
+        dtype=jnp.int32,
+    )
+    # chain_idx: use -1 sentinel for "no chain"
+    chain_idx = jnp.asarray(
+        [(-1 if p["chain_idx"] is None else p["chain_idx"]) for p in protos]
+        + [-1] * (_PL_MAX_PROTOS - n_protos),
+        dtype=jnp.int32,
+    )
+    if created_dyn is None:
+        created = jnp.asarray(
+            [bool(p["created"]) for p in protos] + [False] * (_PL_MAX_PROTOS - n_protos),
+            dtype=jnp.bool_,
+        )
+    else:
+        # Pad created_dyn (shape n_protos) to _PL_MAX_PROTOS with False.
+        pad = _PL_MAX_PROTOS - n_protos
+        created = jnp.concatenate(
+            [created_dyn.astype(jnp.bool_),
+             jnp.zeros((pad,), dtype=jnp.bool_)]
+        )
+
+    nd = jnp.asarray(num_dunlevs, dtype=jnp.int32)
+    slot_ids = jnp.arange(_PL_MAX_SLOTS, dtype=jnp.int32)  # 0..31
+
+    def _level_range_jax(idx, slots):
+        """Port of vendor ``level_range`` (dungeon.c:350-382) — JAX form."""
+        base = bases[idx]
+        randc = rands[idx]
+        ch = chain_idx[idx]
+        # base adjustment: chain → base += slots[chain]; else negatives count from end
+        base_chain = base + jnp.where(ch >= 0, slots[jnp.maximum(ch, 0)], 0)
+        base_nochain = jnp.where(base < 0, nd + base + jnp.int32(1), base)
+        base_eff = jnp.where(ch >= 0, base_chain, base_nochain)
+        # count:
+        #   randc == -1 → count = nd - base + 1
+        #   randc  >  0 → if base+randc-1 > nd: nd-base+1 else randc
+        #   randc == 0 → count = 1
+        count_neg = nd - base_eff + jnp.int32(1)
+        count_pos = jnp.where(
+            (base_eff + randc - jnp.int32(1)) > nd,
+            nd - base_eff + jnp.int32(1),
+            randc,
+        )
+        count = jnp.where(
+            randc == jnp.int32(-1),
+            count_neg,
+            jnp.where(randc > jnp.int32(0), count_pos, jnp.int32(1)),
+        )
+        return base_eff, count
+
+    def _possible_places_jax(idx, slots):
+        """Port of vendor ``possible_places`` (dungeon.c:573-602) — JAX form.
+
+        Returns bool array of shape (_PL_MAX_SLOTS,) where ``mask[s]`` is True
+        iff slot ``s`` is in [base, base+count) clipped to [1, num_dunlevs]
+        AND not already taken by a prior placement ``slots[j]`` for ``j < idx``.
+        """
+        base_eff, count = _level_range_jax(idx, slots)
+        in_range = (slot_ids >= base_eff) & (slot_ids < (base_eff + count))
+        in_dunlev = (slot_ids >= jnp.int32(1)) & (slot_ids <= nd)
+        m = in_range & in_dunlev
+
+        # Subtract slots[j] for j < idx (vendor: pd->start..idx-1).
+        # Sentinel: slots[j] == 0 means "not yet placed" — slot 0 isn't valid
+        # anyway, so blanking it is a no-op.
+        proto_idx = jnp.arange(_PL_MAX_PROTOS, dtype=jnp.int32)
+        # Compare slots[j] (broadcast over slot_ids) to slot s, and mask only
+        # j < idx.  Result: per-slot, is it claimed by some earlier proto?
+        # slots[j] is shape (P,); slot_ids is shape (S,).
+        # taken[s] = any_j ( j<idx AND slots[j]==s )
+        active = (proto_idx < idx)[:, None]                       # (P, 1)
+        eq = (slots[:, None] == slot_ids[None, :])                # (P, S)
+        taken = jnp.any(active & eq, axis=0)                       # (S,)
+        return m & ~taken
+
+    def _pick_nth_jax(m, nth):
+        """Vendor ``pick_level`` (dungeon.c:606-616): nth-True (0-based) in m.
+
+        Returns the slot index s (1..num_dunlevs) corresponding to the nth
+        True entry.  Uses cumsum: smallest s with cumsum(m)[s] == nth+1.
+        """
+        cum = jnp.cumsum(m.astype(jnp.int32))                       # (_PL_MAX_SLOTS,)
+        # argmax over (cum > nth) returns the first index where this is True
+        return jnp.argmax(cum > nth).astype(jnp.int32)
+
+    # ---- Iterative backtracking state machine ----------------------------
+    # Carry: (rng, idx, slots, mask, fresh)
+    #   idx  : current proto being placed (int32, -1 = backtrack-failed)
+    #   slots: int32[_PL_MAX_PROTOS] — placed slot (0 = not placed)
+    #   mask : bool[_PL_MAX_PROTOS, _PL_MAX_SLOTS] — per-frame remaining
+    #          eligible slots; on fresh entry filled from possible_places,
+    #          on backtrack the failed pick is already cleared.
+    #   fresh: bool[_PL_MAX_PROTOS] — True if frame needs possible_places init
+    DONE_IDX = jnp.int32(n_protos)
+
+    init_slots = jnp.zeros((_PL_MAX_PROTOS,), dtype=jnp.int32)
+    init_mask = jnp.zeros((_PL_MAX_PROTOS, _PL_MAX_SLOTS), dtype=jnp.bool_)
+    init_fresh = jnp.ones((_PL_MAX_PROTOS,), dtype=jnp.bool_)
+    init_carry = (vendor_rng, jnp.int32(0), init_slots, init_mask, init_fresh)
+
+    def cond(carry):
+        _rng, idx, _slots, _mask, _fresh = carry
+        # Loop while we haven't finished all protos AND haven't backtracked
+        # past the root (idx >= 0 since vendor panics on root failure).
+        return (idx < DONE_IDX) & (idx >= jnp.int32(0))
+
+    def body(carry):
+        rng, idx, slots, mask, fresh = carry
+
+        # ---- Branch 1: proto not created → skip frame, advance ---------
+        # Equivalent to ``if not protos[idx]["created"]: return _place(idx+1, vrng)``
+        def skip_uncreated(_args):
+            r, i, s, mk, fr = _args
+            return r, i + jnp.int32(1), s, mk, fr
+
+        # ---- Branch 2: proto created → maybe init mask, then try pick --
+        def place_created(_args):
+            r, i, s, mk, fr = _args
+            # If this frame is fresh, recompute possible_places(i) from current slots.
+            need_init = fr[i]
+            new_row = _possible_places_jax(i, s)
+            row = jnp.where(need_init, new_row, mk[i])
+            mk_init = mk.at[i].set(row)
+            fr_init = fr.at[i].set(jnp.bool_(False))
+
+            npossible = jnp.sum(row.astype(jnp.int32))
+
+            def do_backtrack(_a):
+                rr, ii, ss, mmk, ffr = _a
+                # No options remain at this frame → drop choice, return to parent.
+                # Reset frame i so re-entry recomputes possible_places.
+                ffr_new = ffr.at[ii].set(jnp.bool_(True))
+                # Find prior CREATED frame to backtrack into.  Skip uncreated
+                # frames (they didn't consume any draw).
+                # Iterate from ii-1 downwards, decrement until either we hit
+                # a created frame or fall below 0.
+                def bt_cond(b):
+                    j, _ = b
+                    # stop when j<0 OR created[j] is True
+                    return (j >= jnp.int32(0)) & (~created[jnp.maximum(j, 0)])
+
+                def bt_body(b):
+                    j, _flag = b
+                    return j - jnp.int32(1), _flag
+
+                # Start at ii-1
+                j_final, _ = lax.while_loop(bt_cond, bt_body,
+                                             (ii - jnp.int32(1), jnp.bool_(False)))
+                # At j_final: either <0 (root failure) or points to a CREATED frame.
+                # We need to remove the failed pick from that frame's mask AND
+                # clear its slot.  If <0 the loop terminates next iteration.
+                safe_j = jnp.maximum(j_final, jnp.int32(0))
+                chosen_at_j = ss[safe_j]
+                # mmk[safe_j, chosen_at_j] = False (only if j_final >= 0)
+                cur_row = mmk[safe_j]
+                new_row2 = jnp.where(
+                    j_final >= jnp.int32(0),
+                    cur_row.at[chosen_at_j].set(jnp.bool_(False)),
+                    cur_row,
+                )
+                mmk2 = mmk.at[safe_j].set(new_row2)
+                ss2 = jnp.where(
+                    j_final >= jnp.int32(0),
+                    ss.at[safe_j].set(jnp.int32(0)),
+                    ss,
+                )
+                return rr, j_final, ss2, mmk2, ffr_new
+
+            def do_pick(_a):
+                rr, ii, ss, mmk, ffr = _a
+                # rn2(npossible) — JAX-traceable draw on traced npossible.
+                from Nethax.nethax.vendor_rng import rn2_jax as _rn2_jax
+                new_rng, pick = _rn2_jax(rr, npossible)
+                chosen = _pick_nth_jax(mmk[ii], pick)
+                ss_new = ss.at[ii].set(chosen)
+                # Clear chosen from this frame's mask so a later backtrack
+                # into this frame retries a different slot (vendor semantics:
+                # ``m_list[i] = m_list[--m_count]`` permanently removes).
+                row_new = mmk[ii].at[chosen].set(jnp.bool_(False))
+                mmk_new = mmk.at[ii].set(row_new)
+                # Mark next frame as fresh so it recomputes possible_places.
+                next_i = ii + jnp.int32(1)
+                # Only mark fresh if next_i is within bounds (no-op otherwise).
+                safe_next = jnp.minimum(next_i, jnp.int32(_PL_MAX_PROTOS - 1))
+                ffr_new = ffr.at[safe_next].set(jnp.bool_(True))
+                return new_rng, next_i, ss_new, mmk_new, ffr_new
+
+            return lax.cond(
+                npossible == jnp.int32(0),
+                do_backtrack,
+                do_pick,
+                (r, i, s, mk_init, fr_init),
+            )
+
+        # Dispatch on protos[idx].created.  ``idx`` is traced; ``created`` is a
+        # static array, so we index it with idx.
+        is_created = created[jnp.minimum(jnp.maximum(idx, 0), _PL_MAX_PROTOS - 1)]
+        return lax.cond(is_created, place_created, skip_uncreated,
+                        (rng, idx, slots, mask, fresh))
+
+    final = lax.while_loop(cond, body, init_carry)
+    final_rng, _final_idx, final_slots, _final_mask, _final_fresh = final
+    return final_rng, final_slots
 
 def consume_init_dungeons_draws(vendor_rng):
     """Replay the ISAAC64 draws of vendor ``init_dungeons`` byte-exactly.
@@ -3192,7 +3435,7 @@ def consume_init_dungeons_draws(vendor_rng):
         ``(new_vendor_rng, dungeon_state)`` where ``dungeon_state`` is a
         small dict of the values caller may want for downstream wiring.
     """
-    from Nethax.nethax import vendor_rng as _vrng
+    from Nethax.nethax.vendor_rng import rn2_jax as _rn2
 
     drawn = {}
 
@@ -3205,8 +3448,8 @@ def consume_init_dungeons_draws(vendor_rng):
     # =======================================================================
 
     # depth draw — dungeon.c:797-798
-    vendor_rng, dod_levels = _vrng.rn2(vendor_rng, 5)   # rn1(5, 25)
-    drawn["dod_levels"] = dod_levels + 25
+    vendor_rng, dod_levels = _rn2(vendor_rng, 5)   # rn1(5, 25)
+    drawn["dod_levels"] = dod_levels + jnp.int32(25)
 
     # init_level rn2(100) gates — dungeon.c:548 — in dungeon.def order.
     # PARITY FIX: dgn_comp.y's RNDLEVEL 1-INT production (lines 188-198) sets
@@ -3217,28 +3460,33 @@ def consume_init_dungeons_draws(vendor_rng):
     # vendor/nle/build/.../dat/dungeon binary: medusa.chance=100.
     # Cite: vendor/nle/util/dgn_comp.y lines 188-209;
     # vendor/nle/dat/dungeon.def medusa/minetn/minend/soko entries.
-    vendor_rng, gate_rogue  = _vrng.rn2(vendor_rng, 100)  # rogue   chance=100 (LEVEL)
-    vendor_rng, gate_oracle = _vrng.rn2(vendor_rng, 100)  # oracle  chance=100 (LEVEL)
-    vendor_rng, gate_bigrm  = _vrng.rn2(vendor_rng, 100)  # bigrm   chance=40  (RNDLEVEL 2-int)
-    vendor_rng, gate_medusa = _vrng.rn2(vendor_rng, 100)  # medusa  chance=100 (RNDLEVEL 1-int → default)
-    vendor_rng, gate_castle = _vrng.rn2(vendor_rng, 100)  # castle  chance=100 (LEVEL)
+    vendor_rng, gate_rogue  = _rn2(vendor_rng, 100)  # rogue   chance=100 (LEVEL)
+    vendor_rng, gate_oracle = _rn2(vendor_rng, 100)  # oracle  chance=100 (LEVEL)
+    vendor_rng, gate_bigrm  = _rn2(vendor_rng, 100)  # bigrm   chance=40  (RNDLEVEL 2-int)
+    vendor_rng, gate_medusa = _rn2(vendor_rng, 100)  # medusa  chance=100 (RNDLEVEL 1-int → default)
+    vendor_rng, gate_castle = _rn2(vendor_rng, 100)  # castle  chance=100 (LEVEL)
 
-    bigrm_placed  = int(gate_bigrm)  < 40
-    medusa_placed = True  # chance=100 → always placed (1-INT RNDLEVEL default)
+    bigrm_placed  = gate_bigrm < jnp.int32(40)          # traced bool
+    medusa_placed = jnp.bool_(True)  # chance=100 → always placed (1-INT RNDLEVEL default)
 
     drawn["gate_bigrm"]  = gate_bigrm
     drawn["gate_medusa"] = gate_medusa
 
-    # place_level recursion — dungeon.c:637-679.  See ``_place_dungeon_levels``.
-    dod_num_dunlevs = int(dod_levels) + 25
+    # place_level recursion — dungeon.c:637-679.  See ``_place_dungeon_levels_jax``.
+    dod_num_dunlevs = dod_levels + jnp.int32(25)
     dod_protos = [
         {"name": "rogue",  "base": 15, "rand": 4, "chain_idx": None, "created": True},
         {"name": "oracle", "base": 5,  "rand": 5, "chain_idx": None, "created": True},
-        {"name": "bigrm",  "base": 10, "rand": 3, "chain_idx": None, "created": bigrm_placed},
-        {"name": "medusa", "base": -5, "rand": 4, "chain_idx": None, "created": medusa_placed},
+        {"name": "bigrm",  "base": 10, "rand": 3, "chain_idx": None, "created": True},   # dyn override below
+        {"name": "medusa", "base": -5, "rand": 4, "chain_idx": None, "created": True},
         {"name": "castle", "base": -1, "rand": 0, "chain_idx": None, "created": True},
     ]
-    vendor_rng, _ = _place_dungeon_levels(vendor_rng, dod_num_dunlevs, dod_protos)
+    dod_created_dyn = jnp.stack([
+        jnp.bool_(True), jnp.bool_(True), bigrm_placed, medusa_placed, jnp.bool_(True),
+    ])
+    vendor_rng, _ = _place_dungeon_levels_jax(
+        vendor_rng, dod_num_dunlevs, dod_protos, created_dyn=dod_created_dyn
+    )
 
     # =======================================================================
     # i = 1 : "Gehennom" (20, 5)
@@ -3249,29 +3497,29 @@ def consume_init_dungeons_draws(vendor_rng):
     #                    wizard1, wizard2, wizard3, orcus, fakewiz1, fakewiz2
     # =======================================================================
 
-    vendor_rng, geh_levels = _vrng.rn2(vendor_rng, 5)   # dungeon.c:797-798 rn1(5, 20)
-    drawn["geh_levels"] = geh_levels + 20
+    vendor_rng, geh_levels = _rn2(vendor_rng, 5)   # dungeon.c:797-798 rn1(5, 20)
+    drawn["geh_levels"] = geh_levels + jnp.int32(20)
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)            # dungeon.c:398 parent_dlevel num=1
+    vendor_rng, _ = _rn2(vendor_rng, 1)            # dungeon.c:398 parent_dlevel num=1
 
     # init_level rn2(100) gates — all LEVEL/CHAINLEVEL chance=100
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 valley
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 sanctum
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 juiblex
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 baalz
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 asmodeus
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 wizard1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 wizard2
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 wizard3
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 orcus
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 fakewiz1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)          # dungeon.c:548 fakewiz2
+    vendor_rng, _ = _rn2(vendor_rng, 100)          # dungeon.c:548 valley
+    vendor_rng, _ = _rn2(vendor_rng, 100)          # dungeon.c:548 sanctum
+    vendor_rng, _ = _rn2(vendor_rng, 100)          # dungeon.c:548 juiblex
+    vendor_rng, _ = _rn2(vendor_rng, 100)          # dungeon.c:548 baalz
+    vendor_rng, _ = _rn2(vendor_rng, 100)          # dungeon.c:548 asmodeus
+    vendor_rng, _ = _rn2(vendor_rng, 100)          # dungeon.c:548 wizard1
+    vendor_rng, _ = _rn2(vendor_rng, 100)          # dungeon.c:548 wizard2
+    vendor_rng, _ = _rn2(vendor_rng, 100)          # dungeon.c:548 wizard3
+    vendor_rng, _ = _rn2(vendor_rng, 100)          # dungeon.c:548 orcus
+    vendor_rng, _ = _rn2(vendor_rng, 100)          # dungeon.c:548 fakewiz1
+    vendor_rng, _ = _rn2(vendor_rng, 100)          # dungeon.c:548 fakewiz2
 
     # place_level recursion — dungeon.c:637-679.
     # Gehennom has CHAINLEVEL entries (wizard2/wizard3 chain to wizard1), which
     # can force backtracking when wizard1's chosen slot leaves no room for the
-    # chained slots.  The recursive helper handles this correctly.
-    geh_num_dunlevs = int(geh_levels) + 20
+    # chained slots.  The JAX placer handles this correctly.
+    geh_num_dunlevs = geh_levels + jnp.int32(20)
     # local proto indices: 0=valley, 1=sanctum, 2=juiblex, 3=baalz, 4=asmodeus,
     # 5=wizard1, 6=wizard2 (CHAIN→5), 7=wizard3 (CHAIN→5), 8=orcus,
     # 9=fakewiz1, 10=fakewiz2.
@@ -3288,7 +3536,7 @@ def consume_init_dungeons_draws(vendor_rng):
         {"name": "fakewiz1", "base": -6,  "rand": 4, "chain_idx": None, "created": True},
         {"name": "fakewiz2", "base": -6,  "rand": 4, "chain_idx": None, "created": True},
     ]
-    vendor_rng, _ = _place_dungeon_levels(vendor_rng, geh_num_dunlevs, geh_protos)
+    vendor_rng, _ = _place_dungeon_levels_jax(vendor_rng, geh_num_dunlevs, geh_protos)
 
     # =======================================================================
     # i = 2 : "The Gnomish Mines" (8, 2)
@@ -3296,24 +3544,23 @@ def consume_init_dungeons_draws(vendor_rng):
     #         2 RNDLEVEL levels: minetn (ch=7), minend (ch=3)
     # =======================================================================
 
-    vendor_rng, mines_levels = _vrng.rn2(vendor_rng, 2)  # dungeon.c:797-798 rn1(2, 8)
-    drawn["mines_levels"] = mines_levels + 8
+    vendor_rng, mines_levels = _rn2(vendor_rng, 2)  # dungeon.c:797-798 rn1(2, 8)
+    drawn["mines_levels"] = mines_levels + jnp.int32(8)
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 3)             # dungeon.c:398 parent_dlevel num=3
+    vendor_rng, _ = _rn2(vendor_rng, 3)             # dungeon.c:398 parent_dlevel num=3
 
-    vendor_rng, gate_minetn = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 minetn chance=100 (1-int RNDLEVEL)
-    vendor_rng, gate_minend = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 minend chance=100 (1-int RNDLEVEL)
-    minetn_placed = True  # chance=100 → always placed
-    minend_placed = True  # chance=100 → always placed
+    vendor_rng, gate_minetn = _rn2(vendor_rng, 100)  # dungeon.c:548 minetn chance=100 (1-int RNDLEVEL)
+    vendor_rng, gate_minend = _rn2(vendor_rng, 100)  # dungeon.c:548 minend chance=100 (1-int RNDLEVEL)
+    # chance=100 → always placed (static True)
     drawn["gate_minetn"] = gate_minetn
     drawn["gate_minend"] = gate_minend
 
-    mines_num_dunlevs = int(mines_levels) + 8
+    mines_num_dunlevs = mines_levels + jnp.int32(8)
     mines_protos = [
-        {"name": "minetn", "base": 3,  "rand": 2, "chain_idx": None, "created": minetn_placed},
-        {"name": "minend", "base": -1, "rand": 0, "chain_idx": None, "created": minend_placed},
+        {"name": "minetn", "base": 3,  "rand": 2, "chain_idx": None, "created": True},
+        {"name": "minend", "base": -1, "rand": 0, "chain_idx": None, "created": True},
     ]
-    vendor_rng, _ = _place_dungeon_levels(vendor_rng, mines_num_dunlevs, mines_protos)
+    vendor_rng, _ = _place_dungeon_levels_jax(vendor_rng, mines_num_dunlevs, mines_protos)
 
     # =======================================================================
     # i = 3 : "The Quest" (5, 2)
@@ -3321,22 +3568,22 @@ def consume_init_dungeons_draws(vendor_rng):
     #         3 LEVEL levels: x-strt, x-loca, x-goal
     # =======================================================================
 
-    vendor_rng, quest_levels = _vrng.rn2(vendor_rng, 2)  # dungeon.c:797-798 rn1(2, 5)
-    drawn["quest_levels"] = quest_levels + 5
+    vendor_rng, quest_levels = _rn2(vendor_rng, 2)  # dungeon.c:797-798 rn1(2, 5)
+    drawn["quest_levels"] = quest_levels + jnp.int32(5)
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 2)             # dungeon.c:398 parent_dlevel num=2
+    vendor_rng, _ = _rn2(vendor_rng, 2)             # dungeon.c:398 parent_dlevel num=2
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 x-strt
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 x-loca
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 x-goal
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 x-strt
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 x-loca
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 x-goal
 
-    quest_num_dunlevs = int(quest_levels) + 5
+    quest_num_dunlevs = quest_levels + jnp.int32(5)
     quest_protos = [
         {"name": "x-strt", "base": 1,  "rand": 1, "chain_idx": None, "created": True},
         {"name": "x-loca", "base": 3,  "rand": 1, "chain_idx": None, "created": True},
         {"name": "x-goal", "base": -1, "rand": 0, "chain_idx": None, "created": True},
     ]
-    vendor_rng, _ = _place_dungeon_levels(vendor_rng, quest_num_dunlevs, quest_protos)
+    vendor_rng, _ = _place_dungeon_levels_jax(vendor_rng, quest_num_dunlevs, quest_protos)
 
     # =======================================================================
     # i = 4 : "Sokoban" (4, 0)
@@ -3345,29 +3592,25 @@ def consume_init_dungeons_draws(vendor_rng):
     #         4 RNDLEVEL levels: soko1..soko4 (ch=2 each)
     # =======================================================================
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:398 parent_dlevel num=1
+    vendor_rng, _ = _rn2(vendor_rng, 1)             # dungeon.c:398 parent_dlevel num=1
 
-    vendor_rng, gate_soko1 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko1 chance=100 (1-int RNDLEVEL)
-    vendor_rng, gate_soko2 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko2 chance=100 (1-int RNDLEVEL)
-    vendor_rng, gate_soko3 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko3 chance=100 (1-int RNDLEVEL)
-    vendor_rng, gate_soko4 = _vrng.rn2(vendor_rng, 100)  # dungeon.c:548 soko4 chance=100 (1-int RNDLEVEL)
-    soko1_placed = True  # chance=100 → always placed
-    soko2_placed = True  # chance=100 → always placed
-    soko3_placed = True  # chance=100 → always placed
-    soko4_placed = True  # chance=100 → always placed
+    vendor_rng, gate_soko1 = _rn2(vendor_rng, 100)  # dungeon.c:548 soko1 chance=100 (1-int RNDLEVEL)
+    vendor_rng, gate_soko2 = _rn2(vendor_rng, 100)  # dungeon.c:548 soko2 chance=100 (1-int RNDLEVEL)
+    vendor_rng, gate_soko3 = _rn2(vendor_rng, 100)  # dungeon.c:548 soko3 chance=100 (1-int RNDLEVEL)
+    vendor_rng, gate_soko4 = _rn2(vendor_rng, 100)  # dungeon.c:548 soko4 chance=100 (1-int RNDLEVEL)
     drawn["gate_soko1"] = gate_soko1
     drawn["gate_soko2"] = gate_soko2
     drawn["gate_soko3"] = gate_soko3
     drawn["gate_soko4"] = gate_soko4
 
-    soko_num_dunlevs = 4  # Sokoban (4, 0) — lev.rand=0 → fixed
+    soko_num_dunlevs = jnp.int32(4)  # Sokoban (4, 0) — lev.rand=0 → fixed
     soko_protos = [
-        {"name": "soko1", "base": 1, "rand": 0, "chain_idx": None, "created": soko1_placed},
-        {"name": "soko2", "base": 2, "rand": 0, "chain_idx": None, "created": soko2_placed},
-        {"name": "soko3", "base": 3, "rand": 0, "chain_idx": None, "created": soko3_placed},
-        {"name": "soko4", "base": 4, "rand": 0, "chain_idx": None, "created": soko4_placed},
+        {"name": "soko1", "base": 1, "rand": 0, "chain_idx": None, "created": True},
+        {"name": "soko2", "base": 2, "rand": 0, "chain_idx": None, "created": True},
+        {"name": "soko3", "base": 3, "rand": 0, "chain_idx": None, "created": True},
+        {"name": "soko4", "base": 4, "rand": 0, "chain_idx": None, "created": True},
     ]
-    vendor_rng, _ = _place_dungeon_levels(vendor_rng, soko_num_dunlevs, soko_protos)
+    vendor_rng, _ = _place_dungeon_levels_jax(vendor_rng, soko_num_dunlevs, soko_protos)
 
     # =======================================================================
     # i = 5 : "Fort Ludios" (1, 0)
@@ -3381,12 +3624,12 @@ def consume_init_dungeons_draws(vendor_rng):
     #         BRANCH @ (18,4) portal in Main → parent_dlevel num=4.
     # =======================================================================
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 4)         # dungeon.c:398 parent_dlevel num=4
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)       # dungeon.c:548 knox
+    vendor_rng, _ = _rn2(vendor_rng, 4)         # dungeon.c:398 parent_dlevel num=4
+    vendor_rng, _ = _rn2(vendor_rng, 100)       # dungeon.c:548 knox
     knox_protos = [
         {"name": "knox", "base": -1, "rand": 0, "chain_idx": None, "created": True},
     ]
-    vendor_rng, _ = _place_dungeon_levels(vendor_rng, 1, knox_protos)
+    vendor_rng, _ = _place_dungeon_levels_jax(vendor_rng, jnp.int32(1), knox_protos)
 
     # =======================================================================
     # i = 6 : "Vlad's Tower" (3, 0)
@@ -3394,18 +3637,18 @@ def consume_init_dungeons_draws(vendor_rng):
     #         3 LEVEL: tower1, tower2, tower3
     # =======================================================================
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 5)             # dungeon.c:398 parent_dlevel num=5
+    vendor_rng, _ = _rn2(vendor_rng, 5)             # dungeon.c:398 parent_dlevel num=5
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 tower1
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 tower2
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 tower3
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 tower1
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 tower2
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 tower3
 
     vlad_protos = [
         {"name": "tower1", "base": 1, "rand": 0, "chain_idx": None, "created": True},
         {"name": "tower2", "base": 2, "rand": 0, "chain_idx": None, "created": True},
         {"name": "tower3", "base": 3, "rand": 0, "chain_idx": None, "created": True},
     ]
-    vendor_rng, _ = _place_dungeon_levels(vendor_rng, 3, vlad_protos)
+    vendor_rng, _ = _place_dungeon_levels_jax(vendor_rng, jnp.int32(3), vlad_protos)
 
     # =======================================================================
     # i = 7 : "The Elemental Planes" (6, 0)
@@ -3413,14 +3656,14 @@ def consume_init_dungeons_draws(vendor_rng):
     #         6 LEVEL: astral, water, fire, air, earth, dummy
     # =======================================================================
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 1)             # dungeon.c:398 parent_dlevel num=1
+    vendor_rng, _ = _rn2(vendor_rng, 1)             # dungeon.c:398 parent_dlevel num=1
 
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 astral
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 water
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 fire
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 air
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 earth
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 100)           # dungeon.c:548 dummy
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 astral
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 water
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 fire
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 air
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 earth
+    vendor_rng, _ = _rn2(vendor_rng, 100)           # dungeon.c:548 dummy
 
     planes_protos = [
         {"name": "astral", "base": 1, "rand": 0, "chain_idx": None, "created": True},
@@ -3430,17 +3673,17 @@ def consume_init_dungeons_draws(vendor_rng):
         {"name": "earth",  "base": 5, "rand": 0, "chain_idx": None, "created": True},
         {"name": "dummy",  "base": 6, "rand": 0, "chain_idx": None, "created": True},
     ]
-    vendor_rng, _ = _place_dungeon_levels(vendor_rng, 6, planes_protos)
+    vendor_rng, _ = _place_dungeon_levels_jax(vendor_rng, jnp.int32(6), planes_protos)
 
     # =======================================================================
     # After the per-dungeon loop: tune string — dungeon.c:917-918
     #     for (i = 0; i < 5; i++) tune[i] = 'A' + rn2(7);
     # =======================================================================
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 7)              # dungeon.c:918 tune[0]
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 7)              # dungeon.c:918 tune[1]
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 7)              # dungeon.c:918 tune[2]
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 7)              # dungeon.c:918 tune[3]
-    vendor_rng, _ = _vrng.rn2(vendor_rng, 7)              # dungeon.c:918 tune[4]
+    vendor_rng, _ = _rn2(vendor_rng, 7)              # dungeon.c:918 tune[0]
+    vendor_rng, _ = _rn2(vendor_rng, 7)              # dungeon.c:918 tune[1]
+    vendor_rng, _ = _rn2(vendor_rng, 7)              # dungeon.c:918 tune[2]
+    vendor_rng, _ = _rn2(vendor_rng, 7)              # dungeon.c:918 tune[3]
+    vendor_rng, _ = _rn2(vendor_rng, 7)              # dungeon.c:918 tune[4]
 
     return vendor_rng, drawn
 
