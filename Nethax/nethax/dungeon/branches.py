@@ -989,6 +989,27 @@ def generate_main_branch_l1(
             vendor_rng, pool0, depth=1,
         )
 
+        # Save tried_vault so we can emit do_vault block draws AFTER make_niches
+        # but BEFORE place_branch (matching vendor mklev.c:738-762 → 800 order).
+        # Use tried_vault as the proxy for vault creation; if create_room itself
+        # failed in the vault attempt, the fill_room body never runs in vendor
+        # — but if the rn2(2) gate fires AND vendor create_vault succeeds, the
+        # do_vault block runs.  For now, use tried_vault as a coarse gate and
+        # check empirically; refine to (tried_vault & vault_success) if needed.
+        # Vendor's do_vault block calls ``add_room(...VAULT)`` which BOTH
+        # fills a rooms[] slot AND increments nroom (mklev.c:200 in add_room).
+        # So when vault succeeds, vendor's nroom is bumped by 1 at do_vault
+        # time; all subsequent ``rn2(nroom)`` calls (place_branch, etc.) use
+        # the bumped value.  Nethax's makerooms vault path does NOT increment
+        # nroom (rooms.py:577 ``incremented = success & ~vault``), so we
+        # manually bump it here before place_branch.  Vendor cite:
+        # vendor/nle/src/mklev.c:200 (add_room nroom++);
+        # vendor/nle/src/mklev.c:738-762 (do_vault block calls add_room).
+        _vault_created_in_makerooms = _tried_vault
+        _nroom_post_vault = jnp.where(
+            _vault_created_in_makerooms, _nroom + jnp.int32(1), _nroom,
+        )
+
         # sort_rooms() — vendor mklev.c:707.  Vendor qsorts the rooms[]
         # array by ``lx`` (do_comp at mklev.c:62-64 compares lx only) so
         # that all subsequent indexing — the stair-room picks
@@ -1266,6 +1287,45 @@ def generate_main_branch_l1(
         )
 
         # ------------------------------------------------------------------
+        # do_vault block — vendor mklev.c:738-762.
+        #
+        # Runs AFTER make_niches and BEFORE place_branch.  On Dlvl 1 when the
+        # vault path was taken in makerooms (``tried_vault`` AND an active
+        # slot carries the hx=-1 sentinel), vendor performs:
+        #
+        #   fill_room(&rooms[nroom-1], FALSE)        — sp_lev.c:2447-2452
+        #     for each of 4 vault interior tiles:
+        #         mkgold(rn1(abs(depth) * 100, 51), x, y)
+        #         → rn1(100, 51) = 51 + rn2(100); amount>0 so mkgold's inner
+        #            rnd(2)/rnd(3) block is SKIPPED.  Net: 4 rn2(100).
+        #   mk_knox_portal(...)                       — mklev.c:1865-1899
+        #     On Dlvl 1 source->dnum < n_dgns is TRUE (init_dungeons sets it
+        #     to dnum during branch insertion), so the rn2(3) at mklev.c:1884
+        #     is SHORT-CIRCUITED.  Net: 0 draws on Dlvl 1.
+        #   if (!noteleport && !rn2(3)) makevtele();  — mklev.c:752
+        #     noteleport=0 on Dlvl 1 (mklev.c:622); 1 rn2(3) is drawn.
+        #
+        # Net for Dlvl 1 vault path: 4 rn2(100) + 1 rn2(3) = 5 draws.
+        # ------------------------------------------------------------------
+        from Nethax.nethax.vendor_rng import rn2_jax as _rn2_jax_do_vault
+
+        def _do_vault_draws(v):
+            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 0
+            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 1
+            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 2
+            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 3
+            v, _ = _rn2_jax_do_vault(v, jnp.int32(3))     # makevtele gate
+            return v
+
+        def _skip_do_vault_draws(v):
+            return v
+
+        vendor_rng = lax.cond(
+            _vault_created_in_makerooms,
+            _do_vault_draws, _skip_do_vault_draws, vendor_rng,
+        )
+
+        # ------------------------------------------------------------------
         # place_branch(branchp, 0, 0) — vendor mklev.c:800.
         #
         # makelevel() places the multi-dungeon branch stairway AFTER
@@ -1301,21 +1361,39 @@ def generate_main_branch_l1(
         #              vendor/nle/src/mkroom.c:640-651.
         from Nethax.nethax.vendor_rng import rn1_jax as _rn1_jax
 
+        # Vendor's nroom at place_branch time includes the vault slot (added
+        # in do_vault's add_room call, mklev.c:746).  Use _nroom_post_vault
+        # so rn2(nroom) matches vendor when vault was created.  The vault
+        # slot itself is non-OROOM, so the do/while at mklev.c:1117-1120
+        # ``rtype != OROOM`` filter rejects it — model this by treating
+        # idx == vault_slot_idx (== _nroom_post_vault - 1 when vault present)
+        # as a collision that triggers redraw.
+        _nroom_branch_int = _nroom_post_vault
+        _vault_slot_idx = jnp.where(
+            _vault_created_in_makerooms,
+            _nroom_post_vault - jnp.int32(1),
+            jnp.int32(-1),
+        )
+
         # nroom > 2 path (mklev.c:1114): do/while redraw rn2(nroom) while the
-        # pick collides with the down-stair room.  tryct < 100 caps the loop.
+        # pick collides with the down-stair room or vault slot.  tryct < 100
+        # caps the loop.
         def _branch_pick_cond(carry):
             _vr, idx, tryct = carry
-            collide = (idx == down_idx) & has_rooms
+            collide = (
+                ((idx == down_idx) & has_rooms)
+                | (idx == _vault_slot_idx)
+            )
             return collide & (tryct < jnp.int32(100))
 
         def _branch_pick_body(carry):
             vr, _idx, tryct = carry
-            vr, idx = rn2_jax(vr, jnp.maximum(nroom_int, jnp.int32(1)))
+            vr, idx = rn2_jax(vr, jnp.maximum(_nroom_branch_int, jnp.int32(1)))
             return vr, idx, tryct + jnp.int32(1)
 
         # First (unconditional) draw of the do/while, then redraw-on-collide.
         vendor_rng, _br_idx0 = rn2_jax(
-            vendor_rng, jnp.maximum(nroom_int, jnp.int32(1)),
+            vendor_rng, jnp.maximum(_nroom_branch_int, jnp.int32(1)),
         )
         vendor_rng, branch_idx, _br_tryct = lax.while_loop(
             _branch_pick_cond,
@@ -1417,9 +1495,22 @@ def generate_main_branch_l1(
     up_stair_pos   = jnp.stack([up_r, up_c]).astype(jnp.int16)
     down_stair_pos = jnp.stack([dn_r, dn_c]).astype(jnp.int16)
 
+    # Vendor nroom at fill_ordinary_rooms time includes the vault slot (added
+    # in do_vault's add_room call).  Expose it so the wrapper can pass it to
+    # fill_ordinary_rooms's ``nroom`` argument (used by the box-gate modulus
+    # rn2(nroom*5/2) at mklev.c:853).  Defaults to ``active.sum()`` when no
+    # vault was created — semantically equivalent to vendor nroom.
+    if vendor_rng is not None:
+        try:
+            _nroom_for_fill = _nroom_post_vault
+        except NameError:
+            _nroom_for_fill = active.sum().astype(jnp.int32)
+    else:
+        _nroom_for_fill = active.sum().astype(jnp.int32)
+
     return (
         terrain, rooms, active, up_stair_pos, down_stair_pos, vendor_rng,
-        vendor_levl_grid,
+        vendor_levl_grid, _nroom_for_fill,
     )
 
 
@@ -1517,6 +1608,7 @@ def generate_main_branch_l1_with_features(
 
     (
         terrain, rooms, active, up_pos, dn_pos, vendor_rng, vendor_levl_grid,
+        _nroom_for_fill,
     ) = generate_main_branch_l1(
         k_level, static_params, n_rooms=n_rooms, vendor_rng=vendor_rng,
     )
@@ -1535,6 +1627,10 @@ def generate_main_branch_l1_with_features(
     # Thread vendor_rng so per-room rn2/somexy draws come from the
     # ISAAC64 stream under NLE_BYTEPARITY (byte-exact with vendor C).
     #
+    # Pass ``nroom=_nroom_for_fill`` so the box-gate ``rn2(nroom*5/2)`` at
+    # mklev.c:853 uses the vault-bumped count — vendor's nroom INCLUDES
+    # the vault slot at fill_ordinary_rooms time.
+    #
     # When ``state`` is supplied (NLE_BYTEPARITY reset path), the
     # per-OROOM sleeping-monster spawn (vendor mklev.c:813-817) runs as
     # step 1 of each room iteration INSIDE :func:`fill_ordinary_rooms`,
@@ -1547,14 +1643,14 @@ def generate_main_branch_l1_with_features(
         terrain, features, traps, vendor_rng, state = fill_ordinary_rooms(
             k_fill, rooms, active, terrain, features, traps,
             flat_lv=flat_lv, depth=depth, player_align=player_align,
-            vendor_rng=vendor_rng,
+            vendor_rng=vendor_rng, nroom=_nroom_for_fill,
             state=state, monster_rng=k_monster,
         )
     else:
         terrain, features, traps, vendor_rng = fill_ordinary_rooms(
             k_fill, rooms, active, terrain, features, traps,
             flat_lv=flat_lv, depth=depth, player_align=player_align,
-            vendor_rng=vendor_rng,
+            vendor_rng=vendor_rng, nroom=_nroom_for_fill,
         )
 
     # vendor/nle/src/mklev.c::mineralize line 1006 — called from mklev()

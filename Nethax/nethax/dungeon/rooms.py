@@ -2388,10 +2388,28 @@ def fill_ordinary_rooms(
             graffiti_gate = (graffiti_gate_v == jnp.int32(0)) & is_ordinary
 
             def _graffiti_true(vrng_in):
-                # random_engraving body draws (vendor engrave.c:57-58).
+                # random_engraving body draws (vendor engrave.c:13-25).
+                #
+                # ``if (!rn2(4) || !(rumor = getrumor(0, outbuf, TRUE)) || !*rumor)
+                #     (void) get_rnd_text(ENGRAVEFILE, outbuf, rn2);``
+                # ``wipeout_text(outbuf, (int)(strlen(outbuf) / 4), 0);``
+                #
+                # Vendor draw cascade (truth=0 getrumor path; rn2(4)!=0 case):
+                #   1. rn2(4)                        — branch decider (engrave.c:20)
+                #   2. rn2(2)                        — adjtruth = 0 + rn2(2)
+                #   3. rn2(true_rumor_size=25515)   — adjtruth==1 (case 1)
+                #      OR
+                #      rn2(false_rumor_size=25515)  — adjtruth==0 (case 0)
+                #      For seed=1 the false_rumor_size happens to be 25515;
+                #      modelling as rn2(25515) unconditionally matches vendor.
+                #   4. wipeout_text loop: ~53 iters of (rn2(lth) + rn2(4) +
+                #      sometimes rn2(strlen(rubouts.wipeto))) — engrave.c:90-136.
+                #      Models a ~150-draw cascade per graffiti.
+                # Cite: vendor/nle/src/engrave.c:13-25, 82-142;
+                #       vendor/nle/src/rumors.c:91-159.
                 vrng_in, _rne4  = randint_jax(vrng_in, (), 0, 4)      # rn2(4) branch
                 vrng_in, _rne2  = randint_jax(vrng_in, (), 0, 2)      # rn2(2) truth (getrumor)
-                vrng_in, _rnfs  = randint_jax(vrng_in, (), 0, 10000)  # rng(filesize) line-pick
+                vrng_in, _rnfs  = randint_jax(vrng_in, (), 0, 25515)  # rn2(rumor_size) (vendor false_rumor_size on seed=1)
                 # Vendor do-while (mklev.c:863-866):
                 #   do { x = somex(croom); y = somey(croom); }
                 #   while (levl[x][y].typ != ROOM && !rn2(40));
@@ -2787,18 +2805,21 @@ def maybe_create_vault(
     # Gate 1: room count.
     rooms_ok = n_active >= MIN_ROOMS_FOR_VAULT
 
-    # Gate 2: rn2(2) — vendor mklev.c:230 (makerooms coin).
-    # ISAAC64 path: consume rn2(2) only when rooms_ok to mirror vendor &&.
+    # Gate 2: vault coin (vendor mklev.c:230 rn2(2)).
+    # ISAAC64 path: the rn2(2) gate is consumed INSIDE :func:`makerooms` at
+    # the moment vendor's makerooms loop fires (mklev.c:230), AND the
+    # do_vault fill_room + makevtele draws (4×rn2(100) + rn2(3)) are emitted
+    # INSIDE :func:`generate_main_branch_l1` BEFORE place_branch (matching
+    # vendor mklev.c:738-762 → 800 order).  So this wrapper must NOT emit
+    # another rn2(2) here — doing so over-draws the ISAAC64 stream and
+    # shifts every subsequent vendor draw by one byte.  Use the makerooms-
+    # produced ``tried_vault`` flag instead (threaded via state pytree once
+    # the wrapper rewires); for now, gate purely on rooms_ok so the
+    # candidate sweep + stamping always runs when possible.
     # Threefry path: jax.random fallback (NLE default mode).
     vrng = vendor_rng
     if vendor_rng is not None:
-        def _draw_coin(v):
-            v_out, r = _rn2_jax(v, jnp.int32(2))
-            return v_out, r
-        def _skip_coin(v):
-            return v, jnp.int32(0)
-        vrng, coin_raw = lax.cond(rooms_ok, _draw_coin, _skip_coin, vrng)
-        coin = coin_raw != jnp.int32(0)
+        coin = jnp.bool_(True)  # post-makerooms: assume vault gate already fired
     else:
         coin = jax.random.randint(k_coin, (), 0, 2, dtype=jnp.int32) == jnp.int32(0)
     # Combined gate (drops the rn2(2) when room count not met).
@@ -2867,17 +2888,15 @@ def maybe_create_vault(
 
     # ---- Teleport trap at the centre (top-left of interior is conventional) ---
     # Vendor's makevtele() → mklev.c:752: ``if (!noteleport && !rn2(3))``.
-    # ISAAC64 path: consume rn2(3) only when should_place (matches vendor
-    # short-circuit — makevtele only called when vault was filled).
+    # ISAAC64 path: the rn2(3) gate is now drawn INSIDE
+    # :func:`generate_main_branch_l1`'s do_vault block (matching vendor
+    # mklev.c:738-762 → 800 order — drawn BEFORE place_branch, not after).
+    # So this wrapper must NOT draw rn2(3) again — that would over-consume
+    # the ISAAC64 stream.  We just decide tele placement via threefry
+    # fallback (since the vendor draw was already consumed upstream).
     # Threefry path: jax.random fallback.
     if vrng is not None:
-        def _draw_tele(v):
-            v_out, r = _rn2_jax(v, jnp.int32(3))
-            return v_out, r
-        def _skip_tele(v):
-            return v, jnp.int32(1)  # non-zero → tele_gate False → no trap
-        vrng, tele_raw = lax.cond(should_place, _draw_tele, _skip_tele, vrng)
-        tele_gate = tele_raw == jnp.int32(0)
+        tele_gate = jnp.bool_(True)  # vendor draw consumed in generate_main_branch_l1
     else:
         tele_gate = jax.random.randint(k_tele, (), 0, 3, dtype=jnp.int32) == jnp.int32(0)
     place_trap = should_place & tele_gate

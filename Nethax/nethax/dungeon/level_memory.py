@@ -250,7 +250,7 @@ def enter_level(
     already = state.generated[b, lv]
 
     # --- Generate branch: produce new terrain ---
-    terrain_new, _rooms, _active, _up, _dn, _vrng, _levl = generate_main_branch_l1(rng, static_params)
+    terrain_new, _rooms, _active, _up, _dn, _vrng, _levl, _nfill = generate_main_branch_l1(rng, static_params)
 
     # Store a uint32 seed derived from the rng key.
     # Use fold_in to produce a stable uint32 regardless of key format.
