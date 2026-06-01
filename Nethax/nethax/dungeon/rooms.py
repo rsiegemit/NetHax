@@ -29,7 +29,8 @@ import jax.lax as lax
 from flax import struct
 
 from Nethax.nethax.dungeon.branches import MAP_H, MAP_W, MAX_LEVELS_PER_BRANCH
-from Nethax.nethax.vendor_rng import Isaac64State, randint_jax, rnd_jax
+from Nethax.nethax.vendor_rng import Isaac64State, randint_jax, rnd_jax, rne_jax, rn2_jax
+from Nethax.nethax.dungeon.spawning import pick_monster_for_level
 from Nethax.nethax.subsystems.random_objects import (
     _MKOBJ_TABLE,
     _mkbox_cnts_draws,
@@ -1999,20 +2000,42 @@ def fill_ordinary_rooms(
                     # is skipped (mksobj.c:771-1112 only runs the per-class
                     # init switch, not the type-pick).  Previous code drew
                     # rnd(1000) here which was an over-draw of 1.
+                    #
+                    # ARROW (otyp 1, oc_skill=-P_BOW=-21) and DART (otyp 7,
+                    # oc_skill=-P_DART=-24) ARE is_multigen/is_poisonable
+                    # weapons — so we MUST pass the otyp here so
+                    # ``_weapon_draws`` fires its rn1(6,6) multigen + rn2(100)
+                    # poison draws.  ROCK (otyp 270, GEM_CLASS) ignores otyp.
+                    # artif=FALSE per vendor mklev.c:1436-1450.
                     # Vendor cite: vendor/nle/src/mklev.c:1436-1450 (mksobj
                     # call site), vendor/nle/src/mkobj.c:771-1112 (mksobj
                     # signature and init).
                     is_rock = kind == jnp.int32(3)
                     item_cls = jnp.where(is_rock, jnp.int32(13), jnp.int32(2))
-                    vi = consume_mksobj_init_draws(vi, item_cls)
+                    # kind=1 ARROW_TRAP → ARROW (otyp 1); kind=2 DART_TRAP →
+                    # DART (otyp 7); kind=3 ROCKTRAP → ROCK (otyp 446, GEM_CLASS).
+                    item_otyp = jnp.where(
+                        kind == jnp.int32(1), jnp.int32(1),     # ARROW
+                        jnp.where(
+                            kind == jnp.int32(2), jnp.int32(7), # DART
+                            jnp.int32(446),                      # ROCK
+                        ),
+                    )
+                    vi = consume_mksobj_init_draws(vi, item_cls, item_otyp)
                     return vi
                 v = lax.cond(is_item_trap, _item_true, lambda vi: vi, v)
 
                 # Possession do-while (vendor mklev.c:1460-1490).
+                # Vendor calls mkobj(poss_class, FALSE) → mksobj(otyp, TRUE,
+                # FALSE).  We thread the decoded otyp into
+                # consume_mksobj_init_draws so WEAPON_CLASS can gate is_multigen
+                # / is_poisonable / artif correctly (mkobj.c:803-818).
+                # artif=FALSE here per vendor mklev.c:1478.
                 v, rn4_0 = randint_jax(v, (), 0, 4)
                 poss_cls_0 = _POSS_CLASS[rn4_0]
-                v, _ = randint_jax(v, (), 1, 1001)
-                v = consume_mksobj_init_draws(v, poss_cls_0)
+                v, typ_roll_0 = randint_jax(v, (), 1, 1001)
+                otyp_0 = decode_picked_otyp(poss_cls_0, typ_roll_0)
+                v = consume_mksobj_init_draws(v, poss_cls_0, otyp_0)
                 v, rn5_0 = randint_jax(v, (), 0, 5)
                 cont0_p = rn5_0 == jnp.int32(0)
                 POSS_CAP = jnp.int32(100)
@@ -2025,8 +2048,9 @@ def fill_ordinary_rooms(
                     vp, _cont_p, iters_p = carry_p
                     vp, rn4 = randint_jax(vp, (), 0, 4)
                     poss_cls = _POSS_CLASS[rn4]
-                    vp, _ = randint_jax(vp, (), 1, 1001)
-                    vp = consume_mksobj_init_draws(vp, poss_cls)
+                    vp, typ_roll_p = randint_jax(vp, (), 1, 1001)
+                    otyp_p = decode_picked_otyp(poss_cls, typ_roll_p)
+                    vp = consume_mksobj_init_draws(vp, poss_cls, otyp_p)
                     vp, rn5 = randint_jax(vp, (), 0, 5)
                     return (vp, rn5 == jnp.int32(0), iters_p + jnp.int32(1))
 
@@ -2051,9 +2075,24 @@ def fill_ordinary_rooms(
                 def _gnome_candle(vi):
                     vi, rn10 = randint_jax(vi, (), 0, 10)
                     def _candle_true(vic):
-                        vic, _ = randint_jax(vic, (), 0, 4)
-                        vic, _ = randint_jax(vic, (), 1, 1001)
-                        vic = consume_mksobj_init_draws(vic, jnp.int32(6))
+                        # Vendor mklev.c:1515-1516 calls mksobj() with a
+                        # SPECIFIC otyp (TALLOW_CANDLE / WAX_CANDLE) — NOT
+                        # mkobj() — so we skip the rnd(1000) type-pick.
+                        # rn2(4) selects TALLOW (199) vs WAX (200); then
+                        # mksobj_init runs the TOOL_CLASS candle branch
+                        # (rn2(2)?rn2(7):0 + blessorcurse(5)) via the
+                        # per-otyp dispatcher.  artif=FALSE per vendor.
+                        # Vendor cite: vendor/nle/src/mklev.c:1515-1521;
+                        #              vendor/nle/src/mkobj.c:899-907.
+                        vic, candle_pick = randint_jax(vic, (), 0, 4)
+                        candle_otyp = jnp.where(
+                            candle_pick != jnp.int32(0),
+                            jnp.int32(199),  # TALLOW_CANDLE
+                            jnp.int32(200),  # WAX_CANDLE
+                        )
+                        vic = consume_mksobj_init_draws(
+                            vic, jnp.int32(6), candle_otyp,
+                        )
                         return vic
                     vi = lax.cond(
                         rn10 == jnp.int32(0), _candle_true, lambda vic: vic, vi,
@@ -2061,8 +2100,43 @@ def fill_ordinary_rooms(
                     return vi
                 v = lax.cond(is_gnome_victim, _gnome_candle, lambda vi: vi, v)
 
-                # mkcorpstat(CORPSE) → rndmonnum (mklev.c:1529-1530).
-                v, _ = randint_jax(v, (), 1, 501)
+                # mkcorpstat(CORPSE, NULL, &mons[victim_mnum], m.x, m.y,
+                # CORPSTAT_INIT) — vendor mklev.c:1529-1530.
+                #
+                # Call chain (vendor mkobj.c::mkcorpstat lines 1524-1567):
+                #   → mksobj_at(CORPSE, x, y, init=TRUE, artif=FALSE)
+                #   → mksobj(CORPSE, TRUE, FALSE)
+                #     1. FOOD_CLASS/CORPSE init (mkobj.c:822-836):
+                #          do otmp->corpsenm = undead_to_corpse(rndmonnum())
+                #          while ((mvitals[corpsenm].mvflags & G_NOCORPSE)
+                #                 && (--tryct > 0));
+                #        We model the common single-iteration path: one
+                #        rndmonnum() == rndmonst() == rnd(choice_count) draw
+                #        via ``pick_monster_for_level`` (byte-exact).
+                #     2. post-init switch CORPSE fallthrough (mkobj.c:1075-1090):
+                #          corpsenm already set → skip second rndmonnum.
+                #          → set_corpsenm(otmp, corpsenm):
+                #            → start_corpse_timeout(body) (mkobj.c:1176-1224):
+                #              rnz(rot_adjust=25) draws inside.
+                #   → mkcorpstat ptr-override (mkobj.c:1555-1566):
+                #     if special_corpse(...) call start_corpse_timeout AGAIN.
+                #     For PM_HUMAN (the common case), special_corpse is FALSE
+                #     → no extra draws.  For PM_LIZARD / PM_LICHEN / Trolls /
+                #     Riders, set_corpsenm + start_corpse_timeout re-fire;
+                #     for byte-exact parity on the common path we don't model
+                #     the re-fire (most victims are HUMAN/DWARF/ORC/GNOME).
+                #
+                # Vendor cite: vendor/nle/src/mklev.c:1529-1530;
+                #              vendor/nle/src/mkobj.c:822-836, 1075-1112;
+                #              vendor/nle/src/mkobj.c::start_corpse_timeout;
+                #              vendor/nle/src/rnd.c::rnz.
+                v, _corpsenm = pick_monster_for_level(
+                    None, depth_i, vendor_rng=v,
+                )
+                # rnz(25) = rn2(1000) + rne(4) + rn2(2) — vendor rnd.c:249-272.
+                v, _ = rn2_jax(v, 1000)
+                v, _ = rne_jax(v, 4)
+                v, _ = rn2_jax(v, 2)
                 return v
 
             def trap_step_isaac(carry, j):
@@ -2344,7 +2418,8 @@ def fill_ordinary_rooms(
                         vj, cls_roll = rnd_jax(vj, 100)              # tprob = rnd(100) mkobj.c:259
                         oclass_g = _MKOBJ_TABLE[cls_roll - jnp.int32(1)]
                         otyp_g = decode_picked_otyp(oclass_g, typ_g) # mkobj.c:264-266
-                        vj = consume_mksobj_init_draws(vj, oclass_g, otyp_g)  # mkobj.c:801-1069
+                        # Vendor mkgrave mklev.c:1679: mkobj(RANDOM_CLASS, TRUE) → artif=TRUE.
+                        vj = consume_mksobj_init_draws(vj, oclass_g, otyp_g, artif=True)  # mkobj.c:801-1069
                         return vj
                     return lax.cond(
                         jnp.int32(idx) < _tryct,
@@ -2403,9 +2478,15 @@ def fill_ordinary_rooms(
             def _statue_true(v):
                 # somex(croom) / somey(croom) — placement draws.
                 v, _rst, _cst = somexy(v)
-                # rndmonnum() proxy: rndmonst() rn2(7) + rnd(choice_count).
-                # Vendor mkobj.c:1054 (mksobj_init STATUE branch).
-                v, _ = randint_jax(v, (), 1, 501)
+                # rndmonnum() — vendor mkobj.c:1054 (mksobj_init STATUE branch).
+                # Byte-exact via ``pick_monster_for_level``: draws
+                # ``rnd(choice_count)`` (no rn2(7) quest gate — main dungeon
+                # has u.uz.dnum != quest_dnum so short-circuited).
+                # Vendor cite: vendor/nle/src/makemon.c::rndmonst lines
+                # 1520-1601 (rnd(choice_count) at line 1591).
+                v, _statue_corpsenm = pick_monster_for_level(
+                    None, depth_i, vendor_rng=v,
+                )
                 # Spbook gate: rn2(level_difficulty()/2 + 10).
                 # Vendor mkobj.c:1056 — always drawn; verysmall unmodelled.
                 spbook_mod = jnp.maximum(depth_i // jnp.int32(2) + jnp.int32(10), jnp.int32(1))
@@ -2648,7 +2729,8 @@ def fill_ordinary_rooms(
                 # to its per-otyp cascade (mkobj.c:897-966 + mkbox_cnts).  Other
                 # classes ignore the otyp argument (legacy 0-draw fallback).
                 otyp0 = decode_picked_otyp(oclass0, typ0)              # mkobj.c:264-266
-                vrng_in = consume_mksobj_init_draws(vrng_in, oclass0, otyp0)  # mkobj.c:801-1069
+                # Vendor mklev.c:875: mkobj_at(0, somex, somey, TRUE) → artif=TRUE.
+                vrng_in = consume_mksobj_init_draws(vrng_in, oclass0, otyp0, artif=True)  # mkobj.c:801-1069
                 # Persist the decoded item into ground_items at the somexy
                 # position.  Vendor mklev.c:875 ``mkobj_at(0, somex, somey,
                 # TRUE)`` places the freshly-decoded object on the floor;
@@ -2713,7 +2795,8 @@ def fill_ordinary_rooms(
                         vi, cls_roll = rnd_jax(vi, 100)                  # tprob = rnd(100) (mkobj.c:259)
                         oclass_i = _MKOBJ_TABLE[cls_roll - jnp.int32(1)]
                         otyp_i = decode_picked_otyp(oclass_i, typ_i)     # mkobj.c:264-266
-                        vi = consume_mksobj_init_draws(vi, oclass_i, otyp_i)  # mkobj.c:801-1069
+                        # Vendor mklev.c:882: mkobj_at(0, somex, somey, TRUE) → artif=TRUE.
+                        vi = consume_mksobj_init_draws(vi, oclass_i, otyp_i, artif=True)  # mkobj.c:801-1069
                         # Persist inner mkobj_at placement to ground_items
                         # (vendor mklev.c:882).  Same first-empty-slot
                         # allocation as the outer placement above.

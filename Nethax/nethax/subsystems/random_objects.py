@@ -371,16 +371,74 @@ def _blessorcurse_jax(rng: Isaac64State, chance: int) -> Isaac64State:
     return rng
 
 
-def _weapon_draws(rng: Isaac64State) -> Isaac64State:
+# ---------------------------------------------------------------------------
+# is_multigen / is_poisonable lookup tables — vendor obj.h:197-204
+# ---------------------------------------------------------------------------
+# Both predicates use IDENTICAL conditions in vendor obj.h:
+#     oclass == WEAPON_CLASS && oc_skill in [-P_SHURIKEN, -P_BOW]
+#                                       == [-25, -21]
+# We bake the predicate into a single length-NUM_OBJECTS bool table for
+# O(1) lookup inside ``_weapon_draws`` (which already runs under lax.cond
+# gating).  Unknown otyps (>= NUM_OBJECTS) fall back to False via clip.
+
+def _build_weapon_predicate_table() -> jnp.ndarray:
+    """Return bool array sized to OBJECTS: True iff otyp is multigen/poisonable.
+
+    Vendor cite: vendor/nle/include/obj.h:197-204.
+
+    Note on Nethax skill offsets: Nethax's ``oc_skill`` enum is OFFSET BY 1
+    relative to vendor (Nethax P_BOW=20 vs vendor P_BOW=21; Nethax
+    P_SHURIKEN=24 vs vendor P_SHURIKEN=25).  The vendor predicate range
+    ``[-P_SHURIKEN, -P_BOW] = [-25, -21]`` therefore maps to Nethax-space
+    ``[-24, -20]``.  Verified set (arrows, ya, crossbow bolt, dart,
+    shuriken — 8 otyps) matches vendor is_multigen exactly.
+    """
+    n = len(OBJECTS)
+    table = [False] * n
+    weapon_cls = int(ObjectClass.WEAPON_CLASS)
+    for i, o in enumerate(OBJECTS):
+        if int(o.class_) != weapon_cls:
+            continue
+        # Nethax skill space [-24, -20] == vendor [-P_SHURIKEN, -P_BOW].
+        if -24 <= int(o.oc_skill) <= -20:
+            table[i] = True
+    return jnp.array(table, dtype=jnp.bool_)
+
+
+_WEAPON_MULTIGEN_TABLE = _build_weapon_predicate_table()
+# Vendor obj.h:201-204 — is_poisonable has IDENTICAL definition to is_multigen.
+_WEAPON_POISONABLE_TABLE = _WEAPON_MULTIGEN_TABLE
+
+
+def _weapon_draws(
+    rng: Isaac64State,
+    otyp: jnp.ndarray,
+    artif: jnp.ndarray,
+) -> Isaac64State:
     """WEAPON_CLASS — vendor mkobj.c:803-818.
 
-    rn2(11)                              # always  (mkobj.c:805)
-    if == 0: rne(3) + rn2(2)            # spe + blessed  (mkobj.c:806-807)
-    elif rn2(10)==0: rne(3)             # curse branch  (mkobj.c:808-810)
-    else: blessorcurse(10)              # (mkobj.c:812)
-    rn2(100)                            # poison check  (mkobj.c:813)
-    rn2(20)                             # artifact check  (mkobj.c:816)
+    quan = is_multigen(otmp) ? rn1(6,6) : 1   # mkobj.c:804 — 0 or 1 draws
+    rn2(11)                                    # always  (mkobj.c:805)
+    if == 0: rne(3) + rn2(2)                  # spe + blessed (mkobj.c:806-807)
+    elif rn2(10)==0: rne(3)                   # curse branch  (mkobj.c:808-810)
+    else: blessorcurse(10)                    # (mkobj.c:812)
+    if is_poisonable(otmp): rn2(100)          # poison check  (mkobj.c:813)
+    if artif: rn2(20)                          # artifact check (mkobj.c:816)
+
+    Vendor cite: vendor/nle/src/mkobj.c:803-818, vendor/nle/include/obj.h:197-204.
     """
+    safe_otyp = jnp.clip(otyp, 0, _WEAPON_MULTIGEN_TABLE.shape[0] - 1).astype(jnp.int32)
+    is_mg = _WEAPON_MULTIGEN_TABLE[safe_otyp]
+    is_poi = _WEAPON_POISONABLE_TABLE[safe_otyp]
+
+    # rn1(6, 6) = rn2(6) + 7 — 1 draw, gated on is_multigen (mkobj.c:804).
+    rng = lax.cond(
+        is_mg,
+        lambda r: rn1_jax(r, 6, 6)[0],
+        lambda r: r,
+        rng,
+    )
+
     rng, r11 = rn2_jax(rng, 11)                              # mkobj.c:805
 
     def _branch_blessed(r):
@@ -399,12 +457,24 @@ def _weapon_draws(rng: Isaac64State) -> Isaac64State:
         return r
 
     rng = lax.cond(r11 == jnp.int32(0), _branch_blessed, _branch_curse_or_boc, rng)
-    rng, _ = rn2_jax(rng, 100)                               # mkobj.c:813 poison
-    rng, _ = rn2_jax(rng, 20)                                # mkobj.c:816 artifact
+    # mkobj.c:813 — rn2(100) only fires when is_poisonable(otmp) is true.
+    rng = lax.cond(
+        is_poi,
+        lambda r: rn2_jax(r, 100)[0],                        # mkobj.c:813
+        lambda r: r,
+        rng,
+    )
+    # mkobj.c:816 — rn2(20) only fires when ``artif`` flag is TRUE.
+    rng = lax.cond(
+        artif,
+        lambda r: rn2_jax(r, 20)[0],                         # mkobj.c:816
+        lambda r: r,
+        rng,
+    )
     return rng
 
 
-def _armor_draws(rng: Isaac64State) -> Isaac64State:
+def _armor_draws(rng: Isaac64State, artif: jnp.ndarray) -> Isaac64State:
     """ARMOR_CLASS — vendor mkobj.c:992-1005.
 
     rn2(10)                              # outer guard  (mkobj.c:993)
@@ -415,7 +485,7 @@ def _armor_draws(rng: Isaac64State) -> Isaac64State:
         else: blessorcurse(10)          # mkobj.c:1004
     elif rn2(10)==0: rn2(2)+rne(3)     # mkobj.c:1000-1002
     else: blessorcurse(10)             # mkobj.c:1004
-    rn2(40)                             # artifact check  (mkobj.c:1005)
+    if artif: rn2(40)                   # artifact check  (mkobj.c:1005)
     """
     rng, outer = rn2_jax(rng, 10)                            # mkobj.c:993
 
@@ -449,7 +519,13 @@ def _armor_draws(rng: Isaac64State) -> Isaac64State:
         _elif_boc,
         rng,
     )
-    rng, _ = rn2_jax(rng, 40)                                # mkobj.c:1005 artifact
+    # mkobj.c:1005 — rn2(40) only fires when ``artif`` flag is TRUE.
+    rng = lax.cond(
+        artif,
+        lambda r: rn2_jax(r, 40)[0],                         # mkobj.c:1005
+        lambda r: r,
+        rng,
+    )
     return rng
 
 
@@ -929,8 +1005,18 @@ def _consume_mksobj_init_draws_inner(
     Used by ``_mkbox_cnts_draws`` for the per-item cascade so that bag-in-bag
     and the boxiprobs-emits-no-TOOL invariant are upheld (vendor mkobj.c:41-49
     boxiprobs class table; mkobj.c:342-345 bag-in-bag guard).
+
+    Inner callers don't have the decoded otyp (boxiprobs picks class but
+    doesn't expose the per-item type-roll downstream), so we pass otyp=0
+    and artif=False — both are safe defaults: boxiprobs (mkobj.c:41-49) emits
+    no WEAPON_CLASS items so the otyp=0 path through ``_weapon_draws`` is
+    never taken in practice, and bag-in-bag mksobj calls always pass
+    artif=FALSE per vendor mkobj.c:929 → mkbox_cnts → mksobj recursion.
     """
-    return lax.switch(oclass_id, _MKSOBJ_INIT_BRANCHES, rng)
+    return lax.switch(
+        oclass_id, _MKSOBJ_INIT_BRANCHES,
+        rng, jnp.int32(0), jnp.bool_(False),
+    )
 
 
 # lax.switch branch table indexed by ObjectClass int value.
@@ -938,21 +1024,67 @@ def _consume_mksobj_init_draws_inner(
 # ObjectClass values: RANDOM=0, COIN=1(?), WEAPON=2, ARMOR=3, RING=4,
 # AMULET=5, TOOL=6, FOOD=7, POTION=8, SCROLL=9, SPBOOK=10, WAND=11,
 # COIN=12, GEM=13.
+#
+# All branches share the uniform signature ``(rng, otyp, artif) -> rng`` so
+# lax.switch can dispatch them.  Branches that don't depend on otyp/artif
+# simply ignore those args.  WEAPON_CLASS uses both (otyp → is_multigen/is_poisonable
+# table lookup; artif → rn2(20) gate).  ARMOR_CLASS uses artif (→ rn2(40) gate).
+
+def _weapon_branch(rng, otyp, artif):
+    return _weapon_draws(rng, otyp, artif)
+
+def _armor_branch(rng, otyp, artif):
+    del otyp
+    return _armor_draws(rng, artif)
+
+def _noop_branch(rng, otyp, artif):
+    del otyp, artif
+    return rng
+
+def _ring_branch(rng, otyp, artif):
+    del otyp, artif
+    return _ring_draws(rng)
+
+def _amulet_branch(rng, otyp, artif):
+    del otyp, artif
+    return _amulet_draws(rng)
+
+def _food_branch(rng, otyp, artif):
+    del otyp, artif
+    return _food_draws(rng)
+
+def _potion_scroll_branch(rng, otyp, artif):
+    del otyp, artif
+    return _potion_scroll_draws(rng)
+
+def _spbook_branch(rng, otyp, artif):
+    del otyp, artif
+    return _spbook_draws(rng)
+
+def _wand_branch(rng, otyp, artif):
+    del otyp, artif
+    return _wand_draws(rng)
+
+def _gem_branch(rng, otyp, artif):
+    del otyp, artif
+    return _gem_draws(rng)
+
+
 _MKSOBJ_INIT_BRANCHES = [
-    _noop_draws,          # 0  RANDOM_CLASS   (never spawned directly)
-    _noop_draws,          # 1  (unused slot)
-    _weapon_draws,        # 2  WEAPON_CLASS   mkobj.c:803-818
-    _armor_draws,         # 3  ARMOR_CLASS    mkobj.c:992-1005
-    _ring_draws,          # 4  RING_CLASS     mkobj.c:1028-1048 (uncharged path)
-    _amulet_draws,        # 5  AMULET_CLASS   mkobj.c:967-975
-    _noop_draws,          # 6  TOOL_CLASS     dispatched via _tool_draws_dispatch
-    _food_draws,          # 7  FOOD_CLASS     mkobj.c:880-884
-    _potion_scroll_draws, # 8  POTION_CLASS   mkobj.c:981-987
-    _potion_scroll_draws, # 9  SCROLL_CLASS   mkobj.c:981-987
-    _spbook_draws,        # 10 SPBOOK_CLASS   mkobj.c:988-991
-    _wand_draws,          # 11 WAND_CLASS     mkobj.c:1019-1027
-    _noop_draws,          # 12 COIN_CLASS     mkobj.c:1060-1061 (no draws)
-    _gem_draws,           # 13 GEM_CLASS      mkobj.c:886-895
+    _noop_branch,          # 0  RANDOM_CLASS   (never spawned directly)
+    _noop_branch,          # 1  (unused slot)
+    _weapon_branch,        # 2  WEAPON_CLASS   mkobj.c:803-818
+    _armor_branch,         # 3  ARMOR_CLASS    mkobj.c:992-1005
+    _ring_branch,          # 4  RING_CLASS     mkobj.c:1028-1048 (uncharged path)
+    _amulet_branch,        # 5  AMULET_CLASS   mkobj.c:967-975
+    _noop_branch,          # 6  TOOL_CLASS     dispatched via _tool_draws_dispatch
+    _food_branch,          # 7  FOOD_CLASS     mkobj.c:880-884
+    _potion_scroll_branch, # 8  POTION_CLASS   mkobj.c:981-987
+    _potion_scroll_branch, # 9  SCROLL_CLASS   mkobj.c:981-987
+    _spbook_branch,        # 10 SPBOOK_CLASS   mkobj.c:988-991
+    _wand_branch,          # 11 WAND_CLASS     mkobj.c:1019-1027
+    _noop_branch,          # 12 COIN_CLASS     mkobj.c:1060-1061 (no draws)
+    _gem_branch,           # 13 GEM_CLASS      mkobj.c:886-895
 ]
 
 
@@ -960,6 +1092,7 @@ def consume_mksobj_init_draws(
     rng: Isaac64State,
     oclass_id: jnp.ndarray,
     otyp: jnp.ndarray | None = None,
+    artif: bool | jnp.ndarray = False,
 ) -> Isaac64State:
     """Consume vendor ``mksobj_init`` ISAAC64 draws for a given object class.
 
@@ -1014,14 +1147,26 @@ def consume_mksobj_init_draws(
     vendor/nle/src/mkobj.c:1028-1048 — RING_CLASS
     vendor/nle/src/mkobj.c:1370-1385 — blessorcurse definition
     """
-    rng = lax.switch(oclass_id, _MKSOBJ_INIT_BRANCHES, rng)
+    # Coerce otyp/artif into JAX scalars with safe defaults.
+    # When otyp is None (legacy callers — e.g. dead-pred possession that
+    # discarded the type roll) we pass otyp=0; ``_weapon_draws`` falls back
+    # to is_multigen=is_poisonable=False which matches the predominant
+    # weapon path (~94% of WEAPON_CLASS otyps by oc_prob mass are NOT
+    # multigen-skilled).  This was the pre-fix behaviour but is no longer
+    # the byte-correct path: callers that have the otyp roll SHOULD pass it.
+    otyp_arr = jnp.int32(0) if otyp is None else jnp.asarray(otyp, dtype=jnp.int32)
+    artif_arr = jnp.asarray(artif, dtype=jnp.bool_)
+    rng = lax.switch(
+        oclass_id, _MKSOBJ_INIT_BRANCHES,
+        rng, otyp_arr, artif_arr,
+    )
     if otyp is not None:
         # TOOL_CLASS per-otyp dispatch (mkobj.c:897-966).  Only fires when
         # the picked class is TOOL_CLASS; otherwise this is a noop.
         is_tool = oclass_id == jnp.int32(int(ObjectClass.TOOL_CLASS))
         rng = lax.cond(
             is_tool,
-            lambda r: _tool_draws_dispatch(r, otyp),
+            lambda r: _tool_draws_dispatch(r, otyp_arr),
             lambda r: r,
             rng,
         )
