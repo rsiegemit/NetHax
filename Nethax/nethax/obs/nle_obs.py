@@ -610,6 +610,22 @@ def build_colors(env_state) -> jnp.ndarray:
     explored = env_state.explored[branch, level_idx, :21, 1:80]
     colors = jnp.where(explored, colors, jnp.uint8(0))
 
+    # Object-color overlay (mirrors object-glyph overlay in build_glyphs).  Each
+    # visible cell whose ground stack has a non-zero slot 0 picks up the
+    # object's display color from the per-glyph color table.  Vendor cite:
+    # vendor/nle/src/mapglyph.c GLYPH_OBJ_OFF branch sets
+    # ``color = objects[obj_descr_idx].oc_color``.
+    visible_all = env_state.visible[:21, 1:80]                     # bool[21,79]
+    gi_cat0 = env_state.ground_items.category[branch, level_idx, :21, 1:80, 0]
+    gi_typ0 = env_state.ground_items.type_id[branch, level_idx, :21, 1:80, 0]
+    has_obj = (gi_cat0 != jnp.int8(0)) & visible_all
+    obj_glyph_idx = jnp.clip(
+        gi_typ0.astype(jnp.int32) + jnp.int32(GLYPH_OBJ_OFF),
+        0, _GLYPH_TO_COLOR.shape[0] - 1,
+    )
+    obj_colors = _GLYPH_TO_COLOR[obj_glyph_idx]                    # uint8[21,79]
+    colors = jnp.where(has_obj, obj_colors, colors)
+
     # Monster-color overlay.  Mirror the monster-glyph overlay in build_glyphs:
     # every visible, alive monster cell takes the monster's own display color
     # (vendor permonst.mcolor), NOT the terrain color underneath.  Pets are NOT
@@ -2042,6 +2058,19 @@ def build_glyphs(env_state) -> jnp.ndarray:
     # (`levl[x][y].glyph = cmap_to_glyph(S_stone); /* default val */`).
     stone_glyph_val = jnp.int16(GLYPH_CMAP_OFF + _S_stone)               # 2359
     glyphs = jnp.where(explored, terrain_glyphs, stone_glyph_val)
+
+    # Overlay ground objects on visible cells (vendor order: terrain → trap →
+    # object → monster → player; vendor/nethack/src/display.c::map_location
+    # lines 350-430).  Nethax's ground_items stack has slot 0 = TOP of pile
+    # (head of vendor's level.objects[x][y] linked list); see
+    # Nethax/nethax/subsystems/inventory.py:754-761 (pickup reads slot 0) and
+    # the drop scan at lines 1067-1095 (drop fills first-empty slot).  We
+    # therefore render slot 0's type_id as the visible object glyph.
+    gi_cat0 = env_state.ground_items.category[branch, level_idx, :21, 1:80, 0]   # int8[21,79]
+    gi_typ0 = env_state.ground_items.type_id[branch, level_idx, :21, 1:80, 0]    # int16[21,79]
+    has_obj = (gi_cat0 != jnp.int8(0)) & visible                                 # bool[21,79]
+    obj_glyphs = (gi_typ0.astype(jnp.int32) + jnp.int32(GLYPH_OBJ_OFF)).astype(jnp.int16)
+    glyphs = jnp.where(has_obj, obj_glyphs, glyphs)
 
     # Overlay live monsters at their tile positions.  Each visible, alive
     # monster slot writes GLYPH_MON_OFF + entry_idx at its (row, col).
