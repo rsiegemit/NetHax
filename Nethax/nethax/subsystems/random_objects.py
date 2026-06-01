@@ -410,6 +410,110 @@ _WEAPON_MULTIGEN_TABLE = _build_weapon_predicate_table()
 _WEAPON_POISONABLE_TABLE = _WEAPON_MULTIGEN_TABLE
 
 
+# ---------------------------------------------------------------------------
+# mk_artifact(otmp, A_NONE) eligible-count table — vendor artifact.c:125-208.
+# ---------------------------------------------------------------------------
+# When mkobj.c:816 fires `mk_artifact(otmp, A_NONE)` after `artif && !rn2(20)`
+# succeeds, vendor walks artilist[1..NROFARTIFACTS] collecting entries where
+# (a->otyp == otmp->otyp) && !(a->spfx & SPFX_NOGEN) && !artiexist[m].
+# If the eligible count n > 0, a single `rn2(n)` picks the artifact.
+# If n == 0, no draw fires.
+#
+# Threading artiexist through state is deferred (no artifacts exist on Dlvl 1
+# fresh game so the static eligible-count is exact for the reset prelude).
+# Once any artifact is generated mid-game, this table must be re-evaluated
+# against the live artiexist registry.
+#
+# Cite: vendor/nle/src/artifact.c:125-208, vendor/nle/include/artilist.h:34-253.
+# ---------------------------------------------------------------------------
+
+def _build_artifact_anone_count_table() -> jnp.ndarray:
+    """Return int8[NUM_OBJECTS]: count of non-NOGEN artifacts per otyp.
+
+    Hard-coded from vendor artilist.h.  We do NOT consult Nethax wish._ARTIFACTS
+    here because that table currently mis-maps Demonbane to "silver mace"
+    (vendor says LONG_SWORD); the eligible-count table needs the byte-accurate
+    vendor mapping.
+
+    Cite: vendor/nle/include/artilist.h lines 47-252 (one entry per A() macro).
+    """
+    # Lazy import to avoid circular module load.
+    from Nethax.nethax.subsystems.wish import _OBJECT_BY_NAME
+    # (artifact_idx, base_obj_name, has_SPFX_NOGEN) — order = artilist.h.
+    # Indices match Nethax wish._ARTIFACTS positions.
+    VENDOR_ARTIFACTS = (
+        # idx, base name (must match Nethax _OBJECT_BY_NAME), NOGEN flag
+        ( 0, "long sword",        True),   # Excalibur            (NOGEN)
+        ( 1, "katana",            False),  # Snickersnee
+        ( 2, "runesword",         False),  # Stormbringer
+        ( 3, "war hammer",        False),  # Mjollnir
+        ( 4, "battle-axe",        False),  # Cleaver
+        ( 5, "elven dagger",      False),  # Sting
+        ( 6, "elven broadsword",  False),  # Orcrist
+        ( 7, "silver saber",      False),  # Grayswandir
+        ( 8, "long sword",        False),  # Vorpal Blade
+        ( 9, "mace",              True),   # Sceptre of Might     (NOGEN)
+        (10, "tsurugi",           True),   # Tsurugi of Muramasa  (NOGEN)
+        (11, "mirror",            True),   # Magic Mirror Merlin  (NOGEN)
+        (12, "crystal ball",      True),   # Orb of Detection     (NOGEN)
+        (13, "luckstone",         True),   # Heart of Ahriman     (NOGEN)
+        (14, "quarterstaff",      True),   # Staff of Aesculapius (NOGEN)
+        (15, "pair of lenses",    True),   # Eyes of the Overworld(NOGEN)
+        (16, "helm of brilliance",True),   # Mitre of Holiness    (NOGEN)
+        (17, "bow",               True),   # Longbow of Diana     (NOGEN)
+        (18, "skeleton key",      True),   # Master Key Thievery  (NOGEN)
+        (19, "credit card",       True),   # Yendorian Express    (NOGEN)
+        (20, "crystal ball",      True),   # Orb of Fate          (NOGEN)
+        (21, "amulet of ESP",     True),   # Eye of Aethiopica    (NOGEN)
+        (22, "long sword",        False),  # Frost Brand
+        (23, "long sword",        False),  # Fire Brand
+        (24, "broadsword",        False),  # Dragonbane
+        (25, "long sword",        False),  # Demonbane (vendor LONG_SWORD)
+        (26, "silver saber",      False),  # Werebane
+        (27, "morning star",      False),  # Trollsbane
+        (28, "orcish dagger",     False),  # Grimtooth
+        (29, "athame",            False),  # Magicbane
+        (30, "long sword",        False),  # Giantslayer
+        (31, "war hammer",        False),  # Ogresmasher
+        (32, "long sword",        False),  # Sunsword
+    )
+    n_obj = len(OBJECTS)
+    counts = [0] * n_obj
+    for _idx, base, nogen in VENDOR_ARTIFACTS:
+        if nogen:
+            continue
+        otyp = _OBJECT_BY_NAME.get(base)
+        if otyp is None:
+            # Should not happen for the WEAPON_CLASS bases we care about.
+            continue
+        counts[otyp] += 1
+    return jnp.array(counts, dtype=jnp.int32)
+
+
+_ARTIFACT_ANONE_COUNT_TABLE = _build_artifact_anone_count_table()
+
+
+def _mk_artifact_anone_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
+    """Consume the single `rn2(n_eligible)` draw vendor mk_artifact A_NONE makes.
+
+    Vendor cite: artifact.c:191 `m = eligible[rn2(n)]` — fires only if n > 0.
+    Caller must already have gated on the outer `artif && !rn2(20)` success.
+
+    Note: this assumes artiexist is empty (Dlvl 1 fresh game / reset prelude).
+    Once mid-game artifact generation is supported, n must be re-derived from
+    the live artiexist registry (P0 #13).
+    """
+    safe_otyp = jnp.clip(otyp, 0, _ARTIFACT_ANONE_COUNT_TABLE.shape[0] - 1).astype(jnp.int32)
+    n = _ARTIFACT_ANONE_COUNT_TABLE[safe_otyp]
+    # rn2(0) would be ill-defined; vendor skips the draw entirely when n==0.
+    return lax.cond(
+        n > jnp.int32(0),
+        lambda r: rn2_jax(r, n)[0],
+        lambda r: r,
+        rng,
+    )
+
+
 def _weapon_draws(
     rng: Isaac64State,
     otyp: jnp.ndarray,
@@ -465,9 +569,21 @@ def _weapon_draws(
         rng,
     )
     # mkobj.c:816 — rn2(20) only fires when ``artif`` flag is TRUE.
+    # When the gate succeeds (r20 == 0), vendor calls mk_artifact(otmp, A_NONE)
+    # which emits a single `rn2(n_eligible)` over per-otyp candidate artifacts.
+    def _artif_check(r):
+        r, r20 = rn2_jax(r, 20)                              # mkobj.c:816
+        # mk_artifact(otmp, A_NONE) — vendor artifact.c:125-208.
+        # Fires only when the rn2(20) gate succeeds AND n_eligible > 0.
+        return lax.cond(
+            r20 == jnp.int32(0),
+            lambda rr: _mk_artifact_anone_draws(rr, safe_otyp),
+            lambda rr: rr,
+            r,
+        )
     rng = lax.cond(
         artif,
-        lambda r: rn2_jax(r, 20)[0],                         # mkobj.c:816
+        _artif_check,
         lambda r: r,
         rng,
     )
