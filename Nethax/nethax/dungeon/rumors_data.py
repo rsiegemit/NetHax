@@ -388,6 +388,12 @@ def get_jax_tables():
     """
     global _TABLES
     if _TABLES is None:
+        # Use jnp.asarray so JAX-tracer indexing inside the JIT body works
+        # (numpy arrays can't be indexed by a tracer).  CRITICAL: this
+        # function is eagerly called at module load (see bottom of file)
+        # so the first jnp.asarray runs OUTSIDE any JIT context and
+        # produces concrete DeviceArrays, never tracers.  Lazy init
+        # inside JIT would leak — same class of bug as pending_action.py.
         import jax.numpy as jnp
         text_len, char_class, rubout_len = _load_or_build_tables()
         _TABLES = (
@@ -396,3 +402,9 @@ def get_jax_tables():
             jnp.asarray(rubout_len, dtype=jnp.int32),
         )
     return _TABLES
+
+
+# Eagerly populate _TABLES at module load so the first JIT trace that
+# calls get_jax_tables() sees concrete DeviceArrays — never lazy-init
+# inside a tracer scope.
+get_jax_tables()
