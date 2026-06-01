@@ -37,6 +37,14 @@ from Nethax.nethax.subsystems.random_objects import (
     decode_picked_otyp,
 )
 from Nethax.nethax.subsystems.inventory import MAX_GROUND_STACK
+from Nethax.nethax.dungeon.rumors_data import (
+    CHAR_CLASS_RUBOUT,
+    CHAR_CLASS_SPACE,
+    CHAR_CLASS_PUNCT,
+    FALSE_RUMOR_SIZE,
+    MAX_RUMOR_LEN,
+    get_jax_tables as _get_rumor_tables,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1984,10 +1992,18 @@ def fill_ordinary_rooms(
                 )
 
                 def _item_true(vi):
-                    # ARROW/DART → WEAPON_CLASS(2); ROCK → GEM_CLASS(13).
+                    # ARROW/DART → mksobj(ARROW/DART, TRUE, FALSE) WEAPON_CLASS;
+                    # ROCK       → mksobj(ROCK, TRUE, FALSE)       GEM_CLASS.
+                    # Vendor calls mksobj() with a SPECIFIC otyp here — NOT
+                    # mkobj() — so the rnd(1000)/rnd(100) class+type cascade
+                    # is skipped (mksobj.c:771-1112 only runs the per-class
+                    # init switch, not the type-pick).  Previous code drew
+                    # rnd(1000) here which was an over-draw of 1.
+                    # Vendor cite: vendor/nle/src/mklev.c:1436-1450 (mksobj
+                    # call site), vendor/nle/src/mkobj.c:771-1112 (mksobj
+                    # signature and init).
                     is_rock = kind == jnp.int32(3)
                     item_cls = jnp.where(is_rock, jnp.int32(13), jnp.int32(2))
-                    vi, _ = randint_jax(vi, (), 1, 1001)  # rnd(1000) type-pick
                     vi = consume_mksobj_init_draws(vi, item_cls)
                     return vi
                 v = lax.cond(is_item_trap, _item_true, lambda vi: vi, v)
@@ -2076,12 +2092,70 @@ def fill_ordinary_rooms(
 
                 def _mktrap_true(carry_m):
                     v, t_in, tr_in = carry_m
-                    # traptype_rnd: rnd(TRAPNUM-1) = randint(1, TRAPNUM=26).
-                    v, kind_raw = randint_jax(v, (), 1, 26)
-                    # HOLE rn2(7) filter: vendor/nethack/src/mklev.c:1991-1994
-                    # draw always consumed (matches vendor stream even on non-HOLE kinds).
-                    v, hole_rn7_ = randint_jax(v, (), 0, 7)
-                    kind_ = _isaac_legalise_trap_kind(kind_raw, depth_i, hole_rn7_)
+                    # Vendor mktrap trap-kind picker (mklev.c:1318-1366) is a
+                    # do/while retry loop:
+                    #
+                    #     do {
+                    #         kind = rnd(TRAPNUM - 1);            // rnd(23)
+                    #         switch (kind) {
+                    #             case MAGIC_PORTAL: kind = NO_TRAP; break;
+                    #             case VIBRATING_SQUARE: kind = NO_TRAP; break;
+                    #             ... (depth-gated cases set kind = NO_TRAP) ...
+                    #             case HOLE: if (rn2(7)) kind = NO_TRAP; break;
+                    #         }
+                    #     } while (kind == NO_TRAP);
+                    #
+                    # The HOLE branch is the ONLY case that draws an extra
+                    # rn2(7) — every other rejection is a pure conditional.
+                    # On retry, the whole body runs again: another rnd(23),
+                    # and another rn2(7) iff that new kind is HOLE.
+                    #
+                    # Vendor TRAPNUM = 24 (vendor/nle/include/trap.h:83); the
+                    # ``rnd(TRAPNUM-1)`` call therefore draws in [1, 23] →
+                    # randint_jax range_size = 23.
+                    # Vendor cite: vendor/nle/src/mklev.c:1318-1366.
+                    HOLE = jnp.int32(13)
+
+                    def _kind_cond(carry):
+                        _v, _k, accepted, _iters = carry
+                        # Retry until a legal (non-NO_TRAP) kind is drawn;
+                        # cap at 32 iters to keep the JIT loop bounded
+                        # (probability of 32 rejections in a row is < 1e-20).
+                        return (~accepted) & (_iters < jnp.int32(32))
+
+                    def _kind_body(carry):
+                        vi, _k_prev, _acc_prev, iters = carry
+                        vi, k_raw = randint_jax(vi, (), 1, 24)   # rnd(23)
+                        # rn2(7) fires only when k_raw == HOLE — vendor's
+                        # switch/case only draws this inside ``case HOLE``.
+                        is_hole = k_raw == HOLE
+
+                        def _draw_h7(vv):
+                            vv, h = randint_jax(vv, (), 0, 7)
+                            return vv, h
+
+                        def _no_h7(vv):
+                            return vv, jnp.int32(0)
+
+                        vi, h7 = lax.cond(is_hole, _draw_h7, _no_h7, vi)
+                        k_final = _isaac_legalise_trap_kind(k_raw, depth_i, h7)
+                        # legalise() collapses rejected draws to ARROW_TRAP
+                        # (==1) — but vendor RETRIES on rejection.  Detect a
+                        # rejection by comparing k_final vs k_raw: if they
+                        # differ AND k_raw != 1, the draw was rejected.
+                        # When k_raw==1 (ARROW_TRAP), legalise is a no-op so
+                        # accepted is True.
+                        accepted = jnp.logical_or(
+                            k_final == k_raw,            # legalise no-op
+                            k_raw == jnp.int32(1),       # raw was already ARROW_TRAP
+                        )
+                        return (vi, k_final, accepted, iters + jnp.int32(1))
+
+                    v, kind_, _, _ = lax.while_loop(
+                        _kind_cond,
+                        _kind_body,
+                        (v, jnp.int32(0), jnp.bool_(False), jnp.int32(0)),
+                    )
                     # mktrap's do/while: somexy placement (single-attempt model).
                     v, rt_r_, rt_c_ = somexy(v)
                     new_t = t_in.at[rt_r_, rt_c_].set(TRAP_TILE)
@@ -2126,16 +2200,22 @@ def fill_ordinary_rooms(
             def _mkgold_true(v):
                 # somex/somey are evaluated arguments to mkgold().
                 v, _rg, _cg = somexy(v)
-                # mkgold(amount==0) draws two RNG values inside (mkobj.c:1486-1504):
-                #   mul  = rnd(level_difficulty() + 2)      (mkobj.c:1493)
-                #   amount = rnd(30 * mul)                  (mkobj.c:1495)
+                # mkgold(amount==0) draws two RNG values inside.  Vendor
+                # mkobj.c:1492-1496:
+                #     long mul = rnd(30 / max(12-depth(&u.uz), 2));   // FIRST
+                #     amount = (long) (1 + rnd(level_difficulty() + 2) * mul);
+                # The C operator-precedence note: ``rnd(...) * mul`` evaluates
+                # ``rnd(level_difficulty()+2)`` and multiplies by the already-
+                # drawn ``mul`` — so the ``mul`` draw fires FIRST, then the
+                # level_difficulty draw fires SECOND.
                 # Vendor cite: vendor/nle/src/mkobj.c:1486-1504.
-                # mul = rnd(level_difficulty() + 2) → [1, depth+2] FIRST
-                v, _ = randint_jax(v, (), 1, depth_i + jnp.int32(3))
-                # amount = rnd(30 * mul) → [1, 30*mul] SECOND
+                # mul = rnd(30 / max(12-depth, 2)) FIRST
                 _denom = jnp.maximum(jnp.int32(12) - depth_i, jnp.int32(2))
                 _hi = jnp.int32(30) // _denom          # rnd(30/denom) → [1, hi]
                 v, _ = randint_jax(v, (), 1, _hi + jnp.int32(1))
+                # amount = 1 + rnd(level_difficulty() + 2) * mul SECOND.
+                # rnd(level_difficulty() + 2) → [1, depth+2]
+                v, _ = randint_jax(v, (), 1, depth_i + jnp.int32(3))
                 return v
 
             vrng = lax.cond(_gold_gate, _mkgold_true, lambda v: v, vrng)
@@ -2397,36 +2477,112 @@ def fill_ordinary_rooms(
                 # Vendor draw cascade (truth=0 getrumor path; rn2(4)!=0 case):
                 #   1. rn2(4)                        — branch decider (engrave.c:20)
                 #   2. rn2(2)                        — adjtruth = 0 + rn2(2)
-                #   3. rn2(true_rumor_size=25515)   — adjtruth==1 (case 1)
-                #      OR
-                #      rn2(false_rumor_size=25515)  — adjtruth==0 (case 0)
-                #      For seed=1 the false_rumor_size happens to be 25515;
-                #      modelling as rn2(25515) unconditionally matches vendor.
-                #   4. wipeout_text loop: ~53 iters of (rn2(lth) + rn2(4) +
-                #      sometimes rn2(strlen(rubouts.wipeto))) — engrave.c:90-136.
-                #      Models a ~150-draw cascade per graffiti.
+                #   3. rn2(false_rumor_size=25515)   — adjtruth==0 case 0
+                #                                       (rumors.c:133, FALSE path)
+                #   4. wipeout_text loop (engrave.c:82-142): cnt = strlen(rumor)/4
+                #      iterations, each consuming
+                #          rn2(strlen(rumor))         — pick position
+                #          rn2(4)                     — pick use_rubout flag
+                #          [conditional] rn2(strlen(rubouts.wipeto))
+                #                                     — substitute pick when
+                #                                       use_rubout!=0 AND char
+                #                                       is in the rubouts table
+                #      The full per-rumor character data (text_len, char-class,
+                #      rubout-substitute lengths) is pre-computed once at
+                #      import time in ``rumors_data.py`` so the JIT body can
+                #      branch on static lookups rather than a Python-side scan
+                #      over the rumors.fal source.
                 # Cite: vendor/nle/src/engrave.c:13-25, 82-142;
-                #       vendor/nle/src/rumors.c:91-159.
-                vrng_in, _rne4  = randint_jax(vrng_in, (), 0, 4)      # rn2(4) branch
-                vrng_in, _rne2  = randint_jax(vrng_in, (), 0, 2)      # rn2(2) truth (getrumor)
-                vrng_in, _rnfs  = randint_jax(vrng_in, (), 0, 25515)  # rn2(rumor_size) (vendor false_rumor_size on seed=1)
+                #       vendor/nle/src/rumors.c:91-159 (false path adjtruth==0).
+                vrng_in, _rne4  = randint_jax(vrng_in, (), 0, 4)      # rn2(4) branch (engrave.c:20)
+                vrng_in, _rne2  = randint_jax(vrng_in, (), 0, 2)      # rn2(2) truth-coin (rumors.c:124)
+                vrng_in, tidbit = randint_jax(
+                    vrng_in, (), 0, FALSE_RUMOR_SIZE
+                )                                                    # rn2(false_rumor_size) (rumors.c:133)
+                # ---- wipeout_text simulation ----
+                # Pre-built per-tidbit tables (host-side, in rumors_data.py):
+                #   text_len_tab[tidbit]              : int32 strlen(rumor)
+                #   char_class_tab[tidbit, pos]       : int8 dispatch class
+                #                                       (SPACE/PUNCT/RUBOUT/OTHER)
+                #   rubout_len_tab[tidbit, pos]       : int32 wipeto-string len
+                # Vendor wipeout_text loop body per iteration (engrave.c:90-136):
+                #   nxt        = rn2(lth);              // always drawn
+                #   use_rubout = rn2(4);                // always drawn
+                #   if (*s == ' ')                continue;     // no extra draw
+                #   if (index("?.,'`-|_", *s)) { *s=' '; continue; } // no extra draw
+                #   if (!use_rubout) i = SIZE(rubouts);          // no extra draw
+                #   else /* search rubouts */ {
+                #       if (found) j = rn2(strlen(wipeto));   // ONE extra draw
+                #       else i == SIZE(rubouts);                // no extra draw
+                #   }
+                #   if (i == SIZE(rubouts)) *s = '?';
+                text_len_tab, char_class_tab, rubout_len_tab = _get_rumor_tables()
+                rumor_lth = text_len_tab[tidbit]              # int32 scalar
+                wipe_cnt  = rumor_lth // jnp.int32(4)         # cnt = strlen/4
+
+                def _wipe_cond(carry):
+                    _v, i = carry
+                    return i < wipe_cnt
+
+                def _wipe_body(carry):
+                    v, i = carry
+                    v, nxt        = randint_jax(v, (), 0, rumor_lth)
+                    v, use_rubout = randint_jax(v, (), 0, 4)
+                    cclass = char_class_tab[tidbit, nxt]
+                    rlen   = rubout_len_tab[tidbit, nxt]
+                    # Conditional substitute draw fires iff
+                    #   cclass == RUBOUT  AND  use_rubout != 0  AND  rlen > 0.
+                    # rlen > 0 is guaranteed whenever cclass == RUBOUT (table
+                    # invariant) — included defensively so a zero-len wipeto
+                    # never reaches randint_jax (which would assert/UB).
+                    need_extra = (
+                        (cclass == jnp.int8(CHAR_CLASS_RUBOUT))
+                        & (use_rubout != jnp.int32(0))
+                        & (rlen > jnp.int32(0))
+                    )
+
+                    def _do_extra(vv):
+                        # Clamp rlen lower bound to 1 so the false branch's
+                        # range_size argument is always positive; the result
+                        # is discarded when need_extra is false (the draw still
+                        # consumes one uint64 from the false branch — but the
+                        # lax.cond gates it, so the false branch returns vv
+                        # untouched).
+                        vv, _j = randint_jax(vv, (), 0, rlen)
+                        return vv
+
+                    def _no_extra(vv):
+                        return vv
+
+                    v = lax.cond(need_extra, _do_extra, _no_extra, v)
+                    return v, i + jnp.int32(1)
+
+                vrng_in, _ = lax.while_loop(
+                    _wipe_cond, _wipe_body, (vrng_in, jnp.int32(0))
+                )
+                # ---- end wipeout_text simulation ----
                 # Vendor do-while (mklev.c:863-866):
                 #   do { x = somex(croom); y = somey(croom); }
                 #   while (levl[x][y].typ != ROOM && !rn2(40));
                 # First iteration always draws somex+somey.  Continuation is
-                # the conjunction of (typ != ROOM) && (rn2(40) == 0); the
-                # `typ != ROOM` half is purely deterministic (no RNG), so the
-                # only RNG-side termination is `rn2(40) == 0`.  We model the
-                # vendor draw-stream by issuing exactly one rn2(40) per iter
-                # whose result is non-zero (the typically-true ROOM short-
-                # circuit caps loops at the first rn2(40) miss in practice).
-                # Use lax.while_loop — JIT-compatible, fixed-pytree carry —
-                # so we burn only the draws vendor actually consumes.
-                vrng_in, _rx0, _ry0 = somexy(vrng_in)
-                vrng_in, rn40_0 = randint_jax(vrng_in, (), 0, 40)
-                cont0 = rn40_0 == jnp.int32(0)
-                # Safety cap matches vendor's implicit ROOM short-circuit;
-                # average vendor iters ≈ 1.026 (1/39 continuation rate).
+                # the conjunction (levl[x][y].typ != ROOM) && (rn2(40) == 0);
+                # because of C ``&&`` short-circuit, the ``rn2(40)`` is only
+                # drawn when the somex/somey position is NOT a ROOM tile.
+                # For an ordinary room whose interior is entirely floor (no
+                # fountain/sink/altar/grave/statue/box already placed at that
+                # exact cell), somex/somey lands on a ROOM tile on iter 1 and
+                # the loop exits with ZERO rn2(40) draws — matching vendor's
+                # observed stream on seed=1 (draws 1344,1345 are somex/somey
+                # but no rn2(40) appears before the next room's mkobj gate).
+                #
+                # Vendor's ROOM check uses ``levl[x][y].typ == ROOM`` (rm.h
+                # enum value 11).  In Nethax the per-cell terrain encoding
+                # uses the TileType FLOOR=1 for ROOM-typed cells — see the
+                # ``_VTYP_TO_TILE`` map in branches.py.  Use terrain_ here:
+                # a freshly-placed feature (fountain/sink/altar/grave) would
+                # already have mutated terrain_ to a non-FLOOR tile before
+                # graffiti runs, so the test ``terrain_[ry,cx] == FLOOR`` is
+                # the byte-parity proxy for ``typ == ROOM``.
                 GRAFFITI_CAP = jnp.int32(40)
 
                 def _graf_cond(carry):
@@ -2435,14 +2591,29 @@ def fill_ordinary_rooms(
 
                 def _graf_body(carry):
                     v, _cont, iters = carry
-                    v, _gx, _gy = somexy(v)
-                    v, rn40 = randint_jax(v, (), 0, 40)
-                    return (v, rn40 == jnp.int32(0), iters + jnp.int32(1))
+                    # somex + somey ALWAYS draw (vendor mklev.c:864-865, inside
+                    # the do { ... } body — they run unconditionally each iter).
+                    v, ry, cx = somexy(v)
+                    is_room = terrain_[ry, cx] == jnp.int8(_TILE_FLOOR)
+                    # rn2(40) is gated: vendor's `typ != ROOM && !rn2(40)`
+                    # short-circuit on `typ == ROOM` (i.e. is_room True)
+                    # SKIPS the rn2(40) draw entirely.  Use lax.cond so the
+                    # ISAAC stream sees the draw only when vendor would.
+                    def _do_rn40(vv):
+                        vv, rn40 = randint_jax(vv, (), 0, 40)
+                        return vv, (rn40 == jnp.int32(0))
+
+                    def _skip_rn40(vv):
+                        # typ == ROOM ⇒ exit loop (cont=False); no draw.
+                        return vv, jnp.bool_(False)
+
+                    v, cont_next = lax.cond(is_room, _skip_rn40, _do_rn40, v)
+                    return (v, cont_next, iters + jnp.int32(1))
 
                 vrng_in, _, _ = lax.while_loop(
                     _graf_cond,
                     _graf_body,
-                    (vrng_in, cont0, jnp.int32(1)),
+                    (vrng_in, jnp.bool_(True), jnp.int32(0)),
                 )
                 return vrng_in
 
