@@ -1087,72 +1087,87 @@ def consume_init_attr_draws(
     Cite: vendor/nle/src/attrib.c:614-660
           vendor/nle/src/u_init.c:1390 (``init_attr(75)`` call site)
     """
-    from Nethax.nethax import vendor_rng as _vrng
+    from Nethax.nethax.vendor_rng import rn2_jax
 
     r_entry = get_role(role)
     race_entry = get_race(race)
 
-    attrbase = list(int(v) for v in r_entry.attrbase)   # [6] ints
-    attrdist = list(int(v) for v in r_entry.attrdist)   # [6] ints
-    attrmin  = list(int(v) for v in race_entry.attrmin) # [6] ints
-    attrmax  = list(int(v) for v in race_entry.attrmax) # [6] ints
-    a_max_idx = 6  # A_MAX — vendor include/attrib.h
+    # Static role/race tables — captured by closure as Python lists, then
+    # baked into jnp arrays.  attrdist sums to 100, so the inner-walk
+    # "i >= A_MAX" branch is unreachable; we still match vendor structure.
+    attrbase_py = [int(v) for v in r_entry.attrbase]
+    attrdist_py = [int(v) for v in r_entry.attrdist]
+    attrmin_py  = [int(v) for v in race_entry.attrmin]
+    attrmax_py  = [int(v) for v in race_entry.attrmax]
+
+    attrdist_arr = jnp.asarray(attrdist_py, dtype=jnp.int32)
+    attrmin_arr  = jnp.asarray(attrmin_py,  dtype=jnp.int32)
+    attrmax_arr  = jnp.asarray(attrmax_py,  dtype=jnp.int32)
+
+    # Inclusive prefix-sum of attrdist (jnp).  argmax(cumsum >= x) gives the
+    # same ``i`` as the vendor for-loop because vendor stops at the first i
+    # where (running sum from 0..i inclusive) >= original_x.
+    cumsum_arr = jnp.cumsum(attrdist_arr)  # int32[6]
 
     # Step 1: initialise ABASE from role, compute remaining points.
     # attrib.c:619-623
-    abase = list(attrbase)
-    np = np_total - sum(attrbase)
+    abase0 = jnp.asarray(attrbase_py, dtype=jnp.int32)
+    np0    = jnp.int32(np_total - sum(attrbase_py))
 
-    # Step 2: distribute excess points upward.
-    # attrib.c:625-640
-    tryct = 0
-    while np > 0 and tryct < 100:
-        vendor_rng, x = _vrng.rn2(vendor_rng, 100)  # attrib.c:627
-        # Walk attrdist exactly like vendor:
-        #   attrib.c:628 ``for (i=0; (i<A_MAX) && ((x -= attrdist[i]) > 0); i++)``
-        # The C ``for`` subtracts attrdist[i] from x, then advances i only while
-        # the *result* is strictly > 0.  So the loop stops at the first i where
-        # the running subtraction reaches <= 0, i.e. cumsum[i] >= original x.
-        # (A naive ``x >= 0`` check over-advances when x lands exactly on a
-        # cumulative-sum boundary, consuming one fewer draw than vendor.)
-        i = 0
-        while i < a_max_idx:
-            x -= attrdist[i]
-            if not (x > 0):
-                break
-            i += 1
-        if i >= a_max_idx:          # attrib.c:630-631 impossible branch
-            continue                 # (never reached when attrdist sums to 100)
-        if abase[i] >= attrmax[i]:  # attrib.c:633-636
-            tryct += 1
-            continue
-        tryct = 0                   # attrib.c:637-640
-        abase[i] += 1
-        np -= 1
+    def _walk_dist(x: jnp.ndarray) -> jnp.ndarray:
+        """Vendor for-loop walk — returns i in [0,5] where cumsum >= x."""
+        return jnp.argmax(cumsum_arr >= x).astype(jnp.int32)
 
-    # Step 3: redistribute excess points downward (np < 0).
-    # attrib.c:643-660
-    tryct = 0
-    while np < 0 and tryct < 100:
-        vendor_rng, x = _vrng.rn2(vendor_rng, 100)  # attrib.c:646
-        # Same vendor walk as the distribute loop (attrib.c:647 ``> 0`` form).
-        i = 0
-        while i < a_max_idx:
-            x -= attrdist[i]
-            if not (x > 0):
-                break
-            i += 1
-        if i >= a_max_idx:          # attrib.c:649-651
-            continue
-        if abase[i] <= attrmin[i]:  # attrib.c:652-655
-            tryct += 1
-            continue
-        tryct = 0                   # attrib.c:656-659
-        abase[i] -= 1
-        np += 1
+    # Step 2: distribute excess points upward.  attrib.c:625-640.
+    # State: (rng, abase, np, tryct).  Loop while np>0 and tryct<100.
+    def _up_cond(carry):
+        _rng, _abase, np_c, tryct_c = carry
+        return jnp.logical_and(np_c > jnp.int32(0), tryct_c < jnp.int32(100))
+
+    def _up_body(carry):
+        rng_c, abase_c, np_c, tryct_c = carry
+        rng_c, x = rn2_jax(rng_c, jnp.int32(100))           # attrib.c:627
+        i = _walk_dist(x)
+        cur = abase_c[i]
+        cap = attrmax_arr[i]
+        capped = cur >= cap                                  # attrib.c:633-636
+        new_abase = abase_c.at[i].set(cur + jnp.int32(1))    # attrib.c:638
+        # capped: tryct++ no change to abase/np.  uncapped: tryct=0, abase++, np--.
+        abase_n = jax.lax.cond(capped, lambda: abase_c, lambda: new_abase)
+        np_n    = jax.lax.cond(capped, lambda: np_c,    lambda: np_c - jnp.int32(1))
+        tryct_n = jax.lax.cond(capped, lambda: tryct_c + jnp.int32(1), lambda: jnp.int32(0))
+        return rng_c, abase_n, np_n, tryct_n
+
+    vendor_rng, abase1, np1, _ = jax.lax.while_loop(
+        _up_cond, _up_body,
+        (vendor_rng, abase0, np0, jnp.int32(0)),
+    )
+
+    # Step 3: redistribute excess points downward (np < 0).  attrib.c:643-660.
+    def _dn_cond(carry):
+        _rng, _abase, np_c, tryct_c = carry
+        return jnp.logical_and(np_c < jnp.int32(0), tryct_c < jnp.int32(100))
+
+    def _dn_body(carry):
+        rng_c, abase_c, np_c, tryct_c = carry
+        rng_c, x = rn2_jax(rng_c, jnp.int32(100))           # attrib.c:646
+        i = _walk_dist(x)
+        cur = abase_c[i]
+        floor = attrmin_arr[i]
+        capped = cur <= floor                                # attrib.c:652-655
+        new_abase = abase_c.at[i].set(cur - jnp.int32(1))    # attrib.c:657
+        abase_n = jax.lax.cond(capped, lambda: abase_c, lambda: new_abase)
+        np_n    = jax.lax.cond(capped, lambda: np_c,    lambda: np_c + jnp.int32(1))
+        tryct_n = jax.lax.cond(capped, lambda: tryct_c + jnp.int32(1), lambda: jnp.int32(0))
+        return rng_c, abase_n, np_n, tryct_n
+
+    vendor_rng, abase2, _np2, _ = jax.lax.while_loop(
+        _dn_cond, _dn_body,
+        (vendor_rng, abase1, np1, jnp.int32(0)),
+    )
 
     # Clamp final values to [attrmin, attrmax].
-    clamped = [max(attrmin[i], min(attrmax[i], abase[i])) for i in range(a_max_idx)]
+    clamped = jnp.minimum(jnp.maximum(abase2, attrmin_arr), attrmax_arr)
 
     attributes = {name: clamped[i] for i, name in enumerate(_STAT_NAMES)}
     return vendor_rng, attributes
@@ -1228,34 +1243,51 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
     vendor/nle/src/rnd.c:196-215        — rne implementation
     vendor/nle/src/rnd.c:194            — rne range comment
     """
-    from Nethax.nethax import vendor_rng as _vrng
+    from Nethax.nethax.vendor_rng import rn2_jax, rne_jax
+
+    # Local blessorcurse(chance) helper — vendor mkobj.c:1370-1385.
+    # rn2(chance); if hit==0: rn2(2).  All draws emitted via JAX-traceable rn2.
+    def _boc(rng_c, chance):
+        rng_c, hit = rn2_jax(rng_c, jnp.int32(chance))
+        return jax.lax.cond(
+            hit == jnp.int32(0),
+            lambda r: rn2_jax(r, jnp.int32(2))[0],
+            lambda r: r,
+            rng_c,
+        )
 
     # 1. rn1(10, 6) dagger quantity — u_init.c:750
     # rn1(x, y) == rn2(x) + y, so trquan = rn2(10) + 6 ∈ [6, 15].
     # Cite: vendor/nle/src/rnd.c::rn1.
-    vendor_rng, _dagger_roll = _vrng.rn2(vendor_rng, 10)
-    dagger_qty = _dagger_roll + 6
+    vendor_rng, _dagger_roll = rn2_jax(vendor_rng, jnp.int32(10))
+    dagger_qty = _dagger_roll + jnp.int32(6)
 
     # 2–3. SHORT_SWORD and DAGGER — WEAPON_CLASS (mkobj.c:803-818)
     # trspe=0 for both → rne draws only if rn2(11)==0 or rn2(10)==0 branches hit.
     # Vendor order in !rn2(11) branch: spe=rne(3) THEN blessed=rn2(2) (mkobj.c:806-807).
     # Vendor order in elif !rn2(10) branch: curse + spe=-rne(3) only (mkobj.c:809-810).
-    for _ in range(2):
-        vendor_rng, r11 = _vrng.rn2(vendor_rng, 11)
-        if r11 == 0:
-            # !rn2(11) branch: spe=rne(3), blessed=rn2(2) — mkobj.c:806-807
-            vendor_rng, _spe = _vrng.rne(vendor_rng, 3)
-            vendor_rng, _blessed = _vrng.rn2(vendor_rng, 2)
-        else:
-            vendor_rng, r10 = _vrng.rn2(vendor_rng, 10)
-            if r10 == 0:
-                # elif !rn2(10): curse + spe=-rne(3) — mkobj.c:809-810
-                vendor_rng, _spe = _vrng.rne(vendor_rng, 3)
-            else:
-                # else: blessorcurse(10) → rn2(10) [+ rn2(2) if 0] — mkobj.c:812
-                vendor_rng, bc = _vrng.rn2(vendor_rng, 10)
-                if bc == 0:
-                    vendor_rng, _bc2 = _vrng.rn2(vendor_rng, 2)
+    def _weapon_blessed(r):                                      # mkobj.c:806-807
+        r, _ = rne_jax(r, jnp.int32(3))
+        r, _ = rn2_jax(r, jnp.int32(2))
+        return r
+
+    def _weapon_else(r):
+        r, r10 = rn2_jax(r, jnp.int32(10))
+        return jax.lax.cond(
+            r10 == jnp.int32(0),
+            lambda rr: rne_jax(rr, jnp.int32(3))[0],            # mkobj.c:809-810
+            lambda rr: _boc(rr, 10),                             # mkobj.c:812
+            r,
+        )
+
+    def _weapon_step(r):
+        r, r11 = rn2_jax(r, jnp.int32(11))
+        return jax.lax.cond(
+            r11 == jnp.int32(0), _weapon_blessed, _weapon_else, r,
+        )
+
+    vendor_rng = _weapon_step(vendor_rng)  # SHORT_SWORD
+    vendor_rng = _weapon_step(vendor_rng)  # DAGGER
 
     # 4. LEATHER_ARMOR — ARMOR_CLASS (mkobj.c:992-1004)
     # trspe=1 → rne(3) fires in both the curse and blessed branches.
@@ -1265,49 +1297,45 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
     # LEATHER_ARMOR is none of the named special types, so the inner || chain
     # reaches !rn2(11) — that draw always fires when outer rn2(10) != 0.
     # When outer rn2(10) == 0, C short-circuits and rn2(11) is NOT drawn.
-    vendor_rng, outer = _vrng.rn2(vendor_rng, 10)   # mkobj.c:993
-    if outer != 0:
-        # outer rn2(10) non-zero → evaluate || chain → reaches !rn2(11)
-        vendor_rng, r11 = _vrng.rn2(vendor_rng, 11)  # mkobj.c:997
-        if r11 == 0:
-            # if-branch taken: curse + spe=-rne(3) — mkobj.c:999
-            vendor_rng, _spe = _vrng.rne(vendor_rng, 3)
-        else:
-            # if-condition False → fall to elif !rn2(10)
-            vendor_rng, elif10 = _vrng.rn2(vendor_rng, 10)  # mkobj.c:1000
-            if elif10 == 0:
-                # elif branch: blessed=rn2(2) then spe=rne(3) — mkobj.c:1001-1002
-                vendor_rng, _blessed = _vrng.rn2(vendor_rng, 2)
-                vendor_rng, _spe = _vrng.rne(vendor_rng, 3)
-            else:
-                # else: blessorcurse(10) — mkobj.c:1004
-                vendor_rng, bc = _vrng.rn2(vendor_rng, 10)
-                if bc == 0:
-                    vendor_rng, _bc2 = _vrng.rn2(vendor_rng, 2)
-    else:
-        # outer rn2(10) == 0 → if-condition False (short-circuit, no rn2(11))
-        # fall to elif !rn2(10)
-        vendor_rng, elif10 = _vrng.rn2(vendor_rng, 10)  # mkobj.c:1000
-        if elif10 == 0:
-            # elif branch: blessed=rn2(2) then spe=rne(3) — mkobj.c:1001-1002
-            vendor_rng, _blessed = _vrng.rn2(vendor_rng, 2)
-            vendor_rng, _spe = _vrng.rne(vendor_rng, 3)
-        else:
-            # else: blessorcurse(10) — mkobj.c:1004
-            vendor_rng, bc = _vrng.rn2(vendor_rng, 10)
-            if bc == 0:
-                vendor_rng, _bc2 = _vrng.rn2(vendor_rng, 2)
+    def _armor_blessed_branch(r):                                # mkobj.c:1001-1002
+        r, _ = rn2_jax(r, jnp.int32(2))
+        r, _ = rne_jax(r, jnp.int32(3))
+        return r
+
+    def _armor_elif_boc(r):
+        r, elif10 = rn2_jax(r, jnp.int32(10))                   # mkobj.c:1000
+        return jax.lax.cond(
+            elif10 == jnp.int32(0),
+            _armor_blessed_branch,
+            lambda rr: _boc(rr, 10),                             # mkobj.c:1004
+            r,
+        )
+
+    def _armor_outer_nonzero(r):
+        r, r11 = rn2_jax(r, jnp.int32(11))                       # mkobj.c:997
+        return jax.lax.cond(
+            r11 == jnp.int32(0),
+            lambda rr: rne_jax(rr, jnp.int32(3))[0],            # mkobj.c:999
+            _armor_elif_boc,
+            r,
+        )
+
+    vendor_rng, outer = rn2_jax(vendor_rng, jnp.int32(10))      # mkobj.c:993
+    vendor_rng = jax.lax.cond(
+        outer != jnp.int32(0),
+        _armor_outer_nonzero,
+        _armor_elif_boc,   # outer == 0 short-circuit → straight to elif !rn2(10)
+        vendor_rng,
+    )
 
     # 5. POT_SICKNESS — POTION_CLASS (mkobj.c:981-987 → blessorcurse(4))
-    vendor_rng, bc = _vrng.rn2(vendor_rng, 4)
-    if bc == 0:
-        vendor_rng, _bc2 = _vrng.rn2(vendor_rng, 2)
+    vendor_rng = _boc(vendor_rng, 4)
 
     # 6. LOCK_PICK — TOOL_CLASS, no switch case → 0 draws
     # (mkobj.c:897-965: LOCK_PICK not listed → falls off switch with no RNG)
 
     # 7. SACK — TOOL_CLASS: mkbox_cnts at moves<=1 → n=0 → rn2(1) (mkobj.c:309)
-    vendor_rng, _sack = _vrng.rn2(vendor_rng, 1)
+    vendor_rng, _sack = rn2_jax(vendor_rng, jnp.int32(1))
 
     return vendor_rng, dagger_qty
 
@@ -1359,38 +1387,90 @@ def _consume_attr_variation_draws(vendor_rng, stats, role: Role, race: Race):
 
     Citation: vendor/nle/src/u_init.c:886-894; vendor/nle/src/attrib.c:114-188.
     """
-    from Nethax.nethax import vendor_rng as _vrng
+    from Nethax.nethax.vendor_rng import rn2_jax
 
     race_entry = get_race(race)
-    attrmin = [int(v) for v in race_entry.attrmin]  # [6] STR INT WIS DEX CON CHA
-    attrmax = [int(v) for v in race_entry.attrmax]
-    out = dict(stats)
+    attrmin_arr = jnp.asarray([int(v) for v in race_entry.attrmin], dtype=jnp.int32)
+    attrmax_arr = jnp.asarray([int(v) for v in race_entry.attrmax], dtype=jnp.int32)
 
-    for i in range(6):  # A_MAX = 6
-        vendor_rng, gate = _vrng.rn2(vendor_rng, 20)  # u_init.c:888
-        if gate == 0:
-            vendor_rng, xd_raw = _vrng.rn2(vendor_rng, 7)  # u_init.c:889
-            xd = int(xd_raw) - 2  # biased variation, range -2..+4
-            if xd == 0:
-                continue  # adjattrib no-op, no further draw
-            name = _STAT_NAMES[i]
-            base = int(out[name])
-            new_base = base + xd
-            if xd > 0:
-                # clamp up to race ATTRMAX (attrib.c:131-138)
-                if new_base > attrmax[i]:
-                    new_base = attrmax[i]
-            else:
-                # incr < 0: only draw + adjust AMAX when below ATTRMIN
-                # (attrib.c:140-165).  Never reached at init for the
-                # current parity targets, but keep the draw for safety.
-                if new_base < attrmin[i]:
-                    vendor_rng, _decr = _vrng.rn2(
-                        vendor_rng, attrmin[i] - new_base + 1
-                    )
-                    new_base = attrmin[i]
-            out[name] = new_base
+    # Working stats array in canonical _STAT_NAMES order (str,int,wis,dex,con,cha).
+    # Convert input dict (Python ints or jnp scalars) to a single int32[6] array.
+    vals = jnp.stack([jnp.asarray(stats[name], dtype=jnp.int32) for name in _STAT_NAMES])
 
+    # Vendor u_init.c:886-894 — fixed 6 iterations.  i is static, so we unroll.
+    # Each iter: draw rn2(20); if 0, draw rn2(7)-2 = xd ∈ [-2,+4]; if xd != 0,
+    # apply adjattrib(i, xd, TRUE) which mutates vals[i] (clamp up to attrmax
+    # on positive; on deeply-negative, draw rn2(attrmin-new+1) and clamp to
+    # attrmin — never reached at init for current targets but kept for parity).
+    for i in range(6):
+        attrmin_i = attrmin_arr[i]
+        attrmax_i = attrmax_arr[i]
+
+        def _hit_branch(carry):
+            rng_c, vals_c = carry
+            rng_c, xd_raw = rn2_jax(rng_c, jnp.int32(7))         # u_init.c:889
+            xd = xd_raw - jnp.int32(2)
+            base = vals_c[i]
+            new_base_pos = jnp.minimum(base + xd, attrmax_i)     # attrib.c:131-138
+
+            def _neg_path(args):
+                # xd < 0: may need an extra rn2 if new_base < attrmin.
+                rng_n, base_n, xd_n = args
+                tentative = base_n + xd_n
+                need_extra = tentative < attrmin_i
+                # The extra draw modulus is (attrmin - tentative + 1) which we
+                # compute jnp-side; when need_extra is False, the modulus would
+                # be <= 0 (invalid for rn2), so guard with lax.cond.
+                modulus = (attrmin_i - tentative + jnp.int32(1)).astype(jnp.int32)
+
+                def _do_draw(r):
+                    r, _ = rn2_jax(r, modulus)
+                    return r
+
+                rng_n = jax.lax.cond(need_extra, _do_draw, lambda r: r, rng_n)
+                new_b = jax.lax.cond(
+                    need_extra,
+                    lambda: attrmin_i,
+                    lambda: tentative,
+                )
+                return rng_n, new_b
+
+            def _pos_path(args):
+                rng_p, _base_p, _xd_p = args
+                return rng_p, new_base_pos
+
+            def _zero_path(args):
+                # xd == 0: adjattrib no-op, no further draw.
+                rng_z, base_z, _xd_z = args
+                return rng_z, base_z
+
+            # Three-way dispatch on sign(xd).  Use nested lax.cond.
+            rng_c, new_base = jax.lax.cond(
+                xd == jnp.int32(0),
+                _zero_path,
+                lambda args: jax.lax.cond(
+                    args[2] > jnp.int32(0),
+                    _pos_path,
+                    _neg_path,
+                    args,
+                ),
+                (rng_c, base, xd),
+            )
+            vals_c = vals_c.at[i].set(new_base)
+            return rng_c, vals_c
+
+        def _miss_branch(carry):
+            return carry
+
+        vendor_rng, gate = rn2_jax(vendor_rng, jnp.int32(20))    # u_init.c:888
+        vendor_rng, vals = jax.lax.cond(
+            gate == jnp.int32(0),
+            _hit_branch,
+            _miss_branch,
+            (vendor_rng, vals),
+        )
+
+    out = {name: vals[idx] for idx, name in enumerate(_STAT_NAMES)}
     return vendor_rng, out
 
 
