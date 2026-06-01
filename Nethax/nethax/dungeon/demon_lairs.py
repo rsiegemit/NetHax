@@ -49,7 +49,6 @@ top-level generate_special_level() dispatcher.
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 
 from Nethax.nethax.dungeon.branches import MAP_H, MAP_W
@@ -313,8 +312,21 @@ def _pack_placements(triples, capacity=64):
 
 
 def _rand_offset(rng, n):
-    """Return n int offsets in [-1, 1] for jitter on lieutenant placement."""
-    return jax.random.randint(rng, (n,), minval=-1, maxval=2, dtype=jnp.int32)
+    """Return n fixed int offsets in [-1, 1] for jitter on lieutenant placement.
+
+    Byte-parity contract: these factories MUST NOT consume any vendor
+    ISAAC64 draws.  There is no vendor .lua precedent for these jitter
+    draws (the original lairs use des.monster() with fixed coords or
+    class-letter spawns whose RNG cost is paid by a different code path
+    in vendor/nethack/src/mkmaze.c).  Drawing here would inject extra
+    bytes into the ISAAC64 stream that vendor C does not, breaking
+    seed=0 byteparity.  We therefore return a deterministic sequence
+    (zeros) — the lieutenant placements degrade to their nominal vendor
+    coords with no jitter.  The ``rng`` argument is retained for ABI
+    stability with the host-side dispatch in branches.py.
+    """
+    del rng
+    return [0] * n
 
 
 # ===========================================================================
@@ -369,8 +381,7 @@ def generate_asmodeus_lair(rng):
 
     # Asmodeus: vendor line 40, des.monster("Asmodeus",12,07).
     # Lieutenants jitter around the boss using the rng key.
-    key_l, _ = jax.random.split(rng, 2)
-    jitter = _rand_offset(key_l, 4)
+    jitter = _rand_offset(rng,4)
 
     triples = [
         # The fellow in residence.
@@ -444,8 +455,7 @@ def generate_baalzebub_lair(rng):
     for col in range(16, 41, 4):
         terrain = terrain.at[6, col].set(jnp.int8(_T_LAVA))
 
-    key_l, _ = jax.random.split(rng, 2)
-    jitter = _rand_offset(key_l, 5)
+    jitter = _rand_offset(rng,5)
 
     triples = [
         # The fellow in residence — vendor line 37: des.monster("Baalzebub",35,06).
@@ -527,8 +537,7 @@ def generate_juiblex_lair(rng):
     terrain = terrain.at[2, 3].set(jnp.int8(_T_STAIR_UP))
     terrain = terrain.at[15, 51].set(jnp.int8(_T_STAIR_DOWN))
 
-    key_l, _ = jax.random.split(rng, 2)
-    jitter = _rand_offset(key_l, 4)
+    jitter = _rand_offset(rng,4)
 
     triples = [
         # Juiblex himself — vendor line 70: des.monster("Juiblex",25,08).
@@ -609,8 +618,7 @@ def generate_orcus_lair(rng):
     # — verify the placement.
     terrain = terrain.at[7, 24].set(jnp.int8(_T_ALTAR))
 
-    key_l, _ = jax.random.split(rng, 2)
-    jitter = _rand_offset(key_l, 6)
+    jitter = _rand_offset(rng,6)
 
     triples = [
         # The resident nasty — vendor line 113: des.monster("Orcus",33,15).
@@ -706,8 +714,7 @@ def generate_yeenoghu_lair(rng):
     # Throne tile in the centre.
     terrain = terrain.at[10, 22].set(jnp.int8(_T_THRONE))
 
-    key_l, _ = jax.random.split(rng, 2)
-    jitter = _rand_offset(key_l, 8)
+    jitter = _rand_offset(rng,8)
 
     triples = [
         # The boss on his throne.
@@ -799,8 +806,7 @@ def generate_demogorgon_lair(rng):
     # Stair-up only (deepest Gehennom — no down).
     terrain = terrain.at[4, 4].set(jnp.int8(_T_STAIR_UP))
 
-    key_l, _ = jax.random.split(rng, 2)
-    jitter = _rand_offset(key_l, 6)
+    jitter = _rand_offset(rng,6)
 
     triples = [
         # Demogorgon — centre of the swamp.
