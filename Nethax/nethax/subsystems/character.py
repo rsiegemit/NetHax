@@ -1226,11 +1226,12 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
     trspe=0 but the weapon-class branch also calls rne when rn2(11)==0 or
     rn2(10)==0 — those draws are now included.
 
-    Returns ``(post-draw Isaac64State, dagger_qty)`` where ``dagger_qty`` is
-    the vendor ``rn1(10, 6) = 6 + rn2(10)`` dagger stack count (the same draw
-    is consumed regardless; we now surface its value instead of discarding it
-    so the DAGGER stack matches vendor — no extra draw, byte-stream unchanged).
-    Cite: vendor/nle/src/u_init.c:750; rnd.c::rn1 (rn1(x,y)=rn2(x)+y).
+    Returns ``(post-draw Isaac64State, dagger_qty, buc_flags)`` where
+    ``buc_flags`` is int32[4] of vendor's final BUC for SHORT_SWORD, DAGGER,
+    LEATHER_ARMOR, POT_SICKNESS (in trobj order).  Values are ``_BUC_UNCURSED``
+    or ``_BUC_BLESSED`` (cursed is wiped by ini_inv u_init.c:113 → uncursed).
+    No extra draw — we surface outcomes already consumed.
+    Cite: vendor/nle/src/u_init.c:750, 113; rnd.c::rn1.
 
     Citations
     ---------
@@ -1247,13 +1248,18 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
 
     # Local blessorcurse(chance) helper — vendor mkobj.c:1370-1385.
     # rn2(chance); if hit==0: rn2(2).  All draws emitted via JAX-traceable rn2.
+    # Surfaces ``(rng, blessed)`` where blessed=1 iff the inner rn2(2)==1.
+    # ini_inv (u_init.c:113) wipes ``cursed`` so only blessed bit matters
+    # for inv_strs rendering.
     def _boc(rng_c, chance):
         rng_c, hit = rn2_jax(rng_c, jnp.int32(chance))
+        def _hit_branch(r):
+            r2, inner = rn2_jax(r, jnp.int32(2))
+            return r2, inner
+        def _miss_branch(r):
+            return r, jnp.int32(0)
         return jax.lax.cond(
-            hit == jnp.int32(0),
-            lambda r: rn2_jax(r, jnp.int32(2))[0],
-            lambda r: r,
-            rng_c,
+            hit == jnp.int32(0), _hit_branch, _miss_branch, rng_c,
         )
 
     # 1. rn1(10, 6) dagger quantity — u_init.c:750
@@ -1262,21 +1268,27 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
     vendor_rng, _dagger_roll = rn2_jax(vendor_rng, jnp.int32(10))
     dagger_qty = _dagger_roll + jnp.int32(6)
 
-    # 2–3. SHORT_SWORD and DAGGER — WEAPON_CLASS (mkobj.c:803-818)
-    # trspe=0 for both → rne draws only if rn2(11)==0 or rn2(10)==0 branches hit.
-    # Vendor order in !rn2(11) branch: spe=rne(3) THEN blessed=rn2(2) (mkobj.c:806-807).
-    # Vendor order in elif !rn2(10) branch: curse + spe=-rne(3) only (mkobj.c:809-810).
+    # 2–3. SHORT_SWORD and DAGGER — WEAPON_CLASS (mkobj.c:803-818).
+    # Neither is is_multigen (oc_skill >= 0 → fails the negative-skill test),
+    # nor is_poisonable (same predicate), so no rn1(6,6)/rn2(100) draws fire.
+    # The if/elif/else cascade is the only RNG.  Each step returns the
+    # ``blessed`` flag for the resulting Item (0=uncursed-or-cursed-wiped,
+    # 1=blessed).  Cite: vendor/nle/include/obj.h:197-205 (is_multigen,
+    # is_poisonable); vendor/nle/src/mkobj.c:803-818 (WEAPON_CLASS init).
     def _weapon_blessed(r):                                      # mkobj.c:806-807
-        r, _ = rne_jax(r, jnp.int32(3))
-        r, _ = rn2_jax(r, jnp.int32(2))
-        return r
+        r, _ = rne_jax(r, jnp.int32(3))                          # spe = rne(3)
+        r, b = rn2_jax(r, jnp.int32(2))                          # blessed = rn2(2)
+        return r, b
+
+    def _weapon_cursed(r):                                       # mkobj.c:809-810
+        r, _ = rne_jax(r, jnp.int32(3))                          # spe = -rne(3)
+        return r, jnp.int32(0)                                    # cursed → wiped → 0
 
     def _weapon_else(r):
         r, r10 = rn2_jax(r, jnp.int32(10))
         return jax.lax.cond(
-            r10 == jnp.int32(0),
-            lambda rr: rne_jax(rr, jnp.int32(3))[0],            # mkobj.c:809-810
-            lambda rr: _boc(rr, 10),                             # mkobj.c:812
+            r10 == jnp.int32(0), _weapon_cursed,
+            lambda rr: _boc(rr, 10),                              # blessorcurse(10)
             r,
         )
 
@@ -1286,28 +1298,25 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
             r11 == jnp.int32(0), _weapon_blessed, _weapon_else, r,
         )
 
-    vendor_rng = _weapon_step(vendor_rng)  # SHORT_SWORD
-    vendor_rng = _weapon_step(vendor_rng)  # DAGGER
+    vendor_rng, _ss_blessed = _weapon_step(vendor_rng)           # SHORT_SWORD
+    vendor_rng, _dg_blessed = _weapon_step(vendor_rng)           # DAGGER
 
-    # 4. LEATHER_ARMOR — ARMOR_CLASS (mkobj.c:992-1004)
-    # trspe=1 → rne(3) fires in both the curse and blessed branches.
-    # C code: if (rn2(10) && (FUMBLE_BOOTS||...||!rn2(11))) { curse; spe=-rne(3) }
-    #         else if (!rn2(10))                              { blessed=rn2(2); spe=rne(3) }
-    #         else                                            { blessorcurse(10) }
-    # LEATHER_ARMOR is none of the named special types, so the inner || chain
-    # reaches !rn2(11) — that draw always fires when outer rn2(10) != 0.
-    # When outer rn2(10) == 0, C short-circuits and rn2(11) is NOT drawn.
+    # 4. LEATHER_ARMOR — ARMOR_CLASS (mkobj.c:992-1004).
+    # LEATHER_ARMOR is not in the FUMBLE_BOOTS/LEVITATION_BOOTS/etc. special
+    # list, so the inner || chain reduces to ``!rn2(11)`` (draws only when
+    # outer rn2(10) != 0 due to C short-circuit on outer == 0).  Returns
+    # (rng, blessed_flag) where blessed=1 iff vendor's `blessed = rn2(2)`
+    # rolled 1 in the elif branch OR blessorcurse(10) hit and inner==1.
     def _armor_blessed_branch(r):                                # mkobj.c:1001-1002
-        r, _ = rn2_jax(r, jnp.int32(2))
-        r, _ = rne_jax(r, jnp.int32(3))
-        return r
+        r, b = rn2_jax(r, jnp.int32(2))                          # blessed = rn2(2)
+        r, _ = rne_jax(r, jnp.int32(3))                          # spe = rne(3)
+        return r, b
 
     def _armor_elif_boc(r):
-        r, elif10 = rn2_jax(r, jnp.int32(10))                   # mkobj.c:1000
+        r, elif10 = rn2_jax(r, jnp.int32(10))                    # mkobj.c:1000
         return jax.lax.cond(
-            elif10 == jnp.int32(0),
-            _armor_blessed_branch,
-            lambda rr: _boc(rr, 10),                             # mkobj.c:1004
+            elif10 == jnp.int32(0), _armor_blessed_branch,
+            lambda rr: _boc(rr, 10),                              # mkobj.c:1004
             r,
         )
 
@@ -1315,21 +1324,19 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
         r, r11 = rn2_jax(r, jnp.int32(11))                       # mkobj.c:997
         return jax.lax.cond(
             r11 == jnp.int32(0),
-            lambda rr: rne_jax(rr, jnp.int32(3))[0],            # mkobj.c:999
+            lambda rr: (rne_jax(rr, jnp.int32(3))[0], jnp.int32(0)),  # cursed
             _armor_elif_boc,
             r,
         )
 
     vendor_rng, outer = rn2_jax(vendor_rng, jnp.int32(10))      # mkobj.c:993
-    vendor_rng = jax.lax.cond(
-        outer != jnp.int32(0),
-        _armor_outer_nonzero,
-        _armor_elif_boc,   # outer == 0 short-circuit → straight to elif !rn2(10)
+    vendor_rng, _la_blessed = jax.lax.cond(
+        outer != jnp.int32(0), _armor_outer_nonzero, _armor_elif_boc,
         vendor_rng,
     )
 
     # 5. POT_SICKNESS — POTION_CLASS (mkobj.c:981-987 → blessorcurse(4))
-    vendor_rng = _boc(vendor_rng, 4)
+    vendor_rng, _ps_blessed = _boc(vendor_rng, 4)
 
     # 6. LOCK_PICK — TOOL_CLASS, no switch case → 0 draws
     # (mkobj.c:897-965: LOCK_PICK not listed → falls off switch with no RNG)
@@ -1337,7 +1344,31 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
     # 7. SACK — TOOL_CLASS: mkbox_cnts at moves<=1 → n=0 → rn2(1) (mkobj.c:309)
     vendor_rng, _sack = rn2_jax(vendor_rng, jnp.int32(1))
 
-    return vendor_rng, dagger_qty
+    # Compose per-item BUC, honouring vendor's ``trbless`` override.  Per
+    # u_init.c::ini_inv (line 126-128): after mksobj sets the blessed bit
+    # from the rolled blessorcurse cascade, ini_inv runs
+    #     if (trop->trbless != UNDEF_BLESS) obj->blessed = trop->trbless;
+    # so trbless != UNDEF_BLESS pins ``blessed`` to the trobj value REGARDLESS
+    # of mksobj's roll.  Vendor's Rogue trobj (u_init.c:124-130):
+    #     { SHORT_SWORD,    0, WEAPON_CLASS,  1, UNDEF_BLESS },  -- keep roll
+    #     { DAGGER,         0, WEAPON_CLASS, 10, 0           },  -- force UNCURSED
+    #     { LEATHER_ARMOR,  1, ARMOR_CLASS,   1, UNDEF_BLESS },  -- keep roll
+    #     { POT_SICKNESS,   0, POTION_CLASS,  1, 0           },  -- force UNCURSED
+    # ``UNDEF_BLESS = 2`` per u_init.c:23.  ini_inv (u_init.c:113) also wipes
+    # ``cursed`` regardless, so blessed=0 → UNCURSED.
+    def _buc(b):
+        return jnp.where(
+            b == jnp.int32(1),
+            jnp.int32(_BUC_BLESSED), jnp.int32(_BUC_UNCURSED),
+        )
+    buc_flags = jnp.stack([
+        _buc(_ss_blessed),                  # SHORT_SWORD: trbless=UNDEF_BLESS
+        jnp.int32(_BUC_UNCURSED),           # DAGGER:       trbless=0 forced
+        _buc(_la_blessed),                  # LEATHER_ARMOR: trbless=UNDEF_BLESS
+        jnp.int32(_BUC_UNCURSED),           # POT_SICKNESS:  trbless=0 forced
+    ])
+
+    return vendor_rng, dagger_qty, buc_flags
 
 
 # ---------------------------------------------------------------------------
@@ -1532,10 +1563,11 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     from Nethax.nethax.parity_mode import is_nle_mode as _is_nle
     blindfold_roll = None
     dagger_qty = None
+    rogue_buc_flags = None
     if vendor_rng is not None and role == Role.ROGUE:
-        # Step 1+2: dagger qty + ini_inv(Rogue) blessorcurse
-        # Cite: vendor/nle/src/u_init.c:750; mkobj.c:803-1004
-        vendor_rng, dagger_qty = _consume_ini_inv_rogue_draws(vendor_rng)
+        # Step 1+2: dagger qty + ini_inv(Rogue) blessorcurse + per-item BUC.
+        # Cite: vendor/nle/src/u_init.c:750; mkobj.c:803-1004; u_init.c:113.
+        vendor_rng, dagger_qty, rogue_buc_flags = _consume_ini_inv_rogue_draws(vendor_rng)
         # Step 3: BLINDFOLD gate — u_init.c:753
         from Nethax.nethax import vendor_rng as _vendor_rng_mod
         vendor_rng, blindfold_roll = _vendor_rng_mod.rn2(vendor_rng, 5)
@@ -1576,6 +1608,26 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         items_list = [
             _weapon(ObjType.DAGGER, int(dagger_qty))
             if int(it.type_id) == int(ObjType.DAGGER)
+            else it
+            for it in items_list
+        ]
+    # Apply per-item BUC overrides from vendor's ini_inv mksobj cascade.
+    # Only SHORT_SWORD + LEATHER_ARMOR keep mksobj's rolled blessed bit;
+    # DAGGER + POT_SICKNESS are forced UNCURSED via trbless=0.  ini_inv
+    # also sets bknown=1 on every starting item so inv_strs renders the
+    # BUC prefix per buc_status.  Byte-stream unchanged — the rolls were
+    # already consumed in _consume_ini_inv_rogue_draws.
+    # Cite: vendor/nle/src/u_init.c:113-128.
+    if rogue_buc_flags is not None and role == Role.ROGUE:
+        _buc_by_type = {
+            int(ObjType.SHORT_SWORD):   int(rogue_buc_flags[0]),
+            int(ObjType.DAGGER):        int(rogue_buc_flags[1]),
+            int(ObjType.LEATHER_ARMOR): int(rogue_buc_flags[2]),
+            int(ObjType.POT_SICKNESS):  int(rogue_buc_flags[3]),
+        }
+        items_list = [
+            it.replace(buc_status=jnp.int8(_buc_by_type[int(it.type_id)]))
+            if int(it.type_id) in _buc_by_type
             else it
             for it in items_list
         ]
