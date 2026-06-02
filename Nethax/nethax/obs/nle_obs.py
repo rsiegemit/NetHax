@@ -209,6 +209,8 @@ _S_lava     = _cmap.S_lava
 _S_trap     = _cmap.S_arrow_trap   # generic trap base
 _S_vcdoor   = _cmap.S_vcdoor
 _S_vodoor   = _cmap.S_vodoor
+_S_hcdoor   = _cmap.S_hcdoor
+_S_hodoor   = _cmap.S_hodoor
 _S_ndoor    = _cmap.S_ndoor
 
 # Indexed by TileType integer value; must cover indices 0..NUM_TILE_TYPES-1
@@ -2011,10 +2013,27 @@ def _apply_wall_angle(display_terrain: jnp.ndarray,
 
     wall_variant = _WALL_ANGLE_TABLE[pattern]                     # int16[21,79]
 
-    # Only rewrite cells that are themselves WALL.  Door tiles keep their
-    # CLOSED_DOOR / OPEN_DOOR cmap (which is _NOT_ a wall variant).
+    # Only rewrite WALL cells with the corner/T-junction variant.
     is_wall_cell = (t == WALL)
-    return jnp.where(is_wall_cell, wall_variant, cmap_idx)
+    cmap_idx = jnp.where(is_wall_cell, wall_variant, cmap_idx)
+
+    # ---- Door orientation: vendor display.c:1737-1739 picks h*door vs v*door
+    # from ``ptr->horizontal`` which is set when the door is embedded in a
+    # horizontal wall (mklev.c:163, top/bottom of room).  We derive horizontal
+    # at render time from the wall-continuation neighbours computed above:
+    # a door is horizontal when its east/west neighbours are wall-ish (i.e.
+    # part of an HWALL run) and vertical otherwise.  Mirrors the same vendor
+    # rule that ``ptr->horizontal=1`` is set on HWALL cells.
+    is_horiz_door = e & w  # E and W neighbours both wall-ish -> horizontal door
+    is_closed = (t == CLOSED)
+    is_open = (t == OPEN)
+    cmap_idx = jnp.where(
+        is_closed & is_horiz_door, jnp.int16(_S_hcdoor), cmap_idx,
+    )
+    cmap_idx = jnp.where(
+        is_open & is_horiz_door, jnp.int16(_S_hodoor), cmap_idx,
+    )
+    return cmap_idx
 
 
 def build_glyphs(env_state) -> jnp.ndarray:
