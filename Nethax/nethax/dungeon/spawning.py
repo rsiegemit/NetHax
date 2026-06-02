@@ -2182,8 +2182,8 @@ def _populate_oroom_single(
         alive=mai.alive.at[slot].set(jnp.bool_(True)),
         ac=mai.ac.at[slot].set(_BASE_AC[tid]),
         is_large=mai.is_large.at[slot].set(_IS_LARGE[tid]),
-        attack_dice_n=mai.attack_dice_n.at[slot].set(_ATK_DICE_N[tid]),
-        attack_dice_sides=mai.attack_dice_sides.at[slot].set(_ATK_DICE_S[tid]),
+        attack_dice_n=mai.attack_dice_n.at[slot].set(_ATK_DICE_N[tid].astype(jnp.int8)),
+        attack_dice_sides=mai.attack_dice_sides.at[slot].set(_ATK_DICE_S[tid].astype(jnp.int8)),
         mstrategy=mai.mstrategy.at[slot].set(jnp.int8(0)),
         entry_idx=mai.entry_idx.at[slot].set(tid.astype(jnp.int16)),
         peaceful=mai.peaceful.at[slot].set(peace_bit),
@@ -2316,8 +2316,8 @@ def spawn_oroom_monster_scanbody(
                 alive=mai_g.alive.at[slot_g].set(jnp.bool_(True)),
                 ac=mai_g.ac.at[slot_g].set(_BASE_AC[tid]),
                 is_large=mai_g.is_large.at[slot_g].set(_IS_LARGE[tid]),
-                attack_dice_n=mai_g.attack_dice_n.at[slot_g].set(_ATK_DICE_N[tid]),
-                attack_dice_sides=mai_g.attack_dice_sides.at[slot_g].set(_ATK_DICE_S[tid]),
+                attack_dice_n=mai_g.attack_dice_n.at[slot_g].set(_ATK_DICE_N[tid].astype(jnp.int8)),
+                attack_dice_sides=mai_g.attack_dice_sides.at[slot_g].set(_ATK_DICE_S[tid].astype(jnp.int8)),
                 mstrategy=mai_g.mstrategy.at[slot_g].set(jnp.int8(0)),
                 entry_idx=mai_g.entry_idx.at[slot_g].set(tid.astype(jnp.int16)),
                 peaceful=mai_g.peaceful.at[slot_g].set(peace_bit),
@@ -2522,8 +2522,8 @@ def populate_level_with_monsters(
         new_alive     = mai_carry.alive.at[i].set(jnp.bool_(True))
         new_ac        = mai_carry.ac.at[i].set(_BASE_AC[type_id])
         new_is_large  = mai_carry.is_large.at[i].set(_IS_LARGE[type_id])
-        new_atk_n     = mai_carry.attack_dice_n.at[i].set(_ATK_DICE_N[type_id])
-        new_atk_s     = mai_carry.attack_dice_sides.at[i].set(_ATK_DICE_S[type_id])
+        new_atk_n     = mai_carry.attack_dice_n.at[i].set(_ATK_DICE_N[type_id].astype(jnp.int8))
+        new_atk_s     = mai_carry.attack_dice_sides.at[i].set(_ATK_DICE_S[type_id].astype(jnp.int8))
         new_strategy  = mai_carry.mstrategy.at[i].set(jnp.int8(0))  # NONE until awakened
         new_entry     = mai_carry.entry_idx.at[i].set(type_id.astype(jnp.int16))
         # Vendor mtmp->movement starts at 0 (calloc default — makemon.c has

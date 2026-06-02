@@ -1030,7 +1030,7 @@ def apply_starvation(
         state.hunger_state,
     )
     new_statuses = state.timed_statuses.at[TimedStatus.FAINTING_TURNS].set(
-        new_fainting_turns
+        new_fainting_turns.astype(jnp.int32)
     )
     new_state = state.replace(
         timed_statuses=new_statuses,

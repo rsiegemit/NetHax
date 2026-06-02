@@ -1563,8 +1563,8 @@ def _effect_draining(
         new_hp_max = jnp.maximum(s.mon_hp_max[mon_idx] - actual_dmg, jnp.int32(0))
         is_killed  = (new_hp_max <= jnp.int32(0)) | (new_hp <= jnp.int32(0))
         s = s.replace(
-            mon_hp=s.mon_hp.at[mon_idx].set(new_hp),
-            mon_hp_max=s.mon_hp_max.at[mon_idx].set(new_hp_max),
+            mon_hp=s.mon_hp.at[mon_idx].set(new_hp.astype(jnp.int32)),
+            mon_hp_max=s.mon_hp_max.at[mon_idx].set(new_hp_max.astype(jnp.int32)),
             mon_alive=s.mon_alive.at[mon_idx].set(~is_immune & ~is_killed),
         )
         return s, r

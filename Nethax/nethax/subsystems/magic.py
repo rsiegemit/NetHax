@@ -1286,7 +1286,7 @@ def _effect_sleep(state: dict, rng: jax.Array) -> dict:
     mai = state["monster_ai"]
     if hasattr(mai, "mstrategy") and mai.mstrategy.shape[0] > 0:
         alive = mai.hp[0] > 0 if hasattr(mai, "hp") else jnp.bool_(True)
-        new_strat = jnp.where(alive, jnp.int32(MoveStrategy.PARALYZE), mai.mstrategy[0])
+        new_strat = jnp.where(alive, jnp.int8(MoveStrategy.PARALYZE), mai.mstrategy[0])
         new_mstrategy = mai.mstrategy.at[0].set(new_strat)
         return {**state, "monster_ai": mai.replace(mstrategy=new_mstrategy)}
     return state
@@ -1298,7 +1298,7 @@ def _effect_confuse_monster(state: dict, rng: jax.Array) -> dict:
     mai = state["monster_ai"]
     if hasattr(mai, "mstrategy") and mai.mstrategy.shape[0] > 0:
         alive = mai.hp[0] > 0 if hasattr(mai, "hp") else jnp.bool_(True)
-        new_strat = jnp.where(alive, jnp.int32(MoveStrategy.CONFUSED), mai.mstrategy[0])
+        new_strat = jnp.where(alive, jnp.int8(MoveStrategy.CONFUSED), mai.mstrategy[0])
         new_mstrategy = mai.mstrategy.at[0].set(new_strat)
         return {**state, "monster_ai": mai.replace(mstrategy=new_mstrategy)}
     return state
