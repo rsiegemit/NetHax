@@ -1993,7 +1993,17 @@ def generate_main_branch_l1_with_features(
     # LevelGenState surface; this is the JAX-side terrain materialisation
     # so niche features are observable.  Runs last so it does not disturb
     # the vendor_rng (ISAAC64) byte-parity stream.
-    terrain = _place_niches(terrain, rooms, active, k_niche, n=2)
+    #
+    # In NLE_BYTEPARITY mode (vendor_rng is not None), vendor's make_niches +
+    # do_vault + fill_ordinary_rooms have ALREADY stamped every niche feature
+    # vendor itself would place onto vendor_levl_grid, and that grid is the
+    # source of truth for ``terrain`` (via ``_vendor_grid_to_terrain``).
+    # Running this extra Threefry-driven stamp on top of that adds a feature
+    # vendor does not have — observed on seed=4 as a spurious throne at
+    # (row 8, col 11).  Skip the post-pass when threading the vendor stream
+    # so the rendered terrain matches NLE exactly.
+    if vendor_rng is None:
+        terrain = _place_niches(terrain, rooms, active, k_niche, n=2)
 
     # Hero placement — vendor/nle/src/allmain.c:628 ``u_on_upstairs()`` runs
     # immediately after ``mklev()`` returns (after mineralize) and **consumes
