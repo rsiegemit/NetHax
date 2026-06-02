@@ -392,11 +392,28 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
         desc[_INV] = _bytes_for("invisible creature")
 
     # Objects
+    #
+    # Gold-piece (COIN_CLASS) farlook special-case: vendor pager.c renders
+    # ground gold as "some gold pieces", not the bare object name "gold piece".
+    # The flow is:
+    #   pager.c::look_at_object -> distant_name(otmp, doname_vague_quan)
+    #     -> doname_base with DONAME_VAGUE_QUAN
+    # Inside object_from_map (pager.c:189-190), if no real obj is at the spot
+    # a fakeobj is created with otmp->quan = 2L "to force pluralization"; and
+    # doname_base (objnam.c:966-970) emits "some " when quan != 1 and
+    # !dknown (which doname_vague_quan implies for farlook).  Real ground
+    # gold piles likewise carry quan>1 and dknown=0, yielding the same
+    # "some gold pieces" string.  We bake that string into the static
+    # glyph->description table for the single COIN_CLASS object slot.
+    from Nethax.nethax.constants.objects import ObjectClass as _OC
     for i, o in enumerate(OBJECTS):
         g = _OBJ + i
         if 0 <= g < _MAX:
             colors[g] = int(o.color) & 0xFF
-            desc[g] = _bytes_for(o.name)
+            if o is not None and getattr(o, "class_", None) == _OC.COIN_CLASS:
+                desc[g] = _bytes_for("some gold pieces")
+            else:
+                desc[g] = _bytes_for(o.name)
 
     # Cmap (terrain)
     for cmap_i, txt in cmap_desc.items():
