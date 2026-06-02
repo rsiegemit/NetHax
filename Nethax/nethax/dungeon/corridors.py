@@ -657,8 +657,16 @@ def dodoor(
     is_door_kind = r8 != jnp.int32(0)
 
     # Avoid SDOORs on already-made doors: if !IS_WALL(typ), force DOOR.
+    # Vendor IS_WALL(typ) ((typ) && (typ) <= DBWALL) covers the full wall
+    # family VWALL(1)..DBWALL(12), including TLCORNER..BRCORNER(3..6),
+    # CROSSWALL(7), and TUWALL..TRWALL(8..11).  A narrow HWALL/VWALL check
+    # would miss corner cells (and other wall variants), causing
+    # ``type_is_door`` to short-circuit true on corner-adjacent door sites
+    # where vendor produced SDOOR — that emits a spurious DOORWAY tile.
+    # Vendor cite: vendor/nle/include/rm.h:85 (IS_WALL) +
+    # vendor/nle/src/mklev.c:391 (the !IS_WALL gate).
     cur = gs.typ[x, y]
-    is_wall = (cur == jnp.int8(VTILE_HWALL)) | (cur == jnp.int8(VTILE_VWALL))
+    is_wall = (cur >= jnp.int8(VTILE_VWALL)) & (cur <= jnp.int8(12))
     type_is_door = is_door_kind | ~is_wall
 
     # --- DOOR branch — only drawn when type_is_door.  Vendor dosdoor
