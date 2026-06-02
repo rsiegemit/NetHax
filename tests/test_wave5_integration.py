@@ -79,7 +79,7 @@ def test_minihack_room_5x5_still_works_after_wave5():
         )
         fired_mask = info["fired_mask"]
         step_count = info["step_count"]
-        if done:
+        if bool(done):
             break
 
     obs2 = build_nle_observation(state)
@@ -127,10 +127,11 @@ def test_minihack_lavacross_with_polymorph_combat():
         )
         fired_mask = info["fired_mask"]
         step_count = info["step_count"]
-        if done:
+        if bool(done):
             break
 
-    assert isinstance(reward, float)
+    # MinihaxEnv.step now returns JAX scalars (jit-friendly).
+    assert isinstance(reward, jax.Array)
 
 
 # ---------------------------------------------------------------------------

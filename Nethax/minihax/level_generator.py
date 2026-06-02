@@ -1306,16 +1306,15 @@ def _carve_maze(
     Returns:
         terrain_np with maze carved in.
     """
-    import numpy as _np
-
-    # Materialise the sub-region into a host-side numpy array for the
-    # iterative carve (this entire function runs at Python init time, so
-    # converting to numpy is fine).
-    sub = _np.asarray(terrain_np[0, 0, :h, :w])
+    # Materialise the sub-region as Python lists for the iterative carve.
+    # This entire function runs at Python init time (level-build, not the
+    # per-step JIT trace), so we use plain Python containers and pull
+    # randomness from the JAX PRNG stream (via ``next_key``) instead of
+    # round-tripping through numpy's RandomState.
     wall = int(TileType.WALL)
     corridor = int(TileType.CORRIDOR)
     # Fill with WALL first.
-    sub = _np.full_like(sub, wall, dtype=sub.dtype)
+    sub = [[wall for _ in range(w)] for _ in range(h)]
 
     sx = max(0, min(int(start_x), w - 1))
     sy = max(0, min(int(start_y), h - 1))
@@ -1325,36 +1324,35 @@ def _carve_maze(
     if sy % 2 == 0:
         sy = min(h - 1, sy + 1)
 
-    visited = _np.zeros((h, w), dtype=_np.bool_)
+    visited = [[False for _ in range(w)] for _ in range(h)]
     stack = [(sy, sx)]
-    visited[sy, sx] = True
-    sub[sy, sx] = corridor
-
-    # Use jax PRNG to derive a seed for the host-side shuffle so the
-    # function stays deterministic with respect to the input key.
-    key = next_key()
-    rng_seed = int(jax.random.randint(key, (), 0, 2**31 - 1))
-    pyrng = _np.random.RandomState(rng_seed)
+    visited[sy][sx] = True
+    sub[sy][sx] = corridor
 
     while stack:
         r, c = stack[-1]
         neighbours = []
         for dr, dc in ((-2, 0), (2, 0), (0, -2), (0, 2)):
             nr, nc = r + dr, c + dc
-            if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc]:
+            if 0 <= nr < h and 0 <= nc < w and not visited[nr][nc]:
                 neighbours.append((nr, nc, dr, dc))
         if not neighbours:
             stack.pop()
             continue
-        idx = pyrng.randint(0, len(neighbours))
+        # Pure JAX-stream randomness: pull a fresh subkey from the
+        # build-time PRNG factory each step.  Equivalent in distribution
+        # to ``random.randrange(len(neighbours))`` but stays entirely on
+        # the JAX side — no numpy RandomState round-trip.
+        idx = int(jax.random.randint(next_key(), (), 0, len(neighbours)))
         nr, nc, dr, dc = neighbours[idx]
         # Carve bridge cell + neighbour.
         br, bc = r + dr // 2, c + dc // 2
-        sub[br, bc] = corridor
-        sub[nr, nc] = corridor
-        visited[nr, nc] = True
+        sub[br][bc] = corridor
+        sub[nr][nc] = corridor
+        visited[nr][nc] = True
         stack.append((nr, nc))
 
     # Write the carved sub-region back.
-    new_terrain = terrain_np.at[0, 0, :h, :w].set(jnp.asarray(sub))
+    sub_arr = jnp.asarray(sub, dtype=terrain_np.dtype)
+    new_terrain = terrain_np.at[0, 0, :h, :w].set(sub_arr)
     return new_terrain

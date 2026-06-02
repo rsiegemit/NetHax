@@ -40,6 +40,11 @@ Notes
 factory closure (which runs once at reset) and to ``NethaxEnv.step`` (which
 is fully JIT-friendly).  Building env instances is therefore NOT JIT-able;
 calling ``env.step`` IS.
+
+JIT contract: ``step`` returns JAX arrays for ``reward`` / ``done`` and
+keeps ``info["step_count"]`` etc. as JAX scalars, so ``jax.jit(env.step)``
+and ``jax.vmap(env.step)`` work end-to-end.  Callers that need Python
+scalars must call ``.item()`` themselves.
 """
 from __future__ import annotations
 
@@ -132,11 +137,15 @@ class MinihaxEnv:
         Returns ``(state, info)`` where ``info`` carries the initial
         ``fired_mask`` for the configured ``RewardManager`` so callers can
         thread it through subsequent ``step`` calls.
+
+        Note: ``step_count`` is returned as a JAX scalar (int32) so callers
+        can thread it through a ``jax.jit``'d ``step``.  Use ``.item()`` to
+        get a Python int.
         """
         state = self._level_factory(rng)
         info: Dict[str, Any] = {
             "fired_mask": self._reward_manager.initial_fired_mask(),
-            "step_count": 0,
+            "step_count": jnp.int32(0),
         }
         return state, info
 
@@ -147,9 +156,14 @@ class MinihaxEnv:
         rng: jax.Array,
         *,
         fired_mask: Optional[jax.Array] = None,
-        step_count: int = 0,
-    ) -> Tuple[EnvState, float, bool, Dict[str, Any]]:
+        step_count: Any = 0,
+    ) -> Tuple[EnvState, jax.Array, jax.Array, Dict[str, Any]]:
         """Apply ``action``, evaluate reward, return updated state.
+
+        JIT-friendly: all return values are JAX arrays so this method can be
+        wrapped with :func:`jax.jit` / :func:`jax.vmap`.  Callers that need
+        Python scalars must call ``.item()`` on ``reward``/``done`` and on
+        ``info["step_count"]``.
 
         Parameters
         ----------
@@ -162,13 +176,17 @@ class MinihaxEnv:
         fired_mask : jax.Array, optional
             Per-event ``fired`` mask returned by a previous ``step``.  If
             ``None``, we build a fresh mask via the reward manager.
-        step_count : int
-            Current step count for max-steps termination check.
+        step_count : int | jax.Array
+            Current step count for max-steps termination check.  Python ints
+            are accepted for ergonomics and converted to ``jnp.int32``.
 
         Returns
         -------
         (new_state, reward, done, info)
-            ``info`` carries the updated ``fired_mask`` and ``step_count``.
+            ``reward`` and ``done`` are JAX scalars (``float32`` and
+            ``bool_``).  ``info`` carries the updated ``fired_mask``,
+            ``step_count``, ``truncated``, ``engine_done``, and
+            ``reward_manager_done`` — all JAX arrays.
         """
         if fired_mask is None:
             fired_mask = self._reward_manager.initial_fired_mask()
@@ -182,13 +200,18 @@ class MinihaxEnv:
             state, new_state, fired_mask,
         )
 
-        # Truncation: cap on max_steps.
-        new_step_count = int(step_count) + 1
-        truncated = new_step_count >= self._max_steps
+        # Truncation: cap on max_steps.  All arithmetic in JAX-space so the
+        # full ``step`` can be traced under ``jax.jit``.
+        prev_step_count = jnp.asarray(step_count, dtype=jnp.int32)
+        new_step_count = prev_step_count + jnp.int32(1)
+        max_steps_j = jnp.int32(self._max_steps)
+        truncated = new_step_count >= max_steps_j
 
         # Combine: episode ends if reward-manager says done, or engine done,
-        # or we hit max_steps.
-        done = bool(rm_done) or bool(_engine_done) or truncated
+        # or we hit max_steps.  ``jnp.logical_or`` keeps the tracer alive.
+        rm_done_b = jnp.asarray(rm_done, dtype=jnp.bool_)
+        engine_done_b = jnp.asarray(_engine_done, dtype=jnp.bool_)
+        done = jnp.logical_or(jnp.logical_or(rm_done_b, engine_done_b), truncated)
 
         # Vendor parity: vendor/minihack/minihack/base.py::_reward_fn lines
         # 378-392 — when a ``reward_manager`` is present, the per-step reward
@@ -199,16 +222,16 @@ class MinihaxEnv:
         # sparse-stair), so the win/lose additions would double-count and
         # are not applied.  ``penalty_step`` is kept and added unconditionally;
         # in vendor it is paid each step when frozen (tasks.py:55-80).
-        reward = float(reward) + self._penalty_step
+        reward = jnp.asarray(reward, dtype=jnp.float32) + jnp.float32(self._penalty_step)
 
         info: Dict[str, Any] = {
             "fired_mask": new_fired,
             "step_count": new_step_count,
             "truncated": truncated,
-            "engine_done": bool(_engine_done),
-            "reward_manager_done": bool(rm_done),
+            "engine_done": engine_done_b,
+            "reward_manager_done": rm_done_b,
         }
-        return new_state, float(reward), done, info
+        return new_state, reward, done, info
 
     # ------------------------------------------------------------------
     # Repr

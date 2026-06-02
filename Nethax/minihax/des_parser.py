@@ -1494,8 +1494,13 @@ def _resolve_pos(pos: Any, env: dict, rng_key: Any) -> Optional[Tuple[int, int]]
 
 
 def _emit_stmt(lg: Any, stmt: Any, env: dict, rng_state: dict) -> None:
-    """Emit LevelGenerator calls for a single statement."""
-    import random as _random
+    """Emit LevelGenerator calls for a single statement.
+
+    Build-time host-side helper: runs once per ``reset()`` to compile a parsed
+    DES AST into LevelGenerator calls.  Reads ``rng_state["rand"]``, a seeded
+    :class:`random.Random` derived deterministically from the input PRNGKey
+    (see :func:`compile_des`).  This path is NEVER on the per-step / JIT trace.
+    """
     rnd = rng_state["rand"]
 
     if isinstance(stmt, Region):
@@ -1739,6 +1744,13 @@ def compile_des(ast: DesAST) -> Callable[..., None]:
     ``rng`` may be either a JAX PRNGKey or any object with a ``tolist``
     method (we fold it into Python's ``random.Random`` for the seeding).
     Plain ints are also accepted.
+
+    Host-side note: this helper is build-time only — it executes once per
+    ``reset()`` to walk the parsed DES AST and emit LevelGenerator calls.  The
+    seeded :class:`random.Random` is fully deterministic w.r.t. the input
+    PRNGKey (see :func:`_seed_from`), and the function is NEVER invoked on the
+    per-step / JIT trace.  Therefore keeping the host-side stdlib RNG here is
+    safe and preserves byte-exact reproducibility.
     """
     import random as _random
 

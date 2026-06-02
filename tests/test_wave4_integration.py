@@ -58,9 +58,10 @@ def test_minihack_room_5x5_full_episode():
         )
         fired_mask = info["fired_mask"]
         step_count = info["step_count"]
-        assert isinstance(reward, float)
-        assert isinstance(done, bool)
-        if done:
+        # MinihaxEnv.step is now JIT-friendly: reward/done are JAX scalars.
+        assert isinstance(reward, jax.Array)
+        assert isinstance(done, jax.Array)
+        if bool(done):
             break
 
     # Final obs must still expose all 17 keys.
@@ -92,10 +93,10 @@ def test_minihack_corridor_full_episode():
         )
         fired_mask = info["fired_mask"]
         step_count = info["step_count"]
-        if done:
+        if bool(done):
             break
 
-    assert step_count <= env.max_steps
+    assert int(step_count) <= env.max_steps
 
 
 # ---------------------------------------------------------------------------
@@ -126,11 +127,11 @@ def test_minihack_lavacross_terminal_on_lava():
         )
         fired_mask = info["fired_mask"]
         step_count = info["step_count"]
-        if done:
+        if bool(done):
             break
 
-    # No crash by here is the bar.  Reward must be a scalar float.
-    assert isinstance(reward, float)
+    # No crash by here is the bar.  Reward must be a JAX scalar.
+    assert isinstance(reward, jax.Array)
 
 
 # ---------------------------------------------------------------------------
@@ -550,7 +551,7 @@ def test_full_step_lifecycle_with_minihax_env():
         )
         fired_mask = info["fired_mask"]
         step_count = info["step_count"]
-        if done:
+        if bool(done):
             break
 
     final_shapes = [leaf.shape for leaf in jax.tree.leaves(state)]

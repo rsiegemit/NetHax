@@ -71,7 +71,8 @@ def test_minihack_room_5x5_reset():
     assert state.terrain.shape == (7, 32, 21, 80)
     # The fired_mask in info is a bool array.
     assert "fired_mask" in info
-    assert info["step_count"] == 0
+    # ``step_count`` is now a JAX scalar so the wrapper is jit-traceable.
+    assert int(info["step_count"]) == 0
 
 
 @pytest.mark.timeout(900)
@@ -90,10 +91,13 @@ def test_minihack_room_5x5_step():
         step_count=info["step_count"],
     )
     assert isinstance(new_state, EnvState)
-    assert isinstance(reward, float)
-    assert isinstance(done, bool)
+    # ``reward`` / ``done`` are JAX scalars (jit-friendly).
+    assert isinstance(reward, jax.Array)
+    assert isinstance(done, jax.Array)
+    assert reward.dtype == jnp.float32
+    assert done.dtype == jnp.bool_
     assert "fired_mask" in new_info
-    assert new_info["step_count"] == 1
+    assert int(new_info["step_count"]) == 1
 
 
 @pytest.mark.timeout(900)
@@ -128,8 +132,8 @@ def test_minihack_room_5x5_terminal_on_goal():
         fired_mask=info["fired_mask"],
         step_count=0,
     )
-    assert reward == pytest.approx(1.0)
-    assert done is True
+    assert float(reward) == pytest.approx(1.0)
+    assert bool(done) is True
 
 
 # ---------------------------------------------------------------------------
@@ -188,5 +192,5 @@ def test_custom_reward_manager_overrides_default():
         fired_mask=info["fired_mask"],
         step_count=0,
     )
-    assert reward == pytest.approx(42.0)
-    assert done is True
+    assert float(reward) == pytest.approx(42.0)
+    assert bool(done) is True

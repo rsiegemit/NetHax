@@ -278,8 +278,16 @@ def main():
     # Env params with higher timestep limit for human play
     env_params = env.default_params.replace(max_timesteps=args.max_steps)
 
-    # Setup seed
-    seed = args.seed if args.seed is not None else int(np.random.randint(2**31))
+    # Setup seed.  When the user does not supply ``--seed`` we derive one from
+    # the wall-clock so successive interactive runs vary, but stay entirely on
+    # the Python/stdlib side — no numpy-random round-trip — so the script does
+    # not introduce a numpy RNG into the JAX-traceable env path.
+    import time as _time
+    seed = (
+        args.seed
+        if args.seed is not None
+        else int(_time.time_ns() & ((1 << 31) - 1))
+    )
     rng = jax.random.PRNGKey(seed)
 
     # Reset env
