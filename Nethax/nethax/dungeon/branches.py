@@ -1316,7 +1316,11 @@ def generate_main_branch_l1(
         # opening no longer shows as a spurious '+').  Vendor cite:
         # vendor/nle/src/mklev.c::dosdoor sets rm.doormask per door.
         vendor_door_mask_grid = jnp.transpose(_lgs.doormask)  # [ROWNO, COLNO]
-        del _lgs, _rooms_box
+        # NOTE: ``_lgs`` and ``_rooms_box`` are kept alive past this point so
+        # the do_vault block's ``makevtele -> makeniche(TELEP_TRAP)`` cascade
+        # (vendor mklev.c:752-753, 568-571) can re-enter ``_makeniche`` with
+        # the current level-gen surface.  They are released after the do_vault
+        # block below.
 
         # ------------------------------------------------------------------
         # Materialise the RENDERED terrain from the vendor-exact level grid.
@@ -1472,21 +1476,124 @@ def generate_main_branch_l1(
         _wall_cells = (_hwall | _vwall | _corner)
         terrain = jnp.where(_gate & _wall_cells, _WALL, terrain)
 
-        def _do_vault_draws(v):
+        # Build a post-vault RoomsBox view that includes the vault slot at
+        # index ``_nroom_post_vault - 1`` with rtype = VAULT.  Vendor's
+        # add_room call at mklev.c:746-747 sets the slot's rtype to VAULT,
+        # which makes makeniche's ``rtype != OROOM`` filter (mklev.c:495)
+        # reject the vault slot during room picks — without this override,
+        # the slot would still read rtype=ORDINARY (the default from
+        # _invoke_create_room) and the SCORR branch would mis-target it.
+        # Vault interior bounds were computed above (_v_lx/_v_ly/_v_hx/_v_hy).
+        # The slot's stored hx carries the -1 sentinel; we replace it here
+        # with the real vault hx so place_niche's strip span is well-formed.
+        from Nethax.nethax.dungeon.rooms import RoomType as _RoomType_v
+        _ROOM_TYPE_VAULT = jnp.int8(int(_RoomType_v.VAULT))
+        # Compute the vault slot index (used to patch the RoomsBox view with
+        # the real vault bounds + rtype=VAULT).  When the vault wasn't created
+        # we target the last slot harmlessly (gated below by
+        # ``_vault_created_in_makerooms``).
+        _slot_idx = jnp.where(
+            _vault_created_in_makerooms,
+            _nroom_post_vault - jnp.int32(1),
+            jnp.int32(MAX_ROOMS_PER_LEVEL - 1),
+        )
+        _rooms_box_postvault = _rooms_box.replace(
+            lx=_rooms_box.lx.at[_slot_idx].set(_v_lx.astype(jnp.int16)),
+            ly=_rooms_box.ly.at[_slot_idx].set(_v_ly.astype(jnp.int16)),
+            hx=_rooms_box.hx.at[_slot_idx].set(_v_hx.astype(jnp.int16)),
+            hy=_rooms_box.hy.at[_slot_idx].set(_v_hy.astype(jnp.int16)),
+            rtype=lax.cond(
+                _vault_created_in_makerooms,
+                lambda a: a.at[_slot_idx].set(_ROOM_TYPE_VAULT),
+                lambda a: a,
+                _rooms_box.rtype,
+            ),
+            active=lax.cond(
+                _vault_created_in_makerooms,
+                lambda a: a.at[_slot_idx].set(jnp.bool_(True)),
+                lambda a: a,
+                _rooms_box.active,
+            ),
+        )
+
+        # Stamp the vault footprint into _lgs.typ so place_niche / finddpos
+        # see the vault walls as HWALL/VWALL (vendor add_room writes these in
+        # levl[][] before makevtele runs — mklev.c:746,160-182).  Without
+        # this, niche candidates around the vault would be evaluated against
+        # stale STONE cells.  The grid is [COLNO, ROWNO] (gs.typ orientation).
+        from Nethax.nethax.dungeon.corridors import (
+            VTILE_HWALL as _VH_v, VTILE_VWALL as _VV_v,
+            VTILE_ROOM as _VR_v,
+        )
+        _cols_axis = jnp.arange(_lgs.typ.shape[0], dtype=jnp.int32)[:, None]
+        _rows_axis = jnp.arange(_lgs.typ.shape[1], dtype=jnp.int32)[None, :]
+        _v_wall_x = (_cols_axis >= _v_lx - 1) & (_cols_axis <= _v_hx + 1)
+        _v_wall_y = (_rows_axis >= _v_ly - 1) & (_rows_axis <= _v_hy + 1)
+        _v_interior = (
+            (_cols_axis >= _v_lx) & (_cols_axis <= _v_hx)
+            & (_rows_axis >= _v_ly) & (_rows_axis <= _v_hy)
+        )
+        _v_hwall_lgs = _v_wall_x & ((_rows_axis == _v_ly - 1) | (_rows_axis == _v_hy + 1))
+        _v_vwall_lgs = (
+            ((_cols_axis == _v_lx - 1) | (_cols_axis == _v_hx + 1))
+            & (_rows_axis >= _v_ly) & (_rows_axis <= _v_hy)
+        )
+        _v_corner_lgs = (
+            ((_cols_axis == _v_lx - 1) | (_cols_axis == _v_hx + 1))
+            & ((_rows_axis == _v_ly - 1) | (_rows_axis == _v_hy + 1))
+        )
+        _stamp_gate = _vault_created_in_makerooms
+        _new_lgs_typ = _lgs.typ
+        _new_lgs_typ = jnp.where(_stamp_gate & _v_hwall_lgs, jnp.int8(_VH_v), _new_lgs_typ)
+        _new_lgs_typ = jnp.where(_stamp_gate & _v_vwall_lgs, jnp.int8(_VV_v), _new_lgs_typ)
+        _new_lgs_typ = jnp.where(_stamp_gate & _v_interior,  jnp.int8(_VR_v), _new_lgs_typ)
+        _new_lgs_typ = jnp.where(_stamp_gate & _v_corner_lgs, jnp.int8(_VR_v), _new_lgs_typ)
+        _lgs = _lgs.replace(typ=_new_lgs_typ)
+
+        from Nethax.nethax.dungeon.corridors import _makeniche as _vendor_makeniche
+
+        # TELEP_TRAP=15 (vendor/nle/include/trap.h:73).  Non-zero, so
+        # _makeniche short-circuits past the rn2(4) SCORR/CORR gate and
+        # always takes the SCORR branch (matching vendor mklev.c:504).
+        _TELEP_TRAP = jnp.int32(15)
+
+        def _do_vault_draws(carry):
+            v, gs_ = carry
             v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 0
             v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 1
             v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 2
             v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 3
-            v, _ = _rn2_jax_do_vault(v, jnp.int32(3))     # makevtele gate
-            return v
+            # makevtele gate — vendor mklev.c:752 ``if (!level.flags.noteleport
+            # && !rn2(3)) makevtele();``.  On Main Dlvl 1 noteleport=False is
+            # static, so the gate reduces to !rn2(3) (gate fires when r==0).
+            v, _r3 = _rn2_jax_do_vault(v, jnp.int32(3))
+            gate_fires = _r3 == jnp.int32(0)
 
-        def _skip_do_vault_draws(v):
-            return v
+            # makevtele() -> makeniche(TELEP_TRAP).  Single makeniche call.
+            # Vendor cite: vendor/nle/src/mklev.c:567-571.  ``_makeniche``
+            # already loops up to vct=8 internally and short-circuits on the
+            # first successful placement, so calling it once matches vendor.
+            def _do_makevtele(rg):
+                r_, g_ = rg
+                r_, g_ = _vendor_makeniche(
+                    r_, g_, _rooms_box_postvault, _nroom_post_vault,
+                    _TELEP_TRAP, depth=1,
+                )
+                return r_, g_
 
-        vendor_rng = lax.cond(
+            v, gs_ = lax.cond(
+                gate_fires, _do_makevtele, lambda rg: rg, (v, gs_),
+            )
+            return v, gs_
+
+        def _skip_do_vault_draws(carry):
+            return carry
+
+        vendor_rng, _lgs = lax.cond(
             _vault_created_in_makerooms,
-            _do_vault_draws, _skip_do_vault_draws, vendor_rng,
+            _do_vault_draws, _skip_do_vault_draws, (vendor_rng, _lgs),
         )
+        del _lgs, _rooms_box, _rooms_box_postvault
 
         # ------------------------------------------------------------------
         # place_branch(branchp, 0, 0) — vendor mklev.c:800.

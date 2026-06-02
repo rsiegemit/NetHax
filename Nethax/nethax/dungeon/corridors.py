@@ -263,6 +263,8 @@ from Nethax.nethax.vendor_rng import (
     rnd_jax,
     rn1_jax,
 )
+from Nethax.nethax.constants.objects import ObjectClass
+from Nethax.nethax.subsystems.random_objects import consume_mksobj_init_draws
 
 # ---------------------------------------------------------------------------
 # Vendor tile-type constants (vendor/nle/include/rm.h).
@@ -1400,19 +1402,84 @@ def _makeniche(
 
             placed = (~gate_continue) & pok
 
-            # rn2(4) — SCORR vs CORR branch (vendor mklev.c:501); only on a
-            # successful placement.
+            # rn2(4) — SCORR vs CORR branch (vendor mklev.c:504:
+            # ``if (trap_type || !rn2(4))``).  C short-circuit: when
+            # ``trap_type != 0`` the ``rn2(4)`` is NEVER drawn — the SCORR
+            # branch fires unconditionally.  Only draw on a successful
+            # placement AND when trap_type == 0.  Callers using a non-zero
+            # trap_type (e.g. makevtele -> TELEP_TRAP=15) MUST see zero
+            # draws here to keep the ISAAC64 stream byte-aligned.
+            draw_r4 = placed & (trap_type == jnp.int32(0))
             r, r4 = lax.cond(
-                placed, lambda rr: rn2_jax(rr, jnp.int32(4)),
+                draw_r4, lambda rr: rn2_jax(rr, jnp.int32(4)),
                 lambda rr: (rr, jnp.int32(0)), r,
             )
             scorr_branch = (trap_type != jnp.int32(0)) | (r4 == jnp.int32(0))
 
-            # SCORR branch: dosdoor(xx, yy, aroom, SDOOR) — vendor mklev.c:516.
-            # Draws rn2(5) [+rn2(20) if depth>=4].  add_door bumps the niche
-            # room's doorct.  Vendor cite: vendor/nle/src/mklev.c:516,1198.
+            # SCORR branch: maketrap + (engraving) + dosdoor.  Vendor:
+            # mklev.c:505-522.  Draws (in order):
+            #   1. maketrap(trap_type) — zero draws for non-switch trap types
+            #      (TELEP_TRAP=15, LEVEL_TELEP=16, TRAPDOOR=14 all fall through
+            #      the maketrap switch with no RNG).  Vendor cite:
+            #      vendor/nle/src/trap.c:315-443 (maketrap, only SQKY_BOARD /
+            #      STATUE_TRAP / ROLLING_BOULDER / PIT/HOLE/TRAPDOOR-furniture
+            #      paths draw).
+            #   2. if trap_engravings[trap_type] != NULL:
+            #        make_engr_at(..., DUST) — zero draws (e_type=DUST>0
+            #          short-circuits the rnd(N_ENGRAVE-1) draw at
+            #          engrave.c:412).
+            #        wipe_engr_at(xx, yy-dy, 5, FALSE) -> wipeout_text(s, 5, 0)
+            #          DUST engravings skip the cnt reduction at engrave.c:301,
+            #          so wipeout_text loops 5 times drawing
+            #          ``rn2(lth), rn2(4)`` per iteration (engrave.c:95-96).
+            #          The string length is fixed per trap_type:
+            #            TRAPDOOR (14):    "Vlad was here"   lth = 13
+            #            TELEP_TRAP (15):  "ad aerarium"     lth = 11
+            #            LEVEL_TELEP (16): "ad aerarium"     lth = 11
+            #            other trap_type: NULL -> wipe_engr_at not called.
+            #   3. dosdoor(xx, yy, aroom, SDOOR): rn2(5) locked-vs-closed
+            #      [+rn2(20) if depth>=4]. add_door bumps the niche room's
+            #      doorct.  Vendor cite: vendor/nle/src/mklev.c:516,1198.
+            #
+            # Caller's responsibility: ensure ``trap_type`` matches vendor.
             def _scorr_path(rg2):
                 r_, g_ = rg2
+
+                # Step 2: wipe_engr_at(5) draws for engraved traps.  The
+                # engraving length is static per trap_type — pick it via
+                # jnp.where so the draw count stays compile-time-constant (5)
+                # but the modulus is data-dependent.  This is correct because
+                # mod doesn't affect ISAAC64 stream advancement (each rn2
+                # consumes exactly one uint64).
+                # NB: ``has_engr`` could also be data-dependent but on the
+                # Main Dlvl 1 makevtele path it is always True (TELEP_TRAP=15).
+                # We gate with jnp.where instead of lax.cond so the trace is
+                # straight-line — every ISAAC64 draw advances unconditionally
+                # but masked out via lax.cond at the helper boundary below.
+                _engr_lth = jnp.where(
+                    (trap_type == jnp.int32(14)),
+                    jnp.int32(13),  # "Vlad was here"
+                    jnp.where(
+                        (trap_type == jnp.int32(15))
+                        | (trap_type == jnp.int32(16)),
+                        jnp.int32(11),  # "ad aerarium"
+                        jnp.int32(0),
+                    ),
+                )
+                has_engr = _engr_lth != jnp.int32(0)
+
+                def _wipe_one(_, r_carry):
+                    rr = r_carry
+                    rr, _v1 = rn2_jax(rr, jnp.maximum(_engr_lth, jnp.int32(1)))
+                    rr, _v2 = rn2_jax(rr, jnp.int32(4))
+                    return rr
+
+                def _do_wipe(rr):
+                    return lax.fori_loop(0, 5, _wipe_one, rr)
+
+                r_ = lax.cond(has_engr, _do_wipe, lambda rr: rr, r_)
+
+                # Step 3: dosdoor(SDOOR) — rn2(5) locked-vs-closed.
                 r_, r5s = rn2_jax(r_, jnp.int32(5))
                 sdoor_locked = r5s == jnp.int32(0)
                 mask_s = jnp.where(sdoor_locked, jnp.int8(DMASK_LOCKED), jnp.int8(DMASK_CLOSED))
@@ -1500,6 +1567,26 @@ def _makeniche(
 
                 # rn2(7)==0 sub-path: inaccessible niche (vendor:529-540).
                 # No door -> no doorct bump.
+                #
+                # Vendor sequence (mklev.c:528-540):
+                #   if (!rn2(5) && IS_WALL(...)) {           # ironbars gate
+                #       levl[xx][yy].typ = IRONBARS;
+                #       if (rn2(3)) mkcorpstat(CORPSE, ...);  # corpse roll
+                #   }
+                #   if (!level.flags.noteleport)
+                #       mksobj_at(SCR_TELEPORTATION, ...);    # SCROLL_CLASS init
+                #   if (!rn2(3)) mkobj_at(0, ...);            # mkobj gate
+                #
+                # The mksobj_at(SCR_TELEPORTATION) call invokes mksobj(otyp,
+                # TRUE, FALSE) which runs the SCROLL_CLASS mksobj_init branch
+                # (mkobj.c:981-987) = boc(4) = rn2(4) + cond rn2(2).  This
+                # was missing prior to this fix, shifting the ISAAC64 stream
+                # by 2 draws on the inaccessible-niche path.  Dlvl 1 in the
+                # main dungeon has noteleport=False so the scroll always
+                # spawns; we unconditionally consume the draws here (the
+                # ``noteleport`` param is not threaded down to _makeniche).
+                # Vendor cite: vendor/nle/src/mklev.c:536-538,
+                # vendor/nle/src/mkobj.c:981-987 (SCROLL_CLASS boc(4)).
                 def _corr_inaccessible(rg3):
                     r2, g2 = rg3
                     r2, r5i = rn2_jax(r2, jnp.int32(5))   # !rn2(5) ironbars gate
@@ -1511,6 +1598,14 @@ def _makeniche(
                         return r3
 
                     r2 = lax.cond(ironbars, _ironbars_true, lambda r3: r3, r2)
+
+                    # mksobj_at(SCR_TELEPORTATION) → SCROLL_CLASS mksobj_init
+                    # = blessorcurse(4) = rn2(4) [+ cond rn2(2)].
+                    r2 = consume_mksobj_init_draws(
+                        r2,
+                        jnp.int32(int(ObjectClass.SCROLL_CLASS)),
+                    )
+
                     r2, _r3mk = rn2_jax(r2, jnp.int32(3))
                     return r2, g2
 
