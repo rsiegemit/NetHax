@@ -2276,6 +2276,23 @@ def fill_ordinary_rooms(
                     new_tr = tr_in.at[flat_lv, rt_r_, rt_c_].set(
                         kind_.astype(jnp.int8)
                     )
+                    # maketrap() internal draws (vendor trap.c:315-443) — fire
+                    # BEFORE the dead-predecessor gate.  SQKY_BOARD draws
+                    # rn2(tcnt) to pick an unused note (trap.c:355-372); for the
+                    # first SQKY_BOARD on a level, tcnt=12.  We don't track
+                    # per-level placed SQKY_BOARDs, so we approximate as
+                    # rn2(12) — exact for the first board (the common case),
+                    # off-by-mod for subsequent ones (same draw count).
+                    # STATUE_TRAP (19) and ROLLING_BOULDER_TRAP (7) also have
+                    # internal draws, but both are legalised away on lvl<8/lvl<2
+                    # respectively so they cannot appear here on Dlvl 1.
+                    # Vendor cite: vendor/nle/src/trap.c:355-372 (SQKY_BOARD
+                    # note pick); rooms.py:1514-1524 (legalise depth gates).
+                    is_sqky = kind_ == jnp.int32(4)
+                    def _sqky_true(vi):
+                        vi, _ = randint_jax(vi, (), 0, 12)
+                        return vi
+                    v = lax.cond(is_sqky, _sqky_true, lambda vi: vi, v)
                     # Dead-predecessor gate: rnd(4) drawn AFTER mktrap fires.
                     # Vendor mklev.c:1418-1425 — the full predicate is:
                     #   kind != NO_TRAP && lvl <= rnd(4)
