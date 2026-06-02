@@ -1285,6 +1285,21 @@ def generate_main_branch_l1(
         # to its (xl, yh) fallback, shifting every corridor door position
         # and diverging the dig_corridor rn2(dix-diy+1) bias stream.
         _lgs = _vendor_stamp_rooms(_lgs, _rooms_box)
+        # Stamp the down-stair into _lgs.typ at (dn_sx, dn_sy).  Vendor
+        # mkstairs (mklev.c:1566) writes ``levl[x][y].typ = STAIRS`` after
+        # picking the stair coordinates and BEFORE makecorridors / make_niches
+        # run.  Niche placement's !IS_FURNITURE check (vendor mklev.c:470)
+        # uses this stamp to reject "back-onto stairs" placements; without
+        # it, Nethax saw ROOM there and accepted niche attempts that vendor
+        # rejected — diverging the ISAAC64 stream (e.g. seed=4 at draw 1691).
+        # Vendor cite: vendor/nle/src/mklev.c:712,1566.
+        from Nethax.nethax.dungeon.corridors import VTILE_STAIRS as _VTILE_STAIRS
+        _lgs = _lgs.replace(
+            typ=_lgs.typ.at[
+                dn_sx.astype(jnp.int32),
+                dn_sy.astype(jnp.int32),
+            ].set(jnp.int8(_VTILE_STAIRS))
+        )
         # mklev.c:734 — makecorridors(rooms, nroom).  ``depth=1`` on
         # Main Dlvl 1 gates maybe_sdoor: depth>2 is false so dodoor skips
         # the rn2(8) draw and forces DOOR on every corridor endpoint.

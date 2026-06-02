@@ -281,6 +281,10 @@ VTILE_SCORR:   int = 14   # SCORR (secret corridor)
 VTILE_DOOR:    int = 15   # DOOR
 VTILE_SDOOR:   int = 16   # SDOOR (secret door)
 VTILE_IRONBARS: int = 21  # IRONBARS
+VTILE_STAIRS:   int = 25  # STAIRS (vendor rm.h: STAIRS=25).  Stamped by
+                          # mkstairs (vendor mklev.c:1566) into ``levl[][].typ``;
+                          # consulted by place_niche's !IS_FURNITURE check.
+VTILE_ALTAR:    int = 31  # ALTAR (vendor IS_FURNITURE upper bound).
 
 # Vendor door masks (rm.h: D_NODOOR=0, D_BROKEN=1, D_ISOPEN=2, D_CLOSED=4,
 # D_LOCKED=8, D_TRAPPED=16).
@@ -1320,9 +1324,20 @@ def _place_niche(
     in_b = (out_y - dy >= 0) & (out_y - dy < ROWNO)
     typ_a = gs.typ[out_x, jnp.clip(out_y + dy, 0, ROWNO - 1)]
     typ_b = gs.typ[out_x, jnp.clip(out_y - dy, 0, ROWNO - 1)]
-    ok = in_a & in_b & (typ_a == jnp.int8(VTILE_STONE))
-    # POOL/FURNITURE checks skipped — Phase 4 surface is rooms+corridors;
-    # no pool/furniture tiles exist yet on Dlvl 1 at this stage.
+    # IS_FURNITURE(typ) := STAIRS<=typ<=ALTAR (vendor rm.h:104).  Without this
+    # check the niche may try to back-onto the downstair cell, which vendor
+    # rejects.  Seed=4 hits exactly this: room aidx=3 at (26,3)-(28,5) has
+    # the downstair stamped at (28, 3); niche attempt with yy=2, dy=-1 has
+    # yy-dy=3 (STAIRS), so vendor's place_niche returns false.
+    # POOL check (vendor IS_POOL = POOL<=typ<=DRAWBRIDGE_UP, [16, 19]) is also
+    # required by vendor; on Dlvl 1 main branch there are no pools yet, but
+    # we include it for completeness.
+    is_furniture_b = (typ_b >= jnp.int8(VTILE_STAIRS)) & (typ_b <= jnp.int8(VTILE_ALTAR))
+    is_pool_b = (typ_b >= jnp.int8(16)) & (typ_b <= jnp.int8(19))
+    ok = (in_a & in_b
+          & (typ_a == jnp.int8(VTILE_STONE))
+          & ~is_furniture_b
+          & ~is_pool_b)
     return rng, ok, out_x, out_y, dy
 
 
