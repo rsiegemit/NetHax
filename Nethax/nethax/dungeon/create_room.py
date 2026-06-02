@@ -256,23 +256,26 @@ def _scan_check_room(
     estimates "hundreds of draws/attempt x 100 attempts x 7 rooms = 1000+
     draws/level".  Prior to this fix that entire stream was skipped.
 
-    Simplification vs vendor:
-        Vendor's ``goto chk`` shrinks the candidate room on a non-zero
-        ``rn2(3)`` roll and restarts the scan from the new bounds; the
-        post-shrink cells consume *more* RNG bytes.  We model the linear
-        single-pass scan only -- one ``rn2(3)`` per non-stone cell, exit on
-        the first ``0`` roll.  This captures the dominant per-attempt draw
-        count; the shrink+retry refinement (additional ~tens of bytes when
-        a roll is non-zero) is a future polish item.  See audit doc for
-        the impact estimate.
+    Vendor semantics ported here (sp_lev.c:1063-1120):
+        The outer ``chk:`` label is a goto-restart that shrinks the
+        candidate bounds whenever a non-stone cell rolls a non-zero
+        ``rn2(3)`` and restarts the scan.  At most ONE ``rn2(3)`` is
+        drawn per outer iteration -- the cell that triggered the
+        ``goto chk``.  We carry ``(rng, lowx, lowy, hix, hiy, status)``
+        and drive the loop via a fixed-size ``lax.fori_loop`` whose
+        upper bound (``_MAX_SHRINK_ITERS``) exceeds the worst-case
+        number of restarts.  Each shrink reduces ``hix - lowx`` or
+        ``hiy - lowy`` by at least one column/row, so the geometry
+        collapses (``hix <= lowx || hiy <= lowy`` -> FALSE) within at
+        most ``(hix_init - lowx_init) + (hiy_init - lowy_init)`` iters,
+        which is bounded by ``COLNO + ROWNO``.
 
-    JIT shape: the scan iterates over the full padded box
-    ``[lowx-xlim_max .. hix+xlim_max] x [lowy-ylim_max .. hiy+ylim_max]``
-    -- both ranges are bounded by COLNO/ROWNO so we use a static-sized
-    ``fori_loop`` over ``_COLNO x _ROWNO`` cells and mask out cells outside
-    the per-attempt bounding box via ``jnp.where``.  Vendor's clamps
-    (``x <= 0 || x >= COLNO`` and ``y < 0`` / ``ymax >= ROWNO``) are folded
-    into the same mask.
+    JIT shape: outer ``fori_loop(0, _MAX_SHRINK_ITERS, ...)`` over the
+    restart count; inside each iter, an inner ``fori_loop`` over
+    ``_COLNO * _ROWNO`` cells finds the FIRST (x-major, y-minor) non-stone
+    cell in the padded box.  Per-cell test mirrors vendor's clamp gates
+    (``x > 0 && x < COLNO`` and ``y in [max(0,lowy-ylim), min(ROWNO-1,
+    hiy+ylim)]``).
 
     Args:
         rng: ISAAC64 stream.
@@ -285,69 +288,139 @@ def _scan_check_room(
             & fits``) so vendor would never have reached ``check_room``.
 
     Returns:
-        ``(new_rng, check_ok)``.  ``check_ok`` is True iff every non-stone
-        cell in the scan window rolled a non-zero ``rn2(3)`` (or there were
-        no non-stone cells).
+        ``(new_rng, check_ok)``.  ``check_ok`` is True iff the scan
+        terminates with status == ACCEPTED (no non-stone cell remaining in
+        the shrunken box).  Returns False on REJECTED (rolled 0) or on the
+        ``hix<=lowx||hiy<=lowy`` collapse.
     """
     xlim = jnp.int16(_XLIM) + jnp.where(vault, jnp.int16(1), jnp.int16(0))
     ylim = jnp.int16(_YLIM) + jnp.where(vault, jnp.int16(1), jnp.int16(0))
 
-    # Padded scan window (pre-clamp -- the per-cell mask applies vendor's
-    # ``x <= 0 || x >= COLNO`` / ``y < 0`` / ``ymax >= ROWNO`` clamps).
-    scan_lowx = lowx - xlim
-    scan_lowy = lowy - ylim
-    scan_hix = hix + xlim
-    scan_hiy = hiy + ylim
+    # Status codes: 0=SCANNING, 1=ACCEPTED, 2=REJECTED.
+    SCANNING = jnp.int8(0)
+    ACCEPTED = jnp.int8(1)
+    REJECTED = jnp.int8(2)
+
+    # Pre-collapse check (vendor sp_lev.c:1084 at the first ``chk:`` entry).
+    init_status = jnp.where(
+        ~enable,
+        REJECTED,
+        jnp.where(
+            (hix <= lowx) | (hiy <= lowy),
+            REJECTED,
+            SCANNING,
+        ),
+    )
 
     n_cells = _COLNO * _ROWNO
 
-    def _body(i, carry):
-        rng_c, ok_c = carry
-        # Cell coordinates -- iterate y inner (matches vendor's ``lev++``
-        # which walks down the column).
-        x = jnp.int16(i // _ROWNO)
-        y = jnp.int16(i % _ROWNO)
+    def _outer_body(_i, carry):
+        rng_c, lowx_c, lowy_c, hix_c, hiy_c, status_c = carry
 
-        # Vendor mask: ``lowx-xlim <= x <= hix+xlim`` AND ``1 <= x < COLNO``
-        # (vendor: ``if (x <= 0 || x >= COLNO) continue;``) AND
-        # ``max(0, lowy-ylim) <= y <= min(ROWNO-1, hiy+ylim)``.
-        in_x = (
-            (x >= scan_lowx)
-            & (x <= scan_hix)
-            & (x > jnp.int16(0))
-            & (x < jnp.int16(_COLNO))
+        def _do_iter(state):
+            r, lx, ly, hx, hy, _st = state
+
+            # Padded scan window for this iteration (sp_lev.c:1088-1096).
+            scan_lowx = lx - xlim
+            scan_lowy = ly - ylim
+            scan_hix = hx + xlim
+            scan_hiy = hy + ylim
+
+            # Inner scan: find the FIRST (x-major, y-minor) non-stone cell
+            # in the padded box.  Cell index ``i`` maps to ``x = i//_ROWNO,
+            # y = i%_ROWNO`` so iteration order is x outer, y inner -- this
+            # matches vendor's ``for (x = ...) for (y = ...) lev++``.
+            def _inner_body(j, inner_carry):
+                found_c, idx_c = inner_carry
+                xj = jnp.int16(j // _ROWNO)
+                yj = jnp.int16(j % _ROWNO)
+                in_x = (
+                    (xj >= scan_lowx)
+                    & (xj <= scan_hix)
+                    & (xj > jnp.int16(0))
+                    & (xj < jnp.int16(_COLNO))
+                )
+                in_y = (
+                    (yj >= scan_lowy)
+                    & (yj <= scan_hiy)
+                    & (yj >= jnp.int16(0))
+                    & (yj < jnp.int16(_ROWNO))
+                )
+                cell = level_grid[yj, xj]
+                hit = in_x & in_y & (cell != jnp.int8(0))
+                # Latch the first hit -- subsequent hits are ignored.
+                take = hit & (~found_c)
+                idx_n = jnp.where(take, jnp.int32(j), idx_c)
+                found_n = found_c | hit
+                return (found_n, idx_n)
+
+            found, idx = lax.fori_loop(
+                0,
+                n_cells,
+                _inner_body,
+                (jnp.bool_(False), jnp.int32(-1)),
+            )
+
+            def _no_hit(args):
+                # Entire padded box is stone -- vendor falls off the
+                # nested for-loops and returns TRUE.  ACCEPTED, no draw.
+                r2, lx2, ly2, hx2, hy2 = args
+                return r2, lx2, ly2, hx2, hy2, ACCEPTED
+
+            def _has_hit(args):
+                # Non-stone cell at idx -- draw rn2(3).  Roll == 0 ->
+                # REJECTED.  Roll != 0 -> shrink + continue.
+                r2, lx2, ly2, hx2, hy2 = args
+                r3, roll = rn2_jax(r2, jnp.int32(3))
+                rejected = roll == jnp.int32(0)
+                xh = jnp.int16(idx // _ROWNO)
+                yh = jnp.int16(idx % _ROWNO)
+                # Vendor shrink (sp_lev.c:1105-1112):
+                #   if (x < *lowx) *lowx = x + xlim + 1;
+                #   else           hix   = x - xlim - 1;
+                #   if (y < *lowy) *lowy = y + ylim + 1;
+                #   else           hiy   = y - ylim - 1;
+                new_lx = jnp.where(xh < lx2, xh + xlim + jnp.int16(1), lx2)
+                new_hx = jnp.where(xh < lx2, hx2, xh - xlim - jnp.int16(1))
+                new_ly = jnp.where(yh < ly2, yh + ylim + jnp.int16(1), ly2)
+                new_hy = jnp.where(yh < ly2, hy2, yh - ylim - jnp.int16(1))
+                # Re-check collapse after shrink (vendor goto chk -> 1084).
+                collapsed = (new_hx <= new_lx) | (new_hy <= new_ly)
+                next_status = jnp.where(
+                    rejected,
+                    REJECTED,
+                    jnp.where(collapsed, REJECTED, SCANNING),
+                )
+                return r3, new_lx, new_ly, new_hx, new_hy, next_status
+
+            return lax.cond(
+                found,
+                _has_hit,
+                _no_hit,
+                (r, lx, ly, hx, hy),
+            )
+
+        def _skip_iter(state):
+            return state
+
+        return lax.cond(
+            status_c == SCANNING,
+            _do_iter,
+            _skip_iter,
+            (rng_c, lowx_c, lowy_c, hix_c, hiy_c, status_c),
         )
-        in_y = (
-            (y >= scan_lowy)
-            & (y <= scan_hiy)
-            & (y >= jnp.int16(0))
-            & (y < jnp.int16(_ROWNO))
-        )
-        in_box = enable & in_x & in_y
 
-        cell = level_grid[y, x]
-        non_stone = cell != jnp.int8(0)
+    # Worst-case restart count: each shrink loses >=1 row or column in the
+    # interior box.  Initial spans are bounded by COLNO + ROWNO = 101.
+    _MAX_SHRINK_ITERS = _COLNO + _ROWNO
 
-        # Draw rn2(3) iff (in_box AND non_stone) -- short-circuited via
-        # lax.cond so the ISAAC64 stream is consumed only on cells vendor
-        # would have hit.
-        def _draw(r):
-            return rn2_jax(r, jnp.int32(3))
-
-        def _skip(r):
-            return r, jnp.int32(0)
-
-        # Once we've already rejected (ok_c=False) vendor would have
-        # returned FALSE -- no further draws.  Gate on ok_c too.
-        gate = in_box & non_stone & ok_c
-        rng_n, roll = lax.cond(gate, _draw, _skip, rng_c)
-
-        # Reject when this cell consumed a draw and rolled 0.
-        ok_n = ok_c & ((~gate) | (roll != jnp.int32(0)))
-        return (rng_n, ok_n)
-
-    rng_f, ok_f = lax.fori_loop(0, n_cells, _body, (rng, jnp.bool_(True)))
-    return rng_f, ok_f
+    rng_f, _, _, _, _, status_f = lax.fori_loop(
+        0,
+        _MAX_SHRINK_ITERS,
+        _outer_body,
+        (rng, lowx, lowy, hix, hiy, init_status),
+    )
+    return rng_f, status_f == ACCEPTED
 
 
 def _try_one_attempt(
