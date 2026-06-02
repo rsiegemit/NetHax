@@ -42,10 +42,10 @@ from Nethax.nethax.vendor_rng import Isaac64State, rn2_jax, rnd_jax, rn1_jax, rn
 
 _MKOBJPROBS: tuple[tuple[int, int], ...] = (
     (10, int(ObjectClass.WEAPON_CLASS)),
-    (11, int(ObjectClass.ARMOR_CLASS)),
+    (10, int(ObjectClass.ARMOR_CLASS)),
     (20, int(ObjectClass.FOOD_CLASS)),
     ( 8, int(ObjectClass.TOOL_CLASS)),
-    ( 7, int(ObjectClass.GEM_CLASS)),
+    ( 8, int(ObjectClass.GEM_CLASS)),
     (16, int(ObjectClass.POTION_CLASS)),
     (16, int(ObjectClass.SCROLL_CLASS)),
     ( 4, int(ObjectClass.SPBOOK_CLASS)),
