@@ -486,39 +486,33 @@ class NethaxEnv:
             state = state.replace(vendor_rng=new_vrng)
             # Vendor makedog (NLE 3.x dog.c::makedog → makemon → ... → moveloop)
             # continues past the rn2(2) pet-type coin flip (dog.c:66) with the
-            # following ISAAC64 stream consumption (kitten case; little dog is
-            # analogous via the same m_lev=1 → d(1,8) → m_initinv path):
+            # following ISAAC64 stream consumption.  Both kitten (PM 32) and
+            # little dog (PM 16) have ``LVL(2, ...)`` in vendor/nle/src/monst.c,
+            # but ``newmonhp`` calls ``adj_lev(ptr)`` first (makemon.c:989) and
+            # adj_lev (makemon.c:1757) reduces level by 1 when ``mlevel >
+            # level_difficulty()`` — for a Dlvl=1 fresh game ``level_difficulty
+            # = 1`` so the pet's effective ``m_lev = 1``.  Then ``d(1, 8)``
+            # silently consumes ONE uint64 via inline RND() (rnd.c:208-224
+            # bypasses the rn2/rnd trace hook):
             #
             #   makemon body:
-            #     enexto_core (teleport.c:215)        rn2(N)        TRACED  -> trace pos 1782
-            #     mtmp->female = rn2(2) (makemon.c:1226)            TRACED  -> trace pos 1783
-            #     [SILENT 1 uint64 — empirically required to align trace pos 1784+;
-            #      most likely d(n,x) bypass via RND() inline (vendor rnd.c:75-79
-            #      / rnd.c:222 — d() calls RND() directly, skipping the rn2/rnd
-            #      op-trace hook).  Candidate sources: newmonhp d(m_lev,8) for
-            #      kitten, m_initweap/d_dowear default paths, mksobj/mkobj internals.
-            #      The exact site is academic — the trace-driven byte-parity proof
-            #      shows ISAAC bytes [X+0, X+1, X+2 (silent), X+3, X+4, X+5, X+6]
-            #      land on vendor trace positions [1782, 1783, _, 1784, 1785, 1786,
-            #      1787] respectively, so consuming exactly one silent uint64
-            #      between trace pos 1783 and 1784 restores byte parity.]
+            #     enexto_core (teleport.c:215)            rn2(N)        TRACED  (consumed inside _spawn_starting_pet)
+            #     newmonhp d(m_lev=1, 8) (makemon.c:1011) SILENT × 1    [hit-dice roll]
+            #     mtmp->female = rn2(2) (makemon.c:1226)  rn2(2)        TRACED
             #   m_initinv (makemon.c:794-797):
-            #     rn2(50)                                           TRACED  -> trace pos 1784
-            #     rn2(100)                                          TRACED  -> trace pos 1785
+            #     rnd_defensive_item gate                 rn2(50)       TRACED
+            #     rnd_misc_item gate                      rn2(100)      TRACED
             #   makemon trailer (makemon.c:1386):
-            #     rn2(100) for is_domestic saddle gate              TRACED  -> trace pos 1786
+            #     is_domestic saddle gate                 rn2(100)      TRACED
             #   moveloop entry (allmain.c:67):
-            #     context.rndencode = rnd(9000)                     TRACED  -> trace pos 1787
+            #     context.rndencode                       rnd(9000)     TRACED
             #
-            # Previously this block emitted six op-traced draws assuming each
-            # vendor trace position corresponded to a single ISAAC draw — but
-            # vendor's d(n,x) is a SILENT consumer (rnd.c:208-224 calls RND(x)
-            # directly, bypassing the rn2/rnd trace hook).  Missing the silent
-            # draw shifted Nethax's ISAAC stream one uint64 EARLY starting at
-            # trace pos 1784, so every subsequent uint64 was off-by-one
-            # (Nethax 1785 mirrored vendor 1784, etc).  Cite vendor/nle/src/
-            # rnd.c:75-79 (RND inline) and the diagnostic in
-            # .test_runs/ghost_draw_eager_check.py.
+            # Previous attempt consumed the silent uint64 AFTER the female
+            # rn2(2), which made the female draw read newmonhp's slot instead
+            # of the female slot — seed=1's draw 2448 + seed=4's draw 2512 both
+            # diverged.  Moving the silent BEFORE female aligns every uint64.
+            # Cite vendor/nle/src/makemon.c:989 (adj_lev), :1011 (d call),
+            # :1757 (adj_lev impl), rnd.c:208-224 (d inline RND).
             from Nethax.nethax import vendor_rng as _vrng_mod
             v = state.vendor_rng
             # NOTE: the ``enexto_core`` rn2(num_good) draw is consumed INSIDE
@@ -527,8 +521,10 @@ class NethaxEnv:
             # cell (matching vendor teleport.c:215).  Do NOT consume another
             # rn2 here — that would advance the stream twice for a single
             # vendor draw and misalign every subsequent uint64.
+            #
+            # newmonhp d(1, 8) → 1 silent uint64 BEFORE the female rn2:
+            v, _ = _vrng_mod.next_uint64_jax(v)       # newmonhp d(1,8)
             v, _ = _vrng_mod.rn2_jax(v, 2)            # mtmp->female = rn2(2)
-            v, _ = _vrng_mod.next_uint64_jax(v)       # silent draw (see comment block above)
             v, _ = _vrng_mod.rn2_jax(v, 50)           # m_initinv rnd_defensive_item gate
             v, _ = _vrng_mod.rn2_jax(v, 100)          # m_initinv rnd_misc_item gate
             v, _ = _vrng_mod.rn2_jax(v, 100)          # is_domestic saddle gate
