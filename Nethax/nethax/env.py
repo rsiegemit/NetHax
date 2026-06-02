@@ -162,7 +162,10 @@ class NethaxEnv:
             seed_hi = jnp.uint64(rng[0])
             seed_lo = jnp.uint64(rng[1])
             seed_arr = (seed_hi << jnp.uint64(32)) | seed_lo
-            v_state = _vendor_rng.init(int(seed_arr))
+            # Use vmap-compatible JAX init.  Bit-exact with the legacy
+            # _vendor_rng.init(int(seed_arr)) for any uint64 seed
+            # (verified for seeds 0..999999 against Python reference).
+            v_state = _vendor_rng.init_jax(seed_arr)
 
             # Seed the DISP stream (rnglist[DISP]) alongside CORE.  NLE's
             # ``nle_set_seed`` takes BOTH integers and seeds the two
@@ -175,8 +178,12 @@ class NethaxEnv:
             # an explicit ``disp_seed`` override.
             # Cite: vendor/nle/src/nle.c:530-532 ``set_random(core, rn2)``
             #       and ``set_random(disp, rn2_on_display_rng)``.
-            disp_seed_val = int(seed_arr) if disp_seed is None else int(disp_seed)
-            v_state_disp = _vendor_rng.init(disp_seed_val)
+            # disp_seed: only convert to traced uint64 if not already
+            if disp_seed is None:
+                disp_seed_val = seed_arr
+            else:
+                disp_seed_val = jnp.uint64(disp_seed)
+            v_state_disp = _vendor_rng.init_jax(disp_seed_val)
             state = state.replace(vendor_rng_disp=v_state_disp)
 
             # Replay vendor ``init_objects()`` BEFORE any dungeon-gen
@@ -760,21 +767,41 @@ def _spawn_starting_pet(state, role: Role, vendor_rng=None):
     # Resolve pet monster name → MONSTERS index.  ``role`` is a Python
     # hyperparameter (not a traced value), so this Python lookup is fine
     # under ``jax.vmap`` over the rng axis.
+    #
+    # VMAP NOTE: under the NON_PM-pet-role branch the rn2(2) coin flip is
+    # routed through ``_vendor_rng.rn2_jax`` (NOT the host-side ``rn2``)
+    # so ``flip`` stays a JAX tracer rather than being materialised as a
+    # Python int via ``int(flip)``.  ``pet_pm`` then becomes a traced int32
+    # selected via ``jnp.where``, and the downstream ``_BASE_AC[pet_pm]`` /
+    # ``_ATK_DICE_N[pet_pm]`` / ``_ATK_DICE_S[pet_pm]`` / ``_IS_LARGE[pet_pm]``
+    # indexings are all JAX-array gathers that accept traced indices.
+    # Kitten and little dog both have ``level=2`` (constants/monster_entries
+    # /chunk1.py:323, 599), so ``pet_level`` is a static Python int regardless
+    # of the coin flip — no traced-level branch needed.
+    _KITTEN_PM = 32      # constants/monster_entries/chunk1.py:595
+    _LITTLE_DOG_PM = 16  # constants/monster_entries/chunk1.py:319
     if vendor_rng is not None and role in _NON_PM_PET_ROLES:
         # Consume the rn2(2) coin flip from the vendor ISAAC64 stream.
         # Vendor dog.c:66: return rn2(2) ? PM_KITTEN : PM_LITTLE_DOG;
         # (non-zero → kitten, zero → little dog — same as C truthiness)
         # Cite: vendor/nle/src/dog.c:66
-        vendor_rng, flip = _vendor_rng.rn2(vendor_rng, 2)
-        pet_name = "kitten" if int(flip) != 0 else "little dog"
+        vendor_rng, flip = _vendor_rng.rn2_jax(vendor_rng, 2)
+        pet_pm = jnp.where(
+            flip != jnp.int32(0),
+            jnp.int32(_KITTEN_PM),
+            jnp.int32(_LITTLE_DOG_PM),
+        )
+        # Both pet candidates share ``level=2`` so the static Python int is
+        # bit-identical to the traced selection — keep it static so callers
+        # of ``_roll_hp`` outside this branch keep their static-int contract.
+        pet_level = 2
     else:
         pet_name = get_starting_pet(role)
-
-    pet_pm = next(
-        (i for i, m in enumerate(MONSTERS) if m.name == pet_name),
-        32,  # fallback: kitten (index 32)
-    )
-    pet_level = max(1, int(MONSTERS[pet_pm].level))  # also a static int.
+        pet_pm = next(
+            (i for i, m in enumerate(MONSTERS) if m.name == pet_name),
+            32,  # fallback: kitten (index 32)
+        )
+        pet_level = max(1, int(MONSTERS[pet_pm].level))  # static int.
 
     # Find an adjacent FLOOR or CORRIDOR tile (Chebyshev distance == 1).
     # Static-shape: 8 candidate offsets, pure-JAX gather + argmax.
@@ -833,10 +860,10 @@ def _spawn_starting_pet(state, role: Role, vendor_rng=None):
         ac=state.monster_ai.ac.at[PET_SLOT].set(_BASE_AC[pet_pm]),
         is_large=state.monster_ai.is_large.at[PET_SLOT].set(_IS_LARGE[pet_pm]),
         attack_dice_n=state.monster_ai.attack_dice_n.at[PET_SLOT].set(
-            _ATK_DICE_N[pet_pm]
+            _ATK_DICE_N[pet_pm].astype(jnp.int8)
         ),
         attack_dice_sides=state.monster_ai.attack_dice_sides.at[PET_SLOT].set(
-            _ATK_DICE_S[pet_pm]
+            _ATK_DICE_S[pet_pm].astype(jnp.int8)
         ),
     )
     # Build the vendor fmon LIFO iteration order:
