@@ -37,7 +37,7 @@ from Nethax.nethax.subsystems.random_objects import (
     consume_mksobj_init_draws,
     decode_picked_otyp,
 )
-from Nethax.nethax.subsystems.inventory import MAX_GROUND_STACK
+from Nethax.nethax.subsystems.inventory import MAX_GROUND_STACK, ItemCategory
 from Nethax.nethax.dungeon.rumors_data import (
     CHAR_CLASS_RUBOUT,
     CHAR_CLASS_SPACE,
@@ -2353,8 +2353,9 @@ def fill_ordinary_rooms(
             vrng, _gold_roll = randint_jax(vrng, (), 0, 3)
             _gold_gate = (_gold_roll == jnp.int32(0)) & is_ordinary
 
-            def _mkgold_true(v):
+            def _mkgold_true(carry):
                 # somex/somey are evaluated arguments to mkgold().
+                v, gcat_g, gtyp_g, gqty_g = carry
                 v, _rg, _cg = somexy(v)
                 # mkgold(amount==0) draws two RNG values inside.  Vendor
                 # mkobj.c:1492-1496:
@@ -2368,13 +2369,60 @@ def fill_ordinary_rooms(
                 # mul = rnd(30 / max(12-depth, 2)) FIRST
                 _denom = jnp.maximum(jnp.int32(12) - depth_i, jnp.int32(2))
                 _hi = jnp.int32(30) // _denom          # rnd(30/denom) → [1, hi]
-                v, _ = randint_jax(v, (), 1, _hi + jnp.int32(1))
+                v, _mul = randint_jax(v, (), 1, _hi + jnp.int32(1))
                 # amount = 1 + rnd(level_difficulty() + 2) * mul SECOND.
                 # rnd(level_difficulty() + 2) → [1, depth+2]
-                v, _ = randint_jax(v, (), 1, depth_i + jnp.int32(3))
-                return v
+                v, _lvl_roll = randint_jax(v, (), 1, depth_i + jnp.int32(3))
+                _amount = jnp.int32(1) + _lvl_roll * _mul
 
-            vrng = lax.cond(_gold_gate, _mkgold_true, lambda v: v, vrng)
+                # --- Materialise gold into ground_items (vendor mkgold) ---
+                # Vendor mkobj.c:1486-1504: ``g_at(x, y)`` checks for existing
+                # gold pile at (x, y); if found, ``gold->quan += amount``
+                # (stacks merge — single pile per cell).  Otherwise
+                # ``mksobj_at(GOLD_PIECE, ...)`` creates a new pile.  We mirror
+                # ``g_at`` by scanning the cell's stack for an existing COIN
+                # entry; on hit we accumulate quantity (merge), on miss we
+                # write into the first empty slot.  This prevents room-gold
+                # over-emitting a duplicate stack when a later mkobj/mineralize
+                # cycle has already deposited gold at the same cell.
+                # Vendor cite: vendor/nle/src/mkobj.c:1486-1504 (mkgold,
+                #              g_at merge);
+                #              vendor/nle/src/mklev.c:827-828 (call site).
+                _COIN_CAT = jnp.int8(int(ItemCategory.COIN))
+                _GOLD_OTYP = jnp.int16(410)
+                _cell_cats = gcat_g[branch_idx, level_idx, _rg, _cg]
+                _coin_mask = _cell_cats == _COIN_CAT
+                _empty_mask = _cell_cats == jnp.int8(0)
+                _has_coin = jnp.any(_coin_mask)
+                # Existing-coin slot (first match) OR first-empty slot.
+                _coin_slot = jnp.argmax(_coin_mask.astype(jnp.int32))
+                _empty_slot = jnp.argmax(_empty_mask.astype(jnp.int32))
+                _slot = jnp.where(_has_coin, _coin_slot, _empty_slot).astype(jnp.int32)
+                # On merge, add to existing quan; on new pile, write amount.
+                _existing_qty = gqty_g[
+                    branch_idx, level_idx, _rg, _cg, _slot
+                ].astype(jnp.int32)
+                _new_qty_i32 = jnp.where(
+                    _has_coin, _existing_qty + _amount, _amount
+                )
+                _new_qty = jnp.clip(
+                    _new_qty_i32, 0, jnp.iinfo(jnp.int16).max,
+                ).astype(jnp.int16)
+                gcat_g = gcat_g.at[
+                    branch_idx, level_idx, _rg, _cg, _slot
+                ].set(_COIN_CAT)
+                gtyp_g = gtyp_g.at[
+                    branch_idx, level_idx, _rg, _cg, _slot
+                ].set(_GOLD_OTYP)
+                gqty_g = gqty_g.at[
+                    branch_idx, level_idx, _rg, _cg, _slot
+                ].set(_new_qty)
+                return (v, gcat_g, gtyp_g, gqty_g)
+
+            vrng, gcat_, gtyp_, gqty_ = lax.cond(
+                _gold_gate, _mkgold_true, lambda c: c,
+                (vrng, gcat_, gtyp_, gqty_),
+            )
 
             # --- Fountain: !rn2(10) + mkfount internals (vendor mklev.c:831-832) ---
             # Vendor:  if (!rn2(10)) mkfount(0, croom);
