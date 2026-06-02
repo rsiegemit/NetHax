@@ -2277,9 +2277,34 @@ def fill_ordinary_rooms(
                         kind_.astype(jnp.int8)
                     )
                     # Dead-predecessor gate: rnd(4) drawn AFTER mktrap fires.
+                    # Vendor mklev.c:1418-1425 — the full predicate is:
+                    #   kind != NO_TRAP && lvl <= rnd(4)
+                    #   && kind != SQKY_BOARD && kind != RUST_TRAP
+                    #   && !(kind == ROLLING_BOULDER_TRAP && launch.x==tx
+                    #        && launch.y==ty)
+                    #   && !is_pit(kind) && kind < HOLE
+                    # We elide the ROLLING_BOULDER_TRAP launch-overlap check
+                    # (no launch geometry modelled) — empirically the cascade
+                    # entry rate matches vendor for non-RBT kinds, which is
+                    # the dominant case.  kind_ is the legalised vendor kind,
+                    # so kind!=NO_TRAP is implicit (legalise collapses
+                    # rejects to ARROW_TRAP, never 0).
+                    # Vendor cite: vendor/nle/src/mklev.c:1418-1425.
                     v, rnd4_gate_ = randint_jax(v, (), 1, 5)  # rnd(4)
+                    SQKY_BOARD = jnp.int32(4)
+                    RUST_TRAP  = jnp.int32(9)
+                    PIT_       = jnp.int32(11)
+                    SPIKED_PIT = jnp.int32(12)
+                    HOLE_      = jnp.int32(13)
+                    kind_ok = (
+                        (kind_ != SQKY_BOARD)
+                        & (kind_ != RUST_TRAP)
+                        & (kind_ != PIT_)
+                        & (kind_ != SPIKED_PIT)
+                        & (kind_ < HOLE_)
+                    )
                     v = lax.cond(
-                        depth_i <= rnd4_gate_,
+                        kind_ok & (depth_i <= rnd4_gate_),
                         lambda vi: _dead_pred_cascade(vi, kind_),
                         lambda vi: vi,
                         v,
