@@ -741,77 +741,37 @@ _PET_NEIGHBOUR_OFFSETS = jnp.array(
 )  # [8, 2] — vendor u_init.c::makedog scans the 8 adjacent tiles.
 
 
-# Vendor enexto_core (teleport.c:126-216) candidate iteration order, encoded
-# as (dr, dc) offsets from the centre cell, per ring radius.  Vendor walks
-# concentric square rings around (xx, yy) starting at range=1, in two passes
-# per ring:
-#   Row pass: for x = xmin..xmax:
-#     emit (x, ymin) then (x, ymax)                            [2*(xmax-xmin+1) slots]
-#   Col pass: for y = ymin..ymax-1:                              (3.6.3 fix-up:
-#     emit (xmin, y) then (xmax, y)                              vendor used to
-#                                                                start at ymin+1
-#                                                                which left the
-#                                                                top row unchecked
-#                                                                — comment at
-#                                                                teleport.c:182)
-# At ring R the unclamped iteration emits 2*(2R+1) + 2*(2R) = 8R+2 slots; this
-# includes the 2 NW/NE corner cells visited TWICE (once in the row pass at
-# y=ymin, once in the col pass at y=ymin = ymin of the col-pass range).  The
-# loop expands rings until any ring produces at least one goodpos hit; vendor
-# then picks ``good[rn2(count)]``.  ``MAX_GOOD = 15`` caps the per-ring
-# candidate list (vendor: ``if (good_ptr++ == &good[MAX_GOOD - 1]) goto full;``
-# at teleport.c:172).
+# Vendor enexto_core (teleport.c:126-216) range=1 candidate iteration order,
+# encoded as (dr, dc) offsets from the centre cell.  Vendor walks the radius-1
+# square border in two passes:
+#   Row pass (x=xmin..xmax, check y=ymin then y=ymax):
+#     6 positions — (x=ux-1..ux+1) × (y=ymin, ymax)
+#   Col pass (y=ymin..ymax-1, check x=xmin then x=xmax):
+#     4 positions — (y=uy-1, uy) × (x=xmin, xmax)
 #
-# Vendor coordinate convention: ``x`` is column (0..COLNO-1), ``y`` is row
-# (0..ROWNO-1).  Nethax ``player_pos = [row, col]``, so we store offsets as
-# ``[dr, dc]`` — i.e., vendor ``(x_off, y_off)`` maps to ``(dc=x_off, dr=y_off)``.
-#
-# Cite: vendor/nle/src/teleport.c:126-219 enexto_core; called from makemon
-# (makemon.c:1132-1136 ``byyou && !in_mklev``).  ``in_mklev`` is FALSE here
-# because vendor's allmain.c:636 calls ``makedog()`` after ``mklev()`` has
-# returned.
-_PET_ENEXTO_MAX_RANGE = 10            # vendor practical cap (see task spec)
-_PET_ENEXTO_MAX_GOOD = 15             # vendor MAX_GOOD (teleport.c:132)
-_PET_ENEXTO_RING_SIZE = 8 * _PET_ENEXTO_MAX_RANGE + 2  # 82 — max slots per ring
-
-
-def _build_pet_enexto_rings():
-    """Precompute the per-ring offset table for vendor enexto_core iteration.
-
-    Returns ``(rings, ring_counts)`` where:
-      * ``rings`` is ``int32[_PET_ENEXTO_MAX_RANGE, _PET_ENEXTO_RING_SIZE, 2]``
-        with ``rings[R-1, k] = (dr, dc)`` for the k-th candidate of ring R, in
-        vendor iteration order.  Unused slots (k >= 8R+2) are padded with a
-        large sentinel offset (`_PET_ENEXTO_PAD`) that always maps out-of-bounds.
-      * ``ring_counts`` is ``int32[_PET_ENEXTO_MAX_RANGE]`` with the actual slot
-        count per ring (8R+2).
-    """
-    import numpy as np
-    PAD = 32767
-    rings = np.full(
-        (_PET_ENEXTO_MAX_RANGE, _PET_ENEXTO_RING_SIZE, 2), PAD, dtype=np.int32
-    )
-    counts = np.zeros((_PET_ENEXTO_MAX_RANGE,), dtype=np.int32)
-    for R in range(1, _PET_ENEXTO_MAX_RANGE + 1):
-        offs = []
-        # Row pass: for x_off in [-R..R]: emit (x_off, -R) then (x_off, R).
-        for x_off in range(-R, R + 1):
-            offs.append((-R, x_off))   # (dr=-R, dc=x_off)  → vendor (x, ymin)
-            offs.append((R, x_off))    # (dr=R,  dc=x_off)  → vendor (x, ymax)
-        # Col pass: for y_off in [-R..R-1]: emit (-R, y_off) then (R, y_off).
-        for y_off in range(-R, R):
-            offs.append((y_off, -R))   # (dr=y_off, dc=-R) → vendor (xmin, y)
-            offs.append((y_off, R))    # (dr=y_off, dc=R)  → vendor (xmax, y)
-        assert len(offs) == 8 * R + 2
-        for k, (dr, dc) in enumerate(offs):
-            rings[R - 1, k, 0] = dr
-            rings[R - 1, k, 1] = dc
-        counts[R - 1] = len(offs)
-    return jnp.asarray(rings, dtype=jnp.int32), jnp.asarray(counts, dtype=jnp.int32)
-
-
-_PET_ENEXTO_RINGS, _PET_ENEXTO_RING_COUNTS = _build_pet_enexto_rings()
-_PET_ENEXTO_PAD = jnp.int32(32767)    # sentinel offset; always falls out-of-bounds
+# The 2 corner cells (NW at (ux-1, uy-1) and NE at (ux+1, uy-1)) are visited
+# TWICE because the row pass already covers y=ymin AND the col pass re-visits
+# them when y=uy-1.  Vendor's 3.6.3 commit (mklev.c log "this used to use
+# 'ymin+1' which left top row unchecked") intentionally introduced this
+# overlap, so the candidate list has 2 duplicates.  Replicate exactly to
+# match the rn2(num_good) pick.  Vendor cite: vendor/nle/src/teleport.c:167-196.
+_PET_ENEXTO_OFFSETS = jnp.array(
+    [
+        # Row pass: x=ux-1, ux, ux+1; for each: (x, ymin) then (x, ymax).
+        [-1, -1],  # (x=ux-1, y=ymin)  → NW
+        [ 1, -1],  # (x=ux-1, y=ymax)  → SW
+        [-1,  0],  # (x=ux,   y=ymin)  → N
+        [ 1,  0],  # (x=ux,   y=ymax)  → S
+        [-1,  1],  # (x=ux+1, y=ymin)  → NE
+        [ 1,  1],  # (x=ux+1, y=ymax)  → SE
+        # Col pass: y=ymin (=uy-1), uy; for each: (xmin, y) then (xmax, y).
+        [-1, -1],  # (x=xmin, y=ymin)  → NW (DUP)
+        [-1,  1],  # (x=xmax, y=ymin)  → NE (DUP)
+        [ 0, -1],  # (x=xmin, y=uy)    → W
+        [ 0,  1],  # (x=xmax, y=uy)    → E
+    ],
+    dtype=jnp.int32,
+)  # [10, 2] — vendor enexto_core range=1 candidate order (with 2 corner DUPs).
 
 
 def _spawn_starting_pet(state, role: Role, vendor_rng=None):
@@ -899,180 +859,75 @@ def _spawn_starting_pet(state, role: Role, vendor_rng=None):
     H, W = terrain.shape
 
     if vendor_rng is not None:
-        # Vendor ``enexto_core`` (teleport.c:126-219): walk concentric square
-        # rings around the centre cell starting at radius 1; at each ring
-        # enumerate the border in vendor's row-then-col iteration order; apply
-        # ``goodpos`` per cell; if any cell qualifies pick ``good[rn2(count)]``
-        # and stop, else expand to the next ring.  ``MAX_GOOD = 15`` caps the
-        # per-ring candidate list.
-        #
-        # Vendor goodpos (teleport.c:25-106) here reduces to:
-        #   isok(x, y) AND not the player cell AND no monster at (x, y) AND
-        #   ``accessible(typ) := typ >= DOOR``  (rm.h:92 ACCESSIBLE macro).
-        # The previous range=1-only port matched vendor for seed=0 but
-        # diverged whenever no ring=1 cell qualified (e.g. seed=1's hero spawn
-        # has fewer good ring=1 cells than ring=2), so we now port the full
-        # multi-ring search.  Cite: vendor/nle/src/teleport.c:126-219.
-
-        # Vendor map dimensions: COLNO=80, ROWNO=21.  Nethax ``terrain`` has
-        # shape ``[H, W] = [ROWNO, COLNO]`` and ``player_pos = [row, col]``.
-        # Vendor uses ``(x=col, y=row)``; we keep Nethax ``(dr, dc)``.
-        #
-        # Vendor bounds:
-        #   xmin = max(1, xx-R)     — column 0 is reserved (status line in
-        #                              vendor); Nethax obs already drops col 0
-        #                              (commit 307afcb) so col 0 is padding.
-        #   xmax = min(COLNO-1, xx+R)
-        #   ymin = max(0, yy-R)
-        #   ymax = min(ROWNO-1, yy+R)
-        # We don't need to clamp the LOOP bounds because our precomputed
-        # offset table iterates the full ring; out-of-bounds slots simply fail
-        # ``isok`` / land on padding and never enter ``good[]``.  The relative
-        # order of in-bounds slots is preserved — matching vendor's clamped
-        # iteration.
-        player_r = player_pos_i32[0]
-        player_c = player_pos_i32[1]
-
-        # Densify a [_PET_ENEXTO_RING_SIZE, 2] candidate offset buffer for a
-        # given ring R (1-indexed).  ``lax.dynamic_index_in_dim`` returns the
-        # slice for ring R.  Pad offsets land out-of-bounds via the
-        # ``_PET_ENEXTO_PAD`` sentinel and are rejected by the bounds check.
-        def _ring_offsets(R):
-            # R is a traced int32 in [1, _PET_ENEXTO_MAX_RANGE].
-            return jax.lax.dynamic_index_in_dim(
-                _PET_ENEXTO_RINGS, R - 1, axis=0, keepdims=False
-            )  # [_PET_ENEXTO_RING_SIZE, 2]
-
-        # Build a per-cell occupancy mask for ``m_at(x, y)`` (vendor
-        # goodpos teleport.c:48).  Wild monsters are already placed at this
-        # point (vendor allmain.c calls makedog after the level is populated).
-        # ``monster_ai.pos`` is ``[N, 2]`` of ``[row, col]``; ``alive`` is
-        # ``[N]`` bool.  Build an ``[H, W]`` occupancy bitmap, then index by
-        # candidate cell.
-        mai = state.monster_ai
-        mon_alive = mai.alive                                          # [N]
-        mon_pos = mai.pos.astype(jnp.int32)                            # [N, 2]
-        mon_r = mon_pos[:, 0]
-        mon_c = mon_pos[:, 1]
-        mon_in = (
-            mon_alive
-            & (mon_r >= 0) & (mon_r < H)
-            & (mon_c >= 0) & (mon_c < W)
+        # Vendor goodpos for a fresh level + makedog uses ``accessible(x, y)``
+        # which is ``levl[x][y].typ >= DOOR`` (vendor/nle/include/rm.h:92).  The
+        # ``>= DOOR`` predicate accepts DOOR (incl. open/closed/doorway), CORR,
+        # ROOM, STAIRS, LADDER, FOUNTAIN, THRONE, SINK, GRAVE, ALTAR, ICE — any
+        # tile type with code >= 22 in vendor's enum.  Previously this check
+        # admitted ONLY FLOOR/CORRIDOR, so DOOR / STAIRS / open-feature
+        # neighbours were dropped → num_good under-counted vs vendor for any
+        # seed whose hero spawn cell has a door / stairs neighbour.  Seed=0
+        # happens to have 4 FLOOR neighbours and matches vendor's rn2(4); seed
+        # =2 hero spawns at the branch staircase whose 10 enexto-iteration
+        # slots are all FLOOR/STAIRS (= 10 vendor goodpos hits), so vendor
+        # draws rn2(10) while Nethax was drawing rn2(4) — shifting the ISAAC64
+        # stream and mis-placing the pet.  Expand the walkable predicate to
+        # mirror vendor's ``accessible`` semantics.  Vendor cite:
+        # vendor/nle/include/rm.h:92 (ACCESSIBLE macro), vendor/nle/src/
+        # teleport.c:98-101 (goodpos accessible check).
+        cands_v = player_pos_i32[None, :] + _PET_ENEXTO_OFFSETS       # [10, 2]
+        rr_v = cands_v[:, 0]
+        cc_v = cands_v[:, 1]
+        in_bounds_v = (rr_v >= 0) & (rr_v < H) & (cc_v >= 0) & (cc_v < W)
+        rr_v_safe = jnp.clip(rr_v, 0, H - 1)
+        cc_v_safe = jnp.clip(cc_v, 0, W - 1)
+        tiles_v = terrain[rr_v_safe, cc_v_safe]
+        # Mirror vendor ``accessible(typ) := typ >= DOOR`` by enumerating the
+        # Nethax TileType values that map to vendor tile codes >= 22.  WALL
+        # (3), STONE-equivalent (0), HIDDEN_TRAP (13), TRAP (12), POOL (19),
+        # DRAWBRIDGE_UP (17), TREE (20), and CLOSED_DOOR (4) are NOT accessible
+        # in vendor's sense (vendor SDOOR/SCORR are stone/wall-equivalent until
+        # discovered; vendor's enexto skips closed_door via accessible >= DOOR
+        # but vendor maps closed-door's typ to DOOR=22, which IS accessible —
+        # however Nethax's CLOSED_DOOR=4 is its own code so we must include
+        # it here too).
+        walkable_v = (
+            (tiles_v == jnp.int8(TileType.FLOOR))
+            | (tiles_v == jnp.int8(TileType.CORRIDOR))
+            | (tiles_v == jnp.int8(TileType.CLOSED_DOOR))
+            | (tiles_v == jnp.int8(TileType.OPEN_DOOR))
+            | (tiles_v == jnp.int8(TileType.DOORWAY))
+            | (tiles_v == jnp.int8(TileType.STAIRCASE_UP))
+            | (tiles_v == jnp.int8(TileType.STAIRCASE_DOWN))
+            | (tiles_v == jnp.int8(TileType.ALTAR))
+            | (tiles_v == jnp.int8(TileType.FOUNTAIN))
+            | (tiles_v == jnp.int8(TileType.THRONE))
+            | (tiles_v == jnp.int8(TileType.GRAVE))
+            | (tiles_v == jnp.int8(TileType.SINK))
+            | (tiles_v == jnp.int8(TileType.ICE_FLOOR))
         )
-        # Clip to safe indices for the scatter; ``mon_in`` masks out invalid
-        # positions so the scatter values for them are zero.
-        mon_r_safe = jnp.clip(mon_r, 0, H - 1)
-        mon_c_safe = jnp.clip(mon_c, 0, W - 1)
-        occupied = jnp.zeros((H, W), dtype=jnp.bool_)
-        occupied = occupied.at[mon_r_safe, mon_c_safe].set(
-            mon_in, mode="drop"
-        )                                                              # [H, W]
+        good_v = in_bounds_v & walkable_v                              # [10]
+        num_good = jnp.sum(good_v.astype(jnp.int32))
+        any_ok = num_good > jnp.int32(0)
 
-        def _eval_ring(R):
-            """Evaluate goodpos on all candidates of ring R.
-
-            Returns ``(num_good_capped, cands)`` where ``cands`` is
-            ``[_PET_ENEXTO_RING_SIZE, 2]`` of (row, col) absolute positions,
-            and ``num_good_capped`` is ``min(num_good_in_ring, MAX_GOOD)``.
-            The first MAX_GOOD good cells (in vendor order) appear first in
-            ``cands`` after the densification step below.
-            """
-            offs = _ring_offsets(R)                                    # [S, 2]
-            cands = jnp.stack(
-                [player_r + offs[:, 0], player_c + offs[:, 1]], axis=-1,
-            )                                                          # [S, 2]
-            rr = cands[:, 0]
-            cc = cands[:, 1]
-            # isok + vendor xmin=max(1, ...) excludes col=0.  Row 0 is valid.
-            in_bounds = (
-                (rr >= 0) & (rr < H) & (cc >= 1) & (cc < W)
-            )
-            rr_safe = jnp.clip(rr, 0, H - 1)
-            cc_safe = jnp.clip(cc, 0, W - 1)
-            tiles = terrain[rr_safe, cc_safe]
-            # Vendor ``accessible(typ) := typ >= DOOR`` (rm.h:92).
-            walkable = (
-                (tiles == jnp.int8(TileType.FLOOR))
-                | (tiles == jnp.int8(TileType.CORRIDOR))
-                | (tiles == jnp.int8(TileType.CLOSED_DOOR))
-                | (tiles == jnp.int8(TileType.OPEN_DOOR))
-                | (tiles == jnp.int8(TileType.DOORWAY))
-                | (tiles == jnp.int8(TileType.STAIRCASE_UP))
-                | (tiles == jnp.int8(TileType.STAIRCASE_DOWN))
-                | (tiles == jnp.int8(TileType.ALTAR))
-                | (tiles == jnp.int8(TileType.FOUNTAIN))
-                | (tiles == jnp.int8(TileType.THRONE))
-                | (tiles == jnp.int8(TileType.GRAVE))
-                | (tiles == jnp.int8(TileType.SINK))
-                | (tiles == jnp.int8(TileType.ICE_FLOOR))
-            )
-            # vendor goodpos: not the player cell (teleport.c:42-45).
-            not_player = ~((rr == player_r) & (cc == player_c))
-            # vendor goodpos: no monster at (x, y) (teleport.c:48).
-            no_mon = ~occupied[rr_safe, cc_safe]
-            good = in_bounds & walkable & not_player & no_mon          # [S]
-            # Cap to MAX_GOOD in vendor order: keep good[k] only if its
-            # cumulative-rank-of-True (1-based) <= MAX_GOOD.
-            cum = jnp.cumsum(good.astype(jnp.int32))                   # [S]
-            kept = good & (cum <= jnp.int32(_PET_ENEXTO_MAX_GOOD))     # [S]
-            num_good_capped = jnp.sum(kept.astype(jnp.int32))
-            return num_good_capped, cands, kept
-
-        # ``lax.while_loop`` over ring radius.  Carry:
-        #   (R, found, pet_pos_i32)
-        # Body advances R by 1 if not yet found; on the iteration that finds
-        # candidates it consumes one ``rn2(count)`` draw and records pet_pos.
-        # Loop exits when found is True or R > _PET_ENEXTO_MAX_RANGE.
-        def _cond(carry):
-            R, found, _pos, _rng = carry
-            return (~found) & (R <= jnp.int32(_PET_ENEXTO_MAX_RANGE))
-
-        def _body(carry):
-            R, found, pos, vrng = carry
-            num_good_capped, cands, kept = _eval_ring(R)
-            ring_has_good = num_good_capped > jnp.int32(0)
-            # Only consume an ISAAC64 draw on the ring that found candidates,
-            # matching vendor's single ``rn2(count)`` after the do-while.
-            # ``lax.cond`` keeps the draw inside the success branch so failing
-            # rings do not perturb the stream.  Vendor cite: teleport.c:215.
-            def _draw_and_pick(args):
-                v, n, cands_arg, kept_arg = args
-                v2, idx = _vendor_rng.rn2_jax(v, n)
-                # Densify kept[] → indices of the first num_good_capped True
-                # slots in vendor order; pick the idx-th.
-                cum = jnp.cumsum(kept_arg.astype(jnp.int32))           # [S]
-                match = (cum - jnp.int32(1) == idx) & kept_arg         # [S]
-                pick = jnp.argmax(match.astype(jnp.int32)).astype(jnp.int32)
-                return v2, cands_arg[pick]
-
-            def _passthrough(args):
-                v, _n, _cands_arg, _kept_arg = args
-                return v, pos
-
-            new_vrng, new_pos = jax.lax.cond(
-                ring_has_good,
-                _draw_and_pick,
-                _passthrough,
-                (vrng, jnp.maximum(num_good_capped, jnp.int32(1)), cands, kept),
-            )
-            new_found = found | ring_has_good
-            return (R + jnp.int32(1), new_found, new_pos, new_vrng)
-
-        init_carry = (
-            jnp.int32(1),                       # R
-            jnp.bool_(False),                   # found
-            player_pos_i32,                     # pet_pos (fallback)
-            vendor_rng,                         # vendor_rng
+        # rn2(num_good) — consumes one ISAAC64 uint64, which is the same
+        # stream cost as the previous hard-coded ``rn2(4)`` consumption at the
+        # call site.  This single draw replaces that one, so the call-site
+        # ``rn2(4)`` must be REMOVED to keep stream alignment.  Vendor cite:
+        # teleport.c:215 ``i = rn2((int)(good_ptr - good))``.
+        vendor_rng, idx_good = _vendor_rng.rn2_jax(
+            vendor_rng, jnp.maximum(num_good, jnp.int32(1)),
         )
-        _R, found, pet_pos_i32, vendor_rng = jax.lax.while_loop(
-            _cond, _body, init_carry
-        )
-        # If no ring found a cell (extremely unlikely on Dlvl 1), fall back to
-        # the player's cell — matches vendor's ``cc->x = xx, cc->y = yy``
-        # fallback at teleport.c:203.
+
+        # Densify the good cells: cumulative-good rank ranges from 1..num_good
+        # at each True position.  The picked candidate is the smallest slot
+        # whose cumrank-1 == idx_good.
+        cum_v = jnp.cumsum(good_v.astype(jnp.int32))                   # [10]
+        match_v = (cum_v - jnp.int32(1) == idx_good) & good_v          # [10]
+        pick_v = jnp.argmax(match_v.astype(jnp.int32)).astype(jnp.int32)
         pet_pos = jnp.where(
-            found,
-            pet_pos_i32,
+            any_ok,
+            cands_v[pick_v],
             player_pos_i32,
         ).astype(jnp.int16)                                            # [2]
     else:
