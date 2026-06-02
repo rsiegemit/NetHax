@@ -407,7 +407,119 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
     # gold piles likewise carry quan>1 and dknown=0, yielding the same
     # "some gold pieces" string.  We bake that string into the static
     # glyph->description table for the single COIN_CLASS object slot.
-    from Nethax.nethax.constants.objects import ObjectClass as _OC
+    #
+    # All other classes: vendor pager.c::look_at_object calls
+    #   distant_name(otmp, dknown ? doname_with_price : doname_vague_quan).
+    # For an unidentified item viewed at distance (the common screen_descriptions
+    # case at level 1), this resolves to doname_base -> xname with nn=0
+    # (oc_name_known false at game start; see o_init.c:341-371) and dknown
+    # initially false.  xname (objnam.c:471-722) then emits the random
+    # appearance string (OBJ_DESCR, our `description` field) for classes that
+    # have one, with a class-specific suffix (e.g. "ruby potion", "wooden ring",
+    # "etched helmet").  doname_base finally prepends an "a "/"an " article via
+    # just_an() (objnam.c:1269-1276, 1648-1674).
+    #
+    # We bake the unidentified-appearance string + article into the static
+    # table because (a) at game start no objects are name_known, (b) the
+    # screen_descriptions buffer is indexed by *shuffled* glyph (the appearance
+    # glyph that build_glyphs emits via shuffled_glyph), so OBJECTS[N].description
+    # at appearance-slot N is exactly the obj_descr the player would see.
+    # Identified-item paths (uncommon for floor obs) are deferred — they would
+    # require a runtime table keyed on env_state.identification.
+    from Nethax.nethax.constants.objects import ObjectClass as _OC, Material as _MAT
+
+    # Vendor just_an() (objnam.c:1648-1674): pick "a "/"an " by first char of
+    # the description.  Vowels and 'x' (when followed by a consonant) take
+    # "an "; exceptions ("one-", "eucalyptus", "unicorn", "uranium", "useful")
+    # take "a ".  Empty/None strings get no article.
+    _VOWELS = "aeiouAEIOU"
+    _AN_EXCEPTIONS = ("one-", "eucalyptus", "unicorn", "uranium", "useful")
+
+    def _article(s: str) -> str:
+        if not s:
+            return ""
+        c0 = s[0]
+        sl = s.lower()
+        if any(sl.startswith(e) for e in _AN_EXCEPTIONS):
+            return "a "
+        if c0 in _VOWELS:
+            return "an "
+        if c0 in ("x", "X") and len(s) > 1 and s[1].lower() not in "aeiou":
+            return "an "
+        return "a "
+
+    # Vendor xname() (objnam.c:471-722) class-specific unidentified format.
+    # Each branch returns the bare description string (no article); article is
+    # prepended below.  When a description is absent (None) for an
+    # appearance-bearing class, vendor falls back to the canonical name
+    # (objnam.c:440-441 "if (!dn) dn = actualn;").
+    def _unidentified_str(idx: int, o) -> str:
+        if o is None or o.name is None:
+            return ""
+        cls = o.class_
+        # Vendor: if (!dn) dn = actualn — fall back to canonical name.
+        dn = o.description if o.description else o.name
+        actualn = o.name
+
+        if cls == _OC.COIN_CLASS:
+            # Handled separately above via "some gold pieces".
+            return actualn
+        if cls == _OC.AMULET_CLASS:
+            # xname: "%s amulet" using dn (when nn=0, un=0).
+            return f"{dn} amulet"
+        if cls in (_OC.WEAPON_CLASS, _OC.VENOM_CLASS, _OC.TOOL_CLASS):
+            # xname WEAPON/VENOM/TOOL: bare dn (no suffix) when !dknown.
+            # Special prefixes: LENSES -> "pair of "; FIGURINE/wet-towel
+            # require runtime obj state and don't apply at distance.
+            if actualn == "lenses":
+                return f"pair of {dn}"
+            return dn
+        if cls == _OC.ARMOR_CLASS:
+            # xname ARMOR: ELVEN_SHIELD..ORCISH_SHIELD -> "shield"; SHIELD_OF_REFLECTION
+            # -> "smooth shield"; boots/gloves prefix "pair of "; else bare dn.
+            if actualn in ("elven shield", "Uruk-hai shield", "orcish shield"):
+                return "shield"
+            if actualn == "shield of reflection":
+                return "smooth shield"
+            armcat = getattr(o, "oc_armor_class", -1)
+            if armcat == 3:   # ARM_GLOVES
+                return f"pair of {dn}"
+            if armcat == 4:   # ARM_BOOTS
+                return f"pair of {dn}"
+            return dn
+        if cls == _OC.FOOD_CLASS:
+            # xname FOOD: always actualn (no dn).
+            return actualn
+        if cls == _OC.ROCK_CLASS:
+            # Includes STATUE (corpsenm-specific) and ROCK; at distance
+            # we have no corpsenm, so fall back to actualn.
+            return actualn
+        if cls == _OC.BALL_CLASS:
+            # xname BALL: hardcoded "heavy iron ball".
+            return "heavy iron ball"
+        if cls == _OC.CHAIN_CLASS:
+            return actualn
+        if cls == _OC.POTION_CLASS:
+            # xname POTION (!dknown branch): "%s potion".
+            return f"{dn} potion"
+        if cls == _OC.SCROLL_CLASS:
+            # xname SCROLL (!dknown): "scroll" (just the class name).
+            return "scroll"
+        if cls == _OC.WAND_CLASS:
+            # xname WAND (!dknown): "wand".
+            return "wand"
+        if cls == _OC.SPBOOK_CLASS:
+            # xname SPBOOK (!dknown, non-NOVEL): "spellbook".
+            return "spellbook"
+        if cls == _OC.RING_CLASS:
+            # xname RING (!dknown): "ring".
+            return "ring"
+        if cls == _OC.GEM_CLASS:
+            # xname GEM (!dknown): "gem" or "stone" (MINERAL material).
+            return "stone" if o.material == _MAT.MINERAL else "gem"
+        # ILLOBJ / RANDOM / unknown — fall through to canonical name.
+        return actualn
+
     for i, o in enumerate(OBJECTS):
         g = _OBJ + i
         if 0 <= g < _MAX:
@@ -415,7 +527,11 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
             if o is not None and getattr(o, "class_", None) == _OC.COIN_CLASS:
                 desc[g] = _bytes_for("some gold pieces")
             else:
-                desc[g] = _bytes_for(o.name)
+                body = _unidentified_str(i, o)
+                if body:
+                    desc[g] = _bytes_for(_article(body) + body)
+                else:
+                    desc[g] = _bytes_for("")
 
     # Cmap (terrain)
     for cmap_i, txt in cmap_desc.items():
