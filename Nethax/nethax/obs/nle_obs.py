@@ -710,7 +710,21 @@ def build_specials(env_state) -> jnp.ndarray:
 
     occupied = gi_cat != 0
     stack_count = jnp.sum(occupied.astype(jnp.int32), axis=-1)
-    has_objpile = stack_count >= 2
+    # Vendor cite: vendor/nle/src/mapglyph.c:91-92, 164-165, 183-184 — the
+    # ``MG_OBJPILE`` flag is set ONLY inside the ``GLYPH_STATUE``,
+    # ``GLYPH_OBJ`` (non-BOULDER), and ``GLYPH_BODY`` branches.  Those
+    # branches fire only when the displayed glyph at (x,y) is the
+    # corresponding object/statue/corpse glyph — i.e. when the player can
+    # currently see the cell (or remembers an object there).  Nethax's
+    # object overlay in ``build_glyphs`` already gates ``has_obj`` on
+    # ``visible`` (see :func:`build_glyphs` ~line 2088), so the displayed
+    # glyph at an unseen cell stays as the terrain glyph and vendor's
+    # mapglyph never enters the object branch.  We mirror that here by
+    # gating ``has_objpile`` on visibility.  Without this gate, a hidden
+    # 2-stack pile (e.g. seed=2 (15, 42)) sets MG_OBJPILE in Nethax while
+    # vendor leaves the byte clean.
+    visible = env_state.visible[:21, 1:80]                             # bool[21,79]
+    has_objpile = (stack_count >= 2) & visible
 
     # Corpse: category == FOOD_CLASS (7) and type_id == CORPSE_OBJ_TYPE_ID (260).
     # Per vendor/nethack/include/objects.h FOOD("corpse", ...), corpse is the
