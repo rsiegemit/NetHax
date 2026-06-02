@@ -682,29 +682,25 @@ def _vendor_grid_to_terrain(
 
     Steps (all JIT-safe, no Python branches on traced values):
       1. Static lookup ``_VTYP_TO_TILE[clip(grid, 0, 31)]`` -> base TileType.
-      2. Corner-promotion: corridors.py's ``stamp_rooms_into_typ`` encodes the
-         four room corners as ROOM (not a corner code), so step 1 leaves them
-         as FLOOR.  Re-derive the true outer corners geometrically: a ROOM cell
-         is an outer corner iff it has a HORIZONTAL-wall segment neighbour to
-         the E *or* W AND a VERTICAL-wall segment neighbour to the N *or* S.
-         A horizontal-wall segment is HWALL *or a DOOR* (a doorway carved into
-         a horizontal wall is still part of that wall run); a vertical-wall
-         segment is VWALL *or a DOOR*.  Doors must count as wall continuations
-         because makecorridors can punch a doorway into the wall *adjacent* to
-         a corner — e.g. seed-0's hero room has a doorless doorway (DOOR) in
-         the left VWALL at (69,10) directly N of the bottom-left corner
-         (69,11); with a VWALL-only test that corner's vertical neighbour is
-         the door, so it was wrongly left as FLOOR (rendering S_room instead
-         of S_blcorn).  Treating the door as a vertical-wall segment promotes
-         it correctly.  Interior floor cells still fail the test: a true
-         interior cell never simultaneously has a horizontal-wall segment E/W
-         AND a vertical-wall segment N/S (only the four meeting-point corners
-         do), so only the corners are promoted to WALL.  This matches the obs
-         ``_apply_wall_angle`` pass, which likewise treats doors as wall
-         continuations, so it then picks the correct S_tlcorn / S_trcorn /
-         S_blcorn / S_brcorn variant from the 4-neighbour wall pattern.
+         Corners are already stamped with their proper vendor codes
+         (TLCORNER=3 / TRCORNER=4 / BLCORNER=5 / BRCORNER=6) by
+         ``stamp_rooms_into_typ`` and the vault stamp block in
+         ``generate_main_branch_l1``, all of which map directly to WALL via
+         ``_VTYP_TO_TILE``.  No geometric corner-promotion is required — an
+         earlier promotion pass that derived corners from "ROOM cell flanked
+         by an H-wall segment E/W and a V-wall segment N/S" misfired on
+         interior ROOM cells with a door on the W wall and a door on the S
+         wall (the test treated both as wall continuations), wrongly
+         upgrading the cell to WALL.  Concrete regression: seed=4 cell
+         (col=26, row=5) — interior of rooms[3] (lx=26, hx=28, ly=3, hy=5)
+         with a SDOOR at (col=25, row=5) and a DOOR at (col=26, row=6) —
+         got promoted to WALL, breaking the graffiti loop's
+         ``terrain[ry,cx] == FLOOR`` proxy for ``levl[x][y].typ == ROOM``
+         and forcing one extra ``rn2(40)`` draw at byte-parity stream
+         position 1833.  Encoding corners directly removes the failure
+         mode.
 
-      3. Door-mask refinement (only when ``door_mask_grid`` is supplied):
+      2. Door-mask refinement (only when ``door_mask_grid`` is supplied):
          step 1 maps every DOOR cell to CLOSED_DOOR, but vendor ``dosdoor``
          assigns a per-cell door MASK (D_NODOOR / D_BROKEN / D_ISOPEN /
          D_CLOSED / D_LOCKED — vendor/nle/include/rm.h).  Only D_CLOSED /
@@ -770,30 +766,14 @@ def _vendor_grid_to_terrain(
         )
         terrain = jnp.where(is_door_cell, door_tile, terrain)
 
-    # --- Corner promotion (ROOM-coded corners -> WALL). ---
-    is_door = (grid == jnp.int32(_VTILE_DOOR)) | (grid == jnp.int32(_VTILE_SDOOR))
-    # Horizontal-wall segment = HWALL or a door punched into a horizontal wall.
-    # Vertical-wall segment   = VWALL or a door punched into a vertical wall.
-    # A door can sit immediately beside a corner (e.g. the doorless doorway in
-    # the left wall directly N of the bottom-left corner), so doors must count
-    # as wall continuations or that corner is missed.
-    is_hseg = (grid == jnp.int32(_VTILE_HWALL)) | is_door
-    is_vseg = (grid == jnp.int32(_VTILE_VWALL)) | is_door
-    is_room = grid == jnp.int32(_VTILE_ROOM)
-
-    H, W = grid.shape
-    false_row = jnp.zeros((1, W), dtype=jnp.bool_)
-    false_col = jnp.zeros((H, 1), dtype=jnp.bool_)
-
-    # Horizontal-wall-segment neighbour to the E or W.
-    hseg_w = jnp.concatenate([false_col, is_hseg[:, :-1]], axis=1)
-    hseg_e = jnp.concatenate([is_hseg[:, 1:], false_col], axis=1)
-    # Vertical-wall-segment neighbour to the N or S.
-    vseg_n = jnp.concatenate([false_row, is_vseg[:-1, :]], axis=0)
-    vseg_s = jnp.concatenate([is_vseg[1:, :], false_row], axis=0)
-
-    is_corner = is_room & (hseg_w | hseg_e) & (vseg_n | vseg_s)
-    terrain = jnp.where(is_corner, jnp.int8(_TILE_WALL), terrain)
+    # Corner cells are pre-stamped with their proper vendor codes
+    # (TLCORNER=3 / TRCORNER=4 / BLCORNER=5 / BRCORNER=6) in
+    # ``stamp_rooms_into_typ`` (corridors.py) and the vault-stamp block in
+    # ``generate_main_branch_l1`` below; ``_VTYP_TO_TILE`` maps each of
+    # those vendor codes directly to ``_TILE_WALL``, so the step-1 lookup
+    # already renders corners correctly.  No geometric corner-promotion
+    # pass is needed (and the previous geometric pass mis-fired on interior
+    # ROOM cells with perpendicular adjacent doors — see the docstring).
     return terrain
 
 
@@ -1409,25 +1389,24 @@ def generate_main_branch_l1(
         # where for vault: w=h=1 so interior is 2x2 at (vault_x..vault_x+1)
         # × (vault_y..vault_y+1), and walls extend one cell outward.
         #
-        # The vault slot is identified post-sort_rooms by the hx=-1 sentinel
-        # written in _invoke_create_room (rooms.py:542) on a successful
-        # vault create_room.  We use the slot's (x1, y1) as vault_x, vault_y.
-        # NOTE: when the vault slot is overwritten by a subsequent OROOM in
-        # makerooms, the sentinel is lost.  The makerooms-captured
-        # _mk_vault_x/_mk_vault_y survive this overwrite, but switching
-        # branches.py to use them unconditionally REGRESSED seed=1 (vault
-        # topology intersected downstream draws that previously avoided it
-        # because no stamping happened).  Keeping the sentinel-based gate
-        # here matches the pre-vault_x/y behavior; the makerooms
-        # vault_x/vault_y carry is available for future use but is not
-        # currently consumed.  TODO: investigate why seed=1 regresses when
-        # vault stamping fires unconditionally.
-        _vault_slot_active = active & (rooms.x2 == jnp.int16(-1))
-        _vault_present = _vault_slot_active.any() & _vault_created_in_makerooms
-        # Find first vault slot index; argmax of bool returns the first True.
-        _v_idx = jnp.argmax(_vault_slot_active.astype(jnp.int32))
-        _vault_x = rooms.x1[_v_idx].astype(jnp.int32)
-        _vault_y = rooms.y1[_v_idx].astype(jnp.int32)
+        # Vault placement coords come from makerooms' static-variable capture
+        # ``_mk_vault_x/_mk_vault_y``.  Vendor's create_vault() writes the
+        # placement coords into static ``vault_x/vault_y`` (mklev.c:233-234)
+        # BEFORE the next OROOM iteration's create_room may overwrite the
+        # ``rooms[nroom]`` slot (mklev.c:235 sets ``hx=-1`` but the lx/ly
+        # remain readable).  Nethax's makerooms captures the same static-
+        # equivalent values via the ``capture_vault`` carry in
+        # rooms.py:873-875, surviving any subsequent OROOM overwrite at the
+        # same slot index.  Gate stamping on ``_vault_created_in_makerooms``
+        # (the actual success flag from create_room) rather than a sentinel
+        # presence check, since the sentinel is lost on overwrite — seed=1
+        # and seed=2 both hit this case and previously skipped vault
+        # stamping, leaving mineralize to draw rn2(1000) on the 16 vault
+        # footprint cells that vendor had already converted to non-stone.
+        # Vendor cite: vendor/nle/src/mklev.c:232-235, :738-762.
+        _vault_present = _vault_created_in_makerooms
+        _vault_x = _mk_vault_x.astype(jnp.int32)
+        _vault_y = _mk_vault_y.astype(jnp.int32)
         # Vault interior bounds (w=h=1 → interior is 2 cells wide/tall):
         #   lx = vault_x, hx = vault_x + 1
         #   ly = vault_y, hy = vault_y + 1
@@ -1442,6 +1421,8 @@ def generate_main_branch_l1(
         # the vault was actually created.
         from Nethax.nethax.dungeon.corridors import (
             VTILE_HWALL as _V_H, VTILE_VWALL as _V_V, VTILE_ROOM as _V_R,
+            VTILE_TLCORN as _V_TL, VTILE_TRCORN as _V_TR,
+            VTILE_BLCORN as _V_BL, VTILE_BRCORN as _V_BR,
         )
         _vh, _vw = vendor_levl_grid.shape  # [ROWNO, COLNO]
         _y_axis = jnp.arange(_vh, dtype=jnp.int32)[:, None]  # rows
@@ -1460,17 +1441,24 @@ def generate_main_branch_l1(
             ((_x_axis == _v_lx - 1) | (_x_axis == _v_hx + 1))
             & (_y_axis >= _v_ly) & (_y_axis <= _v_hy)
         )
-        _corner = (
-            ((_x_axis == _v_lx - 1) | (_x_axis == _v_hx + 1))
-            & ((_y_axis == _v_ly - 1) | (_y_axis == _v_hy + 1))
-        )
+        # Per-corner masks so each of the 4 vault corners gets its proper
+        # vendor TLCORNER/TRCORNER/BLCORNER/BRCORNER code, matching
+        # do_room_or_subroom (mklev.c:175-179).  ``_VTYP_TO_TILE`` maps these
+        # directly to WALL via the static lookup in ``_vendor_grid_to_terrain``.
+        _tl = (_x_axis == _v_lx - 1) & (_y_axis == _v_ly - 1)
+        _tr = (_x_axis == _v_hx + 1) & (_y_axis == _v_ly - 1)
+        _bl = (_x_axis == _v_lx - 1) & (_y_axis == _v_hy + 1)
+        _br = (_x_axis == _v_hx + 1) & (_y_axis == _v_hy + 1)
+        _corner = _tl | _tr | _bl | _br
         _gate = _vault_present
         _new_grid = vendor_levl_grid
         _new_grid = jnp.where(_gate & _hwall, jnp.int8(_V_H), _new_grid)
         _new_grid = jnp.where(_gate & _vwall, jnp.int8(_V_V), _new_grid)
         _new_grid = jnp.where(_gate & _interior, jnp.int8(_V_R), _new_grid)
-        # Corners stamped as ROOM-equivalent (matching stamp_rooms_into_typ).
-        _new_grid = jnp.where(_gate & _corner, jnp.int8(_V_R), _new_grid)
+        _new_grid = jnp.where(_gate & _tl, jnp.int8(_V_TL), _new_grid)
+        _new_grid = jnp.where(_gate & _tr, jnp.int8(_V_TR), _new_grid)
+        _new_grid = jnp.where(_gate & _bl, jnp.int8(_V_BL), _new_grid)
+        _new_grid = jnp.where(_gate & _br, jnp.int8(_V_BR), _new_grid)
         vendor_levl_grid = _new_grid
 
         # Also stamp the vault FLOOR into the rendered ``terrain`` array so
@@ -1539,6 +1527,8 @@ def generate_main_branch_l1(
         from Nethax.nethax.dungeon.corridors import (
             VTILE_HWALL as _VH_v, VTILE_VWALL as _VV_v,
             VTILE_ROOM as _VR_v,
+            VTILE_TLCORN as _VTL_v, VTILE_TRCORN as _VTR_v,
+            VTILE_BLCORN as _VBL_v, VTILE_BRCORN as _VBR_v,
         )
         _cols_axis = jnp.arange(_lgs.typ.shape[0], dtype=jnp.int32)[:, None]
         _rows_axis = jnp.arange(_lgs.typ.shape[1], dtype=jnp.int32)[None, :]
@@ -1553,16 +1543,25 @@ def generate_main_branch_l1(
             ((_cols_axis == _v_lx - 1) | (_cols_axis == _v_hx + 1))
             & (_rows_axis >= _v_ly) & (_rows_axis <= _v_hy)
         )
-        _v_corner_lgs = (
-            ((_cols_axis == _v_lx - 1) | (_cols_axis == _v_hx + 1))
-            & ((_rows_axis == _v_ly - 1) | (_rows_axis == _v_hy + 1))
-        )
+        # Per-corner masks so each of the 4 vault corners gets its proper
+        # vendor TLCORNER/TRCORNER/BLCORNER/BRCORNER code — matching the
+        # add_room corner-stamp pattern (mklev.c:175-179) and the room
+        # stamping convention in ``stamp_rooms_into_typ``.  This lets
+        # ``_vendor_grid_to_terrain`` map vault corners directly to WALL
+        # via the static ``_VTYP_TO_TILE`` lookup (no geometric promotion).
+        _v_tl = (_cols_axis == _v_lx - 1) & (_rows_axis == _v_ly - 1)
+        _v_tr = (_cols_axis == _v_hx + 1) & (_rows_axis == _v_ly - 1)
+        _v_bl = (_cols_axis == _v_lx - 1) & (_rows_axis == _v_hy + 1)
+        _v_br = (_cols_axis == _v_hx + 1) & (_rows_axis == _v_hy + 1)
         _stamp_gate = _vault_created_in_makerooms
         _new_lgs_typ = _lgs.typ
         _new_lgs_typ = jnp.where(_stamp_gate & _v_hwall_lgs, jnp.int8(_VH_v), _new_lgs_typ)
         _new_lgs_typ = jnp.where(_stamp_gate & _v_vwall_lgs, jnp.int8(_VV_v), _new_lgs_typ)
         _new_lgs_typ = jnp.where(_stamp_gate & _v_interior,  jnp.int8(_VR_v), _new_lgs_typ)
-        _new_lgs_typ = jnp.where(_stamp_gate & _v_corner_lgs, jnp.int8(_VR_v), _new_lgs_typ)
+        _new_lgs_typ = jnp.where(_stamp_gate & _v_tl, jnp.int8(_VTL_v), _new_lgs_typ)
+        _new_lgs_typ = jnp.where(_stamp_gate & _v_tr, jnp.int8(_VTR_v), _new_lgs_typ)
+        _new_lgs_typ = jnp.where(_stamp_gate & _v_bl, jnp.int8(_VBL_v), _new_lgs_typ)
+        _new_lgs_typ = jnp.where(_stamp_gate & _v_br, jnp.int8(_VBR_v), _new_lgs_typ)
         _lgs = _lgs.replace(typ=_new_lgs_typ)
 
         from Nethax.nethax.dungeon.corridors import _makeniche as _vendor_makeniche

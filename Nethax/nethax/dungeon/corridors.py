@@ -274,7 +274,14 @@ from Nethax.nethax.subsystems.random_objects import consume_mksobj_init_draws
 VTILE_STONE:   int = 0    # STONE
 VTILE_VWALL:   int = 1    # VWALL
 VTILE_HWALL:   int = 2    # HWALL
-VTILE_TLCORN:  int = 3    # ... (corner tiles unused here)
+VTILE_TLCORN:  int = 3    # TLCORNER (vendor rm.h: TLCORNER=3). Stamped by
+                          # do_room_or_subroom (mklev.c:176) at (lx-1, ly-1).
+VTILE_TRCORN:  int = 4    # TRCORNER (vendor rm.h: TRCORNER=4). Stamped by
+                          # do_room_or_subroom (mklev.c:177) at (hx+1, ly-1).
+VTILE_BLCORN:  int = 5    # BLCORNER (vendor rm.h: BLCORNER=5). Stamped by
+                          # do_room_or_subroom (mklev.c:178) at (lx-1, hy+1).
+VTILE_BRCORN:  int = 6    # BRCORNER (vendor rm.h: BRCORNER=6). Stamped by
+                          # do_room_or_subroom (mklev.c:179) at (hx+1, hy+1).
 VTILE_ROOM:    int = 11   # ROOM
 VTILE_CORR:    int = 13   # CORR
 VTILE_SCORR:   int = 14   # SCORR (secret corridor)
@@ -376,13 +383,23 @@ def stamp_rooms_into_typ(gs: "LevelGenState", rooms: "RoomsBox") -> "LevelGenSta
         HWALL on rows  y = lowy-1 and y = hiy+1   (x in lowx-1..hix+1)
         VWALL on cols  x = lowx-1 and x = hix+1   (y in lowy..hiy)
         ROOM  on interior (x in lowx..hix, y in lowy..hiy)
-        corners (lowx-1,lowy-1) etc. = TLCORNER/.../BRCORNER
-    We encode corners as ROOM-equivalent non-stone, non-wall cells: that
-    is sufficient for okdoor (corners are not HWALL/VWALL -> rejected,
-    matching vendor) and for dig_corridor (corners are not STONE -> the
-    walker stops there, matching vendor TLCORNER != btyp/ftyp/SCORR).
+        corners (lowx-1,lowy-1) etc. = TLCORNER/.../BRCORNER (rm.h: 3-6)
+    We stamp corners with their proper vendor TLCORNER/TRCORNER/BLCORNER/
+    BRCORNER codes so the level grid round-trips through
+    ``_vendor_grid_to_terrain`` (branches.py) cleanly: ``_VTYP_TO_TILE``
+    maps codes 3-6 directly to WALL, eliminating the need for a
+    geometric corner-promotion pass that previously misfired on interior
+    ROOM cells flanked by doors on two perpendicular sides (see seed=4
+    cell (col=26, row=5) where the W=SDOOR + S=DOOR pair tricked the
+    promotion into marking the cell WALL, breaking the graffiti loop's
+    ROOM check and over-drawing rn2(40) at draw 1833).
+    okdoor remains correct (corners 3-6 are not HWALL/VWALL -> rejected,
+    matching vendor) and so does dig_corridor (corners are not STONE/CORR/
+    SCORR -> the walker treats them as "strange" and stops, matching
+    vendor TLCORNER != btyp/ftyp/SCORR).
 
-    Citation: vendor/nle/src/mklev.c:160-182 (add_room wall/floor stamp).
+    Citation: vendor/nle/src/mklev.c:160-182 (add_room wall/floor stamp);
+    mklev.c:175-179 (corners written AFTER the HWALL/VWALL pass).
     """
     xs = jnp.arange(COLNO, dtype=jnp.int32)[:, None]   # [COLNO, 1]
     ys = jnp.arange(ROWNO, dtype=jnp.int32)[None, :]   # [1, ROWNO]
@@ -413,12 +430,25 @@ def stamp_rooms_into_typ(gs: "LevelGenState", rooms: "RoomsBox") -> "LevelGenSta
         new = jnp.where(act & interior, jnp.int8(VTILE_ROOM), new)
         # Corners: the four (lx-1,ly-1)/(hx+1,ly-1)/(lx-1,hy+1)/(hx+1,hy+1)
         # cells fall in the wall band but are neither hwall (they ARE on the
-        # hwall rows) — vendor overwrites them with corner glyphs AFTER the
-        # HWALL pass.  Mark them ROOM-equivalent (non-stone, non-wall) so
-        # okdoor rejects them like vendor's TLCORNER.
-        corner = (((xs == lx - 1) | (xs == hx + 1))
-                  & ((ys == ly - 1) | (ys == hy + 1)))
-        new = jnp.where(act & corner, jnp.int8(VTILE_ROOM), new)
+        # hwall rows).  Vendor overwrites them with the corner glyphs AFTER
+        # the HWALL pass (mklev.c:175-179: TLCORNER/TRCORNER/BLCORNER/
+        # BRCORNER = rm.h 3-6).  Stamp each corner with its proper code so
+        # ``_vendor_grid_to_terrain`` (branches.py) can map them directly to
+        # WALL via the static ``_VTYP_TO_TILE`` lookup — no geometric
+        # corner-promotion required.  This avoids a false-positive on
+        # interior ROOM cells whose W and S neighbours happen to be doors
+        # (seed=4: cell (col=26, row=5) had a SDOOR on its W wall and a DOOR
+        # on its S wall; the old geometric promotion treated both as
+        # "wall continuations" and wrongly upgraded the interior cell to
+        # WALL, breaking the graffiti loop's ROOM check at draw 1833).
+        tl = (xs == lx - 1) & (ys == ly - 1)
+        tr = (xs == hx + 1) & (ys == ly - 1)
+        bl = (xs == lx - 1) & (ys == hy + 1)
+        br = (xs == hx + 1) & (ys == hy + 1)
+        new = jnp.where(act & tl, jnp.int8(VTILE_TLCORN), new)
+        new = jnp.where(act & tr, jnp.int8(VTILE_TRCORN), new)
+        new = jnp.where(act & bl, jnp.int8(VTILE_BLCORN), new)
+        new = jnp.where(act & br, jnp.int8(VTILE_BRCORN), new)
         return new, None
 
     typ, _ = lax.scan(stamp_one, typ, jnp.arange(MAXNROFROOMS, dtype=jnp.int32))
