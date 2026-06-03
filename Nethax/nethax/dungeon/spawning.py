@@ -482,7 +482,12 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
         # Vendor: makemon.c:389-396.
         int(MonsterSymbol.S_KOP):       0,   # explicit handler             line 389-396
         int(MonsterSymbol.S_ORC):       5,   # helm + orc-captain branch    line 397-432
-        int(MonsterSymbol.S_OGRE):      1,   # !rn2(N)                       line 434
+        # S_OGRE handled explicitly outside the generic loop — the rn2(N)
+        # gate divisor varies by subtype (PM_OGRE=10 vs OGRE_LORD/KING=5)
+        # and on gate fire mongets(WAR_HAMMER) runs the WEAPON_CLASS
+        # mksobj_init cascade.  See _draw_ogre_initweap.  Vendor:
+        # makemon.c:434-438.
+        int(MonsterSymbol.S_OGRE):      0,   # explicit handler              line 434-438
         # S_TROLL handled explicitly outside the generic loop — gate rn2(2)
         # gates an inner rn2(4) gem-type pick + GEM_CLASS mksobj_init draw.
         # See _draw_troll_initweap.  Vendor: makemon.c:440-454.
@@ -837,6 +842,7 @@ _MLET_CENTAUR:     jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_CENTAUR)
 _MLET_KOP:         jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOP)
 _MLET_ZOMBIE:      jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_ZOMBIE)
 _MLET_TROLL:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_TROLL)
+_MLET_OGRE:        jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_OGRE)
 _MLET_HUMAN_MERC:  jnp.ndarray = _compute_mlet_human_merc()
 _MLET_HUMAN_SK:    jnp.ndarray = _compute_mlet_human_shopkeeper()
 _MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
@@ -858,6 +864,32 @@ _PM_WATCHMAN       = _find_pm_index("watchman")
 _PM_WATCH_CAPTAIN  = _find_pm_index("watch captain")
 _PM_GUARD          = _find_pm_index("guard")
 _PM_SOLDIER        = _find_pm_index("soldier")
+# S_OGRE per-subtype rn2 gate divisor — vendor makemon.c:435:
+#   if (!rn2(mm == PM_OGRE ? 10 : 5)) (void) mongets(mtmp, WAR_HAMMER);
+# PM_OGRE divisor is 10; PM_OGRE_LORD / PM_OGRE_KING (and any other S_OGRE
+# entries) use 5.  Build a length-NUMMONS int32 table; non-S_OGRE entries
+# get 0 (unused — gated by _MLET_OGRE before lookup).
+_PM_OGRE = _find_pm_index("ogre")
+
+
+def _compute_ogre_gate_divisor() -> jnp.ndarray:
+    """Length-NUMMONS int32: rn2 divisor for the S_OGRE m_initweap gate.
+
+    Cite: vendor/nle/src/makemon.c:435 (S_OGRE branch).
+    PM_OGRE → 10; other S_OGRE entries → 5; non-S_OGRE entries → 0.
+    """
+    vals = []
+    for i, m in enumerate(MONSTERS):
+        if m.symbol != MonsterSymbol.S_OGRE:
+            vals.append(0)
+        elif i == _PM_OGRE:
+            vals.append(10)
+        else:
+            vals.append(5)
+    return jnp.array(vals, dtype=jnp.int32)
+
+
+_OGRE_GATE_DIVISOR: jnp.ndarray = _compute_ogre_gate_divisor()
 
 
 def _compute_is_pm(pm_index: int) -> jnp.ndarray:
@@ -1885,6 +1917,39 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
             v_after = jax.lax.cond(
                 _MLET_TROLL[tid], _draw_troll_initweap, lambda vc: vc, v_after
+            )
+
+            # S_OGRE: per-subtype rn2(N) gate that conditionally launches a
+            # mongets(WAR_HAMMER) mksobj_init cascade.  Vendor makemon.c:
+            # 434-438:
+            #   case S_OGRE:
+            #       if (!rn2(mm == PM_OGRE ? 10 : 5))
+            #           (void) mongets(mtmp, WAR_HAMMER);
+            #       break;
+            # The gate divisor is 10 for PM_OGRE and 5 for PM_OGRE_LORD /
+            # PM_OGRE_KING.  When the gate fires, mongets(WAR_HAMMER) runs
+            # mksobj(WAR_HAMMER, init=TRUE, artif=FALSE) which dispatches
+            # the WEAPON_CLASS mksobj_init cascade (mkobj.c:803-818).
+            # WAR_HAMMER (otyp 58) is not is_multigen / is_poisonable so
+            # rn1(6,6) + rn2(100) are skipped; otyp=0 sentinel is byte-
+            # equivalent.  artif=FALSE skips the rn2(20) artifact check.
+            # Previously the generic loop drew rn2(2) once (1 byte) which
+            # approximated the gate but missed the WEAPON_CLASS cascade on
+            # gate fire and used the wrong divisor (2 vs vendor's 10/5).
+            # Cite: vendor/nle/src/makemon.c:434-438 (S_OGRE branch),
+            #       vendor/nle/src/mkobj.c:803-818 (WEAPON_CLASS mksobj_init).
+            def _draw_ogre_initweap(vc):
+                divisor = _OGRE_GATE_DIVISOR[tid]
+                vc, gate = randint_jax(vc, (), 0, divisor)
+                return jax.lax.cond(
+                    gate == jnp.int32(0),
+                    lambda vd: _weapon_draws(vd, jnp.int32(0), jnp.bool_(False)),
+                    lambda vd: vd,
+                    vc,
+                )
+
+            v_after = jax.lax.cond(
+                _MLET_OGRE[tid], _draw_ogre_initweap, lambda vc: vc, v_after
             )
 
             # Trailing offensive-item check — vendor makemon.c:556
