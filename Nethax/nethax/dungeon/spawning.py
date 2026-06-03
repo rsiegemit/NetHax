@@ -1641,10 +1641,28 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         # trailing rn2(75) — visible in seed=9 around L1405.
         # Vendor cite: vendor/nle/src/makemon.c:576-788 (m_initinv; no S_KOBOLD).
 
-        # S_GNOME: rn2(60) — vendor makemon.c:778
+        # S_GNOME: rn2(60) gate + optional rn2(4) candle-type pick.
+        # Vendor makemon.c:778-784:
+        #   if (!rn2((In_mines(&u.uz) && in_mklev) ? 20 : 60)) {
+        #       otmp = mksobj(rn2(4) ? TALLOW_CANDLE : WAX_CANDLE, ...);
+        #       ...
+        #   }
+        # On Dlvl 1 we are NOT In_mines, so the outer divisor is 60.  When
+        # the gate passes (rn2(60) == 0, probability 1/60), vendor draws
+        # one additional rn2(4) to pick TALLOW vs WAX candle.  Previously
+        # only the outer rn2(60) was modelled → under-consumed 1 ISAAC64
+        # draw with probability 1/60 per S_GNOME spawn.
+        # Cite: vendor/nle/src/makemon.c:778-779.
         def _draw_gnome(vv):
-            nv, _ = randint_jax(vv, (), 0, 60)
-            return nv
+            nv, r_outer = randint_jax(vv, (), 0, 60)
+
+            def _draw_candle_pick(vc):
+                nvc, _ = randint_jax(vc, (), 0, 4)
+                return nvc
+
+            return jax.lax.cond(
+                r_outer == jnp.int32(0), _draw_candle_pick, lambda vc: vc, nv,
+            )
         v = jax.lax.cond(is_gnome, _draw_gnome, lambda vv: vv, v)
 
         # S_NYMPH: rn2(2) + rn2(2) — vendor makemon.c:701,703
