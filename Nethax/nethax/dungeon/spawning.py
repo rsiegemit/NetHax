@@ -802,7 +802,6 @@ def _compute_mlet_human_priest() -> jnp.ndarray:
 # Per-class masks.  Computed once at import time.
 _MLET_NYMPH:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_NYMPH)
 _MLET_GNOME:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_GNOME)
-_MLET_KOBOLD:      jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOBOLD)
 _MLET_MUMMY:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_MUMMY)
 _MLET_QUANTMECH:   jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_QUANTMECH)
 _MLET_LEPRECHAUN:  jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_LEPRECHAUN)
@@ -1599,7 +1598,6 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         # --- 6b. m_initinv per-class body — vendor makemon.c:589-788 ---
         # Only classes with rn2() calls listed; others are 0 draws.
         # Cite: makemon.c:1444  m_initinv(mtmp)
-        is_kobold    = _MLET_KOBOLD[tid]
         is_gnome     = _MLET_GNOME[tid]
         is_nymph     = _MLET_NYMPH[tid]
         is_mummy     = _MLET_MUMMY[tid]
