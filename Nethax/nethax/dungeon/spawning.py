@@ -97,6 +97,7 @@ from Nethax.nethax.vendor_rng import (
 from Nethax.nethax.subsystems.random_objects import (
     _armor_draws,
     _potion_scroll_draws,
+    _wand_draws,
 )
 
 
@@ -837,6 +838,7 @@ _MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
 _PM_ICE_DEVIL   = _find_pm_index("ice devil")
 _PM_MASTER_LICH = _find_pm_index("master lich")
 _PM_ARCH_LICH   = _find_pm_index("arch-lich")
+_PM_MINOTAUR    = _find_pm_index("minotaur")
 # Mercenary subtypes — drive the per-subtype m_initinv tail at
 # vendor/nle/src/makemon.c:653-672.  WATCHMAN draws rn2(3) whistle;
 # soldier/officer types draw rn2(3) k-ration + rn2(2) c-ration + (for
@@ -856,6 +858,7 @@ def _compute_is_pm(pm_index: int) -> jnp.ndarray:
 _IS_PM_ICE_DEVIL:      jnp.ndarray = _compute_is_pm(_PM_ICE_DEVIL)
 _IS_PM_MASTER_LICH:    jnp.ndarray = _compute_is_pm(_PM_MASTER_LICH)
 _IS_PM_ARCH_LICH:      jnp.ndarray = _compute_is_pm(_PM_ARCH_LICH)
+_IS_PM_MINOTAUR:       jnp.ndarray = _compute_is_pm(_PM_MINOTAUR)
 _IS_PM_WATCHMAN:       jnp.ndarray = _compute_is_pm(_PM_WATCHMAN)
 _IS_PM_WATCH_CAPTAIN:  jnp.ndarray = _compute_is_pm(_PM_WATCH_CAPTAIN)
 _IS_PM_GUARD:          jnp.ndarray = _compute_is_pm(_PM_GUARD)
@@ -1780,6 +1783,7 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         is_lep       = _MLET_LEPRECHAUN[tid]
         is_ice_devil = _IS_PM_ICE_DEVIL[tid]
         is_giant_cls = _MLET_GIANT[tid]
+        is_minotaur  = _IS_PM_MINOTAUR[tid]
         is_master_lich = _IS_PM_MASTER_LICH[tid]
         is_arch_lich   = _IS_PM_ARCH_LICH[tid]
         is_hmerc     = _MLET_HUMAN_MERC[tid]
@@ -1902,11 +1906,68 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             return nv
         v = jax.lax.cond(is_ice_devil, _draw_ice_devil, lambda vv: vv, v)
 
-        # S_GIANT: rn2(m_lev/2) gem-loop count — vendor makemon.c:711
+        # S_GIANT: split into minotaur vs other-giant branches — vendor
+        # makemon.c:706-719:
+        #   case S_GIANT:
+        #       if (ptr == &mons[PM_MINOTAUR]) {
+        #           if (!rn2(3) || (in_mklev && Is_earthlevel(&u.uz)))
+        #               (void) mongets(mtmp, WAN_DIGGING);
+        #       } else if (is_giant(ptr)) {
+        #           for (cnt = rn2((int) (mtmp->m_lev / 2)); cnt; cnt--) {
+        #               otmp = mksobj(rnd_class(DILITHIUM_CRYSTAL, LUCKSTONE - 1),
+        #                             FALSE, FALSE);
+        #               otmp->quan = (long) rn1(2, 3);
+        #               ...
+        #           }
+        #       }
+        #       break;
+        #
+        # The minotaur and is_giant branches are mutually exclusive (if/else if),
+        # and PM_MINOTAUR itself does NOT carry M2_GIANT (mondata.h is_giant
+        # checks the M2_GIANT flag, which PM_MINOTAUR lacks).  Previously this
+        # single rn2(50) was drawn for ALL S_GIANT entries including
+        # PM_MINOTAUR, which both over-consumed (rn2(50) for minotaur where
+        # vendor draws rn2(3) + optional wand cascade) and missed the
+        # WAN_DIGGING mongets cascade.
+        #
+        # Dlvl 1 main: Is_earthlevel(&u.uz) is FALSE, so the gate reduces to
+        # `!rn2(3)`.  On gate fire, vendor mongets(WAN_DIGGING) →
+        # mksobj(WAN_DIGGING, init=TRUE, artif=FALSE) → mkobj.c:1019-1027
+        # WAND_CLASS cascade (rn1(5) charges + blessorcurse(17)) → _wand_draws.
+        # Cite: vendor/nle/src/makemon.c:706-719;
+        #       vendor/nle/src/mkobj.c:1019-1027 (WAND_CLASS cascade);
+        #       vendor/nle/include/mondata.h:114 (is_giant = M2_GIANT flag).
+        def _draw_minotaur(vv):
+            v1, r1 = randint_jax(vv, (), 0, 3)
+            # Gate fires when rn2(3) == 0 (Is_earthlevel FALSE on Dlvl 1).
+            # On fire: mongets(WAN_DIGGING) consumes _wand_draws cascade.
+            v2 = jax.lax.cond(
+                r1 == jnp.int32(0),
+                _wand_draws,
+                lambda vc: vc,
+                v1,
+            )
+            return v2
+
+        # Non-minotaur S_GIANT entries (is_giant branch): rn2(m_lev/2) gem-loop
+        # count, approximated as rn2(50).  Per-iteration mksobj(rnd_class(...))
+        # is init=FALSE so the GEM_CLASS mksobj_init body is skipped; only the
+        # rnd_class draw + rn1(2,3) quan draw fire — those remain unmodelled
+        # here as a separate follow-up.
         def _draw_giant_cls(vv):
             nv, _ = randint_jax(vv, (), 0, 50)
             return nv
-        v = jax.lax.cond(is_giant_cls, _draw_giant_cls, lambda vv: vv, v)
+
+        # Dispatch: minotaur takes its own branch; other S_GIANT entries
+        # fall through to the existing gem-loop approximation.
+        v = jax.lax.cond(
+            is_minotaur,
+            _draw_minotaur,
+            lambda vv: jax.lax.cond(
+                is_giant_cls, _draw_giant_cls, lambda vc: vc, vv,
+            ),
+            v,
+        )
 
         # S_LICH: per-species gated draws — vendor makemon.c:727-738.
         # Vendor structure:
