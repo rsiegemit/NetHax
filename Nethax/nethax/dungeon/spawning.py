@@ -1625,7 +1625,8 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         is_lep       = _MLET_LEPRECHAUN[tid]
         is_ice_devil = _IS_PM_ICE_DEVIL[tid]
         is_giant_cls = _MLET_GIANT[tid]
-        is_lich_cls  = _MLET_LICH[tid]
+        is_master_lich = _IS_PM_MASTER_LICH[tid]
+        is_arch_lich   = _IS_PM_ARCH_LICH[tid]
         is_hmerc     = _MLET_HUMAN_MERC[tid]
         is_hsk       = _MLET_HUMAN_SK[tid]
         is_hpr       = _MLET_HUMAN_PR[tid]
@@ -1705,12 +1706,60 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             return nv
         v = jax.lax.cond(is_giant_cls, _draw_giant_cls, lambda vv: vv, v)
 
-        # S_LICH: rn2(13) + rn2(7) — vendor makemon.c:728-737
-        def _draw_lich_cls(vv):
-            v1, _ = randint_jax(vv, (), 0, 13)
-            v2, _ = randint_jax(v1, (), 0, 7)
-            return v2
-        v = jax.lax.cond(is_lich_cls, _draw_lich_cls, lambda vv: vv, v)
+        # S_LICH: per-species gated draws — vendor makemon.c:727-738.
+        # Vendor structure:
+        #   if (ptr == &mons[PM_MASTER_LICH] && !rn2(13))
+        #       (void) mongets(mtmp, (rn2(7) ? ATHAME : WAN_NOTHING));
+        #   else if (ptr == &mons[PM_ARCH_LICH] && !rn2(3)) {
+        #       otmp = mksobj(rn2(3) ? ATHAME : QUARTERSTAFF, TRUE,
+        #                     rn2(13) ? FALSE : TRUE);
+        #       if (otmp->spe < 2) otmp->spe = rnd(3);
+        #       if (!rn2(4)) otmp->oerodeproof = 1;
+        #   }
+        #
+        # C short-circuit: the species check is evaluated FIRST in each
+        # branch, so non-MASTER/non-ARCH liches (lich, demilich) consume
+        # ZERO draws.  Previously _MLET_LICH gated rn2(13)+rn2(7) for ALL
+        # S_LICH entries — over-consumed 2 ISAAC64 bytes per lich/demilich.
+        #
+        # PM_MASTER_LICH and PM_ARCH_LICH are disjoint entries; gate each
+        # branch on the specific entry index so only the matching species
+        # consumes draws.  The inner ``!rn2(N)`` is C-short-circuited by
+        # the species check, then further short-circuits its inner draws
+        # via rn2(N)==0.
+        #
+        # For ARCH_LICH we model the minimal byte-faithful path: rn2(3)
+        # gate, then on fire we draw the rn2(3) weapon-pick + rn2(13)
+        # blessed flag + rn2(4) erodeproof.  The conditional ``rnd(3)``
+        # spe-boost is skipped (it depends on mksobj internals we don't
+        # otherwise model).
+        def _draw_master_lich(vv):
+            v1, r1 = randint_jax(vv, (), 0, 13)
+
+            def _draw_inner(vc):
+                nv, _ = randint_jax(vc, (), 0, 7)
+                return nv
+
+            return jax.lax.cond(
+                r1 == jnp.int32(0), _draw_inner, lambda vc: vc, v1
+            )
+
+        v = jax.lax.cond(is_master_lich, _draw_master_lich, lambda vv: vv, v)
+
+        def _draw_arch_lich(vv):
+            v1, r1 = randint_jax(vv, (), 0, 3)
+
+            def _draw_inner(vc):
+                vc2, _ = randint_jax(vc,  (), 0, 3)   # rn2(3) ATHAME vs QUARTERSTAFF
+                vc3, _ = randint_jax(vc2, (), 0, 13)  # rn2(13) blessed flag
+                vc4, _ = randint_jax(vc3, (), 0, 4)   # rn2(4) erodeproof
+                return vc4
+
+            return jax.lax.cond(
+                r1 == jnp.int32(0), _draw_inner, lambda vc: vc, v1
+            )
+
+        v = jax.lax.cond(is_arch_lich, _draw_arch_lich, lambda vv: vv, v)
 
         # S_HUMAN / mercenary armor chain — vendor makemon.c:622-672.
         # Straight-line conditional draws (no loop): up to 9 rn2 calls in
