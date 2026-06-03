@@ -820,6 +820,14 @@ _MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
 _PM_ICE_DEVIL   = _find_pm_index("ice devil")
 _PM_MASTER_LICH = _find_pm_index("master lich")
 _PM_ARCH_LICH   = _find_pm_index("arch-lich")
+# Mercenary subtypes — drive the per-subtype m_initinv tail at
+# vendor/nle/src/makemon.c:653-672.  WATCHMAN draws rn2(3) whistle;
+# soldier/officer types draw rn2(3) k-ration + rn2(2) c-ration + (for
+# non-SOLDIER officers) rn2(3) bugle.  WATCH_CAPTAIN and GUARD draw nothing.
+_PM_WATCHMAN       = _find_pm_index("watchman")
+_PM_WATCH_CAPTAIN  = _find_pm_index("watch captain")
+_PM_GUARD          = _find_pm_index("guard")
+_PM_SOLDIER        = _find_pm_index("soldier")
 
 
 def _compute_is_pm(pm_index: int) -> jnp.ndarray:
@@ -828,9 +836,13 @@ def _compute_is_pm(pm_index: int) -> jnp.ndarray:
     return jnp.array(flags, dtype=jnp.bool_)
 
 
-_IS_PM_ICE_DEVIL:   jnp.ndarray = _compute_is_pm(_PM_ICE_DEVIL)
-_IS_PM_MASTER_LICH: jnp.ndarray = _compute_is_pm(_PM_MASTER_LICH)
-_IS_PM_ARCH_LICH:   jnp.ndarray = _compute_is_pm(_PM_ARCH_LICH)
+_IS_PM_ICE_DEVIL:      jnp.ndarray = _compute_is_pm(_PM_ICE_DEVIL)
+_IS_PM_MASTER_LICH:    jnp.ndarray = _compute_is_pm(_PM_MASTER_LICH)
+_IS_PM_ARCH_LICH:      jnp.ndarray = _compute_is_pm(_PM_ARCH_LICH)
+_IS_PM_WATCHMAN:       jnp.ndarray = _compute_is_pm(_PM_WATCHMAN)
+_IS_PM_WATCH_CAPTAIN:  jnp.ndarray = _compute_is_pm(_PM_WATCH_CAPTAIN)
+_IS_PM_GUARD:          jnp.ndarray = _compute_is_pm(_PM_GUARD)
+_IS_PM_SOLDIER:        jnp.ndarray = _compute_is_pm(_PM_SOLDIER)
 
 
 # ---------------------------------------------------------------------------
@@ -1630,6 +1642,11 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         is_hmerc     = _MLET_HUMAN_MERC[tid]
         is_hsk       = _MLET_HUMAN_SK[tid]
         is_hpr       = _MLET_HUMAN_PR[tid]
+        # Mercenary subtypes for the post-armor tail (vendor makemon.c:653-672).
+        is_pm_watchman      = _IS_PM_WATCHMAN[tid]
+        is_pm_watch_captain = _IS_PM_WATCH_CAPTAIN[tid]
+        is_pm_guard         = _IS_PM_GUARD[tid]
+        is_pm_soldier       = _IS_PM_SOLDIER[tid]
 
         # S_KOBOLD: vendor m_initinv (makemon.c:589-788) has NO case S_KOBOLD,
         # so kobolds consume ZERO draws inside m_initinv.  The previous
@@ -1888,7 +1905,49 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             v_after_shld = _pair_block(v_after_helm,  3, 2)
             v_after_boot = _pair_block(v_after_shld,  3, 2)
             v_after_glov = _pair_block(v_after_boot,  3, 2)
-            return v_after_glov
+
+            # Per-subtype tail — vendor makemon.c:653-672.
+            #   if (ptr == WATCH_CAPTAIN) { /* no rn2 */ }
+            #   else if (ptr == WATCHMAN)  { if (rn2(3)) mongets(TIN_WHISTLE); }
+            #   else if (ptr == GUARD)     { /* unconditional curse(whistle) */ }
+            #   else { /* soldiers + officers */
+            #       if (!rn2(3)) mongets(K_RATION);
+            #       if (!rn2(2)) mongets(C_RATION);
+            #       if (ptr != SOLDIER && !rn2(3)) mongets(BUGLE);
+            #   }
+            # WATCH_CAPTAIN and GUARD draw zero in this tail.  WATCHMAN
+            # draws exactly one rn2(3).  The else-branch (soldier and the
+            # officer ranks SERGEANT/LIEUTENANT/CAPTAIN) draws rn2(3) +
+            # rn2(2) unconditionally, plus rn2(3) when not PM_SOLDIER.
+            # Cite: vendor/nle/src/makemon.c:653-672.
+            def _watchman_tail(vc):
+                nv, _ = randint_jax(vc, (), 0, 3)
+                return nv
+
+            def _soldier_officer_tail(vc):
+                vc1, _ = randint_jax(vc,  (), 0, 3)   # K_RATION gate
+                vc2, _ = randint_jax(vc1, (), 0, 2)   # C_RATION gate
+
+                def _bugle(vd):
+                    nvd, _ = randint_jax(vd, (), 0, 3)
+                    return nvd
+
+                # rn2(3) bugle only when ptr != PM_SOLDIER.
+                return jax.lax.cond(
+                    is_pm_soldier, lambda vd: vd, _bugle, vc2,
+                )
+
+            # Dispatch via nested cond — WATCH_CAPTAIN / GUARD: zero;
+            # WATCHMAN: one rn2(3); else: soldier/officer tail.
+            v_tail = jax.lax.cond(
+                is_pm_watch_captain | is_pm_guard,
+                lambda vc: vc,
+                lambda vc: jax.lax.cond(
+                    is_pm_watchman, _watchman_tail, _soldier_officer_tail, vc,
+                ),
+                v_after_glov,
+            )
+            return v_tail
 
         v = jax.lax.cond(is_hmerc, _draw_hmerc, lambda vv: vv, v)
 
