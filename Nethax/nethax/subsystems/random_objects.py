@@ -1372,6 +1372,65 @@ def _gem_branch(rng, otyp, artif):
     return _gem_draws(rng, otyp)
 
 
+# ROCK_CLASS STATUE otyp — vendor onames.h STATUE; positional index in
+# constants/objects.py OBJECTS tuple (line 9149: "# 448 — statue").
+_OTYP_STATUE: int = 448
+
+
+def _rock_branch(rng, otyp, artif):
+    """ROCK_CLASS — vendor mkobj.c:1050-1058.
+
+    Vendor source::
+
+        case ROCK_CLASS:
+            if (otmp->otyp == STATUE) {
+                otmp->corpsenm = rndmonnum();
+                if (!verysmall(&mons[otmp->corpsenm])
+                    && rn2(level_difficulty() / 2 + 10) > 10)
+                    (void) add_to_container(otmp,
+                                            mkobj(SPBOOK_CLASS, FALSE));
+            }
+            break;
+
+    Per-otyp draw counts (Dlvl 1 byte-parity scope):
+      otyp != STATUE              : 0 draws
+      otyp == STATUE              : rndmonnum() (1 draw via rnd(choice_count))
+
+    The verysmall + ``rn2(level_difficulty()/2 + 10) > 10`` gate is
+    unreachable at Dlvl 1: ``level_difficulty()`` returns depth=1 in the
+    main dungeon, so the modulus is ``1/2 + 10 = 10`` and ``rn2(10)``
+    produces values in [0, 9], which can never satisfy ``> 10``.  The
+    nested ``mkobj(SPBOOK_CLASS)`` branch therefore never fires at depth=1,
+    and ``rn2`` itself is short-circuited by the leading ``!verysmall``
+    test on tiny monsters.  Both sub-paths are skipped here — re-enable
+    them when extending byte-parity beyond Dlvl 1 (depth-threading the
+    branch signature is required).
+
+    rndmonnum() is realised via ``pick_monster_for_level`` (byte-exact,
+    drawing ``rnd(choice_count)`` from the ISAAC64 stream — matches the
+    main-dungeon path where the rn2(7) quest-branch gate short-circuits).
+
+    Vendor cite: vendor/nle/src/mkobj.c:1050-1058 (STATUE branch);
+                 vendor/nle/src/makemon.c:1591-1594 (rndmonst draw);
+                 vendor/nle/include/mondata.h:8 (verysmall).
+    """
+    del artif  # ROCK_CLASS makes no artifact / curse-check draws.
+    is_statue = otyp == jnp.int32(_OTYP_STATUE)
+
+    def _statue_path(r):
+        # Lazy import to avoid spawning.py → random_objects.py circular import
+        # (spawning imports consume_mksobj_init_draws at module top).
+        from Nethax.nethax.dungeon.spawning import pick_monster_for_level
+
+        # depth=1 hard-coded: byte-parity scope is Dlvl 1.  When extending
+        # beyond Dlvl 1 the branch signature needs a depth parameter (the
+        # verysmall + rn2 spbook gate becomes reachable at depth > 5).
+        new_r, _corpsenm = pick_monster_for_level(None, 1, vendor_rng=r)
+        return new_r
+
+    return lax.cond(is_statue, _statue_path, lambda r: r, rng)
+
+
 _MKSOBJ_INIT_BRANCHES = [
     _noop_branch,          # 0  RANDOM_CLASS   (never spawned directly)
     _noop_branch,          # 1  (unused slot)
@@ -1391,14 +1450,10 @@ _MKSOBJ_INIT_BRANCHES = [
     # Without these explicit slots, lax.switch clamps out-of-range indices to
     # the LAST branch (verified: oclass_id in {14,15,16,17} all routed to
     # _gem_branch on JAX 0.x), incorrectly consuming a rn2(6) GEM draw.
-    _noop_branch,          # 14 ROCK_CLASS     mkobj.c:1050-1058 (STATUE has
-                           #                   rndmonnum + conditional nested
-                           #                   mkobj(SPBOOK); deferred — fresh
-                           #                   non-STATUE rock spawns are rare
-                           #                   on early levels, and the full
-                           #                   STATUE cascade needs a monster
-                           #                   table port.  Noop is a safer
-                           #                   default than _gem_branch.)
+    _rock_branch,          # 14 ROCK_CLASS     mkobj.c:1050-1058 (STATUE has
+                           #                   rndmonnum; verysmall+rn2 spbook
+                           #                   gate unreachable at Dlvl 1 — see
+                           #                   _rock_branch docstring).
     _noop_branch,          # 15 BALL_CLASS     mkobj.c:977-980 (explicit break)
     _noop_branch,          # 16 CHAIN_CLASS    mkobj.c:977-980 (explicit break)
     _noop_branch,          # 17 VENOM_CLASS    mkobj.c:977-980 (explicit break)
