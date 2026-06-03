@@ -65,6 +65,7 @@ from Nethax.nethax.constants.monsters import (
     M2_NEUTER,
     M2_FEMALE,
     M2_MALE,
+    M1_HUMANOID,
     M2_DEMON,
     M2_LORD,
     M2_PRINCE,
@@ -474,7 +475,11 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
     counts_by_mlet = {
         int(MonsterSymbol.S_GIANT):     1,   # rn2(2)            line 184
         int(MonsterSymbol.S_HUMAN):     7,   # elf branch peak; mercenary handled below
-        int(MonsterSymbol.S_ANGEL):     3,   # !rn2(20) + rn2(2) + rn2(4)  line 332-340
+        # S_ANGEL handled explicitly outside the generic loop — gated on
+        # humanoid(ptr) with conditional `!rn2(20) || is_lord` artiname,
+        # rn2(4) spe, and `!rn2(4) || is_lord` shield pick.  See
+        # _draw_angel_initweap.  Vendor: makemon.c:326-348.
+        int(MonsterSymbol.S_ANGEL):     0,   # explicit handler              line 326-348
         int(MonsterSymbol.S_HUMANOID):  6,   # dwarf worst case             line 367-386
         # S_KOP handled explicitly outside the generic loop (two gates each
         # with conditional inner draws — m_initthrow rn1 and weapon-pick
@@ -520,8 +525,19 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
     }
     default_count = 1  # default switch case: rnd(14-2*bias) — 1 draw
 
+    # Per-monster overrides for PMs whose explicit handler runs OUTSIDE the
+    # generic loop and consumes the full byte budget itself; force their loop
+    # count to 0 so the placeholder does not double-draw.  Currently:
+    # PM_HOBBIT — S_HUMANOID's hobbit branch (vendor makemon.c:351-366).
+    hobbit_name = "hobbit"
+    pm_hobbit_idx = -1
+    for i, m in enumerate(MONSTERS):
+        if m.name == hobbit_name:
+            pm_hobbit_idx = i
+            break
+
     counts = []
-    for m in MONSTERS:
+    for i, m in enumerate(MONSTERS):
         # Non-armed monsters skip m_initweap entirely; assign 0.
         armed = False
         for atk in (m.attacks or ()):
@@ -529,6 +545,10 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
                 armed = True
                 break
         if not armed:
+            counts.append(0)
+            continue
+        # PM-level overrides (explicit handlers run outside the loop).
+        if i == pm_hobbit_idx:
             counts.append(0)
             continue
         c = counts_by_mlet.get(int(m.symbol), default_count)
@@ -718,6 +738,30 @@ def _compute_is_group_l() -> jnp.ndarray:
     return jnp.array(flags, dtype=jnp.bool_)
 
 
+def _compute_is_humanoid() -> jnp.ndarray:
+    """True where monster's mflags1 has M1_HUMANOID set.
+
+    Cite: vendor/nle/include/mondata.h — humanoid(ptr) checks M1_HUMANOID.
+    Used to gate S_ANGEL m_initweap body (vendor makemon.c:327).
+    """
+    mask = int(M1_HUMANOID) & 0xFFFFFFFF
+    flags = [((int(m.flags1) & 0xFFFFFFFF) & mask) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_is_lord_mask() -> jnp.ndarray:
+    """True where monster's mflags2 has M2_LORD set.
+
+    Cite: vendor/nle/include/mondata.h — is_lord(ptr) checks M2_LORD.
+    Used to short-circuit S_ANGEL artiname and shield-pick draws at
+    vendor makemon.c:332 (`!rn2(20) || is_lord(ptr)`) and :340
+    (`!rn2(4) || is_lord(ptr)`).
+    """
+    mask = int(M2_LORD) & 0xFFFFFFFF
+    flags = [((int(m.flags2) & 0xFFFFFFFF) & mask) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
 def _compute_is_domestic() -> jnp.ndarray:
     """True where monster has M2_DOMESTIC flag2.
 
@@ -856,6 +900,10 @@ _MLET_ORC:         jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_ORC)
 _MLET_HUMAN_MERC:  jnp.ndarray = _compute_mlet_human_merc()
 _MLET_HUMAN_SK:    jnp.ndarray = _compute_mlet_human_shopkeeper()
 _MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
+_MLET_ANGEL:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_ANGEL)
+_MLET_HUMANOID:    jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_HUMANOID)
+_IS_HUMANOID:      jnp.ndarray = _compute_is_humanoid()
+_IS_LORD:          jnp.ndarray = _compute_is_lord_mask()
 
 
 # Specific monster entry indices for short-circuit-gated m_initinv draws.
@@ -896,6 +944,11 @@ _PM_ORC_SHAMAN   = _find_pm_index("orc shaman")
 # already skipped by the outer `is_armed(ptr)` gate.  See
 # _draw_lizard_initweap.
 _PM_SALAMANDER   = _find_pm_index("salamander")
+# S_HUMANOID m_initweap: PM_HOBBIT takes its own switch(rn2(3)) +
+# 2× rn2(10) cloak gates branch (vendor makemon.c:351-366).  Dwarves
+# and elven_mithril_coat path remain on the generic placeholder for
+# now (separate fix).
+_PM_HOBBIT       = _find_pm_index("hobbit")
 
 
 def _compute_ogre_gate_divisor() -> jnp.ndarray:
@@ -937,6 +990,7 @@ _IS_PM_URUK_HAI:       jnp.ndarray = _compute_is_pm(_PM_URUK_HAI)
 _IS_PM_ORC_CAPTAIN:    jnp.ndarray = _compute_is_pm(_PM_ORC_CAPTAIN)
 _IS_PM_ORC_SHAMAN:     jnp.ndarray = _compute_is_pm(_PM_ORC_SHAMAN)
 _IS_PM_SALAMANDER:     jnp.ndarray = _compute_is_pm(_PM_SALAMANDER)
+_IS_PM_HOBBIT:         jnp.ndarray = _compute_is_pm(_PM_HOBBIT)
 
 
 # ---------------------------------------------------------------------------
@@ -2209,6 +2263,124 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
             v_after = jax.lax.cond(
                 _IS_PM_SALAMANDER[tid], _draw_lizard_initweap, lambda vc: vc, v_after
+            )
+
+            # S_ANGEL: humanoid-gated cascade — vendor makemon.c:326-348.
+            #   case S_ANGEL:
+            #       if (humanoid(ptr)) {
+            #           otmp = mksobj(LONG_SWORD, FALSE, FALSE);  // 0 draws
+            #           if (!rn2(20) || is_lord(ptr))             // 1 byte if !is_lord
+            #               otmp = oname(otmp,
+            #                            artiname(rn2(2) ? ART_DEMONBANE : ART_SUNSWORD));
+            #           bless(otmp);
+            #           otmp->oerodeproof = TRUE;
+            #           otmp->spe = rn2(4);                       // 1 byte ALWAYS
+            #           (void) mpickobj(mtmp, otmp);
+            #           otmp = mksobj(!rn2(4) || is_lord(ptr)     // 1 byte if !is_lord
+            #                         ? SHIELD_OF_REFLECTION : LARGE_SHIELD, FALSE, FALSE);
+            #           ...
+            #       }
+            #       break;
+            # Both mksobj() calls have init=TRUE, artif=FALSE:
+            #   LONG_SWORD (otyp 37, WEAPON_CLASS, P_LONG_SWORD positive skill →
+            #     NOT in is_multigen range [-P_SHURIKEN, -P_BOW]) → 0 cascade bytes.
+            #   SHIELD_OF_REFLECTION / LARGE_SHIELD (ARMOR_CLASS, neither in the
+            #     FUMBLE_BOOTS/LEVITATION_BOOTS/HELM_OF_OPPOSITE_ALIGNMENT/
+            #     GAUNTLETS_OF_FUMBLING shortlist) → 0 cascade bytes.
+            # `!rn2(N) || is_lord(ptr)` short-circuits: when is_lord, NO rn2(N)
+            # is drawn (the LHS is never evaluated).  When !is_lord, rn2(N) is
+            # drawn unconditionally.
+            # Byte budget (per humanoid angel):
+            #   non-lord, no artiname (19/20):  1 (rn20) + 1 (spe) + 1 (shield) = 3
+            #   non-lord, with artiname (1/20): 1 (rn20) + 1 (art) + 1 (spe) + 1 (shield) = 4
+            #   is_lord:                        1 (art)  + 1 (spe) = 2
+            # Non-humanoid armed angels: 0 bytes (the whole body is gated).
+            # Previously the generic placeholder loop drew rn2(2) thrice (3 bytes)
+            # for ALL armed angels including non-humanoid ones (e.g., couatl),
+            # and under-drew by 1 byte in the 1/20-of-non-lord with-artiname case.
+            # Cite: vendor/nle/src/makemon.c:326-348 (S_ANGEL branch),
+            #       vendor/nle/src/mkobj.c:803-818 (WEAPON_CLASS mksobj_init),
+            #       vendor/nle/src/mkobj.c:993-1005 (ARMOR_CLASS mksobj_init).
+            def _draw_angel_initweap(vc):
+                is_lord = _IS_LORD[tid]
+
+                def _humanoid_body(vd):
+                    # !rn2(20) || is_lord artiname gate.
+                    def _non_lord_artiname(ve):
+                        ve, r20 = randint_jax(ve, (), 0, 20)
+
+                        def _draw_artname(vf):
+                            vf, _ = randint_jax(vf, (), 0, 2)
+                            return vf
+
+                        return jax.lax.cond(
+                            r20 == jnp.int32(0),
+                            _draw_artname,
+                            lambda vf: vf,
+                            ve,
+                        )
+
+                    def _lord_artiname(ve):
+                        # rn2(20) short-circuited; rn2(2) ALWAYS drawn (LHS of || true).
+                        ve, _ = randint_jax(ve, (), 0, 2)
+                        return ve
+
+                    vd = jax.lax.cond(is_lord, _lord_artiname, _non_lord_artiname, vd)
+                    # spe = rn2(4) — ALWAYS
+                    vd, _ = randint_jax(vd, (), 0, 4)
+
+                    # !rn2(4) || is_lord shield-type gate.
+                    def _shield_pick(ve):
+                        ve, _ = randint_jax(ve, (), 0, 4)
+                        return ve
+
+                    vd = jax.lax.cond(is_lord, lambda ve: ve, _shield_pick, vd)
+                    return vd
+
+                return jax.lax.cond(
+                    _IS_HUMANOID[tid], _humanoid_body, lambda vd: vd, vc,
+                )
+
+            v_after = jax.lax.cond(
+                _MLET_ANGEL[tid], _draw_angel_initweap, lambda vc: vc, v_after
+            )
+
+            # S_HUMANOID PM_HOBBIT: switch(rn2(3)) DAGGER/ELVEN_DAGGER/SLING
+            # weapon-pick + 2× rn2(10) armor gates — vendor makemon.c:351-366.
+            #   case S_HUMANOID:
+            #       if (mm == PM_HOBBIT) {
+            #           switch (rn2(3)) {
+            #               case 0: mongets(DAGGER); break;
+            #               case 1: mongets(ELVEN_DAGGER); break;
+            #               case 2: mongets(SLING); break;
+            #           }
+            #           if (!rn2(10)) (void) mongets(mtmp, ELVEN_MITHRIL_COAT);
+            #           if (!rn2(10)) (void) mongets(mtmp, DWARVISH_CLOAK);
+            #       } else if (is_dwarf(ptr)) { ... (deferred — see _INITWEAP_DRAW_COUNT) }
+            # Hobbit byte budget: rn2(3) (1) + rn2(10) (1) + rn2(10) (1) = 3 bytes.
+            # Mongets cascade per otyp (all init=TRUE, artif=FALSE):
+            #   DAGGER (otyp 10, P_DAGGER skill — positive, not multigen): 0 bytes.
+            #   ELVEN_DAGGER (otyp 11, P_DAGGER, not multigen): 0 bytes.
+            #   SLING (otyp 73, P_SLING positive, not in is_multigen range): 0 bytes.
+            #   ELVEN_MITHRIL_COAT (ARMOR, not in special shortlist): 0 bytes.
+            #   DWARVISH_CLOAK (ARMOR, not in special shortlist): 0 bytes.
+            # Previously the generic placeholder loop drew rn2(2) six times
+            # (6 bytes) for hobbits using the S_HUMANOID dwarf-worst-case slot,
+            # over-drawing by 3 bytes per hobbit spawn.  _INITWEAP_DRAW_COUNT
+            # now overrides PM_HOBBIT to 0 so the placeholder is bypassed.
+            # Cite: vendor/nle/src/makemon.c:351-366 (S_HUMANOID PM_HOBBIT branch),
+            #       vendor/nle/include/obj.h:197-204 (is_multigen predicate).
+            def _draw_hobbit_initweap(vc):
+                # switch(rn2(3)) weapon pick — 1 byte
+                vc, _ = randint_jax(vc, (), 0, 3)
+                # !rn2(10) ELVEN_MITHRIL_COAT — 1 byte
+                vc, _ = randint_jax(vc, (), 0, 10)
+                # !rn2(10) DWARVISH_CLOAK — 1 byte
+                vc, _ = randint_jax(vc, (), 0, 10)
+                return vc
+
+            v_after = jax.lax.cond(
+                _IS_PM_HOBBIT[tid], _draw_hobbit_initweap, lambda vc: vc, v_after
             )
 
             # Trailing offensive-item check — vendor makemon.c:556
