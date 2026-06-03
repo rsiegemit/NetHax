@@ -477,7 +477,10 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
         # m_initthrow draw is gate-conditional).  See _draw_kobold_initweap
         # in _consume_makemon_post_hp_draws.  Vendor: makemon.c:456-459.
         int(MonsterSymbol.S_KOBOLD):    0,   # explicit handler              line 457
-        int(MonsterSymbol.S_CENTAUR):   1,   # rn2(2)                        line 462
+        # S_CENTAUR handled explicitly outside the generic loop (gate + rn1
+        # m_initthrow draw is gate-conditional).  See _draw_centaur_initweap
+        # in _consume_makemon_post_hp_draws.  Vendor: makemon.c:461-471.
+        int(MonsterSymbol.S_CENTAUR):   0,   # explicit handler              line 462
         int(MonsterSymbol.S_WRAITH):    0,   # no rn2                         line 472-475
         int(MonsterSymbol.S_ZOMBIE):    3,   # !rn2(4) + !rn2(4) + rn2(3)   line 477-481
         int(MonsterSymbol.S_LIZARD):    2,   # salamander rn2(7) + rn2(3)   line 482-486
@@ -812,6 +815,7 @@ _MLET_DEMON:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_DEMON)
 _MLET_GIANT:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_GIANT)
 _MLET_LICH:        jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_LICH)
 _MLET_KOBOLD:      jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOBOLD)
+_MLET_CENTAUR:     jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_CENTAUR)
 _MLET_HUMAN_MERC:  jnp.ndarray = _compute_mlet_human_merc()
 _MLET_HUMAN_SK:    jnp.ndarray = _compute_mlet_human_shopkeeper()
 _MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
@@ -1654,6 +1658,48 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
             v_after = jax.lax.cond(
                 _MLET_KOBOLD[tid], _draw_kobold_initweap, lambda vc: vc, v_after
+            )
+
+            # S_CENTAUR: explicit gate + m_initthrow draw — vendor makemon.c:461-471
+            #   case S_CENTAUR:
+            #       if (rn2(2)) {
+            #           if (ptr == &mons[PM_FOREST_CENTAUR]) {
+            #               (void) mongets(mtmp, BOW);
+            #               m_initthrow(mtmp, ARROW, 12);          /* rn1(12, 3) */
+            #           } else {
+            #               (void) mongets(mtmp, CROSSBOW);
+            #               m_initthrow(mtmp, CROSSBOW_BOLT, 12);  /* rn1(12, 3) */
+            #           }
+            #       }
+            #       break;
+            # Vendor draws rn2(2) unconditionally (the gate) and rn1(12, 3)
+            # for the ARROW or CROSSBOW_BOLT stack only when the gate is
+            # NON-zero (1/2 of the time — vendor: ``if (rn2(2))``).  The
+            # generic loop placeholder drew a single rn2(2) for centaurs,
+            # matching vendor only when the gate failed (1/2 case) and
+            # under-drawing by 1 byte when the gate passed (1/2 case).
+            # The inner ``ptr == FOREST_CENTAUR`` branch picks ARROW vs.
+            # CROSSBOW_BOLT but both call m_initthrow with the same rn1(12, 3),
+            # so the ISAAC64 byte cost is identical.
+            # Cite: vendor/nle/src/makemon.c:461-471 (S_CENTAUR case),
+            #       vendor/nle/src/makemon.c:148-160 (m_initthrow rn1).
+            def _draw_centaur_initweap(vc):
+                vc, gate = randint_jax(vc, (), 0, 2)
+
+                def _draw_initthrow(vd):
+                    # m_initthrow rn1(12, 3) — 1 ISAAC64 word.
+                    nv, _ = randint_jax(vd, (), 3, 15)
+                    return nv
+
+                return jax.lax.cond(
+                    gate != jnp.int32(0),
+                    _draw_initthrow,
+                    lambda vd: vd,
+                    vc,
+                )
+
+            v_after = jax.lax.cond(
+                _MLET_CENTAUR[tid], _draw_centaur_initweap, lambda vc: vc, v_after
             )
 
             # Trailing offensive-item check — vendor makemon.c:556
