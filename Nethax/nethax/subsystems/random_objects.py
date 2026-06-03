@@ -1241,6 +1241,21 @@ _MKSOBJ_INIT_BRANCHES = [
     _wand_branch,          # 11 WAND_CLASS     mkobj.c:1019-1027
     _noop_branch,          # 12 COIN_CLASS     mkobj.c:1060-1061 (no draws)
     _gem_branch,           # 13 GEM_CLASS      mkobj.c:886-895
+    # Length-18 table covers all ObjectClass enum values (RANDOM=0..VENOM=17).
+    # Without these explicit slots, lax.switch clamps out-of-range indices to
+    # the LAST branch (verified: oclass_id in {14,15,16,17} all routed to
+    # _gem_branch on JAX 0.x), incorrectly consuming a rn2(6) GEM draw.
+    _noop_branch,          # 14 ROCK_CLASS     mkobj.c:1050-1058 (STATUE has
+                           #                   rndmonnum + conditional nested
+                           #                   mkobj(SPBOOK); deferred — fresh
+                           #                   non-STATUE rock spawns are rare
+                           #                   on early levels, and the full
+                           #                   STATUE cascade needs a monster
+                           #                   table port.  Noop is a safer
+                           #                   default than _gem_branch.)
+    _noop_branch,          # 15 BALL_CLASS     mkobj.c:977-980 (explicit break)
+    _noop_branch,          # 16 CHAIN_CLASS    mkobj.c:977-980 (explicit break)
+    _noop_branch,          # 17 VENOM_CLASS    mkobj.c:977-980 (explicit break)
 ]
 
 
