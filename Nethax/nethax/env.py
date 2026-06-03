@@ -557,32 +557,52 @@ class NethaxEnv:
         # Mirror that here by also seeding ``visible`` and stamping
         # ``last_seen_terrain`` for the FOV tiles — exactly as the per-step
         # ``subsystems/action_dispatch.py::_apply_fov`` does after a move.
-        from Nethax.nethax.fov import compute_fov, lit_room_flood
+        from Nethax.nethax.fov import view_from
         terrain_l0_full = state.terrain[0, 0, :, :]
-        # Lit-room flood (vendor vision.c:320-335): when the hero stands in a
-        # LIT room, vision_recalc makes the whole room region visible at once —
-        # the interior PLUS the one-cell bounding wall ring — not just the
-        # Bresenham LOS subset.  Compute it FIRST so it can both (a) serve as the
-        # per-cell ``lit_mask`` that gates the raycast (dark distal corridor
-        # cells reached by a ray through the doorway are dropped — vendor only
-        # sets IN_SIGHT for unlit cells within the light radius, not for every
-        # line-of-sight cell) and (b) be OR'd back in so the far walls/corners
-        # of the starting lit room — which the rays cannot reach — still render
-        # on turn 0.  Dark rooms / corridors then reveal only via the LOS rays
-        # within the hero's light radius.
+        # Vendor view_from (vendor/nle/src/vision.c:2640-2731, Algorithm C):
+        # the could_see/IN_SIGHT mask is produced by a row-by-row segment
+        # sweep outward from the source, with per-row Bresenham q?_path
+        # visibility tests at each "finger of light" endpoint.  This
+        # replaces the previous ``compute_fov`` + ``lit_room_flood`` ring
+        # hack: the vendor algorithm naturally includes lit-room walls and
+        # corridor doorway corners that simple raycasts miss, and naturally
+        # excludes cells the prior ring over-included (where the vendor
+        # shadow/wall-jump logic would have terminated visibility).
+        #
+        # Dark-cell gating (rlit handling) is applied AFTER view_from via
+        # the per-tile lit mask: a cell that view_from marks could_see is
+        # only actually IN_SIGHT if it is LIT or within the hero's own
+        # light radius (Chebyshev <= 1).  This mirrors vendor
+        # ``vision_recalc`` lines 320-335.
+        vis = view_from(
+            terrain_l0_full,
+            state.player_pos.astype(jnp.int32),
+            max_radius=0,  # 0 = unlimited (vendor default for vision_recalc)
+        )                                                  # bool[MAP_H, MAP_W]
+        # Dark-cell gate (vendor vision.c::vision_recalc lines 320-335 +
+        # recheck_pos): a couldsee cell is only IN_SIGHT if LIT or adjacent
+        # to the hero.  Build the lit-cell mask from the rooms' rlit flag
+        # over each room's wall-inclusive bounding ring (vendor mkroom.c:653
+        # ``inside_room`` — that is the per-tile rlit stamp source).
+        from Nethax.nethax.fov import lit_room_flood as _lit_flood
         _h, _w = terrain_l0_full.shape
-        lit_flood = lit_room_flood(
+        lit_flood = _lit_flood(
             state.player_pos.astype(jnp.int32),
             _rooms.x1, _rooms.y1, _rooms.x2, _rooms.y2,
             _active, _rooms.is_lit,
             _h, _w,
-        )                                                  # bool[MAP_H, MAP_W]
-        vis = compute_fov(
-            terrain_l0_full,
-            state.player_pos.astype(jnp.int32),
-            lit_mask=lit_flood,
-        )                                                  # bool[MAP_H, MAP_W]
-        vis = vis | lit_flood
+        )
+        # Within-light radius (Chebyshev <= 1) — applies to any room (lit or
+        # dark) and to corridor cells.
+        pr = state.player_pos[0].astype(jnp.int32)
+        pc = state.player_pos[1].astype(jnp.int32)
+        rows_g = jnp.arange(_h, dtype=jnp.int32)[:, None]
+        cols_g = jnp.arange(_w, dtype=jnp.int32)[None, :]
+        within_light = (
+            (jnp.abs(rows_g - pr) <= jnp.int32(1))
+            & (jnp.abs(cols_g - pc) <= jnp.int32(1))
+        )
+        vis = vis & (lit_flood | within_light)
         new_explored = state.explored.at[0, 0].set(
             state.explored[0, 0] | vis
         )
