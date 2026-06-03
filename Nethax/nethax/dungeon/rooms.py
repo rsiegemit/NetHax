@@ -2252,11 +2252,25 @@ def fill_ordinary_rooms(
                 is_elf_victim   = rn15 == jnp.int32(0)
                 SLP_GAS_TRAP = jnp.int32(8)   # vendor/nethack/include/trap.h:66
 
+                # Vendor mklev.c:1501:
+                #   if (kind == SLP_GAS_TRAP && !(lvl <= 2 && rn2(2)))
+                # The inner ``lvl <= 2 && rn2(2)`` uses C ``&&`` short-circuit:
+                # ``rn2(2)`` is drawn ONLY when ``lvl <= 2`` is TRUE.  On
+                # Dlvl 3+ the rn2(2) is NEVER drawn (even when the elf+SLP_GAS
+                # gate is reached), but Dlvl 3+ is also where SLP_GAS_TRAP can
+                # legally appear without being legalised away (vendor mklev.c:
+                # 1327-1330 requires ``lvl >= 2`` — actually ``!lvl<2``).
+                # On Dlvl 1 SLP_GAS_TRAP is rejected so this gate never fires;
+                # on Dlvl 2 (lvl==2) it can fire AND ``lvl<=2`` is TRUE so
+                # rn2(2) draws.  On Dlvl 3+ ``lvl<=2`` is FALSE so vendor's
+                # inner short-circuit skips the rn2(2) draw — previously
+                # Nethax over-drew one rn2(2) on this path.
+                # Vendor cite: vendor/nle/src/mklev.c:1501.
                 def _elf_slp_true(vi):
                     vi, _ = randint_jax(vi, (), 0, 2)
                     return vi
                 v = lax.cond(
-                    is_elf_victim & (kind == SLP_GAS_TRAP),
+                    is_elf_victim & (kind == SLP_GAS_TRAP) & (depth_i <= jnp.int32(2)),
                     _elf_slp_true, lambda vi: vi, v,
                 )
 
