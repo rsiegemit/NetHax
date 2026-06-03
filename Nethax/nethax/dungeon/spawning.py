@@ -1966,6 +1966,19 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         # d(n, x) rolls EXACTLY n dice of (rn2(x)+1) — n rn2(30) draws.
         # On Dlvl 1 with depth=1 this is 1 draw (was capped at 8 → over-consumed
         # 7 extra ISAAC64 draws per leprechaun).
+        #
+        # No mksobj_init cascade is needed: mkmonmoney() calls
+        # ``mksobj(GOLD_PIECE, FALSE, FALSE)`` with init=FALSE, so the
+        # mkobj.c:801 ``if (init)`` gate skips the entire mksobj_init switch
+        # body.  COIN_CLASS's mksobj_init body (mkobj.c:1060-1061) is a noop
+        # anyway, but init=FALSE skips it before that point.  S_LEPRECHAUN
+        # is not AT_WEAP-armed so _INITWEAP_DRAW_COUNT[S_LEPRECHAUN] == 0
+        # (no m_initweap draws either).  Verified: the N rn2(30) loop below
+        # is the complete vendor draw set for the leprechaun cascade.
+        # Cite: vendor/nle/src/rnd.c:208-224 (d(n,x) = N rn2(x) calls);
+        #       vendor/nle/src/makemon.c:564-573 (mkmonmoney → mksobj
+        #         init=FALSE);
+        #       vendor/nle/src/mkobj.c:801 (init=FALSE skips mksobj_init).
         ld = jnp.maximum(jnp.int32(level_difficulty), jnp.int32(1))
 
         def _draw_lep(vv):
