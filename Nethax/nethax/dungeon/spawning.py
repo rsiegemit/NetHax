@@ -2128,8 +2128,14 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             # so _armor_draws follows the generic ARMOR_CLASS draw cascade
             # (rn2(10) outer + conditional rn2(11)/rn2(10)/blessorcurse).
             # artif=FALSE so the rn2(40) artifact check is skipped.
-            v3 = _armor_draws(v2, jnp.bool_(False))   # cloak
-            v4 = _armor_draws(v3, jnp.bool_(False))   # SMALL_SHIELD
+            # otyp=0 sentinel avoids the FUMBLE_BOOTS / LEVITATION_BOOTS /
+            # HELM_OF_OPPOSITE_ALIGNMENT / GAUNTLETS_OF_FUMBLING short-circuit
+            # branch (which would skip the rn2(11) inner draw).  Priest cloaks
+            # (ROBE / CLOAK_OF_PROTECTION / CLOAK_OF_MAGIC_RESISTANCE) and
+            # SMALL_SHIELD are all in the generic cascade so otyp=0 is byte-
+            # equivalent for them.
+            v3 = _armor_draws(v2, jnp.int32(0), jnp.bool_(False))   # cloak
+            v4 = _armor_draws(v3, jnp.int32(0), jnp.bool_(False))   # SMALL_SHIELD
             # mkmonmoney(mtmp, rn1(10, 20)) — rn2(10) + 20 (mkobj.c:1486-1504
             # mkgold: amount > 0 path skips the rnd(2)/rnd(3) gold cascade).
             v5, _ = randint_jax(v4, (), 0, 10)
