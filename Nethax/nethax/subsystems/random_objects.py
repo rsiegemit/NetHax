@@ -671,19 +671,62 @@ def _wand_draws(rng: Isaac64State) -> Isaac64State:
     return _blessorcurse_jax(rng, 17)                        # mkobj.c:1025
 
 
-def _ring_draws(rng: Isaac64State) -> Isaac64State:
+# Special uncharged ring otyps that short-circuit the !rn2(9) curse check.
+# Vendor mkobj.c:1043-1048:
+#   } else if (rn2(10) && (otyp == RIN_TELEPORTATION
+#                       || otyp == RIN_POLYMORPH
+#                       || otyp == RIN_AGGRAVATE_MONSTER
+#                       || otyp == RIN_HUNGER
+#                       || !rn2(9))) curse(otmp);
+# The `||` short-circuits: when otyp is one of the 4 special otyps, !rn2(9)
+# is never evaluated and the RNG stream skips that draw.
+# otyp ids from constants/objects.py positional indices:
+#   161 ring of hunger, 162 ring of aggravate monster,
+#   171 ring of teleportation, 173 ring of polymorph.
+_OTYP_RIN_HUNGER:            int = 161
+_OTYP_RIN_AGGRAVATE_MONSTER: int = 162
+_OTYP_RIN_TELEPORTATION:     int = 171
+_OTYP_RIN_POLYMORPH:         int = 173
+
+
+def _ring_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
     """RING_CLASS (uncharged path) — vendor mkobj.c:1043-1048.
 
-    Uncharged rings: rn2(10) curse gate + cond rn2(9)  (mkobj.c:1043-1048).
-    Charged rings require otyp-level dispatch (deferred).
+    Vendor source (uncharged branch only)::
 
-    rn2(10)                    # curse check gate  (mkobj.c:1043)
-    if hit: (no extra draw — curse() has no RNG)
-    else: rn2(9) curse check   # mkobj.c:1046
+        } else if (rn2(10) && (otyp == RIN_TELEPORTATION
+                            || otyp == RIN_POLYMORPH
+                            || otyp == RIN_AGGRAVATE_MONSTER
+                            || otyp == RIN_HUNGER
+                            || !rn2(9))) {
+            curse(otmp);
+        }
+
+    Per-otyp draw counts (uncharged otyps only):
+      r10 == 0                            : rn2(10)              → 1 draw
+      r10 != 0 AND special otyp           : rn2(10)              → 1 draw
+      r10 != 0 AND non-special otyp       : rn2(10) + rn2(9)    → 2 draws
+
+    Previously Nethax always emitted rn2(9) when r10 != 0, over-consuming the
+    ISAAC64 stream by 1 draw on every uncharged spawn of the 4 special otyps.
+
+    The charged-ring path (mkobj.c:1029-1042 — runs when objects[otyp].oc_charged
+    is true) is NOT modeled here; that requires a deeper otyp dispatch and
+    is tracked separately.
+
+    Cite: vendor/nle/src/mkobj.c:1043-1048.
     """
     rng, r10 = rn2_jax(rng, 10)                              # mkobj.c:1043
+    is_special = (
+        (otyp == jnp.int32(_OTYP_RIN_HUNGER))
+        | (otyp == jnp.int32(_OTYP_RIN_AGGRAVATE_MONSTER))
+        | (otyp == jnp.int32(_OTYP_RIN_TELEPORTATION))
+        | (otyp == jnp.int32(_OTYP_RIN_POLYMORPH))
+    )
+    # rn2(9) fires iff: rn2(10) was non-zero AND otyp not in the 4 specials.
+    do_inner = (r10 != jnp.int32(0)) & (~is_special)
     rng = lax.cond(
-        r10 != jnp.int32(0),
+        do_inner,
         lambda r: rn2_jax(r, 9)[0],                          # mkobj.c:1046
         lambda r: r,
         rng,
@@ -1238,8 +1281,10 @@ def _noop_branch(rng, otyp, artif):
     return rng
 
 def _ring_branch(rng, otyp, artif):
-    del otyp, artif
-    return _ring_draws(rng)
+    del artif
+    # otyp threaded through so RIN_TELEPORTATION/POLYMORPH/AGGRAVATE/HUNGER
+    # short-circuit the !rn2(9) curse check.  Cite: vendor/nle/src/mkobj.c:1043-1048.
+    return _ring_draws(rng, otyp)
 
 def _amulet_branch(rng, otyp, artif):
     del artif
