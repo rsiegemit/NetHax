@@ -2000,12 +2000,14 @@ def generate_main_branch_l1_with_features(
             flat_lv=flat_lv, depth=depth, player_align=player_align,
             vendor_rng=vendor_rng, nroom=_nroom_for_fill,
             state=state, monster_rng=k_monster,
+            vendor_levl_grid=vendor_levl_grid,
         )
     else:
         terrain, features, traps, vendor_rng = fill_ordinary_rooms(
             k_fill, rooms, active, terrain, features, traps,
             flat_lv=flat_lv, depth=depth, player_align=player_align,
             vendor_rng=vendor_rng, nroom=_nroom_for_fill,
+            vendor_levl_grid=vendor_levl_grid,
         )
 
     # vendor/nle/src/mklev.c::mineralize line 1006 — called from mklev()

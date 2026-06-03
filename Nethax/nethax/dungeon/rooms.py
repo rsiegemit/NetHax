@@ -1540,6 +1540,7 @@ def fill_ordinary_rooms(
     nroom: jnp.ndarray | None = None,
     state=None,
     monster_rng=None,
+    vendor_levl_grid: jnp.ndarray | None = None,
 ):
     """Apply per-room independent feature rolls to every ordinary room.
 
@@ -1622,17 +1623,46 @@ def fill_ordinary_rooms(
     from Nethax.nethax.constants.tiles import TileType
     FLOOR    = jnp.int8(int(TileType.FLOOR))
     FOUNTAIN = jnp.int8(int(TileType.FOUNTAIN))
-    # The internal TileType enum has no SINK / STATUE / GOLD codes; we use
-    # FLOOR for those (the *object* layer carries the gold/statue and the
-    # *features* layer carries sink semantics).  Vendor uses rm.h tile
-    # codes for fountain/sink/altar/grave but our compact TileType only
-    # exposes FOUNTAIN/ALTAR/GRAVE.  Sink/statue/gold tiles stay FLOOR
-    # here; downstream object-layer fills handle them.
     ALTAR    = jnp.int8(int(TileType.ALTAR))
     GRAVE    = jnp.int8(int(TileType.GRAVE))
+    SINK     = jnp.int8(int(TileType.SINK))
     TRAP_TILE = jnp.int8(int(TileType.HIDDEN_TRAP))
 
+    # Tile codes used by the vendor occupied/bydoor predicates inside the
+    # mkfount/mksink/mkaltar do-while retry loops (vendor mklev.c:1578-1632).
+    # IS_FURNITURE(typ) in vendor (rm.h:104) is STAIRS..ALTAR; in our
+    # internal TileType encoding these are STAIRCASE_UP, STAIRCASE_DOWN,
+    # ALTAR, FOUNTAIN, THRONE, GRAVE, SINK.  IS_DOOR(typ) || typ == SDOOR
+    # in vendor (rm.h:88) maps to CLOSED_DOOR / OPEN_DOOR / DOORWAY here
+    # (SDOOR collapses to WALL in our internal terrain, which the rare
+    # SDOOR-bydoor case can't see — acceptable approximation for Dlvl 1
+    # OROOMs where SDOOR is virtually absent in the room interior).
+    _STAIRCASE_UP   = jnp.int8(int(TileType.STAIRCASE_UP))
+    _STAIRCASE_DOWN = jnp.int8(int(TileType.STAIRCASE_DOWN))
+    _THRONE         = jnp.int8(int(TileType.THRONE))
+    _CLOSED_DOOR    = jnp.int8(int(TileType.CLOSED_DOOR))
+    _OPEN_DOOR      = jnp.int8(int(TileType.OPEN_DOOR))
+    _DOORWAY        = jnp.int8(int(TileType.DOORWAY))
+    _WATER          = jnp.int8(int(TileType.WATER))
+    _LAVA           = jnp.int8(int(TileType.LAVA))
+    _POOL           = jnp.int8(int(TileType.POOL))
+
     depth_i = jnp.asarray(depth, dtype=jnp.int32)
+
+    # Secret-door overlay for the bydoor() predicate inside mkfount/mksink/
+    # mkaltar's do-while retry loop.  Vendor bydoor() (mklev.c:1209-1236)
+    # checks IS_DOOR(typ) || typ == SDOOR on each 4-neighbor.  Our internal
+    # ``terrain`` collapses SDOOR (vendor code 16) to WALL via
+    # ``_vendor_grid_to_terrain``, so we'd never fire bydoor for an SDOOR
+    # neighbor.  ``vendor_levl_grid`` preserves the raw vendor codes — when
+    # the caller threads it through, we use it to detect SDOOR-adjacency.
+    # When it's None (legacy path), the mask is all-False, matching the
+    # prior behaviour.  Vendor cite: corridors.py VTILE_SDOOR = 16.
+    if vendor_levl_grid is not None:
+        _SDOOR_CODE = jnp.int8(16)
+        _sdoor_mask = vendor_levl_grid == _SDOOR_CODE
+    else:
+        _sdoor_mask = jnp.zeros(terrain.shape, dtype=jnp.bool_)
 
     # Trap rate (vendor mklev.c:981-983):
     #   x = 8 - level_difficulty()/6;  if (x <= 1) x = 2;
@@ -1944,6 +1974,124 @@ def fill_ordinary_rooms(
             ry = jnp.clip(ry, 0, h_max)
             cx = jnp.clip(cx, 0, w_max)
             return vrng_in, ry, cx
+
+        # -----------------------------------------------------------------
+        # Vendor occupied/bydoor predicates — the gate for mkfount/mksink/
+        # mkaltar's do-while retry loop (vendor mklev.c:1578-1632).
+        #
+        # occupied(x, y) (mklev.c:1262-1269):
+        #     t_at(x, y) || IS_FURNITURE(levl[x][y].typ)
+        #     || is_lava(x, y) || is_pool(x, y) || invocation_pos(x, y)
+        # IS_FURNITURE = typ in [STAIRS .. ALTAR] (rm.h:104).  In our internal
+        # TileType encoding this is the set {STAIRCASE_UP, STAIRCASE_DOWN,
+        # ALTAR, FOUNTAIN, THRONE, GRAVE, SINK}.  invocation_pos is FALSE on
+        # Dlvl 1 (Gehennom-only sanctum check) — omitted.
+        #
+        # bydoor(x, y) (mklev.c:1209-1236): any of the 4 orthogonal neighbors
+        # has IS_DOOR(typ) || typ == SDOOR.  In our terrain, vendor DOOR maps
+        # to CLOSED_DOOR / OPEN_DOOR / DOORWAY (via _vendor_grid_to_terrain
+        # door-mask refinement); vendor SDOOR is collapsed to WALL and is
+        # therefore invisible here — that's an acceptable approximation
+        # because rooms-interior SDOOR is virtually absent on Dlvl 1.
+        # -----------------------------------------------------------------
+        def _is_furniture(typ_):
+            return (
+                (typ_ == _STAIRCASE_UP)
+                | (typ_ == _STAIRCASE_DOWN)
+                | (typ_ == ALTAR)
+                | (typ_ == FOUNTAIN)
+                | (typ_ == _THRONE)
+                | (typ_ == GRAVE)
+                | (typ_ == SINK)
+            )
+
+        def _occupied(rr, cc, t_grid, tr_grid):
+            typ_ = t_grid[rr, cc]
+            trap_present = tr_grid[flat_lv, rr, cc] != jnp.int8(0)
+            is_lava_ = typ_ == _LAVA
+            is_pool_ = (typ_ == _WATER) | (typ_ == _POOL)
+            return trap_present | _is_furniture(typ_) | is_lava_ | is_pool_
+
+        def _is_door_typ(typ_):
+            return (
+                (typ_ == _CLOSED_DOOR)
+                | (typ_ == _OPEN_DOOR)
+                | (typ_ == _DOORWAY)
+            )
+
+        def _bydoor(rr, cc, t_grid):
+            H_ = t_grid.shape[0]
+            W_ = t_grid.shape[1]
+            rp = jnp.clip(rr + jnp.int32(1), jnp.int32(0), jnp.int32(H_ - 1))
+            rm = jnp.clip(rr - jnp.int32(1), jnp.int32(0), jnp.int32(H_ - 1))
+            cp = jnp.clip(cc + jnp.int32(1), jnp.int32(0), jnp.int32(W_ - 1))
+            cm = jnp.clip(cc - jnp.int32(1), jnp.int32(0), jnp.int32(W_ - 1))
+            # Vendor uses isok() to bound — replicated via clip: out-of-bounds
+            # neighbors collapse to a valid in-bounds cell that vendor's isok
+            # would have skipped.  WALL cells (the most common boundary tile)
+            # are NOT doors, so the clip approximation matches vendor's
+            # "skip if !isok" semantics on the bydoor predicate.
+            in_bounds_rp = (rr + jnp.int32(1)) < jnp.int32(H_)
+            in_bounds_rm = (rr - jnp.int32(1)) >= jnp.int32(0)
+            in_bounds_cp = (cc + jnp.int32(1)) < jnp.int32(W_)
+            in_bounds_cm = (cc - jnp.int32(1)) >= jnp.int32(0)
+            # Per-neighbor door test combines:
+            #   (a) terrain has DOOR-derived tile (CLOSED_DOOR/OPEN_DOOR/DOORWAY)
+            #   (b) _sdoor_mask carries vendor SDOOR (collapsed to WALL in
+            #       ``terrain`` by ``_vendor_grid_to_terrain``).
+            # Without (b) the bydoor predicate misses SDOOR neighbors stamped
+            # by make_niches — exactly the missing draw on seed=5.
+            d_rp = (_is_door_typ(t_grid[rp, cc]) | _sdoor_mask[rp, cc]) & in_bounds_rp
+            d_rm = (_is_door_typ(t_grid[rm, cc]) | _sdoor_mask[rm, cc]) & in_bounds_rm
+            d_cp = (_is_door_typ(t_grid[rr, cp]) | _sdoor_mask[rr, cp]) & in_bounds_cp
+            d_cm = (_is_door_typ(t_grid[rr, cm]) | _sdoor_mask[rr, cm]) & in_bounds_cm
+            return d_rp | d_rm | d_cp | d_cm
+
+        # Bounded port of vendor's do-while retry loop:
+        #   do { somex(croom); somey(croom); }
+        #   while (occupied(x, y) || bydoor(x, y));
+        # Vendor caps via tryct <= 200; on a 1-level dungeon with an open
+        # room interior the loop almost always succeeds in 1-2 iterations.
+        # We use a fixed upper bound of 20 iterations and freeze the cell
+        # (r, c) once a valid candidate is found by gating further somexy
+        # draws on ~done — matching vendor's short-circuit exit semantics.
+        # The first iteration ALWAYS draws somexy (vendor's do-while
+        # evaluates the body once before checking the condition).
+        # Vendor cite: vendor/nle/src/mklev.c:1578-1585 (mkfount),
+        #              1603-1608 (mksink), 1627-1632 (mkaltar).
+        _SOMEXY_RETRY_MAX = 20
+
+        def _somexy_retry(vrng_in, t_grid, tr_grid):
+            def _body(_i, carry):
+                v, r_, c_, done_ = carry
+                # Draw a fresh somexy only while still searching.  Once
+                # ``done_`` flips True the cell is frozen and we replay
+                # zero-draw no-ops (matches vendor's loop-exit semantics).
+                def _draw(vi):
+                    return somexy(vi)
+                def _hold(vi):
+                    return (vi, r_, c_)
+                v, r_cand, c_cand = lax.cond(~done_, _draw, _hold, v)
+                bad = _occupied(r_cand, c_cand, t_grid, tr_grid) | _bydoor(
+                    r_cand, c_cand, t_grid,
+                )
+                new_done = done_ | (~bad)
+                # Lock in the first accepted (r, c); on rejection keep
+                # searching, on hold (done) keep previous values.
+                new_r = jnp.where(done_, r_, r_cand)
+                new_c = jnp.where(done_, c_, c_cand)
+                return (v, new_r.astype(jnp.int32), new_c.astype(jnp.int32), new_done)
+
+            init_carry = (
+                vrng_in,
+                jnp.int32(0),
+                jnp.int32(0),
+                jnp.bool_(False),
+            )
+            v_out, r_out, c_out, done_out = lax.fori_loop(
+                0, _SOMEXY_RETRY_MAX, _body, init_carry,
+            )
+            return v_out, r_out, c_out, done_out
 
         # --- Sleeping monster: !rn2(3) + somexy (vendor mklev.c:813-817) ---
         # Vendor short-circuit:  if (u.uhave.amulet || !rn2(3)) {
@@ -2426,53 +2574,89 @@ def fill_ordinary_rooms(
 
             # --- Fountain: !rn2(10) + mkfount internals (vendor mklev.c:831-832) ---
             # Vendor:  if (!rn2(10)) mkfount(0, croom);
-            # mkfount (mklev.c:1571-1594) calls somexy() in a do/while, then on
-            # success draws rn2(7) for blessedftn.  All these draws fire ONLY
-            # when the !rn2(10) gate passes — the previous unconditional somexy
-            # was an over-draw on the 90% miss path.
+            # mkfount (mklev.c:1571-1594) calls somexy() in a do-while retry
+            # loop:
+            #     do { somex(croom); somey(croom); }
+            #     while (occupied(x, y) || bydoor(x, y));
+            # then on success draws rn2(7) for blessedftn.  All these draws
+            # fire ONLY when the !rn2(10) gate passes — short-circuit via
+            # lax.cond.  The retry-loop somexy draws fire 1..N times until
+            # the candidate cell passes the occupied + bydoor predicates;
+            # earlier code modelled only the first attempt, missing extra
+            # somexy draws on the (sometimes common) seeds where vendor's
+            # first candidate hits an occupied/bydoor cell.
             # Vendor cite: vendor/nle/src/mklev.c:831-832, 1571-1594.
             vrng, fount_roll_v = randint_jax(vrng, (), 0, 10)
             fount_roll = fount_roll_v == jnp.int32(0)
             place_fount = is_ordinary & fount_roll
 
             def _fount_true(carry):
-                v, t, aa = carry
-                # mkfount somexy (single attempt; vendor's tryct loop almost always
-                # succeeds on iter 1 — we model one somexy draw, matching vendor
-                # behaviour on open rooms).
-                v, rf_, cf_ = somexy(v)
-                # rn2(7) blessedftn (mklev.c:1571-1594).
+                v, t, aa, tr = carry
+                # mkfount somexy do-while retry (mklev.c:1578-1585).
+                v, rf_, cf_, done_f = _somexy_retry(v, t, tr)
+                # rn2(7) blessedftn (mklev.c:1590) — vendor draws unconditionally
+                # on retry-loop success; if the retry never succeeded (rare),
+                # vendor's tryct>200 early-return skips this draw too.  We
+                # model the success path (the overwhelming case).
                 v, blessed_ = randint_jax(v, (), 0, 7)
                 blessed_ftn = (blessed_ == jnp.int32(0)).astype(jnp.int8)
-                new_t = t.at[rf_, cf_].set(FOUNTAIN)
-                new_aa = aa.at[flat_lv, rf_, cf_].set(blessed_ftn)
-                return (v, new_t, new_aa)
+                # Only commit the terrain/feature writes when the retry loop
+                # actually accepted a cell; otherwise the placement bailed out.
+                def _commit(args):
+                    tt, aaa = args
+                    new_tt = tt.at[rf_, cf_].set(FOUNTAIN)
+                    new_aaa = aaa.at[flat_lv, rf_, cf_].set(blessed_ftn)
+                    return (new_tt, new_aaa)
+                new_t, new_aa = lax.cond(
+                    done_f, _commit, lambda args: args, (t, aa),
+                )
+                return (v, new_t, new_aa, tr)
 
             def _fount_false(carry):
                 return carry
 
-            vrng, terrain_, features_aa = lax.cond(
-                place_fount, _fount_true, _fount_false, (vrng, terrain_, features_aa)
+            vrng, terrain_, features_aa, traps_tt = lax.cond(
+                place_fount, _fount_true, _fount_false,
+                (vrng, terrain_, features_aa, traps_tt),
             )
 
             # --- Sink: !rn2(60) + mksink internals (vendor mklev.c:833-834) ---
             # Vendor:  if (!rn2(60)) mksink(croom);
-            # mksink (mklev.c:1597-1614) calls somexy in a do/while (no further
-            # rolls on success).  Short-circuit: somexy only when gate passes.
+            # mksink (mklev.c:1597-1614) calls somexy in the same do-while
+            # retry pattern as mkfount, with no further draws on success.
+            # On retry success vendor stamps SINK onto levl[m.x][m.y].typ
+            # (mklev.c:1611) — we mirror that so a later mkaltar in the
+            # same room sees the sink via IS_FURNITURE in its occupied check.
             # Vendor cite: vendor/nle/src/mklev.c:833-834, 1597-1614.
             vrng, _sink_roll = randint_jax(vrng, (), 0, 60)
             _sink_gate = (_sink_roll == jnp.int32(0)) & is_ordinary
 
-            def _sink_true(v):
-                v, _rsk, _csk = somexy(v)
-                return v
+            def _sink_true(carry):
+                v, t, tr = carry
+                v, _rsk, _csk, done_sk = _somexy_retry(v, t, tr)
+                # Stamp SINK onto terrain so subsequent altar/grave/etc.
+                # occupied() probes in the same room see the sink cell
+                # (vendor mklev.c:1611 sets levl[..].typ = SINK).  Skip
+                # the write on retry-loop failure.
+                new_t = jnp.where(
+                    done_sk,
+                    t.at[_rsk, _csk].set(SINK),
+                    t,
+                )
+                return (v, new_t, tr)
 
-            vrng = lax.cond(_sink_gate, _sink_true, lambda v: v, vrng)
+            def _sink_false(carry):
+                return carry
+
+            vrng, terrain_, traps_tt = lax.cond(
+                _sink_gate, _sink_true, _sink_false,
+                (vrng, terrain_, traps_tt),
+            )
 
             # --- Altar: !rn2(60) + mkaltar internals (vendor mklev.c:835-836) ---
             # Vendor:  if (!rn2(60)) mkaltar(croom);
-            # mkaltar (mklev.c:1616-1640) does:  somexy (do/while);  then on
-            # success draws al = rn2(3) - 1 for the altar alignment.
+            # mkaltar (mklev.c:1616-1640) does:  somexy do-while retry;  then
+            # on success draws al = rn2(3) - 1 for the altar alignment.
             # Short-circuit: somexy + rn2(3) only fire on the hit path.
             # Vendor cite: vendor/nle/src/mklev.c:835-836, 1616-1640.
             vrng, altar_roll_v = randint_jax(vrng, (), 0, 60)
@@ -2480,21 +2664,28 @@ def fill_ordinary_rooms(
             place_altar = is_ordinary & altar_roll
 
             def _altar_true(carry):
-                v, t, aa = carry
-                v, ra_, ca_ = somexy(v)
-                # rn2(3) → al = rn2(3) - 1, ALawful+2 = 3 in vendor.
+                v, t, aa, tr = carry
+                v, ra_, ca_, done_a = _somexy_retry(v, t, tr)
+                # rn2(3) → al = rn2(3) - 1, ALawful+2 = 3 in vendor — vendor
+                # draws this unconditionally after the retry loop (mklev.c:1638).
                 v, alt_align_ = randint_jax(v, (), 0, 3)
                 induced_ = alt_align_.astype(jnp.int8)
-                new_t = t.at[ra_, ca_].set(ALTAR)
-                new_aa = aa.at[flat_lv, ra_, ca_].set(induced_)
-                return (v, new_t, new_aa)
+                def _commit(args):
+                    tt, aaa = args
+                    new_tt = tt.at[ra_, ca_].set(ALTAR)
+                    new_aaa = aaa.at[flat_lv, ra_, ca_].set(induced_)
+                    return (new_tt, new_aaa)
+                new_t, new_aa = lax.cond(
+                    done_a, _commit, lambda args: args, (t, aa),
+                )
+                return (v, new_t, new_aa, tr)
 
             def _altar_false(carry):
                 return carry
 
-            vrng, terrain_, features_aa = lax.cond(
+            vrng, terrain_, features_aa, traps_tt = lax.cond(
                 place_altar, _altar_true, _altar_false,
-                (vrng, terrain_, features_aa),
+                (vrng, terrain_, features_aa, traps_tt),
             )
 
             # --- Grave: !rn2(grave_x) + mkgrave internals (vendor mklev.c:840-841) ---
@@ -2617,10 +2808,39 @@ def fill_ordinary_rooms(
                 v, _statue_corpsenm = pick_monster_for_level(
                     None, depth_i, vendor_rng=v,
                 )
-                # Spbook gate: rn2(level_difficulty()/2 + 10).
-                # Vendor mkobj.c:1056 — always drawn; verysmall unmodelled.
-                spbook_mod = jnp.maximum(depth_i // jnp.int32(2) + jnp.int32(10), jnp.int32(1))
-                v, _ = randint_jax(v, (), 0, spbook_mod)
+                # Spbook gate: vendor mkobj.c:1056-1057:
+                #   if (!verysmall(&mons[corpsenm])
+                #       && rn2(level_difficulty()/2 + 10) > 10)
+                #           (void) add_to_container(otmp, mkobj(SPBOOK_CLASS, FALSE));
+                # The ``&&`` short-circuits: when ``verysmall(monster)`` is
+                # true (msize < MZ_SMALL == 1, i.e. MZ_TINY), the ``rn2(...)``
+                # draw NEVER fires.  Previously the draw fired unconditionally
+                # which over-consumed the ISAAC64 stream on tiny-monster
+                # statues — visible as a phantom mod=10 draw immediately
+                # after rndmonnum in seed=9.
+                # Vendor cite: vendor/nle/src/mkobj.c:1056-1057 (spbook gate);
+                #              vendor/nle/include/mondata.h:8 (verysmall);
+                #              vendor/nle/include/monflag.h:162-163 (MZ_*).
+                from Nethax.nethax.subsystems.monster_ai import (
+                    _MONSTER_SIZE_TABLE,
+                    _MZ_SMALL,
+                )
+                _safe_pm = jnp.clip(
+                    _statue_corpsenm.astype(jnp.int32),
+                    0, _MONSTER_SIZE_TABLE.shape[0] - 1,
+                )
+                _pm_msize = _MONSTER_SIZE_TABLE[_safe_pm].astype(jnp.int32)
+                _is_verysmall = _pm_msize < jnp.int32(_MZ_SMALL)
+
+                def _draw_spbook(vv):
+                    spbook_mod = jnp.maximum(
+                        depth_i // jnp.int32(2) + jnp.int32(10),
+                        jnp.int32(1),
+                    )
+                    vv, _ = randint_jax(vv, (), 0, spbook_mod)
+                    return vv
+
+                v = lax.cond(_is_verysmall, lambda vv: vv, _draw_spbook, v)
                 return v
 
             vrng = lax.cond(_statue_gate, _statue_true, lambda v: v, vrng)
