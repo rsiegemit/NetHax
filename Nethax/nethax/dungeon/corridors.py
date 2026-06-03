@@ -17,6 +17,7 @@ Wave 2: connect_segments carves an L-shaped corridor between two rooms
 
 from __future__ import annotations
 
+import functools
 from typing import Tuple
 
 import jax
@@ -1443,6 +1444,47 @@ def _place_niche(
 
 
 def _makeniche(
+    rng: "Isaac64State",
+    gs: "LevelGenState",
+    rooms: "RoomsBox",
+    nroom: jnp.ndarray,
+    trap_type: jnp.ndarray,
+    depth: int = 1,
+) -> tuple["Isaac64State", "LevelGenState"]:
+    """Thin dispatcher — see :func:`_makeniche_body`.
+
+    The real cascade lives in :func:`_makeniche_body`, which is wrapped in a
+    module-level ``@jax.jit`` (:func:`_makeniche_jit`) so XLA compiles the
+    8-attempt ``lax.fori_loop`` body (with its nested SCORR/CORR cascades,
+    wipeout_text fori_loop, dosdoor branches, and consume_mksobj_init_draws /
+    consume_mkobj_random_draws calls) ONCE per ``depth`` value and emits a
+    CALL instruction at every call site.  Prior to this hoist the cascade
+    was inlined into ``make_niches``'s ``lax.fori_loop`` body — XLA profiler
+    flagged the resulting HLO module (module_1644 = 4.9 MB).  Byte-
+    equivalent to the prior inlined body — no draws move, no branch counts
+    change.
+    """
+    return _makeniche_jit(rng, gs, rooms, nroom, trap_type, int(depth))
+
+
+@functools.partial(jax.jit, static_argnames=("depth",))
+def _makeniche_jit(
+    rng: "Isaac64State",
+    gs: "LevelGenState",
+    rooms: "RoomsBox",
+    nroom: jnp.ndarray,
+    trap_type: jnp.ndarray,
+    depth: int,
+) -> tuple["Isaac64State", "LevelGenState"]:
+    """Hoisted ``@jax.jit`` wrapper around the cascade body.  ``depth`` is a
+    Python ``int`` (drives compile-time ``if depth >= 4`` / ``if depth >= 5``
+    branches inside the body); marking it static keeps the closed-over depth
+    constant in the cached executable.  See :func:`_makeniche_body`.
+    """
+    return _makeniche_body(rng, gs, rooms, nroom, trap_type, depth=depth)
+
+
+def _makeniche_body(
     rng: "Isaac64State",
     gs: "LevelGenState",
     rooms: "RoomsBox",
