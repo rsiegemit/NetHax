@@ -1294,6 +1294,7 @@ def consume_mkobj_random_draws(
     *,
     in_rogue: bool = False,
     in_hell: bool = False,
+    artif: bool | jnp.ndarray = True,
 ) -> Isaac64State:
     """Consume vendor ``mkobj(RANDOM_CLASS, artif)`` ISAAC64 draws.
 
@@ -1329,5 +1330,11 @@ def consume_mkobj_random_draws(
     # by (tprob - 1).
     picked_class = table[jnp.clip(tprob - jnp.int32(1), 0, 99)]
     # 3. mksobj_init draws for the picked class.
-    rng = consume_mksobj_init_draws(rng, picked_class)
+    # Vendor mkobj(oclass, artif) ends with `mksobj(i, TRUE, artif)` — the
+    # caller's ``artif`` boolean (TRUE for mkobj_at(0,x,y,TRUE) call sites
+    # like mklev.c:540 inaccessible-niche placement) is propagated into
+    # mksobj_init.  Without this, _weapon_draws skips its rn2(20) artifact
+    # check (mkobj.c:816) and the ISAAC64 stream desyncs.
+    # Vendor cite: vendor/nle/src/mkobj.c:271, vendor/nle/src/mkobj.c:816.
+    rng = consume_mksobj_init_draws(rng, picked_class, artif=artif)
     return rng
