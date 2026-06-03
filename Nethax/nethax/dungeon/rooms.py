@@ -1959,7 +1959,19 @@ def fill_ordinary_rooms(
         new_lit = jnp.where(in_room & room_lit, jnp.bool_(True), cur_lit)
         features_lit = features_lit.at[flat_lv].set(new_lit)
 
-        is_ordinary = act & (
+        # Vendor mklev.c:803 loops ``for (croom = rooms; croom->hx > 0; croom++)``
+        # — a sentinel-terminated walk that STOPS at the first slot with hx<=0.
+        # The vault branch (mklev.c:233-235) sets ``rooms[nroom].hx = -1``
+        # WITHOUT calling add_room, so the vault sits at the sentinel slot and
+        # vendor's fill loop NEVER reaches it.  Without the ``x2 > 0`` guard
+        # below, Nethax's fixed-length scan over MAX_ROOMS_PER_LEVEL processes
+        # the vault slot (rt defaults to ORDINARY=0, ``act`` is True because
+        # ``rlx >= 0``), over-drawing one full fill_features iteration on every
+        # seed where create_vault() succeeded.  Seed=8 (vault at slot 6) is the
+        # canonical case: vendor stops after 6 OROOMs, Nethax used to fill 7.
+        # Vendor cite: vendor/nle/src/mklev.c:803 (loop bound),
+        # vendor/nle/src/mklev.c:233-235 (vault hx = -1 sentinel).
+        is_ordinary = act & (x2 > jnp.int32(0)) & (
             (rt == jnp.int32(int(RoomType.ORDINARY))) |
             (rt == jnp.int32(int(RoomType.THEMEROOM)))
         )
