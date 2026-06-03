@@ -511,7 +511,11 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
         # cascade for RING_MAIL / LONG_SWORD / mlet_zombie_weap[mlev] when it
         # fires.  Vendor: makemon.c:477-481.  See _draw_zombie_initweap.
         int(MonsterSymbol.S_ZOMBIE):    0,   # explicit handler              line 477-481
-        int(MonsterSymbol.S_LIZARD):    2,   # salamander rn2(7) + rn2(3)   line 482-486
+        # S_LIZARD handled explicitly outside the generic loop — gated on
+        # PM_SALAMANDER (the only AT_WEAP S_LIZARD) with chained ternary
+        # `rn2(7) ? SPEAR : rn2(3) ? TRIDENT : STILETTO`.  See
+        # _draw_lizard_initweap.  Vendor: makemon.c:482-486.
+        int(MonsterSymbol.S_LIZARD):    0,   # explicit handler              line 482-486
         int(MonsterSymbol.S_DEMON):     1,   # rn2(4) trident-vs-bullwhip   line 497
     }
     default_count = 1  # default switch case: rnd(14-2*bias) — 1 draw
@@ -886,6 +890,12 @@ _PM_MORDOR_ORC   = _find_pm_index("Mordor orc")
 _PM_URUK_HAI     = _find_pm_index("Uruk-hai")
 _PM_ORC_CAPTAIN  = _find_pm_index("orc-captain")
 _PM_ORC_SHAMAN   = _find_pm_index("orc shaman")
+# S_LIZARD m_initweap is gated on PM_SALAMANDER specifically (vendor
+# makemon.c:483 — `if (mm == PM_SALAMANDER)`); other S_LIZARD entries
+# (newt/gecko/iguana/crocodile/lizard/chameleon) lack AT_WEAP and are
+# already skipped by the outer `is_armed(ptr)` gate.  See
+# _draw_lizard_initweap.
+_PM_SALAMANDER   = _find_pm_index("salamander")
 
 
 def _compute_ogre_gate_divisor() -> jnp.ndarray:
@@ -926,6 +936,7 @@ _IS_PM_MORDOR_ORC:     jnp.ndarray = _compute_is_pm(_PM_MORDOR_ORC)
 _IS_PM_URUK_HAI:       jnp.ndarray = _compute_is_pm(_PM_URUK_HAI)
 _IS_PM_ORC_CAPTAIN:    jnp.ndarray = _compute_is_pm(_PM_ORC_CAPTAIN)
 _IS_PM_ORC_SHAMAN:     jnp.ndarray = _compute_is_pm(_PM_ORC_SHAMAN)
+_IS_PM_SALAMANDER:     jnp.ndarray = _compute_is_pm(_PM_SALAMANDER)
 
 
 # ---------------------------------------------------------------------------
@@ -2151,6 +2162,53 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
             v_after = jax.lax.cond(
                 _MLET_ORC[tid], _draw_orc_initweap, lambda vc: vc, v_after
+            )
+
+            # S_LIZARD: PM_SALAMANDER chained-ternary weapon pick —
+            # vendor makemon.c:482-486:
+            #   case S_LIZARD:
+            #       if (mm == PM_SALAMANDER)
+            #           (void) mongets(mtmp,
+            #                          (rn2(7) ? SPEAR : rn2(3) ? TRIDENT : STILETTO));
+            #       break;
+            # PM_SALAMANDER is the only AT_WEAP S_LIZARD entry (newt /
+            # gecko / iguana / baby crocodile / lizard / chameleon /
+            # crocodile all lack AT_WEAP in vendor monst.c), so non-
+            # salamander S_LIZARDs are already skipped by the outer
+            # is_armed gate.  Gating on _IS_PM_SALAMANDER matches vendor's
+            # explicit `mm == PM_SALAMANDER` check.
+            #
+            # Draws: rn2(7) (1 byte) always; if rn2(7) == 0 then rn2(3)
+            # (1 byte) picks TRIDENT vs STILETTO; plus WEAPON_CLASS
+            # mongets cascade.  SPEAR (P_SPEAR), TRIDENT (P_TRIDENT),
+            # and STILETTO (P_KNIFE) all have positive oc_skill so none
+            # fall in vendor's is_multigen range [-P_SHURIKEN, -P_BOW]
+            # (obj.h:197-204); otyp=0 sentinel reproduces the same byte
+            # cost.  artif=FALSE skips the rn2(20) artifact check.
+            # Previously the generic _INITWEAP_DRAW_COUNT[S_LIZARD]=2
+            # placeholder loop drew rn2(2) twice for ALL salamander
+            # spawns — matching only when the chained ternary fell into
+            # the rn2(7)==0 branch (1/7 of the time) and over-drawing
+            # by 1 byte in the rn2(7) non-zero branch (6/7 of the time).
+            # Cite: vendor/nle/src/makemon.c:482-486 (S_LIZARD branch),
+            #       vendor/nle/src/mkobj.c:803-818 (WEAPON_CLASS mksobj_init).
+            def _draw_lizard_initweap(vc):
+                vc, r7 = randint_jax(vc, (), 0, 7)
+
+                def _trident_or_stiletto(vd):
+                    vd, _r3 = randint_jax(vd, (), 0, 3)
+                    return vd
+
+                vc = jax.lax.cond(
+                    r7 == jnp.int32(0),
+                    _trident_or_stiletto,
+                    lambda vd: vd,
+                    vc,
+                )
+                return _weapon_draws(vc, jnp.int32(0), jnp.bool_(False))
+
+            v_after = jax.lax.cond(
+                _IS_PM_SALAMANDER[tid], _draw_lizard_initweap, lambda vc: vc, v_after
             )
 
             # Trailing offensive-item check — vendor makemon.c:556
