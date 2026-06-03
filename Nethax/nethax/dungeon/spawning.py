@@ -97,6 +97,7 @@ from Nethax.nethax.vendor_rng import (
 from Nethax.nethax.subsystems.random_objects import (
     _armor_draws,
     _weapon_draws,
+    _gem_draws,
     _potion_scroll_draws,
     _wand_draws,
 )
@@ -482,7 +483,10 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
         int(MonsterSymbol.S_KOP):       0,   # explicit handler             line 389-396
         int(MonsterSymbol.S_ORC):       5,   # helm + orc-captain branch    line 397-432
         int(MonsterSymbol.S_OGRE):      1,   # !rn2(N)                       line 434
-        int(MonsterSymbol.S_TROLL):     2,   # !rn2(2) + rn2(4)              line 440-454
+        # S_TROLL handled explicitly outside the generic loop — gate rn2(2)
+        # gates an inner rn2(4) gem-type pick + GEM_CLASS mksobj_init draw.
+        # See _draw_troll_initweap.  Vendor: makemon.c:440-454.
+        int(MonsterSymbol.S_TROLL):     0,   # explicit handler              line 440-454
         # S_KOBOLD handled explicitly outside the generic loop (gate + rn1
         # m_initthrow draw is gate-conditional).  See _draw_kobold_initweap
         # in _consume_makemon_post_hp_draws.  Vendor: makemon.c:456-459.
@@ -832,6 +836,7 @@ _MLET_KOBOLD:      jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOBOLD)
 _MLET_CENTAUR:     jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_CENTAUR)
 _MLET_KOP:         jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOP)
 _MLET_ZOMBIE:      jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_ZOMBIE)
+_MLET_TROLL:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_TROLL)
 _MLET_HUMAN_MERC:  jnp.ndarray = _compute_mlet_human_merc()
 _MLET_HUMAN_SK:    jnp.ndarray = _compute_mlet_human_shopkeeper()
 _MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
@@ -1829,6 +1834,57 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
             v_after = jax.lax.cond(
                 _MLET_ZOMBIE[tid], _draw_zombie_initweap, lambda vc: vc, v_after
+            )
+
+            # S_TROLL: gate rn2(2) gates an inner rn2(4) gem-type pick which
+            # picks one of RUBY/DIAMOND/SAPPHIRE/BLACK_OPAL.  Vendor
+            # makemon.c:440-454:
+            #   case S_TROLL:
+            #       if (!rn2(2)) {
+            #           switch (rn2(4)) {
+            #               case 0: mongets(mtmp, RUBY); break;
+            #               case 1: mongets(mtmp, DIAMOND); break;
+            #               case 2: mongets(mtmp, SAPPHIRE); break;
+            #               case 3: mongets(mtmp, BLACK_OPAL); break;
+            #           }
+            #       }
+            #       break;
+            # The outer rn2(2) always fires; the inner rn2(4) and the
+            # mongets() mksobj_init cascade only fire when rn2(2) == 0
+            # (1/2 probability).  RUBY (413), DIAMOND (412), SAPPHIRE (415),
+            # and BLACK_OPAL (416) all take the GEM_CLASS "other gems" path
+            # at mkobj.c:892 (rn2(6) — one draw), since none are LOADSTONE
+            # (443) or LUCKSTONE (442).  otyp=0 sentinel reproduces the
+            # same byte cost.
+            # Previously the generic loop drew rn2(2) twice (2 bytes),
+            # missing both the gem-type rn2(4) AND the GEM_CLASS mksobj_init
+            # rn2(6) when the outer gate fired.
+            # Cite: vendor/nle/src/makemon.c:440-454 (S_TROLL branch),
+            #       vendor/nle/src/mkobj.c:886-895 (GEM_CLASS mksobj_init).
+            def _draw_troll_initweap(vc):
+                # Outer gate: rn2(2)
+                vc, gate = randint_jax(vc, (), 0, 2)
+
+                def _draw_gem_pick(vd):
+                    # Inner rn2(4) picks the gem type (RUBY/DIAMOND/
+                    # SAPPHIRE/BLACK_OPAL).  All four take the same
+                    # GEM_CLASS draw path so the picked otyp doesn't
+                    # affect byte cost.
+                    vd, _r4 = randint_jax(vd, (), 0, 4)
+                    # GEM_CLASS mksobj_init — rn2(6) one draw for non-
+                    # LUCKSTONE/LOADSTONE gems.
+                    vd = _gem_draws(vd, jnp.int32(0))
+                    return vd
+
+                return jax.lax.cond(
+                    gate == jnp.int32(0),
+                    _draw_gem_pick,
+                    lambda vd: vd,
+                    vc,
+                )
+
+            v_after = jax.lax.cond(
+                _MLET_TROLL[tid], _draw_troll_initweap, lambda vc: vc, v_after
             )
 
             # Trailing offensive-item check — vendor makemon.c:556
