@@ -1604,6 +1604,12 @@ def _makeniche(
                 def _wipe_one(_, carry):
                     rr, engr = carry
                     rr, r1 = rn2_jax(rr, _lth_safe)
+                    # Vendor wipeout_text draws BOTH rn2(lth) AND rn2(4)
+                    # UNCONDITIONALLY (engrave.c:95-96), BEFORE the space
+                    # and trivial-char `continue` checks at engrave.c:106
+                    # and :110.  Per-iter draw count is always 2 outer +
+                    # optional 1 inner (rubouts match).  Vendor cite:
+                    # vendor/nle/src/engrave.c:91-103.
                     rr, r2 = rn2_jax(rr, jnp.int32(4))
                     ch = engr[r1]
                     is_space = ch == _SPACE
