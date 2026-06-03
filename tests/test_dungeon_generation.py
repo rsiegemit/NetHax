@@ -77,7 +77,7 @@ def test_corridor_connectivity():
 
     rng = jax.random.PRNGKey(0)
     static = StaticParams()
-    terrain, _rooms, _active, up_pos, dn_pos = generate_main_branch_l1(rng, static)
+    terrain, _rooms, _active, up_pos, dn_pos, *_rest = generate_main_branch_l1(rng, static)
 
     terrain_np = terrain.__array__() if hasattr(terrain, "__array__") else terrain
     up_r, up_c = int(up_pos[0]), int(up_pos[1])
