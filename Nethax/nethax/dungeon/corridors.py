@@ -54,6 +54,66 @@ _MAX_DOORS: int = 80
 
 
 # ---------------------------------------------------------------------------
+# wipeout_text rubouts table (vendor/nle/src/engrave.c:27-78).
+#
+# Used by ``_wipe_one`` inside the SCORR niche-trap engraving step to model
+# vendor wipeout_text's conditional inner ``rn2(strlen(wipeto))`` draw.
+# Indexed by ASCII code 0..127.  Non-wipefrom chars have len=0; wipefrom
+# chars store ``len`` plus the wipeto chars packed into a fixed-5-slot row.
+# ---------------------------------------------------------------------------
+def _build_rubouts_tables():
+    import numpy as _np
+    rubouts = [
+        ('A', '^'), ('B', 'Pb['), ('C', '('), ('D', '|)['),
+        ('E', '|FL[_'), ('F', '|-'), ('G', 'C('), ('H', '|-'),
+        ('I', '|'), ('K', '|<'), ('L', '|_'), ('M', '|'),
+        ('N', '|\\'), ('O', 'C('), ('P', 'F'), ('Q', 'C('),
+        ('R', 'PF'), ('T', '|'), ('U', 'J'), ('V', '/\\'),
+        ('W', 'V/\\'), ('Z', '/'), ('b', '|'), ('d', 'c|'),
+        ('e', 'c'), ('g', 'c'), ('h', 'n'), ('j', 'i'),
+        ('k', '|'), ('l', '|'), ('m', 'nr'), ('n', 'r'),
+        ('o', 'c'), ('q', 'c'), ('w', 'v'), ('y', 'v'),
+        (':', '.'), (';', ',:'), (',', '.'), ('=', '-'),
+        ('+', '-|'), ('*', '+'), ('@', '0'), ('0', 'C('),
+        ('1', '|'), ('6', 'o'), ('7', '/'), ('8', '3o'),
+    ]
+    lens = _np.zeros(128, dtype=_np.int32)
+    chars = _np.zeros((128, 5), dtype=_np.int32)
+    for src, dst in rubouts:
+        i = ord(src)
+        lens[i] = len(dst)
+        for k, c in enumerate(dst):
+            chars[i, k] = ord(c)
+    return jnp.asarray(lens), jnp.asarray(chars)
+
+
+_RUBOUT_LEN, _RUBOUT_CHARS = _build_rubouts_tables()
+
+# Trivial wipe-to-space set: ``"?.,'`-|_"`` (engrave.c:110).
+_TRIVIAL_WIPE_CHARS = jnp.asarray(
+    [ord(c) for c in "?.,'`-|_"], dtype=jnp.int32
+)
+
+# Engraving template chars padded to length 13 (the longer of the two trap
+# engravings).  Index 0..12.  For lth=11 ("ad aerarium") only [0..10] used.
+def _engr_template(lth):
+    """Return int32[13] of engraving char codes, padded with 0 beyond ``lth``.
+
+    Vendor trap_engravings (engrave.c references trap.c):
+        TRAPDOOR (14):    "Vlad was here"   lth=13
+        TELEP_TRAP (15):  "ad aerarium"     lth=11
+        LEVEL_TELEP(16):  "ad aerarium"     lth=11
+    """
+    import numpy as _np
+    vlad = _np.array([ord(c) for c in "Vlad was here"], dtype=_np.int32)
+    aer  = _np.array([ord(c) for c in "ad aerarium\0\0"], dtype=_np.int32)
+    out_vlad = jnp.asarray(vlad)
+    out_aer  = jnp.asarray(aer)
+    # lth==13 -> vlad; lth==11 -> aer.
+    return jnp.where(lth == jnp.int32(13), out_vlad, out_aer)
+
+
+# ---------------------------------------------------------------------------
 # Public functions
 # ---------------------------------------------------------------------------
 
@@ -1524,14 +1584,69 @@ def _makeniche(
                 )
                 has_engr = _engr_lth != jnp.int32(0)
 
-                def _wipe_one(_, r_carry):
-                    rr = r_carry
-                    rr, _v1 = rn2_jax(rr, jnp.maximum(_engr_lth, jnp.int32(1)))
-                    rr, _v2 = rn2_jax(rr, jnp.int32(4))
-                    return rr
+                # wipeout_text(s, 5, seed=0) — vendor engrave.c:80-142.  Each
+                # iteration draws ``rn2(lth)`` then ``rn2(4)``.  When the
+                # picked char is neither space nor in the trivial-rub set
+                # ``"?.,'\`-|_"``, AND ``use_rubout != 0``, AND the char
+                # matches a wipefrom in the rubouts table (engrave.c:27-78),
+                # vendor draws an inner ``rn2(strlen(wipeto))`` and writes
+                # ``wipeto[j]`` back into the engraving.  Otherwise the cell
+                # is overwritten with ``'?'`` (the unreadable fallback) and
+                # no inner draw fires.  Modelling the dynamic engraving is
+                # required because the same cell can be picked across
+                # iterations — its current contents drive whether the inner
+                # draw fires (seed=7 hits this twice in 5 iterations).
+                _engr_init = _engr_template(_engr_lth)
+                _lth_safe = jnp.maximum(_engr_lth, jnp.int32(1))
+                _SPACE = jnp.int32(ord(' '))
+                _QMARK = jnp.int32(ord('?'))
+
+                def _wipe_one(_, carry):
+                    rr, engr = carry
+                    rr, r1 = rn2_jax(rr, _lth_safe)
+                    rr, r2 = rn2_jax(rr, jnp.int32(4))
+                    ch = engr[r1]
+                    is_space = ch == _SPACE
+                    is_trivial = jnp.any(_TRIVIAL_WIPE_CHARS == ch)
+                    use_rubout = r2 != jnp.int32(0)
+                    ch_idx = jnp.clip(ch, jnp.int32(0), jnp.int32(127))
+                    wipeto_len = _RUBOUT_LEN[ch_idx]
+                    has_rubout = wipeto_len > jnp.int32(0)
+                    # Vendor enters the rubouts loop only when NOT space AND
+                    # NOT trivial AND use_rubout!=0.  Inside, the inner draw
+                    # fires only when a wipefrom row matches.
+                    do_inner = (~is_space) & (~is_trivial) & use_rubout & has_rubout
+                    rr, r3 = lax.cond(
+                        do_inner,
+                        lambda rr_: rn2_jax(rr_, jnp.maximum(wipeto_len, jnp.int32(1))),
+                        lambda rr_: (rr_, jnp.int32(0)),
+                        rr,
+                    )
+                    # Compute the replacement char.  Branches (vendor order):
+                    #   space        -> unchanged (continue, no replace)
+                    #   trivial set  -> ' '
+                    #   use_rubout=0 -> '?' (i=SIZE(rubouts) fallthrough)
+                    #   matched     -> wipeto[r3]
+                    #   no match    -> '?'
+                    replaced_rubout = _RUBOUT_CHARS[ch_idx, jnp.clip(r3, 0, 4)]
+                    new_ch = jnp.where(
+                        is_space, ch,
+                        jnp.where(
+                            is_trivial, _SPACE,
+                            jnp.where(
+                                ~use_rubout, _QMARK,
+                                jnp.where(has_rubout, replaced_rubout, _QMARK),
+                            ),
+                        ),
+                    )
+                    engr = engr.at[r1].set(new_ch)
+                    return rr, engr
 
                 def _do_wipe(rr):
-                    return lax.fori_loop(0, 5, _wipe_one, rr)
+                    rr_out, _engr_final = lax.fori_loop(
+                        0, 5, _wipe_one, (rr, _engr_init),
+                    )
+                    return rr_out
 
                 r_ = lax.cond(has_engr, _do_wipe, lambda rr: rr, r_)
 
