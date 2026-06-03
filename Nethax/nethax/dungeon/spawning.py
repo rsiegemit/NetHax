@@ -521,16 +521,16 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
         # `rn2(7) ? SPEAR : rn2(3) ? TRIDENT : STILETTO`.  See
         # _draw_lizard_initweap.  Vendor: makemon.c:482-486.
         int(MonsterSymbol.S_LIZARD):    0,   # explicit handler              line 482-486
-        # S_DEMON: 1-byte placeholder approximates the default-case
-        # rnd(14-2*bias) selector that fires after FALLTHRU for is_demon
-        # monsters (vendor makemon.c:509-553).  The inner per-PM switch
-        # (PM_BALROG / PM_ORCUS / PM_HORNED_DEVIL / PM_DISPATER /
-        # PM_YEENOGHU) is layered ON TOP via _draw_demon_inner_switch,
-        # adding the exact inner cascade bytes per PM.  Full default-case
-        # modeling (bias + per-case mongets cascades) is a separate fix.
-        int(MonsterSymbol.S_DEMON):     1,   # placeholder for default sel  line 487-505
+        # S_DEMON inner switch handled by _draw_demon_inner_switch outside
+        # the loop; FALLTHRU to default is handled by _draw_default_case
+        # which is wired on _DEFAULT_ELIGIBLE (true for is_demon S_DEMONs).
+        int(MonsterSymbol.S_DEMON):     0,   # explicit (inner + default)   line 487-553
     }
-    default_count = 1  # default switch case: rnd(14-2*bias) — 1 draw
+    # Default case (vendor makemon.c:512-553) is handled by the explicit
+    # _draw_default_case handler outside this loop, wired on _DEFAULT_ELIGIBLE.
+    # Setting count=0 here means the placeholder loop draws nothing; the
+    # explicit handler then draws rnd(14-2*bias) plus the per-case cascade.
+    default_count = 0  # default-case → _draw_default_case (line 512-553)
 
     # Per-monster overrides for PMs whose explicit handler runs OUTSIDE the
     # generic loop and consumes the full byte budget itself; force their loop
@@ -1128,6 +1128,17 @@ _IS_PM_ORCUS:          jnp.ndarray = _compute_is_pm(_PM_ORCUS)
 _IS_PM_HORNED_DEVIL:   jnp.ndarray = _compute_is_pm(_PM_HORNED_DEVIL)
 _IS_PM_DISPATER:       jnp.ndarray = _compute_is_pm(_PM_DISPATER)
 _IS_PM_YEENOGHU:       jnp.ndarray = _compute_is_pm(_PM_YEENOGHU)
+
+# Default-case m_initweap masks — vendor makemon.c:512-553 (default switch).
+# bias = is_lord + is_prince*2 + extra_nasty.  strongmonst gates per-case
+# weak-vs-strong weapon picks.  _DEFAULT_ELIGIBLE flags monsters that
+# reach the default case (non-explicit-mlet OR is_demon S_DEMON fallthrough).
+_IS_PRINCE_MASK:       jnp.ndarray = _compute_is_prince_mask()
+_IS_NASTY_MASK:        jnp.ndarray = _compute_is_nasty_mask()
+_IS_STRONG_MASK:       jnp.ndarray = _compute_is_strong_mask()
+_IS_DEMON_FLAG:        jnp.ndarray = _compute_is_demon_mask()
+_BIAS_TABLE:           jnp.ndarray = _compute_bias_table()
+_DEFAULT_ELIGIBLE:     jnp.ndarray = _compute_default_case_eligible()
 
 
 # ---------------------------------------------------------------------------
@@ -2591,6 +2602,153 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
             v_after = jax.lax.cond(
                 _MLET_DEMON[tid], _draw_demon_inner_switch, lambda vc: vc, v_after
+            )
+
+            # Default-case — vendor makemon.c:512-553.  Fires for:
+            #   (a) any armed monster whose mlet is NOT in the explicit case
+            #       set {S_GIANT, S_HUMAN, S_ANGEL, S_HUMANOID, S_KOP, S_ORC,
+            #       S_OGRE, S_TROLL, S_KOBOLD, S_CENTAUR, S_WRAITH, S_ZOMBIE,
+            #       S_LIZARD, S_DEMON};
+            #   (b) any S_DEMON monster with is_demon(ptr) == TRUE, via
+            #       FALLTHRU from line 511 (`if (!is_demon(ptr)) break;`).
+            # The _DEFAULT_ELIGIBLE mask precomputes membership.
+            #
+            # Vendor body:
+            #     bias = is_lord(ptr) + is_prince(ptr)*2 + extra_nasty(ptr);
+            #     switch (rnd(14 - 2*bias)) {
+            #     case 1:
+            #         if (strongmonst(ptr))
+            #             (void) mongets(mtmp, BATTLE_AXE);
+            #         else
+            #             m_initthrow(mtmp, DART, 12);
+            #         break;
+            #     case 2:
+            #         if (strongmonst(ptr))
+            #             (void) mongets(mtmp, TWO_HANDED_SWORD);
+            #         else {
+            #             (void) mongets(mtmp, CROSSBOW);
+            #             m_initthrow(mtmp, CROSSBOW_BOLT, 12);
+            #         }
+            #         break;
+            #     case 3:
+            #         (void) mongets(mtmp, BOW);
+            #         m_initthrow(mtmp, ARROW, 12);
+            #         break;
+            #     case 4:
+            #         if (strongmonst(ptr))
+            #             (void) mongets(mtmp, LONG_SWORD);
+            #         else
+            #             m_initthrow(mtmp, DAGGER, 3);
+            #         break;
+            #     case 5:
+            #         if (strongmonst(ptr))
+            #             (void) mongets(mtmp, LUCERN_HAMMER);
+            #         else
+            #             (void) mongets(mtmp, AKLYS);
+            #         break;
+            #     default: break;
+            #     }
+            #
+            # Byte costs per case (selector consumes 1 byte ALWAYS):
+            #   case 1 strong: BATTLE_AXE non-multigen → 0 bytes
+            #   case 1 weak:   DART mksobj (rn1(6,6)+rn2(100)=2) + rn1(12,3)=1 → 3
+            #   case 2 strong: TWO_HANDED_SWORD non-multigen → 0 bytes
+            #   case 2 weak:   CROSSBOW(0) + CROSSBOW_BOLT mksobj(2) + rn1(12,3)=1 → 3
+            #   case 3 always: BOW(0) + ARROW mksobj(2) + rn1(12,3)=1 → 3
+            #   case 4 strong: LONG_SWORD non-multigen → 0 bytes
+            #   case 4 weak:   DAGGER non-multigen(0) + rn1(3,3)=1 → 1
+            #   case 5 strong: LUCERN_HAMMER non-multigen → 0 bytes
+            #   case 5 weak:   AKLYS non-multigen → 0 bytes
+            #   default (6+): 0 bytes
+            #
+            # DART (otyp 7), CROSSBOW_BOLT (otyp 6), ARROW (otyp 1) — all in
+            # vendor is_multigen range (negative oc_skill in [-P_SHURIKEN,
+            # -P_BOW]); _weapon_draws with the right otyp triggers the
+            # rn1(6,6) + rn2(100) multigen+poisonable cascade.
+            #
+            # Vendor m_initthrow order (vendor/nle/src/makemon.c:148-160):
+            #   1. mksobj(otyp, TRUE, FALSE) — runs mksobj_init cascade first
+            #   2. otmp->quan = rn1(oquan, 3) — 1 byte AFTER cascade
+            # Must reproduce that order.
+            #
+            # Previously the placeholder loop drew rn2(2)=1 byte for ALL
+            # default-eligible monsters (most armed Dlvl 1 monsters: rats,
+            # dogs, wolves, cats, leopards, etc.).  Vendor average is
+            # ~1.21-1.71 bytes depending on strongmonst, so the placeholder
+            # under-counted by ~0.2-0.7 bytes per default-eligible spawn.
+            #
+            # Cite: vendor/nle/src/makemon.c:512-553 (default case),
+            #       vendor/nle/src/makemon.c:148-160 (m_initthrow body),
+            #       vendor/nle/src/mkobj.c:803-818 (WEAPON_CLASS mksobj_init),
+            #       vendor/nle/include/obj.h:197-204 (is_multigen).
+            _OTYP_DART          = jnp.int32(7)
+            _OTYP_CROSSBOW_BOLT = jnp.int32(6)
+            _OTYP_ARROW         = jnp.int32(1)
+
+            def _draw_default_case(vc):
+                bias = _BIAS_TABLE[tid]
+                # rnd(14 - 2*bias) — vendor selector.  rnd(N) = 1 + rn2(N).
+                # Cast to int32 explicitly so JAX picks a stable dtype.
+                n = jnp.int32(14) - jnp.int32(2) * bias
+                vc, r = rnd_jax(vc, n)
+                is_strong = _IS_STRONG_MASK[tid]
+
+                def _case1(vd):
+                    def _strong(ve):
+                        return ve  # BATTLE_AXE non-multigen → 0 bytes
+                    def _weak(ve):
+                        # m_initthrow(DART, 12): mksobj cascade FIRST, then rn1.
+                        ve = _weapon_draws(ve, _OTYP_DART, jnp.bool_(False))
+                        ve, _ = randint_jax(ve, (), 3, 15)  # rn1(12, 3)
+                        return ve
+                    return jax.lax.cond(is_strong, _strong, _weak, vd)
+
+                def _case2(vd):
+                    def _strong(ve):
+                        return ve  # TWO_HANDED_SWORD non-multigen → 0 bytes
+                    def _weak(ve):
+                        # mongets(CROSSBOW) — non-multigen → 0 bytes
+                        # m_initthrow(CROSSBOW_BOLT, 12)
+                        ve = _weapon_draws(ve, _OTYP_CROSSBOW_BOLT, jnp.bool_(False))
+                        ve, _ = randint_jax(ve, (), 3, 15)  # rn1(12, 3)
+                        return ve
+                    return jax.lax.cond(is_strong, _strong, _weak, vd)
+
+                def _case3(vd):
+                    # mongets(BOW) — non-multigen → 0 bytes
+                    # m_initthrow(ARROW, 12) — always, no strongmonst branch
+                    vd = _weapon_draws(vd, _OTYP_ARROW, jnp.bool_(False))
+                    vd, _ = randint_jax(vd, (), 3, 15)  # rn1(12, 3)
+                    return vd
+
+                def _case4(vd):
+                    def _strong(ve):
+                        return ve  # LONG_SWORD non-multigen → 0 bytes
+                    def _weak(ve):
+                        # m_initthrow(DAGGER, 3) — DAGGER non-multigen (0 bytes)
+                        ve, _ = randint_jax(ve, (), 3, 6)  # rn1(3, 3)
+                        return ve
+                    return jax.lax.cond(is_strong, _strong, _weak, vd)
+
+                def _case5(vd):
+                    # LUCERN_HAMMER or AKLYS — both non-multigen → 0 bytes
+                    return vd
+
+                def _default_case(vd):
+                    return vd  # cases 6..14 → no draw
+
+                # rnd returns 1..N.  Map to switch index [0..5] where
+                # index 5 catches all "default" cases (r >= 6).
+                idx = jnp.clip(r - jnp.int32(1), 0, 5)
+                vc = jax.lax.switch(
+                    idx,
+                    [_case1, _case2, _case3, _case4, _case5, _default_case],
+                    vc,
+                )
+                return vc
+
+            v_after = jax.lax.cond(
+                _DEFAULT_ELIGIBLE[tid], _draw_default_case, lambda vc: vc, v_after
             )
 
             # Trailing offensive-item check — vendor makemon.c:556
