@@ -94,6 +94,7 @@ from Nethax.nethax.vendor_rng import (
     Isaac64State, randint_jax, isaac_weighted_choice, isaac_rndmonst_choice,
     rnd_jax, next_uint64_jax,
 )
+from Nethax.nethax.subsystems.random_objects import _armor_draws
 
 
 # ---------------------------------------------------------------------------
@@ -2109,6 +2110,7 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         # → over-consumed 1 ISAAC64 draw with probability 6/7 for priests.
         # Cite: vendor/nle/src/makemon.c:691-695.
         def _draw_hpr(vv):
+            # Cloak choice (rn2(7) ternary, rn2(3) short-circuited per 634daf8).
             v1, r1 = randint_jax(vv, (), 0, 7)
 
             def _draw_inner_3(vc):
@@ -2118,8 +2120,20 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             v2 = jax.lax.cond(
                 r1 == jnp.int32(0), _draw_inner_3, lambda vc: vc, v1
             )
-            v3, _ = randint_jax(v2, (), 0, 10)
-            return v3
+            # Vendor mongets(cloak) then mongets(SMALL_SHIELD) each call
+            # mksobj(otyp, init=TRUE, artif=FALSE) → mksobj_init ARMOR_CLASS
+            # body (mkobj.c:992-1005).  ROBE/CLOAK_OF_PROTECTION/
+            # CLOAK_OF_MAGIC_RESISTANCE/SMALL_SHIELD are none of FUMBLE_BOOTS/
+            # LEVITATION_BOOTS/HELM_OF_OPPOSITE_ALIGNMENT/GAUNTLETS_OF_FUMBLING
+            # so _armor_draws follows the generic ARMOR_CLASS draw cascade
+            # (rn2(10) outer + conditional rn2(11)/rn2(10)/blessorcurse).
+            # artif=FALSE so the rn2(40) artifact check is skipped.
+            v3 = _armor_draws(v2, jnp.bool_(False))   # cloak
+            v4 = _armor_draws(v3, jnp.bool_(False))   # SMALL_SHIELD
+            # mkmonmoney(mtmp, rn1(10, 20)) — rn2(10) + 20 (mkobj.c:1486-1504
+            # mkgold: amount > 0 path skips the rnd(2)/rnd(3) gold cascade).
+            v5, _ = randint_jax(v4, (), 0, 10)
+            return v5
         v = jax.lax.cond(is_hpr, _draw_hpr, lambda vv: vv, v)
 
         # --- 7. m_initinv tail — vendor makemon.c:794,796,798 ---
