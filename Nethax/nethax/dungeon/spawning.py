@@ -813,6 +813,26 @@ _MLET_HUMAN_SK:    jnp.ndarray = _compute_mlet_human_shopkeeper()
 _MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
 
 
+# Specific monster entry indices for short-circuit-gated m_initinv draws.
+# Vendor uses ``ptr == &mons[PM_X]`` as a C short-circuit AND operand BEFORE
+# the rn2 call, so rn2 only fires when the species matches.  Resolve by name
+# to remain robust against future chunk reordering.
+_PM_ICE_DEVIL   = _find_pm_index("ice devil")
+_PM_MASTER_LICH = _find_pm_index("master lich")
+_PM_ARCH_LICH   = _find_pm_index("arch-lich")
+
+
+def _compute_is_pm(pm_index: int) -> jnp.ndarray:
+    """Bool[NUMMONS]: True only at the given entry index."""
+    flags = [(i == pm_index) for i in range(len(MONSTERS))]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+_IS_PM_ICE_DEVIL:   jnp.ndarray = _compute_is_pm(_PM_ICE_DEVIL)
+_IS_PM_MASTER_LICH: jnp.ndarray = _compute_is_pm(_PM_MASTER_LICH)
+_IS_PM_ARCH_LICH:   jnp.ndarray = _compute_is_pm(_PM_ARCH_LICH)
+
+
 # ---------------------------------------------------------------------------
 # Spawn-time inventory kits
 # ---------------------------------------------------------------------------
@@ -1603,7 +1623,7 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         is_mummy     = _MLET_MUMMY[tid]
         is_qmech     = _MLET_QUANTMECH[tid]
         is_lep       = _MLET_LEPRECHAUN[tid]
-        is_demon_cls = _MLET_DEMON[tid]
+        is_ice_devil = _IS_PM_ICE_DEVIL[tid]
         is_giant_cls = _MLET_GIANT[tid]
         is_lich_cls  = _MLET_LICH[tid]
         is_hmerc     = _MLET_HUMAN_MERC[tid]
@@ -1667,11 +1687,17 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
         v = jax.lax.cond(is_lep, _draw_lep, lambda vv: vv, v)
 
-        # S_DEMON: rn2(4) ice devil gate — vendor makemon.c:770
-        def _draw_demon_cls(vv):
+        # S_DEMON: rn2(4) ice-devil gate — vendor makemon.c:770
+        #   if (ptr == &mons[PM_ICE_DEVIL] && !rn2(4)) ...
+        # C short-circuit: the species check is evaluated FIRST, so rn2(4)
+        # only fires when ptr == PM_ICE_DEVIL.  Gating on the broader
+        # _MLET_DEMON mask drew rn2(4) for every S_DEMON entry (succubus,
+        # vrock, balrog, asmodeus, orcus, ...) when vendor draws 0 for them.
+        # Cite: vendor/nle/src/makemon.c:770.
+        def _draw_ice_devil(vv):
             nv, _ = randint_jax(vv, (), 0, 4)
             return nv
-        v = jax.lax.cond(is_demon_cls, _draw_demon_cls, lambda vv: vv, v)
+        v = jax.lax.cond(is_ice_devil, _draw_ice_devil, lambda vv: vv, v)
 
         # S_GIANT: rn2(m_lev/2) gem-loop count — vendor makemon.c:711
         def _draw_giant_cls(vv):
