@@ -590,23 +590,67 @@ def _weapon_draws(
     return rng
 
 
-def _armor_draws(rng: Isaac64State, artif: jnp.ndarray) -> Isaac64State:
-    """ARMOR_CLASS — vendor mkobj.c:992-1005.
+# Special armor otyps that short-circuit the outer ||-chain (!rn2(11)).
+# Vendor mkobj.c:993-998:
+#   if (rn2(10)
+#       && (otyp == FUMBLE_BOOTS
+#           || otyp == LEVITATION_BOOTS
+#           || otyp == HELM_OF_OPPOSITE_ALIGNMENT
+#           || otyp == GAUNTLETS_OF_FUMBLING
+#           || !rn2(11))) { curse(otmp); otmp->spe = -rne(3); }
+# The `||` short-circuits: when otyp is one of these 4, !rn2(11) is never
+# evaluated and the curse() / rne(3) path is taken directly.
+# otyp ids from constants/objects.py positional indices:
+#   80  helm of opposite alignment, 137 gauntlets of fumbling,
+#   148 fumble boots, 149 levitation boots.
+_OTYP_HELM_OF_OPPOSITE_ALIGNMENT: int = 80
+_OTYP_GAUNTLETS_OF_FUMBLING:      int = 137
+_OTYP_FUMBLE_BOOTS:               int = 148
+_OTYP_LEVITATION_BOOTS:           int = 149
 
-    rn2(10)                              # outer guard  (mkobj.c:993)
-    if outer!=0:
-        rn2(11)                          # inner guard  (mkobj.c:997 via ||)
-        if inner==0: rne(3)             # mkobj.c:999
-        elif rn2(10)==0: rn2(2)+rne(3) # mkobj.c:1000-1002
-        else: blessorcurse(10)          # mkobj.c:1004
-    elif rn2(10)==0: rn2(2)+rne(3)     # mkobj.c:1000-1002
-    else: blessorcurse(10)             # mkobj.c:1004
-    if artif: rn2(40)                   # artifact check  (mkobj.c:1005)
+
+def _armor_draws(rng: Isaac64State, otyp: jnp.ndarray, artif: jnp.ndarray) -> Isaac64State:
+    """ARMOR_CLASS — vendor mkobj.c:992-1006.
+
+    Vendor source::
+
+        if (rn2(10)
+            && (otyp == FUMBLE_BOOTS
+                || otyp == LEVITATION_BOOTS
+                || otyp == HELM_OF_OPPOSITE_ALIGNMENT
+                || otyp == GAUNTLETS_OF_FUMBLING
+                || !rn2(11))) {
+            curse(otmp);
+            otmp->spe = -rne(3);                  // ≥1 draw
+        } else if (!rn2(10)) {
+            otmp->blessed = rn2(2);               // 1 draw
+            otmp->spe = rne(3);                   // ≥1 draw
+        } else
+            blessorcurse(otmp, 10);               // 1–2 draws
+        if (artif && !rn2(40))                     // 1 draw if artif
+            otmp = mk_artifact(otmp, A_NONE);
+
+    Per-otyp behaviour (outer = rn2(10)):
+      outer == 0                                 → else-if chain: rn2(10) + ...
+      outer != 0 AND non-special otyp            → rn2(11); if 0 curse path, else else-if chain
+      outer != 0 AND special otyp                → curse path directly (NO rn2(11))
+
+    The special-otyp short-circuit was previously not modeled (Nethax always
+    drew rn2(11) when outer != 0), over-consuming the stream by 1 draw on
+    every spawn of the 4 special armor otyps where outer != 0.
+
+    Cite: vendor/nle/src/mkobj.c:992-1006.
     """
     rng, outer = rn2_jax(rng, 10)                            # mkobj.c:993
+    is_special = (
+        (otyp == jnp.int32(_OTYP_HELM_OF_OPPOSITE_ALIGNMENT))
+        | (otyp == jnp.int32(_OTYP_GAUNTLETS_OF_FUMBLING))
+        | (otyp == jnp.int32(_OTYP_FUMBLE_BOOTS))
+        | (otyp == jnp.int32(_OTYP_LEVITATION_BOOTS))
+    )
 
     def _inner_branch(r):
-        # outer != 0: evaluate the || chain; LEATHER_ARMOR etc. always reach !rn2(11)
+        # outer != 0 AND not special: evaluate !rn2(11) in the ||-chain.
         r, r11 = rn2_jax(r, 11)                              # mkobj.c:997
         return lax.cond(
             r11 == jnp.int32(0),
@@ -614,6 +658,12 @@ def _armor_draws(rng: Isaac64State, artif: jnp.ndarray) -> Isaac64State:
             lambda rr: _elif_boc(rr),
             r,
         )
+
+    def _special_curse(r):
+        # outer != 0 AND special otyp: curse + spe = -rne(3).  No rn2(11) draw.
+        # Cite: vendor/nle/src/mkobj.c:994-999 (||-chain short-circuit).
+        r, _ = rne_jax(r, 3)                                 # mkobj.c:999
+        return r
 
     def _elif_boc(r):
         r, r10b = rn2_jax(r, 10)                             # mkobj.c:1000
@@ -629,9 +679,14 @@ def _armor_draws(rng: Isaac64State, artif: jnp.ndarray) -> Isaac64State:
         r, _ = rne_jax(r, 3)                                 # mkobj.c:1002
         return r
 
+    def _outer_truthy(r):
+        # When outer != 0, the ||-chain is evaluated.  Special otyps short-
+        # circuit to curse() directly; non-special otyps evaluate !rn2(11).
+        return lax.cond(is_special, _special_curse, _inner_branch, r)
+
     rng = lax.cond(
         outer != jnp.int32(0),
-        _inner_branch,
+        _outer_truthy,
         _elif_boc,
         rng,
     )
@@ -1273,8 +1328,10 @@ def _weapon_branch(rng, otyp, artif):
     return _weapon_draws(rng, otyp, artif)
 
 def _armor_branch(rng, otyp, artif):
-    del otyp
-    return _armor_draws(rng, artif)
+    # otyp threaded through so FUMBLE_BOOTS/LEVITATION_BOOTS/
+    # HELM_OF_OPPOSITE_ALIGNMENT/GAUNTLETS_OF_FUMBLING short-circuit the
+    # !rn2(11) draw.  Cite: vendor/nle/src/mkobj.c:992-1006.
+    return _armor_draws(rng, otyp, artif)
 
 def _noop_branch(rng, otyp, artif):
     del otyp, artif
