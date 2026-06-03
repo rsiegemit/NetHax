@@ -94,7 +94,10 @@ from Nethax.nethax.vendor_rng import (
     Isaac64State, randint_jax, isaac_weighted_choice, isaac_rndmonst_choice,
     rnd_jax, next_uint64_jax,
 )
-from Nethax.nethax.subsystems.random_objects import _armor_draws
+from Nethax.nethax.subsystems.random_objects import (
+    _armor_draws,
+    _potion_scroll_draws,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1822,11 +1825,35 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             )
         v = jax.lax.cond(is_gnome, _draw_gnome, lambda vv: vv, v)
 
-        # S_NYMPH: rn2(2) + rn2(2) — vendor makemon.c:701,703
+        # S_NYMPH: rn2(2) gate + optional mongets(MIRROR), then rn2(2) gate +
+        # optional mongets(POT_OBJECT_DETECTION).  Vendor makemon.c:700-705:
+        #   if (!rn2(2)) (void) mongets(mtmp, MIRROR);
+        #   if (!rn2(2)) (void) mongets(mtmp, POT_OBJECT_DETECTION);
+        # Each mongets() runs mksobj(otyp, init=TRUE, artif=FALSE) which
+        # dispatches the mksobj_init body for the otyp's oclass:
+        #   MIRROR (otyp 205, TOOL_CLASS): mkobj.c:897-966 TOOL switch has no
+        #     case for MIRROR — falls through default → 0 RNG draws.
+        #   POT_OBJECT_DETECTION (POTION_CLASS): mkobj.c:981-987 →
+        #     blessorcurse(otmp, 4) → 1–2 ISAAC64 draws via _potion_scroll_draws.
+        # Previously only the two outer rn2(2) gates were modelled, so the
+        # POT_OBJECT_DETECTION mksobj_init blessorcurse was missing whenever
+        # the second gate passed (probability 1/2 per nymph).
+        # Cite: vendor/nle/src/makemon.c:700-705;
+        #       vendor/nle/src/mkobj.c:981-987 (POTION blessorcurse cascade).
         def _draw_nymph(vv):
-            v1, _ = randint_jax(vv, (), 0, 2)
-            v2, _ = randint_jax(v1, (), 0, 2)
-            return v2
+            # First gate (rn2(2)) — MIRROR mongets, TOOL default = 0 draws.
+            v1, _r1 = randint_jax(vv, (), 0, 2)
+            # Second gate (rn2(2)) — POT_OBJECT_DETECTION mongets.
+            v2, r2 = randint_jax(v1, (), 0, 2)
+            # On second gate fire (r2 == 0), consume POTION_CLASS mksobj_init
+            # blessorcurse(4) draws via _potion_scroll_draws.
+            v3 = jax.lax.cond(
+                r2 == jnp.int32(0),
+                _potion_scroll_draws,
+                lambda vc: vc,
+                v2,
+            )
+            return v3
         v = jax.lax.cond(is_nymph, _draw_nymph, lambda vv: vv, v)
 
         # S_MUMMY: rn2(7) — vendor makemon.c:741
