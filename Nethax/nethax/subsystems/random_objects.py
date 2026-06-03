@@ -718,14 +718,52 @@ def _food_draws(rng: Isaac64State) -> Isaac64State:
     return rng
 
 
-def _gem_draws(rng: Isaac64State) -> Isaac64State:
+# GEM_CLASS otyps with no rn2(6) quantity draw in mksobj_init.
+# Citation: vendor/nle/src/mkobj.c:887-895 (case GEM_CLASS body).
+#   LOADSTONE (mkobj.c:888): early-return after curse() — no RNG draws.
+#   LUCKSTONE (mkobj.c:892): ``otmp->otyp != LUCKSTONE`` short-circuits the
+#     rn2(6) call, dropping the byte from the ISAAC64 stream.
+# otyp ids match constants/objects.py positional indices (luckstone=442,
+# loadstone=443) and vendor onames.h.
+_OTYP_LUCKSTONE: int = 442
+_OTYP_LOADSTONE: int = 443
+
+
+def _gem_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
     """GEM_CLASS — vendor mkobj.c:886-895.
 
-    Most gems: rn2(6) quantity check  (mkobj.c:892).
-    ROCK: rn1(6,6) (1 draw).  LOADSTONE: no draw (curse() is stateless).
-    We model the common gem path: 1 draw.
+    Vendor source (mkobj.c:887-895)::
+
+        case GEM_CLASS:
+            otmp->corpsenm = 0; /* LOADSTONE hack */
+            if (otmp->otyp == LOADSTONE)
+                curse(otmp);                      // no RNG draws
+            else if (otmp->otyp == ROCK)
+                otmp->quan = (long) rn1(6, 6);    // 1 draw
+            else if (otmp->otyp != LUCKSTONE && !rn2(6))
+                otmp->quan = 2L;                  // 1 draw (rn2(6))
+            else
+                otmp->quan = 1L;
+
+    Per-otyp draw counts:
+      LOADSTONE  → 0 draws (curse() is stateless)
+      ROCK       → 1 draw  (rn1(6,6) ≡ rn2(6)+7 — same byte cost as rn2(6))
+      LUCKSTONE  → 0 draws (else-if short-circuits on ``otyp != LUCKSTONE``)
+      other gems → 1 draw  (rn2(6))
     """
-    rng, _ = rn2_jax(rng, 6)                                 # mkobj.c:892
+    # LOADSTONE (otyp 443) and LUCKSTONE (otyp 442) take the curse() and
+    # default branches respectively — both skip the rn2(6) / rn1(6,6) draw.
+    # Cite: vendor/nle/src/mkobj.c:888 (LOADSTONE) and :892 (LUCKSTONE gate).
+    is_loadstone = otyp == jnp.int32(_OTYP_LOADSTONE)
+    is_luckstone = otyp == jnp.int32(_OTYP_LUCKSTONE)
+    skip_draw = is_loadstone | is_luckstone
+
+    rng = lax.cond(
+        skip_draw,
+        lambda r: r,
+        lambda r: rn2_jax(r, 6)[0],                          # mkobj.c:892
+        rng,
+    )
     return rng
 
 
@@ -1182,8 +1220,10 @@ def _wand_branch(rng, otyp, artif):
     return _wand_draws(rng)
 
 def _gem_branch(rng, otyp, artif):
-    del otyp, artif
-    return _gem_draws(rng)
+    del artif
+    # otyp threaded through so LOADSTONE/LUCKSTONE skip the rn2(6) draw.
+    # Cite: vendor/nle/src/mkobj.c:887-895.
+    return _gem_draws(rng, otyp)
 
 
 _MKSOBJ_INIT_BRANCHES = [
