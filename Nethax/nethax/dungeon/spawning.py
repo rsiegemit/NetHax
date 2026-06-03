@@ -1931,7 +1931,31 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             return nv
         v = jax.lax.cond(is_mummy, _draw_mummy, lambda vv: vv, v)
 
-        # S_QUANTMECH: rn2(20) — vendor makemon.c:745
+        # S_QUANTMECH: rn2(20) gate — vendor makemon.c:744-762.
+        #
+        # Vendor body on gate fire:
+        #   otmp = mksobj(LARGE_BOX, FALSE, FALSE);  // init=FALSE
+        #   if ((catcorpse = mksobj(CORPSE, TRUE, FALSE)) != 0) { ... }
+        #
+        # The LARGE_BOX mksobj is init=FALSE (mkobj.c:801 ``if (init)`` gate
+        # skips the entire mksobj_init switch body), so the TOOL_CLASS
+        # LARGE_BOX cascade in mkobj.c:920-924 (rn2(5) olocked + rn2(10)
+        # otrapped + mkbox_cnts) does NOT fire here — _tool_lbox_draws
+        # would over-consume.
+        #
+        # The CORPSE mksobj is init=TRUE so the FOOD_CLASS CORPSE cascade
+        # at mkobj.c:822-836 DOES fire — an undead_to_corpse do-loop
+        # calling rndmonnum() up to 50 tries.  That cascade requires a
+        # rndmonst monster-table port and is deferred (TODO: separate
+        # commit once rndmonnum draws are modelled).
+        #
+        # The remaining cat-corpse manipulation (set_corpsenm, stop_timer,
+        # add_to_container, weight, mpickobj) at lines 755-761 is RNG-free.
+        #
+        # Cite: vendor/nle/src/makemon.c:744-762 (S_QUANTMECH case);
+        #       vendor/nle/src/mkobj.c:801 (init=FALSE skips mksobj_init);
+        #       vendor/nle/src/mkobj.c:822-836 (FOOD_CLASS CORPSE cascade
+        #         — deferred, needs rndmonnum port).
         def _draw_qmech(vv):
             nv, _ = randint_jax(vv, (), 0, 20)
             return nv
