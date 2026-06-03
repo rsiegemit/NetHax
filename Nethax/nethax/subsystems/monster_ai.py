@@ -35,6 +35,7 @@ TODO — later Wave 5 phases:
     - Spellbook list per mage class (Wave 5 Phase 2).
 """
 
+import functools
 from enum import IntEnum
 
 import jax
@@ -3993,6 +3994,34 @@ def pet_within_leash(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
 
 
 def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
+    """Thin dispatcher — see :func:`_pet_move_body`.
+
+    The real cascade lives in :func:`_pet_move_body`, which is wrapped in
+    a module-level ``@jax.jit`` (:func:`_pet_move_jit`) so XLA compiles
+    the ~460-LOC body ONCE per ``vendor_mode`` value (two variants) and
+    emits a CALL instruction at every site instead of inlining the body
+    into the surrounding ``monster_turn`` ``lax.cond`` and the
+    ``monsters_step_all`` ``lax.scan``.  Byte-equivalent to the prior
+    inlined body — the only change is that XLA emits a CALL rather than
+    re-tracing the body at every scan iteration.
+
+    Pattern mirrors :func:`_consume_makemon_post_hp_draws` from
+    spawning.py (commit 15f074e).
+    """
+    return _pet_move_jit(state, rng, monster_idx, bool(_use_vendor_rng()))
+
+
+@functools.partial(jax.jit, static_argnames=("vendor_mode",))
+def _pet_move_jit(state, rng: jax.Array, monster_idx: jnp.ndarray,
+                  vendor_mode: bool):
+    """Hoisted ``@jax.jit`` wrapper around the pet_move body.  See
+    :func:`_pet_move_body` for the implementation.
+    """
+    return _pet_move_body(state, rng, monster_idx, vendor_mode)
+
+
+def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
+                   vendor_mode: bool):
     """Run one turn for a pet (tame) monster.
 
     Vendor-parity behaviour (vendor/nethack/src/dogmove.c::dog_move):
@@ -4394,7 +4423,7 @@ def pet_move(state, rng: jax.Array, monster_idx: jnp.ndarray):
         Cite: vendor/nle/src/dogmove.c lines 862-1126 (dog_move body) and
               vendor/nle/src/monmove.c lines 320, 578 (prelude draws).
         """
-        if _use_vendor_rng():
+        if vendor_mode:
             from Nethax.nethax.subsystems.pet_dog_move import vendor_pet_dog_move
             new_s, new_vrng = vendor_pet_dog_move(s, s.vendor_rng, idx)
             return new_s.replace(vendor_rng=new_vrng)
