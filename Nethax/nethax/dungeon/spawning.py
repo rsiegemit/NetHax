@@ -101,6 +101,7 @@ from Nethax.nethax.subsystems.random_objects import (
     _gem_draws,
     _potion_scroll_draws,
     _wand_draws,
+    _food_draws,
 )
 
 
@@ -1933,7 +1934,13 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
                 vc, gate = randint_jax(vc, (), 0, 4)
 
                 def _draw_initthrow(vd):
-                    # m_initthrow rn1(12, 3) — 1 ISAAC64 word.
+                    # m_initthrow(DART, 12) — vendor makemon.c:148-160:
+                    #   1. mksobj(DART, TRUE, FALSE) — DART (otyp 7) is
+                    #      multigen+poisonable so cascade draws rn1(6,6) +
+                    #      rn2(100) = 2 ISAAC64 words.  artif=FALSE skips
+                    #      the rn2(20) artifact roll.
+                    #   2. otmp->quan = rn1(12, 3) — 1 ISAAC64 word.
+                    vd = _weapon_draws(vd, jnp.int32(7), jnp.bool_(False))
                     nv, _ = randint_jax(vd, (), 3, 15)
                     return nv
 
@@ -1975,7 +1982,15 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
                 vc, gate = randint_jax(vc, (), 0, 2)
 
                 def _draw_initthrow(vd):
-                    # m_initthrow rn1(12, 3) — 1 ISAAC64 word.
+                    # m_initthrow(ARROW/CROSSBOW_BOLT, 12) — vendor
+                    # makemon.c:148-160:
+                    #   1. mksobj(ARROW/CROSSBOW_BOLT, TRUE, FALSE) — both
+                    #      multigen+poisonable so cascade draws rn1(6,6) +
+                    #      rn2(100) = 2 ISAAC64 words.  ARROW=1 and
+                    #      CROSSBOW_BOLT=6 both fall in vendor is_multigen
+                    #      range [-P_SHURIKEN, -P_BOW]; bytes are identical.
+                    #   2. otmp->quan = rn1(12, 3) — 1 ISAAC64 word.
+                    vd = _weapon_draws(vd, jnp.int32(1), jnp.bool_(False))
                     nv, _ = randint_jax(vd, (), 3, 15)
                     return nv
 
@@ -2012,7 +2027,13 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
                 vc, gate1 = randint_jax(vc, (), 0, 4)
 
                 def _draw_creampie(vd):
-                    # m_initthrow rn1(2, 3) — 1 ISAAC64 word.
+                    # m_initthrow(CREAM_PIE, 2) — vendor makemon.c:148-160:
+                    #   1. mksobj(CREAM_PIE, TRUE, FALSE) — CREAM_PIE (otyp
+                    #      262) is FOOD_CLASS; `_food_draws` draws rn2(6)
+                    #      for non-CORPSE/MEAT_RING/KELP_FROND/pudding food
+                    #      (1 byte).
+                    #   2. otmp->quan = rn1(2, 3) — 1 ISAAC64 word.
+                    vd = _food_draws(vd, jnp.int32(262))
                     nv, _ = randint_jax(vd, (), 3, 5)
                     return nv
 
