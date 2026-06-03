@@ -264,7 +264,10 @@ from Nethax.nethax.vendor_rng import (
     rn1_jax,
 )
 from Nethax.nethax.constants.objects import ObjectClass
-from Nethax.nethax.subsystems.random_objects import consume_mksobj_init_draws
+from Nethax.nethax.subsystems.random_objects import (
+    consume_mksobj_init_draws,
+    consume_mkobj_random_draws,
+)
 
 # ---------------------------------------------------------------------------
 # Vendor tile-type constants (vendor/nle/include/rm.h).
@@ -1659,7 +1662,23 @@ def _makeniche(
                         jnp.int32(int(ObjectClass.SCROLL_CLASS)),
                     )
 
-                    r2, _r3mk = rn2_jax(r2, jnp.int32(3))
+                    # if (!rn2(3)) mkobj_at(0, xx, yy + dy, TRUE);
+                    # When r3mk == 0, vendor invokes mkobj() with
+                    # RANDOM_CLASS: rnd(1000) prob + rnd(100) class-pick +
+                    # mksobj_init for the picked class.  Without consuming
+                    # these draws Nethax desyncs by 2+ draws whenever the
+                    # gate fires (seed=5 hits this on the first
+                    # inaccessible-niche placement).
+                    # Vendor cite: vendor/nle/src/mklev.c:539-540,
+                    #              vendor/nle/src/mkobj.c:249-301 (mkobj).
+                    r2, r3mk = rn2_jax(r2, jnp.int32(3))
+                    do_mkobj = r3mk == jnp.int32(0)
+                    r2 = lax.cond(
+                        do_mkobj,
+                        lambda r3: consume_mkobj_random_draws(r3),
+                        lambda r3: r3,
+                        r2,
+                    )
                     return r2, g2
 
                 r_, g_ = lax.cond(has_door, _corr_door, _corr_inaccessible, (r_, g_))

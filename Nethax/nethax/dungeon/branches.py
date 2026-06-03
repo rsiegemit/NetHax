@@ -23,13 +23,78 @@ Wave 2: traverse_stair reads stair_links table; enter_branch updates
 
 from __future__ import annotations
 
+import ctypes
 from enum import IntEnum
 from typing import Tuple
 
 import jax
 import jax.numpy as jnp
 import jax.lax as lax
+import numpy as np
 from flax import struct
+
+
+# ---------------------------------------------------------------------------
+# macOS qsort tie-break emulation
+#
+# Vendor's ``sort_rooms()`` (mklev.c:707) calls ``qsort()`` from libSystem
+# with a comparator that keys on ``lx`` only.  macOS's BSD qsort is NOT
+# stable — when two rooms share an ``lx`` value, qsort partitioning can
+# swap them relative to creation order.  ``jnp.argsort(stable=True)``
+# preserves creation order on ties, producing a different room order than
+# vendor; seed=5 has tied lx=68 rooms and this swap drives a
+# whole-level layout divergence.
+#
+# We reproduce vendor's qsort behavior via a host-side ``pure_callback``
+# that invokes libSystem's actual qsort.  The shape is static (bounded
+# room count) so the callback is JIT-friendly.
+# ---------------------------------------------------------------------------
+
+_libc = ctypes.CDLL("libSystem.dylib")
+_libc.qsort.argtypes = [
+    ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+    ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p),
+]
+_libc.qsort.restype = None
+
+_CMP_TYPE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+
+def _cmp_int32_key(a, b):
+    # First int32 of each 8-byte (key, orig_idx) record is the key.
+    x = ctypes.cast(a, ctypes.POINTER(ctypes.c_int32))[0]
+    y = ctypes.cast(b, ctypes.POINTER(ctypes.c_int32))[0]
+    if x < y:
+        return -1
+    if x > y:
+        return 1
+    return 0
+
+
+_CMP_INT32_CB = _CMP_TYPE(_cmp_int32_key)
+
+
+def _host_qsort_argsort_int32(keys: np.ndarray) -> np.ndarray:
+    """Argsort ``keys`` using macOS libSystem qsort (tie behavior matches
+    vendor's sort_rooms()).  Returns the int32 permutation."""
+    keys = np.ascontiguousarray(keys, dtype=np.int32)
+    n = keys.shape[0]
+    arr = np.empty(n, dtype=[("k", "<i4"), ("o", "<i4")])
+    arr["k"] = keys
+    arr["o"] = np.arange(n, dtype=np.int32)
+    _libc.qsort(arr.ctypes.data, n, 8, _CMP_INT32_CB)
+    return arr["o"].astype(np.int32)
+
+
+def _argsort_macos_qsort(keys: jnp.ndarray) -> jnp.ndarray:
+    """JAX-callable wrapper around libSystem qsort.  Replaces
+    ``jnp.argsort(stable=True)`` for sort_rooms parity (see
+    ``_sort_rooms_by_lx``)."""
+    return jax.pure_callback(
+        _host_qsort_argsort_int32,
+        jax.ShapeDtypeStruct(keys.shape, jnp.int32),
+        keys.astype(jnp.int32),
+    )
 
 # ---------------------------------------------------------------------------
 # Map geometry constants
@@ -914,7 +979,13 @@ def _sort_rooms_by_lx(rooms, active, nroom=None):
     else:
         sort_eligible = active
     sort_key = jnp.where(sort_eligible, rooms.x1.astype(jnp.int32), jnp.int32(81))
-    order = jnp.argsort(sort_key, stable=True)
+    # Vendor sort_rooms() uses libSystem qsort, which is NOT stable on
+    # tied keys.  Emulating with jnp.argsort(stable=True) preserves
+    # creation order on ties — mismatching vendor and breaking seeds
+    # whose room layout has tied lx values (e.g. seed=5 has two rooms
+    # both at lx=68).  Use a host-side qsort callback so the tie order
+    # matches vendor byte-for-byte.
+    order = _argsort_macos_qsort(sort_key)
     sorted_rooms = jax.tree_util.tree_map(lambda f: f[order], rooms)
     sorted_active = active[order]
     return sorted_rooms, sorted_active

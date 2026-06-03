@@ -1287,3 +1287,47 @@ def consume_mksobj_init_draws(
             rng,
         )
     return rng
+
+
+def consume_mkobj_random_draws(
+    rng: Isaac64State,
+    *,
+    in_rogue: bool = False,
+    in_hell: bool = False,
+) -> Isaac64State:
+    """Consume vendor ``mkobj(RANDOM_CLASS, artif)`` ISAAC64 draws.
+
+    Vendor (mkobj.c:249-275): when oclass==RANDOM_CLASS, mkobj() draws
+    ``prob = rnd(1000)``, then ``tprob = rnd(100)`` and walks the per-
+    level iprobs table to pick a class, then walks objects[] by
+    subtracting from prob to pick an otyp.  The picked class then
+    determines mksobj_init's per-class draws (mkobj.c:801-1069).
+
+    This helper consumes exactly that sequence:
+        1. rnd(1000) — type-pick roll (prob)
+        2. rnd(100)  — class-pick roll (tprob)
+        3. consume_mksobj_init_draws(picked_class) — class-specific init
+
+    Use this wherever vendor invokes ``mkobj_at(0, ...)`` or
+    ``mkobj(RANDOM_CLASS, ...)``.
+
+    Citation: vendor/nle/src/mkobj.c:249-301 (mkobj),
+              vendor/nle/src/mkobj.c:801-1069 (mksobj_init switch).
+    """
+    # 1. rnd(1000) — prob (type-pick roll); result not needed for byte parity.
+    rng, _prob = rnd_jax(rng, jnp.int32(1000))
+    # 2. rnd(100) — tprob (class-pick walk).  Pick class table at trace time.
+    rng, tprob = rnd_jax(rng, jnp.int32(100))
+    if in_rogue:
+        table = _ROGUE_TABLE
+    elif in_hell:
+        table = _HELL_TABLE
+    else:
+        table = _MKOBJ_TABLE
+    # vendor walks tprob (rnd(100) ∈ [1..100]) until iprob subtracts to <=0;
+    # _expand_class_table flattens probs to a 100-element class lookup keyed
+    # by (tprob - 1).
+    picked_class = table[jnp.clip(tprob - jnp.int32(1), 0, 99)]
+    # 3. mksobj_init draws for the picked class.
+    rng = consume_mksobj_init_draws(rng, picked_class)
+    return rng
