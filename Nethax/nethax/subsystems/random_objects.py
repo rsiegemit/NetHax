@@ -691,18 +691,60 @@ def _ring_draws(rng: Isaac64State) -> Isaac64State:
     return rng
 
 
-def _amulet_draws(rng: Isaac64State) -> Isaac64State:
+# Special amulet otyps whose curse path skips blessorcurse(10) when rn2(10)!=0.
+# Vendor mkobj.c:970-975:
+#   if (rn2(10) && (otyp == AMULET_OF_STRANGULATION
+#                || otyp == AMULET_OF_CHANGE
+#                || otyp == AMULET_OF_RESTFUL_SLEEP)) curse(otmp);
+#   else blessorcurse(otmp, 10);
+# otyp ids from constants/objects.py positional indices (match vendor onames.h):
+#   180 amulet of strangulation, 181 amulet of restful sleep,
+#   183 amulet of change.
+_OTYP_AMULET_STRANGULATION: int = 180
+_OTYP_AMULET_RESTFUL_SLEEP: int = 181
+_OTYP_AMULET_CHANGE:        int = 183
+
+
+def _amulet_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
     """AMULET_CLASS — vendor mkobj.c:967-975.
 
-    rn2(10)                    # (mkobj.c:970)
-    if != 0 and special: curse (no RNG)
-    else: blessorcurse(10)     # (mkobj.c:975)
+    Vendor source::
 
-    We model the common non-special-amulet path (blessorcurse always fires):
-    rn2(10) + blessorcurse(10)  (1–3 draws total).
+        if (rn2(10) && (otyp == STRANGULATION
+                     || otyp == CHANGE
+                     || otyp == RESTFUL_SLEEP)) {
+            curse(otmp);                    // no further RNG
+        } else {
+            blessorcurse(otmp, 10);         // 1–2 draws
+        }
+
+    Per-otyp draw counts:
+      non-special amulet         : rn2(10) + blessorcurse(10)  → 2–3 draws
+      special amulet, rn2(10)==0 : rn2(10) + blessorcurse(10)  → 2–3 draws
+      special amulet, rn2(10)!=0 : rn2(10)                      → 1 draw
+
+    The special-otyp short-circuit was previously not modeled (Nethax always
+    ran blessorcurse), causing the ISAAC64 stream to over-consume 1–2 draws
+    in ~90 % of spawns of the 3 special amulet otyps.
+
+    Cite: vendor/nle/src/mkobj.c:970-975.
     """
-    rng, _ = rn2_jax(rng, 10)                                # mkobj.c:970
-    return _blessorcurse_jax(rng, 10)                        # mkobj.c:975
+    rng, r10 = rn2_jax(rng, 10)                              # mkobj.c:970
+    is_special = (
+        (otyp == jnp.int32(_OTYP_AMULET_STRANGULATION))
+        | (otyp == jnp.int32(_OTYP_AMULET_RESTFUL_SLEEP))
+        | (otyp == jnp.int32(_OTYP_AMULET_CHANGE))
+    )
+    # Vendor short-circuits blessorcurse when (rn2(10) && special) — i.e. when
+    # the rn2(10) draw was non-zero AND otyp is one of the 3 special amulets.
+    skip_boc = (r10 != jnp.int32(0)) & is_special
+    rng = lax.cond(
+        skip_boc,
+        lambda r: r,
+        lambda r: _blessorcurse_jax(r, 10),                  # mkobj.c:975
+        rng,
+    )
+    return rng
 
 
 def _food_draws(rng: Isaac64State) -> Isaac64State:
@@ -1200,8 +1242,10 @@ def _ring_branch(rng, otyp, artif):
     return _ring_draws(rng)
 
 def _amulet_branch(rng, otyp, artif):
-    del otyp, artif
-    return _amulet_draws(rng)
+    del artif
+    # otyp threaded through so STRANGULATION/CHANGE/RESTFUL_SLEEP skip
+    # blessorcurse when rn2(10) != 0.  Cite: vendor/nle/src/mkobj.c:970-975.
+    return _amulet_draws(rng, otyp)
 
 def _food_branch(rng, otyp, artif):
     del otyp, artif
