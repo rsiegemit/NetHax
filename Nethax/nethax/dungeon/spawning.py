@@ -96,6 +96,7 @@ from Nethax.nethax.vendor_rng import (
 )
 from Nethax.nethax.subsystems.random_objects import (
     _armor_draws,
+    _weapon_draws,
     _potion_scroll_draws,
     _wand_draws,
 )
@@ -491,7 +492,11 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
         # in _consume_makemon_post_hp_draws.  Vendor: makemon.c:461-471.
         int(MonsterSymbol.S_CENTAUR):   0,   # explicit handler              line 462
         int(MonsterSymbol.S_WRAITH):    0,   # no rn2                         line 472-475
-        int(MonsterSymbol.S_ZOMBIE):    3,   # !rn2(4) + !rn2(4) + rn2(3)   line 477-481
+        # S_ZOMBIE handled explicitly outside the generic loop — each of the
+        # three rn2 gates additionally launches a mongets()/mksobj_init
+        # cascade for RING_MAIL / LONG_SWORD / mlet_zombie_weap[mlev] when it
+        # fires.  Vendor: makemon.c:477-481.  See _draw_zombie_initweap.
+        int(MonsterSymbol.S_ZOMBIE):    0,   # explicit handler              line 477-481
         int(MonsterSymbol.S_LIZARD):    2,   # salamander rn2(7) + rn2(3)   line 482-486
         int(MonsterSymbol.S_DEMON):     1,   # rn2(4) trident-vs-bullwhip   line 497
     }
@@ -826,6 +831,7 @@ _MLET_LICH:        jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_LICH)
 _MLET_KOBOLD:      jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOBOLD)
 _MLET_CENTAUR:     jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_CENTAUR)
 _MLET_KOP:         jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOP)
+_MLET_ZOMBIE:      jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_ZOMBIE)
 _MLET_HUMAN_MERC:  jnp.ndarray = _compute_mlet_human_merc()
 _MLET_HUMAN_SK:    jnp.ndarray = _compute_mlet_human_shopkeeper()
 _MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
@@ -1764,6 +1770,65 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
             v_after = jax.lax.cond(
                 _MLET_KOP[tid], _draw_kop_initweap, lambda vc: vc, v_after
+            )
+
+            # S_ZOMBIE: three independent gates each launching a
+            # mongets()/mksobj_init cascade — vendor makemon.c:477-481.
+            #   case S_ZOMBIE:
+            #       if (!rn2(4)) (void) mongets(mtmp, RING_MAIL);
+            #       if (!rn2(4)) (void) mongets(mtmp, LONG_SWORD);
+            #       if (!rn2(3)) (void) mongets(mtmp, mlet_zombie_weap[mlev]);
+            #       break;
+            # Each mongets(otyp) calls mksobj(otyp, init=TRUE, artif=FALSE)
+            # which runs the per-class mksobj_init body.
+            #   RING_MAIL  (otyp 111) → ARMOR_CLASS cascade (mkobj.c:992-1005).
+            #     Not in FUMBLE_BOOTS/LEVITATION_BOOTS/HELM_OF_OPPOSITE_ALIGNMENT/
+            #     GAUNTLETS_OF_FUMBLING shortlist, so otyp=0 sentinel is byte-
+            #     equivalent.  artif=FALSE skips the rn2(40) artifact check.
+            #   LONG_SWORD (otyp 37)  → WEAPON_CLASS cascade (mkobj.c:803-818).
+            #     Not is_multigen/is_poisonable so rn1(6,6) + rn2(100) are
+            #     skipped; otyp=0 sentinel is byte-equivalent.  artif=FALSE
+            #     skips the rn2(20) artifact check.
+            #   mlet_zombie_weap[mlev] → WEAPON_CLASS, level-gated weapon
+            #     table.  All entries are non-projectile melee weapons
+            #     (KNIFE, MACE, SHORT_SWORD, ...), none multigen/poisonable,
+            #     so otyp=0 sentinel reproduces the same byte cost.
+            # Previously the generic loop drew rn2(2) three times (3 bytes
+            # total) which approximated the GATE bytes but missed every
+            # per-mongets mksobj_init cascade.  Add the cascades when each
+            # gate fires.
+            # Cite: vendor/nle/src/makemon.c:477-481 (S_ZOMBIE branch),
+            #       vendor/nle/src/mkobj.c:992-1005 (ARMOR_CLASS mksobj_init),
+            #       vendor/nle/src/mkobj.c:803-818  (WEAPON_CLASS mksobj_init).
+            def _draw_zombie_initweap(vc):
+                # Gate 1: rn2(4) — RING_MAIL armor.
+                vc, gate1 = randint_jax(vc, (), 0, 4)
+                vc = jax.lax.cond(
+                    gate1 == jnp.int32(0),
+                    lambda vd: _armor_draws(vd, jnp.int32(0), jnp.bool_(False)),
+                    lambda vd: vd,
+                    vc,
+                )
+                # Gate 2: rn2(4) — LONG_SWORD weapon.
+                vc, gate2 = randint_jax(vc, (), 0, 4)
+                vc = jax.lax.cond(
+                    gate2 == jnp.int32(0),
+                    lambda vd: _weapon_draws(vd, jnp.int32(0), jnp.bool_(False)),
+                    lambda vd: vd,
+                    vc,
+                )
+                # Gate 3: rn2(3) — mlet_zombie_weap[mlev] weapon.
+                vc, gate3 = randint_jax(vc, (), 0, 3)
+                vc = jax.lax.cond(
+                    gate3 == jnp.int32(0),
+                    lambda vd: _weapon_draws(vd, jnp.int32(0), jnp.bool_(False)),
+                    lambda vd: vd,
+                    vc,
+                )
+                return vc
+
+            v_after = jax.lax.cond(
+                _MLET_ZOMBIE[tid], _draw_zombie_initweap, lambda vc: vc, v_after
             )
 
             # Trailing offensive-item check — vendor makemon.c:556
