@@ -1880,10 +1880,28 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             return nv
         v = jax.lax.cond(is_hsk, _draw_hsk, lambda vv: vv, v)
 
-        # S_HUMAN / priest: rn2(7)+rn2(3)+rn2(10) — vendor makemon.c:691-695
+        # S_HUMAN / priest: rn2(7) + optional rn2(3) + rn2(10).
+        # Vendor makemon.c:691-695:
+        #   (void) mongets(mtmp, rn2(7) ? ROBE
+        #                               : rn2(3) ? CLOAK_OF_PROTECTION
+        #                                        : CLOAK_OF_MAGIC_RESISTANCE);
+        #   (void) mongets(mtmp, SMALL_SHIELD);
+        #   mkmonmoney(mtmp, (long) rn1(10, 20));
+        # C ternary short-circuits: rn2(3) fires ONLY when rn2(7) == 0
+        # (probability 1/7).  The rn1(10, 20) = rn2(10) + 20 in a separate
+        # statement always fires.  Previously this drew rn2(3) every time
+        # → over-consumed 1 ISAAC64 draw with probability 6/7 for priests.
+        # Cite: vendor/nle/src/makemon.c:691-695.
         def _draw_hpr(vv):
-            v1, _ = randint_jax(vv,  (), 0, 7)
-            v2, _ = randint_jax(v1, (), 0, 3)
+            v1, r1 = randint_jax(vv, (), 0, 7)
+
+            def _draw_inner_3(vc):
+                nv, _ = randint_jax(vc, (), 0, 3)
+                return nv
+
+            v2 = jax.lax.cond(
+                r1 == jnp.int32(0), _draw_inner_3, lambda vc: vc, v1
+            )
             v3, _ = randint_jax(v2, (), 0, 10)
             return v3
         v = jax.lax.cond(is_hpr, _draw_hpr, lambda vv: vv, v)
