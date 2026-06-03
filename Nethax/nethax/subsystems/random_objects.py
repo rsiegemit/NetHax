@@ -330,10 +330,12 @@ def class_prob_totals() -> jnp.ndarray:
 # the same input/output pytree structure, which is satisfied since Isaac64State
 # is a flax struct (fixed shape/dtype leaves).
 #
-# RING note: vendor distinguishes charged vs. uncharged rings by otyp.  Since
-# we receive only oclass here, we model the *uncharged* path (the common case
-# for curse-check rings).  The full charged cascade requires otyp-level
-# dispatch and is deferred to a follow-up.
+# RING note: vendor distinguishes charged vs. uncharged rings by oc_charged
+# (vendor/nle/src/objects.c:537-602 RING macro; only adornment, gain
+# strength/constitution, increase accuracy/damage, and protection set
+# spec=1).  ``_ring_draws`` dispatches on a precomputed mask
+# (``_RING_CHARGED_TABLE``) to either the charged enchantment-roll branch
+# (mkobj.c:1029-1042) or the uncharged curse-check branch (mkobj.c:1043-1048).
 #
 # TOOL note: only the common non-container tools are modeled; container types
 # (CHEST/LARGE_BOX/ICE_BOX/BAG_OF_HOLDING) require a recursive mkbox_cnts
@@ -744,49 +746,148 @@ _OTYP_RIN_TELEPORTATION:     int = 171
 _OTYP_RIN_POLYMORPH:         int = 173
 
 
-def _ring_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
+# ---------------------------------------------------------------------------
+# oc_charged ring mask — vendor/nle/src/objects.c:537-602 (RING macro).
+# ---------------------------------------------------------------------------
+# Each RING() entry passes (..., mgc, spec, mohs, ...).  The BITS macro at
+# vendor/nle/src/objects.c:67 maps the 6th arg (`chrg`) into the oc_charged
+# bitfield (objclass.h:59).  The RING macro at objects.c:539 passes ``spec``
+# as ``chrg`` -- i.e. the third numeric column of each RING entry is
+# oc_charged.  In vendor objects.c:542-601 only the first six rings have
+# spec=1 (adornment, gain strength, gain constitution, increase accuracy,
+# increase damage, protection).  Nethax otyp indices for these rings start
+# at 150 (adornment) and run consecutively to 155 (protection).
+#
+# Cite: vendor/nle/src/objects.c:537-602; vendor/nle/include/objclass.h:59.
+_OTYP_RIN_ADORNMENT:         int = 150
+_OTYP_RIN_GAIN_STRENGTH:     int = 151
+_OTYP_RIN_GAIN_CONSTITUTION: int = 152
+_OTYP_RIN_INCREASE_ACCURACY: int = 153
+_OTYP_RIN_INCREASE_DAMAGE:   int = 154
+_OTYP_RIN_PROTECTION:        int = 155
+
+
+def _build_ring_charged_table() -> jnp.ndarray:
+    """Return length-NUM_OBJECTS bool array: True iff oc_charged ring.
+
+    Vendor RING macro (vendor/nle/src/objects.c:537-541) passes ``spec`` into
+    the BITS slot for oc_charged.  Only rings 150-155 in Nethax otyp space
+    set spec=1; all others set spec=0.
+    """
+    n = len(OBJECTS)
+    table = [False] * n
+    for otyp in (
+        _OTYP_RIN_ADORNMENT,
+        _OTYP_RIN_GAIN_STRENGTH,
+        _OTYP_RIN_GAIN_CONSTITUTION,
+        _OTYP_RIN_INCREASE_ACCURACY,
+        _OTYP_RIN_INCREASE_DAMAGE,
+        _OTYP_RIN_PROTECTION,
+    ):
+        table[otyp] = True
+    return jnp.array(table, dtype=jnp.bool_)
+
+
+_RING_CHARGED_TABLE = _build_ring_charged_table()
+
+
+def _ring_draws_charged(rng: Isaac64State) -> Isaac64State:
+    """RING_CLASS (charged path) — vendor mkobj.c:1029-1042.
+
+    Vendor source::
+
+        if (objects[otmp->otyp].oc_charged) {
+            blessorcurse(otmp, 3);               // 1-2 draws
+            switch (rn2(9)) {                     // 1 draw, always
+            case 0:
+                break;                            // +0 draws
+            case 1: case 2: case 3: case 4:
+                otmp->spe = rne(3);              // +rne(3) draws
+                break;
+            case 5:
+                otmp->spe = -rne(3);             // +rne(3) draws
+                ...; break;
+            case 6: case 7: case 8:
+                ...; otmp->spe = -rne(3);        // +rne(3) draws
+                break;
+            }
+        }
+
+    Total per-spawn draw cost:
+        blessorcurse(3)        : 1 or 2 draws
+        rn2(9)                  : 1 draw       (always)
+        rne(3) for r in 1..8    : 1+ draws    (case 0 has 0 rne(3) calls)
+
+    Cite: vendor/nle/src/mkobj.c:1029-1042.
+    """
+    rng = _blessorcurse_jax(rng, 3)                          # mkobj.c:1031
+    rng, r9 = rn2_jax(rng, 9)                                # mkobj.c:1032
+    # All non-zero cases (1..8) call exactly one rne(3); case 0 calls none.
+    rng = lax.cond(
+        r9 != jnp.int32(0),
+        lambda r: rne_jax(r, 3)[0],                          # mkobj.c:1036/1039/1042
+        lambda r: r,
+        rng,
+    )
+    return rng
+
+
+def _ring_draws_uncharged(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
     """RING_CLASS (uncharged path) — vendor mkobj.c:1043-1048.
 
     Vendor source (uncharged branch only)::
 
-        } else if (rn2(10) && (otyp == RIN_TELEPORTATION
-                            || otyp == RIN_POLYMORPH
-                            || otyp == RIN_AGGRAVATE_MONSTER
-                            || otyp == RIN_HUNGER
-                            || !rn2(9))) {
-            curse(otmp);
+        } else {
+            blessorcurse(otmp, 10);            // 1-2 draws
+            if (otmp->otyp == RIN_TELEPORTATION
+                || otmp->otyp == RIN_POLYMORPH
+                || otmp->otyp == RIN_AGGRAVATE_MONSTER
+                || otmp->otyp == RIN_HUNGER
+                || !rn2(9))
+                curse(otmp);
         }
 
     Per-otyp draw counts (uncharged otyps only):
-      r10 == 0                            : rn2(10)              → 1 draw
-      r10 != 0 AND special otyp           : rn2(10)              → 1 draw
-      r10 != 0 AND non-special otyp       : rn2(10) + rn2(9)    → 2 draws
-
-    Previously Nethax always emitted rn2(9) when r10 != 0, over-consuming the
-    ISAAC64 stream by 1 draw on every uncharged spawn of the 4 special otyps.
-
-    The charged-ring path (mkobj.c:1029-1042 — runs when objects[otyp].oc_charged
-    is true) is NOT modeled here; that requires a deeper otyp dispatch and
-    is tracked separately.
+      special otyp                : blessorcurse(10)              → 1-2 draws
+      non-special otyp            : blessorcurse(10) + rn2(9)    → 2-3 draws
 
     Cite: vendor/nle/src/mkobj.c:1043-1048.
     """
-    rng, r10 = rn2_jax(rng, 10)                              # mkobj.c:1043
+    rng = _blessorcurse_jax(rng, 10)                         # mkobj.c:1044
     is_special = (
         (otyp == jnp.int32(_OTYP_RIN_HUNGER))
         | (otyp == jnp.int32(_OTYP_RIN_AGGRAVATE_MONSTER))
         | (otyp == jnp.int32(_OTYP_RIN_TELEPORTATION))
         | (otyp == jnp.int32(_OTYP_RIN_POLYMORPH))
     )
-    # rn2(9) fires iff: rn2(10) was non-zero AND otyp not in the 4 specials.
-    do_inner = (r10 != jnp.int32(0)) & (~is_special)
+    # rn2(9) fires iff otyp is not one of the 4 specials (||-chain short-circuit).
     rng = lax.cond(
-        do_inner,
-        lambda r: rn2_jax(r, 9)[0],                          # mkobj.c:1046
+        ~is_special,
+        lambda r: rn2_jax(r, 9)[0],                          # mkobj.c:1048
         lambda r: r,
         rng,
     )
     return rng
+
+
+def _ring_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
+    """RING_CLASS dispatch — vendor mkobj.c:1029-1048.
+
+    Splits on ``objects[otyp].oc_charged`` (bake from vendor objects.c:537-602
+    via ``_RING_CHARGED_TABLE``).  Charged rings (oc_charged=1) take the
+    enchantment-roll branch at mkobj.c:1029-1042; uncharged rings take the
+    curse-check branch at mkobj.c:1043-1048.
+
+    Cite: vendor/nle/src/mkobj.c:1029-1048.
+    """
+    safe_otyp = jnp.clip(otyp, 0, _RING_CHARGED_TABLE.shape[0] - 1).astype(jnp.int32)
+    is_charged = _RING_CHARGED_TABLE[safe_otyp]
+    return lax.cond(
+        is_charged,
+        lambda r: _ring_draws_charged(r),
+        lambda r: _ring_draws_uncharged(r, safe_otyp),
+        rng,
+    )
 
 
 # Special amulet otyps whose curse path skips blessorcurse(10) when rn2(10)!=0.
@@ -1436,7 +1537,7 @@ _MKSOBJ_INIT_BRANCHES = [
     _noop_branch,          # 1  (unused slot)
     _weapon_branch,        # 2  WEAPON_CLASS   mkobj.c:803-818
     _armor_branch,         # 3  ARMOR_CLASS    mkobj.c:992-1005
-    _ring_branch,          # 4  RING_CLASS     mkobj.c:1028-1048 (uncharged path)
+    _ring_branch,          # 4  RING_CLASS     mkobj.c:1029-1048 (charged + uncharged)
     _amulet_branch,        # 5  AMULET_CLASS   mkobj.c:967-975
     _noop_branch,          # 6  TOOL_CLASS     dispatched via _tool_draws_dispatch
     _food_branch,          # 7  FOOD_CLASS     mkobj.c:880-884
@@ -1493,7 +1594,8 @@ def consume_mksobj_init_draws(
     WEAPON_CLASS  (2):  rn2(11) + branch[rne(3)+rn2(2) | rne(3) | boc(10)]
                         + rn2(100) + rn2(20)            → 4–8 draws typical
     ARMOR_CLASS   (3):  rn2(10) + inner branch + rn2(40)→ 3–8 draws typical
-    RING_CLASS    (4):  rn2(10) + cond rn2(9)           → 1–2 draws
+    RING_CLASS    (4):  charged:   boc(3) + rn2(9) + cond rne(3)  → 3-5 draws
+                        uncharged: boc(10) + cond rn2(9)          → 1-3 draws
     AMULET_CLASS  (5):  rn2(10) + boc(10)               → 2–3 draws
     TOOL_CLASS    (6):  per-otyp dispatch (see _tool_draws_dispatch) — 0–~45 draws
                         for containers (mkobj.c:920-929 → mkbox_cnts)
