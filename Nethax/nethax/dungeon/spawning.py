@@ -473,7 +473,10 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
         int(MonsterSymbol.S_ORC):       5,   # helm + orc-captain branch    line 397-432
         int(MonsterSymbol.S_OGRE):      1,   # !rn2(N)                       line 434
         int(MonsterSymbol.S_TROLL):     2,   # !rn2(2) + rn2(4)              line 440-454
-        int(MonsterSymbol.S_KOBOLD):    1,   # !rn2(4)                       line 457
+        # S_KOBOLD handled explicitly outside the generic loop (gate + rn1
+        # m_initthrow draw is gate-conditional).  See _draw_kobold_initweap
+        # in _consume_makemon_post_hp_draws.  Vendor: makemon.c:456-459.
+        int(MonsterSymbol.S_KOBOLD):    0,   # explicit handler              line 457
         int(MonsterSymbol.S_CENTAUR):   1,   # rn2(2)                        line 462
         int(MonsterSymbol.S_WRAITH):    0,   # no rn2                         line 472-475
         int(MonsterSymbol.S_ZOMBIE):    3,   # !rn2(4) + !rn2(4) + rn2(3)   line 477-481
@@ -808,6 +811,7 @@ _MLET_LEPRECHAUN:  jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_LEPRECHAUN)
 _MLET_DEMON:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_DEMON)
 _MLET_GIANT:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_GIANT)
 _MLET_LICH:        jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_LICH)
+_MLET_KOBOLD:      jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOBOLD)
 _MLET_HUMAN_MERC:  jnp.ndarray = _compute_mlet_human_merc()
 _MLET_HUMAN_SK:    jnp.ndarray = _compute_mlet_human_shopkeeper()
 _MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
@@ -1620,6 +1624,38 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
             v_after, _ = jax.lax.while_loop(
                 _cond, _body, (vv, jnp.int32(0))
             )
+
+            # S_KOBOLD: explicit gate + m_initthrow draw — vendor makemon.c:456-459
+            #   case S_KOBOLD:
+            #       if (!rn2(4))
+            #           m_initthrow(mtmp, DART, 12);   /* rn1(12, 3) */
+            # Vendor draws rn2(4) unconditionally (the gate) and rn1(12, 3)
+            # only when the gate result is 0 (1/4 of the time).  The generic
+            # loop placeholder couldn't model the gate-conditional rn1 since
+            # it draws rn2(2) regardless of the real gate value.  Bypass the
+            # loop for kobolds (count=0 in _INITWEAP_DRAW_COUNT) and consume
+            # the real rn2(4) here, then conditionally rn1.
+            # Cite: vendor/nle/src/makemon.c:456-459 (S_KOBOLD case),
+            #       vendor/nle/src/makemon.c:148-160 (m_initthrow rn1).
+            def _draw_kobold_initweap(vc):
+                vc, gate = randint_jax(vc, (), 0, 4)
+
+                def _draw_initthrow(vd):
+                    # m_initthrow rn1(12, 3) — 1 ISAAC64 word.
+                    nv, _ = randint_jax(vd, (), 3, 15)
+                    return nv
+
+                return jax.lax.cond(
+                    gate == jnp.int32(0),
+                    _draw_initthrow,
+                    lambda vd: vd,
+                    vc,
+                )
+
+            v_after = jax.lax.cond(
+                _MLET_KOBOLD[tid], _draw_kobold_initweap, lambda vc: vc, v_after
+            )
+
             # Trailing offensive-item check — vendor makemon.c:556
             #   if ((int) mtmp->m_lev > rn2(75)) (void) mongets(...)
             v_after, _ = randint_jax(v_after, (), 0, 75)
