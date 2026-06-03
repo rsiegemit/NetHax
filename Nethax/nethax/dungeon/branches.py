@@ -1642,20 +1642,12 @@ def generate_main_branch_l1(
         # always takes the SCORR branch (matching vendor mklev.c:504).
         _TELEP_TRAP = jnp.int32(15)
 
-        # Capture the 4 fill_room VAULT gold amounts so the wrapper can
-        # materialise COIN_CLASS piles into ``state.ground_items``.  Vendor
-        # cite: vendor/nle/src/sp_lev.c:2447-2452 — ``mkgold(rn1(depth*100,
-        # 51), x, y)`` for every cell (x, y) in the 2x2 vault interior.
-        # On Main Dlvl 1 depth==1 so the rn1 reduces to ``51 + rn2(100)``;
-        # the four rn2(100) draws below were already consumed (and
-        # discarded) for ISAAC64 byte parity — we now keep the values.
         def _do_vault_draws(carry):
-            v, gs_, _amts = carry
-            v, _a0 = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 0
-            v, _a1 = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 1
-            v, _a2 = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 2
-            v, _a3 = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 3
-            _amts = jnp.stack([_a0, _a1, _a2, _a3]).astype(jnp.int32)
+            v, gs_ = carry
+            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 0
+            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 1
+            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 2
+            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 3
             # makevtele gate — vendor mklev.c:752 ``if (!level.flags.noteleport
             # && !rn2(3)) makevtele();``.  On Main Dlvl 1 noteleport=False is
             # static, so the gate reduces to !rn2(3) (gate fires when r==0).
@@ -1677,23 +1669,14 @@ def generate_main_branch_l1(
             v, gs_ = lax.cond(
                 gate_fires, _do_makevtele, lambda rg: rg, (v, gs_),
             )
-            return v, gs_, _amts
+            return v, gs_
 
         def _skip_do_vault_draws(carry):
             return carry
 
-        _vault_gold_amts_init = jnp.zeros((4,), dtype=jnp.int32)
-        vendor_rng, _lgs, _vault_gold_rn2 = lax.cond(
+        vendor_rng, _lgs = lax.cond(
             _vault_created_in_makerooms,
-            _do_vault_draws, _skip_do_vault_draws,
-            (vendor_rng, _lgs, _vault_gold_amts_init),
-        )
-        # rn1(100, 51) = 51 + rn2(100); zero when no vault (gated on
-        # ``_vault_created_in_makerooms`` at the call site).
-        _vault_gold_amounts = jnp.where(
-            _vault_created_in_makerooms,
-            _vault_gold_rn2 + jnp.int32(51),
-            jnp.zeros((4,), dtype=jnp.int32),
+            _do_vault_draws, _skip_do_vault_draws, (vendor_rng, _lgs),
         )
         del _lgs, _rooms_box, _rooms_box_postvault
 
@@ -1880,37 +1863,9 @@ def generate_main_branch_l1(
     else:
         _nroom_for_fill = active.sum().astype(jnp.int32)
 
-    # Vault gold metadata — used by the wrapper to write fill_room VAULT
-    # gold piles into ``state.ground_items`` after this function returns.
-    # Vendor cite: vendor/nle/src/sp_lev.c:2447-2452.  Threefry layout
-    # path (vendor_rng is None) never produces a vault, so the metadata
-    # is the zero-vault sentinel.
-    if vendor_rng is not None:
-        try:
-            _vault_info = (
-                _vault_created_in_makerooms,
-                _vault_x.astype(jnp.int32),
-                _vault_y.astype(jnp.int32),
-                _vault_gold_amounts,
-            )
-        except NameError:
-            _vault_info = (
-                jnp.bool_(False),
-                jnp.int32(0),
-                jnp.int32(0),
-                jnp.zeros((4,), dtype=jnp.int32),
-            )
-    else:
-        _vault_info = (
-            jnp.bool_(False),
-            jnp.int32(0),
-            jnp.int32(0),
-            jnp.zeros((4,), dtype=jnp.int32),
-        )
-
     return (
         terrain, rooms, active, up_stair_pos, down_stair_pos, vendor_rng,
-        vendor_levl_grid, _nroom_for_fill, _vault_info,
+        vendor_levl_grid, _nroom_for_fill,
     )
 
 
@@ -2008,13 +1963,10 @@ def generate_main_branch_l1_with_features(
 
     (
         terrain, rooms, active, up_pos, dn_pos, vendor_rng, vendor_levl_grid,
-        _nroom_for_fill, _vault_info,
+        _nroom_for_fill,
     ) = generate_main_branch_l1(
         k_level, static_params, n_rooms=n_rooms, vendor_rng=vendor_rng,
     )
-    (
-        _vault_created, _vault_x_int, _vault_y_int, _vault_gold_amounts,
-    ) = _vault_info
 
     # vendor/nle/src/mklev.c:738-762 — do_vault() block runs BEFORE
     # fill_ordinary_rooms.  Thread vendor_rng so the rn2(2) vault gate
@@ -2107,97 +2059,6 @@ def generate_main_branch_l1_with_features(
             _mineralize_grid, vendor_rng = _mineralize(
                 _mineralize_grid, vendor_rng, depth=depth, dunlev=depth,
             )
-
-    # Vault fill_room gold — vendor/nle/src/sp_lev.c:2447-2452:
-    #     for (x = croom->lx; x <= croom->hx; x++)
-    #         for (y = croom->ly; y <= croom->hy; y++)
-    #             mkgold(rn1(abs(depth) * 100, 51), x, y);
-    # The four ``rn2(100)`` draws were already consumed in
-    # ``generate_main_branch_l1::_do_vault_draws`` (now captured as
-    # ``_vault_gold_amounts``); here we materialise each amount as a
-    # COIN_CLASS / GOLD_PIECE pile in ``state.ground_items`` using the
-    # same g_at merge semantics as ``rooms.py::_mkgold_true``.  Vendor's
-    # nested-loop order is X-outer / Y-inner, so amounts map to:
-    #     amounts[0] -> (x=lx, y=ly)   amounts[1] -> (x=lx, y=hy)
-    #     amounts[2] -> (x=hx, y=ly)   amounts[3] -> (x=hx, y=hy)
-    # ground_items is indexed [branch, level, row=y, col=x, slot].
-    # Cite: vendor/nle/src/sp_lev.c:2447-2452 (fill_room VAULT);
-    #       vendor/nle/src/mkobj.c:1486-1504 (mkgold + g_at merge).
-    if state is not None and vendor_rng is not None:
-        from Nethax.nethax.subsystems.inventory import ItemCategory as _IC
-        _br = int(flat_lv) // MAX_LEVELS_PER_BRANCH
-        _lv = int(flat_lv) %  MAX_LEVELS_PER_BRANCH
-        _COIN_CAT = jnp.int8(int(_IC.COIN))
-        _GOLD_OTYP = jnp.int16(410)
-
-        _gcat = state.ground_items.category
-        _gtyp = state.ground_items.type_id
-        _gqty = state.ground_items.quantity
-
-        # Vault interior bounds: lx, hx=lx+1, ly, hy=ly+1.
-        _vx = _vault_x_int
-        _vy = _vault_y_int
-        _cell_xy = jnp.stack([
-            jnp.stack([_vx,                 _vy                ]),  # tile 0
-            jnp.stack([_vx,                 _vy + jnp.int32(1)]),  # tile 1
-            jnp.stack([_vx + jnp.int32(1),  _vy                ]),  # tile 2
-            jnp.stack([_vx + jnp.int32(1),  _vy + jnp.int32(1)]),  # tile 3
-        ])  # shape [4, 2]
-
-        # Clip the cell indices to [0, MAP-1] so a no-vault sentinel (-1)
-        # does not produce a negative gather (the actual write is gated
-        # below on ``_vault_created``).  This keeps the gather in-bounds
-        # for XLA without changing behaviour when the vault DID succeed
-        # (vendor vault_x/y are always > 0 in that case).
-        _MAP_H = _gcat.shape[2]
-        _MAP_W = _gcat.shape[3]
-
-        def _write_one(carry, idx):
-            gcat_g, gtyp_g, gqty_g = carry
-            _x = jnp.clip(_cell_xy[idx, 0], 0, _MAP_W - 1)
-            _y = jnp.clip(_cell_xy[idx, 1], 0, _MAP_H - 1)
-            _amount = _vault_gold_amounts[idx]
-            # g_at merge: existing COIN stack at (row=y, col=x) → accumulate
-            # quan; otherwise write into first empty slot.
-            _cell_cats = gcat_g[_br, _lv, _y, _x]
-            _coin_mask = _cell_cats == _COIN_CAT
-            _empty_mask = _cell_cats == jnp.int8(0)
-            _has_coin = jnp.any(_coin_mask)
-            _coin_slot = jnp.argmax(_coin_mask.astype(jnp.int32))
-            _empty_slot = jnp.argmax(_empty_mask.astype(jnp.int32))
-            _slot = jnp.where(_has_coin, _coin_slot, _empty_slot).astype(jnp.int32)
-            _existing_qty = gqty_g[_br, _lv, _y, _x, _slot].astype(jnp.int32)
-            _new_qty_i32 = jnp.where(
-                _has_coin, _existing_qty + _amount, _amount,
-            )
-            _new_qty = jnp.clip(
-                _new_qty_i32, 0, jnp.iinfo(jnp.int16).max,
-            ).astype(jnp.int16)
-            # Only commit when vault was created — otherwise leave the
-            # ground_items arrays untouched (gate via lax.cond so the
-            # write is JIT-pure).
-            def _commit(g):
-                gc, gt, gq = g
-                gc = gc.at[_br, _lv, _y, _x, _slot].set(_COIN_CAT)
-                gt = gt.at[_br, _lv, _y, _x, _slot].set(_GOLD_OTYP)
-                gq = gq.at[_br, _lv, _y, _x, _slot].set(_new_qty)
-                return gc, gt, gq
-
-            gcat_g, gtyp_g, gqty_g = lax.cond(
-                _vault_created,
-                _commit, lambda g: g, (gcat_g, gtyp_g, gqty_g),
-            )
-            return (gcat_g, gtyp_g, gqty_g), None
-
-        (_gcat, _gtyp, _gqty), _ = lax.scan(
-            _write_one, (_gcat, _gtyp, _gqty),
-            jnp.arange(4, dtype=jnp.int32),
-        )
-        state = state.replace(
-            ground_items=state.ground_items.replace(
-                category=_gcat, type_id=_gtyp, quantity=_gqty,
-            ),
-        )
 
     # Threefry-only post-pass (NOT a vendor call): stamp fountain / sink /
     # grave / throne tiles onto random FLOOR cells.  Vendor's make_niches

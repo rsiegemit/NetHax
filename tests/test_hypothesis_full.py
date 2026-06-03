@@ -235,7 +235,7 @@ def _bfs_reachable(terrain: np.ndarray, start_r: int, start_c: int,
 def test_dungeon_gen_seeds(seed: int):
     """Fuzz dungeon generator: connectivity, bounds, stair counts."""
     rng = jax.random.PRNGKey(seed)
-    terrain, _rooms, active, up_pos, dn_pos, *_rest = generate_main_branch_l1(rng, _STATIC)
+    terrain, _rooms, active, up_pos, dn_pos = generate_main_branch_l1(rng, _STATIC)
 
     terrain_np = np.asarray(terrain)
     up_r, up_c = int(up_pos[0]), int(up_pos[1])

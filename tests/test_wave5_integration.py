@@ -208,7 +208,7 @@ def test_cross_branch_main_to_mines_to_main_terrain_preserved():
 
     # Plant a real Main Dlvl 3 terrain.
     sp = StaticParams()
-    terrain_main3, _r, _a, _u, _d, *_rest = generate_main_branch_l1(rng, sp)
+    terrain_main3, _r, _a, _u, _d = generate_main_branch_l1(rng, sp)
     state = state.replace(
         terrain=state.terrain.at[int(Branch.MAIN), 2].set(terrain_main3),
         dungeon=state.dungeon.replace(
