@@ -565,18 +565,38 @@ class NethaxEnv:
         # on turn 0.  Dark rooms / corridors then reveal only via the LOS rays
         # within the hero's light radius.
         _h, _w = terrain_l0_full.shape
+        # Raw Bresenham LOS (no dark-cell gate yet) — used twice below:
+        #   1. As the `los_mask` for ``lit_room_flood``'s door gate (vendor
+        #      vision.c:744-785 only sets IN_SIGHT on a viz_clear door when the
+        #      shadow-caster reaches it; Bresenham approximates that — a wall
+        #      corner adjacent to the door stops the ray on the wall, so the
+        #      door cell isn't reached).
+        #   2. As the input to the dark-cell gate (which is applied locally
+        #      below rather than via ``compute_fov(lit_mask=...)``, so we
+        #      compute the raycast exactly once).
+        vis_raw = compute_fov(
+            terrain_l0_full,
+            state.player_pos.astype(jnp.int32),
+            lit_mask=None,
+        )                                                  # bool[MAP_H, MAP_W]
         lit_flood = lit_room_flood(
             state.player_pos.astype(jnp.int32),
             _rooms.x1, _rooms.y1, _rooms.x2, _rooms.y2,
             _active, _rooms.is_lit,
             _h, _w,
+            terrain=terrain_l0_full,
+            los_mask=vis_raw,
         )                                                  # bool[MAP_H, MAP_W]
-        vis = compute_fov(
-            terrain_l0_full,
-            state.player_pos.astype(jnp.int32),
-            lit_mask=lit_flood,
-        )                                                  # bool[MAP_H, MAP_W]
-        vis = vis | lit_flood
+        # Local dark-cell gate (mirrors fov.compute_fov's lit_mask branch).
+        # A Bresenham-reached cell is actually SEEN iff it's lit OR within the
+        # hero's own light radius (Chebyshev <= 1).  Vendor: vision.c:320-335.
+        _pr = state.player_pos[0].astype(jnp.int32)
+        _pc = state.player_pos[1].astype(jnp.int32)
+        _rr = jnp.arange(_h, dtype=jnp.int32)[:, None]
+        _cc = jnp.arange(_w, dtype=jnp.int32)[None, :]
+        _cheb = jnp.maximum(jnp.abs(_rr - _pr), jnp.abs(_cc - _pc))
+        _within_light = _cheb <= jnp.int32(1)
+        vis = (vis_raw & (lit_flood | _within_light)) | lit_flood
         new_explored = state.explored.at[0, 0].set(
             state.explored[0, 0] | vis
         )

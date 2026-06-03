@@ -278,6 +278,8 @@ def lit_room_flood(
     room_lit: jnp.ndarray,
     h: int,
     w: int,
+    terrain: jnp.ndarray | None = None,
+    los_mask: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """Flood-visibility mask for the hero's containing LIT room.
 
@@ -305,6 +307,37 @@ def lit_room_flood(
         room_active: bool[n_rooms] — placed-room mask.
         room_lit:    bool[n_rooms] — per-room lit flag (rlit).
         h, w: map dimensions (static).
+        terrain: optional int[h, w] tile grid.  When provided together with
+            ``los_mask``, transparent door cells (DOORWAY / OPEN_DOOR) in the
+            perimeter ring are gated on Bresenham LOS so vendor-blocked
+            doorways stop being flooded as visible.  See "Door gate" below.
+        los_mask: optional bool[h, w] of Bresenham LOS from the hero (i.e.
+            ``compute_fov(... lit_mask=None)``).  Gates transparent doors when
+            paired with ``terrain``.
+
+    Door gate (vendor parity).  Vendor's main-loop branch in vision_recalc
+    (vendor/nle/src/vision.c:744-785) treats lit-room perimeter cells in two
+    distinct ways:
+
+      * Walls and ``!viz_clear`` doors (closed/locked/trapped) — opaque cells
+        whose room-interior neighbour is lit — are made ``IN_SIGHT`` via the
+        "fake LOS from inward neighbour" rule (lines 749-774).  Every wall on
+        a lit room's bounding ring qualifies; the flood matches that exactly.
+
+      * ``viz_clear`` doors (doorless DOORWAY, OPEN_DOOR) take the else-branch
+        at line 776: they receive ``IN_SIGHT`` only when the shadow-caster
+        actually reached them (``COULD_SEE`` set in ``next_array``).  A
+        diagonally-adjacent wall corner can shadow such a doorway out of
+        ``COULD_SEE`` (e.g. seed=4 dlvl 1: hero @ internal (8, 7), HWALL @
+        (9, 8) shadows the DOORWAY @ (9, 9), so NLE renders (9, 9) as
+        ``S_stone``).  Bresenham LOS catches that case because the ray
+        ``(8, 7) -> (9, 9)`` lands on the wall (9, 8) first and stops.
+
+    The gate: a perimeter cell is kept in the flood IFF it is **not** a
+    transparent door, OR ``los_mask`` reaches it.  Opaque doors and walls
+    are unaffected.  Cite: vendor/nle/src/vision.c::does_block lines 164-167
+    (D_CLOSED/D_LOCKED/D_TRAPPED block, D_NODOOR/D_BROKEN do not) and
+    vision_recalc lines 744-785 (the two-branch lit/IN_SIGHT decision).
 
     Returns:
         bool[h, w] mask, True for cells flooded by the hero's lit room.
@@ -337,7 +370,21 @@ def lit_room_flood(
         return in_box & contains[i]
 
     masks = jax.vmap(room_mask)(jnp.arange(x1.shape[0]))  # (n_rooms, h, w)
-    return jnp.any(masks, axis=0)
+    flood = jnp.any(masks, axis=0)
+
+    # Door gate: transparent doors (DOORWAY/OPEN_DOOR) in the flood require
+    # actual Bresenham LOS.  See vendor reference in the docstring above.
+    # Import here to avoid a circular import with the TileType enum module
+    # being itself imported in fov.py at top.
+    if terrain is not None and los_mask is not None:
+        from Nethax.nethax.constants import TileType
+        is_transparent_door = (
+            (terrain == jnp.int32(int(TileType.DOORWAY)))
+            | (terrain == jnp.int32(int(TileType.OPEN_DOOR)))
+        )
+        # Keep the cell in the flood unless it's a transparent door without LOS.
+        flood = flood & ((~is_transparent_door) | los_mask)
+    return flood
 
 
 def update_explored(
