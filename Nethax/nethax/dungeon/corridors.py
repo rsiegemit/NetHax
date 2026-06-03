@@ -1604,24 +1604,16 @@ def _makeniche(
                 def _wipe_one(_, carry):
                     rr, engr = carry
                     rr, r1 = rn2_jax(rr, _lth_safe)
+                    # Vendor wipeout_text draws BOTH rn2(lth) AND rn2(4)
+                    # UNCONDITIONALLY (engrave.c:95-96), BEFORE the space
+                    # and trivial-char `continue` checks at engrave.c:106
+                    # and :110.  Per-iter draw count is always 2 outer +
+                    # optional 1 inner (rubouts match).  Vendor cite:
+                    # vendor/nle/src/engrave.c:91-103.
+                    rr, r2 = rn2_jax(rr, jnp.int32(4))
                     ch = engr[r1]
                     is_space = ch == _SPACE
                     is_trivial = jnp.any(_TRIVIAL_WIPE_CHARS == ch)
-                    # Vendor wipeout_text (vendor/nle/src/engrave.c:80-142)
-                    # SHORT-CIRCUITS the rn2(4) useRubout draw when the picked
-                    # char is space or in the trivial set ("?.,'`-|_") — those
-                    # branches `continue` BEFORE the `useRubout = rn2(4) ?…`
-                    # line.  Gate the rn2(4) draw on the same predicate to
-                    # avoid over-drawing on iterations that hit a space (the
-                    # "ad aerarium" / "Vlad was here" engravings both contain
-                    # spaces that fire 9-15% of the time).
-                    skip_rest = is_space | is_trivial
-                    rr, r2 = lax.cond(
-                        skip_rest,
-                        lambda rr_: (rr_, jnp.int32(0)),
-                        lambda rr_: rn2_jax(rr_, jnp.int32(4)),
-                        rr,
-                    )
                     use_rubout = r2 != jnp.int32(0)
                     ch_idx = jnp.clip(ch, jnp.int32(0), jnp.int32(127))
                     wipeto_len = _RUBOUT_LEN[ch_idx]
