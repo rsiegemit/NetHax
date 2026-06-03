@@ -571,6 +571,23 @@ class NethaxEnv:
             _active, _rooms.is_lit,
             _h, _w,
         )                                                  # bool[MAP_H, MAP_W]
+        # Vendor `view_from` shadow-casts (vendor/nle/src/vision.c:614);
+        # our lit_room_flood blanket-includes the wall-inclusive ring
+        # `[lx-1..hx+1] x [ly-1..hy+1]`.  This over-includes DOORWAY cells
+        # on the room perimeter that vendor's shadow-cast would not reach
+        # when an intervening wall blocks the LOS from the hero's position
+        # (e.g. seed=4 cell (9,8) — confirmed via byte-stream trace 2517/
+        # 2517 draws match vendor but Nethax marks the doorway visible
+        # while vendor leaves it unexplored).  DOORWAY cells must be
+        # discovered via the Bresenham raycast in compute_fov, which
+        # honours LOS occlusion.  Walls remain in the flood (vendor
+        # stamps seenv=SVALL for them).
+        # Cite: vendor/nle/src/vision.c:614 (view_from);
+        #       vendor/nle/include/rm.h (D_NODOOR / D_BROKEN doormasks
+        #       both render as DOORWAY which is transparent).
+        from Nethax.nethax.constants.tiles import TileType
+        doorway_mask = terrain_l0_full == jnp.int8(TileType.DOORWAY)
+        lit_flood = lit_flood & ~doorway_mask
         vis = compute_fov(
             terrain_l0_full,
             state.player_pos.astype(jnp.int32),
