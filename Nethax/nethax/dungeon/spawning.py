@@ -1612,11 +1612,15 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
         is_hsk       = _MLET_HUMAN_SK[tid]
         is_hpr       = _MLET_HUMAN_PR[tid]
 
-        # S_KOBOLD: rn2(4) — vendor makemon.c:457
-        def _draw_kobold(vv):
-            nv, _ = randint_jax(vv, (), 0, 4)
-            return nv
-        v = jax.lax.cond(is_kobold, _draw_kobold, lambda vv: vv, v)
+        # S_KOBOLD: vendor m_initinv (makemon.c:589-788) has NO case S_KOBOLD,
+        # so kobolds consume ZERO draws inside m_initinv.  The previous
+        # `rn2(4)` here mis-attributed vendor m_initweap's kobold gate
+        # (vendor makemon.c:457 — `if (!rn2(4)) m_initthrow(mtmp, DART, 12);`)
+        # which is ALREADY consumed inside ``_draw_initweap`` above via the
+        # ``_INITWEAP_DRAW_COUNT[S_KOBOLD] == 1`` loop iteration.  Drawing
+        # it again caused a phantom rn2(4) draw immediately after the
+        # trailing rn2(75) — visible in seed=9 around L1405.
+        # Vendor cite: vendor/nle/src/makemon.c:576-788 (m_initinv; no S_KOBOLD).
 
         # S_GNOME: rn2(60) — vendor makemon.c:778
         def _draw_gnome(vv):
