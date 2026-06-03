@@ -50,7 +50,9 @@ from flax import struct
 # room count) so the callback is JIT-friendly.
 # ---------------------------------------------------------------------------
 
-_libc = ctypes.CDLL("libSystem.dylib")
+import ctypes.util as _ctypes_util
+_libc_name = _ctypes_util.find_library("c") or "libSystem.dylib"
+_libc = ctypes.CDLL(_libc_name)
 _libc.qsort.argtypes = [
     ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
     ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p),
