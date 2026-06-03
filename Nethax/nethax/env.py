@@ -69,7 +69,12 @@ class NethaxEnv:
 
     def __init__(self, static: StaticParams | None = None):
         self.static = static or StaticParams()
-        self._step_jit = jax.jit(_step_impl)
+        # Seam C: ``_step_impl`` is now a Python orchestrator that chains
+        # two independently ``@jax.jit``-decorated helpers (``_dispatch_jit``
+        # and ``_rest_jit``).  Wrapping the orchestrator in another outer
+        # ``jax.jit`` would inline both helpers into one trace and defeat
+        # the separation, so we call it directly.
+        self._step_jit = _step_impl
 
     def reset(
         self,
@@ -658,7 +663,7 @@ class NethaxEnv:
         info is omitted (per-env Python dicts don't vmap; callers can
         attach metadata after the call).
         """
-        return jax.vmap(self._step_jit, in_axes=(0, 0, 0))(states, actions, rngs)
+        return _step_impl_batched(states, actions, rngs)
 
     def reset_batched(
         self,
@@ -1125,8 +1130,415 @@ def _tick_stinking_cloud(state):
     )
 
 
+def _dispatch_body(state, action, rng_act):
+    """Phase-1 body: remap action, clear message, run ``dispatch_action``.
+
+    Split out from ``_step_impl`` as Seam C to keep the 3970-LOC dispatch
+    table in its own JIT cache slot.  Pure (no host-side branches), so it
+    composes with both ``jax.jit`` and ``jax.vmap``.
+
+    The ``already_done`` short-circuit is applied by the caller — this
+    function unconditionally performs the dispatch work.  When the caller
+    skips it for a done state, the rest-jit must also skip its body so
+    the original ``state`` flows through unchanged.
+    """
+    # NLE-action-index → ASCII-ord remap.  An NLE-trained policy emits
+    # ``action`` as an index into ``env.actions`` (86-entry USEFUL_ACTIONS);
+    # Nethax's dispatch table expects the ASCII ord.  ``_maybe_remap_action``
+    # auto-detects: ``action < 86`` → gather from USEFUL_ACTIONS;
+    # ``action >= 86`` → pass through (caller already supplied an ord).
+    # JIT-pure via jnp.where, so it survives jax.jit / vmap.
+    # Cite: vendor/nle/nle/env/base.py:359 — same remap NLE does numpy-side.
+    action = _maybe_remap_action(action)
+
+    # Pre-1. Clear message buffer — vendor topl.c / winrl.cc:353 zeros
+    # obs->message when ttyDisplay->toplin==0 (no new pline this turn).
+    # Without this the welcome line persists across every step.
+    # Cite: vendor/nle/win/rl/winrl.cc line 353 — std::memset(obs->message,
+    #       0, NLE_MESSAGE_SIZE) when toplin is false at obs-fill time.
+    # Also reset the per-step "did this action consume a game turn" flag to
+    # True; handlers (e.g. a blocked wall-bump in action_dispatch
+    # ``_move_branch``) clear it to False when the action took zero game
+    # time, which gates the game_moves (BL_TIME) increment below.
+    ns0 = state.replace(
+        messages=_clear_message(state.messages),
+        action_consumed_turn=jnp.bool_(True),
+    )
+
+    # 1. Player action — allmain.c line 203 (svc.context.move).
+    ns = dispatch_action(ns0, action, rng_act)
+    return ns
+
+
+def _dispatch_jit_impl(state, action, rng_act):
+    """JIT-compiled phase-1 wrapper around ``_dispatch_body``.
+
+    Honours the same ``already_done`` short-circuit semantics as the
+    original monolithic ``_step_impl``: a done state passes through
+    unchanged so the rest-jit (which also short-circuits) sees the
+    identical pytree it would have seen pre-split.
+    """
+    return jax.lax.cond(
+        state.done,
+        lambda _: state,
+        lambda _: _dispatch_body(state, action, rng_act),
+        operand=None,
+    )
+
+
+_dispatch_jit = jax.jit(_dispatch_jit_impl)
+
+
+def _rest_body(
+    ns,
+    state,
+    prev_wizard_alive,
+    prev_branch,
+    prev_level,
+    rng_act,
+    rng_monsters,
+    rng_status,
+    rng_poly,
+    rng_shop,
+    rng_swallow,
+    rng_explvl,
+    rng_regions,
+    rng_astral,
+):
+    """Phase-1a..8a body: everything from astral seeding through intervene.
+
+    Receives the post-dispatch state ``ns`` and the pre-step ``state``
+    snapshot.  The caller (rest-jit) wraps this in a ``jax.lax.cond`` on
+    ``state.done`` so a done state is returned unchanged.
+    """
+    # 1a. Astral-Plane mplayer trigger — vendor mplayer.c::create_mplayers
+    #     (lines 327-355) called from astral.lua MAP section on level
+    #     entry.  Edge-triggered on (prev != Astral) → (curr == Astral).
+    ns = _maybe_seed_astral_mplayers(ns, rng_astral, prev_branch, prev_level)
+
+    # 1b. Digging tick — advance multi-turn pickaxe dig (dig.c::dodig).
+    ns = _dig_tick(ns, rng_act)
+
+    # 2. Monster turn — allmain.c line 212 (movemon).
+    # Vendor moveloop only enters the per-turn block (movemon + mcalcmove
+    # + maintenance) when "actual time passed" — i.e. the player's action
+    # consumed a turn.  A wall-bump returns early from domove without
+    # decrementing ``youmonst.movement``, so the do-while at allmain.c:103
+    # short-circuits and monsters do not act.  Gate the call on
+    # ``action_consumed_turn`` so wall-bump turns leave monsters AND the
+    # vendor_rng stream untouched.  Without this gate Nethax monsters
+    # drift relative to vendor on every non-time-consuming step.
+    # Cite: vendor/nle/src/allmain.c lines 88-112 (do-while turn loop).
+    ns = jax.lax.cond(
+        ns.action_consumed_turn,
+        lambda s: _monster_ai_step(s, rng_monsters),
+        lambda s: s,
+        ns,
+    )
+
+    # 2b. Per-turn region tick — vendor/nethack/src/region.c::run_regions
+    #     (line 414).  Ages every active region by 1 and applies
+    #     gas-cloud damage to the player when they stand inside one.
+    ns = _run_regions(ns, rng_regions)
+
+    # 2c. Stinking-cloud tick — vendor/nethack/src/region.c::inside_gas_cloud
+    #     (called from run_regions when player tile is inside).  Scroll of
+    #     stinking cloud writes scalar cloud_pos/radius/turns directly to
+    #     EnvState (items_scrolls SCR_STINKING_CLOUD); decrement turns and
+    #     when the player is within Chebyshev radius, apply 1 HP damage +
+    #     extend VOMITING timer per vendor inside_gas_cloud (region.c:1100+).
+    ns = _tick_stinking_cloud(ns)
+
+    # 3. Increment turn counter — allmain.c line 244 (svm.moves++).
+    #    ``timestep`` is the monotonic env-step clock (timer deadlines,
+    #    hallucination hash, monster-AI cadence) and advances every env
+    #    step regardless of whether the action consumed game time.
+    ns = ns.replace(timestep=ns.timestep + jnp.int32(1))
+    #    ``game_moves`` is the vendor ``moves`` turn counter (BL_TIME
+    #    source).  Vendor only reaches ``svm.moves++`` in moveloop for a
+    #    time-consuming turn; a blocked move (wall-bump) returns early from
+    #    domove without ticking it.  Gate on the per-step flag the action
+    #    handlers set, so a wall-bump leaves game_moves unchanged.
+    ns = ns.replace(
+        game_moves=ns.game_moves
+        + jnp.where(ns.action_consumed_turn, jnp.int32(1), jnp.int32(0))
+    )
+
+    # 4. Status-effect tick — allmain.c line 273 (nh_timeout),
+    #    inclusive of regen_hp (line 294) and regen_pw (line 305).
+    #    Pre-tick: emit HALLUCINATION expiry message (vendor timeout.c
+    #    HALLU case lines 778-783 — make_hallucinated(0L, TRUE, 0L) →
+    #    "Everything looks SO boring now.").
+    ns = _tick_hallu_expiry(ns)
+    # Stoning is cancelled silently on the "turning into slime" tick
+    # (slime_dialogue i==1 branch, timeout.c lines 436-440).  Must run
+    # BEFORE the timer decrement in _status_step so we read the
+    # pre-decrement SLIMED value.
+    ns = _tick_slime_cancels_stoning(ns)
+    new_status, new_hp, new_pw, new_done = _status_step(
+        ns.status,
+        rng_status,
+        ns.player_hp,
+        ns.player_hp_max,
+        ns.player_pw,
+        ns.player_pw_max,
+        ns.player_xl,
+        ns.player_role,
+        ns.done,
+    )
+    ns = ns.replace(
+        status=new_status,
+        player_hp=new_hp,
+        player_pw=new_pw,
+        done=new_done,
+    )
+
+    # 4a-riding.  Per-turn riding ticks: decrement u.ugallop (gallop
+    # counter) and apply 1/100-chance saddle wear.  Both gated internally
+    # on player_steed_mid != 0.
+    # Cite: vendor/nethack/src/timeout.c lines 664-667 (ugallop--);
+    #       vendor/nethack/src/steed.c saddle wear (implicit).
+    ns = _tick_gallop(ns)
+    ns = _tick_saddle(ns)
+
+    # 4a0. Luck drift toward baseluck=0 every 300/600 moves (300 if the
+    #    hero is carrying the Amulet of Yendor or god_anger>0, else 600).
+    #    Cite: vendor/nethack/src/timeout.c lines 606-620 — nh_timeout
+    #    luck-decay block.  No-op when |Luck|==baseluck or off-cadence.
+    ns = _tick_luck_drift(ns)
+
+    # 4a1. Generic timer queue drain (vendor timeout.c::run_timers
+    #    lines 2222-2245).  Fires any timer whose fire_turn <= current
+    #    timestep, then clears the slot.  Wave 47f scaffolding —
+    #    callbacks are currently no-ops awaiting per-consumer wiring.
+    ns = _tick_timer_queue(ns)
+
+    # 4a2. Multi-turn occupation tick (vendor ga.afternmv invocation
+    #    when gm.multi reaches 0).  Decrements occupation_remaining;
+    #    fires the matching callback (e.g. STEAL_ARM) when it hits
+    #    zero.  Wave 47g scaffolding.
+    ns = _tick_occupation(ns)
+
+    # 4a3. Ball-as-trap-escape (vendor ball.c::drop_ball lines 882-961).
+    # When the hero is punished AND in a trap, vendor's drop_ball
+    # mechanic lets the iron ball "drop" forcefully and break the
+    # trap with a 1/4 chance per turn.  Per vendor:927-953 the ball
+    # can break a bear trap, dispel a web, or fill in a pit when it
+    # lands on the player's tile.
+    from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS_ball
+    rng_ball_esc, _rng_after = jax.random.split(jax.random.fold_in(rng_status, jnp.int32(0xBA77)), 2)
+    _ball_roll = jax.random.randint(rng_ball_esc, (), 0, 4, dtype=jnp.int32)
+    _can_drop_escape = ns.is_punished & ns.player_in_trap & (_ball_roll == jnp.int32(0))
+    # On successful drop-escape: clear trap; ball lands at player.
+    ns = ns.replace(
+        player_in_trap=jnp.where(_can_drop_escape, jnp.bool_(False), ns.player_in_trap),
+        player_trap_timer=jnp.where(_can_drop_escape, jnp.int16(0), ns.player_trap_timer),
+        ball_pos=jnp.where(_can_drop_escape, ns.player_pos, ns.ball_pos),
+        ball_thrown_pos=jnp.where(_can_drop_escape, ns.player_pos, ns.ball_thrown_pos),
+        ball_thrown_turns=jnp.where(_can_drop_escape, jnp.int8(1), ns.ball_thrown_turns),
+    )
+    # Decay the ball_thrown_turns counter for landed projectiles.
+    ns = ns.replace(
+        ball_thrown_turns=jnp.maximum(
+            ns.ball_thrown_turns - jnp.int8(1), jnp.int8(0)
+        ).astype(jnp.int8),
+    )
+
+    # 4a. Experience-level check — vendor exper.c::newexplevel called from
+    #    allmain.c (after nh_timeout / before the next turn).  Promotes
+    #    ulevel when uexp crosses the next newuexp(ulevel) threshold.
+    ns = _newexplevel(ns, rng_explvl)
+
+    # 4b. Swallow/engulf digestion tick — vendor/nethack/src/mhitu.c:1418.
+    ns = _digest_tick(ns, rng_swallow)
+
+    # 5. Were-creature / polymorph timer tick — allmain.c lines 322-339
+    #    (mvl_change handling).  polymorph.step decrements both
+    #    poly_timer and lycanthropy_timer.
+    ns = _polymorph_step(ns, rng_poly)
+
+    # 6. age_spells — vendor/nethack/src/spell.c::age_spells (called
+    #    from allmain.c line 355).  Decrement every spell_memory > 0
+    #    by 1, or by 2 when the hero is Confused (vendor doubles the
+    #    decay under confusion — Wave 47i parity).
+    from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS_spell
+    magic = ns.magic
+    is_confused = ns.status.timed_statuses[int(_TS_spell.CONFUSION)] > jnp.int32(0)
+    decrement = jnp.where(is_confused, jnp.int32(2), jnp.int32(1))
+    new_mem = jnp.maximum(magic.spell_memory - decrement, jnp.int32(0))
+    ns = ns.replace(magic=magic.replace(spell_memory=new_mem))
+
+    # 6b. Calendar tick — cycle moonphase every 250 turns (Wave 47i
+    # approximation of vendor calendar.c).  Mirrors flags.moonphase
+    # cycle (new→waxing→full→waning).  Used by luck-drift baseluck
+    # and were_change rate.
+    moon_advance = (ns.timestep % jnp.int32(250)) == jnp.int32(0)
+    new_moon = jnp.where(
+        moon_advance,
+        (ns.calendar_moonphase.astype(jnp.int32) + jnp.int32(1)) % jnp.int32(4),
+        ns.calendar_moonphase.astype(jnp.int32),
+    ).astype(jnp.int8)
+    ns = ns.replace(calendar_moonphase=new_moon)
+
+    # 7. Shop tick — Wave 6 #47 (pay-at-exit + angry shopkeeper pursuit).
+    #    Vendor: shk.c invoked from moveloop's per-turn block.
+    ns = _shop_step(ns, rng_shop)
+
+    # 8. Ascension / endgame check — vendor allmain.c done() paths.
+    ns = maybe_ascend(ns)
+
+    # 8a. intervene() — post-Wizard-kill harassment.
+    # Vendor wizard.c::intervene lines 784-810 picks rn2(6):
+    #   0,1 → "You feel vaguely nervous."  (no gameplay effect)
+    #   2   → rndcurse — random curse on player items
+    #   3   → aggravate — wake all sleeping monsters
+    #   4   → nasty — summon a high-difficulty monster (placeholder)
+    #   5   → resurrect — re-spawn the Wizard (placeholder)
+    # Fires once when the Wizard transitions alive → dead this turn.
+    _PM_WIZARD_ENTRY = jnp.int32(281)
+    wiz_now = jnp.any(
+        ns.monster_ai.alive
+        & (ns.monster_ai.entry_idx.astype(jnp.int32) == _PM_WIZARD_ENTRY)
+    )
+    wiz_just_died = prev_wizard_alive & ~wiz_now
+
+    rng_iv, rng_iv2 = jax.random.split(rng_status, 2)
+    which = jax.random.randint(rng_iv, (), 0, 6, dtype=jnp.int32)
+
+    # Effect 2: rndcurse — flip BUC on one random inventory slot to cursed(1).
+    is_curse = wiz_just_died & (which == jnp.int32(2))
+    items = ns.inventory.items
+    n_slots = items.category.shape[0]
+    cur_slot = jax.random.randint(rng_iv2, (), 0, n_slots, dtype=jnp.int32)
+    occupied = items.category[cur_slot] != jnp.int8(0)
+    new_buc = jnp.where(is_curse & occupied, jnp.int8(1), items.buc_status[cur_slot])
+    new_items = items.replace(buc_status=items.buc_status.at[cur_slot].set(new_buc))
+
+    # Effect 3: aggravate — wake all sleeping monsters.
+    is_aggr = wiz_just_died & (which == jnp.int32(3))
+    mai = ns.monster_ai
+    new_asleep = jnp.where(is_aggr, jnp.zeros_like(mai.asleep), mai.asleep)
+    new_sleep_t = jnp.where(
+        is_aggr, jnp.zeros_like(mai.sleep_timer), mai.sleep_timer
+    )
+
+    # Effect 4: nasty — summon a high-difficulty monster at first
+    # dead monster slot.  Vendor nasty() picks from a 44-species
+    # nasties[] pool; this expanded set covers a representative
+    # 10-monster slice across demons/devils/giant beasts:
+    #   297 water demon     299 horned devil    300 erinys
+    #   301 barbed devil    302 marilith        307 nalfeshnee
+    #   150 red dragon       49 master mind flayer
+    #   182 jabberwock      234 vampire lord
+    is_nasty = wiz_just_died & (which == jnp.int32(4))
+    rng_iv3, rng_iv4 = jax.random.split(rng_iv2, 2)
+    _NASTY_POOL = jnp.array(
+        [297, 299, 300, 301, 302, 307, 150, 49, 182, 234], dtype=jnp.int16
+    )
+    nasty_pick_roll = jax.random.randint(
+        rng_iv3, (), 0, _NASTY_POOL.shape[0], dtype=jnp.int32
+    )
+    nasty_entry = _NASTY_POOL[nasty_pick_roll]
+    dead_slots = ~new_asleep & ~mai.alive   # logic-only: use alive only
+    dead_mask = ~mai.alive
+    any_dead = jnp.any(dead_mask)
+    dead_idx = jnp.argmax(dead_mask.astype(jnp.int32)).astype(jnp.int32)
+    do_nasty = is_nasty & any_dead
+
+    spawn_pos = state.player_pos  # Nasty spawns near hero (vendor enexto)
+    nasty_alive = jnp.where(do_nasty, jnp.bool_(True),  mai.alive[dead_idx])
+    nasty_entry_v = jnp.where(do_nasty, nasty_entry, mai.entry_idx[dead_idx])
+    nasty_hp     = jnp.where(do_nasty, jnp.int32(20), mai.hp[dead_idx])
+    nasty_hpmax  = jnp.where(do_nasty, jnp.int32(20), mai.hp_max[dead_idx])
+
+    # Effect 5: resurrect — re-spawn the Wizard at first dead slot.
+    is_resurr = wiz_just_died & (which == jnp.int32(5))
+    do_resurr = is_resurr & any_dead
+    resurr_alive = jnp.where(do_resurr, jnp.bool_(True), nasty_alive)
+    resurr_entry = jnp.where(do_resurr, jnp.int16(281), nasty_entry_v)
+    resurr_hp    = jnp.where(do_resurr, jnp.int32(50), nasty_hp)
+    resurr_hpmax = jnp.where(do_resurr, jnp.int32(50), nasty_hpmax)
+
+    new_alive_arr  = mai.alive.at[dead_idx].set(resurr_alive)
+    new_entry_arr  = mai.entry_idx.at[dead_idx].set(resurr_entry)
+    new_hp_arr     = mai.hp.at[dead_idx].set(resurr_hp)
+    new_hpmax_arr  = mai.hp_max.at[dead_idx].set(resurr_hpmax)
+
+    ns = ns.replace(
+        inventory=ns.inventory.replace(items=new_items),
+        monster_ai=mai.replace(
+            asleep=new_asleep,
+            sleep_timer=new_sleep_t,
+            alive=new_alive_arr,
+            entry_idx=new_entry_arr,
+            hp=new_hp_arr,
+            hp_max=new_hpmax_arr,
+        ),
+    )
+    # Effects 0/1 remain no-ops (vendor's "You feel nervous." flavor).
+    return ns
+
+
+def _rest_jit_impl(
+    ns,
+    state,
+    prev_wizard_alive,
+    prev_branch,
+    prev_level,
+    rng_act,
+    rng_monsters,
+    rng_status,
+    rng_poly,
+    rng_shop,
+    rng_swallow,
+    rng_explvl,
+    rng_regions,
+    rng_astral,
+):
+    """JIT-compiled phase-1a..8a wrapper around ``_rest_body``.
+
+    Mirrors the ``already_done`` short-circuit from the original
+    monolithic ``_step_impl``: when the pre-step state was done, return
+    that original state unchanged so the overall ``_step_impl`` output
+    is byte-identical to the pre-split implementation.
+    """
+    return jax.lax.cond(
+        state.done,
+        lambda _: state,
+        lambda _: _rest_body(
+            ns,
+            state,
+            prev_wizard_alive,
+            prev_branch,
+            prev_level,
+            rng_act,
+            rng_monsters,
+            rng_status,
+            rng_poly,
+            rng_shop,
+            rng_swallow,
+            rng_explvl,
+            rng_regions,
+            rng_astral,
+        ),
+        operand=None,
+    )
+
+
+_rest_jit = jax.jit(_rest_jit_impl)
+
+
 def _step_impl(state, action, rng):
-    """JIT-compatible inner body of NethaxEnv.step.
+    """Thin Python orchestrator: splits RNG and chains the two JITs.
+
+    Seam C splits the original monolithic ``_step_impl`` into:
+      * ``_dispatch_jit`` — phase 1 (``dispatch_action`` table).
+      * ``_rest_jit``     — phases 1a..8a (astral seed through intervene).
+
+    Both jits internally honour the ``already_done`` short-circuit so a
+    done state returns ``state`` unchanged through both.  The RNG
+    ``jax.random.split(rng, 9)`` happens here exactly once; the resulting
+    subkeys are passed down explicitly with no further splitting.
 
     Vendor order (vendor/nethack/src/allmain.c::moveloop, lines ~200-360):
       1. Player action / docmd                       (line 203: svc.context.move)
@@ -1147,15 +1559,6 @@ def _step_impl(state, action, rng):
         Cite: vendor/nethack/src/light.c::do_light_sources.
     """
     rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow, rng_explvl, rng_regions, rng_astral = jax.random.split(rng, 9)
-    # NLE-action-index → ASCII-ord remap.  An NLE-trained policy emits
-    # ``action`` as an index into ``env.actions`` (86-entry USEFUL_ACTIONS);
-    # Nethax's dispatch table expects the ASCII ord.  ``_maybe_remap_action``
-    # auto-detects: ``action < 86`` → gather from USEFUL_ACTIONS;
-    # ``action >= 86`` → pass through (caller already supplied an ord).
-    # JIT-pure via jnp.where, so it survives jax.jit / vmap.
-    # Cite: vendor/nle/nle/env/base.py:359 — same remap NLE does numpy-side.
-    action = _maybe_remap_action(action)
-    already_done = state.done
 
     # Pre-step snapshot: was the Wizard of Yendor alive?  Used to fire
     # intervene() once on Wizard kill (vendor wizard.c::intervene 784-810).
@@ -1171,291 +1574,26 @@ def _step_impl(state, action, rng):
     prev_branch = state.dungeon.current_branch.astype(jnp.int32)
     prev_level  = state.dungeon.current_level.astype(jnp.int32)
 
-    def _do_step(_):
-        # Pre-1. Clear message buffer — vendor topl.c / winrl.cc:353 zeros
-        # obs->message when ttyDisplay->toplin==0 (no new pline this turn).
-        # Without this the welcome line persists across every step.
-        # Cite: vendor/nle/win/rl/winrl.cc line 353 — std::memset(obs->message,
-        #       0, NLE_MESSAGE_SIZE) when toplin is false at obs-fill time.
-        # Also reset the per-step "did this action consume a game turn" flag to
-        # True; handlers (e.g. a blocked wall-bump in action_dispatch
-        # ``_move_branch``) clear it to False when the action took zero game
-        # time, which gates the game_moves (BL_TIME) increment below.
-        ns0 = state.replace(
-            messages=_clear_message(state.messages),
-            action_consumed_turn=jnp.bool_(True),
-        )
+    # Phase 1: dispatch_action (Seam C — separate JIT cache slot).
+    ns = _dispatch_jit(state, action, rng_act)
 
-        # 1. Player action — allmain.c line 203 (svc.context.move).
-        ns = dispatch_action(ns0, action, rng_act)
-
-        # 1a. Astral-Plane mplayer trigger — vendor mplayer.c::create_mplayers
-        #     (lines 327-355) called from astral.lua MAP section on level
-        #     entry.  Edge-triggered on (prev != Astral) → (curr == Astral).
-        ns = _maybe_seed_astral_mplayers(ns, rng_astral, prev_branch, prev_level)
-
-        # 1b. Digging tick — advance multi-turn pickaxe dig (dig.c::dodig).
-        ns = _dig_tick(ns, rng_act)
-
-        # 2. Monster turn — allmain.c line 212 (movemon).
-        # Vendor moveloop only enters the per-turn block (movemon + mcalcmove
-        # + maintenance) when "actual time passed" — i.e. the player's action
-        # consumed a turn.  A wall-bump returns early from domove without
-        # decrementing ``youmonst.movement``, so the do-while at allmain.c:103
-        # short-circuits and monsters do not act.  Gate the call on
-        # ``action_consumed_turn`` so wall-bump turns leave monsters AND the
-        # vendor_rng stream untouched.  Without this gate Nethax monsters
-        # drift relative to vendor on every non-time-consuming step.
-        # Cite: vendor/nle/src/allmain.c lines 88-112 (do-while turn loop).
-        ns = jax.lax.cond(
-            ns.action_consumed_turn,
-            lambda s: _monster_ai_step(s, rng_monsters),
-            lambda s: s,
-            ns,
-        )
-
-        # 2b. Per-turn region tick — vendor/nethack/src/region.c::run_regions
-        #     (line 414).  Ages every active region by 1 and applies
-        #     gas-cloud damage to the player when they stand inside one.
-        ns = _run_regions(ns, rng_regions)
-
-        # 2c. Stinking-cloud tick — vendor/nethack/src/region.c::inside_gas_cloud
-        #     (called from run_regions when player tile is inside).  Scroll of
-        #     stinking cloud writes scalar cloud_pos/radius/turns directly to
-        #     EnvState (items_scrolls SCR_STINKING_CLOUD); decrement turns and
-        #     when the player is within Chebyshev radius, apply 1 HP damage +
-        #     extend VOMITING timer per vendor inside_gas_cloud (region.c:1100+).
-        ns = _tick_stinking_cloud(ns)
-
-        # 3. Increment turn counter — allmain.c line 244 (svm.moves++).
-        #    ``timestep`` is the monotonic env-step clock (timer deadlines,
-        #    hallucination hash, monster-AI cadence) and advances every env
-        #    step regardless of whether the action consumed game time.
-        ns = ns.replace(timestep=ns.timestep + jnp.int32(1))
-        #    ``game_moves`` is the vendor ``moves`` turn counter (BL_TIME
-        #    source).  Vendor only reaches ``svm.moves++`` in moveloop for a
-        #    time-consuming turn; a blocked move (wall-bump) returns early from
-        #    domove without ticking it.  Gate on the per-step flag the action
-        #    handlers set, so a wall-bump leaves game_moves unchanged.
-        ns = ns.replace(
-            game_moves=ns.game_moves
-            + jnp.where(ns.action_consumed_turn, jnp.int32(1), jnp.int32(0))
-        )
-
-        # 4. Status-effect tick — allmain.c line 273 (nh_timeout),
-        #    inclusive of regen_hp (line 294) and regen_pw (line 305).
-        #    Pre-tick: emit HALLUCINATION expiry message (vendor timeout.c
-        #    HALLU case lines 778-783 — make_hallucinated(0L, TRUE, 0L) →
-        #    "Everything looks SO boring now.").
-        ns = _tick_hallu_expiry(ns)
-        # Stoning is cancelled silently on the "turning into slime" tick
-        # (slime_dialogue i==1 branch, timeout.c lines 436-440).  Must run
-        # BEFORE the timer decrement in _status_step so we read the
-        # pre-decrement SLIMED value.
-        ns = _tick_slime_cancels_stoning(ns)
-        new_status, new_hp, new_pw, new_done = _status_step(
-            ns.status,
-            rng_status,
-            ns.player_hp,
-            ns.player_hp_max,
-            ns.player_pw,
-            ns.player_pw_max,
-            ns.player_xl,
-            ns.player_role,
-            ns.done,
-        )
-        ns = ns.replace(
-            status=new_status,
-            player_hp=new_hp,
-            player_pw=new_pw,
-            done=new_done,
-        )
-
-        # 4a-riding.  Per-turn riding ticks: decrement u.ugallop (gallop
-        # counter) and apply 1/100-chance saddle wear.  Both gated internally
-        # on player_steed_mid != 0.
-        # Cite: vendor/nethack/src/timeout.c lines 664-667 (ugallop--);
-        #       vendor/nethack/src/steed.c saddle wear (implicit).
-        ns = _tick_gallop(ns)
-        ns = _tick_saddle(ns)
-
-        # 4a0. Luck drift toward baseluck=0 every 300/600 moves (300 if the
-        #    hero is carrying the Amulet of Yendor or god_anger>0, else 600).
-        #    Cite: vendor/nethack/src/timeout.c lines 606-620 — nh_timeout
-        #    luck-decay block.  No-op when |Luck|==baseluck or off-cadence.
-        ns = _tick_luck_drift(ns)
-
-        # 4a1. Generic timer queue drain (vendor timeout.c::run_timers
-        #    lines 2222-2245).  Fires any timer whose fire_turn <= current
-        #    timestep, then clears the slot.  Wave 47f scaffolding —
-        #    callbacks are currently no-ops awaiting per-consumer wiring.
-        ns = _tick_timer_queue(ns)
-
-        # 4a2. Multi-turn occupation tick (vendor ga.afternmv invocation
-        #    when gm.multi reaches 0).  Decrements occupation_remaining;
-        #    fires the matching callback (e.g. STEAL_ARM) when it hits
-        #    zero.  Wave 47g scaffolding.
-        ns = _tick_occupation(ns)
-
-        # 4a3. Ball-as-trap-escape (vendor ball.c::drop_ball lines 882-961).
-        # When the hero is punished AND in a trap, vendor's drop_ball
-        # mechanic lets the iron ball "drop" forcefully and break the
-        # trap with a 1/4 chance per turn.  Per vendor:927-953 the ball
-        # can break a bear trap, dispel a web, or fill in a pit when it
-        # lands on the player's tile.
-        from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS_ball
-        rng_ball_esc, _rng_after = jax.random.split(jax.random.fold_in(rng_status, jnp.int32(0xBA77)), 2)
-        _ball_roll = jax.random.randint(rng_ball_esc, (), 0, 4, dtype=jnp.int32)
-        _can_drop_escape = ns.is_punished & ns.player_in_trap & (_ball_roll == jnp.int32(0))
-        # On successful drop-escape: clear trap; ball lands at player.
-        ns = ns.replace(
-            player_in_trap=jnp.where(_can_drop_escape, jnp.bool_(False), ns.player_in_trap),
-            player_trap_timer=jnp.where(_can_drop_escape, jnp.int16(0), ns.player_trap_timer),
-            ball_pos=jnp.where(_can_drop_escape, ns.player_pos, ns.ball_pos),
-            ball_thrown_pos=jnp.where(_can_drop_escape, ns.player_pos, ns.ball_thrown_pos),
-            ball_thrown_turns=jnp.where(_can_drop_escape, jnp.int8(1), ns.ball_thrown_turns),
-        )
-        # Decay the ball_thrown_turns counter for landed projectiles.
-        ns = ns.replace(
-            ball_thrown_turns=jnp.maximum(
-                ns.ball_thrown_turns - jnp.int8(1), jnp.int8(0)
-            ).astype(jnp.int8),
-        )
-
-        # 4a. Experience-level check — vendor exper.c::newexplevel called from
-        #    allmain.c (after nh_timeout / before the next turn).  Promotes
-        #    ulevel when uexp crosses the next newuexp(ulevel) threshold.
-        ns = _newexplevel(ns, rng_explvl)
-
-        # 4b. Swallow/engulf digestion tick — vendor/nethack/src/mhitu.c:1418.
-        ns = _digest_tick(ns, rng_swallow)
-
-        # 5. Were-creature / polymorph timer tick — allmain.c lines 322-339
-        #    (mvl_change handling).  polymorph.step decrements both
-        #    poly_timer and lycanthropy_timer.
-        ns = _polymorph_step(ns, rng_poly)
-
-        # 6. age_spells — vendor/nethack/src/spell.c::age_spells (called
-        #    from allmain.c line 355).  Decrement every spell_memory > 0
-        #    by 1, or by 2 when the hero is Confused (vendor doubles the
-        #    decay under confusion — Wave 47i parity).
-        from Nethax.nethax.subsystems.status_effects import TimedStatus as _TS_spell
-        magic = ns.magic
-        is_confused = ns.status.timed_statuses[int(_TS_spell.CONFUSION)] > jnp.int32(0)
-        decrement = jnp.where(is_confused, jnp.int32(2), jnp.int32(1))
-        new_mem = jnp.maximum(magic.spell_memory - decrement, jnp.int32(0))
-        ns = ns.replace(magic=magic.replace(spell_memory=new_mem))
-
-        # 6b. Calendar tick — cycle moonphase every 250 turns (Wave 47i
-        # approximation of vendor calendar.c).  Mirrors flags.moonphase
-        # cycle (new→waxing→full→waning).  Used by luck-drift baseluck
-        # and were_change rate.
-        moon_advance = (ns.timestep % jnp.int32(250)) == jnp.int32(0)
-        new_moon = jnp.where(
-            moon_advance,
-            (ns.calendar_moonphase.astype(jnp.int32) + jnp.int32(1)) % jnp.int32(4),
-            ns.calendar_moonphase.astype(jnp.int32),
-        ).astype(jnp.int8)
-        ns = ns.replace(calendar_moonphase=new_moon)
-
-        # 7. Shop tick — Wave 6 #47 (pay-at-exit + angry shopkeeper pursuit).
-        #    Vendor: shk.c invoked from moveloop's per-turn block.
-        ns = _shop_step(ns, rng_shop)
-
-        # 8. Ascension / endgame check — vendor allmain.c done() paths.
-        ns = maybe_ascend(ns)
-
-        # 8a. intervene() — post-Wizard-kill harassment.
-        # Vendor wizard.c::intervene lines 784-810 picks rn2(6):
-        #   0,1 → "You feel vaguely nervous."  (no gameplay effect)
-        #   2   → rndcurse — random curse on player items
-        #   3   → aggravate — wake all sleeping monsters
-        #   4   → nasty — summon a high-difficulty monster (placeholder)
-        #   5   → resurrect — re-spawn the Wizard (placeholder)
-        # Fires once when the Wizard transitions alive → dead this turn.
-        wiz_now = jnp.any(
-            ns.monster_ai.alive
-            & (ns.monster_ai.entry_idx.astype(jnp.int32) == _PM_WIZARD_ENTRY)
-        )
-        wiz_just_died = prev_wizard_alive & ~wiz_now
-
-        rng_iv, rng_iv2 = jax.random.split(rng_status, 2)
-        which = jax.random.randint(rng_iv, (), 0, 6, dtype=jnp.int32)
-
-        # Effect 2: rndcurse — flip BUC on one random inventory slot to cursed(1).
-        is_curse = wiz_just_died & (which == jnp.int32(2))
-        items = ns.inventory.items
-        n_slots = items.category.shape[0]
-        cur_slot = jax.random.randint(rng_iv2, (), 0, n_slots, dtype=jnp.int32)
-        occupied = items.category[cur_slot] != jnp.int8(0)
-        new_buc = jnp.where(is_curse & occupied, jnp.int8(1), items.buc_status[cur_slot])
-        new_items = items.replace(buc_status=items.buc_status.at[cur_slot].set(new_buc))
-
-        # Effect 3: aggravate — wake all sleeping monsters.
-        is_aggr = wiz_just_died & (which == jnp.int32(3))
-        mai = ns.monster_ai
-        new_asleep = jnp.where(is_aggr, jnp.zeros_like(mai.asleep), mai.asleep)
-        new_sleep_t = jnp.where(
-            is_aggr, jnp.zeros_like(mai.sleep_timer), mai.sleep_timer
-        )
-
-        # Effect 4: nasty — summon a high-difficulty monster at first
-        # dead monster slot.  Vendor nasty() picks from a 44-species
-        # nasties[] pool; this expanded set covers a representative
-        # 10-monster slice across demons/devils/giant beasts:
-        #   297 water demon     299 horned devil    300 erinys
-        #   301 barbed devil    302 marilith        307 nalfeshnee
-        #   150 red dragon       49 master mind flayer
-        #   182 jabberwock      234 vampire lord
-        is_nasty = wiz_just_died & (which == jnp.int32(4))
-        rng_iv3, rng_iv4 = jax.random.split(rng_iv2, 2)
-        _NASTY_POOL = jnp.array(
-            [297, 299, 300, 301, 302, 307, 150, 49, 182, 234], dtype=jnp.int16
-        )
-        nasty_pick_roll = jax.random.randint(
-            rng_iv3, (), 0, _NASTY_POOL.shape[0], dtype=jnp.int32
-        )
-        nasty_entry = _NASTY_POOL[nasty_pick_roll]
-        dead_slots = ~new_asleep & ~mai.alive   # logic-only: use alive only
-        dead_mask = ~mai.alive
-        any_dead = jnp.any(dead_mask)
-        dead_idx = jnp.argmax(dead_mask.astype(jnp.int32)).astype(jnp.int32)
-        do_nasty = is_nasty & any_dead
-
-        spawn_pos = state.player_pos  # Nasty spawns near hero (vendor enexto)
-        nasty_alive = jnp.where(do_nasty, jnp.bool_(True),  mai.alive[dead_idx])
-        nasty_entry_v = jnp.where(do_nasty, nasty_entry, mai.entry_idx[dead_idx])
-        nasty_hp     = jnp.where(do_nasty, jnp.int32(20), mai.hp[dead_idx])
-        nasty_hpmax  = jnp.where(do_nasty, jnp.int32(20), mai.hp_max[dead_idx])
-
-        # Effect 5: resurrect — re-spawn the Wizard at first dead slot.
-        is_resurr = wiz_just_died & (which == jnp.int32(5))
-        do_resurr = is_resurr & any_dead
-        resurr_alive = jnp.where(do_resurr, jnp.bool_(True), nasty_alive)
-        resurr_entry = jnp.where(do_resurr, jnp.int16(281), nasty_entry_v)
-        resurr_hp    = jnp.where(do_resurr, jnp.int32(50), nasty_hp)
-        resurr_hpmax = jnp.where(do_resurr, jnp.int32(50), nasty_hpmax)
-
-        new_alive_arr  = mai.alive.at[dead_idx].set(resurr_alive)
-        new_entry_arr  = mai.entry_idx.at[dead_idx].set(resurr_entry)
-        new_hp_arr     = mai.hp.at[dead_idx].set(resurr_hp)
-        new_hpmax_arr  = mai.hp_max.at[dead_idx].set(resurr_hpmax)
-
-        ns = ns.replace(
-            inventory=ns.inventory.replace(items=new_items),
-            monster_ai=mai.replace(
-                asleep=new_asleep,
-                sleep_timer=new_sleep_t,
-                alive=new_alive_arr,
-                entry_idx=new_entry_arr,
-                hp=new_hp_arr,
-                hp_max=new_hpmax_arr,
-            ),
-        )
-        # Effects 0/1 remain no-ops (vendor's "You feel nervous." flavor).
-        return ns
-
-    new_state = jax.lax.cond(already_done, lambda _: state, _do_step, operand=None)
+    # Phase 1a..8a: astral seeding through Wizard-intervene.
+    new_state = _rest_jit(
+        ns,
+        state,
+        prev_wizard_alive,
+        prev_branch,
+        prev_level,
+        rng_act,
+        rng_monsters,
+        rng_status,
+        rng_poly,
+        rng_shop,
+        rng_swallow,
+        rng_explvl,
+        rng_regions,
+        rng_astral,
+    )
 
     # Drain DISP for the per-step obs draws (display.c:486-498 glyph
     # selection + winrl.cc:458 inv glyph emit) — see env.reset() for
@@ -1471,3 +1609,81 @@ def _step_impl(state, action, rng):
     # contribute 0 since new_state == state.
     reward = jnp.float32(new_state.scoring.score - state.scoring.score)
     return new_state, obs, reward, new_state.done
+
+
+# --- Batched orchestrator (Seam C) ---
+#
+# ``step_batched`` cannot simply ``jax.vmap(_step_impl)``: that would
+# re-trace the entire pipeline inside one vmap, inlining both inner
+# jits and defeating the cache-slot separation Seam C exists to provide.
+# Instead, vmap each ``@jax.jit`` helper independently and chain the
+# results on the host.  The RNG split + pre-step snapshot extraction
+# stay in Python (host-side) so the per-batch fan-out is explicit.
+_VMAP_DISPATCH = jax.vmap(_dispatch_jit, in_axes=(0, 0, 0))
+_VMAP_REST = jax.vmap(
+    _rest_jit,
+    in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+)
+_VMAP_BUILD_OBS = jax.vmap(build_nle_observation)
+
+
+def _step_impl_batched(states, actions, rngs):
+    """Batched (vmap-parallel) version of ``_step_impl``.
+
+    See ``_step_impl`` for the per-env semantics; this function is the
+    Seam-C-aware batched orchestrator that vmaps the two inner jits
+    independently so each retains its own compile cache.
+    """
+    # Per-env RNG fan-out — ``jax.random.split(r, 9)`` per env, batched
+    # via vmap.  Result shape: ``[B, 9, 2]``; unstack along axis=1 to
+    # get nine ``[B, 2]`` subkey arrays.
+    sub = jax.vmap(lambda r: jax.random.split(r, 9))(rngs)
+    rng_act       = sub[:, 0]
+    rng_monsters  = sub[:, 1]
+    rng_status    = sub[:, 2]
+    rng_poly      = sub[:, 3]
+    rng_shop      = sub[:, 4]
+    rng_swallow   = sub[:, 5]
+    rng_explvl    = sub[:, 6]
+    rng_regions   = sub[:, 7]
+    rng_astral    = sub[:, 8]
+
+    # Pre-step snapshots (per-env, batched).
+    _PM_WIZARD_ENTRY = jnp.int32(281)
+    prev_wizard_alive = jnp.any(
+        states.monster_ai.alive
+        & (states.monster_ai.entry_idx.astype(jnp.int32) == _PM_WIZARD_ENTRY),
+        axis=-1,
+    )
+    prev_branch = states.dungeon.current_branch.astype(jnp.int32)
+    prev_level  = states.dungeon.current_level.astype(jnp.int32)
+
+    # Phase 1 (vmapped).
+    ns = _VMAP_DISPATCH(states, actions, rng_act)
+
+    # Phase 1a..8a (vmapped).
+    new_states = _VMAP_REST(
+        ns,
+        states,
+        prev_wizard_alive,
+        prev_branch,
+        prev_level,
+        rng_act,
+        rng_monsters,
+        rng_status,
+        rng_poly,
+        rng_shop,
+        rng_swallow,
+        rng_explvl,
+        rng_regions,
+        rng_astral,
+    )
+
+    if use_vendor_rng():
+        from Nethax.nethax.obs.nle_obs import consume_disp_for_obs as _consume_disp
+        new_states = new_states.replace(
+            vendor_rng_disp=jax.vmap(_consume_disp)(new_states)
+        )
+    obs = _VMAP_BUILD_OBS(new_states)
+    reward = (new_states.scoring.score - states.scoring.score).astype(jnp.float32)
+    return new_states, obs, reward, new_states.done
