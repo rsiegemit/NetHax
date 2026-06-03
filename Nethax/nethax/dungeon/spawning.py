@@ -469,7 +469,11 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
         int(MonsterSymbol.S_HUMAN):     7,   # elf branch peak; mercenary handled below
         int(MonsterSymbol.S_ANGEL):     3,   # !rn2(20) + rn2(2) + rn2(4)  line 332-340
         int(MonsterSymbol.S_HUMANOID):  6,   # dwarf worst case             line 367-386
-        int(MonsterSymbol.S_KOP):       3,   # !rn2(4) + !rn2(3) + rn2(2)   line 392-395
+        # S_KOP handled explicitly outside the generic loop (two gates each
+        # with conditional inner draws — m_initthrow rn1 and weapon-pick
+        # rn2(2)).  See _draw_kop_initweap in _consume_makemon_post_hp_draws.
+        # Vendor: makemon.c:389-396.
+        int(MonsterSymbol.S_KOP):       0,   # explicit handler             line 389-396
         int(MonsterSymbol.S_ORC):       5,   # helm + orc-captain branch    line 397-432
         int(MonsterSymbol.S_OGRE):      1,   # !rn2(N)                       line 434
         int(MonsterSymbol.S_TROLL):     2,   # !rn2(2) + rn2(4)              line 440-454
@@ -816,6 +820,7 @@ _MLET_GIANT:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_GIANT)
 _MLET_LICH:        jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_LICH)
 _MLET_KOBOLD:      jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOBOLD)
 _MLET_CENTAUR:     jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_CENTAUR)
+_MLET_KOP:         jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOP)
 _MLET_HUMAN_MERC:  jnp.ndarray = _compute_mlet_human_merc()
 _MLET_HUMAN_SK:    jnp.ndarray = _compute_mlet_human_shopkeeper()
 _MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
@@ -1700,6 +1705,58 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
             v_after = jax.lax.cond(
                 _MLET_CENTAUR[tid], _draw_centaur_initweap, lambda vc: vc, v_after
+            )
+
+            # S_KOP: explicit two-gate cascade — vendor makemon.c:389-396
+            #   case S_KOP:
+            #       if (!rn2(4))
+            #           m_initthrow(mtmp, CREAM_PIE, 2);   /* rn1(2, 3) */
+            #       if (!rn2(3))
+            #           (void) mongets(mtmp,
+            #                          (rn2(2)) ? CLUB : RUBBER_HOSE);
+            #       break;
+            # Two independent gates, each with one conditional inner draw:
+            #   gate1 = rn2(4): if 0, m_initthrow rn1(2, 3) (1 byte)
+            #   gate2 = rn2(3): if 0, weapon-pick rn2(2)   (1 byte)
+            # Worst case 4 bytes (both gates 0); typical 2-3 bytes.  The
+            # generic loop placeholder drew 3 bytes always, which over-counts
+            # by 1 in the 1/2 both-fail case and under-counts by 1 in the
+            # 1/12 both-pass case.
+            # Cite: vendor/nle/src/makemon.c:389-396 (S_KOP case),
+            #       vendor/nle/src/makemon.c:148-160 (m_initthrow rn1).
+            def _draw_kop_initweap(vc):
+                # Gate 1: rn2(4)
+                vc, gate1 = randint_jax(vc, (), 0, 4)
+
+                def _draw_creampie(vd):
+                    # m_initthrow rn1(2, 3) — 1 ISAAC64 word.
+                    nv, _ = randint_jax(vd, (), 3, 5)
+                    return nv
+
+                vc = jax.lax.cond(
+                    gate1 == jnp.int32(0),
+                    _draw_creampie,
+                    lambda vd: vd,
+                    vc,
+                )
+
+                # Gate 2: rn2(3)
+                vc, gate2 = randint_jax(vc, (), 0, 3)
+
+                def _draw_weapon_pick(vd):
+                    # rn2(2) — CLUB vs RUBBER_HOSE pick.
+                    nv, _ = randint_jax(vd, (), 0, 2)
+                    return nv
+
+                return jax.lax.cond(
+                    gate2 == jnp.int32(0),
+                    _draw_weapon_pick,
+                    lambda vd: vd,
+                    vc,
+                )
+
+            v_after = jax.lax.cond(
+                _MLET_KOP[tid], _draw_kop_initweap, lambda vc: vc, v_after
             )
 
             # Trailing offensive-item check — vendor makemon.c:556
