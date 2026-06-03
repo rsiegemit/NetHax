@@ -481,7 +481,12 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
         # rn2(2)).  See _draw_kop_initweap in _consume_makemon_post_hp_draws.
         # Vendor: makemon.c:389-396.
         int(MonsterSymbol.S_KOP):       0,   # explicit handler             line 389-396
-        int(MonsterSymbol.S_ORC):       5,   # helm + orc-captain branch    line 397-432
+        # S_ORC handled explicitly outside the generic loop — the rn2(2)
+        # ORCISH_HELM gate plus per-PM subtype branches (PM_MORDOR_ORC,
+        # PM_URUK_HAI, PM_ORC_CAPTAIN, PM_ORC_SHAMAN) each launch their
+        # own mongets()/m_initthrow mksobj_init cascades.  See
+        # _draw_orc_initweap.  Vendor: makemon.c:397-432.
+        int(MonsterSymbol.S_ORC):       0,   # explicit handler              line 397-432
         # S_OGRE handled explicitly outside the generic loop — the rn2(N)
         # gate divisor varies by subtype (PM_OGRE=10 vs OGRE_LORD/KING=5)
         # and on gate fire mongets(WAR_HAMMER) runs the WEAPON_CLASS
@@ -843,6 +848,7 @@ _MLET_KOP:         jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_KOP)
 _MLET_ZOMBIE:      jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_ZOMBIE)
 _MLET_TROLL:       jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_TROLL)
 _MLET_OGRE:        jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_OGRE)
+_MLET_ORC:         jnp.ndarray = _compute_mlet_mask(MonsterSymbol.S_ORC)
 _MLET_HUMAN_MERC:  jnp.ndarray = _compute_mlet_human_merc()
 _MLET_HUMAN_SK:    jnp.ndarray = _compute_mlet_human_shopkeeper()
 _MLET_HUMAN_PR:    jnp.ndarray = _compute_mlet_human_priest()
@@ -870,6 +876,16 @@ _PM_SOLDIER        = _find_pm_index("soldier")
 # entries) use 5.  Build a length-NUMMONS int32 table; non-S_OGRE entries
 # get 0 (unused — gated by _MLET_OGRE before lookup).
 _PM_OGRE = _find_pm_index("ogre")
+# S_ORC per-subtype branches — vendor makemon.c:404-431.  Each subtype
+# triggers a distinct chain of mongets/m_initthrow calls (Mordor orc:
+# ORCISH_SHORT_SWORD + ORCISH_BOW + ORCISH_ARROW; Uruk-hai: IRON_SKULL_CAP
+# + ORCISH_SHORT_SWORD + ORCISH_BOW + ORCISH_ARROW; orc-captain / shaman:
+# ORCISH_SHORT_SWORD or SCIMITAR pick).  Subtypes not listed (goblin /
+# hobgoblin / orc / hill orc) get only the rn2(2) ORCISH_HELM check.
+_PM_MORDOR_ORC   = _find_pm_index("Mordor orc")
+_PM_URUK_HAI     = _find_pm_index("Uruk-hai")
+_PM_ORC_CAPTAIN  = _find_pm_index("orc-captain")
+_PM_ORC_SHAMAN   = _find_pm_index("orc shaman")
 
 
 def _compute_ogre_gate_divisor() -> jnp.ndarray:
@@ -906,6 +922,10 @@ _IS_PM_WATCHMAN:       jnp.ndarray = _compute_is_pm(_PM_WATCHMAN)
 _IS_PM_WATCH_CAPTAIN:  jnp.ndarray = _compute_is_pm(_PM_WATCH_CAPTAIN)
 _IS_PM_GUARD:          jnp.ndarray = _compute_is_pm(_PM_GUARD)
 _IS_PM_SOLDIER:        jnp.ndarray = _compute_is_pm(_PM_SOLDIER)
+_IS_PM_MORDOR_ORC:     jnp.ndarray = _compute_is_pm(_PM_MORDOR_ORC)
+_IS_PM_URUK_HAI:       jnp.ndarray = _compute_is_pm(_PM_URUK_HAI)
+_IS_PM_ORC_CAPTAIN:    jnp.ndarray = _compute_is_pm(_PM_ORC_CAPTAIN)
+_IS_PM_ORC_SHAMAN:     jnp.ndarray = _compute_is_pm(_PM_ORC_SHAMAN)
 
 
 # ---------------------------------------------------------------------------
@@ -1950,6 +1970,187 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
             v_after = jax.lax.cond(
                 _MLET_OGRE[tid], _draw_ogre_initweap, lambda vc: vc, v_after
+            )
+
+            # S_ORC: rn2(2) ORCISH_HELM gate + per-PM subtype branches.
+            # Vendor makemon.c:397-432:
+            #   case S_ORC:
+            #       if (rn2(2))
+            #           (void) mongets(mtmp, ORCISH_HELM);
+            #       if (mm == PM_MORDOR_ORC) {
+            #           if (!rn2(3))
+            #               (void) mongets(mtmp, ORCISH_SHORT_SWORD);
+            #           if (!rn2(2)) {
+            #               (void) mongets(mtmp, ORCISH_BOW);
+            #               m_initthrow(mtmp, ORCISH_ARROW, 12);
+            #           }
+            #       } else if (mm == PM_URUK_HAI) {
+            #           if (!rn2(3))
+            #               (void) mongets(mtmp, IRON_SKULL_CAP);
+            #           if (!rn2(3))
+            #               (void) mongets(mtmp, ORCISH_SHORT_SWORD);
+            #           if (!rn2(3)) {
+            #               (void) mongets(mtmp, ORCISH_BOW);
+            #               m_initthrow(mtmp, ORCISH_ARROW, 12);
+            #           }
+            #       } else if (orc_captain || mm == PM_ORC_SHAMAN) {
+            #           (void) mongets(mtmp,
+            #                          rn2(2) ? ORCISH_SHORT_SWORD : SCIMITAR);
+            #       }
+            #       break;
+            #
+            # Byte-cost notes:
+            #   ORCISH_HELM (otyp 72) and IRON_SKULL_CAP (#define alias for
+            #     ORCISH_HELM at otyp 72): ARMOR_CLASS, not in
+            #     FUMBLE_BOOTS/LEVITATION_BOOTS/HELM_OF_OPPOSITE_ALIGNMENT/
+            #     GAUNTLETS_OF_FUMBLING shortlist → otyp=0 sentinel byte-
+            #     equivalent.  artif=FALSE.
+            #   ORCISH_SHORT_SWORD (31), ORCISH_BOW (67), SCIMITAR (33):
+            #     WEAPON_CLASS, none is_multigen/is_poisonable → otyp=0
+            #     sentinel byte-equivalent.  artif=FALSE.
+            #   ORCISH_ARROW (3): WEAPON_CLASS, IS multigen+poisonable so
+            #     _weapon_draws MUST receive otyp=3 to draw rn1(6,6) +
+            #     rn2(100) on top of the base cascade.  artif=FALSE.
+            #
+            # m_initthrow(mtmp, ORCISH_ARROW, 12) — vendor makemon.c:148-160:
+            #     otmp = mksobj(otyp, TRUE, FALSE);     // mksobj_init draws
+            #     otmp->quan = (long) rn1(oquan, 3);    // rn1(12, 3) = 1 draw
+            #
+            # Subtype gating uses _IS_PM_MORDOR_ORC / _URUK_HAI /
+            # _ORC_CAPTAIN / _ORC_SHAMAN.  Subtypes NOT in those four
+            # (goblin / hobgoblin / orc / hill orc) get only the rn2(2)
+            # ORCISH_HELM check.
+            #
+            # Previously the generic m_initweap loop drew rn2(2) five times
+            # (5 bytes) which over-counted the helm-skip case for orc
+            # captain/shaman and under-counted Mordor orc / Uruk-hai (which
+            # have up to 4 gate draws + 4 mksobj_init cascades each).
+            #
+            # Cite: vendor/nle/src/makemon.c:397-432 (S_ORC branch),
+            #       vendor/nle/src/makemon.c:148-160 (m_initthrow),
+            #       vendor/nle/src/mkobj.c:992-1005 (ARMOR_CLASS mksobj_init),
+            #       vendor/nle/src/mkobj.c:803-818  (WEAPON_CLASS mksobj_init).
+            def _draw_orc_initweap(vc):
+                # rn2(2) ORCISH_HELM gate.  Vendor uses `if (rn2(2))` (NO `!`)
+                # — gate fires when result is NON-zero (probability 1/2).
+                vc, helm_gate = randint_jax(vc, (), 0, 2)
+                vc = jax.lax.cond(
+                    helm_gate != jnp.int32(0),
+                    lambda vd: _armor_draws(vd, jnp.int32(0), jnp.bool_(False)),
+                    lambda vd: vd,
+                    vc,
+                )
+
+                # Subtype branches (mutually exclusive).
+                is_mordor = _IS_PM_MORDOR_ORC[tid]
+                is_uruk   = _IS_PM_URUK_HAI[tid]
+                is_cap    = _IS_PM_ORC_CAPTAIN[tid]
+                is_sham   = _IS_PM_ORC_SHAMAN[tid]
+
+                def _draw_mordor(vd):
+                    # rn2(3) → ORCISH_SHORT_SWORD on 0.
+                    vd, g1 = randint_jax(vd, (), 0, 3)
+                    vd = jax.lax.cond(
+                        g1 == jnp.int32(0),
+                        lambda ve: _weapon_draws(
+                            ve, jnp.int32(0), jnp.bool_(False)),
+                        lambda ve: ve,
+                        vd,
+                    )
+                    # rn2(2) → ORCISH_BOW + m_initthrow(ORCISH_ARROW, 12) on 0.
+                    vd, g2 = randint_jax(vd, (), 0, 2)
+
+                    def _draw_bow_and_arrows(ve):
+                        # ORCISH_BOW mksobj_init (non-multigen).
+                        ve = _weapon_draws(ve, jnp.int32(0), jnp.bool_(False))
+                        # m_initthrow body for ORCISH_ARROW:
+                        #   1. mksobj_init for ORCISH_ARROW (multigen+poisonable
+                        #      → otyp=3 to trigger rn1(6,6) + rn2(100)).
+                        #   2. rn1(12, 3) = rn2(12) + 3 — 1 draw for quan.
+                        ve = _weapon_draws(ve, jnp.int32(3), jnp.bool_(False))
+                        ve, _q = randint_jax(ve, (), 3, 15)
+                        return ve
+
+                    vd = jax.lax.cond(
+                        g2 == jnp.int32(0),
+                        _draw_bow_and_arrows,
+                        lambda ve: ve,
+                        vd,
+                    )
+                    return vd
+
+                def _draw_uruk(vd):
+                    # rn2(3) → IRON_SKULL_CAP (= ORCISH_HELM, ARMOR) on 0.
+                    vd, g1 = randint_jax(vd, (), 0, 3)
+                    vd = jax.lax.cond(
+                        g1 == jnp.int32(0),
+                        lambda ve: _armor_draws(
+                            ve, jnp.int32(0), jnp.bool_(False)),
+                        lambda ve: ve,
+                        vd,
+                    )
+                    # rn2(3) → ORCISH_SHORT_SWORD on 0.
+                    vd, g2 = randint_jax(vd, (), 0, 3)
+                    vd = jax.lax.cond(
+                        g2 == jnp.int32(0),
+                        lambda ve: _weapon_draws(
+                            ve, jnp.int32(0), jnp.bool_(False)),
+                        lambda ve: ve,
+                        vd,
+                    )
+                    # rn2(3) → ORCISH_BOW + m_initthrow(ORCISH_ARROW, 12) on 0.
+                    vd, g3 = randint_jax(vd, (), 0, 3)
+
+                    def _draw_bow_and_arrows(ve):
+                        ve = _weapon_draws(ve, jnp.int32(0), jnp.bool_(False))
+                        ve = _weapon_draws(ve, jnp.int32(3), jnp.bool_(False))
+                        ve, _q = randint_jax(ve, (), 3, 15)
+                        return ve
+
+                    vd = jax.lax.cond(
+                        g3 == jnp.int32(0),
+                        _draw_bow_and_arrows,
+                        lambda ve: ve,
+                        vd,
+                    )
+                    return vd
+
+                def _draw_cap_or_sham(vd):
+                    # rn2(2) weapon-pick (ORCISH_SHORT_SWORD vs SCIMITAR) +
+                    # mongets(picked).  Both weapons are non-multigen so the
+                    # mksobj_init cascade has identical byte cost regardless
+                    # of the picked otyp; otyp=0 sentinel is byte-equivalent.
+                    vd, _pick = randint_jax(vd, (), 0, 2)
+                    vd = _weapon_draws(vd, jnp.int32(0), jnp.bool_(False))
+                    return vd
+
+                # Mutually-exclusive dispatch — vendor uses `if / else if /
+                # else if`.  Build a single switch index over four cases:
+                #   0 = no subtype branch (goblin / hobgoblin / orc / hill orc)
+                #   1 = PM_MORDOR_ORC
+                #   2 = PM_URUK_HAI
+                #   3 = PM_ORC_CAPTAIN or PM_ORC_SHAMAN
+                idx = jnp.where(
+                    is_mordor, jnp.int32(1),
+                    jnp.where(
+                        is_uruk, jnp.int32(2),
+                        jnp.where(is_cap | is_sham, jnp.int32(3), jnp.int32(0)),
+                    ),
+                )
+                vc = jax.lax.switch(
+                    idx,
+                    [
+                        lambda vd: vd,           # 0 — no subtype branch
+                        _draw_mordor,            # 1
+                        _draw_uruk,              # 2
+                        _draw_cap_or_sham,       # 3
+                    ],
+                    vc,
+                )
+                return vc
+
+            v_after = jax.lax.cond(
+                _MLET_ORC[tid], _draw_orc_initweap, lambda vc: vc, v_after
             )
 
             # Trailing offensive-item check — vendor makemon.c:556
