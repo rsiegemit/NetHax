@@ -2925,11 +2925,33 @@ def fill_ordinary_rooms(
                 #      over the rumors.fal source.
                 # Cite: vendor/nle/src/engrave.c:13-25, 82-142;
                 #       vendor/nle/src/rumors.c:91-159 (false path adjtruth==0).
-                vrng_in, _rne4  = randint_jax(vrng_in, (), 0, 4)      # rn2(4) branch (engrave.c:20)
-                vrng_in, _rne2  = randint_jax(vrng_in, (), 0, 2)      # rn2(2) truth-coin (rumors.c:124)
-                vrng_in, tidbit = randint_jax(
-                    vrng_in, (), 0, FALSE_RUMOR_SIZE
-                )                                                    # rn2(false_rumor_size) (rumors.c:133)
+                #
+                # Short-circuit gate (vendor engrave.c:20):
+                #   `if (!rn2(4) || !(rumor = getrumor(0, ...)) || !*rumor)`
+                # C ``||`` is strictly left-to-right with short-circuit.
+                # `getrumor` is called ONLY when `rn2(4) != 0` (i.e. the
+                # `!rn2(4)` LHS is FALSE).  When `rn2(4) == 0` (~25%) the
+                # LHS is true, vendor short-circuits and SKIPS getrumor's
+                # rn2(2) + rn2(rumor_size) draws entirely.  Previously
+                # those two draws fired unconditionally, over-consuming 2
+                # ISAAC64 bytes on every rn2(4)==0 graffiti gate.
+                # Vendor cite: vendor/nle/src/engrave.c:20 (||
+                # short-circuit); vendor/nle/src/rumors.c:124,128,133
+                # (rn2(2) adjtruth + rn2(rumor_size) tidbit).
+                vrng_in, rne4 = randint_jax(vrng_in, (), 0, 4)        # rn2(4) branch (engrave.c:20)
+                rumor_path = rne4 != jnp.int32(0)
+
+                def _draw_rumor(v):
+                    v, _rne2 = randint_jax(v, (), 0, 2)               # rn2(2) truth-coin (rumors.c:124)
+                    v, t = randint_jax(v, (), 0, FALSE_RUMOR_SIZE)    # rn2(false_rumor_size) (rumors.c:133)
+                    return v, t
+
+                def _skip_rumor(v):
+                    return v, jnp.int32(0)
+
+                vrng_in, tidbit = lax.cond(
+                    rumor_path, _draw_rumor, _skip_rumor, vrng_in,
+                )
                 # ---- wipeout_text simulation ----
                 # Pre-built per-tidbit tables (host-side, in rumors_data.py):
                 #   text_len_tab[tidbit]              : int32 strlen(rumor)
