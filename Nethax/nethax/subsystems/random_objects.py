@@ -1621,6 +1621,58 @@ _MKSOBJ_INIT_BRANCHES = [
 ]
 
 
+@jax.jit
+def _consume_mksobj_init_draws_jit_with_tool(
+    rng: Isaac64State,
+    oclass_id: jnp.ndarray,
+    otyp_arr: jnp.ndarray,
+    artif_arr: jnp.ndarray,
+) -> Isaac64State:
+    """Hoisted JIT-cached body of :func:`consume_mksobj_init_draws` (otyp known).
+
+    Standalone ``@jax.jit`` so XLA compiles this once and call sites (e.g.
+    ``fill_one_isaac``'s lax.scan body) emit a CALL instruction rather than
+    inlining the full 13-way ``lax.switch`` + TOOL_CLASS sub-dispatch every
+    time.  The TOOL_CLASS conditional dispatch fires only when
+    ``oclass_id == TOOL_CLASS`` — for non-TOOL callers this is a JAX no-op.
+    Byte-equivalent to the inlined version: same draws, same order.
+    """
+    rng = lax.switch(
+        oclass_id, _MKSOBJ_INIT_BRANCHES,
+        rng, otyp_arr, artif_arr,
+    )
+    # TOOL_CLASS per-otyp dispatch (mkobj.c:897-966).  Only fires when
+    # the picked class is TOOL_CLASS; otherwise this is a noop.
+    is_tool = oclass_id == jnp.int32(int(ObjectClass.TOOL_CLASS))
+    rng = lax.cond(
+        is_tool,
+        lambda r: _tool_draws_dispatch(r, otyp_arr),
+        lambda r: r,
+        rng,
+    )
+    return rng
+
+
+@jax.jit
+def _consume_mksobj_init_draws_jit_no_tool(
+    rng: Isaac64State,
+    oclass_id: jnp.ndarray,
+    otyp_arr: jnp.ndarray,
+    artif_arr: jnp.ndarray,
+) -> Isaac64State:
+    """Hoisted JIT-cached body of :func:`consume_mksobj_init_draws` (otyp=None).
+
+    Legacy ``otyp=None`` callers (e.g. ``consume_mkobj_random_draws``,
+    ``corridors.py`` SCROLL_CLASS) do not need the TOOL_CLASS per-otyp
+    dispatch (they pass non-TOOL classes or accept the 0-draw fallback).
+    Byte-equivalent to the prior inlined ``otyp is None`` branch.
+    """
+    return lax.switch(
+        oclass_id, _MKSOBJ_INIT_BRANCHES,
+        rng, otyp_arr, artif_arr,
+    )
+
+
 def consume_mksobj_init_draws(
     rng: Isaac64State,
     oclass_id: jnp.ndarray,
@@ -1688,23 +1740,22 @@ def consume_mksobj_init_draws(
     # weapon path (~94% of WEAPON_CLASS otyps by oc_prob mass are NOT
     # multigen-skilled).  This was the pre-fix behaviour but is no longer
     # the byte-correct path: callers that have the otyp roll SHOULD pass it.
-    otyp_arr = jnp.int32(0) if otyp is None else jnp.asarray(otyp, dtype=jnp.int32)
+    #
+    # The body is dispatched to one of two module-level ``@jax.jit``
+    # helpers so XLA compiles the 13-way ``lax.switch`` + optional TOOL
+    # sub-dispatch ONCE and emits CALL instructions at every site.  Prior
+    # to this hoist, every caller (notably ``fill_one_isaac``'s lax.scan
+    # body) inlined the full dispatch into its HLO graph — pathological
+    # cold-compile time on Mac CPU.  Byte-equivalent: same draws / order.
     artif_arr = jnp.asarray(artif, dtype=jnp.bool_)
-    rng = lax.switch(
-        oclass_id, _MKSOBJ_INIT_BRANCHES,
-        rng, otyp_arr, artif_arr,
-    )
-    if otyp is not None:
-        # TOOL_CLASS per-otyp dispatch (mkobj.c:897-966).  Only fires when
-        # the picked class is TOOL_CLASS; otherwise this is a noop.
-        is_tool = oclass_id == jnp.int32(int(ObjectClass.TOOL_CLASS))
-        rng = lax.cond(
-            is_tool,
-            lambda r: _tool_draws_dispatch(r, otyp_arr),
-            lambda r: r,
-            rng,
+    if otyp is None:
+        return _consume_mksobj_init_draws_jit_no_tool(
+            rng, oclass_id, jnp.int32(0), artif_arr,
         )
-    return rng
+    otyp_arr = jnp.asarray(otyp, dtype=jnp.int32)
+    return _consume_mksobj_init_draws_jit_with_tool(
+        rng, oclass_id, otyp_arr, artif_arr,
+    )
 
 
 def consume_mkobj_random_draws(

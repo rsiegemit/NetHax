@@ -41,6 +41,8 @@ Notes on coverage:
 
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
@@ -1725,6 +1727,49 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
                                    player_align=0, player_align_record=0,
                                    in_mklev=True, level_difficulty=1,
                                    mm_nogrp=False):
+    """Thin dispatcher — see :func:`_consume_makemon_post_hp_draws_body`.
+
+    The real cascade lives in
+    :func:`_consume_makemon_post_hp_draws_body`, which is wrapped in a
+    module-level ``@jax.jit`` (:func:`_consume_makemon_post_hp_draws_jit`)
+    so XLA compiles the 88-closure body ONCE per ``mm_nogrp`` value (two
+    variants) and emits a CALL instruction at every site.  Prior to this
+    hoist the cascade was inlined into ``fill_one_isaac``'s lax.scan HLO
+    module — 137 MB / 411k-line graph, 60+ min cold compile.  Byte-
+    equivalent to the prior inlined body.
+    """
+    # All non-static kwargs are normalised to JAX scalars by the body; the
+    # JIT helper sees a stable shape on every call so the cached executable
+    # is reused.  ``mm_nogrp`` controls a Python branch and is therefore a
+    # static argument of the wrapper.
+    return _consume_makemon_post_hp_draws_jit(
+        vrng, type_id,
+        player_align, player_align_record,
+        in_mklev, level_difficulty,
+        bool(mm_nogrp),
+    )
+
+
+@functools.partial(jax.jit, static_argnames=("mm_nogrp",))
+def _consume_makemon_post_hp_draws_jit(vrng, type_id,
+                                       player_align, player_align_record,
+                                       in_mklev, level_difficulty,
+                                       mm_nogrp):
+    """Hoisted ``@jax.jit`` wrapper around the cascade body.  See
+    :func:`_consume_makemon_post_hp_draws_body` for the implementation.
+    """
+    return _consume_makemon_post_hp_draws_body(
+        vrng, type_id,
+        player_align, player_align_record,
+        in_mklev, level_difficulty,
+        mm_nogrp,
+    )
+
+
+def _consume_makemon_post_hp_draws_body(vrng, type_id,
+                                        player_align=0, player_align_record=0,
+                                        in_mklev=True, level_difficulty=1,
+                                        mm_nogrp=False):
     """Consume the post-newmonhp RNG cascade for one monster.
 
     Mirrors vendor/nle/src/makemon.c lines 1214-1386 in draw order:
