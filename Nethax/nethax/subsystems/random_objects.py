@@ -946,16 +946,74 @@ def _amulet_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
     return rng
 
 
-def _food_draws(rng: Isaac64State) -> Isaac64State:
-    """FOOD_CLASS — vendor mkobj.c:880-884.
+# FOOD_CLASS otyps that short-circuit (or replace) the rn2(6) quantity draw.
+# Citation: vendor/nle/src/mkobj.c:874-884 (case FOOD_CLASS body).
+#   Is_pudding(otmp) (GLOB_OF_GRAY_OOZE..GLOB_OF_BLACK_PUDDING, 246..249) takes
+#     the `if` branch and never reaches the else — zero rn2(6) draw.
+#   CORPSE (240), MEAT_RING (245), KELP_FROND (250) short-circuit the `&&`
+#     chain before the !rn2(6) call, dropping the byte from the ISAAC64 stream.
+# otyp ids match constants/objects.py positional indices (see comments around
+# lines 4984..5184 of constants/objects.py: corpse=240, meat ring=245,
+# glob of gray ooze=246, ..., glob of black pudding=249, kelp frond=250).
+_OTYP_CORPSE:                 int = 240
+_OTYP_MEAT_RING:              int = 245
+_OTYP_GLOB_OF_GRAY_OOZE:      int = 246
+_OTYP_GLOB_OF_BLACK_PUDDING:  int = 249
+_OTYP_KELP_FROND:             int = 250
 
-    Default food (ration/fruit/veggie) quantity check:
-        rn2(6)    # if != 0: quan = 2  (mkobj.c:881)
 
-    Corpse/egg/tin have rndmonnum loops (deferred — requires monster table).
-    We model the common default food path: 1 draw.
+def _food_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
+    """FOOD_CLASS — vendor mkobj.c:874-884.
+
+    Vendor source::
+
+        case FOOD_CLASS:
+            if (Is_pudding(otmp)) {
+                otmp->globby = 1;
+                otmp->known = otmp->dknown = 1;
+                otmp->corpsenm = PM_GRAY_OOZE
+                                 + (otmp->otyp - GLOB_OF_GRAY_OOZE);
+            } else {
+                if (otmp->otyp != CORPSE && otmp->otyp != MEAT_RING
+                    && otmp->otyp != KELP_FROND && !rn2(6)) {
+                    otmp->quan = 2L;
+                }
+            }
+            break;
+
+    Per-otyp draw counts:
+      Is_pudding(otmp)  (246..249) : 0 draws (takes the `if` branch — the
+                                     else with rn2(6) is unreachable).
+      CORPSE (240)                 : 0 draws (`&&` short-circuit before rn2(6)).
+      MEAT_RING (245)              : 0 draws (`&&` short-circuit before rn2(6)).
+      KELP_FROND (250)             : 0 draws (`&&` short-circuit before rn2(6)).
+      other FOOD_CLASS otyps       : 1 draw  (rn2(6)).
+
+    Corpse/egg/tin have rndmonnum loops in later vendor code (deferred —
+    requires monster table); only the mksobj_init quantity draw is modelled
+    here.
+
+    Cite: vendor/nle/src/mkobj.c:874-884.
     """
-    rng, _ = rn2_jax(rng, 6)                                 # mkobj.c:881
+    # Short-circuit conditions where vendor skips the rn2(6) draw entirely.
+    # Cite: vendor/nle/src/mkobj.c:875 (Is_pudding `if` branch) and :881-882
+    # (the `otyp != CORPSE && otyp != MEAT_RING && otyp != KELP_FROND &&`
+    # short-circuit chain ahead of !rn2(6)).
+    is_pudding = (
+        (otyp >= jnp.int32(_OTYP_GLOB_OF_GRAY_OOZE))
+        & (otyp <= jnp.int32(_OTYP_GLOB_OF_BLACK_PUDDING))
+    )
+    is_corpse     = otyp == jnp.int32(_OTYP_CORPSE)
+    is_meat_ring  = otyp == jnp.int32(_OTYP_MEAT_RING)
+    is_kelp_frond = otyp == jnp.int32(_OTYP_KELP_FROND)
+    skip_draw = is_pudding | is_corpse | is_meat_ring | is_kelp_frond
+
+    rng = lax.cond(
+        skip_draw,
+        lambda r: r,
+        lambda r: rn2_jax(r, 6)[0],                          # mkobj.c:882
+        rng,
+    )
     return rng
 
 
@@ -1451,8 +1509,10 @@ def _amulet_branch(rng, otyp, artif):
     return _amulet_draws(rng, otyp)
 
 def _food_branch(rng, otyp, artif):
-    del otyp, artif
-    return _food_draws(rng)
+    del artif
+    # otyp threaded through so CORPSE/MEAT_RING/KELP_FROND/puddings skip the
+    # rn2(6) quantity draw.  Cite: vendor/nle/src/mkobj.c:874-884.
+    return _food_draws(rng, otyp)
 
 def _potion_scroll_branch(rng, otyp, artif):
     del otyp, artif
