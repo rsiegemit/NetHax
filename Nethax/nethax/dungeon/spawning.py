@@ -521,7 +521,14 @@ def _compute_initweap_draw_count() -> jnp.ndarray:
         # `rn2(7) ? SPEAR : rn2(3) ? TRIDENT : STILETTO`.  See
         # _draw_lizard_initweap.  Vendor: makemon.c:482-486.
         int(MonsterSymbol.S_LIZARD):    0,   # explicit handler              line 482-486
-        int(MonsterSymbol.S_DEMON):     1,   # rn2(4) trident-vs-bullwhip   line 497
+        # S_DEMON: 1-byte placeholder approximates the default-case
+        # rnd(14-2*bias) selector that fires after FALLTHRU for is_demon
+        # monsters (vendor makemon.c:509-553).  The inner per-PM switch
+        # (PM_BALROG / PM_ORCUS / PM_HORNED_DEVIL / PM_DISPATER /
+        # PM_YEENOGHU) is layered ON TOP via _draw_demon_inner_switch,
+        # adding the exact inner cascade bytes per PM.  Full default-case
+        # modeling (bias + per-case mongets cascades) is a separate fix.
+        int(MonsterSymbol.S_DEMON):     1,   # placeholder for default sel  line 487-505
     }
     default_count = 1  # default switch case: rnd(14-2*bias) — 1 draw
 
@@ -762,6 +769,120 @@ def _compute_is_lord_mask() -> jnp.ndarray:
     return jnp.array(flags, dtype=jnp.bool_)
 
 
+def _compute_is_prince_mask() -> jnp.ndarray:
+    """True where monster's mflags2 has M2_PRINCE set.
+
+    Cite: vendor/nle/include/mondata.h:136 — is_prince(ptr) checks M2_PRINCE.
+    Used in the default-case bias computation:
+    bias = is_lord(ptr) + is_prince(ptr) * 2 + extra_nasty(ptr).
+    """
+    mask = int(M2_PRINCE) & 0xFFFFFFFF
+    flags = [((int(m.flags2) & 0xFFFFFFFF) & mask) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_is_nasty_mask() -> jnp.ndarray:
+    """True where monster's mflags2 has M2_NASTY set.
+
+    Cite: vendor/nle/include/mondata.h:127 — extra_nasty(ptr) checks M2_NASTY.
+    Used in the default-case bias computation.
+    """
+    mask = int(M2_NASTY) & 0xFFFFFFFF
+    flags = [((int(m.flags2) & 0xFFFFFFFF) & mask) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_is_strong_mask() -> jnp.ndarray:
+    """True where monster's mflags2 has M2_STRONG set.
+
+    Cite: vendor/nle/include/mondata.h:128 — strongmonst(ptr) checks M2_STRONG.
+    Used in the default-case to pick BATTLE_AXE / TWO_HANDED_SWORD /
+    LONG_SWORD / LUCERN_HAMMER vs ammo m_initthrow + AKLYS.
+    """
+    mask = int(M2_STRONG) & 0xFFFFFFFF
+    flags = [((int(m.flags2) & 0xFFFFFFFF) & mask) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_is_demon_mask() -> jnp.ndarray:
+    """True where monster's mflags2 has M2_DEMON set.
+
+    Cite: vendor/nle/include/mondata.h:117 — is_demon(ptr) checks M2_DEMON.
+    Used to gate the S_DEMON FALLTHRU to default case at vendor
+    makemon.c:509-511 (`if (!is_demon(ptr)) break; /*FALLTHRU*/`).
+    """
+    mask = int(M2_DEMON) & 0xFFFFFFFF
+    flags = [((int(m.flags2) & 0xFFFFFFFF) & mask) != 0 for m in MONSTERS]
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
+def _compute_bias_table() -> jnp.ndarray:
+    """Per-monster int32 bias for default-case `rnd(14 - 2*bias)`.
+
+    Cite: vendor/nle/src/makemon.c:518:
+        bias = is_lord(ptr) + is_prince(ptr) * 2 + extra_nasty(ptr);
+
+    Range: 0 .. 4 (0+0+0=0 for ordinary monsters; 1+2+1=4 for the
+    rare M2_LORD|M2_PRINCE|M2_NASTY monsters — but is_lord and is_prince
+    are mutually exclusive in practice, so max is 2+1=3).
+    """
+    M2_LORD_M   = int(M2_LORD)   & 0xFFFFFFFF
+    M2_PRINCE_M = int(M2_PRINCE) & 0xFFFFFFFF
+    M2_NASTY_M  = int(M2_NASTY)  & 0xFFFFFFFF
+    vals = []
+    for m in MONSTERS:
+        f2 = int(m.flags2) & 0xFFFFFFFF
+        lord = 1 if (f2 & M2_LORD_M) != 0 else 0
+        prince = 1 if (f2 & M2_PRINCE_M) != 0 else 0
+        nasty = 1 if (f2 & M2_NASTY_M) != 0 else 0
+        vals.append(lord + prince * 2 + nasty)
+    return jnp.array(vals, dtype=jnp.int32)
+
+
+def _compute_default_case_eligible() -> jnp.ndarray:
+    """True where m_initweap reaches the default case.
+
+    Vendor makemon.c:512-553: the default case is hit when the explicit
+    mlet switch hasn't `break`'d.  The explicit cases are:
+        S_GIANT, S_HUMAN, S_ANGEL, S_HUMANOID, S_KOP, S_ORC, S_OGRE,
+        S_TROLL, S_KOBOLD, S_CENTAUR, S_WRAITH, S_ZOMBIE, S_LIZARD,
+        S_DEMON (with FALLTHRU to default when is_demon).
+    All other armed monsters fall directly into default.  S_DEMON with
+    is_demon also falls through after running its inner switch.
+    """
+    EXPLICIT_MLETS = {
+        int(MonsterSymbol.S_GIANT),
+        int(MonsterSymbol.S_HUMAN),
+        int(MonsterSymbol.S_ANGEL),
+        int(MonsterSymbol.S_HUMANOID),
+        int(MonsterSymbol.S_KOP),
+        int(MonsterSymbol.S_ORC),
+        int(MonsterSymbol.S_OGRE),
+        int(MonsterSymbol.S_TROLL),
+        int(MonsterSymbol.S_KOBOLD),
+        int(MonsterSymbol.S_CENTAUR),
+        int(MonsterSymbol.S_WRAITH),
+        int(MonsterSymbol.S_ZOMBIE),
+        int(MonsterSymbol.S_LIZARD),
+        int(MonsterSymbol.S_DEMON),  # FALLTHRU when is_demon; handled below
+    }
+    M2_DEMON_M = int(M2_DEMON) & 0xFFFFFFFF
+    flags = []
+    for m in MONSTERS:
+        mlet = int(m.symbol)
+        f2 = int(m.flags2) & 0xFFFFFFFF
+        if mlet not in EXPLICIT_MLETS:
+            flags.append(True)
+            continue
+        # S_DEMON falls through to default ONLY when is_demon(ptr).
+        if mlet == int(MonsterSymbol.S_DEMON):
+            flags.append((f2 & M2_DEMON_M) != 0)
+            continue
+        # Other explicit mlets break out before default — never fall through.
+        flags.append(False)
+    return jnp.array(flags, dtype=jnp.bool_)
+
+
 def _compute_is_domestic() -> jnp.ndarray:
     """True where monster has M2_DOMESTIC flag2.
 
@@ -949,6 +1070,17 @@ _PM_SALAMANDER   = _find_pm_index("salamander")
 # and elven_mithril_coat path remain on the generic placeholder for
 # now (separate fix).
 _PM_HOBBIT       = _find_pm_index("hobbit")
+# S_DEMON per-PM inner switch (vendor makemon.c:487-505) — each named
+# PM has its own mongets cascade.  Other S_DEMONs (succubus, imp,
+# lemure, manes, vrock, etc.) take the empty inner switch (0 bytes)
+# and then FALLTHRU to the default case (vendor makemon.c:509-553);
+# the default fallthrough is still on the generic placeholder for now
+# (separate fix wired via `_DEFAULT_ELIGIBLE`).
+_PM_BALROG       = _find_pm_index("balrog")
+_PM_ORCUS        = _find_pm_index("Orcus")
+_PM_HORNED_DEVIL = _find_pm_index("horned devil")
+_PM_DISPATER     = _find_pm_index("Dispater")
+_PM_YEENOGHU     = _find_pm_index("Yeenoghu")
 
 
 def _compute_ogre_gate_divisor() -> jnp.ndarray:
@@ -991,6 +1123,11 @@ _IS_PM_ORC_CAPTAIN:    jnp.ndarray = _compute_is_pm(_PM_ORC_CAPTAIN)
 _IS_PM_ORC_SHAMAN:     jnp.ndarray = _compute_is_pm(_PM_ORC_SHAMAN)
 _IS_PM_SALAMANDER:     jnp.ndarray = _compute_is_pm(_PM_SALAMANDER)
 _IS_PM_HOBBIT:         jnp.ndarray = _compute_is_pm(_PM_HOBBIT)
+_IS_PM_BALROG:         jnp.ndarray = _compute_is_pm(_PM_BALROG)
+_IS_PM_ORCUS:          jnp.ndarray = _compute_is_pm(_PM_ORCUS)
+_IS_PM_HORNED_DEVIL:   jnp.ndarray = _compute_is_pm(_PM_HORNED_DEVIL)
+_IS_PM_DISPATER:       jnp.ndarray = _compute_is_pm(_PM_DISPATER)
+_IS_PM_YEENOGHU:       jnp.ndarray = _compute_is_pm(_PM_YEENOGHU)
 
 
 # ---------------------------------------------------------------------------
@@ -2381,6 +2518,79 @@ def _consume_makemon_post_hp_draws(vrng, type_id,
 
             v_after = jax.lax.cond(
                 _IS_PM_HOBBIT[tid], _draw_hobbit_initweap, lambda vc: vc, v_after
+            )
+
+            # S_DEMON inner per-PM switch — vendor makemon.c:487-505:
+            #   case S_DEMON:
+            #       switch (mm) {
+            #       case PM_BALROG:
+            #           (void) mongets(mtmp, BULLWHIP);
+            #           (void) mongets(mtmp, BROADSWORD);
+            #           break;
+            #       case PM_ORCUS:
+            #           (void) mongets(mtmp, WAN_DEATH);
+            #           break;
+            #       case PM_HORNED_DEVIL:
+            #           (void) mongets(mtmp, rn2(4) ? TRIDENT : BULLWHIP);
+            #           break;
+            #       case PM_DISPATER:
+            #           (void) mongets(mtmp, WAN_STRIKING);
+            #           break;
+            #       case PM_YEENOGHU:
+            #           (void) mongets(mtmp, FLAIL);
+            #           break;
+            #       }
+            #       if (!is_demon(ptr)) break;
+            #       /*FALLTHRU*/
+            # The fallthrough to the default case (vendor makemon.c:512-553)
+            # is still on the generic placeholder count=1 for the rnd(14-2*bias)
+            # selector — full default-case modeling is a separate fix.
+            #
+            # Inner-switch byte budgets:
+            #   PM_BALROG:       0 bytes (BULLWHIP non-multigen + BROADSWORD non-multigen)
+            #   PM_ORCUS:        2-3 bytes (WAN_DEATH via _wand_draws: rn2(5) + blessorcurse(17))
+            #   PM_HORNED_DEVIL: 1 byte (rn2(4) ternary) + 0 (TRIDENT/BULLWHIP non-multi)
+            #   PM_DISPATER:     2-3 bytes (WAN_STRIKING via _wand_draws)
+            #   PM_YEENOGHU:     0 bytes (FLAIL non-multigen)
+            # Other S_DEMONs (succubus, imp, lemure, vrock, ice_devil, etc.):
+            # 0 inner bytes — no matching case in the inner switch.
+            #
+            # Previously the placeholder drew rn2(2)=1 byte for ALL S_DEMONs,
+            # under-counting ORCUS/DISPATER by 1-2 bytes (missing WAND cascade)
+            # and HORNED_DEVIL by 0 bytes (matched), and over-counting other
+            # S_DEMONs by 0-1 byte vs vendor's inner+default sum.
+            #
+            # Cite: vendor/nle/src/makemon.c:487-505 (S_DEMON inner switch),
+            #       vendor/nle/src/mkobj.c:803-818 (WEAPON_CLASS mksobj_init),
+            #       vendor/nle/src/mkobj.c:1019-1027 (WAND_CLASS mksobj_init).
+            def _draw_demon_inner_switch(vc):
+                # PM_ORCUS: WAN_DEATH mongets cascade.
+                vc = jax.lax.cond(
+                    _IS_PM_ORCUS[tid],
+                    lambda vd: _wand_draws(vd),
+                    lambda vd: vd,
+                    vc,
+                )
+                # PM_HORNED_DEVIL: rn2(4) ternary (TRIDENT vs BULLWHIP).
+                vc = jax.lax.cond(
+                    _IS_PM_HORNED_DEVIL[tid],
+                    lambda vd: randint_jax(vd, (), 0, 4)[0],
+                    lambda vd: vd,
+                    vc,
+                )
+                # PM_DISPATER: WAN_STRIKING mongets cascade.
+                vc = jax.lax.cond(
+                    _IS_PM_DISPATER[tid],
+                    lambda vd: _wand_draws(vd),
+                    lambda vd: vd,
+                    vc,
+                )
+                # PM_BALROG and PM_YEENOGHU: only non-multigen WEAPONs, 0 bytes.
+                # No explicit draws needed.
+                return vc
+
+            v_after = jax.lax.cond(
+                _MLET_DEMON[tid], _draw_demon_inner_switch, lambda vc: vc, v_after
             )
 
             # Trailing offensive-item check — vendor makemon.c:556
