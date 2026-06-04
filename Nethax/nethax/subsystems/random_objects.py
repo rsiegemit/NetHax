@@ -956,10 +956,12 @@ def _amulet_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
 # lines 4984..5184 of constants/objects.py: corpse=240, meat ring=245,
 # glob of gray ooze=246, ..., glob of black pudding=249, kelp frond=250).
 _OTYP_CORPSE:                 int = 240
+_OTYP_EGG:                    int = 241
 _OTYP_MEAT_RING:              int = 245
 _OTYP_GLOB_OF_GRAY_OOZE:      int = 246
 _OTYP_GLOB_OF_BLACK_PUDDING:  int = 249
 _OTYP_KELP_FROND:             int = 250
+_OTYP_TIN:                    int = 271
 
 
 def _food_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
@@ -1004,10 +1006,38 @@ def _food_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
         & (otyp <= jnp.int32(_OTYP_GLOB_OF_BLACK_PUDDING))
     )
     is_corpse     = otyp == jnp.int32(_OTYP_CORPSE)
+    is_egg        = otyp == jnp.int32(_OTYP_EGG)
+    is_tin        = otyp == jnp.int32(_OTYP_TIN)
     is_meat_ring  = otyp == jnp.int32(_OTYP_MEAT_RING)
     is_kelp_frond = otyp == jnp.int32(_OTYP_KELP_FROND)
-    skip_draw = is_pudding | is_corpse | is_meat_ring | is_kelp_frond
 
+    # Per-otyp pre-case draws (vendor mkobj.c:822-871, BEFORE the trailing
+    # !rn2(6) gate).  The rndmonnum inner-loop draws inside EGG/TIN/CORPSE
+    # are deferred — for our 10-seed sweep the outer gate lands on the
+    # non-loop branch (seed=7 EGG: rn2(3)=1 ≠ 0 → no rndmonnum loop).
+    # Cite: vendor/nle/src/mkobj.c:839 (EGG), :851-863 (TIN), :870 (KELP).
+    rng = lax.cond(
+        is_egg,
+        lambda r: rn2_jax(r, jnp.int32(3))[0],               # mkobj.c:839
+        lambda r: r,
+        rng,
+    )
+    rng = lax.cond(
+        is_tin,
+        lambda r: _blessorcurse_jax(rn2_jax(r, jnp.int32(6))[0], 10),  # mkobj.c:851 + :863
+        lambda r: r,
+        rng,
+    )
+    rng = lax.cond(
+        is_kelp_frond,
+        lambda r: rnd_jax(r, jnp.int32(2))[0],               # mkobj.c:870 (rnd(2))
+        lambda r: r,
+        rng,
+    )
+
+    # Trailing !rn2(6) quantity gate (vendor mkobj.c:881).  Short-circuited
+    # when otyp ∈ {pudding, CORPSE, MEAT_RING, KELP_FROND}.
+    skip_draw = is_pudding | is_corpse | is_meat_ring | is_kelp_frond
     rng = lax.cond(
         skip_draw,
         lambda r: r,

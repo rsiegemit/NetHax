@@ -368,6 +368,56 @@ def _apply_fov(state):
                               opaque_overlay=opaque_overlay,
                               lit_mask=lit_mask)
 
+    # Augment with vendor Algorithm C (``view_from``) for the lit-room
+    # wall ring.  ``compute_fov`` is a Bresenham raycaster that cannot
+    # reach the bounding walls of a lit room from interior positions
+    # (the wall stops the ray before reaching the wall tile itself).
+    # Vendor ``vision_recalc`` (vendor/nle/src/vision.c:320-335) marks
+    # the whole lit room — interior PLUS the 1-cell wall ring — IN_SIGHT
+    # when the hero is inside the lit room.  The reset path (env.py:560)
+    # already uses ``view_from`` with a ``lit_flood | within_light`` gate.
+    # Mirror that here at step time so doorway / wall tiles in the lit
+    # room are revealed each turn (seed=4 step1 (9,8) regression).
+    #
+    # ``state.features.lit`` only stamps the room *interior* (rooms.py:
+    # 1711-1720 — ``in_room`` excludes the wall ring), so dilate by one
+    # cell (3x3 max) to produce the wall-inclusive lit ring, matching
+    # ``lit_room_flood`` semantics.
+    lit_dilated = jnp.zeros_like(lit_mask)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            shifted = jnp.roll(lit_mask, shift=(dr, dc), axis=(0, 1))
+            # roll wraps; mask the wrap-around bands.
+            h, w = lit_mask.shape
+            if dr == -1:
+                shifted = shifted.at[h - 1, :].set(False)
+            elif dr == 1:
+                shifted = shifted.at[0, :].set(False)
+            if dc == -1:
+                shifted = shifted.at[:, w - 1].set(False)
+            elif dc == 1:
+                shifted = shifted.at[:, 0].set(False)
+            lit_dilated = lit_dilated | shifted
+
+    # Chebyshev within-light ring (always-visible adjacent cells), mirroring
+    # the reset path (env.py:599-604).
+    h_map, w_map = terrain_2d.shape
+    rows_g = jnp.arange(h_map, dtype=jnp.int32)[:, None]
+    cols_g = jnp.arange(w_map, dtype=jnp.int32)[None, :]
+    within_light = (
+        (jnp.abs(rows_g - pr) <= jnp.int32(1))
+        & (jnp.abs(cols_g - pc) <= jnp.int32(1))
+    )
+
+    vf_mask = view_from(terrain_2d, state.player_pos,
+                        max_radius=0,
+                        opaque_overlay=opaque_overlay)
+    vf_gated = vf_mask & (lit_dilated | within_light)
+    # OR-augment: never subtract from compute_fov; only add view_from cells
+    # in the lit room ring.  This keeps corridor cells revealed by Bresenham
+    # while picking up the lit-room walls/doorways view_from finds.
+    new_visible = new_visible | vf_gated
+
     b  = state.dungeon.current_branch
     lv = state.dungeon.current_level - 1
     new_explored = update_explored(state.explored[b, lv], new_visible)

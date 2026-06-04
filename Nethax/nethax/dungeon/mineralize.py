@@ -448,6 +448,56 @@ def _mineral_scan(
     gem_otyp   = jnp.zeros((_SCAN_N, _MAX_GEMS), dtype=jnp.int32)
     gem_qty    = jnp.zeros((_SCAN_N, _MAX_GEMS), dtype=jnp.int32)
 
+    # ---------------------------------------------------------------------
+    # Vendor Y-SKIP precompute (mklev.c:950-961).
+    #
+    # Vendor's outer for(x=2..COLNO-2) for(y=1..ROWNO-1) loop ADVANCES y
+    # extra inside the if-else body:
+    #     if (levl[x][y+1].typ != STONE)   y += 2;   /* skip y+1, y+2 */
+    #     else if (levl[x][y].typ != STONE) y += 1;   /* skip y+1 */
+    #     else { 8-neighbour STONE check ... }
+    # Cells skipped this way are NEVER asked the eligibility predicate.
+    # Nethax's flat fori_loop visits every cell, so when (x,y) is non-stone
+    # and (x,y+2) happens to be eligible, Nethax draws rn2(1000) twice
+    # where vendor draws zero — driving the seed=8 first divergence at
+    # draw 2648 (33 extra eligible cells).
+    #
+    # Build a per-column visit_mask via sequential lax.scan with a
+    # skip-count carry.  Columns are independent → vmap over xi.
+    # ---------------------------------------------------------------------
+    _is_stone_grid = _is_stone(terrain)  # bool[ROWNO, COLNO]
+
+    def _col_visit(xi):
+        # Per-column scan: at each yi, decide if cell is visited.
+        # The skip carry counts how many subsequent y values are suppressed
+        # by a prior non-stone (x, y') decision.
+        ys = jnp.arange(_Y_LO, _Y_HI, dtype=jnp.int32)
+
+        def step(skip, yi):
+            visit = skip == jnp.int32(0)
+            # Vendor decision (only when this cell is the inner-loop body
+            # candidate, i.e. when visit is True):
+            #   if levl[x][y+1] != STONE: y += 2  → next 2 cells skipped
+            #   elif levl[x][y]  != STONE: y += 1 → next 1 cell skipped
+            #   else: 0 cells skipped (eligible-or-not, fall through to next y)
+            yp1_nonstone = ~_is_stone_grid[yi + 1, xi]
+            yy_nonstone  = ~_is_stone_grid[yi,     xi]
+            new_skip_if_visit = jnp.where(
+                yp1_nonstone, jnp.int32(2),
+                jnp.where(yy_nonstone, jnp.int32(1), jnp.int32(0)),
+            )
+            next_skip = jnp.where(
+                visit, new_skip_if_visit, skip - jnp.int32(1),
+            )
+            return next_skip, visit
+
+        _, visits = lax.scan(step, jnp.int32(0), ys)
+        return visits  # bool[_SCAN_H]
+
+    # visit_mask shape: (_SCAN_W, _SCAN_H); index by (xi-_X_LO, yi-_Y_LO).
+    _xis = jnp.arange(_X_LO, _X_HI, dtype=jnp.int32)
+    _visit_mask = jax.vmap(_col_visit)(_xis)
+
     def body(flat_i, carry):
         vrng, gpl, gq, gmp, go, gmq = carry
 
@@ -465,9 +515,12 @@ def _mineral_scan(
         cell_sw  = terrain[yi + 1, xi - 1]
 
         # Vendor cite: vendor/nle/src/mklev.c:950-961, :981 — eligibility =
-        # diggable + self + 8 neighbours STONE.
+        # diggable + self + 8 neighbours STONE.  Gated by the Y-SKIP visit
+        # mask above so cells vendor never reaches don't draw rn2(1000) here.
+        visited = _visit_mask[xi - _X_LO, yi - _Y_LO]
         eligible = (
-            (~nondiggable[yi, xi])
+            visited
+            & (~nondiggable[yi, xi])
             & _is_stone(cell)
             & _is_stone(cell_n)
             & _is_stone(cell_s)
