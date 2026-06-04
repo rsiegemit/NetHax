@@ -1120,6 +1120,8 @@ _IS_PM_WATCHMAN:       jnp.ndarray = _compute_is_pm(_PM_WATCHMAN)
 _IS_PM_WATCH_CAPTAIN:  jnp.ndarray = _compute_is_pm(_PM_WATCH_CAPTAIN)
 _IS_PM_GUARD:          jnp.ndarray = _compute_is_pm(_PM_GUARD)
 _IS_PM_SOLDIER:        jnp.ndarray = _compute_is_pm(_PM_SOLDIER)
+_PM_GOBLIN       = _find_pm_index("goblin")
+_IS_PM_GOBLIN:         jnp.ndarray = _compute_is_pm(_PM_GOBLIN)
 _IS_PM_MORDOR_ORC:     jnp.ndarray = _compute_is_pm(_PM_MORDOR_ORC)
 _IS_PM_URUK_HAI:       jnp.ndarray = _compute_is_pm(_PM_URUK_HAI)
 _IS_PM_ORC_CAPTAIN:    jnp.ndarray = _compute_is_pm(_PM_ORC_CAPTAIN)
@@ -2416,13 +2418,41 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
                         jnp.where(is_cap | is_sham, jnp.int32(3), jnp.int32(0)),
                     ),
                 )
+                def _draw_default_orc(vd):
+                    # Vendor makemon.c:426-430 — default subtype branch
+                    # for PM_GOBLIN / PM_HOBGOBLIN / PM_ORC / PM_HILL_ORC
+                    # (PM_ORC_SHAMAN routes via case 3 cap_or_sham above):
+                    #   if (mm != PM_ORC_SHAMAN && rn2(2))
+                    #     mongets(mtmp,
+                    #             (mm == PM_GOBLIN || rn2(2) == 0)
+                    #               ? ORCISH_DAGGER : SCIMITAR);
+                    is_goblin = _IS_PM_GOBLIN[tid]
+                    vd, gate = randint_jax(vd, (), 0, 2)
+
+                    def _gate_hit(ve):
+                        def _non_goblin(vf):
+                            vf, _pick = randint_jax(vf, (), 0, 2)
+                            return vf
+                        ve = jax.lax.cond(is_goblin, lambda vf: vf, _non_goblin, ve)
+                        # mongets(picked) — both ORCISH_DAGGER (multigen) and
+                        # SCIMITAR (non-multigen) consume the same _weapon_draws
+                        # cascade with otyp=0 sentinel; the otyp-dependent
+                        # is_multigen rn1(6,6) gate is skipped (otyp=0 → False).
+                        ve = _weapon_draws(ve, jnp.int32(0), jnp.bool_(False))
+                        return ve
+
+                    vd = jax.lax.cond(
+                        gate != jnp.int32(0), _gate_hit, lambda ve: ve, vd,
+                    )
+                    return vd
+
                 vc = jax.lax.switch(
                     idx,
                     [
-                        lambda vd: vd,           # 0 — no subtype branch
+                        _draw_default_orc,       # 0 — goblin/hobgoblin/orc/hill orc
                         _draw_mordor,            # 1
                         _draw_uruk,              # 2
-                        _draw_cap_or_sham,       # 3
+                        _draw_cap_or_sham,       # 3 (TODO: split shaman→case 0)
                     ],
                     vc,
                 )
