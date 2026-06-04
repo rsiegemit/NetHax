@@ -1652,15 +1652,24 @@ def _step_impl(state, action, rng):
     if use_vendor_rng():
         from Nethax.nethax.obs.nle_obs import consume_disp_for_obs as _consume_disp
         new_state = new_state.replace(vendor_rng_disp=_consume_disp(new_state))
-    obs = build_nle_observation(new_state)
-    # Reward = score delta (NLE convention: vendor topten.c::u.urexp running
-    # accumulator, surfaced as bl_score in blstats).  Already-done steps
-    # contribute 0 since new_state == state.
-    reward = jnp.float32(new_state.scoring.score - state.scoring.score)
+    obs, reward = _obs_jit(state, new_state)
     return new_state, obs, reward, new_state.done
 
 
-# --- Batched orchestrator (Seam C+B) ---
+@jax.jit
+def _obs_jit(prev_state, new_state):
+    """Seam A: observation builder + reward as a separate @jax.jit cache slot.
+
+    Pure function of (prev_state, new_state) — no RNG.  XLA caches this
+    independently of the step body, so obs-builder edits don't recompile
+    the dispatch / monster / post graphs.  Byte-equivalent to inline call.
+    """
+    obs = build_nle_observation(new_state)
+    reward = jnp.float32(new_state.scoring.score - prev_state.scoring.score)
+    return obs, reward
+
+
+# --- Batched orchestrator (Seam C+B+A) ---
 #
 # ``step_batched`` cannot simply ``jax.vmap(_step_impl)``: that would
 # re-trace the entire pipeline inside one vmap, inlining all inner
@@ -1683,6 +1692,7 @@ _VMAP_POST_MONSTER = jax.vmap(
     in_axes=(0, 0, 0, 0, 0, 0, 0, 0),
 )
 _VMAP_BUILD_OBS = jax.vmap(build_nle_observation)
+_VMAP_OBS = jax.vmap(_obs_jit, in_axes=(0, 0))
 
 
 def _step_impl_batched(states, actions, rngs):
@@ -1742,6 +1752,5 @@ def _step_impl_batched(states, actions, rngs):
         new_states = new_states.replace(
             vendor_rng_disp=jax.vmap(_consume_disp)(new_states)
         )
-    obs = _VMAP_BUILD_OBS(new_states)
-    reward = (new_states.scoring.score - states.scoring.score).astype(jnp.float32)
+    obs, reward = _VMAP_OBS(states, new_states)
     return new_states, obs, reward, new_states.done
