@@ -937,6 +937,37 @@ def _sort_rooms_by_lx(rooms, active, nroom=None):
     return sorted_rooms, sorted_active
 
 
+@jax.jit
+def _do_vault_draws_body(vendor_rng, lgs, rooms_box_postvault, nroom_post_vault):
+    """Hoisted body of the inline ``_do_vault_draws`` lax.cond inside
+    generate_main_branch_l1.  Profiler flagged the inlined closure as
+    module_2052 (~4.9MB HLO).  Wrapping at module level + ``@jax.jit`` makes
+    XLA emit a CALL to a cached body instead of inlining each time.
+    Byte-equivalent to the prior inline closure: same draws, same order.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax as _rn2
+    from Nethax.nethax.dungeon.corridors import _makeniche
+    _TELEP_TRAP = jnp.int32(15)
+    v = vendor_rng
+    v, _ = _rn2(v, jnp.int32(100))   # vault tile 0
+    v, _ = _rn2(v, jnp.int32(100))   # vault tile 1
+    v, _ = _rn2(v, jnp.int32(100))   # vault tile 2
+    v, _ = _rn2(v, jnp.int32(100))   # vault tile 3
+    v, r3 = _rn2(v, jnp.int32(3))
+    gate_fires = r3 == jnp.int32(0)
+
+    def _do_makevtele(rg):
+        r_, g_ = rg
+        r_, g_ = _makeniche(
+            r_, g_, rooms_box_postvault, nroom_post_vault,
+            _TELEP_TRAP, depth=1,
+        )
+        return r_, g_
+
+    v, lgs = lax.cond(gate_fires, _do_makevtele, lambda rg: rg, (v, lgs))
+    return v, lgs
+
+
 def generate_main_branch_l1(
     rng: jnp.ndarray,
     static_params,  # StaticParams — imported lazily to avoid circular dep
@@ -1581,41 +1612,9 @@ def generate_main_branch_l1(
         _new_lgs_typ = jnp.where(_stamp_gate & _v_br, jnp.int8(_VBR_v), _new_lgs_typ)
         _lgs = _lgs.replace(typ=_new_lgs_typ)
 
-        from Nethax.nethax.dungeon.corridors import _makeniche as _vendor_makeniche
-
-        # TELEP_TRAP=15 (vendor/nle/include/trap.h:73).  Non-zero, so
-        # _makeniche short-circuits past the rn2(4) SCORR/CORR gate and
-        # always takes the SCORR branch (matching vendor mklev.c:504).
-        _TELEP_TRAP = jnp.int32(15)
-
         def _do_vault_draws(carry):
             v, gs_ = carry
-            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 0
-            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 1
-            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 2
-            v, _ = _rn2_jax_do_vault(v, jnp.int32(100))   # vault tile 3
-            # makevtele gate — vendor mklev.c:752 ``if (!level.flags.noteleport
-            # && !rn2(3)) makevtele();``.  On Main Dlvl 1 noteleport=False is
-            # static, so the gate reduces to !rn2(3) (gate fires when r==0).
-            v, _r3 = _rn2_jax_do_vault(v, jnp.int32(3))
-            gate_fires = _r3 == jnp.int32(0)
-
-            # makevtele() -> makeniche(TELEP_TRAP).  Single makeniche call.
-            # Vendor cite: vendor/nle/src/mklev.c:567-571.  ``_makeniche``
-            # already loops up to vct=8 internally and short-circuits on the
-            # first successful placement, so calling it once matches vendor.
-            def _do_makevtele(rg):
-                r_, g_ = rg
-                r_, g_ = _vendor_makeniche(
-                    r_, g_, _rooms_box_postvault, _nroom_post_vault,
-                    _TELEP_TRAP, depth=1,
-                )
-                return r_, g_
-
-            v, gs_ = lax.cond(
-                gate_fires, _do_makevtele, lambda rg: rg, (v, gs_),
-            )
-            return v, gs_
+            return _do_vault_draws_body(v, gs_, _rooms_box_postvault, _nroom_post_vault)
 
         def _skip_do_vault_draws(carry):
             return carry
