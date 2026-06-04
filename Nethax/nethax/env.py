@@ -69,11 +69,12 @@ class NethaxEnv:
 
     def __init__(self, static: StaticParams | None = None):
         self.static = static or StaticParams()
-        # Seam C: ``_step_impl`` is now a Python orchestrator that chains
-        # two independently ``@jax.jit``-decorated helpers (``_dispatch_jit``
-        # and ``_rest_jit``).  Wrapping the orchestrator in another outer
-        # ``jax.jit`` would inline both helpers into one trace and defeat
-        # the separation, so we call it directly.
+        # Seam C+B: ``_step_impl`` is now a Python orchestrator that chains
+        # four independently ``@jax.jit``-decorated helpers
+        # (``_dispatch_jit`` -> ``_pre_monster_jit`` -> ``_monster_jit``
+        # -> ``_post_monster_jit``).  Wrapping the orchestrator in another
+        # outer ``jax.jit`` would inline all helpers into one trace and
+        # defeat the separation, so we call it directly.
         self._step_jit = _step_impl
 
     def reset(
@@ -1189,27 +1190,13 @@ def _dispatch_jit_impl(state, action, rng_act):
 _dispatch_jit = jax.jit(_dispatch_jit_impl)
 
 
-def _rest_body(
-    ns,
-    state,
-    prev_wizard_alive,
-    prev_branch,
-    prev_level,
-    rng_act,
-    rng_monsters,
-    rng_status,
-    rng_poly,
-    rng_shop,
-    rng_swallow,
-    rng_explvl,
-    rng_regions,
-    rng_astral,
-):
-    """Phase-1a..8a body: everything from astral seeding through intervene.
+def _pre_monster_body(ns, rng_act, rng_astral, prev_branch, prev_level):
+    """Phase-1a/1b body: astral mplayer seed + dig tick.
 
-    Receives the post-dispatch state ``ns`` and the pre-step ``state``
-    snapshot.  The caller (rest-jit) wraps this in a ``jax.lax.cond`` on
-    ``state.done`` so a done state is returned unchanged.
+    Seam B carve-out 1/3.  Receives the post-dispatch state ``ns`` and
+    the pre-step ``(prev_branch, prev_level)`` snapshot.  The caller
+    (pre-monster-jit) wraps this in a ``jax.lax.cond`` on ``state.done``
+    so a done state is returned unchanged.
     """
     # 1a. Astral-Plane mplayer trigger — vendor mplayer.c::create_mplayers
     #     (lines 327-355) called from astral.lua MAP section on level
@@ -1218,7 +1205,37 @@ def _rest_body(
 
     # 1b. Digging tick — advance multi-turn pickaxe dig (dig.c::dodig).
     ns = _dig_tick(ns, rng_act)
+    return ns
 
+
+def _pre_monster_jit_impl(ns, state, rng_act, rng_astral, prev_branch, prev_level):
+    """JIT-compiled wrapper around ``_pre_monster_body``.
+
+    Mirrors the ``already_done`` short-circuit from the original
+    monolithic ``_step_impl``: when the pre-step state was done, return
+    that original state unchanged so the overall ``_step_impl`` output
+    is byte-identical to the pre-split implementation.
+    """
+    return jax.lax.cond(
+        state.done,
+        lambda _: state,
+        lambda _: _pre_monster_body(ns, rng_act, rng_astral, prev_branch, prev_level),
+        operand=None,
+    )
+
+
+_pre_monster_jit = jax.jit(_pre_monster_jit_impl)
+
+
+def _monster_body(ns, rng_monsters, rng_regions):
+    """Phase-2/2b/2c body: monster turn + region tick + stinking cloud.
+
+    Seam B carve-out 2/3.  The ``lax.cond`` gating the monster AI on
+    ``action_consumed_turn`` stays *inside* this body (no host-side
+    branching) so byte-parity with the pre-split ``_rest_body`` is
+    preserved.  The caller (monster-jit) wraps this in a
+    ``jax.lax.cond`` on ``state.done``.
+    """
     # 2. Monster turn — allmain.c line 212 (movemon).
     # Vendor moveloop only enters the per-turn block (movemon + mcalcmove
     # + maintenance) when "actual time passed" — i.e. the player's action
@@ -1248,7 +1265,45 @@ def _rest_body(
     #     when the player is within Chebyshev radius, apply 1 HP damage +
     #     extend VOMITING timer per vendor inside_gas_cloud (region.c:1100+).
     ns = _tick_stinking_cloud(ns)
+    return ns
 
+
+def _monster_jit_impl(ns, state, rng_monsters, rng_regions):
+    """JIT-compiled wrapper around ``_monster_body``.
+
+    Mirrors the ``already_done`` short-circuit from the original
+    monolithic ``_step_impl``: when the pre-step state was done, return
+    that original state unchanged.
+    """
+    return jax.lax.cond(
+        state.done,
+        lambda _: state,
+        lambda _: _monster_body(ns, rng_monsters, rng_regions),
+        operand=None,
+    )
+
+
+_monster_jit = jax.jit(_monster_jit_impl)
+
+
+def _post_monster_body(
+    ns,
+    state,
+    prev_wizard_alive,
+    rng_status,
+    rng_poly,
+    rng_shop,
+    rng_swallow,
+    rng_explvl,
+):
+    """Phase-3..8a body: turn counters through Wizard intervene.
+
+    Seam B carve-out 3/3.  Receives the post-monster-tick state ``ns``
+    plus the pre-step ``state`` snapshot and ``prev_wizard_alive`` (used
+    by the intervene block to detect the Wizard's alive→dead edge).  The
+    caller (post-monster-jit) wraps this in a ``jax.lax.cond`` on
+    ``state.done`` so a done state is returned unchanged.
+    """
     # 3. Increment turn counter — allmain.c line 244 (svm.moves++).
     #    ``timestep`` is the monotonic env-step clock (timer deadlines,
     #    hallucination hash, monster-AI cadence) and advances every env
@@ -1479,23 +1534,17 @@ def _rest_body(
     return ns
 
 
-def _rest_jit_impl(
+def _post_monster_jit_impl(
     ns,
     state,
     prev_wizard_alive,
-    prev_branch,
-    prev_level,
-    rng_act,
-    rng_monsters,
     rng_status,
     rng_poly,
     rng_shop,
     rng_swallow,
     rng_explvl,
-    rng_regions,
-    rng_astral,
 ):
-    """JIT-compiled phase-1a..8a wrapper around ``_rest_body``.
+    """JIT-compiled wrapper around ``_post_monster_body``.
 
     Mirrors the ``already_done`` short-circuit from the original
     monolithic ``_step_impl``: when the pre-step state was done, return
@@ -1505,40 +1554,37 @@ def _rest_jit_impl(
     return jax.lax.cond(
         state.done,
         lambda _: state,
-        lambda _: _rest_body(
+        lambda _: _post_monster_body(
             ns,
             state,
             prev_wizard_alive,
-            prev_branch,
-            prev_level,
-            rng_act,
-            rng_monsters,
             rng_status,
             rng_poly,
             rng_shop,
             rng_swallow,
             rng_explvl,
-            rng_regions,
-            rng_astral,
         ),
         operand=None,
     )
 
 
-_rest_jit = jax.jit(_rest_jit_impl)
+_post_monster_jit = jax.jit(_post_monster_jit_impl)
 
 
 def _step_impl(state, action, rng):
-    """Thin Python orchestrator: splits RNG and chains the two JITs.
+    """Thin Python orchestrator: splits RNG and chains the four JITs.
 
-    Seam C splits the original monolithic ``_step_impl`` into:
-      * ``_dispatch_jit`` — phase 1 (``dispatch_action`` table).
-      * ``_rest_jit``     — phases 1a..8a (astral seed through intervene).
+    Seam C+B splits the original monolithic ``_step_impl`` into:
+      * ``_dispatch_jit``     — phase 1   (``dispatch_action`` table).
+      * ``_pre_monster_jit``  — phases 1a/1b (astral seed + dig tick).
+      * ``_monster_jit``      — phases 2/2b/2c (monster turn + regions).
+      * ``_post_monster_jit`` — phases 3..8a (turn counter → intervene).
 
-    Both jits internally honour the ``already_done`` short-circuit so a
-    done state returns ``state`` unchanged through both.  The RNG
-    ``jax.random.split(rng, 9)`` happens here exactly once; the resulting
-    subkeys are passed down explicitly with no further splitting.
+    All four jits internally honour the ``already_done`` short-circuit
+    so a done state returns ``state`` unchanged through all of them.
+    The RNG ``jax.random.split(rng, 9)`` happens here exactly once; the
+    resulting subkeys are passed down explicitly with no further
+    splitting.
 
     Vendor order (vendor/nethack/src/allmain.c::moveloop, lines ~200-360):
       1. Player action / docmd                       (line 203: svc.context.move)
@@ -1577,22 +1623,25 @@ def _step_impl(state, action, rng):
     # Phase 1: dispatch_action (Seam C — separate JIT cache slot).
     ns = _dispatch_jit(state, action, rng_act)
 
-    # Phase 1a..8a: astral seeding through Wizard-intervene.
-    new_state = _rest_jit(
+    # Phase 1a/1b: astral mplayer seed + dig tick (Seam B carve-out 1/3).
+    ns = _pre_monster_jit(ns, state, rng_act, rng_astral, prev_branch, prev_level)
+
+    # Phase 2/2b/2c: monster turn + region tick + stinking cloud
+    # (Seam B carve-out 2/3).  The ``action_consumed_turn`` gate lives
+    # inside ``_monster_body`` as a ``lax.cond`` — no host-side branch.
+    ns = _monster_jit(ns, state, rng_monsters, rng_regions)
+
+    # Phase 3..8a: turn counter through Wizard-intervene
+    # (Seam B carve-out 3/3).
+    new_state = _post_monster_jit(
         ns,
         state,
         prev_wizard_alive,
-        prev_branch,
-        prev_level,
-        rng_act,
-        rng_monsters,
         rng_status,
         rng_poly,
         rng_shop,
         rng_swallow,
         rng_explvl,
-        rng_regions,
-        rng_astral,
     )
 
     # Drain DISP for the per-step obs draws (display.c:486-498 glyph
@@ -1611,18 +1660,27 @@ def _step_impl(state, action, rng):
     return new_state, obs, reward, new_state.done
 
 
-# --- Batched orchestrator (Seam C) ---
+# --- Batched orchestrator (Seam C+B) ---
 #
 # ``step_batched`` cannot simply ``jax.vmap(_step_impl)``: that would
-# re-trace the entire pipeline inside one vmap, inlining both inner
-# jits and defeating the cache-slot separation Seam C exists to provide.
-# Instead, vmap each ``@jax.jit`` helper independently and chain the
-# results on the host.  The RNG split + pre-step snapshot extraction
-# stay in Python (host-side) so the per-batch fan-out is explicit.
+# re-trace the entire pipeline inside one vmap, inlining all inner
+# jits and defeating the cache-slot separation Seam C+B exists to
+# provide.  Instead, vmap each ``@jax.jit`` helper independently and
+# chain the results on the host.  The RNG split + pre-step snapshot
+# extraction stay in Python (host-side) so the per-batch fan-out is
+# explicit.
 _VMAP_DISPATCH = jax.vmap(_dispatch_jit, in_axes=(0, 0, 0))
-_VMAP_REST = jax.vmap(
-    _rest_jit,
-    in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+_VMAP_PRE_MONSTER = jax.vmap(
+    _pre_monster_jit,
+    in_axes=(0, 0, 0, 0, 0, 0),
+)
+_VMAP_MONSTER = jax.vmap(
+    _monster_jit,
+    in_axes=(0, 0, 0, 0),
+)
+_VMAP_POST_MONSTER = jax.vmap(
+    _post_monster_jit,
+    in_axes=(0, 0, 0, 0, 0, 0, 0, 0),
 )
 _VMAP_BUILD_OBS = jax.vmap(build_nle_observation)
 
@@ -1631,7 +1689,7 @@ def _step_impl_batched(states, actions, rngs):
     """Batched (vmap-parallel) version of ``_step_impl``.
 
     See ``_step_impl`` for the per-env semantics; this function is the
-    Seam-C-aware batched orchestrator that vmaps the two inner jits
+    Seam-C+B-aware batched orchestrator that vmaps the four inner jits
     independently so each retains its own compile cache.
     """
     # Per-env RNG fan-out — ``jax.random.split(r, 9)`` per env, batched
@@ -1661,22 +1719,22 @@ def _step_impl_batched(states, actions, rngs):
     # Phase 1 (vmapped).
     ns = _VMAP_DISPATCH(states, actions, rng_act)
 
-    # Phase 1a..8a (vmapped).
-    new_states = _VMAP_REST(
+    # Phase 1a/1b (vmapped) — astral mplayer seed + dig tick.
+    ns = _VMAP_PRE_MONSTER(ns, states, rng_act, rng_astral, prev_branch, prev_level)
+
+    # Phase 2/2b/2c (vmapped) — monster turn + region tick + stinking cloud.
+    ns = _VMAP_MONSTER(ns, states, rng_monsters, rng_regions)
+
+    # Phase 3..8a (vmapped) — turn counter through Wizard-intervene.
+    new_states = _VMAP_POST_MONSTER(
         ns,
         states,
         prev_wizard_alive,
-        prev_branch,
-        prev_level,
-        rng_act,
-        rng_monsters,
         rng_status,
         rng_poly,
         rng_shop,
         rng_swallow,
         rng_explvl,
-        rng_regions,
-        rng_astral,
     )
 
     if use_vendor_rng():
