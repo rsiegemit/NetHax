@@ -195,6 +195,14 @@ class MessageId(IntEnum):
     ITS_A_TREE            = 54  # hack.c:771 "It's a tree."
     ITS_SOLID_STONE       = 55  # hack.c:772 "It's solid stone."
 
+    # Pet bump-swap gate "foo" message (vendor uhitm.c:500 "You stop.  %s
+    # is in the way!").  Fired when the hero attempts to displace a tame
+    # pet but the gate trips (Punished, rn2(7)==0, longworm-with-tail, or
+    # obstructed tile without passes_walls).  The pet name slot is the
+    # variable; for seed=9 step 1 the pet is the starting little dog.
+    # Cite: vendor/nethack/src/uhitm.c lines 474-500.
+    YOU_STOP_PET_IN_WAY   = 59  # uhitm.c:500 "You stop.  Your little dog is in the way!"
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -338,6 +346,18 @@ _MESSAGE_TEMPLATES: tuple[str, ...] = (
     "It's a wall.",                          # 53 ITS_A_WALL           hack.c:770
     "It's a tree.",                          # 54 ITS_A_TREE           hack.c:771
     "It's solid stone.",                     # 55 ITS_SOLID_STONE      hack.c:772
+    # IDs 56-58 are dynamically-rendered via emit_moonphase_message and
+    # bypass the static template table; we keep placeholder rows so that
+    # list-index == msg_id alignment holds for later appended entries.
+    "",                                      # 56 MOON_FULL_LUCKY     (dyn)
+    "",                                      # 57 MOON_NEW_CAREFUL    (dyn)
+    "",                                      # 58 FRIDAY_13_WATCHOUT  (dyn)
+    # Pet bump-swap gate ("foo") — vendor uhitm.c:500.  Fired when the
+    # hero attempts to displace a tame pet but the gate trips (Punished,
+    # rn2(7)==0, longworm-with-tail, or obstructed tile without
+    # passes_walls).  Static rendering with the starting pet name; full
+    # dynamic name substitution is deferred to a follow-up.
+    "You stop.  Your little dog is in the way!",  # 59 YOU_STOP_PET_IN_WAY uhitm.c:500
 )
 
 

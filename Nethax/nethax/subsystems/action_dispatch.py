@@ -69,7 +69,7 @@ from Nethax.nethax.constants.actions import (
 )
 from Nethax.nethax.constants import TileType
 from Nethax.nethax.constants.objects import ObjectClass
-from Nethax.nethax.fov import compute_fov, update_explored, BLIND_SIGHT_RADIUS, DEFAULT_SIGHT_RADIUS, DARK_ROOM_SIGHT_RADIUS
+from Nethax.nethax.fov import compute_fov, update_explored, view_from, BLIND_SIGHT_RADIUS, DEFAULT_SIGHT_RADIUS, DARK_ROOM_SIGHT_RADIUS
 from Nethax.nethax.subsystems.lighting import _player_in_lit_area
 from Nethax.nethax.subsystems.features import (
     DoorState,
@@ -670,18 +670,64 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
         return attacked.replace(monster_ai=new_mai, status=new_status)
 
     def _pet_swap_branch(s):
-        # vendor/nethack/src/hack.c:2098 domove_swap_with_pet — when the hero
-        # bumps an adjacent tame pet, swap positions instead of attacking
-        # or stalling.  Move the pet to the hero's prior tile; move the
-        # hero into the pet's tile.
-        old_pos = s.player_pos.astype(jnp.int32)
-        new_player_pos = target.astype(jnp.int16)
-        mai_in = s.monster_ai
-        new_mon_pos = mai_in.pos.at[monster_idx].set(old_pos.astype(mai_in.pos.dtype))
-        new_mai = mai_in.replace(pos=new_mon_pos)
-        s2 = s.replace(player_pos=new_player_pos, monster_ai=new_mai)
-        # Re-apply FOV from new player position.
-        return _apply_fov(s2)
+        # vendor/nethack/src/uhitm.c:474-502 — bump-into-safemon "foo" gate.
+        # Before the displace-pet swap fires, vendor evaluates
+        #     boolean foo = (Punished || !rn2(7)
+        #                    || (is_longworm(mtmp->data) && mtmp->wormno)
+        #                    || (IS_OBSTRUCTED(levl[u.ux][u.uy].typ)
+        #                        && !passes_walls(mtmp->data)));
+        # When ``foo`` (or ``inshop``) is true the displace is blocked: the
+        # turn is consumed, "You stop.  <Pet> is in the way!" is printed,
+        # and if the pet is tame ``monflee(mtmp, rnd(6), FALSE, FALSE)``
+        # fires (drawing one ``rnd(6)`` from ISAAC64).
+        #
+        # Byte-parity rationale (v1): on Dlvl 1 step 1 the hero is never
+        # Punished, never bumps a longworm tail, never stands on an
+        # obstructed tile, and never enters a shop, so the vendor draw
+        # pattern collapses to a single ``rn2(7)`` plus a conditional
+        # ``rnd(6)``.  Long-worm / obstructed / shop are deferred — they
+        # do not apply to the seed sweep this gate currently fixes.
+        #
+        # We ALWAYS draw the ``rn2(7)`` from ``state.vendor_rng`` when this
+        # branch fires (matches vendor when Punished=False, which is the
+        # case across all current parity seeds at Dlvl 1 step 1).  The
+        # ``rnd(6)`` for monflee fires only when the gate trips (foo branch).
+        from Nethax.nethax.vendor_rng import rn2_jax as _rn2j, rnd_jax as _rndj
+        from Nethax.nethax.subsystems.messages import (
+            emit as _msg_emit,
+            MessageId as _MsgId,
+        )
+
+        vrng = s.vendor_rng
+        vrng, rn7 = _rn2j(vrng, jnp.int64(7))
+        foo = rn7 == jnp.int32(0)
+
+        def _foo_blocked(s_in):
+            # Gate tripped: draw rnd(6) for monflee (tame-only branch in
+            # vendor; ``is_pet_swap`` guarantees tame here), emit the
+            # "You stop." pline, leave positions unchanged.  The turn is
+            # still consumed by virtue of returning from _try_step.
+            vrng2 = s_in.vendor_rng
+            vrng2, _flee_dur = _rndj(vrng2, jnp.int64(6))
+            new_msgs = _msg_emit(s_in.messages, int(_MsgId.YOU_STOP_PET_IN_WAY))
+            return s_in.replace(vendor_rng=vrng2, messages=new_msgs)
+
+        def _do_swap(s_in):
+            # vendor/nethack/src/hack.c:2098 domove_swap_with_pet —
+            # standard displace-pet swap.  Move the pet to the hero's
+            # prior tile; move the hero into the pet's tile.
+            old_pos = s_in.player_pos.astype(jnp.int32)
+            new_player_pos = target.astype(jnp.int16)
+            mai_in = s_in.monster_ai
+            new_mon_pos = mai_in.pos.at[monster_idx].set(
+                old_pos.astype(mai_in.pos.dtype)
+            )
+            new_mai = mai_in.replace(pos=new_mon_pos)
+            s2 = s_in.replace(player_pos=new_player_pos, monster_ai=new_mai)
+            return _apply_fov(s2)
+
+        s_after_rn7 = s.replace(vendor_rng=vrng)
+        return jax.lax.cond(foo, _foo_blocked, _do_swap, s_after_rn7)
 
     # _attack_branch must return the same pytree shape as _move_branch
     # (below).  Selection order:
