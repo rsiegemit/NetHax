@@ -1383,6 +1383,19 @@ def _mkbox_cnts_draws(rng: Isaac64State, box_otyp: jnp.ndarray) -> Isaac64State:
             # Pass the decoded otyp so FOOD_CLASS (EGG/TIN/KELP per-otyp gates)
             # consume the correct vendor pre-case draws.
             r = _consume_mksobj_init_draws_inner(r, iclass, inner_otyp)
+            # mkobj.c:330-333 — COIN_CLASS post-mksobj quantity:
+            #   otmp->quan = rnd(level_difficulty() + 2) * rnd(75)
+            # Byte-parity scope is Dlvl 1 (depth=1 ⇒ level_difficulty()=1
+            # ⇒ modulus = 1 + 2 = 3).  Two RNG draws are consumed; the
+            # quantity value itself is unused for stream parity.
+            is_coin = iclass == jnp.int32(int(ObjectClass.COIN_CLASS))
+
+            def _coin_quan(r_):
+                r_, _ = rnd_jax(r_, 3)                          # mkobj.c:332 rnd(level_difficulty()+2)
+                r_, _ = rnd_jax(r_, 75)                         # mkobj.c:332 rnd(75)
+                return r_
+
+            r = lax.cond(is_coin, _coin_quan, lambda r_: r_, r)
             return r
 
         rng_ = lax.cond(is_icebox_, _icebox_item, _regular_item, rng_)
