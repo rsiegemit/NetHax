@@ -483,6 +483,20 @@ class NethaxEnv:
                 vendor_rng_disp=_vendor_rng.reseed_random(state.vendor_rng_disp),
             )
 
+        # Displace any per-OROOM monster that mklev placed on the hero's
+        # upstair — vendor/nle/src/allmain.c:634-635:
+        #     if (MON_AT(u.ux, u.uy))
+        #         mnexto(m_at(u.ux, u.uy));
+        # On seeds where no monster lands on the upstair this is a no-op and
+        # consumes ZERO ISAAC64 draws.  When a monster IS there, exactly one
+        # rn2(num_good) is drawn (teleport.c:215) — matching the extra uint64
+        # vendor consumes between mineralize and makedog on e.g. seed=5
+        # rog-hum-cha.  Cite: vendor/nle/src/allmain.c:634-635 trigger,
+        # vendor/nle/src/mon.c:2727 mnexto, vendor/nle/src/teleport.c:126-219
+        # enexto_core.
+        if use_vendor_rng():
+            state = _displace_oroom_monster_on_player(state)
+
         # Spawn starting pet adjacent to player — vendor/nethack/src/u_init.c::makedog.
         # Host-side (reset is not jit-compiled), so Python loops are fine.
         # Under NLE_BYTEPARITY, thread vendor_rng so the rn2(2) pet-type coin
@@ -822,6 +836,127 @@ def _build_pet_enexto_rings():
 
 
 _PET_ENEXTO_RINGS, _PET_ENEXTO_RING_COUNTS = _build_pet_enexto_rings()
+
+
+def _displace_oroom_monster_on_player(state):
+    """Vendor allmain.c:634-635 + mon.c:2727 mnexto — relocate a monster that
+    mklev spawned on the hero's upstair to an adjacent good cell.
+
+    Vendor pipeline (``allmain.c:634-635``)::
+
+        if (MON_AT(u.ux, u.uy))
+            mnexto(m_at(u.ux, u.uy));
+
+    ``mnexto`` calls ``enexto(&mm, u.ux, u.uy, ptr)``, which expands
+    concentric square rings from (u.ux, u.uy) and draws ``rn2(num_good)``
+    once a non-empty candidate list exists (``teleport.c:215``).
+
+    Consumes ZERO ISAAC64 draws on seeds where the hero's cell is empty
+    of monsters (the ``MON_AT`` gate short-circuits).  When a monster IS
+    present, exactly one ``rn2(count)`` is drawn — matching the extra
+    uint64 vendor consumes on e.g. seed=5 rog-hum-cha where the
+    per-OROOM spawn for the hero's room lands on the upstair tile.
+
+    Cite: vendor/nle/src/allmain.c:634-635 (MON_AT/mnexto trigger),
+          vendor/nle/src/mon.c:2727-2752 (mnexto body),
+          vendor/nle/src/teleport.c:25-106 (goodpos),
+          vendor/nle/src/teleport.c:126-219 (enexto_core ring search).
+    """
+    player_pos_i32 = state.player_pos.astype(jnp.int32)
+    player_r = player_pos_i32[0]
+    player_c = player_pos_i32[1]
+    terrain = state.terrain[0, 0]
+    H, W = terrain.shape
+
+    mai = state.monster_ai
+    mon_alive = mai.alive
+    mon_pos = mai.pos.astype(jnp.int32)
+    mon_at_player = mon_alive & (
+        (mon_pos[:, 0] == player_r) & (mon_pos[:, 1] == player_c)
+    )
+    any_mon_at_player = jnp.any(mon_at_player)
+    occupant_slot = jnp.argmax(mon_at_player.astype(jnp.int32)).astype(jnp.int32)
+
+    all_offs = _PET_ENEXTO_RINGS
+    all_rr = player_r + all_offs[..., 0]
+    all_cc = player_c + all_offs[..., 1]
+
+    slot_idx = jnp.arange(_PET_ENEXTO_RING_SIZE)[None, :]
+    valid_slot = slot_idx < _PET_ENEXTO_RING_COUNTS[:, None]
+    in_bounds = (
+        (all_rr >= 0) & (all_rr < H) & (all_cc >= 1) & (all_cc < W)
+        & valid_slot
+    )
+    rr_safe = jnp.clip(all_rr, 0, H - 1)
+    cc_safe = jnp.clip(all_cc, 0, W - 1)
+
+    tiles = terrain[rr_safe, cc_safe]
+    walkable = (
+        (tiles == jnp.int8(TileType.FLOOR))
+        | (tiles == jnp.int8(TileType.CORRIDOR))
+        | (tiles == jnp.int8(TileType.CLOSED_DOOR))
+        | (tiles == jnp.int8(TileType.OPEN_DOOR))
+        | (tiles == jnp.int8(TileType.DOORWAY))
+        | (tiles == jnp.int8(TileType.STAIRCASE_UP))
+        | (tiles == jnp.int8(TileType.STAIRCASE_DOWN))
+        | (tiles == jnp.int8(TileType.ALTAR))
+        | (tiles == jnp.int8(TileType.FOUNTAIN))
+        | (tiles == jnp.int8(TileType.THRONE))
+        | (tiles == jnp.int8(TileType.GRAVE))
+        | (tiles == jnp.int8(TileType.SINK))
+        | (tiles == jnp.int8(TileType.ICE_FLOOR))
+    )
+
+    # "OTHER monster" occupancy grid: exclude the slot being displaced.
+    # Vendor's ``m_at(x, y)`` inside goodpos returns NULL for the candidate
+    # ring cells because the monster being moved sits at (xx, yy), never
+    # at any ring cell of radius >= 1.
+    mon_r = jnp.clip(mon_pos[:, 0], 0, H - 1)
+    mon_c = jnp.clip(mon_pos[:, 1], 0, W - 1)
+    other_alive = mon_alive & ~mon_at_player
+    occupied = jnp.zeros((H, W), dtype=jnp.bool_)
+    occupied = occupied.at[mon_r, mon_c].set(other_alive, mode="drop")
+    no_mon = ~occupied[rr_safe, cc_safe]
+    not_player = ~((all_rr == player_r) & (all_cc == player_c))
+
+    good = in_bounds & walkable & no_mon & not_player
+
+    cum = jnp.cumsum(good.astype(jnp.int32), axis=1)
+    kept = good & (cum <= jnp.int32(_PET_ENEXTO_MAX_GOOD))
+    ring_count = jnp.sum(kept.astype(jnp.int32), axis=1)
+    has_hits = ring_count > jnp.int32(0)
+    any_hits = jnp.any(has_hits)
+
+    first_ring = jnp.argmax(has_hits.astype(jnp.int32)).astype(jnp.int32)
+    kept_ring = kept[first_ring]
+    cands_rr_ring = all_rr[first_ring]
+    cands_cc_ring = all_cc[first_ring]
+    count = ring_count[first_ring]
+
+    do_displace = any_mon_at_player & any_hits
+
+    def _draw_and_move(carry):
+        v_in, mai_in = carry
+        v_out, idx = _vendor_rng.rn2_jax(v_in, jnp.maximum(count, jnp.int32(1)))
+        cum_r = jnp.cumsum(kept_ring.astype(jnp.int32))
+        match = (cum_r - jnp.int32(1) == idx) & kept_ring
+        pick = jnp.argmax(match.astype(jnp.int32)).astype(jnp.int32)
+        new_pos = jnp.stack(
+            [cands_rr_ring[pick].astype(jnp.int16),
+             cands_cc_ring[pick].astype(jnp.int16)]
+        )
+        mai_out = mai_in.replace(
+            pos=mai_in.pos.at[occupant_slot].set(new_pos),
+        )
+        return v_out, mai_out
+
+    def _no_op(carry):
+        return carry
+
+    new_vrng, new_mai = jax.lax.cond(
+        do_displace, _draw_and_move, _no_op, (state.vendor_rng, state.monster_ai),
+    )
+    return state.replace(vendor_rng=new_vrng, monster_ai=new_mai)
 
 
 def _spawn_starting_pet(state, role: Role, vendor_rng=None):
