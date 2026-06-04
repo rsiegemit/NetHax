@@ -1376,10 +1376,13 @@ def _mkbox_cnts_draws(rng: Isaac64State, box_otyp: jnp.ndarray) -> Isaac64State:
             # Non-ICE_BOX item path — mkobj.c:321-349.
             r, cls_roll = rn2_jax(r, 100)                       # mkobj.c:324 rnd(100)-1
             iclass = _BOXIPROBS_TABLE[cls_roll]
-            r, _ = rn2_jax(r, 1000)                             # mkobj.c:251 type pick (rnd(1000))
+            r, type_roll = rn2_jax(r, 1000)                     # mkobj.c:251 type pick (rnd(1000))
+            inner_otyp = decode_picked_otyp(iclass, type_roll + jnp.int32(1))
             # Inner mksobj_init cascade — boxiprobs (mkobj.c:41-49) never emits
             # TOOL_CLASS, so the inner dispatch cannot re-enter mkbox_cnts.
-            r = _consume_mksobj_init_draws_inner(r, iclass)
+            # Pass the decoded otyp so FOOD_CLASS (EGG/TIN/KELP per-otyp gates)
+            # consume the correct vendor pre-case draws.
+            r = _consume_mksobj_init_draws_inner(r, iclass, inner_otyp)
             return r
 
         rng_ = lax.cond(is_icebox_, _icebox_item, _regular_item, rng_)
@@ -1482,6 +1485,7 @@ def _tool_draws_dispatch(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
 def _consume_mksobj_init_draws_inner(
     rng: Isaac64State,
     oclass_id: jnp.ndarray,
+    otyp: jnp.ndarray = None,
 ) -> Isaac64State:
     """Inner mksobj_init dispatch with no TOOL container recursion.
 
@@ -1489,16 +1493,17 @@ def _consume_mksobj_init_draws_inner(
     and the boxiprobs-emits-no-TOOL invariant are upheld (vendor mkobj.c:41-49
     boxiprobs class table; mkobj.c:342-345 bag-in-bag guard).
 
-    Inner callers don't have the decoded otyp (boxiprobs picks class but
-    doesn't expose the per-item type-roll downstream), so we pass otyp=0
-    and artif=False — both are safe defaults: boxiprobs (mkobj.c:41-49) emits
-    no WEAPON_CLASS items so the otyp=0 path through ``_weapon_draws`` is
-    never taken in practice, and bag-in-bag mksobj calls always pass
-    artif=FALSE per vendor mkobj.c:929 → mkbox_cnts → mksobj recursion.
+    When ``otyp`` is supplied (caller decoded the type-roll), per-otyp
+    branches (FOOD_CLASS EGG/TIN/KELP_FROND pre-case gates) consume their
+    extra draws.  When omitted (legacy), the dispatch uses otyp=0 — safe
+    because boxiprobs (mkobj.c:41-49) emits no WEAPON_CLASS items.  artif
+    is always FALSE per vendor mkobj.c:929 mkbox_cnts → mksobj recursion.
     """
+    if otyp is None:
+        otyp = jnp.int32(0)
     return lax.switch(
         oclass_id, _MKSOBJ_INIT_BRANCHES,
-        rng, jnp.int32(0), jnp.bool_(False),
+        rng, otyp, jnp.bool_(False),
     )
 
 
