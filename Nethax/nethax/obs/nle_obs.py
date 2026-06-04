@@ -868,7 +868,12 @@ def build_specials(env_state) -> jnp.ndarray:
     FOOD_CLASS = jnp.int8(int(_IC.FOOD))
     CORPSE_TYPE_ID = jnp.int16(260)
     is_corpse_stack = (gi_cat == FOOD_CLASS) & (gi_typ == CORPSE_TYPE_ID)
-    has_corpse = jnp.any(is_corpse_stack, axis=-1)
+    # Gate on visibility — vendor mapglyph.c only sets MG_CORPSE in the
+    # GLYPH_BODY branch when the displayed glyph is the corpse glyph
+    # (i.e. when the cell is currently seen or remembered).  Without
+    # this gate Nethax sets MG_CORPSE at off-screen corpses where
+    # vendor leaves the byte clean (seed=9 @503 row=6 col=30).
+    has_corpse = jnp.any(is_corpse_stack, axis=-1) & visible
 
     # MG_PET: any tile occupied by a tame monster (pets state).
     # The pets subsystem layout exposes positions per pet; fall back to all
