@@ -1676,6 +1676,23 @@ def generate_main_branch_l1(
             _vault_created_in_makerooms,
             _do_vault_draws, _skip_do_vault_draws, (vendor_rng, _lgs),
         )
+        # Re-snapshot vendor_levl_grid from the POST-vault ``_lgs.typ`` so the
+        # SCORR + SDOOR writes performed by ``_do_vault_draws_body``'s nested
+        # ``makevtele -> _makeniche`` cascade (vendor mklev.c:752-753, 568-571)
+        # propagate into the grid handed to ``mineralize`` downstream.  The
+        # pre-vault snapshot taken at the line above the ``_vendor_grid_to_terrain``
+        # call captured only the makecorridors + make_niches surface; the
+        # subsequent ``_do_vault_draws_body`` writes (e.g. seed 7 SCORR @ (col=50,
+        # row=13) + SDOOR @ (col=50, row=14); seed 8 SCORR @ (col=6, row=5) +
+        # SDOOR @ (col=6, row=6)) never reached ``vendor_levl_grid`` and so
+        # mineralize saw different terrain → ISAAC stream drift → pet kitten
+        # placed at wrong (row, col).  Re-snapshotting here picks them up while
+        # preserving the local vault-footprint stamp already mirrored into
+        # ``_lgs.typ`` at lines above.  Vendor cite: vendor/nle/src/mklev.c:
+        # 752-753 (makevtele call) -> 568-571 (_makeniche SCORR/SDOOR writes
+        # into levl[][]); vendor/nle/src/mklev.c:948-961 (mineralize scans
+        # the post-do_vault levl[][] grid).
+        vendor_levl_grid = jnp.transpose(_lgs.typ)  # [ROWNO, COLNO]
         del _lgs, _rooms_box, _rooms_box_postvault
 
         # ------------------------------------------------------------------
