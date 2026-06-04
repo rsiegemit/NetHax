@@ -861,12 +861,14 @@ def build_specials(env_state) -> jnp.ndarray:
     visible = env_state.visible[:21, 1:80]                             # bool[21,79]
     has_objpile = (stack_count >= 2) & visible
 
-    # Corpse: category == FOOD_CLASS (7) and type_id == CORPSE_OBJ_TYPE_ID (260).
+    # Corpse: category == FOOD_CLASS (7) and type_id == CORPSE_OBJ_TYPE_ID (240).
     # Per vendor/nethack/include/objects.h FOOD("corpse", ...), corpse is the
-    # canonical food entry; in our OBJECTS table that lands at index 260.
+    # FIRST food entry; in our OBJECTS table that lands at index 240.
+    # (Prior value 260 was the slime-mold index — caused has_corpse to
+    # false-positive on slime molds, mis-setting MG_CORPSE.)
     from Nethax.nethax.subsystems.inventory import ItemCategory as _IC
     FOOD_CLASS = jnp.int8(int(_IC.FOOD))
-    CORPSE_TYPE_ID = jnp.int16(260)
+    CORPSE_TYPE_ID = jnp.int16(240)
     is_corpse_stack = (gi_cat == FOOD_CLASS) & (gi_typ == CORPSE_TYPE_ID)
     # Gate on visibility — vendor mapglyph.c only sets MG_CORPSE in the
     # GLYPH_BODY branch when the displayed glyph is the corpse glyph

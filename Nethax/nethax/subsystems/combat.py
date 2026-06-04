@@ -108,8 +108,9 @@ def _build_killed_drops_corpse_table() -> jnp.ndarray:
 _KILLED_DROPS_CORPSE: jnp.ndarray = _build_killed_drops_corpse_table()
 
 # Sentinel type_id for a corpse item (FOOD class, vendor objects.h index 240).
-# Mirrors nle_obs.py::CORPSE_TYPE_ID = 260.
-_CORPSE_TYPE_ID: int = 260
+# Nethax OBJECTS table has corpse at index 240 (`constants/objects.py:4984`).
+# Prior value 260 was the slime-mold index — wrong.  apply_tools.py uses 240.
+_CORPSE_TYPE_ID: int = 240
 
 # ItemCategory.FOOD value = 7 (inventory.py ItemCategory enum).
 _FOOD_CATEGORY: int = 7
