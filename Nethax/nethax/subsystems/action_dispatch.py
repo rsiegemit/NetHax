@@ -412,10 +412,41 @@ def _apply_fov(state):
     vf_mask = view_from(terrain_2d, state.player_pos,
                         max_radius=0,
                         opaque_overlay=opaque_overlay)
-    vf_gated = vf_mask & (lit_dilated | within_light)
-    # OR-augment: never subtract from compute_fov; only add view_from cells
-    # in the lit room ring.  This keeps corridor cells revealed by Bresenham
-    # while picking up the lit-room walls/doorways view_from finds.
+    # EXPERIMENT 2026-06-04: gate vf_mask with hero-room-only lit flood
+    # rather than map-wide lit_dilated.  vendor vision_recalc only marks
+    # cells IN_SIGHT in the hero's CURRENT lit room, not every lit room.
+    # Hero's lit room = flood-fill from hero over lit cells.
+    pr_i = jnp.int32(state.player_pos[0])
+    pc_i = jnp.int32(state.player_pos[1])
+    # Start mask with hero's cell if lit; otherwise empty.
+    hero_lit_start = jnp.zeros_like(lit_mask)
+    hero_lit_start = hero_lit_start.at[pr_i, pc_i].set(lit_mask[pr_i, pc_i])
+    # 4-connected flood: 21 iterations covers max map diameter for 21x80.
+    hero_room_lit = hero_lit_start
+    for _ in range(21):
+        hero_room_lit = (
+            hero_room_lit
+            | jnp.roll(hero_room_lit, 1, 0).at[0, :].set(False)
+            | jnp.roll(hero_room_lit, -1, 0).at[-1, :].set(False)
+            | jnp.roll(hero_room_lit, 1, 1).at[:, 0].set(False)
+            | jnp.roll(hero_room_lit, -1, 1).at[:, -1].set(False)
+        ) & lit_mask
+    # Dilate hero's lit room by 1 to include walls.
+    hero_room_dilated = jnp.zeros_like(hero_room_lit)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            shifted = jnp.roll(hero_room_lit, shift=(dr, dc), axis=(0, 1))
+            h, w = hero_room_lit.shape
+            if dr == -1:
+                shifted = shifted.at[h - 1, :].set(False)
+            elif dr == 1:
+                shifted = shifted.at[0, :].set(False)
+            if dc == -1:
+                shifted = shifted.at[:, w - 1].set(False)
+            elif dc == 1:
+                shifted = shifted.at[:, 0].set(False)
+            hero_room_dilated = hero_room_dilated | shifted
+    vf_gated = vf_mask & (hero_room_dilated | within_light)
     new_visible = new_visible | vf_gated
 
     b  = state.dungeon.current_branch
