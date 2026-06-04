@@ -338,6 +338,11 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
 
     colors = _np.zeros((_MAX,), dtype=_np.uint8)
     desc = _np.zeros((_MAX, 80), dtype=_np.uint8)
+    # Parallel plural table — used at runtime by build_screen_descriptions
+    # when a cell's top ground-items stack has quan > 1 (vendor's pager.c
+    # /winrl.cc emits the plural descr for multi-quantity piles, e.g. "some
+    # food rations" instead of "a food ration").
+    desc_plural = _np.zeros((_MAX, 80), dtype=_np.uint8)
     # CMAP description table (TileType-ish names, keyed by cmap index).
     # Built from Nethax.nethax.constants.cmap_indices.CMAP_DESC, which
     # indexes per-symbol descriptions through the active layout — so
@@ -354,6 +359,86 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
         enc = s.encode("ascii", errors="ignore")[:79]  # leave null terminator
         b[:len(enc)] = _np.frombuffer(enc, dtype=_np.uint8)
         return b
+
+    def _pluralize_word(w: str) -> str:
+        """Simplified vendor makeplural() — covers the NetHack Dlvl 1 noun set.
+
+        Vendor cite: vendor/nethack/src/objnam.c::makeplural (full irregulars
+        live there; we replicate the subset that surfaces in the byteparity
+        validator's screen_descriptions check).
+        """
+        # Irregulars (vendor objnam.c:679+).
+        IRREGULARS = {
+            "die": "dice",
+            "child": "children",
+            "ox": "oxen",
+            "fungus": "fungi",
+            "wumpus": "wumpi",
+            "octopus": "octopuses",
+            "knife": "knives",
+            "leaf": "leaves",
+            "loaf": "loaves",
+            "wolf": "wolves",
+            "mouse": "mice",
+            "louse": "lice",
+            "tooth": "teeth",
+            "foot": "feet",
+            "man": "men",
+            "woman": "women",
+            "human": "humans",
+            "shaman": "shamans",
+            "djinni": "djinn",
+            "afreet": "afreeti",
+            "marilith": "marilith",
+            "deer": "deer",
+            "sheep": "sheep",
+            "fish": "fish",
+        }
+        if w in IRREGULARS:
+            return IRREGULARS[w]
+        if w.endswith("y") and len(w) >= 2 and w[-2] not in "aeiou":
+            return w[:-1] + "ies"
+        if w.endswith(("s", "x", "z", "ch", "sh")):
+            return w + "es"
+        # Default: just add 's'.
+        return w + "s"
+
+    def _pluralize_descr(s: str) -> str:
+        """Convert a singular descr (e.g. ``"a food ration"``) into its plural
+        form (``"some food rations"``).
+
+        - Replaces leading article (``"a "/"an "``) with ``"some "``.
+        - Pluralises the head noun: in compound names with ``"of"``, the head
+          noun is the last word BEFORE ``"of"`` (``"potion of healing"`` ->
+          ``"potions of healing"``).  Otherwise the last word is pluralised
+          (``"food ration"`` -> ``"food rations"``).
+        - Returns the input unchanged when no article prefix matches (e.g.
+          monster names, hero descriptions, gold piece descrs that already
+          use ``"some"``).
+        """
+        if not s:
+            return s
+        if s.startswith("a "):
+            rest = s[2:]
+        elif s.startswith("an "):
+            rest = s[3:]
+        elif s.startswith("the "):
+            rest = s[4:]
+        else:
+            # Already plural / non-article (e.g. monster name); leave intact.
+            return s
+        words = rest.split()
+        if not words:
+            return s
+        # Find head-noun index: last word BEFORE the first "of".
+        head_idx = len(words) - 1
+        for i, w in enumerate(words):
+            if w == "of":
+                head_idx = i - 1
+                break
+        head_idx = max(head_idx, 0)
+        words[head_idx] = _pluralize_word(words[head_idx])
+        return "some " + " ".join(words)
 
     # CLR_* constants from vendor/nethack/include/color.h
     CLR_GRAY = 7
@@ -526,12 +611,18 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
             colors[g] = int(o.color) & 0xFF
             if o is not None and getattr(o, "class_", None) == _OC.COIN_CLASS:
                 desc[g] = _bytes_for("some gold pieces")
+                # Gold piles are always multi-quantity (vendor mkgold),
+                # so the plural slot reuses the same string.
+                desc_plural[g] = _bytes_for("some gold pieces")
             else:
                 body = _unidentified_str(i, o)
                 if body:
-                    desc[g] = _bytes_for(_article(body) + body)
+                    singular = _article(body) + body
+                    desc[g] = _bytes_for(singular)
+                    desc_plural[g] = _bytes_for(_pluralize_descr(singular))
                 else:
                     desc[g] = _bytes_for("")
+                    desc_plural[g] = _bytes_for("")
 
     # Cmap (terrain)
     for cmap_i, txt in cmap_desc.items():
@@ -546,13 +637,20 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
     # Replace any literal black 0 outside cmap with gray? No — black is valid for
     # unexplored / dark.  Leave zero defaults.
 
+    # For glyphs that did not get an explicit plural (monsters, terrain,
+    # corpses, invisible, etc.), default the plural slot to the singular desc
+    # so the runtime fallback in build_screen_descriptions stays a no-op.
+    plural_empty = (desc_plural == 0).all(axis=-1)
+    desc_plural[plural_empty] = desc[plural_empty]
+
     return (
         jnp.asarray(colors, dtype=jnp.uint8),
         jnp.asarray(desc, dtype=jnp.uint8),
+        jnp.asarray(desc_plural, dtype=jnp.uint8),
     )
 
 
-_GLYPH_TO_COLOR, _GLYPH_TO_DESCRIPTION_BYTES = _build_glyph_lookups()
+_GLYPH_TO_COLOR, _GLYPH_TO_DESCRIPTION_BYTES, _GLYPH_TO_PLURAL_DESCRIPTION_BYTES = _build_glyph_lookups()
 
 
 # ---------------------------------------------------------------------------
@@ -1013,7 +1111,29 @@ def build_screen_descriptions(env_state) -> jnp.ndarray:
     glyphs = build_glyphs(env_state)  # int16[21,79]
     # Clamp index into [0, MAX_GLYPH-1] before fancy indexing.
     g_idx = jnp.clip(glyphs.astype(jnp.int32), 0, _GLYPH_TO_DESCRIPTION_BYTES.shape[0] - 1)
-    desc = _GLYPH_TO_DESCRIPTION_BYTES[g_idx]  # uint8[21,79,80]
+    desc_singular = _GLYPH_TO_DESCRIPTION_BYTES[g_idx]    # uint8[21,79,80]
+    desc_plural   = _GLYPH_TO_PLURAL_DESCRIPTION_BYTES[g_idx]  # uint8[21,79,80]
+
+    # Plural override: when the cell's TOP ground-items stack has quan > 1,
+    # vendor's pager/winrl emits the plural descr (e.g. "some food rations"
+    # instead of "a food ration").  We replicate by checking the first-occupied
+    # slot's quantity at each cell.  Non-OBJ cells (terrain, monsters, etc.)
+    # fall back to singular — desc_plural for those glyphs equals desc_singular
+    # by construction in _build_glyph_lookups.
+    branch_p = jnp.int32(env_state.dungeon.current_branch)
+    level_idx_p = jnp.int32(env_state.dungeon.current_level) - 1
+    gi_cat_p = env_state.ground_items.category[branch_p, level_idx_p, :21, 1:80, :]
+    gi_qty_p = env_state.ground_items.quantity[branch_p, level_idx_p, :21, 1:80, :]
+    # First-occupied slot per cell (matches the placement order written by
+    # ``fill_ordinary_rooms``'s argmax-on-empty slot allocator).
+    occupied_p = gi_cat_p != 0
+    top_slot_p = jnp.argmax(occupied_p.astype(jnp.int32), axis=-1)  # [21,79]
+    any_obj_p = jnp.any(occupied_p, axis=-1)                        # [21,79]
+    top_qty_p = jnp.take_along_axis(
+        gi_qty_p, top_slot_p[..., None], axis=-1
+    ).squeeze(-1)                                                   # [21,79]
+    use_plural = any_obj_p & (top_qty_p > jnp.int16(1))             # [21,79]
+    desc = jnp.where(use_plural[:, :, None], desc_plural, desc_singular)
 
     # Zero out descriptions for unexplored tiles — vendor only calls
     # store_screen_description for cells that went through show_glyph().

@@ -1047,6 +1047,70 @@ def _food_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
     return rng
 
 
+def _food_draws_with_qty(
+    rng: Isaac64State, otyp: jnp.ndarray,
+) -> tuple[Isaac64State, jnp.ndarray]:
+    """Same as :func:`_food_draws` but also returns the resulting ``quan``.
+
+    Vendor mkobj.c:879-983 sets ``otmp->quan = 2L`` when
+    ``otyp not in {pudding, CORPSE, MEAT_RING, KELP_FROND} && !rn2(6)``.
+    The existing :func:`_food_draws` correctly consumes the rn2(6) byte but
+    discards the result, leaving Nethax's ``ground_items.quantity`` at the
+    hardcoded ``1`` and producing a singular screen_description
+    (``"a food ration"``) where vendor renders the plural
+    (``"some food rations"``) — observed on seed 7 at obs (12, 16).
+
+    Byte-equivalent to ``_food_draws`` (identical draw count + order); the
+    only difference is the additional ``qty`` return.
+
+    Vendor cite: vendor/nle/src/mkobj.c:874-984 (full FOOD case).
+    """
+    is_pudding = (
+        (otyp >= jnp.int32(_OTYP_GLOB_OF_GRAY_OOZE))
+        & (otyp <= jnp.int32(_OTYP_GLOB_OF_BLACK_PUDDING))
+    )
+    is_corpse     = otyp == jnp.int32(_OTYP_CORPSE)
+    is_egg        = otyp == jnp.int32(_OTYP_EGG)
+    is_tin        = otyp == jnp.int32(_OTYP_TIN)
+    is_meat_ring  = otyp == jnp.int32(_OTYP_MEAT_RING)
+    is_kelp_frond = otyp == jnp.int32(_OTYP_KELP_FROND)
+
+    # Per-otyp pre-case draws (EGG/TIN/KELP) — identical to _food_draws above.
+    rng = lax.cond(
+        is_egg,
+        lambda r: rn2_jax(r, jnp.int32(3))[0],
+        lambda r: r,
+        rng,
+    )
+    rng = lax.cond(
+        is_tin,
+        lambda r: _blessorcurse_jax(rn2_jax(r, jnp.int32(6))[0], 10),
+        lambda r: r,
+        rng,
+    )
+    rng = lax.cond(
+        is_kelp_frond,
+        lambda r: rnd_jax(r, jnp.int32(2))[0],
+        lambda r: r,
+        rng,
+    )
+
+    # Trailing !rn2(6) qty gate.  Capture the result so the caller can set
+    # ``quan = 2`` when the gate fires.
+    skip_draw = is_pudding | is_corpse | is_meat_ring | is_kelp_frond
+
+    def _draw_qty(r):
+        new_r, roll = rn2_jax(r, jnp.int32(6))
+        return new_r, roll
+
+    def _skip_qty(r):
+        return r, jnp.int32(1)  # non-zero → qty stays 1
+
+    rng, qty_roll = lax.cond(skip_draw, _skip_qty, _draw_qty, rng)
+    qty = jnp.where(qty_roll == jnp.int32(0), jnp.int16(2), jnp.int16(1))
+    return rng, qty
+
+
 # GEM_CLASS otyps with no rn2(6) quantity draw in mksobj_init.
 # Citation: vendor/nle/src/mkobj.c:887-895 (case GEM_CLASS body).
 #   LOADSTONE (mkobj.c:888): early-return after curse() — no RNG draws.
@@ -1804,6 +1868,41 @@ def consume_mksobj_init_draws(
     return _consume_mksobj_init_draws_jit_with_tool(
         rng, oclass_id, otyp_arr, artif_arr,
     )
+
+
+def consume_mksobj_init_draws_with_qty(
+    rng: Isaac64State,
+    oclass_id: jnp.ndarray,
+    otyp: jnp.ndarray,
+    artif: bool | jnp.ndarray = False,
+) -> tuple[Isaac64State, jnp.ndarray]:
+    """Same as :func:`consume_mksobj_init_draws` but also returns the resulting
+    ``quan`` (1 or 2) for FOOD_CLASS otyps that match vendor's
+    ``mkobj.c:879-983`` ``!rn2(6)`` qty=2 gate.
+
+    Byte-equivalent to the plain :func:`consume_mksobj_init_draws` — same
+    number / order of ISAAC64 draws.  The only difference is the qty return
+    so the caller can write the correct quantity into ``ground_items``.
+
+    For non-FOOD classes returns ``qty=1`` (vendor leaves ``otmp->quan`` at
+    the default-1 set by ``mksobj`` for all other multigen-relevant classes
+    on Dlvl 1; multigen WEAPON/GEM quantity propagation is a separate TODO).
+
+    Vendor cite: vendor/nle/src/mkobj.c:870-985 (FOOD_CLASS quan gate),
+                 vendor/nle/src/mkobj.c:251-272 (mkobj outer body).
+    """
+    from Nethax.nethax.subsystems.inventory import ItemCategory as _IC
+    _FOOD_CLASS_ID = jnp.int32(int(_IC.FOOD))
+    is_food = oclass_id == _FOOD_CLASS_ID
+
+    def _food_path(r):
+        return _food_draws_with_qty(r, otyp)
+
+    def _non_food_path(r):
+        new_r = consume_mksobj_init_draws(r, oclass_id, otyp, artif=artif)
+        return new_r, jnp.int16(1)
+
+    return lax.cond(is_food, _food_path, _non_food_path, rng)
 
 
 def consume_mkobj_random_draws(

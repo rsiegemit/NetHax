@@ -35,6 +35,7 @@ from Nethax.nethax.subsystems.random_objects import (
     _MKOBJ_TABLE,
     _mkbox_cnts_draws,
     consume_mksobj_init_draws,
+    consume_mksobj_init_draws_with_qty,
     decode_picked_otyp,
 )
 from Nethax.nethax.subsystems.inventory import MAX_GROUND_STACK, ItemCategory
@@ -3128,7 +3129,12 @@ def fill_ordinary_rooms(
                 # classes ignore the otyp argument (legacy 0-draw fallback).
                 otyp0 = decode_picked_otyp(oclass0, typ0)              # mkobj.c:264-266
                 # Vendor mklev.c:875: mkobj_at(0, somex, somey, TRUE) → artif=TRUE.
-                vrng_in = consume_mksobj_init_draws(vrng_in, oclass0, otyp0, artif=True)  # mkobj.c:801-1069
+                # _with_qty variant captures vendor's mkobj.c:881 ``!rn2(6) → quan=2``
+                # gate for FOOD_CLASS so the screen_description plural matches NLE
+                # (e.g. seed 7 "some food rations" vs Nethax's prior "a food ration"
+                # at obs (12, 16)).  Byte-equivalent to consume_mksobj_init_draws —
+                # same draws, just returns the qty for the ground_items write below.
+                vrng_in, qty0 = consume_mksobj_init_draws_with_qty(vrng_in, oclass0, otyp0, artif=True)  # mkobj.c:801-1069
                 # Persist the decoded item into ground_items at the somexy
                 # position.  Vendor mklev.c:875 ``mkobj_at(0, somex, somey,
                 # TRUE)`` places the freshly-decoded object on the floor;
@@ -3161,7 +3167,7 @@ def fill_ordinary_rooms(
                 ].set(new_typ_val)
                 new_gqty = gqty_in.at[
                     branch_idx, level_idx, _rmk, _cmk, slot_idx
-                ].set(jnp.int16(1))
+                ].set(qty0)
                 gcat_in, gtyp_in, gqty_in = new_gcat, new_gtyp, new_gqty
                 # Vendor inner loop (mklev.c:877-883):
                 #   while (!rn2(5)) {
@@ -3194,7 +3200,8 @@ def fill_ordinary_rooms(
                         oclass_i = _MKOBJ_TABLE[cls_roll - jnp.int32(1)]
                         otyp_i = decode_picked_otyp(oclass_i, typ_i)     # mkobj.c:264-266
                         # Vendor mklev.c:882: mkobj_at(0, somex, somey, TRUE) → artif=TRUE.
-                        vi = consume_mksobj_init_draws(vi, oclass_i, otyp_i, artif=True)  # mkobj.c:801-1069
+                        # _with_qty variant captures FOOD_CLASS qty=2 gate (mkobj.c:881).
+                        vi, qty_i = consume_mksobj_init_draws_with_qty(vi, oclass_i, otyp_i, artif=True)  # mkobj.c:801-1069
                         # Persist inner mkobj_at placement to ground_items
                         # (vendor mklev.c:882).  Same first-empty-slot
                         # allocation as the outer placement above.
@@ -3210,7 +3217,7 @@ def fill_ordinary_rooms(
                         ].set(otyp_i.astype(jnp.int16))
                         gqi = gqi.at[
                             branch_idx, level_idx, _ro, _co, slot_i
-                        ].set(jnp.int16(1))
+                        ].set(qty_i)
                         return (vi, gci, gti, gqi)
 
                     v, gc, gt, gq = lax.cond(
