@@ -475,7 +475,14 @@ def stamp_rooms_into_typ(gs: "LevelGenState", rooms: "RoomsBox") -> "LevelGenSta
         ly = rooms.ly[i].astype(jnp.int32)
         hx = rooms.hx[i].astype(jnp.int32)
         hy = rooms.hy[i].astype(jnp.int32)
-        act = rooms.active[i]
+        # Vault sentinel slot carries hx=-1 (mklev.c:235) AND active=True
+        # (rooms.py:894 sets active from lx>=0, not hx>=0).  Without this
+        # gate the sentinel stamps a TR/BR corner + VWALL at col=0 (since
+        # hx+1=0), corrupting seed-5+ bound_digging — see
+        # `.test_runs/diag_seed5_vendor_vs_nethax_grids.py` which traces
+        # +9 extra mineralize-eligible cells at col=2 to this bug.
+        # The actual vault is stamped separately via the do_vault block.
+        act = rooms.active[i] & (hx >= jnp.int32(0))
 
         # Wall band x in [lx-1, hx+1], y in [ly-1, hy+1].
         in_wall_x = (xs >= lx - 1) & (xs <= hx + 1)
