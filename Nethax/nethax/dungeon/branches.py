@@ -23,6 +23,8 @@ Wave 2: traverse_stair reads stair_links table; enter_branch updates
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util as _ctypes_util
 from enum import IntEnum
 from typing import Tuple
 
@@ -33,20 +35,71 @@ import numpy as np
 from flax import struct
 
 
-# Deterministic stable room sort
+# Vendor sort_rooms tie-permutation: libSystem qsort host callback
 #
 # Vendor's ``sort_rooms()`` (mklev.c:707) calls libc ``qsort()`` with a
-# key-only comparator.  libc qsort is implementation-defined on ties
-# (libSystem mergesort vs glibc introsort vs others), so reproducing it
-# faithfully would require either a host callback to the local libc
-# (platform-divergent: Mac vs Linux give different orderings) or a manual
-# port of one libc's algorithm.
+# key-only comparator on ``lx``.  libc qsort is unstable on ties, and
+# macOS libSystem's specific tie permutation drives byte parity for
+# tied-lx seeds (seed=5: rooms with lx=68 swap → makecorridors Pass-1
+# join(5,6) sees a different tt-room → finddpos rn1(y-span) draw 542
+# diverges).  ``jnp.argsort(stable=True)`` does NOT reproduce this and
+# breaks seed=5 (and likely 7/8) byteparity.
 #
-# We instead use a stable, platform-agnostic, JIT-friendly sort:
-# ``jnp.argsort(stable=True)``.  This produces an order that may differ
-# from any specific libc's tied-key permutation, but it is deterministic
-# across runs, platforms, and backends — and it runs inside XLA without a
-# host boundary, so the dungeon-gen pipeline stays GPU-parallelizable.
+# We invoke libSystem's actual qsort via a host pure_callback.  This
+# blocks GPU parallelization (CPU host boundary in every dungeon-gen
+# graph) but is the only way to match vendor's mac-built C binary byte-
+# exactly on tied keys.  On non-Mac platforms we fall back to
+# ``jnp.argsort(stable=True)`` (the libc loader returns None and we
+# detect that below).
+_libc = None
+_CMP_INT32_CB = None
+try:
+    _libc_name = _ctypes_util.find_library("c") or "libSystem.dylib"
+    _libc = ctypes.CDLL(_libc_name)
+    _libc.qsort.argtypes = [
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+        ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p),
+    ]
+    _libc.qsort.restype = None
+    _CMP_TYPE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _cmp_int32_key(a, b):
+        x = ctypes.cast(a, ctypes.POINTER(ctypes.c_int32))[0]
+        y = ctypes.cast(b, ctypes.POINTER(ctypes.c_int32))[0]
+        if x < y:
+            return -1
+        if x > y:
+            return 1
+        return 0
+
+    _CMP_INT32_CB = _CMP_TYPE(_cmp_int32_key)
+except Exception:
+    _libc = None
+
+
+def _host_qsort_argsort_int32(keys: np.ndarray) -> np.ndarray:
+    """Argsort ``keys`` using libSystem qsort (tie behavior matches
+    vendor sort_rooms()).  Returns the int32 permutation."""
+    keys = np.ascontiguousarray(keys, dtype=np.int32)
+    n = keys.shape[0]
+    arr = np.empty(n, dtype=[("k", "<i4"), ("o", "<i4")])
+    arr["k"] = keys
+    arr["o"] = np.arange(n, dtype=np.int32)
+    _libc.qsort(arr.ctypes.data, n, 8, _CMP_INT32_CB)
+    return arr["o"].astype(np.int32)
+
+
+def _argsort_libc_qsort(keys: jnp.ndarray) -> jnp.ndarray:
+    """JAX-callable wrapper around libSystem qsort.  Falls back to
+    ``jnp.argsort(stable=True)`` when libc is unavailable."""
+    if _libc is None or _CMP_INT32_CB is None:
+        return jnp.argsort(keys, stable=True).astype(jnp.int32)
+    return jax.pure_callback(
+        _host_qsort_argsort_int32,
+        jax.ShapeDtypeStruct((keys.shape[0],), jnp.int32),
+        keys.astype(jnp.int32),
+        vmap_method="sequential",
+    )
 
 # ---------------------------------------------------------------------------
 # Map geometry constants
@@ -931,7 +984,7 @@ def _sort_rooms_by_lx(rooms, active, nroom=None):
     else:
         sort_eligible = active
     sort_key = jnp.where(sort_eligible, rooms.x1.astype(jnp.int32), jnp.int32(81))
-    order = jnp.argsort(sort_key, stable=True).astype(jnp.int32)
+    order = _argsort_libc_qsort(sort_key)
     sorted_rooms = jax.tree_util.tree_map(lambda f: f[order], rooms)
     sorted_active = active[order]
     return sorted_rooms, sorted_active
