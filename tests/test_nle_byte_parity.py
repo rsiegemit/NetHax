@@ -220,8 +220,12 @@ def run_validator(
 
         # Step Nethax
         try:
+            # Pass ``action`` as a Python int so NethaxEnv routes through
+            # the static-action fast path (env.py::_dispatch_jit_validator),
+            # avoiding the 46-branch lax.switch in dispatch_action that
+            # otherwise stalls JIT cold-compile.
             nax_state, nax_obs, _, nax_done, _ = nax_env.step(
-                nax_state, jnp.int32(action), jax.random.PRNGKey(seed + step_idx)
+                nax_state, action, jax.random.PRNGKey(seed + step_idx)
             )
         except Exception as e:
             print(f"[abort] Nethax step {step_idx} failed: {e}")

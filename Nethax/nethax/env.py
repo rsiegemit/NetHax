@@ -1345,6 +1345,81 @@ def _dispatch_jit_impl(state, action, rng_act):
 _dispatch_jit = jax.jit(_dispatch_jit_impl)
 
 
+# ---------------------------------------------------------------------------
+# Static-action fast path — sidesteps the 46-branch ``lax.switch`` in
+# ``dispatch_action``.
+#
+# ``dispatch_action`` (4097 LOC, 55 lax.cond/switch/scan calls, three
+# 46-handler ``lax.switch`` invocations) inlines every handler into the
+# HLO graph at trace time so XLA can pick the right one at run time.
+# The XLA HLO optimizer's conditional-canonicalizer pass is quadratic-ish
+# in branch-tree size and stalls on a graph with 138 inlined handlers.
+#
+# For callers that pass ``action`` as a Python int (e.g. the byte-parity
+# validator's fixed ``action = 0``), the target handler is fully
+# determined at trace time.  We pick it host-side and call it directly,
+# so only that single handler enters HLO.  Compile time scales with one
+# handler's size instead of all 46.
+#
+# Assumptions for the validator path:
+#   * ``state.pending_action_kind == 0`` (no inv-letter / direction
+#     prompt is open).  Holds on Main Dlvl 1 fresh-reset and never
+#     becomes non-zero under repeated ``action = 0`` (MOVE_N) steps.
+#   * ``action`` is the NLE-index form (< 86), remapped through
+#     USEFUL_ACTIONS at host time below.
+# ---------------------------------------------------------------------------
+def _dispatch_validator_body(state, static_action: int, rng_act):
+    import numpy as _np
+    from Nethax.nethax.subsystems.action_dispatch import (
+        _ACTION_TO_HANDLER_IDX as _AH_IDX,
+        _SLOT_TO_COMPACT as _SC_IDX,
+        _SLOT_TO_DIR_IDX as _SD_IDX,
+        _COMPACT_HANDLERS,
+    )
+    from Nethax.nethax.constants.actions import USEFUL_ACTIONS as _USEFUL
+
+    # Mirror ``_maybe_remap_action`` at host time.  NLE actions < 86 are
+    # indices into USEFUL_ACTIONS; >= 86 are direct ASCII ords.
+    if 0 <= static_action < 86:
+        action_val = int(list(_USEFUL)[static_action])
+    else:
+        action_val = int(static_action)
+    action_val = max(0, min(255, action_val))
+
+    # Host-side lookup of (handler_idx, compact_idx, dir_idx).
+    handler_idx = int(_np.asarray(_AH_IDX)[action_val])
+    compact_idx = int(_np.asarray(_SC_IDX)[handler_idx])
+    dir_idx     = int(_np.asarray(_SD_IDX)[handler_idx])
+
+    # Same pre-handler state mutation as ``_dispatch_body`` (clear
+    # message, reset turn flag).
+    ns0 = state.replace(
+        messages=_clear_message(state.messages),
+        action_consumed_turn=jnp.bool_(True),
+    )
+
+    # Direct call — no lax.switch over 46 branches.
+    handler = _COMPACT_HANDLERS[compact_idx]
+    return handler(ns0, rng_act, jnp.int32(dir_idx))
+
+
+def _dispatch_jit_validator_impl(state, static_action: int, rng_act):
+    return jax.lax.cond(
+        state.done,
+        lambda _: state,
+        lambda _: _dispatch_validator_body(state, static_action, rng_act),
+        operand=None,
+    )
+
+
+# static_argnums=(1,) so each value of ``static_action`` produces its own
+# compiled specialization.  The validator only uses ``action = 0``, so
+# only one spec is ever compiled.
+_dispatch_jit_validator = jax.jit(
+    _dispatch_jit_validator_impl, static_argnums=(1,)
+)
+
+
 def _pre_monster_body(ns, rng_act, rng_astral, prev_branch, prev_level):
     """Phase-1a/1b body: astral mplayer seed + dig tick.
 
@@ -1776,7 +1851,15 @@ def _step_impl(state, action, rng):
     prev_level  = state.dungeon.current_level.astype(jnp.int32)
 
     # Phase 1: dispatch_action (Seam C — separate JIT cache slot).
-    ns = _dispatch_jit(state, action, rng_act)
+    # When ``action`` is a Python int the caller has signalled they want
+    # the static-action fast path (see ``_dispatch_jit_validator`` for
+    # the rationale — avoids inlining 46 handlers into HLO).  Plain int
+    # vs JAX array dispatch is host-side, so this branch is free at JIT
+    # trace time.
+    if isinstance(action, int):
+        ns = _dispatch_jit_validator(state, action, rng_act)
+    else:
+        ns = _dispatch_jit(state, action, rng_act)
 
     # Phase 1a/1b: astral mplayer seed + dig tick (Seam B carve-out 1/3).
     ns = _pre_monster_jit(ns, state, rng_act, rng_astral, prev_branch, prev_level)
