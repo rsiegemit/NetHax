@@ -539,12 +539,20 @@ def _build_glyph_lookups():  # pragma: no cover — runs once at import
     # appearance-bearing class, vendor falls back to the canonical name
     # (objnam.c:440-441 "if (!dn) dn = actualn;").
     def _unidentified_str(idx: int, o) -> str:
-        if o is None or o.name is None:
+        if o is None:
             return ""
         cls = o.class_
         # Vendor: if (!dn) dn = actualn — fall back to canonical name.
-        dn = o.description if o.description else o.name
-        actualn = o.name
+        # For shuffled appearance slots (typical for scrolls/potions/etc.)
+        # o.name may be None while o.description carries the appearance string
+        # ("EIRIS SAZUN IDISI") and o.class_ is set.  NLE still produces the
+        # bare class name in xname() for unknown items — e.g. "a scroll"
+        # rather than "a scroll labeled EIRIS SAZUN IDISI" — so the class-
+        # based fallback below must run.  Previously the early return on
+        # ``o.name is None`` zeroed the descr for these slots (seed 9 scroll
+        # at (col=30, row=5)).
+        dn = o.description if o.description else (o.name or "")
+        actualn = o.name or ""
 
         if cls == _OC.COIN_CLASS:
             # Handled separately above via "some gold pieces".
@@ -1137,10 +1145,16 @@ def build_screen_descriptions(env_state) -> jnp.ndarray:
 
     # Zero out descriptions for unexplored tiles — vendor only calls
     # store_screen_description for cells that went through show_glyph().
+    # NLE's show_glyph fires for any cell whose glyph is currently displayed,
+    # which includes BOTH remembered-explored cells AND currently-visible
+    # cells (FOV).  Seed 9 (col=30, row=5) is in initial FOV but Nethax's
+    # ``explored`` doesn't get backfilled with the reset FOV — so we OR
+    # ``visible`` into the gate to mirror vendor behaviour.
     branch = jnp.int32(env_state.dungeon.current_branch)
     level_idx = jnp.int32(env_state.dungeon.current_level) - 1  # 0-based
     # Drop internal column 0 to match build_glyphs / NLE obs layout.
     explored = env_state.explored[branch, level_idx, :21, 1:80]  # bool[21,79]
+    explored = explored | env_state.visible[:21, 1:80]
     # Broadcast explored[21,79] -> [21,79,1] to mask [21,79,80]
     desc = jnp.where(explored[:, :, None], desc, jnp.zeros_like(desc))
 

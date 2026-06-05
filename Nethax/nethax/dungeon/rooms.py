@@ -2174,7 +2174,45 @@ def fill_ordinary_rooms(
                 [2, 6, 7, 13], dtype=jnp.int32  # WEAPON, TOOL, FOOD, GEM
             )
 
-            def _dead_pred_cascade(v, kind):
+            def _write_dead_pred_item(
+                gc, gt, gq, tr, tc, ocls, otyp, qty, gate,
+            ):
+                """Persist a dead-predecessor item at (tr, tc) using a DESCENDING
+                slot allocator so the OUTER mkobj_at's later first-empty-slot
+                write still claims slot 0.  This keeps the obs ``top_slot``
+                (and the screen_descriptions / glyph derived from it) matched
+                to vendor's level.objects head — vendor prepends mkobj_at
+                placements, so the LATEST add is the head, which is the outer
+                mkobj_at potion in seed 1 at (col=58, row=14).
+
+                Gate (bool) suppresses the write when the caller's lax.cond
+                branch is the no-op path; we use jnp.where instead of a nested
+                lax.cond to avoid extending the call-time branch table.
+                """
+                cell_cats = gc[branch_idx, level_idx, tr, tc]
+                # First-empty-slot from the TOP (slot 7 down to 0).
+                empty_top = (cell_cats == jnp.int8(0))[::-1]
+                slot_top = jnp.int32(MAX_GROUND_STACK) - jnp.int32(1) - jnp.argmax(
+                    empty_top.astype(jnp.int32),
+                )
+                # Suppress writes when gate is False (or off-map indices) by
+                # routing them to slot 0 of an out-of-bounds branch that we
+                # mask via jnp.where at .set time.
+                new_cat = jnp.where(gate, ocls.astype(jnp.int8), cell_cats[slot_top])
+                new_typ = jnp.where(
+                    gate, otyp.astype(jnp.int16),
+                    gt[branch_idx, level_idx, tr, tc, slot_top],
+                )
+                new_qty = jnp.where(
+                    gate, qty.astype(jnp.int16),
+                    gq[branch_idx, level_idx, tr, tc, slot_top],
+                )
+                gc = gc.at[branch_idx, level_idx, tr, tc, slot_top].set(new_cat)
+                gt = gt.at[branch_idx, level_idx, tr, tc, slot_top].set(new_typ)
+                gq = gq.at[branch_idx, level_idx, tr, tc, slot_top].set(new_qty)
+                return gc, gt, gq
+
+            def _dead_pred_cascade(v, kind, gc, gt, gq, tr_r, tr_c):
                 """Vendor mklev.c:1418-1533 — dead-predecessor item/corpse cascade.
 
                 Fires only when mktrap placed a trap AND ``lvl <= rnd(4)``.
@@ -2186,6 +2224,15 @@ def fill_ordinary_rooms(
                   3. victim race rn2(15); SLP_GAS_TRAP elf guard rn2(2);
                      GNOME victim → !rn2(10) candle gate + rn2(4) candle type.
                   4. mkcorpstat(CORPSE) → FOOD_CLASS rndmonnum draw.
+
+                Items 1 + 2 are written into ``ground_items`` at the trap
+                cell so the obs (specials MG_OBJPILE, screen_descriptions
+                top-item descr) match vendor's level.objects state.  Without
+                these writes Nethax was missing the (col=58, row=14) 4-stack
+                pile for seed 1 (and the (col=30, row=5) MG_OBJPILE for
+                seed 9), even though the underlying ISAAC stream was
+                byte-aligned (verified via .test_runs/vendor_seed1_ops.trace
+                diff: 2453 / 2453 draws match after rnd→rn2 normalisation).
 
                 Vendor cite: vendor/nle/src/mklev.c:1418-1533.
                 """
@@ -2225,6 +2272,20 @@ def fill_ordinary_rooms(
                     vi = consume_mksobj_init_draws(vi, item_cls, item_otyp)
                     return vi
                 v = lax.cond(is_item_trap, _item_true, lambda vi: vi, v)
+                # Persist the trap item (vendor mklev.c:1450 mksobj_at → object
+                # at trap cell) into ground_items.  Gate on is_item_trap so the
+                # write is a no-op for non-ARROW/DART/ROCK traps.  ARROW=otyp 1
+                # weapon, DART=otyp 7 weapon, ROCK=otyp 446 gem.
+                _ti_is_rock = kind == jnp.int32(3)
+                _ti_cls = jnp.where(_ti_is_rock, jnp.int32(13), jnp.int32(2))
+                _ti_otyp = jnp.where(
+                    kind == jnp.int32(1), jnp.int32(1),
+                    jnp.where(kind == jnp.int32(2), jnp.int32(7), jnp.int32(446)),
+                )
+                gc, gt, gq = _write_dead_pred_item(
+                    gc, gt, gq, tr_r, tr_c, _ti_cls, _ti_otyp, jnp.int16(1),
+                    is_item_trap,
+                )
 
                 # Possession do-while (vendor mklev.c:1460-1490).
                 # Vendor calls mkobj(poss_class, FALSE) → mksobj(otyp, TRUE,
@@ -2237,26 +2298,41 @@ def fill_ordinary_rooms(
                 v, typ_roll_0 = randint_jax(v, (), 1, 1001)
                 otyp_0 = decode_picked_otyp(poss_cls_0, typ_roll_0)
                 v = consume_mksobj_init_draws(v, poss_cls_0, otyp_0)
+                # Persist initial possession item.  Vendor mklev.c:1486
+                # mkobj_at always fires on the first possession draw.
+                gc, gt, gq = _write_dead_pred_item(
+                    gc, gt, gq, tr_r, tr_c, poss_cls_0, otyp_0, jnp.int16(1),
+                    jnp.bool_(True),
+                )
                 v, rn5_0 = randint_jax(v, (), 0, 5)
                 cont0_p = rn5_0 == jnp.int32(0)
                 POSS_CAP = jnp.int32(100)
 
                 def _poss_cond(carry_p):
-                    _vp, cont_p, iters_p = carry_p
+                    _vp, _gc, _gt, _gq, cont_p, iters_p = carry_p
                     return cont_p & (iters_p < POSS_CAP)
 
                 def _poss_body(carry_p):
-                    vp, _cont_p, iters_p = carry_p
+                    vp, gci, gti, gqi, _cont_p, iters_p = carry_p
                     vp, rn4 = randint_jax(vp, (), 0, 4)
                     poss_cls = _POSS_CLASS[rn4]
                     vp, typ_roll_p = randint_jax(vp, (), 1, 1001)
                     otyp_p = decode_picked_otyp(poss_cls, typ_roll_p)
                     vp = consume_mksobj_init_draws(vp, poss_cls, otyp_p)
+                    # Persist body-iteration possession item.
+                    gci, gti, gqi = _write_dead_pred_item(
+                        gci, gti, gqi, tr_r, tr_c, poss_cls, otyp_p,
+                        jnp.int16(1), jnp.bool_(True),
+                    )
                     vp, rn5 = randint_jax(vp, (), 0, 5)
-                    return (vp, rn5 == jnp.int32(0), iters_p + jnp.int32(1))
+                    return (
+                        vp, gci, gti, gqi,
+                        rn5 == jnp.int32(0), iters_p + jnp.int32(1),
+                    )
 
-                v, _, _ = lax.while_loop(
-                    _poss_cond, _poss_body, (v, cont0_p, jnp.int32(1)),
+                v, gc, gt, gq, _, _ = lax.while_loop(
+                    _poss_cond, _poss_body,
+                    (v, gc, gt, gq, cont0_p, jnp.int32(1)),
                 )
 
                 # Victim race (vendor mklev.c:1493-1528).
@@ -2352,10 +2428,10 @@ def fill_ordinary_rooms(
                 v, _ = rn2_jax(v, 1000)
                 v, _ = rne_jax(v, 4)
                 v, _ = rn2_jax(v, 2)
-                return v
+                return v, gc, gt, gq
 
             def trap_step_isaac(carry, j):
-                terrain_in, traps_in, continue_, vrng_in = carry
+                terrain_in, traps_in, continue_, vrng_in, gc_in, gt_in, gq_in = carry
                 # Vendor:  while (!rn2(x)) mktrap(0, 0, croom, NULL);
                 # The rn2(x) is the while-loop CONDITION: it is drawn once per
                 # iteration the loop is still live, INCLUDING the final draw that
@@ -2380,7 +2456,7 @@ def fill_ordinary_rooms(
                 should_place = hit & is_ordinary
 
                 def _mktrap_true(carry_m):
-                    v, t_in, tr_in = carry_m
+                    v, t_in, tr_in, gc, gt, gq = carry_m
                     # Vendor mktrap trap-kind picker (mklev.c:1318-1366) is a
                     # do/while retry loop:
                     #
@@ -2495,27 +2571,42 @@ def fill_ordinary_rooms(
                         & (kind_ != SPIKED_PIT)
                         & (kind_ < HOLE_)
                     )
-                    v = lax.cond(
+                    # Thread ground_items through dead_pred so the trap-item
+                    # mksobj + possession do-while placements (vendor mklev.c:
+                    # 1436-1490) are persisted at the trap cell.  Without this,
+                    # Nethax consumes the correct ISAAC bytes (verified
+                    # byte-aligned via /tmp/n_seed1_canon.txt) but leaves the
+                    # dead-pred items off the floor — yielding seed 1's missing
+                    # MG_OBJPILE at (col=58, row=14) where vendor has 4 stacks
+                    # (potion 76 from outer mkobj + weapon 240 / gem 422 /
+                    # tool 209 from dead_pred).
+                    v, gc, gt, gq = lax.cond(
                         kind_ok & (depth_i <= rnd4_gate_),
-                        lambda vi: _dead_pred_cascade(vi, kind_),
-                        lambda vi: vi,
-                        v,
+                        lambda args: _dead_pred_cascade(
+                            args[0], kind_, args[1], args[2], args[3],
+                            rt_r_, rt_c_,
+                        ),
+                        lambda args: args,
+                        (v, gc, gt, gq),
                     )
-                    return (v, new_t, new_tr)
+                    return (v, new_t, new_tr, gc, gt, gq)
 
                 def _mktrap_false(carry_m):
                     return carry_m
 
-                vrng_in, new_terrain, new_traps = lax.cond(
+                vrng_in, new_terrain, new_traps, gc_out, gt_out, gq_out = lax.cond(
                     should_place, _mktrap_true, _mktrap_false,
-                    (vrng_in, terrain_in, traps_in),
+                    (vrng_in, terrain_in, traps_in, gc_in, gt_in, gq_in),
                 )
 
-                return (new_terrain, new_traps, continue_ & hit, vrng_in), None
+                return (
+                    new_terrain, new_traps, continue_ & hit, vrng_in,
+                    gc_out, gt_out, gq_out,
+                ), None
 
-            (terrain_, traps_tt, _, vrng), _ = lax.scan(
+            (terrain_, traps_tt, _, vrng, gcat_, gtyp_, gqty_), _ = lax.scan(
                 trap_step_isaac,
-                (terrain_, traps_tt, jnp.bool_(True), vrng),
+                (terrain_, traps_tt, jnp.bool_(True), vrng, gcat_, gtyp_, gqty_),
                 jnp.arange(MAX_TRAPS_PER_ROOM, dtype=jnp.int32),
             )
 
@@ -2879,7 +2970,8 @@ def fill_ordinary_rooms(
             vrng, box_gate_v = randint_jax(vrng, (), 0, box_mod)
             box_gate = (box_gate_v == jnp.int32(0)) & is_ordinary
 
-            def _box_true(vrng_in):
+            def _box_true(carry_b):
+                vrng_in, gc, gt, gq = carry_b
                 # rn2(3): 0 → CHEST, 1/2 → LARGE_BOX  (vendor mklev.c:854)
                 vrng_in, _box_type = randint_jax(vrng_in, (), 0, 3)
                 vrng_in, _rbx, _cbx = somexy(vrng_in)
@@ -2898,12 +2990,33 @@ def fill_ordinary_rooms(
                                      jnp.int32(190),   # CHEST
                                      jnp.int32(189))   # LARGE_BOX
                 vrng_in = _mkbox_cnts_draws(vrng_in, box_otyp)
-                return vrng_in
+                # Persist the box object at (_rbx, _cbx) into ground_items.
+                # Vendor mklev.c:855 mksobj_at(0, box_type, x, y, TRUE) places
+                # the container on the floor; without this write Nethax was
+                # missing the LARGE_BOX (otyp 189) at seed 9 (col=30, row=5)
+                # — the MG_OBJPILE bit on top of the scroll never set.
+                # Use the same descending-slot allocator as _write_dead_pred_item
+                # so the OUTER mkobj_at can still claim slot 0 with its
+                # "latest = head" semantics.
+                cell_cats = gc[branch_idx, level_idx, _rbx, _cbx]
+                empty_top = (cell_cats == jnp.int8(0))[::-1]
+                slot_top = jnp.int32(MAX_GROUND_STACK) - jnp.int32(1) - jnp.argmax(
+                    empty_top.astype(jnp.int32),
+                )
+                # TOOL_CLASS = 6.
+                gc = gc.at[branch_idx, level_idx, _rbx, _cbx, slot_top].set(jnp.int8(6))
+                gt = gt.at[branch_idx, level_idx, _rbx, _cbx, slot_top].set(
+                    box_otyp.astype(jnp.int16),
+                )
+                gq = gq.at[branch_idx, level_idx, _rbx, _cbx, slot_top].set(jnp.int16(1))
+                return vrng_in, gc, gt, gq
 
-            def _box_false(vrng_in):
-                return vrng_in
+            def _box_false(carry_b):
+                return carry_b
 
-            vrng = lax.cond(box_gate, _box_true, _box_false, vrng)
+            vrng, gcat_, gtyp_, gqty_ = lax.cond(
+                box_gate, _box_true, _box_false, (vrng, gcat_, gtyp_, gqty_),
+            )
 
             # --- Graffiti: !rn2(27+3*|depth|) gate (vendor mklev.c:858-870) ---
             # Short-circuit: inner do-loop only runs when gate passes.
