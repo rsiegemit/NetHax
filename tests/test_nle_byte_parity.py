@@ -29,6 +29,55 @@ import sys
 import numpy as np
 
 
+# Cache for the JIT'd Nethax rollout function.  Keyed by (id(nax_env),
+# num_steps) so we re-use the compiled artifact across seeds when
+# num_steps and env are constant.  In single-process multiseed runs
+# (.test_runs/multiseed_byteparity.py) the env is recreated per seed,
+# so this cache misses across seeds — but JAX's persistent compilation
+# cache (JAX_COMPILATION_CACHE_DIR) still amortizes the XLA cost.
+_ROLLOUT_CACHE: dict = {}
+
+
+def _build_nethax_rollout(nax_env, jax, jnp, num_steps: int):
+    """Build a JIT'd ``lax.scan`` rollout for ``num_steps`` Nethax steps.
+
+    Returns ``rollout(init_state, action, seed_int) -> (all_obs, all_done)``
+    where each leaf has a leading axis of ``num_steps``.  ``num_steps``
+    is closed over as a Python int so the scan length is static at trace
+    time.
+
+    Rationale (vs. a Python ``for step_idx in range(...)`` loop calling
+    ``nax_env.step`` per iteration): every internal ``lax.scan``/
+    ``lax.cond`` in ``nax_env.step`` was lazily compiled on the first
+    iteration of each call, so a 1000-step rollout paid the full XLA
+    cold-compile cost 1000 times (~6+ hours observed on H100).  Wrapping
+    the loop in a single outer ``lax.scan`` collapses that to ONE compile
+    that covers the whole trajectory.
+    """
+    cache_key = (id(nax_env), num_steps)
+    if cache_key in _ROLLOUT_CACHE:
+        return _ROLLOUT_CACHE[cache_key]
+
+    @jax.jit
+    def rollout(init_state, action, seed_int):
+        # ``seed_int`` is a jnp.int32 scalar; the scan iterates over
+        # idx_seq = [1, 2, ..., num_steps].  Per-step PRNGKey is
+        # ``jax.random.PRNGKey(seed_int + step_idx)`` — semantically
+        # identical to the original Python ``seed + step_idx``.
+        idx_seq = jnp.arange(1, num_steps + 1, dtype=jnp.int32)
+
+        def step_fn(state, step_idx):
+            rng = jax.random.PRNGKey(seed_int + step_idx)
+            new_state, obs, _reward, done, _info = nax_env.step(state, action, rng)
+            return new_state, (obs, done)
+
+        _final_state, (all_obs, all_done) = jax.lax.scan(step_fn, init_state, idx_seq)
+        return all_obs, all_done
+
+    _ROLLOUT_CACHE[cache_key] = rollout
+    return rollout
+
+
 def _safe_import_nle():
     try:
         from nle.env import NLE  # vendor/nle/nle/env/base.py::NLE
@@ -205,48 +254,76 @@ def run_validator(
     # We will use a no-op or "search" (ord('s')=115) which is safe in both.
     action = 0
 
-    for step_idx in range(1, num_steps + 1):
-        # Step NLE
+    # ------------------------------------------------------------------
+    # Nethax side: pre-compute the entire ``num_steps`` trajectory in ONE
+    # JIT'd ``lax.scan``.  The scan body wraps ``nax_env.step``, so XLA
+    # compiles the inner dispatch / monster-AI / status pipeline once and
+    # unrolls it ``num_steps`` times inside a single compiled HLO graph.
+    # This is the whole point of the refactor — see
+    # ``_build_nethax_rollout`` docstring for the cold-compile math.
+    #
+    # NLE side: still stepped in Python below (it's vendor C, cannot be
+    # scanned).  We index into the pre-computed ``nax_all_obs`` pytree
+    # per step and diff against the live NLE obs.
+    # ------------------------------------------------------------------
+    if num_steps > 0:
+        rollout = _build_nethax_rollout(nax_env, jax, jnp, num_steps)
         try:
-            nle_step = nle_env.step(action)
-            # gym API: (obs, reward, done, info)
-            if len(nle_step) == 4:
-                nle_obs, _, nle_done, _ = nle_step
-            else:
-                nle_obs, _, _, nle_done, _ = nle_step
-        except Exception as e:
-            print(f"[abort] NLE step {step_idx} failed: {e}")
-            break
-
-        # Step Nethax
-        try:
-            nax_state, nax_obs, _, nax_done, _ = nax_env.step(
-                nax_state, jnp.int32(action), jax.random.PRNGKey(seed + step_idx)
+            nax_all_obs, _nax_all_done = rollout(
+                nax_state, jnp.int32(action), jnp.int32(seed)
             )
         except Exception as e:
-            print(f"[abort] Nethax step {step_idx} failed: {e}")
-            break
+            print(f"[abort] Nethax rollout (scan) failed: {e}")
+            nle_env.close()
+            return len(all_diffs)
 
-        nax_dict = _nax_to_dict(nax_obs)
-        nle_dict = nle_obs if isinstance(nle_obs, dict) else {}
-        diffs = _diff_obs(nle_dict, nax_dict, step_idx)
-        all_diffs.extend(diffs)
-        if verbose:
-            if diffs:
-                print(
-                    f"\n=== step {step_idx}: {len(diffs)} divergences ==="
-                )
-                limit = len(diffs) if show_all else 8
-                for d in diffs[:limit]:
-                    print(f"  {d}")
-                if not show_all and len(diffs) > 8:
-                    print(f"  ... ({len(diffs) - 8} more)")
-            else:
-                print(f"=== step {step_idx}: MATCH ===")
+        # Materialize per-step obs slices once up-front.  ``nax_all_obs``
+        # is a dict-of-arrays where each array has a leading axis of
+        # ``num_steps``.  Slicing per-step inside the comparison loop is
+        # cheap (numpy view).
+        if isinstance(nax_all_obs, dict):
+            nax_all_obs_np = {k: np.asarray(v) for k, v in nax_all_obs.items()}
+        else:
+            nax_all_obs_np = {}
 
-        if bool(nle_done):
-            print(f"[done] NLE terminated at step {step_idx}")
-            break
+        for step_idx in range(1, num_steps + 1):
+            # Step NLE (vendor C; cannot be lifted into the scan).
+            try:
+                nle_step = nle_env.step(action)
+                # gym API: (obs, reward, done, info)
+                if len(nle_step) == 4:
+                    nle_obs, _, nle_done, _ = nle_step
+                else:
+                    nle_obs, _, _, nle_done, _ = nle_step
+            except Exception as e:
+                print(f"[abort] NLE step {step_idx} failed: {e}")
+                break
+
+            # Slice Nethax obs at step_idx-1 (scan output is 0-indexed
+            # over the ``arange(1, num_steps + 1)`` sequence).
+            scan_i = step_idx - 1
+            nax_dict = {k: v[scan_i] for k, v in nax_all_obs_np.items()}
+            nle_dict = nle_obs if isinstance(nle_obs, dict) else {}
+            diffs = _diff_obs(nle_dict, nax_dict, step_idx)
+            all_diffs.extend(diffs)
+            if verbose:
+                if diffs:
+                    print(
+                        f"\n=== step {step_idx}: {len(diffs)} divergences ==="
+                    )
+                    limit = len(diffs) if show_all else 8
+                    for d in diffs[:limit]:
+                        print(f"  {d}")
+                    if not show_all and len(diffs) > 8:
+                        print(f"  ... ({len(diffs) - 8} more)")
+                else:
+                    print(f"=== step {step_idx}: MATCH ===")
+
+            if bool(nle_done):
+                print(f"[done] NLE terminated at step {step_idx}")
+                # Nethax-side tail (steps step_idx+1 .. num_steps) was
+                # pre-computed inside the scan; we just discard it.
+                break
 
     nle_env.close()
     return len(all_diffs)

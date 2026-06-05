@@ -983,11 +983,78 @@ def _sort_rooms_by_lx(rooms, active, nroom=None):
         sort_eligible = active & (slot_idx < nroom.astype(jnp.int32))
     else:
         sort_eligible = active
-    sort_key = jnp.where(sort_eligible, rooms.x1.astype(jnp.int32), jnp.int32(81))
-    order = _argsort_libc_qsort(sort_key)
+    # Pack (lx, ly, hx, hy) into one uint64 lex-ascending key.  Paired with
+    # vendor do_comp patched to compare the same four fields in the same
+    # order, the qsort output is platform-deterministic — both Mac libSystem
+    # and Linux glibc produce the same room order.
+    lx = rooms.x1.astype(jnp.uint64) & jnp.uint64(0xFFFF)
+    ly = rooms.y1.astype(jnp.uint64) & jnp.uint64(0xFFFF)
+    hx = rooms.x2.astype(jnp.uint64) & jnp.uint64(0xFFFF)
+    hy = rooms.y2.astype(jnp.uint64) & jnp.uint64(0xFFFF)
+    packed = (lx << jnp.uint64(48)) | (ly << jnp.uint64(32)) | (hx << jnp.uint64(16)) | hy
+    sentinel = jnp.uint64(0xFFFFFFFFFFFFFFFF)
+    sort_key = jnp.where(sort_eligible, packed, sentinel)
+    order = jnp.argsort(sort_key, stable=True).astype(jnp.int32)
     sorted_rooms = jax.tree_util.tree_map(lambda f: f[order], rooms)
     sorted_active = active[order]
     return sorted_rooms, sorted_active
+
+
+def _check_room_vault_simple(vendor_rng, lgs_typ, vault_x, vault_y):
+    """Simplified port of vendor sp_lev.c::check_room for VAULT (w=h=1).
+
+    Returns ``(vrng_out, success)``.  Models the gating done by vendor's
+    ``check_room`` on the post-``makecorridors`` ``levl[][]`` grid: any
+    non-stone cell in the scan area triggers a single ``rn2(3)`` draw and
+    causes the vault placement to FAIL.  An empty (all-STONE) scan area
+    succeeds with zero draws.
+
+    Vendor cite: vendor/nle/src/sp_lev.c:1063-1120 (check_room).  For
+    vault width=height=1, vendor's bounds-shrink path (lines 1105-1112)
+    immediately collapses ``hix<=lowx`` or ``hiy<=lowy`` on the next
+    ``chk:`` iteration no matter which side of the rectangle the offending
+    cell sits on, so the only relevant draw is the *single* ``rn2(3)`` at
+    the first encountered non-stone cell — vendor returns FALSE on either
+    ``rn2(3)==0`` (early-return) or on the next ``chk:`` iteration's
+    bounds collapse.
+
+    ``lgs_typ`` is the vendor-grid ``_lgs.typ`` after makecorridors+
+    make_niches, in ``[COLNO, ROWNO]`` orientation matching vendor
+    ``levl[x][y]``.  ``vault_x`` / ``vault_y`` are the makerooms-captured
+    candidate coords (``_mk_vault_x``, ``_mk_vault_y``).
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax as _rn2_jax_cr
+    XLIM_VAULT = 5  # vendor XLIM=4 + (vault?1:0); sp_lev.c:1072,181.
+    YLIM_VAULT = 4  # vendor YLIM=3 + (vault?1:0); sp_lev.c:1073,182.
+    COLNO = lgs_typ.shape[0]
+    ROWNO = lgs_typ.shape[1]
+    vx = vault_x.astype(jnp.int32)
+    vy = vault_y.astype(jnp.int32)
+    # Clamp lowx/lowy/hix/hiy per sp_lev.c:1075-1082.
+    lowx = jnp.maximum(vx, jnp.int32(3))
+    lowy = jnp.maximum(vy, jnp.int32(2))
+    hix = jnp.minimum(vx + jnp.int32(1), jnp.int32(COLNO - 3))
+    hiy = jnp.minimum(vy + jnp.int32(1), jnp.int32(ROWNO - 3))
+    # Scan area [lowx-xlim, hix+xlim] x [lowy-ylim, hiy+ylim], clamped per
+    # sp_lev.c:1088-1090, 1093-1096.
+    sx_lo = jnp.maximum(lowx - jnp.int32(XLIM_VAULT), jnp.int32(1))
+    sx_hi = jnp.minimum(hix + jnp.int32(XLIM_VAULT), jnp.int32(COLNO - 1))
+    sy_lo = jnp.maximum(lowy - jnp.int32(YLIM_VAULT), jnp.int32(0))
+    sy_hi = jnp.minimum(hiy + jnp.int32(YLIM_VAULT), jnp.int32(ROWNO - 1))
+    col_idx = jnp.arange(COLNO, dtype=jnp.int32).reshape(COLNO, 1)
+    row_idx = jnp.arange(ROWNO, dtype=jnp.int32).reshape(1, ROWNO)
+    in_area = (
+        (col_idx >= sx_lo) & (col_idx <= sx_hi)
+        & (row_idx >= sy_lo) & (row_idx <= sy_hi)
+    )
+    has_non_stone = jnp.any((lgs_typ != jnp.int8(0)) & in_area)
+
+    def _draw_rn3(v):
+        v_out, _ = _rn2_jax_cr(v, jnp.int32(3))
+        return v_out
+    vrng_out = lax.cond(has_non_stone, _draw_rn3, lambda v: v, vendor_rng)
+    success = jnp.logical_not(has_non_stone)
+    return vrng_out, success
 
 
 @jax.jit
@@ -1473,6 +1540,31 @@ def generate_main_branch_l1(
         # 4 rn2(100) + 1 rn2(3) = 5 draws.
         # ------------------------------------------------------------------
         from Nethax.nethax.vendor_rng import rn2_jax as _rn2_jax_do_vault
+
+        # Port vendor's check_room test (sp_lev.c:1063-1120) on the
+        # post-makecorridors / post-make-niches ``_lgs.typ`` grid.  When the
+        # vault candidate area still has non-stone cells, vendor's loop
+        # consumes 1 ``rn2(3)`` draw and returns FALSE (bounds collapse for
+        # the w=h=1 vault case — see helper docstring), so we gate ALL
+        # downstream vault stamping + draws on the result.  Previously
+        # Nethax always trusted makerooms' create_vault outcome, but with
+        # deterministic sort the patched ``makecorridors`` can now cut
+        # through the vault footprint on certain seeds (e.g. seed 5) —
+        # vendor's ``do_vault`` block then drops the vault while Nethax
+        # used to add it speculatively, causing an 18-byte cascade.
+        # Vendor cite: vendor/nle/src/sp_lev.c:1063-1120 (check_room).
+        def _do_check_room(v):
+            return _check_room_vault_simple(v, _lgs.typ, _mk_vault_x, _mk_vault_y)
+        def _skip_check_room(v):
+            return v, jnp.bool_(False)
+        vendor_rng, _check_room_pass = lax.cond(
+            _vault_created_in_makerooms,
+            _do_check_room, _skip_check_room, vendor_rng,
+        )
+        _vault_created_in_makerooms = _vault_created_in_makerooms & _check_room_pass
+        _nroom_post_vault = jnp.where(
+            _vault_created_in_makerooms, _nroom + jnp.int32(1), _nroom,
+        )
 
         # Stamp the vault footprint into vendor_levl_grid so that mineralize's
         # all-STONE 3x3 neighbourhood scan sees the placed vault cells as
