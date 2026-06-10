@@ -2520,3 +2520,24 @@ def drop_at_altar(state, slot_idx: jnp.ndarray):
         new_buc.astype(jnp.int8))
     new_items = state.inventory.items.replace(buc_status=new_buc_arr)
     return state.replace(inventory=state.inventory.replace(items=new_items))
+
+import os as _os_brax
+if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    _BRAX_MAP = {
+        "handle_open": ("features_brax", "handle_open_brax"),
+        "handle_kick": ("features_brax", "handle_kick_brax"),
+        "sit_on_altar": ("features_brax", "sit_on_altar_brax"),
+        "quaff_fountain": ("features_brax", "quaff_fountain_brax"),
+        "dip_fountain": ("features_brax", "dip_fountain_brax"),
+        "sit_on_throne": ("features_brax", "sit_on_throne_brax"),
+        "drink_sink": ("features_brax", "drink_sink_brax"),
+    }
+    _BRAX_CACHE = {}
+    for _name in list(_BRAX_MAP):
+        if _name in globals(): del globals()[_name]
+    def __getattr__(name):
+        if name not in _BRAX_MAP: raise AttributeError(name)
+        if name not in _BRAX_CACHE:
+            mn, bn = _BRAX_MAP[name]
+            _BRAX_CACHE[name] = getattr(__import__(f"Nethax.nethax.subsystems.{mn}", fromlist=[bn]), bn)
+        return _BRAX_CACHE[name]

@@ -1742,3 +1742,26 @@ def is_hard_helmet(type_id: jnp.ndarray) -> jnp.ndarray:
         result = result | (tid == jnp.int32(hid))
     return result
 
+
+import os as _os_brax
+if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    _BRAX_MAP = {
+        "pickup": ("inventory_brax", "pickup_brax"),
+        "drop": ("inventory_brax", "drop_brax"),
+        "wield": ("inventory_brax", "wield_brax"),
+        "wear_armor": ("inventory_brax", "wear_armor_brax"),
+        "take_off_armor": ("inventory_brax", "take_off_armor_brax"),
+        "handle_pickup": ("inventory_brax", "handle_pickup_brax"),
+        "handle_drop": ("inventory_brax", "handle_drop_brax"),
+        "handle_wield": ("inventory_brax", "handle_wield_brax"),
+        "handle_wear": ("inventory_brax", "handle_wear_brax"),
+    }
+    _BRAX_CACHE = {}
+    for _name in list(_BRAX_MAP):
+        if _name in globals(): del globals()[_name]
+    def __getattr__(name):
+        if name not in _BRAX_MAP: raise AttributeError(name)
+        if name not in _BRAX_CACHE:
+            mn, bn = _BRAX_MAP[name]
+            _BRAX_CACHE[name] = getattr(__import__(f"Nethax.nethax.subsystems.{mn}", fromlist=[bn]), bn)
+        return _BRAX_CACHE[name]

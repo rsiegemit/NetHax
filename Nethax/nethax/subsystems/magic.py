@@ -2987,3 +2987,16 @@ def losespells(state, rng: jax.Array):
     # Zero spell_memory for every spell flagged by the forget mask.
     new_mem = jnp.where(forget_mask, jnp.int32(0), magic.spell_memory)
     return state.replace(magic=magic.replace(spell_memory=new_mem))
+
+import os as _os_brax
+if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    _BRAX_MAP = {"handle_cast": ("magic_brax", "handle_cast_brax")}
+    _BRAX_CACHE = {}
+    for _name in list(_BRAX_MAP):
+        if _name in globals(): del globals()[_name]
+    def __getattr__(name):
+        if name not in _BRAX_MAP: raise AttributeError(name)
+        if name not in _BRAX_CACHE:
+            mn, bn = _BRAX_MAP[name]
+            _BRAX_CACHE[name] = getattr(__import__(f"Nethax.nethax.subsystems.{mn}", fromlist=[bn]), bn)
+        return _BRAX_CACHE[name]

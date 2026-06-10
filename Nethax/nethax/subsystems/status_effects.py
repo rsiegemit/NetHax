@@ -1565,3 +1565,35 @@ def tick_luck_drift(env_state):
             jnp.where(apply & drift_up,   jnp.int32(1), jnp.int32(0)))
     new_luck = (luck + delta).astype(jnp.int8)
     return env_state.replace(player_luck=new_luck)
+
+# Round 3 brax integration via PEP 562 lazy __getattr__.
+import os as _os_brax
+import sys as _sys_brax
+if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    _BRAX_ORIG = {
+        "step": step,
+        "tick_hallu_expiry": tick_hallu_expiry,
+        "tick_luck_drift": tick_luck_drift,
+        "tick_slime_cancels_stoning": tick_slime_cancels_stoning,
+    }
+    _BRAX_MAP = {
+        "step": ("status_effects_brax", "step_brax"),
+        "tick_hallu_expiry": ("status_effects_brax", "tick_hallu_expiry_brax"),
+        "tick_luck_drift": ("status_effects_brax", "tick_luck_drift_brax"),
+        "tick_slime_cancels_stoning": ("status_effects_brax", "tick_slime_cancels_stoning_brax"),
+    }
+    _BRAX_CACHE = {}
+    for _name in list(_BRAX_MAP):
+        if _name in globals(): del globals()[_name]
+    def __getattr__(name):
+        if name not in _BRAX_MAP:
+            raise AttributeError(name)
+        mn, bn = _BRAX_MAP[name]
+        full = f"Nethax.nethax.subsystems.{mn}"
+        if full in _sys_brax.modules:
+            spec = getattr(_sys_brax.modules[full], "__spec__", None)
+            if spec is not None and getattr(spec, "_initializing", False):
+                return _BRAX_ORIG[name]
+        if name not in _BRAX_CACHE:
+            _BRAX_CACHE[name] = getattr(__import__(full, fromlist=[bn]), bn)
+        return _BRAX_CACHE[name]

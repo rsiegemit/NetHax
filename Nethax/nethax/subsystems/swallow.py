@@ -310,3 +310,34 @@ def digest_tick(state, rng: jax.Array):
         lambda s: s,
         state,
     )
+
+# Round 4 brax integration via PEP 562 lazy __getattr__ with cycle-break.
+# When inventory_brax is loading and reads back our names, return the
+# stored originals to break the cycle.  After inventory_brax is fully
+# loaded, subsequent lookups return the brax versions.
+import os as _os_brax
+import sys as _sys_brax
+if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    _BRAX_ORIG = {
+        "digest_tick": digest_tick,
+        "release_from_engulf": release_from_engulf,
+    }
+    _BRAX_MAP = {
+        "digest_tick": ("inventory_brax", "digest_tick_brax"),
+        "release_from_engulf": ("inventory_brax", "release_from_engulf_brax"),
+    }
+    _BRAX_CACHE = {}
+    for _name in list(_BRAX_MAP):
+        if _name in globals(): del globals()[_name]
+    def __getattr__(name):
+        if name not in _BRAX_MAP:
+            raise AttributeError(name)
+        mod_name, brax_name = _BRAX_MAP[name]
+        full = f"Nethax.nethax.subsystems.{mod_name}"
+        if full in _sys_brax.modules:
+            spec = getattr(_sys_brax.modules[full], "__spec__", None)
+            if spec is not None and getattr(spec, "_initializing", False):
+                return _BRAX_ORIG[name]
+        if name not in _BRAX_CACHE:
+            _BRAX_CACHE[name] = getattr(__import__(full, fromlist=[brax_name]), brax_name)
+        return _BRAX_CACHE[name]

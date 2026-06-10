@@ -530,3 +530,19 @@ def handle_read_spellbook(state, rng: jax.Array, slot_idx: int):
     # reading a spellbook (insight.c ~2147, u.uconduct.literate).
     from Nethax.nethax.subsystems.conduct import Conduct, mark_violated
     return mark_violated(new_state, int(Conduct.ILLITERATE))
+
+import os as _os_brax
+if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    _BRAX_MAP = {
+        "read_spellbook": ("wands_books_brax", "read_spellbook_brax"),
+        "handle_read_spellbook": ("wands_books_brax", "handle_read_spellbook_brax"),
+    }
+    _BRAX_CACHE = {}
+    for _name in list(_BRAX_MAP):
+        if _name in globals(): del globals()[_name]
+    def __getattr__(name):
+        if name not in _BRAX_MAP: raise AttributeError(name)
+        if name not in _BRAX_CACHE:
+            mn, bn = _BRAX_MAP[name]
+            _BRAX_CACHE[name] = getattr(__import__(f"Nethax.nethax.subsystems.{mn}", fromlist=[bn]), bn)
+        return _BRAX_CACHE[name]

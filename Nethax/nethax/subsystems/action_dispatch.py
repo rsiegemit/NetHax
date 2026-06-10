@@ -4095,3 +4095,16 @@ def _action_value_to_index(action_value: jnp.int32) -> jnp.int32:
     Wave 1 compatibility shim — runs outside JIT.
     """
     return jnp.int32(_ACTION_VALUE_TO_INDEX[int(action_value)])
+
+# Round 3 brax integration: rebind _try_step / _try_step_inner / _move_branch
+# in module globals.  Function bodies look up these names via LOAD_GLOBAL
+# at call time, so the rebound versions are picked up by _handle_move_*
+# handlers automatically.  No cycle risk — movement_brax doesn't import
+# any of these back.
+import os as _os_brax
+if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    from Nethax.nethax.subsystems.movement_brax import (
+        _try_step_brax as _try_step,
+        _try_step_inner_brax as _try_step_inner,
+        _move_branch_brax as _move_branch,
+    )

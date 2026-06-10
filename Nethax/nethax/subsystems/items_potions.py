@@ -1635,3 +1635,25 @@ def _quaff_no_potion(state, rng):
         lambda s_r: s_r[0],
         (state, rng),
     )
+
+# Round 4 brax integration via PEP 562 lazy __getattr__.  Original names
+# are deleted from module globals; lookups fall through to __getattr__,
+# which imports the Brax versions lazily — breaks circular imports.
+import os as _os_brax
+if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    _BRAX_MAP = {
+        "quaff_potion": ("items_dispatch_brax", "quaff_potion_brax"),
+        "apply_potion_to_monster": ("items_dispatch_brax", "apply_potion_to_monster_brax"),
+    }
+    _BRAX_CACHE = {}
+    for _name in list(_BRAX_MAP):
+        if _name in globals():
+            del globals()[_name]
+    def __getattr__(name):
+        if name not in _BRAX_MAP:
+            raise AttributeError(name)
+        if name not in _BRAX_CACHE:
+            mod_name, brax_name = _BRAX_MAP[name]
+            mod = __import__(f"Nethax.nethax.subsystems.{mod_name}", fromlist=[brax_name])
+            _BRAX_CACHE[name] = getattr(mod, brax_name)
+        return _BRAX_CACHE[name]

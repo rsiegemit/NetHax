@@ -1298,7 +1298,7 @@ def _tile_passable(terrain: jnp.ndarray, r: jnp.ndarray, c: jnp.ndarray) -> jnp.
     return in_bounds & not_blocking
 
 
-def pathfind_step(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
+def _pathfind_step_impl(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
     """Return a one-step (dy, dx) toward the player using bounded BFS.
 
     Implementation: bounded BFS to depth ``_PATHFIND_MAX_DEPTH``. We compute a
@@ -1554,6 +1554,15 @@ def pathfind_step(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
     greedy_delta = jnp.clip(ppos - mpos, -1, 1).astype(jnp.int32)
 
     return jnp.where(reachable, bfs_step, greedy_delta)
+
+
+# Module-level @jax.jit alias so ``pathfind_step`` can be called from a
+# Python-level orchestrator (in ``_monster_turn_one_bp_orchestrate`` below)
+# and compile to its OWN cache slot — separately from the rest of the per-
+# slot monster_turn body.  Pathfind's BFS fori_loop is one of the largest
+# contributors to per-slot HLO size; pulling it out cuts cold-compile
+# memory roughly in half (Fix 1+pathfind surgery, 2026-06-07).
+pathfind_step = jax.jit(_pathfind_step_impl)
 
 
 # Vendor mfndpos confusion gate: ``if (mon->mconf) flag |= ALLOW_ALL`` at
@@ -6004,6 +6013,816 @@ def _were_summon_attempt(state, rng: jax.Array):
     return final_state
 
 
+# ---------------------------------------------------------------------------
+# Per-slot @jax.jit bodies, extracted so monsters_step_all can drive them
+# via a Python for-loop OUTSIDE any JIT/vmap context.  XLA then compiles
+# each body ONCE (cached across the 400 iterations and across env-steps)
+# instead of inlining the entire monster_turn graph into a single huge
+# scan body — which on H100 was failing to compile in 16+ hours.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Pathfind surgery (Fix 1 + pathfind extraction, 2026-06-07): the per-slot
+# byte-parity body is now driven by a Python-level orchestrator that calls
+# FOUR separately-jit'd helpers in sequence: setup → monster_turn_a (work
+# UP TO pathfind) → pathfind_step → monster_turn_b (work FROM pathfind
+# onward).  Each helper compiles to its OWN cache slot — smaller HLOs
+# fit in H100 host RAM where the monolithic per-slot body (~hundreds of
+# GB compile working set) was OOM-ing.  Byte-equivalent: same lax.cond
+# gating on may_act / is_pet / should_act preserved inside each jit;
+# pathfind always runs (wasted for pet/inactive slots but no parity cost).
+# ---------------------------------------------------------------------------
+
+
+def _bp_per_slot_setup_impl(state, k_idx):
+    """Per-slot setup: distfleeck rn2(5) + MP deduct + slot lookup.
+
+    Returns: (state', may_act_jax, safe_slot_jax).
+    Mirrors the ORIGINAL ``_monster_turn_one_bp_impl`` body up to the
+    ``lax.cond(may_act, _do_turn, ...)`` call.
+    """
+    NS = jnp.int32(_MOVEMENT_THRESHOLD)
+    mi = state.monster_ai
+    slot = mi.fmon_order[k_idx]
+    valid = slot >= jnp.int32(0)
+    safe_slot = jnp.where(valid, slot, jnp.int32(0))
+    mp_pre = mi.movement_points[safe_slot].astype(jnp.int32)
+    alive_s = mi.alive[safe_slot]
+    may_act = valid & alive_s & (mp_pre >= NS)
+
+    def _draw_distfleeck(vr):
+        return _vendor_rng_mod.rn2_jax(vr, jnp.int32(5))
+
+    def _no_draw(vr):
+        return vr, jnp.int32(0)
+
+    vrng_post, _bravegremlin = jax.lax.cond(
+        may_act, _draw_distfleeck, _no_draw, state.vendor_rng,
+    )
+
+    new_mp_val = jnp.where(may_act, mp_pre - NS, mp_pre).astype(jnp.int16)
+    new_mp_arr = jnp.where(
+        valid,
+        mi.movement_points.at[safe_slot].set(new_mp_val),
+        mi.movement_points,
+    )
+    mi_pre = mi.replace(movement_points=new_mp_arr)
+    state_pre = state.replace(monster_ai=mi_pre, vendor_rng=vrng_post)
+    return state_pre, may_act, safe_slot
+
+
+_bp_per_slot_setup_jit = jax.jit(_bp_per_slot_setup_impl)
+
+
+def _bp_per_slot_setup_brax_impl(state, k_idx):
+    """Brax-style version of ``_bp_per_slot_setup_impl`` — no ``lax.cond``.
+
+    Always draws the distfleeck rn2(5), then masks the vrng update via
+    ``jnp.where`` on ``may_act``.  Trade-off: vendor_rng draw runs every
+    slot (wasted for dead/inactive slots) but compile is flat.  Byte-
+    equivalent: when ``may_act`` is False, the masked vrng matches the
+    no-draw branch of the original.
+
+    Brax prototype (2026-06-09): if Mac 10/10 PASS and H100 compile is
+    faster, generalize the pattern to other phases.
+    """
+    NS = jnp.int32(_MOVEMENT_THRESHOLD)
+    mi = state.monster_ai
+    slot = mi.fmon_order[k_idx]
+    valid = slot >= jnp.int32(0)
+    safe_slot = jnp.where(valid, slot, jnp.int32(0))
+    mp_pre = mi.movement_points[safe_slot].astype(jnp.int32)
+    alive_s = mi.alive[safe_slot]
+    may_act = valid & alive_s & (mp_pre >= NS)
+
+    # Always draw — discard if not may_act.
+    vrng_drawn, _bravegremlin = _vendor_rng_mod.rn2_jax(
+        state.vendor_rng, jnp.int32(5),
+    )
+    vrng_post = jax.tree_util.tree_map(
+        lambda new, old: jnp.where(may_act, new, old),
+        vrng_drawn, state.vendor_rng,
+    )
+
+    new_mp_val = jnp.where(may_act, mp_pre - NS, mp_pre).astype(jnp.int16)
+    new_mp_arr = jnp.where(
+        valid,
+        mi.movement_points.at[safe_slot].set(new_mp_val),
+        mi.movement_points,
+    )
+    mi_pre = mi.replace(movement_points=new_mp_arr)
+    state_pre = state.replace(monster_ai=mi_pre, vendor_rng=vrng_post)
+    return state_pre, may_act, safe_slot
+
+
+_bp_per_slot_setup_brax_jit = jax.jit(_bp_per_slot_setup_brax_impl)
+
+
+def _bp_pet_or_skip_impl(state, rng, monster_idx, may_act):
+    """Pet branch of monster_turn — gated on (may_act AND is_pet).
+
+    Extracted from monster_turn_a so pet_move (the entire pet AI ~500 LOC)
+    compiles to its OWN cache slot instead of being inlined into phase A's
+    HLO.  For hostile/inactive slots: identity.
+    """
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+    is_pet = mai.tame[idx] & mai.alive[idx]
+    gate = may_act & is_pet
+
+    def _run(s):
+        # rng_pet is the FIRST of the 7-way split monster_turn does.
+        rng_pet = jax.random.split(rng, 7)[0]
+        return pet_move(s, rng_pet, idx)
+
+    return jax.lax.cond(gate, _run, lambda s: s, state)
+
+
+_bp_pet_or_skip_jit = jax.jit(_bp_pet_or_skip_impl)
+
+
+def _monster_turn_a_impl(state, rng, monster_idx, may_act):
+    """Monster turn phase A — HOSTILE branch only, UP TO (not including)
+    pathfind_step.
+
+    Pet branch (pet_move) is extracted to ``_bp_pet_or_skip_jit`` and run
+    at the orchestrator level BEFORE this function.  Gated on
+    (may_act AND NOT is_pet): when False, returns (state, False).
+    Otherwise runs hostile branch body up through cast_spell.
+
+    Returns: (state', was_asleep_jax) — was_asleep is needed by phase B
+    to recompute the ``should_act`` gate (since maybe_wake_monster has
+    already flipped state.monster_ai.asleep by the time phase B runs).
+    """
+    from Nethax.nethax.subsystems.combat import monster_attack_player  # noqa: F401
+
+    idx = monster_idx.astype(jnp.int32)
+
+    def _real_work(s):
+        mai = s.monster_ai
+        (rng_pet, rng_cast, rng_atk, rng_pick,
+         rng_decay, rng_wake, rng_conf_step) = jax.random.split(rng, 7)
+        rng_mconf, rng_mstun = jax.random.split(rng_decay)
+        # is_pet handled by the orchestrator-level _bp_pet_or_skip_jit;
+        # this branch ONLY runs when may_act AND NOT is_pet.
+        def _hostile_branch(ss):
+            _m_pre = ss.monster_ai
+            is_paralyzed = _m_pre.paralyzed_timer[idx] > jnp.int16(0)
+            is_waiting = _m_pre.mstrategy[idx] == jnp.int8(MoveStrategy.WAIT)
+            cannot_move = is_paralyzed | is_waiting
+
+            rn50 = jax.random.randint(rng_mconf, (), 0, 50)
+            rn10 = jax.random.randint(rng_mstun, (), 0, 10)
+            decay_conf = (_m_pre.confuse_timer[idx] > 0) & (rn50 == 0)
+            decay_stun = (_m_pre.stun_timer[idx] > 0) & (rn10 == 0)
+            new_conf_v = jnp.where(decay_conf, jnp.int16(0), _m_pre.confuse_timer[idx])
+            new_stun_v = jnp.where(decay_stun, jnp.int16(0), _m_pre.stun_timer[idx])
+            _m_decay = _m_pre.replace(
+                confuse_timer=_m_pre.confuse_timer.at[idx].set(new_conf_v),
+                stun_timer=_m_pre.stun_timer.at[idx].set(new_stun_v),
+            )
+            ss = ss.replace(monster_ai=_m_decay)
+
+            was_asleep_local = ss.monster_ai.asleep[idx]
+            ss = maybe_wake_monster(ss, idx, rng_wake)
+
+            m = ss.monster_ai
+            should_act = m.alive[idx] & ~was_asleep_local & ~m.peaceful[idx] & ~cannot_move
+
+            def _act_pre_path(st):
+                st = monster_use_item(st, rng_cast, idx)
+                is_mage = _is_mage_entry(st.monster_ai.entry_idx[idx])
+                roll = jax.random.uniform(rng_pick, ())
+                cast_now = is_mage & (roll < 0.5)
+
+                def _maybe_cast(s2):
+                    return monster_cast_spell(s2, rng_cast, idx)
+
+                st = jax.lax.cond(cast_now, _maybe_cast, lambda s2: s2, st)
+                return st
+
+            ss = jax.lax.cond(should_act, _act_pre_path, lambda st: st, ss)
+            return ss, was_asleep_local
+
+        # Pet branch is run separately by ``_bp_pet_or_skip_jit`` at the
+        # orchestrator level.  Gate this phase on NOT is_pet so we skip
+        # hostile-branch work for pets.
+        mai = s.monster_ai
+        is_pet_inner = mai.tame[idx] & mai.alive[idx]
+        return jax.lax.cond(is_pet_inner,
+                            lambda ss: (ss, jnp.bool_(False)),
+                            _hostile_branch, s)
+
+    def _no_work(s):
+        return s, jnp.bool_(False)
+
+    return jax.lax.cond(may_act, _real_work, _no_work, state)
+
+
+_monster_turn_a_jit = jax.jit(_monster_turn_a_impl)
+
+
+def _monster_turn_b_impl(state, rng, monster_idx, path_step, was_asleep, may_act):
+    """Monster turn phase B — FROM pathfind_step result onward.
+
+    Gated on ``may_act``: when False, returns state unchanged.  When True,
+    mirrors monster_turn's post-pathfind work (m_search_items + confusion
+    override + scared check + attack/move dispatch + postmov).
+
+    For pet branch / hostile-skip / hostile-not-act cases, the inner
+    lax.cond chain on ``is_pet`` and ``should_act`` collapses to a no-op,
+    preserving byte-parity with the original lax.cond gating.
+    """
+    from Nethax.nethax.subsystems.combat import monster_attack_player
+
+    idx = monster_idx.astype(jnp.int32)
+
+    def _real_work(s):
+        mai = s.monster_ai
+        (rng_pet, rng_cast, rng_atk, rng_pick,
+         rng_decay, rng_wake, rng_conf_step) = jax.random.split(rng, 7)
+        is_pet = mai.tame[idx] & mai.alive[idx]
+
+        def _pet_or_skip(ss):
+            return ss
+
+        def _hostile_post(ss):
+            m = ss.monster_ai
+            is_paralyzed = m.paralyzed_timer[idx] > jnp.int16(0)
+            is_waiting = m.mstrategy[idx] == jnp.int8(MoveStrategy.WAIT)
+            cannot_move = is_paralyzed | is_waiting
+            should_act = m.alive[idx] & ~was_asleep & ~m.peaceful[idx] & ~cannot_move
+
+            def _act_post_path(st):
+                # 7a: Elbereth fear check (recomputed; deterministic from state).
+                from Nethax.nethax.subsystems.engrave import is_elbereth_at
+                from Nethax.nethax.dungeon.branches import Branch as _Branch
+                _ppos = st.player_pos.astype(jnp.int32)
+                _scared_raw = is_elbereth_at(st.engrave, _ppos[0], _ppos[1])
+                _eidx = st.monster_ai.entry_idx[idx].astype(jnp.int32)
+                _safe_e = jnp.clip(_eidx, 0, _IGNORES_ELBERETH.shape[0] - 1)
+                _ignores = _IGNORES_ELBERETH[_safe_e]
+                _in_gehennom = (
+                    st.dungeon.current_branch.astype(jnp.int32)
+                    == jnp.int32(_Branch.GEHENNOM)
+                )
+                scared = _scared_raw & ~_ignores & ~_in_gehennom
+
+                retreat_step = maybe_retreat(st, idx)
+                wants_retreat = jnp.any(retreat_step != 0)
+                ps = path_step  # provided by caller — pathfind already run
+
+                _ms_found, _ms_r, _ms_c = _m_search_items(st, idx)
+                _mpos_i32 = st.monster_ai.pos[idx].astype(jnp.int32)
+                _item_target = jnp.stack([_ms_r, _ms_c]).astype(jnp.int32)
+                _item_step = jnp.clip(_item_target - _mpos_i32, -1, 1).astype(jnp.int32)
+                ps = jnp.where(_ms_found, _item_step, ps)
+                step_delta = jnp.where(wants_retreat, retreat_step, ps)
+
+                is_confused_mi = st.monster_ai.confuse_timer[idx] > jnp.int16(0)
+                step_delta = apply_confusion_to_step(
+                    step_delta, is_confused_mi, rng_conf_step,
+                )
+                step_delta = jnp.where(
+                    scared, jnp.zeros(2, dtype=jnp.int32), step_delta,
+                )
+
+                cur_pos = st.monster_ai.pos[idx].astype(jnp.int32)
+                new_pos_i32 = cur_pos + step_delta
+                ppos_i32 = st.player_pos.astype(jnp.int32)
+                steps_onto_player = jnp.all(new_pos_i32 == ppos_i32)
+
+                # attack/move dispatch + monster_attack_player call extracted —
+                # orchestrator runs _bp_attack_or_skip_jit + _bp_move_or_skip_jit
+                # after monster_turn_b returns.  Return state UNCHANGED with
+                # the decision metadata.
+                return (st, jnp.bool_(True), steps_onto_player,
+                        cur_pos, new_pos_i32, wants_retreat)
+
+            _zero2 = jnp.zeros(2, dtype=jnp.int32)
+            return jax.lax.cond(
+                should_act, _act_post_path,
+                lambda st: (st, jnp.bool_(False), jnp.bool_(False),
+                            _zero2, _zero2, jnp.bool_(False)),
+                ss,
+            )
+
+        _zero2 = jnp.zeros(2, dtype=jnp.int32)
+        return jax.lax.cond(
+            is_pet,
+            lambda ss: (ss, jnp.bool_(False), jnp.bool_(False),
+                        _zero2, _zero2, jnp.bool_(False)),
+            _hostile_post, s,
+        )
+
+    _zero2 = jnp.zeros(2, dtype=jnp.int32)
+    return jax.lax.cond(
+        may_act, _real_work,
+        lambda s: (s, jnp.bool_(False), jnp.bool_(False),
+                   _zero2, _zero2, jnp.bool_(False)),
+        state,
+    )
+
+
+_monster_turn_b_jit = jax.jit(_monster_turn_b_impl)
+
+
+def _monster_turn_b_brax_impl(state, rng, monster_idx, path_step, was_asleep, may_act):
+    """Brax-style version of ``_monster_turn_b_impl`` — no nested ``lax.cond``.
+
+    Always computes the movement decision (Elbereth check, retreat_step,
+    pathfind override, confusion override, attack/move dispatch decision)
+    regardless of whether the monster actually acts.  Masks all outputs
+    via ``jnp.where`` on the master gate
+    ``do_real_work = may_act & ~is_pet & should_act``.
+
+    Note: ``state`` itself is NOT mutated in this phase — only the decision
+    metadata is computed.  The actual mutations happen downstream in
+    ``_bp_attack_or_skip_jit`` and ``_bp_move_or_skip_jit`` and
+    ``_bp_postmov_or_skip_jit``, which are already gated on ``did_act``.
+
+    Brax prototype (2026-06-09): if Mac 10/10 PASS and the single-phase
+    H100 compile time meaningfully drops, generalize to other phases.
+    """
+    from Nethax.nethax.subsystems.combat import monster_attack_player  # noqa: F401
+    idx = monster_idx.astype(jnp.int32)
+    mai = state.monster_ai
+
+    # 7-way RNG split (same as monster_turn) — always run.
+    (rng_pet, rng_cast, rng_atk, rng_pick,
+     rng_decay, rng_wake, rng_conf_step) = jax.random.split(rng, 7)
+
+    # Compute master gate.
+    is_pet = mai.tame[idx] & mai.alive[idx]
+    is_paralyzed = mai.paralyzed_timer[idx] > jnp.int16(0)
+    is_waiting = mai.mstrategy[idx] == jnp.int8(MoveStrategy.WAIT)
+    cannot_move = is_paralyzed | is_waiting
+    should_act = mai.alive[idx] & ~was_asleep & ~mai.peaceful[idx] & ~cannot_move
+    do_real_work = may_act & ~is_pet & should_act
+
+    # ALWAYS run the post-path movement-decision body.
+    from Nethax.nethax.subsystems.engrave import is_elbereth_at
+    from Nethax.nethax.dungeon.branches import Branch as _Branch
+    _ppos = state.player_pos.astype(jnp.int32)
+    _scared_raw = is_elbereth_at(state.engrave, _ppos[0], _ppos[1])
+    _eidx = state.monster_ai.entry_idx[idx].astype(jnp.int32)
+    _safe_e = jnp.clip(_eidx, 0, _IGNORES_ELBERETH.shape[0] - 1)
+    _ignores = _IGNORES_ELBERETH[_safe_e]
+    _in_gehennom = (
+        state.dungeon.current_branch.astype(jnp.int32)
+        == jnp.int32(_Branch.GEHENNOM)
+    )
+    scared = _scared_raw & ~_ignores & ~_in_gehennom
+
+    retreat_step = maybe_retreat(state, idx)
+    wants_retreat = jnp.any(retreat_step != 0)
+    ps = path_step
+
+    _ms_found, _ms_r, _ms_c = _m_search_items(state, idx)
+    _mpos_i32 = state.monster_ai.pos[idx].astype(jnp.int32)
+    _item_target = jnp.stack([_ms_r, _ms_c]).astype(jnp.int32)
+    _item_step = jnp.clip(_item_target - _mpos_i32, -1, 1).astype(jnp.int32)
+    ps = jnp.where(_ms_found, _item_step, ps)
+    step_delta = jnp.where(wants_retreat, retreat_step, ps)
+
+    is_confused_mi = state.monster_ai.confuse_timer[idx] > jnp.int16(0)
+    step_delta = apply_confusion_to_step(
+        step_delta, is_confused_mi, rng_conf_step,
+    )
+    step_delta = jnp.where(
+        scared, jnp.zeros(2, dtype=jnp.int32), step_delta,
+    )
+
+    cur_pos = state.monster_ai.pos[idx].astype(jnp.int32)
+    new_pos_i32 = cur_pos + step_delta
+    ppos_i32 = state.player_pos.astype(jnp.int32)
+    steps_onto_player = jnp.all(new_pos_i32 == ppos_i32)
+
+    # Mask all outputs by do_real_work — gives identity behavior when
+    # !do_real_work, matching the original lax.cond chain.
+    _zero2 = jnp.zeros(2, dtype=jnp.int32)
+    did_act = do_real_work
+    out_steps_onto_player = jnp.where(do_real_work, steps_onto_player, jnp.bool_(False))
+    out_cur_pos = jnp.where(do_real_work, cur_pos, _zero2)
+    out_new_pos_i32 = jnp.where(do_real_work, new_pos_i32, _zero2)
+    out_wants_retreat = jnp.where(do_real_work, wants_retreat, jnp.bool_(False))
+
+    # State is UNCHANGED — monster_turn_b only computes decisions, doesn't
+    # write.  Mutations happen in attack_or_skip / move_or_skip / postmov.
+    return (state, did_act, out_steps_onto_player,
+            out_cur_pos, out_new_pos_i32, out_wants_retreat)
+
+
+_monster_turn_b_brax_jit = jax.jit(_monster_turn_b_brax_impl)
+
+
+def _bp_attack_or_skip_impl(state, rng_atk, monster_idx, do_attack):
+    """Run ``monster_attack_player`` gated on ``do_attack``.
+
+    Extracted from monster_turn_b's ``_attack`` branch so the 256 LOC of
+    combat logic compiles to its OWN cache slot instead of being inlined
+    via lax.cond in the giant monster_turn_b HLO.  When ``do_attack`` is
+    False (most slots most turns), returns state unchanged.
+    """
+    from Nethax.nethax.subsystems.combat import monster_attack_player
+    idx = monster_idx.astype(jnp.int32)
+
+    def _run(s):
+        new_s, _dmg = monster_attack_player(s, rng_atk, idx)
+        _m = new_s.monster_ai
+        new_m = _m.replace(
+            last_seen_player_pos=_m.last_seen_player_pos.at[idx].set(
+                s.player_pos.astype(jnp.int16)
+            ),
+            mstrategy=_m.mstrategy.at[idx].set(jnp.int8(MoveStrategy.HUNT)),
+        )
+        return new_s.replace(monster_ai=new_m)
+
+    return jax.lax.cond(do_attack, _run, lambda s: s, state)
+
+
+_bp_attack_or_skip_jit = jax.jit(_bp_attack_or_skip_impl)
+
+
+def _bp_move_or_skip_impl(state, monster_idx, cur_pos, new_pos_i32,
+                          wants_retreat, do_move):
+    """Run movement (position + last_seen + mstrategy update) gated on do_move."""
+    idx = monster_idx.astype(jnp.int32)
+
+    def _run(s):
+        _m = s.monster_ai
+        target_r = jnp.clip(new_pos_i32[0], 0, _MAP_H - 1)
+        target_c = jnp.clip(new_pos_i32[1], 0, _MAP_W - 1)
+        final_pos = jnp.stack([target_r, target_c]).astype(jnp.int16)
+        new_strategy = jnp.where(
+            wants_retreat,
+            jnp.int8(MoveStrategy.FLEE),
+            jnp.int8(MoveStrategy.HUNT),
+        )
+        ppos_i16 = s.player_pos.astype(jnp.int16)
+        new_m = _m.replace(
+            pos=_m.pos.at[idx].set(final_pos),
+            last_seen_player_pos=_m.last_seen_player_pos.at[idx].set(ppos_i16),
+            mstrategy=_m.mstrategy.at[idx].set(new_strategy),
+        )
+        return s.replace(monster_ai=new_m)
+
+    return jax.lax.cond(do_move, _run, lambda s: s, state)
+
+
+_bp_move_or_skip_jit = jax.jit(_bp_move_or_skip_impl)
+
+
+def _bp_postmov_or_skip_impl(state, monster_idx, did_act):
+    """Run ``_postmov_per_monster`` gated on ``did_act``.
+
+    Extracted from monster_turn_b so postmov's ~200 LOC of tile-reveal /
+    LoS logic compiles to its OWN cache slot instead of being inlined.
+    """
+    return jax.lax.cond(
+        did_act,
+        lambda s: _postmov_per_monster(s, monster_idx.astype(jnp.int32)),
+        lambda s: s,
+        state,
+    )
+
+
+_bp_postmov_or_skip_jit = jax.jit(_bp_postmov_or_skip_impl)
+
+
+def _monster_turn_one_bp_orchestrate(state, k_idx, key):
+    """Python-level orchestrator for one per-slot byte-parity monster turn.
+
+    Drives FIVE separately-compiled jit'd helpers in sequence so each
+    compiles to a small HLO module instead of one giant monolithic one.
+    Byte-equivalent to the original ``_monster_turn_one_bp_impl``
+    (which inlined the entire monster_turn graph into one compile).
+
+    Phases:
+      1. setup           — distfleeck + MP deduct + slot lookup.
+      2. pet_or_skip     — pet_move (only for pets).
+      3. monster_turn_a  — hostile pre-path: decay, wake, item, cast.
+      4. pathfind_step   — BFS path computation.
+      5. monster_turn_b  — hostile post-path: movement decision (no attack/move).
+      6. attack_or_skip  — monster_attack_player (only when bumping player).
+      7. move_or_skip    — position + last_seen + mstrategy update.
+      8. postmov_or_skip — _postmov_per_monster (only for hostile-act).
+    """
+    # rng_atk is the 3rd of monster_turn's 7-way split (see monster_turn).
+    rng_atk = jax.random.split(key, 7)[2]
+
+    # Phase 1 — setup.  ``NETHAX_BRAX_SETUP=1`` selects the Brax-style
+    # version (always-draw + jnp.where) instead of the lax.cond version.
+    if _os.environ.get("NETHAX_BRAX_SETUP", "0") == "1":
+        state, may_act, safe_slot = _bp_per_slot_setup_brax_jit(state, k_idx)
+    else:
+        state, may_act, safe_slot = _bp_per_slot_setup_jit(state, k_idx)
+
+    state = _bp_pet_or_skip_jit(state, key, safe_slot, may_act)
+    state, was_asleep = _monster_turn_a_jit(state, key, safe_slot, may_act)
+    path_step = pathfind_step(state, safe_slot)
+
+    # Phase 5 — monster_turn_b.  ``NETHAX_BRAX_MT_B=1`` selects the
+    # Brax-style version (always-compute + jnp.where) instead of the
+    # nested-lax.cond version.
+    if _os.environ.get("NETHAX_BRAX_MT_B", "0") == "1":
+        _mt_b = _monster_turn_b_brax_jit
+    else:
+        _mt_b = _monster_turn_b_jit
+    (state, did_act, steps_onto_player,
+     cur_pos, new_pos_i32, wants_retreat) = _mt_b(
+        state, key, safe_slot, path_step, was_asleep, may_act,
+    )
+    do_attack = did_act & steps_onto_player
+    do_move = did_act & ~steps_onto_player
+    state = _bp_attack_or_skip_jit(state, rng_atk, safe_slot, do_attack)
+    state = _bp_move_or_skip_jit(state, safe_slot, cur_pos, new_pos_i32,
+                                 wants_retreat, do_move)
+    return _bp_postmov_or_skip_jit(state, safe_slot, did_act)
+
+
+def _monster_turn_one_bp_monolithic_impl(state, k_idx, key):
+    """Pre-surgery monolithic per-slot body — keeps all of monster_turn in
+    ONE jit (no phase split).  Larger HLO, simpler control flow.
+
+    Opt-in via ``NETHAX_PHASED_ORCH=0`` env var.  Useful as a fallback if
+    the phased orchestrator misbehaves, or to compare compile / runtime
+    characteristics of the two architectures.
+
+    When ``NETHAX_BRAX_ALL=1`` is set, calls ``monster_turn_brax`` instead
+    of ``monster_turn`` — flat-HLO end-to-end (5 Brax rewrites: monster_
+    turn body + monster_attack_player + monster_use_item + monster_cast_
+    spell + pet_move + _postmov_per_monster).
+    """
+    state, may_act, safe_slot = _bp_per_slot_setup_jit(state, k_idx)
+    if _os.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+        from Nethax.nethax.subsystems.monster_turn_brax import monster_turn_brax
+        _mt = monster_turn_brax
+    else:
+        _mt = monster_turn
+    return jax.lax.cond(
+        may_act,
+        lambda s: _mt(s, key, safe_slot),
+        lambda s: s,
+        state,
+    )
+
+
+_monster_turn_one_bp_monolithic_jit = jax.jit(_monster_turn_one_bp_monolithic_impl)
+
+
+import os as _os
+# Selector: phased orchestrator (post-surgery) by default; set
+# ``NETHAX_PHASED_ORCH=0`` to use the monolithic pre-surgery body.
+if _os.environ.get("NETHAX_PHASED_ORCH", "1") == "0":
+    _monster_turn_one_bp_jit = _monster_turn_one_bp_monolithic_jit
+else:
+    _monster_turn_one_bp_jit = _monster_turn_one_bp_orchestrate
+
+
+def _mcalc_one_bp_impl(state, k_idx, pre_round):
+    """One iteration of the byte-parity mcalcmove per-slot draw.
+
+    Mirrors the inner ``_mcalc_body`` previously inside ``monsters_step_all``.
+    Draws ``rn2(NORMAL_SPEED)`` unconditionally whenever the slot is valid
+    and alive (vendor C-arg eval — see comment at scan callsite for the
+    full citation chain), updates ``movement_points[safe_slot]``.
+
+    Cite: vendor/nethack/src/mon.c::mcalcmove lines 1126-1167.
+    """
+    NS = jnp.int32(_MOVEMENT_THRESHOLD)
+    mi = state.monster_ai
+    slot = mi.fmon_order[k_idx]
+    valid = slot >= jnp.int32(0)
+    safe_slot = jnp.where(valid, slot, jnp.int32(0))
+    alive_s = jnp.where(valid, mi.alive[safe_slot], jnp.bool_(False))
+    pre = pre_round[safe_slot]
+    adj = pre % NS
+    floored = pre - adj
+    need_draw = valid & alive_s
+
+    def _draw(vr):
+        return _vendor_rng_mod.rn2_jax(vr, NS)
+
+    def _nodraw(vr):
+        return vr, jnp.int32(0)
+
+    vrng2, v = jax.lax.cond(need_draw, _draw, _nodraw, state.vendor_rng)
+    add_pts = jnp.where(need_draw & (v < adj), floored + NS, floored)
+    add_pts = jnp.where(valid & alive_s, add_pts, jnp.int32(0))
+    new_mp = jnp.clip(
+        mi.movement_points[safe_slot].astype(jnp.int32) + add_pts,
+        0, 32000,
+    ).astype(jnp.int16)
+    mi2 = mi.replace(
+        movement_points=jnp.where(
+            valid,
+            mi.movement_points.at[safe_slot].set(new_mp),
+            mi.movement_points,
+        )
+    )
+    return state.replace(monster_ai=mi2, vendor_rng=vrng2)
+
+
+_mcalc_one_bp_jit = jax.jit(_mcalc_one_bp_impl)
+
+
+def _mattackm_one_impl(state, atk_slot, key_i, conflict_active):
+    """One iteration of the per-attacker mattackm strike body.
+
+    Mirrors the inner ``_strike_body`` previously inside
+    ``monsters_step_all``.  ``atk_slot`` is the attacker's slot index
+    (or -1 for empty fmon entries — collapses to no-op).
+
+    Cite: vendor/nethack/src/mhitm.c lines 1024-1100 (mattackm);
+          vendor/nethack/src/mon.c::mm_aggression lines 2422-2447;
+          vendor/nethack/src/uhitm.c — Conflict intrinsic gate (44).
+    """
+    mi = state.monster_ai
+    i_raw = atk_slot.astype(jnp.int32)
+    valid_i = i_raw >= jnp.int32(0)
+    i32 = jnp.where(valid_i, i_raw, jnp.int32(0))
+
+    atk_alive = mi.alive[i32] & valid_i
+    pi = mi.pos[i32].astype(jnp.int32)
+
+    all_pos = mi.pos.astype(jnp.int32)
+    d_row = jnp.abs(all_pos[:, 0] - pi[0])
+    d_col = jnp.abs(all_pos[:, 1] - pi[1])
+    adj = jnp.maximum(d_row, d_col) == 1
+
+    is_tame_all = mi.tame
+    is_peace_all = mi.peaceful & ~is_tame_all
+    all_faction = jnp.where(is_tame_all, jnp.int32(2),
+                   jnp.where(is_peace_all, jnp.int32(1), jnp.int32(0)))
+    a_faction = all_faction[i32]
+    is_hostile_atk    = a_faction == jnp.int32(0)
+    is_nonhostile_tgt = all_faction != jnp.int32(0)
+
+    idx_arr = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
+    pair_ok = idx_arr > i32
+
+    a_entry = jnp.clip(mi.entry_idx[i32].astype(jnp.int32),
+                       0, _MM_IS_PURPLE_WORM.shape[0] - 1)
+    all_entry = jnp.clip(mi.entry_idx.astype(jnp.int32),
+                         0, _MM_IS_PURPLE_WORM.shape[0] - 1)
+    a_is_pw = _MM_IS_PURPLE_WORM[a_entry]
+    t_is_shr = _MM_IS_SHRIEKER[all_entry]
+    a_is_zm = _MM_IS_ZOMBIE_MAKER[a_entry] & ~mi.cancelled[i32]
+    t_has_zform = _MM_HAS_ZOMBIE_FORM[all_entry]
+
+    pets_brawl = mi.tame[i32] & mi.tame
+
+    species_purple = a_is_pw & t_is_shr & ~pets_brawl
+    species_zombie = a_is_zm & t_has_zform & ~pets_brawl & ~mi.tame[i32] & ~mi.tame
+
+    conflict_allow = conflict_active
+
+    baseline_allow = is_hostile_atk & is_nonhostile_tgt
+    per_target_allow = (baseline_allow
+                        | species_purple
+                        | species_zombie
+                        | conflict_allow)
+
+    candidates = mi.alive & adj & pair_ok & per_target_allow
+    has_target = jnp.any(candidates)
+    j_idx = jnp.argmax(candidates).astype(jnp.int32)
+
+    do_strike = atk_alive & has_target
+
+    def _strike(ss):
+        return mattackm(ss, i32, j_idx, key_i)
+
+    return jax.lax.cond(do_strike, _strike, lambda ss: ss, state)
+
+
+_mattackm_one_jit = jax.jit(_mattackm_one_impl)
+
+
+# ---------------------------------------------------------------------------
+# Byte-parity branch helpers, extracted from monsters_step_all so the
+# batched (vmap-over-seeds) path can call them as separate compile units
+# instead of vmap'ing the entire orchestrator and unrolling all 400 slots.
+# ---------------------------------------------------------------------------
+
+
+def _bp_monsters_pre_loops_one_env_impl(state, rng):
+    """Pre-loop work: were/summon/qsteal/covetous/speed_accum/key_split.
+
+    Mirrors the head of ``monsters_step_all``'s byte-parity branch up to
+    (but not including) the per-slot turn loop.  Pure JAX so it vmaps
+    cleanly over the batch axis.
+
+    Returns: (state', pre_round, turn_keys, mhit_keys, atk_indices_arr,
+              conflict_active).
+    """
+    rng, rng_were = jax.random.split(rng)
+    state = state.replace(monster_ai=_were_change_all(state.monster_ai, rng_were))
+    rng, rng_summon = jax.random.split(rng)
+    state = _were_summon_attempt(state, rng_summon)
+    rng, rng_qsteal = jax.random.split(rng)
+    state = _try_steal_quest_artifact(state, rng_qsteal)
+    state = _covetous_ai_step(state)
+
+    mai = state.monster_ai
+    safe_entry = jnp.clip(
+        mai.entry_idx.astype(jnp.int32),
+        0, _MONSTER_MOVE_SPEED_TABLE.shape[0] - 1,
+    )
+    base_speed = _MONSTER_MOVE_SPEED_TABLE[safe_entry].astype(jnp.int32)
+    smod = mai.speed_mod.astype(jnp.int32)
+    NS = jnp.int32(_MOVEMENT_THRESHOLD)
+    slow_lo = (2 * base_speed + 1) // jnp.int32(3)
+    slow_hi = jnp.int32(4) + base_speed // jnp.int32(3)
+    mslow_speed = jnp.where(base_speed < NS, slow_lo, slow_hi)
+    mfast_speed = (4 * base_speed + 2) // jnp.int32(3)
+    pre_round = jnp.where(smod < 0, mslow_speed,
+                  jnp.where(smod > 0, mfast_speed, base_speed))
+
+    keys = jax.random.split(rng, MAX_MONSTERS_PER_LEVEL * 2)
+    turn_keys = keys[:MAX_MONSTERS_PER_LEVEL]
+    mhit_keys = keys[MAX_MONSTERS_PER_LEVEL:]
+
+    atk_indices_arr = mai.fmon_order
+
+    _status = getattr(state, "status", None)
+    if _status is not None and hasattr(_status, "intrinsics"):
+        conflict_active = _status.intrinsics[_INTRINSIC_CONFLICT]
+    else:
+        conflict_active = jnp.bool_(False)
+
+    return (state, pre_round, turn_keys, mhit_keys,
+            atk_indices_arr, conflict_active)
+
+
+_bp_monsters_pre_loops_one_env_jit = jax.jit(_bp_monsters_pre_loops_one_env_impl)
+
+
+def _bp_monsters_ghost_draws_one_env_impl(state, player_dex):
+    """Per-turn maintenance ISAAC64 ghost-draws (3 draws).
+
+    Cite: vendor allmain.c:164 (maybe_generate_rnd_mon),
+          vendor sounds.c:220 (dosounds),
+          vendor allmain.c:294 (wipe-engraving).
+    """
+    vrng_after = state.vendor_rng
+    vrng_after, _ = _vendor_rng_mod.rn2_jax(vrng_after, jnp.int32(70))
+    vrng_after, _ = _vendor_rng_mod.rn2_jax(vrng_after, jnp.int32(300))
+    dex_i32 = jnp.asarray(player_dex, dtype=jnp.int32)
+    wipe_mod = jnp.int32(40) + dex_i32 * jnp.int32(3)
+    vrng_after, _ = _vendor_rng_mod.rn2_jax(vrng_after, wipe_mod)
+    return state.replace(vendor_rng=vrng_after)
+
+
+_bp_monsters_ghost_draws_one_env_jit = jax.jit(_bp_monsters_ghost_draws_one_env_impl)
+
+
+def _bp_monsters_post_loops_one_env_impl(state):
+    """Post-loop work: status timer decrement + vault-guard cleanup.
+
+    Mirrors the tail of ``monsters_step_all`` after the strike loop.
+    """
+    from Nethax.nethax.subsystems.vault import maybe_grddead as _maybe_grddead
+    mai = state.monster_ai
+    new_stun = jnp.maximum(mai.stun_timer.astype(jnp.int32) - 1, 0).astype(jnp.int16)
+    new_confuse = jnp.maximum(mai.confuse_timer.astype(jnp.int32) - 1, 0).astype(jnp.int16)
+    new_paralyzed = jnp.maximum(mai.paralyzed_timer.astype(jnp.int32) - 1, 0).astype(jnp.int16)
+    new_blind = jnp.maximum(mai.blind_timer.astype(jnp.int32) - 1, 0).astype(jnp.int16)
+    new_mspec = jnp.maximum(mai.mspec_used.astype(jnp.int32) - 1, 0).astype(jnp.int16)
+    mai = mai.replace(
+        stun_timer=new_stun,
+        confuse_timer=new_confuse,
+        paralyzed_timer=new_paralyzed,
+        blind_timer=new_blind,
+        mspec_used=new_mspec,
+    )
+    state = state.replace(monster_ai=mai)
+    return _maybe_grddead(state)
+
+
+_bp_monsters_post_loops_one_env_jit = jax.jit(_bp_monsters_post_loops_one_env_impl)
+
+
+def monsters_step_all_batched_orchestrate(
+    state_orchestrate_helpers_fn,
+    states,
+    rngs,
+):
+    """Generic byte-parity batched orchestrator.
+
+    ``state_orchestrate_helpers_fn`` is a dict-like object exposing the
+    per-slot dispatch helpers (raw or vmap'd).  Used by both single-env
+    (where helpers are scalar jits) and batched (where they're vmap'd
+    jits).  The Python for-loops over MAX_MONSTERS_PER_LEVEL stay HERE
+    so each helper compiles to its own cache slot.
+
+    NOTE: this is just a documentation placeholder — env.py wires its
+    own batched orchestrator using the helpers above plus vmap.
+    """
+    raise NotImplementedError("see env.py::_step_impl_batched_static_v2")
+
+
 def monsters_step_all(state, rng: jax.Array) -> object:
     """Advance all monster slots by one game tick.
 
@@ -6025,32 +6844,37 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     """
     mai = state.monster_ai
 
+    # Round 2 brax: swap in Brax-flat helpers when NETHAX_BRAX_ALL=1.
+    if _os.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+        from Nethax.nethax.subsystems.preloop_brax import (
+            _were_change_all_brax as _were_change_all_pl,
+            _were_summon_attempt_brax as _were_summon_attempt_pl,
+            _try_steal_quest_artifact_brax as _try_steal_quest_artifact_pl,
+            _covetous_ai_step_brax as _covetous_ai_step_pl,
+        )
+    else:
+        _were_change_all_pl = _were_change_all
+        _were_summon_attempt_pl = _were_summon_attempt
+        _try_steal_quest_artifact_pl = _try_steal_quest_artifact
+        _covetous_ai_step_pl = _covetous_ai_step
+
     # ---- Were-creature per-turn shape-shift (vendor were.c::were_change) ----
-    # 1/30 chance per alive were-monster slot per turn to swap between
-    # animal/human form and heal 1/4 of lost HP.  Runs BEFORE speed
-    # accumulation so a newly-transformed monster still uses its (now
-    # post-swap) speed lookup this turn.
     rng, rng_were = jax.random.split(rng)
-    mai = _were_change_all(mai, rng_were)
+    mai = _were_change_all_pl(mai, rng_were)
     state = state.replace(monster_ai=mai)
 
-    # ---- Were-summon: 1/10 chance for any adjacent were-monster to call
-    # 1..5 species-specific helpers (vendor mhitu.c:987 + were.c:140-189).
+    # ---- Were-summon ----
     rng, rng_summon = jax.random.split(rng)
-    state = _were_summon_attempt(state, rng_summon)
+    state = _were_summon_attempt_pl(state, rng_summon)
     mai = state.monster_ai
 
-    # ---- Wizard steals quest artifacts (vendor steal.c::stealamulet 689).
-    # Fires once per turn if the Wizard of Yendor is adjacent to the hero
-    # and the hero carries Amulet/Candelabrum/Bell/Book of the Dead.
+    # ---- Wizard steals quest artifacts ----
     rng, rng_qsteal = jax.random.split(rng)
-    state = _try_steal_quest_artifact(state, rng_qsteal)
+    state = _try_steal_quest_artifact_pl(state, rng_qsteal)
     mai = state.monster_ai
 
-    # ---- Covetous AI: force HUNT + speed boost on Wizard/lich/demons
-    # while the hero carries a quest artifact (vendor wizard.c::strategy
-    # + tactics, M3_WANTS* flag chain).  No RNG needed.
-    state = _covetous_ai_step(state)
+    # ---- Covetous AI ----
+    state = _covetous_ai_step_pl(state)
     mai = state.monster_ai
 
     # ---- Speed-energy accumulation (vendor mon.c::mcalcmove lines 1126-1167) ----
@@ -6105,111 +6929,49 @@ def monsters_step_all(state, rng: jax.Array) -> object:
         turn_keys = keys[:MAX_MONSTERS_PER_LEVEL]
         mhit_keys = keys[MAX_MONSTERS_PER_LEVEL:]
 
-        def _body(carry, xs):
-            k_idx, key = xs
-            mi = carry.monster_ai
-            slot = mi.fmon_order[k_idx]
-            valid = slot >= jnp.int32(0)
-            safe_slot = jnp.where(valid, slot, jnp.int32(0))
-            mp_pre = mi.movement_points[safe_slot].astype(jnp.int32)
-            alive_s = mi.alive[safe_slot]
-            may_act = valid & alive_s & (mp_pre >= NS)
+        # Craftax-pattern path: lax.scan over slot index with (state)
+        # carry.  ``NETHAX_CRAFTAX_SCAN=1`` selects this (default: Python
+        # for-loop from Fix 1).  Research finding (2026-06-09): under vmap
+        # the Python for-loop unrolls into 400× HLO copies of the per-slot
+        # body, while ``lax.scan`` compiles body ONCE and uses an HLO
+        # ``While`` for iteration — same compile result as a single
+        # per-slot body's HLO.  Byte-equivalent: scan is sequential, RNG
+        # threads via the ``vendor_rng`` field inside state.
+        _use_scan = _os.environ.get("NETHAX_CRAFTAX_SCAN", "0") == "1"
 
-            # ---- distfleeck rn2(5) per fmon entry (vendor monmove.c:315-320) ----
-            # distfleeck is the first call inside dochug (mon.c).  dochug
-            # only runs when movemon dispatches it, gated on mtmp->movement
-            # >= NORMAL_SPEED (allmain.c:108-110).  So distfleeck only fires
-            # when may_act is True (mp >= NS).  On step 1, no monster has
-            # accumulated MP (mtmp->movement starts at 0 — calloc default;
-            # only youmonst gets NORMAL_SPEED at allmain.c:85), so vendor
-            # emits ZERO distfleeck draws on step 1.
-            # Cite: vendor/nle/src/monmove.c::distfleeck lines 315-320
-            #       (bravegremlin = rn2(5)); vendor/nle/src/mon.c::dochug entry.
-            need_distfleeck = may_act
+        if _use_scan:
+            def _turn_body(carry, args):
+                st = carry
+                k_idx, key = args
+                return _monster_turn_one_bp_jit(st, k_idx, key), None
 
-            def _draw_distfleeck(vr):
-                return _vendor_rng_mod.rn2_jax(vr, jnp.int32(5))
-
-            def _no_draw(vr):
-                return vr, jnp.int32(0)
-
-            vrng_pre = carry.vendor_rng
-            vrng_post, _bravegremlin = jax.lax.cond(
-                need_distfleeck, _draw_distfleeck, _no_draw, vrng_pre,
+            indices_arr = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
+            final_state, _ = jax.lax.scan(
+                _turn_body, state, (indices_arr, turn_keys),
             )
-
-            # Deduct NORMAL_SPEED on action (vendor movemon).  Do this
-            # BEFORE the turn body so monster_turn sees the post-deduct value.
-            new_mp_val = jnp.where(may_act, mp_pre - NS, mp_pre).astype(jnp.int16)
-            new_mp_arr = jnp.where(
-                valid,
-                mi.movement_points.at[safe_slot].set(new_mp_val),
-                mi.movement_points,
-            )
-            mi_pre = mi.replace(movement_points=new_mp_arr)
-            carry_pre = carry.replace(monster_ai=mi_pre, vendor_rng=vrng_post)
-
-            def _do_turn(s):
-                return monster_turn(s, key, safe_slot)
-
-            new_carry = jax.lax.cond(may_act, _do_turn, lambda s: s, carry_pre)
-            return new_carry, None
-
-        final_state, _ = jax.lax.scan(_body, state, (indices, turn_keys))
+        else:
+            # Per-slot turn dispatch — Python for-loop driving the jit'd body.
+            final_state = state
+            for _k_int in range(MAX_MONSTERS_PER_LEVEL):
+                final_state = _monster_turn_one_bp_jit(
+                    final_state, jnp.int32(_k_int), turn_keys[_k_int],
+                )
 
         # ---- (B) mcalcmove rn2(NORMAL_SPEED) per fmon entry ----
-        # Vendor allmain.c:233-234:
-        #   for (mtmp = fmon; mtmp; mtmp = mtmp->nmon)
-        #       mtmp->movement += mcalcmove(mtmp, TRUE);
-        # mcalcmove draws rn2(NORMAL_SPEED) IFF (pre_round % NS) != 0.
-        # Iterates fmon_order LIFO; skips dead/empty slots.
-        # Cite: vendor/nethack/src/mon.c::mcalcmove lines 1126-1167.
-        def _mcalc_body(carry, k_):
-            st, vrng = carry
-            mi = st.monster_ai
-            slot = mi.fmon_order[k_]
-            valid = slot >= jnp.int32(0)
-            safe_slot = jnp.where(valid, slot, jnp.int32(0))
-            alive_s = jnp.where(valid, mi.alive[safe_slot], jnp.bool_(False))
-            pre = pre_round[safe_slot]
-            adj = pre % NS
-            floored = pre - adj
-            # Vendor mon.c::mcalcmove (lines 1126-1167): the `rn2(NORMAL_SPEED)`
-            # in `if (rn2(NORMAL_SPEED) < mmove_adj)` is UNCONDITIONALLY drawn
-            # whenever this function is entered (C has no short-circuit on
-            # function call arguments).  Gate only on slot validity + alive,
-            # NOT on (adj > 0).  When adj == 0 the draw still fires but the
-            # comparison `v < 0` is always false, so add_pts == floored == pre.
-            need_draw = valid & alive_s
+        # Vendor allmain.c:233-234.  Cite: mon.c::mcalcmove lines 1126-1167.
+        if _use_scan:
+            def _mcalc_body(carry, k_idx):
+                return _mcalc_one_bp_jit(carry, k_idx, pre_round), None
 
-            def _draw(vr):
-                return _vendor_rng_mod.rn2_jax(vr, NS)
-
-            def _nodraw(vr):
-                return vr, jnp.int32(0)
-
-            vrng2, v = jax.lax.cond(need_draw, _draw, _nodraw, vrng)
-            add_pts = jnp.where(need_draw & (v < adj), floored + NS, floored)
-            add_pts = jnp.where(valid & alive_s, add_pts, jnp.int32(0))
-            new_mp = jnp.clip(
-                mi.movement_points[safe_slot].astype(jnp.int32) + add_pts,
-                0, 32000,
-            ).astype(jnp.int16)
-            mi2 = mi.replace(
-                movement_points=jnp.where(
-                    valid,
-                    mi.movement_points.at[safe_slot].set(new_mp),
-                    mi.movement_points,
-                )
+            final_state, _ = jax.lax.scan(
+                _mcalc_body, final_state,
+                jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32),
             )
-            return (st.replace(monster_ai=mi2), vrng2), None
-
-        (final_state, vrng_after_mcalc), _ = jax.lax.scan(
-            _mcalc_body,
-            (final_state, final_state.vendor_rng),
-            indices,
-        )
-        final_state = final_state.replace(vendor_rng=vrng_after_mcalc)
+        else:
+            for _k_int in range(MAX_MONSTERS_PER_LEVEL):
+                final_state = _mcalc_one_bp_jit(
+                    final_state, jnp.int32(_k_int), pre_round,
+                )
 
         # ---- (C) Per-turn maintenance ISAAC64 ghost-draws ----
         # Vendor moveloop, after the fmon mcalcmove loop, calls:
@@ -6297,74 +7059,23 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     else:
         atk_indices_arr = indices
 
-    def _strike_body(carry, args):
-        i, key_i = args
-        mi = carry.monster_ai
-        # `i` is the slot index of the attacker (or -1 for empty fmon slots
-        # under byte-parity mode).  Clamp to 0 so the gather is safe; the
-        # alive/valid mask below collapses the iteration to a no-op.
-        i_raw = i.astype(jnp.int32)
-        valid_i = i_raw >= jnp.int32(0)
-        i32 = jnp.where(valid_i, i_raw, jnp.int32(0))
+    # Per-attacker strike.  Craftax pattern (NETHAX_CRAFTAX_SCAN=1) uses
+    # lax.scan over (atk_slot, key) pairs with (state) carry — compiles
+    # body ONCE.  Default Fix 1 path is Python for-loop.
+    if _os.environ.get("NETHAX_CRAFTAX_SCAN", "0") == "1":
+        def _strike_body(carry, args):
+            atk_slot, key_i = args
+            return _mattackm_one_jit(carry, atk_slot, key_i, _conflict_active), None
 
-        atk_alive = mi.alive[i32] & valid_i
-        pi = mi.pos[i32].astype(jnp.int32)
-
-        all_pos = mi.pos.astype(jnp.int32)            # [N, 2]
-        d_row = jnp.abs(all_pos[:, 0] - pi[0])
-        d_col = jnp.abs(all_pos[:, 1] - pi[1])
-        adj = jnp.maximum(d_row, d_col) == 1
-
-        is_tame_all = mi.tame
-        is_peace_all = mi.peaceful & ~is_tame_all
-        all_faction = jnp.where(is_tame_all, jnp.int32(2),
-                       jnp.where(is_peace_all, jnp.int32(1), jnp.int32(0)))
-        a_faction = all_faction[i32]
-        is_hostile_atk    = a_faction == jnp.int32(0)
-        is_nonhostile_tgt = all_faction != jnp.int32(0)
-
-        idx_arr = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
-        pair_ok = idx_arr > i32
-
-        # Species-pair aggression (vendor mon.c:2422-2447).
-        a_entry = jnp.clip(mi.entry_idx[i32].astype(jnp.int32),
-                           0, _MM_IS_PURPLE_WORM.shape[0] - 1)
-        all_entry = jnp.clip(mi.entry_idx.astype(jnp.int32),
-                             0, _MM_IS_PURPLE_WORM.shape[0] - 1)
-        a_is_pw = _MM_IS_PURPLE_WORM[a_entry]
-        t_is_shr = _MM_IS_SHRIEKER[all_entry]
-        a_is_zm = _MM_IS_ZOMBIE_MAKER[a_entry] & ~mi.cancelled[i32]
-        t_has_zform = _MM_HAS_ZOMBIE_FORM[all_entry]
-
-        # vendor mm_aggression early-out: "don't allow pets to fight each
-        # other" (mon.c:2434).
-        pets_brawl = mi.tame[i32] & mi.tame
-
-        species_purple = a_is_pw & t_is_shr & ~pets_brawl
-        species_zombie = a_is_zm & t_has_zform & ~pets_brawl & ~mi.tame[i32] & ~mi.tame
-
-        # Under Conflict, ALL adjacent monsters brawl regardless of faction
-        # (vendor uhitm.c Conflict gate).
-        conflict_allow = _conflict_active
-
-        baseline_allow = is_hostile_atk & is_nonhostile_tgt
-        per_target_allow = (baseline_allow
-                            | species_purple
-                            | species_zombie
-                            | conflict_allow)
-
-        candidates = mi.alive & adj & pair_ok & per_target_allow
-        has_target = jnp.any(candidates)
-        j_idx = jnp.argmax(candidates).astype(jnp.int32)
-
-        do_strike = atk_alive & has_target
-
-        def _strike(ss):
-            return mattackm(ss, i32, j_idx, key_i)
-
-        return jax.lax.cond(do_strike, _strike, lambda ss: ss, carry), None
-
-    final_state, _ = jax.lax.scan(_strike_body, final_state, (atk_indices_arr, mhit_keys))
+        final_state, _ = jax.lax.scan(
+            _strike_body, final_state, (atk_indices_arr, mhit_keys),
+        )
+    else:
+        for _k_int in range(MAX_MONSTERS_PER_LEVEL):
+            final_state = _mattackm_one_jit(
+                final_state, atk_indices_arr[_k_int], mhit_keys[_k_int],
+                _conflict_active,
+            )
 
     # Tick status timers (vendor src/timeout.c::run_timers pattern).
     mai = final_state.monster_ai

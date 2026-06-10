@@ -1880,3 +1880,20 @@ def zap_polymorph_at_self(state, rng: jax.Array, slot_idx: jax.Array):
     form = choose_random_polymorph_form(state, sub)
     rng, sub2 = jax.random.split(rng)
     return polymorph_player(state, sub2, form, controlled=False)
+
+import os as _os_brax
+if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    _BRAX_MAP = {
+        "zap_wand": ("wands_books_brax", "zap_wand_brax"),
+        "handle_zap": ("wands_books_brax", "handle_zap_brax"),
+        "cast_ray": ("wands_books_brax", "cast_ray_brax"),
+    }
+    _BRAX_CACHE = {}
+    for _name in list(_BRAX_MAP):
+        if _name in globals(): del globals()[_name]
+    def __getattr__(name):
+        if name not in _BRAX_MAP: raise AttributeError(name)
+        if name not in _BRAX_CACHE:
+            mn, bn = _BRAX_MAP[name]
+            _BRAX_CACHE[name] = getattr(__import__(f"Nethax.nethax.subsystems.{mn}", fromlist=[bn]), bn)
+        return _BRAX_CACHE[name]

@@ -776,3 +776,24 @@ def check_life_saving(state):
     import jax
     new_state = jax.lax.cond(should_save, _save, lambda s: s, state)
     return new_state, should_save
+
+import os as _os_brax
+if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    _BRAX_MAP = {
+        "put_on_ring": ("items_misc_brax", "put_on_ring_brax"),
+        "take_off_ring": ("items_misc_brax", "take_off_ring_brax"),
+        "wear_amulet": ("items_misc_brax", "wear_amulet_brax"),
+        "take_off_amulet": ("items_misc_brax", "take_off_amulet_brax"),
+        "handle_put_on": ("items_misc_brax", "handle_put_on_brax"),
+        "handle_remove": ("items_misc_brax", "handle_remove_brax"),
+        "check_life_saving": ("items_misc_brax", "check_life_saving_brax"),
+    }
+    _BRAX_CACHE = {}
+    for _name in list(_BRAX_MAP):
+        if _name in globals(): del globals()[_name]
+    def __getattr__(name):
+        if name not in _BRAX_MAP: raise AttributeError(name)
+        if name not in _BRAX_CACHE:
+            mn, bn = _BRAX_MAP[name]
+            _BRAX_CACHE[name] = getattr(__import__(f"Nethax.nethax.subsystems.{mn}", fromlist=[bn]), bn)
+        return _BRAX_CACHE[name]

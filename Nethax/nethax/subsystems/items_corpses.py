@@ -777,3 +777,24 @@ def apply_eattin(state, rng: jax.Array, item):
     new_sick_kind = jnp.where(is_poisoned_tin, jnp.int8(1), state.status.sick_kind)
     new_status = state.status.replace(timed_statuses=new_ts, sick_kind=new_sick_kind)
     return state.replace(status=new_status)
+
+import os as _os_brax
+import sys as _sys_brax
+if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    _BRAX_ORIG = {"apply_corpse_postfx": apply_corpse_postfx}
+    _BRAX_MAP = {"apply_corpse_postfx": ("items_misc_brax", "apply_corpse_postfx_brax")}
+    _BRAX_CACHE = {}
+    for _name in list(_BRAX_MAP):
+        if _name in globals(): del globals()[_name]
+    def __getattr__(name):
+        if name not in _BRAX_MAP:
+            raise AttributeError(name)
+        mod_name, brax_name = _BRAX_MAP[name]
+        full = f"Nethax.nethax.subsystems.{mod_name}"
+        if full in _sys_brax.modules:
+            spec = getattr(_sys_brax.modules[full], "__spec__", None)
+            if spec is not None and getattr(spec, "_initializing", False):
+                return _BRAX_ORIG[name]
+        if name not in _BRAX_CACHE:
+            _BRAX_CACHE[name] = getattr(__import__(full, fromlist=[brax_name]), brax_name)
+        return _BRAX_CACHE[name]

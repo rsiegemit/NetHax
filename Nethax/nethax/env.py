@@ -1992,3 +1992,32 @@ def _step_impl_batched(states, actions, rngs):
         )
     obs, reward = _VMAP_OBS(states, new_states)
     return new_states, obs, reward, new_states.done
+
+# Round 3 brax integration: recreate _pre_monster_jit and _post_monster_jit
+# using the Brax-flat bodies when NETHAX_BRAX_ALL=1.  Subsequent calls in
+# _step_impl / _step_impl_batched_static look up these names via module
+# globals at call time, so the rebind picks up automatically.
+import os as _os_brax_env
+if _os_brax_env.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    from Nethax.nethax.subsystems.pre_monster_brax import (
+        pre_monster_body_brax as _pre_monster_body_brax,
+    )
+    from Nethax.nethax.subsystems.post_monster_brax import (
+        _post_monster_body_brax,
+    )
+    def _pre_monster_jit_impl_brax(ns, state, rng_act, rng_astral, prev_branch, prev_level):
+        return jax.lax.cond(
+            state.done,
+            lambda _: state,
+            lambda _: _pre_monster_body_brax(ns, rng_act, rng_astral, prev_branch, prev_level),
+            operand=None,
+        )
+    _pre_monster_jit = jax.jit(_pre_monster_jit_impl_brax)
+
+    def _post_monster_jit_impl_brax(ns, state, prev_wizard_alive,
+                                     rng_status, rng_poly, rng_shop,
+                                     rng_swallow, rng_explvl):
+        return _post_monster_body_brax(ns, state, prev_wizard_alive,
+                                        rng_status, rng_poly, rng_shop,
+                                        rng_swallow, rng_explvl)
+    _post_monster_jit = jax.jit(_post_monster_jit_impl_brax)
