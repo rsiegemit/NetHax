@@ -2610,7 +2610,9 @@ def _try_polymorph_self(state, rng: jax.Array, monster_idx: jnp.ndarray):
     state_pre = state.replace(monster_ai=new_mai_pre)
 
     state_post = polymorph_monster(state_pre, rng_poly, idx, new_form.astype(jnp.int16))
-    return jax.lax.cond(has_either, lambda _: state_post, lambda _: state, None)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(has_either, t, f), state_post, state,
+    )
 
 
 # ---------------------------------------------------------------------------
