@@ -15,7 +15,7 @@ Design:
   - _PASSIVE_TYPE[N_MONSTERS] int8 maps each monster's entry_idx to a passive
     type constant (0 = none).
   - apply_passive_to_player(state, attacker_slot, rng) -> EnvState dispatches
-    via jax.lax.switch over 11 cases.
+    via brax-flatten over 11 cases.
   - JIT-pure: no Python branches on tracers.
 """
 import jax
@@ -194,13 +194,13 @@ def _passive_acid(state, rng):
     corrode_roll = _rn2(rng_corrode, 30) == jnp.int32(0)
     should_corrode = splash & has_weapon & (~acid_res) & corrode_roll
 
-    def _do_corrode(items_in):
-        safe_w = jnp.clip(wielded, 0, items_in.oeroded.shape[0] - 1)
-        new_items, _ = erode_obj_slot(items_in, safe_w, ERODE_CORRODE, True)
-        return new_items
-
-    new_items = jax.lax.cond(
-        should_corrode, _do_corrode, lambda x: x, state.inventory.items
+    # Brax-flatten: compute both branches, select via tree_map+where.
+    _sw_cor = jnp.clip(wielded, 0, state.inventory.items.oeroded.shape[0] - 1)
+    _cor_items, _ = erode_obj_slot(state.inventory.items, _sw_cor, ERODE_CORRODE, True)
+    new_items = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(should_corrode, t, f),
+        _cor_items,
+        state.inventory.items,
     )
     new_inv = state.inventory.replace(items=new_items)
     return state.replace(inventory=new_inv)
@@ -237,13 +237,13 @@ def _passive_fire(state, rng):
     burn_chance = _rn2(rng_erode, 6) == jnp.int32(0)
     should_burn = has_weapon & burn_chance
 
-    def _do_burn(items_in):
-        safe_w = jnp.clip(wielded, 0, items_in.oeroded.shape[0] - 1)
-        new_items, _ = erode_obj_slot(items_in, safe_w, ERODE_BURN, True)
-        return new_items
-
-    new_items = jax.lax.cond(
-        should_burn, _do_burn, lambda x: x, state.inventory.items
+    # Brax-flatten: compute both branches, select via tree_map+where.
+    _sw_burn = jnp.clip(wielded, 0, state.inventory.items.oeroded.shape[0] - 1)
+    _burn_items, _ = erode_obj_slot(state.inventory.items, _sw_burn, ERODE_BURN, True)
+    new_items = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(should_burn, t, f),
+        _burn_items,
+        state.inventory.items,
     )
     new_inv = state.inventory.replace(items=new_items)
     return state.replace(inventory=new_inv)
@@ -379,13 +379,13 @@ def _passive_rust(state, rng):
     wielded = state.inventory.wielded.astype(jnp.int32)
     has_weapon = wielded >= jnp.int32(0)
 
-    def _do_rust(items_in):
-        safe_w = jnp.clip(wielded, 0, items_in.oeroded.shape[0] - 1)
-        new_items, _ = erode_obj_slot(items_in, safe_w, ERODE_RUST, True)
-        return new_items
-
-    new_items = jax.lax.cond(
-        has_weapon, _do_rust, lambda x: x, state.inventory.items
+    # Brax-flatten: compute both branches, select via tree_map+where.
+    _sw_rust = jnp.clip(wielded, 0, state.inventory.items.oeroded.shape[0] - 1)
+    _rust_items, _ = erode_obj_slot(state.inventory.items, _sw_rust, ERODE_RUST, True)
+    new_items = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(has_weapon, t, f),
+        _rust_items,
+        state.inventory.items,
     )
     new_inv = state.inventory.replace(items=new_items)
     return state.replace(inventory=new_inv)
@@ -438,9 +438,13 @@ def apply_passive_to_player(state, attacker_slot: jnp.ndarray, rng: jax.Array):
     ptype = _PASSIVE_TYPE[entry].astype(jnp.int32)
     ptype_safe = jnp.clip(ptype, 0, _N_PASSIVE_TYPES - 1)
 
-    return jax.lax.switch(
-        ptype_safe,
-        _PASSIVE_HANDLERS,
-        state,
-        rng,
-    )
+    # Brax-flatten: compute all 11 branch outputs, select via tree_map+where.
+    _branch_states = [_h(state, rng) for _h in _PASSIVE_HANDLERS]
+
+    def _pick(*leaves):
+        out = leaves[0]
+        for _i in range(1, len(leaves)):
+            out = jnp.where(ptype_safe == jnp.int32(_i), leaves[_i], out)
+        return out
+
+    return jax.tree_util.tree_map(_pick, *_branch_states)
