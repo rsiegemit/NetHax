@@ -7120,7 +7120,10 @@ def monsters_step_all(state, rng: jax.Array) -> object:
             def _do_turn(s):
                 return monster_turn(s, key, slot_idx)
 
-            new_carry = jax.lax.cond(may_act, _do_turn, lambda s: s, carry)
+            _carry_t = _do_turn(carry)
+            new_carry = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(may_act, t, f), _carry_t, carry,
+            )
             return new_carry, None
 
         final_state, _ = jax.lax.scan(_body, state, (indices, turn_keys, can_act))

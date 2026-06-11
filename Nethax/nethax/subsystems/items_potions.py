@@ -1446,11 +1446,18 @@ def apply_potion_to_monster(state, rng, type_id: jnp.ndarray, m_slot: jnp.ndarra
         0,
         N_POTIONS - 1,
     )
-    return jax.lax.switch(
-        effect_id,
-        _MONSTER_SWITCH_BRANCHES,
-        (state, m_slot.astype(jnp.int32), rng),
-    )
+    # Brax-flatten: compute all N_POTIONS monster-effect branches and select
+    # by one-hot effect_id mask via jax.tree.map / jnp.where.
+    _operand_m = (state, m_slot.astype(jnp.int32), rng)
+    _results_m = [br(_operand_m) for br in _MONSTER_SWITCH_BRANCHES]
+
+    def _select_m(*branches):
+        out = branches[0]
+        for _i in range(1, len(branches)):
+            out = jnp.where(effect_id == jnp.int32(_i), branches[_i], out)
+        return out
+
+    return jax.tree.map(_select_m, *_results_m)
 
 
 # ---------------------------------------------------------------------------
