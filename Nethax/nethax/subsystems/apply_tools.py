@@ -219,11 +219,8 @@ def wield_tool(state, slot_idx: jnp.ndarray):
     can_wield = has_item & ~already_wielded & ~welded_block & ~shield_block
 
     wielded_state = wield(state, safe_slot.astype(jnp.int8))
-    return jax.lax.cond(
-        can_wield,
-        lambda _: wielded_state,
-        lambda _: state,
-        operand=None,
+    return jax.tree_util.tree_map(
+        lambda w, s: jnp.where(can_wield, w, s), wielded_state, state,
     )
 
 
@@ -881,10 +878,9 @@ def _h_instrument(state, rng: jax.Array) -> object:
     # matches exactly that (skills_freeze.py:7).
     # Cite: vendor/nle/src/music.c:599, vendor/nle/src/zap.c:4263, zap.c:63.
     from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
-    new_messages = jax.lax.cond(
-        is_frost_horn,
-        lambda m: _msg_emit(m, int(_MsgId.COLD_BOLT_BOUNCES)),
-        lambda m: m,
+    new_messages = jax.tree_util.tree_map(
+        lambda e, m: jnp.where(is_frost_horn, e, m),
+        _msg_emit(state.messages, int(_MsgId.COLD_BOLT_BOUNCES)),
         state.messages,
     )
     return state.replace(
@@ -1139,11 +1135,8 @@ def _h_lock_pick(state, rng: jax.Array) -> object:
     # Only attempt unlock when roll succeeds; pass rng=None so picklock_door
     # always opens (we guard via success flag below).
     new_features, _door_changed = picklock_door(state.features, pos, rng=None)
-    final_features = jax.lax.cond(
-        success,
-        lambda _: new_features,
-        lambda _: state.features,
-        operand=None,
+    final_features = jax.tree_util.tree_map(
+        lambda n, o: jnp.where(success, n, o), new_features, state.features,
     )
 
     # --- Chest/container path ---
@@ -1372,4 +1365,12 @@ def dispatch_apply(state, rng: jax.Array) -> object:
     handlers = list(_HANDLERS)
     handlers[_H_MAGIC_MARKER] = _h_marker_bound
 
-    return jax.lax.switch(handler_idx, handlers, state, rng)
+    # Brax-flat: compute all N handler results, then cascading jnp.where on handler_idx.
+    results = [h(state, rng) for h in handlers]
+    selected = results[0]
+    for i in range(1, len(results)):
+        selected = jax.tree_util.tree_map(
+            lambda a, b, i=i: jnp.where(handler_idx == jnp.int32(i), a, b),
+            results[i], selected,
+        )
+    return selected
