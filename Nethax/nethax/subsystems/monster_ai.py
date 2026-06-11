@@ -6099,9 +6099,12 @@ def _bp_per_slot_setup_impl(state, k_idx):
     def _no_draw(vr):
         return vr, jnp.int32(0)
 
-    vrng_post, _bravegremlin = jax.lax.cond(
-        may_act, _draw_distfleeck, _no_draw, state.vendor_rng,
+    _vrng_drawn, _bravegremlin_drawn = _draw_distfleeck(state.vendor_rng)
+    vrng_post = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(may_act, t, f),
+        _vrng_drawn, state.vendor_rng,
     )
+    _bravegremlin = jnp.where(may_act, _bravegremlin_drawn, jnp.int32(0))
 
     new_mp_val = jnp.where(may_act, mp_pre - NS, mp_pre).astype(jnp.int16)
     new_mp_arr = jnp.where(
