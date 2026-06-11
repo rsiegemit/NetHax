@@ -528,20 +528,26 @@ class InventoryState:
         slot 1 -> 'b', etc.
         """
         # Build letters[] positionally: occupied slots 0..N-1 get a..z then A..Z.
+        # Use jnp.where so item.category can be EITHER a Python int OR a
+        # traced JAX scalar (required when an item is built via a traced
+        # `jax.tree_util.tree_map(jnp.where, ...)` — e.g. the Rogue
+        # BLINDFOLD slot-swap in create_character).  Equivalent to the
+        # old Python-if for concrete inputs: empty slot → letter 0,
+        # occupied slot i → 'a' + i (or 'A' + i - 26 above 26).
         letters_list = []
         for i, item in enumerate(item_list):
             if i >= MAX_INVENTORY_SLOTS:
                 break
-            # Empty items (category 0) get letter 0.
-            if int(item.category) == 0:
-                letters_list.append(0)
-            elif i < 26:
-                letters_list.append(ord('a') + i)
-            else:
-                letters_list.append(ord('A') + (i - 26))
+            occupied_letter = (ord('a') + i) if i < 26 else (ord('A') + (i - 26))
+            is_empty = jnp.equal(
+                jnp.asarray(item.category, dtype=jnp.int8), jnp.int8(0)
+            )
+            letters_list.append(
+                jnp.where(is_empty, jnp.int8(0), jnp.int8(occupied_letter))
+            )
         # Pad to MAX_INVENTORY_SLOTS with 0 (empty letter).
-        letters_list += [0] * (MAX_INVENTORY_SLOTS - len(letters_list))
-        letters_arr = jnp.array(letters_list, dtype=jnp.int8)
+        letters_list += [jnp.int8(0)] * (MAX_INVENTORY_SLOTS - len(letters_list))
+        letters_arr = jnp.stack(letters_list).astype(jnp.int8)
 
         return cls(
             items=_items_from_list(item_list),
