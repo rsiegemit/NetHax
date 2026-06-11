@@ -1011,12 +1011,23 @@ _FACTORIES = (
 
 
 def _dispatch_iconic(rng, role: int):
-    """Iconic dispatch — used when ``full_fidelity=False`` (tests, fast render)."""
-    branches = tuple(
-        (lambda f: (lambda r: f(r)))(_FACTORIES[i])
-        for i in range(N_ROLES)
-    )
-    return jax.lax.switch(role, branches, rng)
+    """Iconic dispatch — used when ``full_fidelity=False`` (tests, fast render).
+
+    Brax-flatten: compute all N_ROLES factory outputs eagerly, then select via
+    a cascade of ``jnp.where`` over the role index.  Replaces
+    ``jax.lax.switch`` so the dispatch lowers to a flat MUX rather than a
+    control-flow op (XLA-friendly under vmap).
+    """
+    role_idx = jnp.asarray(role, dtype=jnp.int32)
+    outs = tuple(_FACTORIES[i](rng) for i in range(N_ROLES))
+
+    def _select(*leaves):
+        acc = leaves[0]
+        for i in range(1, N_ROLES):
+            acc = jnp.where(role_idx == jnp.int32(i), leaves[i], acc)
+        return acc
+
+    return jax.tree_util.tree_map(_select, *outs)
 
 
 # ===========================================================================
@@ -1569,12 +1580,23 @@ _FACTORIES_FULL = (
 
 
 def _dispatch_full(rng, role: int):
-    """Wave 6 full-fidelity dispatch over role index."""
-    branches = tuple(
-        (lambda f: (lambda r: f(r)))(_FACTORIES_FULL[i])
-        for i in range(N_ROLES)
-    )
-    return jax.lax.switch(role, branches, rng)
+    """Wave 6 full-fidelity dispatch over role index.
+
+    Brax-flatten: compute all N_ROLES factory outputs eagerly, then select via
+    a cascade of ``jnp.where`` over the role index.  Replaces
+    ``jax.lax.switch`` so the dispatch lowers to a flat MUX rather than a
+    control-flow op (XLA-friendly under vmap).
+    """
+    role_idx = jnp.asarray(role, dtype=jnp.int32)
+    outs = tuple(_FACTORIES_FULL[i](rng) for i in range(N_ROLES))
+
+    def _select(*leaves):
+        acc = leaves[0]
+        for i in range(1, N_ROLES):
+            acc = jnp.where(role_idx == jnp.int32(i), leaves[i], acc)
+        return acc
+
+    return jax.tree_util.tree_map(_select, *outs)
 
 
 def dispatch_quest_level(rng, role: int, full_fidelity: bool = True):
