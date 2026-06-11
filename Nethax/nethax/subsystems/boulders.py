@@ -318,19 +318,23 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
     # upstair tile (well-defined per-level target).  LEVEL_TELEP off-level
     # just removes the boulder (it migrates away).
 
+    # Brax-flat select helper: compute both branches, jnp.where on pred.
+    def _brax_select(pred, true_tree, false_tree):
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred, t, f), true_tree, false_tree
+        )
+
     # Remove boulder from original tile (always when push succeeds).
-    gi_after_remove = lax.cond(
+    gi_after_remove = _brax_select(
         can_push,
-        lambda gi: _remove_boulder(gi, b, lv, boulder_r, boulder_c),
-        lambda gi: gi,
+        _remove_boulder(state.ground_items, b, lv, boulder_r, boulder_c),
         state.ground_items,
     )
 
     # Place boulder at beyond tile unless consumed/relocated.
-    gi_after_place = lax.cond(
+    gi_after_place = _brax_select(
         can_push & ~boulder_consumed_at_beyond,
-        lambda gi: _place_boulder(gi, b, lv, safe_br, safe_bc),
-        lambda gi: gi,
+        _place_boulder(gi_after_remove, b, lv, safe_br, safe_bc),
         gi_after_remove,
     )
 
@@ -339,10 +343,9 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
     # to upstair landing for byte-equal end-state tracking).
     relocate_target = teleports | relocates_lt | launches_rb
     up_r, up_c = _find_upstair(terrain_2d)
-    gi_after_relocate = lax.cond(
+    gi_after_relocate = _brax_select(
         relocate_target,
-        lambda gi: _place_boulder(gi, b, lv, up_r, up_c),
-        lambda gi: gi,
+        _place_boulder(gi_after_place, b, lv, up_r, up_c),
         gi_after_place,
     )
 
@@ -352,25 +355,20 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
     # PIT: pit is filled — vendor: trap stays but boulder marks ground filled;
     #      we disarm to model "filled pit" semantics.
     disarm_trap = consumes_hole | triggers_lm | fills_pit
-    new_traps = lax.cond(
+    new_traps = _brax_select(
         disarm_trap,
-        lambda tt: _disarm_trap(tt, flat_lv, safe_br, safe_bc),
-        lambda tt: tt,
+        _disarm_trap(state.traps, flat_lv, safe_br, safe_bc),
         state.traps,
     )
 
     # ---- Tile conversions (Audit M #56 — pool → floor) -------------------
     new_terrain_flat = state.terrain
-    def _convert_to_floor(t):
-        return t.at[b, lv, safe_br, safe_bc].set(jnp.int8(_TILE_FLOOR))
-    new_terrain_flat = lax.cond(
-        hits_pool, _convert_to_floor, lambda t: t, new_terrain_flat,
-    )
+    _terrain_pool_converted = new_terrain_flat.at[b, lv, safe_br, safe_bc].set(jnp.int8(_TILE_FLOOR))
+    new_terrain_flat = jnp.where(hits_pool, _terrain_pool_converted, new_terrain_flat)
     # HOLE/TRAPDOOR also clear the trap-tile to FLOOR (diggable per
     # hack.c:562-563 ``wall_info &= ~W_NONDIGGABLE; candig = 1``).
-    new_terrain_flat = lax.cond(
-        consumes_hole, _convert_to_floor, lambda t: t, new_terrain_flat,
-    )
+    _terrain_hole_converted = new_terrain_flat.at[b, lv, safe_br, safe_bc].set(jnp.int8(_TILE_FLOOR))
+    new_terrain_flat = jnp.where(consumes_hole, _terrain_hole_converted, new_terrain_flat)
 
     # ---- Sokoban pit counter + prize spawn (#61) -------------------------
     new_pitted = jnp.where(
@@ -379,21 +377,21 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
         state.sokoban_boulders_pitted,
     )
     prize_due = new_pitted >= jnp.int8(SOKOBAN_PITS_TO_FILL)
-    gi_with_prize = lax.cond(
-        prize_due & fills_pit & in_sokoban,
-        lambda gi: gi.replace(
-            category=gi.category.at[b, lv, up_r, up_c, 0].set(
-                jnp.int8(_PRIZE_CATEGORY)
-            ),
-            type_id=gi.type_id.at[b, lv, up_r, up_c, 0].set(
-                jnp.int16(_PRIZE_TYPE_ID)
-            ),
-            quantity=gi.quantity.at[b, lv, up_r, up_c, 0].set(jnp.int16(1)),
-            identified=gi.identified.at[b, lv, up_r, up_c, 0].set(
-                jnp.bool_(True)
-            ),
+    _gi_prize_placed = gi_after_relocate.replace(
+        category=gi_after_relocate.category.at[b, lv, up_r, up_c, 0].set(
+            jnp.int8(_PRIZE_CATEGORY)
         ),
-        lambda gi: gi,
+        type_id=gi_after_relocate.type_id.at[b, lv, up_r, up_c, 0].set(
+            jnp.int16(_PRIZE_TYPE_ID)
+        ),
+        quantity=gi_after_relocate.quantity.at[b, lv, up_r, up_c, 0].set(jnp.int16(1)),
+        identified=gi_after_relocate.identified.at[b, lv, up_r, up_c, 0].set(
+            jnp.bool_(True)
+        ),
+    )
+    gi_with_prize = _brax_select(
+        prize_due & fills_pit & in_sokoban,
+        _gi_prize_placed,
         gi_after_relocate,
     )
 
