@@ -755,35 +755,43 @@ def dodoor(
     # rn2(25) is further gated by ``level_difficulty() >= 5`` (false on
     # Dlvl 1) so its draw is skipped.
     # Vendor cite: vendor/nle/src/mklev.c:394-404.
+    # Brax-flatten: under vmap both branches execute; replace lax.cond with
+    # straight-line draws + jnp.where selection.  Byte-parity preserved
+    # because vmap already lowers lax.cond to lax.select-of-both-branches.
     def _draw_door_branch(r):
         r, r3_ = rn2_jax(r, jnp.int32(3))
         # rn2(5) / rn2(6) only when rn2(3)==0 (the !rn2(3) "path" branch).
         def _draw_path(rr):
             rr, r5_ = rn2_jax(rr, jnp.int32(5))
-            # rn2(6) only when rn2(5)!=0 (the ``else if (!rn2(6))`` branch).
-            def _draw_lock(rrr):
-                return rn2_jax(rrr, jnp.int32(6))
-            rr, r6_ = lax.cond(
-                r5_ != jnp.int32(0),
-                _draw_lock,
-                lambda rrr: (rrr, jnp.int32(0)),
-                rr,
+            # rn2(6) only when rn2(5)!=0 — flattened: always draw, select.
+            rr_t, r6_t = rn2_jax(rr, jnp.int32(6))
+            rr_f, r6_f = rr, jnp.int32(0)
+            pred_lock = r5_ != jnp.int32(0)
+            rr = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(pred_lock, t, f), rr_t, rr_f
             )
+            r6_ = jnp.where(pred_lock, r6_t, r6_f)
             return rr, r5_, r6_
-        r, r5_, r6_ = lax.cond(
-            r3_ == jnp.int32(0),
-            _draw_path,
-            lambda rr: (rr, jnp.int32(0), jnp.int32(0)),
-            r,
+        # Flatten outer lax.cond(r3_==0, _draw_path, identity-with-zeros).
+        r_t, r5t, r6t = _draw_path(r)
+        r_f, r5f, r6f = r, jnp.int32(0), jnp.int32(0)
+        pred_path = r3_ == jnp.int32(0)
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred_path, t, f), r_t, r_f
         )
+        r5_ = jnp.where(pred_path, r5t, r5f)
+        r6_ = jnp.where(pred_path, r6t, r6f)
         return r, r3_, r5_, r6_
 
-    rng, r3, r5d, r6d = lax.cond(
-        type_is_door,
-        _draw_door_branch,
-        lambda r: (r, jnp.int32(0), jnp.int32(0), jnp.int32(0)),
-        rng,
+    # Flatten outer lax.cond(type_is_door, _draw_door_branch, identity-zeros).
+    rng_t, r3_t, r5d_t, r6d_t = _draw_door_branch(rng)
+    rng_f, r3_f, r5d_f, r6d_f = rng, jnp.int32(0), jnp.int32(0), jnp.int32(0)
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(type_is_door, t, f), rng_t, rng_f
     )
+    r3 = jnp.where(type_is_door, r3_t, r3_f)
+    r5d = jnp.where(type_is_door, r5d_t, r5d_f)
+    r6d = jnp.where(type_is_door, r6d_t, r6d_f)
 
     door_path = r3 == jnp.int32(0)
     door_open = door_path & (r5d == jnp.int32(0))
@@ -804,12 +812,13 @@ def dodoor(
         # rn2(20) difficulty gate: false on Dlvl 1 — skip draw entirely.
         return r, r5s_
 
-    rng, r5s = lax.cond(
-        ~type_is_door,
-        _draw_sdoor_branch,
-        lambda r: (r, jnp.int32(0)),
-        rng,
+    # Brax-flatten: always draw, select with where.
+    rng_t, r5s_t = _draw_sdoor_branch(rng)
+    pred_sdoor = ~type_is_door
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(pred_sdoor, t, f), rng_t, rng
     )
+    r5s = jnp.where(pred_sdoor, r5s_t, jnp.int32(0))
 
     sdoor_locked = shdoor | (r5s == jnp.int32(0))
     door_mask_sdoor = jnp.where(sdoor_locked, jnp.int8(DMASK_LOCKED),
@@ -934,9 +943,13 @@ def dig_corridor(
         # rn2(35) early-bail: vendor sp_lev.c:2248 draws only when nxcor
         # AND not already cap_hit (vendor's `||` short-circuits on cap_hit).
         # Vendor returns FALSE on bail with NO further draws this iteration.
-        def _draw_r35(r_): return rn2_jax(r_, jnp.int32(35))
-        r, r35 = lax.cond(nxcor & ~cap_hit, _draw_r35,
-                          lambda r_: (r_, jnp.int32(1)), r)
+        # Brax-flatten: always draw, select with where.
+        pred_r35 = nxcor & ~cap_hit
+        r_t35, r35_t = rn2_jax(r, jnp.int32(35))
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred_r35, t, f), r_t35, r
+        )
+        r35 = jnp.where(pred_r35, r35_t, jnp.int32(1))
         bail = nxcor & ~cap_hit & (r35 == jnp.int32(0))
 
         # Step (vendor sp_lev.c:2251-2252). xx_n/yy_n are the candidate cell;
@@ -962,9 +975,12 @@ def dig_corridor(
         # is btyp.  (Strange-cell path returns FALSE before any rn2.)
         reached_btyp_block = ~cap_hit & ~bail & ~oob & is_btyp
 
-        def _draw_r100(r_): return rn2_jax(r_, jnp.int32(100))
-        r, r100 = lax.cond(reached_btyp_block, _draw_r100,
-                            lambda r_: (r_, jnp.int32(1)), r)
+        # Brax-flatten: always draw, select with where.
+        r_t100, r100_t = rn2_jax(r, jnp.int32(100))
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(reached_btyp_block, t, f), r_t100, r
+        )
+        r100 = jnp.where(reached_btyp_block, r100_t, jnp.int32(1))
 
         # ftyp != CORR || rn2(100) — vendor line 2259.  ftyp_i is static here
         # but kept general; when ftyp==CORR the branch is purely r100!=0.
@@ -975,20 +991,19 @@ def dig_corridor(
         # rn2(50) boulder: vendor 2261 — only when btyp-block AND nxcor AND
         # write_ftyp (the SCORR branch at line 2264 does NOT draw rn2(50)).
         r50_gate = reached_btyp_block & nxcor & write_ftyp
-        def _draw_r50(r_): return rn2_jax(r_, jnp.int32(50))
-        r, _r50 = lax.cond(r50_gate, _draw_r50,
-                            lambda r_: (r_, jnp.int32(0)), r)
-        del _r50
+        # Brax-flatten: always draw, select with where.
+        r_t50, _r50_t = rn2_jax(r, jnp.int32(50))
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(r50_gate, t, f), r_t50, r
+        )
+        del _r50_t
 
         new_tile = jnp.where(write_ftyp, ftyp_i, jnp.int8(VTILE_SCORR))
         do_write = reached_btyp_block & ~done
 
-        new_typ = lax.cond(
-            do_write,
-            lambda t: t.at[xx_n, yy_n].set(new_tile),
-            lambda t: t,
-            g.typ,
-        )
+        # Brax-flatten: compute the .at[].set() unconditionally; mask via where.
+        new_typ_write = g.typ.at[xx_n, yy_n].set(new_tile)
+        new_typ = jnp.where(do_write, new_typ_write, g.typ)
         g_new = LevelGenState(
             typ=new_typ, doormask=g.doormask,
             door_x=g.door_x, door_y=g.door_y,
@@ -1019,17 +1034,20 @@ def dig_corridor(
         # If cond_x: draw rbx, skip rby.
         # Else if cond_y: skip rbx, draw rby.
         # Else: skip both.
-        r, rbx, rby = lax.cond(
-            cond_x,
-            lambda r_: (lambda rr, rv: (rr, rv, jnp.int32(1)))(*_draw_rbx(r_)),
-            lambda r_: lax.cond(
-                cond_y,
-                lambda r2: (lambda rr, rv: (rr, jnp.int32(1), rv))(*_draw_rby(r2)),
-                lambda r2: (r2, jnp.int32(1), jnp.int32(1)),
-                r_,
+        # Brax-flatten: compute both candidate draws, select with where.
+        r_bx, rbx_val = _draw_rbx(r)
+        r_by, rby_val = _draw_rby(r)
+        # Under vmap, lax.cond already ran both branches.  The nested
+        # cond_x/cond_y cascade reduces to: pick rbx-rng if cond_x,
+        # rby-rng if cond_y (and !cond_x), else unchanged r.
+        r = jax.tree_util.tree_map(
+            lambda bx, by, none: jnp.where(
+                cond_x, bx, jnp.where(cond_y, by, none)
             ),
-            r,
+            r_bx, r_by, r,
         )
+        rbx = jnp.where(cond_x, rbx_val, jnp.int32(1))
+        rby = jnp.where(cond_y & ~cond_x, rby_val, jnp.int32(1))
         bias_x = cond_x & (rbx == jnp.int32(0))
         bias_y = cond_y & ~cond_x & (rby == jnp.int32(0))
 
@@ -1197,15 +1215,18 @@ def join(
 
         # First dodoor (cc) — only if okdoor || !nxcor, but vendor still
         # consumes the rn2(8)/rn2(3)/... RNG sequence ONLY when the call
-        # actually fires.  We mirror with lax.cond.
-        def call_first_dodoor(rg):
-            r_, g_ = rg
-            # cc-side door belongs to croom (room a) — vendor join passes
-            # croom to dodoor at mklev.c:301.  Cite: mklev.c:299-301.
-            return dodoor(r_, g_, xx, yy, aroom_idx=a, depth=depth)
+        # actually fires.  Brax-flatten: call dodoor unconditionally, select.
         ok = okdoor(g, xx, yy) | ~nxcor
         first_gate = ok & ~nxcor_block
-        r, g = lax.cond(first_gate, call_first_dodoor, lambda rg: rg, (r, g))
+        # cc-side door belongs to croom (room a) — vendor join passes
+        # croom to dodoor at mklev.c:301.  Cite: mklev.c:299-301.
+        r_t1, g_t1 = dodoor(r, g, xx, yy, aroom_idx=a, depth=depth)
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(first_gate, t, f), r_t1, r
+        )
+        g = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(first_gate, t, f), g_t1, g
+        )
 
         # dig_corridor — only fires if not nxcor_block.  Capture its success
         # flag: vendor ``if (!dig_corridor(...)) return;`` (mklev.c:304-306)
@@ -1214,45 +1235,56 @@ def join(
         # (sp_lev.c:2248), which consumes the rn2(35) draw but still returns
         # FALSE.  Approximating success with ``~nxcor_block`` wrongly fired
         # the second dodoor (an extra rn2(8)) after such a bail.
-        def call_dig(rg):
-            r_, g_ = rg
-            r_, g_, ok_ = dig_corridor(
-                r_, g_, xx + dx, yy + dy, tx_adj, ty_adj, nxcor)
-            return r_, g_, ok_
-        r, g, dig_ok = lax.cond(
-            ~nxcor_block,
-            call_dig,
-            lambda rg: (rg[0], rg[1], jnp.bool_(False)),
-            (r, g),
+        # Brax-flatten: call dig_corridor unconditionally, select with where.
+        pred_dig = ~nxcor_block
+        r_td, g_td, dig_ok_t = dig_corridor(
+            r, g, xx + dx, yy + dy, tx_adj, ty_adj, nxcor)
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred_dig, t, f), r_td, r
         )
+        g = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred_dig, t, f), g_td, g
+        )
+        dig_ok = jnp.where(pred_dig, dig_ok_t, jnp.bool_(False))
 
         # Second dodoor (tt) — vendor mklev.c:309-310, only when the dig
         # succeeded (dig_ok) AND (okdoor(tt) || !nxcor).
         ok2 = okdoor(g, ttx, tty) | ~nxcor
         second_gate = dig_ok & ok2
 
-        def call_second_dodoor(rg):
-            r_, g_ = rg
-            # tt-side door belongs to troom (room b) — vendor join passes
-            # troom to dodoor at mklev.c:310.  Cite: mklev.c:309-310.
-            return dodoor(r_, g_, ttx, tty, aroom_idx=b, depth=depth)
-        r, g = lax.cond(second_gate, call_second_dodoor, lambda rg: rg, (r, g))
+        # Brax-flatten: call second dodoor unconditionally, select with where.
+        # tt-side door belongs to troom (room b) — vendor join passes
+        # troom to dodoor at mklev.c:310.  Cite: mklev.c:309-310.
+        r_t2, g_t2 = dodoor(r, g, ttx, tty, aroom_idx=b, depth=depth)
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(second_gate, t, f), r_t2, r
+        )
+        g = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(second_gate, t, f), g_t2, g
+        )
 
         # smeq union (vendor mklev.c:312-315) — no RNG.  Also gated on
         # dig_ok: vendor returns before this when the dig fails, so the
         # union-find merge must not happen on a failed join.
-        def do_smeq(g_):
-            new_smeq = _smeq_union(g_.smeq, a, b)
-            return LevelGenState(
-                typ=g_.typ, doormask=g_.doormask,
-                door_x=g_.door_x, door_y=g_.door_y,
-                doorindex=g_.doorindex, smeq=new_smeq,
-                doorct=g_.doorct,
-            )
-        g = lax.cond(dig_ok, do_smeq, lambda g_: g_, g)
+        # Brax-flatten: compute new smeq unconditionally, select with where.
+        new_smeq = _smeq_union(g.smeq, a, b)
+        sel_smeq = jnp.where(dig_ok, new_smeq, g.smeq)
+        g = LevelGenState(
+            typ=g.typ, doormask=g.doormask,
+            door_x=g.door_x, door_y=g.door_y,
+            doorindex=g.doorindex, smeq=sel_smeq,
+            doorct=g.doorct,
+        )
         return r, g
 
-    rng_out, gs_out = lax.cond(skip, lambda rg: rg, do_join, (rng, gs))
+    # Brax-flatten outer skip gate: call do_join unconditionally, select.
+    r_dj, g_dj = do_join((rng, gs))
+    rng_out = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(skip, t, f), rng, r_dj
+    )
+    gs_out = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(skip, t, f), gs, g_dj
+    )
     return rng_out, gs_out
 
 
@@ -1291,18 +1323,22 @@ def makecorridors(
     def p1_body(i, carry):
         r, g, broken = carry
         # Vendor draws rn2(50) AFTER the join (mklev.c:325-327).
-        def do_step(rg):
-            r_, g_ = rg
-            r_, g_ = join(r_, g_, rooms, jnp.int32(i), jnp.int32(i) + jnp.int32(1), jnp.bool_(False), depth=depth)
-            r_, r50 = rn2_jax(r_, jnp.int32(50))
-            broken_new = r50 == jnp.int32(0)
-            return r_, g_, broken_new
-        r, g, broken_new = lax.cond(
-            broken | (jnp.int32(i) >= nroom_i - jnp.int32(1)),
-            lambda rg: (rg[0], rg[1], broken),
-            do_step,
-            (r, g),
+        # Brax-flatten: run join+rn2 unconditionally, select with where.
+        r_step, g_step = join(r, g, rooms, jnp.int32(i),
+                              jnp.int32(i) + jnp.int32(1),
+                              jnp.bool_(False), depth=depth)
+        r_step, r50 = rn2_jax(r_step, jnp.int32(50))
+        broken_step = r50 == jnp.int32(0)
+        pred_skip = broken | (jnp.int32(i) >= nroom_i - jnp.int32(1))
+        r = jax.tree_util.tree_map(
+            lambda skip_v, step_v: jnp.where(pred_skip, skip_v, step_v),
+            r, r_step,
         )
+        g = jax.tree_util.tree_map(
+            lambda skip_v, step_v: jnp.where(pred_skip, skip_v, step_v),
+            g, g_step,
+        )
+        broken_new = jnp.where(pred_skip, broken, broken_step)
         return (r, g, broken_new)
 
     rng, gs, _ = lax.fori_loop(
@@ -1313,18 +1349,20 @@ def makecorridors(
     def p2_body(i, carry):
         r, g = carry
         active = jnp.int32(i) < nroom_i - jnp.int32(2)
-        def do_step(rg):
-            r_, g_ = rg
-            differ = g_.smeq[i] != g_.smeq[i + 2]
-            return lax.cond(
-                differ,
-                lambda rg2: join(rg2[0], rg2[1], rooms,
-                                  jnp.int32(i), jnp.int32(i) + jnp.int32(2),
-                                  jnp.bool_(False), depth=depth),
-                lambda rg2: rg2,
-                (r_, g_),
-            )
-        return lax.cond(active, do_step, lambda rg: rg, (r, g))
+        differ = g.smeq[i] != g.smeq[i + 2]
+        # Brax-flatten: call join unconditionally, select with where on
+        # (active & differ).  Under vmap both branches already execute.
+        r_j, g_j = join(r, g, rooms,
+                        jnp.int32(i), jnp.int32(i) + jnp.int32(2),
+                        jnp.bool_(False), depth=depth)
+        gate = active & differ
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(gate, t, f), r_j, r
+        )
+        g = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(gate, t, f), g_j, g
+        )
+        return r, g
 
     rng, gs = lax.fori_loop(0, MAXNROFROOMS, p2_body, (rng, gs))
 
@@ -1336,27 +1374,38 @@ def makecorridors(
         r, g, any_flag = carry_outer
         outer_active = (jnp.int32(a) < nroom_i) & any_flag
 
-        def do_outer(rg_any):
-            r_, g_, _ = rg_any
-            def p3_inner(b, carry_in):
-                r_i, g_i, any_i = carry_in
-                inner_active = jnp.int32(b) < nroom_i
-                def do_inner(rg):
-                    r2, g2, _any = rg
-                    differ = g2.smeq[a] != g2.smeq[b]
-                    def call_join(rg2):
-                        return join(rg2[0], rg2[1], rooms,
-                                    jnp.int32(a), jnp.int32(b),
-                                    jnp.bool_(False), depth=depth)
-                    r3, g3 = lax.cond(differ, call_join, lambda rg2: rg2, (r2, g2))
-                    return r3, g3, _any | differ
-                return lax.cond(inner_active, do_inner, lambda rg: rg, (r_i, g_i, any_i))
-            r_, g_, any_after = lax.fori_loop(
-                0, MAXNROFROOMS, p3_inner, (r_, g_, jnp.bool_(False))
+        def p3_inner(b, carry_in):
+            r_i, g_i, any_i = carry_in
+            inner_active = jnp.int32(b) < nroom_i
+            differ = g_i.smeq[a] != g_i.smeq[b]
+            # Brax-flatten inner cond chain: always call join, select by
+            # (inner_active & differ).  Under vmap both branches execute.
+            r_j, g_j = join(r_i, g_i, rooms,
+                            jnp.int32(a), jnp.int32(b),
+                            jnp.bool_(False), depth=depth)
+            gate = inner_active & differ
+            r_n = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(gate, t, f), r_j, r_i
             )
-            return r_, g_, any_after
+            g_n = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(gate, t, f), g_j, g_i
+            )
+            any_n = jnp.where(inner_active, any_i | differ, any_i)
+            return r_n, g_n, any_n
 
-        return lax.cond(outer_active, do_outer, lambda rg: rg, (r, g, any_flag))
+        r_t, g_t, any_after = lax.fori_loop(
+            0, MAXNROFROOMS, p3_inner, (r, g, jnp.bool_(False))
+        )
+        # Brax-flatten outer cond: select between (r, g, any_flag) and
+        # (r_t, g_t, any_after) by outer_active.
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(outer_active, t, f), r_t, r
+        )
+        g = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(outer_active, t, f), g_t, g
+        )
+        any_out = jnp.where(outer_active, any_after, any_flag)
+        return r, g, any_out
 
     rng, gs, _ = lax.fori_loop(
         0, MAXNROFROOMS, p3_outer, (rng, gs, jnp.bool_(True))
@@ -1380,7 +1429,15 @@ def makecorridors(
         total = i_count + jnp.int32(4)
         return lax.fori_loop(0, total, p4_body, (r, g))
 
-    rng, gs = lax.cond(nroom_i > jnp.int32(2), do_p4, lambda rg: rg, (rng, gs))
+    # Brax-flatten outer p4 gate: call do_p4 unconditionally, select.
+    pred_p4 = nroom_i > jnp.int32(2)
+    r_p4, g_p4 = do_p4((rng, gs))
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(pred_p4, t, f), r_p4, rng
+    )
+    gs = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(pred_p4, t, f), g_p4, gs
+    )
 
     return rng, gs
 
@@ -1547,23 +1604,27 @@ def _makeniche_body(
             # AND doorct == 1.  Vendor cite: vendor/nle/src/mklev.c:497.
             doorct_is_one = g.doorct[aidx] == jnp.int32(1)
             draw_gate = is_oroom & doorct_is_one
-            r, r5gate = lax.cond(
-                draw_gate, lambda rr: rn2_jax(rr, jnp.int32(5)),
-                lambda rr: (rr, jnp.int32(0)), r,
+            # Brax-flatten: always draw, select with where.
+            r_t5g, r5g_t = rn2_jax(r, jnp.int32(5))
+            r = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(draw_gate, t, f), r_t5g, r
             )
+            r5gate = jnp.where(draw_gate, r5g_t, jnp.int32(0))
             # Skip (continue) when non-OROOM, OR doorct==1 gate fired nonzero.
             gate_continue = (~is_oroom) | (doorct_is_one & (r5gate != jnp.int32(0)))
 
             # ``if (!place_niche(...)) continue;`` (mklev.c:499) — place_niche
             # draws rn2(2) + finddpos; reached only when not skipped.
-            def _do_pn(rr):
-                rr, pok_, xx_, yy_, dy_ = _place_niche(rr, g, rooms, aidx)
-                return rr, pok_, xx_, yy_, dy_
-            r, pok, xx, yy, dy_niche = lax.cond(
-                ~gate_continue, _do_pn,
-                lambda rr: (rr, jnp.bool_(False), jnp.int32(0), jnp.int32(0), jnp.int32(0)),
-                r,
+            # Brax-flatten: always call _place_niche, select with where.
+            pred_pn = ~gate_continue
+            r_pn, pok_t, xx_t, yy_t, dy_t = _place_niche(r, g, rooms, aidx)
+            r = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(pred_pn, t, f), r_pn, r
             )
+            pok = jnp.where(pred_pn, pok_t, jnp.bool_(False))
+            xx = jnp.where(pred_pn, xx_t, jnp.int32(0))
+            yy = jnp.where(pred_pn, yy_t, jnp.int32(0))
+            dy_niche = jnp.where(pred_pn, dy_t, jnp.int32(0))
 
             placed = (~gate_continue) & pok
 
@@ -1575,10 +1636,12 @@ def _makeniche_body(
             # trap_type (e.g. makevtele -> TELEP_TRAP=15) MUST see zero
             # draws here to keep the ISAAC64 stream byte-aligned.
             draw_r4 = placed & (trap_type == jnp.int32(0))
-            r, r4 = lax.cond(
-                draw_r4, lambda rr: rn2_jax(rr, jnp.int32(4)),
-                lambda rr: (rr, jnp.int32(0)), r,
+            # Brax-flatten: always draw, select with where.
+            r_t4, r4_t = rn2_jax(r, jnp.int32(4))
+            r = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(draw_r4, t, f), r_t4, r
             )
+            r4 = jnp.where(draw_r4, r4_t, jnp.int32(0))
             scorr_branch = (trap_type != jnp.int32(0)) | (r4 == jnp.int32(0))
 
             # SCORR branch: maketrap + (engraving) + dosdoor.  Vendor:
@@ -1671,12 +1734,12 @@ def _makeniche_body(
                     # NOT trivial AND use_rubout!=0.  Inside, the inner draw
                     # fires only when a wipefrom row matches.
                     do_inner = (~is_space) & (~is_trivial) & use_rubout & has_rubout
-                    rr, r3 = lax.cond(
-                        do_inner,
-                        lambda rr_: rn2_jax(rr_, jnp.maximum(wipeto_len, jnp.int32(1))),
-                        lambda rr_: (rr_, jnp.int32(0)),
-                        rr,
+                    # Brax-flatten: always draw, select with where.
+                    rr_t, r3_t = rn2_jax(rr, jnp.maximum(wipeto_len, jnp.int32(1)))
+                    rr = jax.tree_util.tree_map(
+                        lambda t, f: jnp.where(do_inner, t, f), rr_t, rr
                     )
+                    r3 = jnp.where(do_inner, r3_t, jnp.int32(0))
                     # Compute the replacement char.  Branches (vendor order):
                     #   space        -> unchanged (continue, no replace)
                     #   trivial set  -> ' '
@@ -1703,7 +1766,11 @@ def _makeniche_body(
                     )
                     return rr_out
 
-                r_ = lax.cond(has_engr, _do_wipe, lambda rr: rr, r_)
+                # Brax-flatten: always run the wipe loop, select with where.
+                r_wipe = _do_wipe(r_)
+                r_ = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(has_engr, t, f), r_wipe, r_
+                )
 
                 # Step 3: dosdoor(SDOOR) — rn2(5) locked-vs-closed.
                 r_, r5s = rn2_jax(r_, jnp.int32(5))
@@ -1761,10 +1828,12 @@ def _makeniche_body(
                                                      jnp.int8(DMASK_CLOSED)))
                             return rr, m
 
-                        r3, mask_d = lax.cond(
-                            door_path, _doorway,
-                            lambda rr: (rr, jnp.int8(DMASK_NODOOR)), r3,
+                        # Brax-flatten: always run _doorway, select with where.
+                        r3_dw, mask_dw = _doorway(r3)
+                        r3 = jax.tree_util.tree_map(
+                            lambda t, f: jnp.where(door_path, t, f), r3_dw, r3
                         )
+                        mask_d = jnp.where(door_path, mask_dw, jnp.int8(DMASK_NODOOR))
                         return r3, mask_d
 
                     def _sdoor_type(r3):
@@ -1775,7 +1844,13 @@ def _makeniche_body(
                                            jnp.int8(DMASK_LOCKED), jnp.int8(DMASK_CLOSED))
                         return r3, mask_s
 
-                    r2, door_mask = lax.cond(use_sdoor, _sdoor_type, _door_type, r2)
+                    # Brax-flatten: always call both, select with where.
+                    r2_s, mask_s_typ = _sdoor_type(r2)
+                    r2_d, mask_d_typ = _door_type(r2)
+                    r2 = jax.tree_util.tree_map(
+                        lambda t, f: jnp.where(use_sdoor, t, f), r2_s, r2_d
+                    )
+                    door_mask = jnp.where(use_sdoor, mask_s_typ, mask_d_typ)
                     new_tile = jnp.where(use_sdoor, jnp.int8(VTILE_SDOOR), jnp.int8(VTILE_DOOR))
                     new_typ = g2.typ.at[xx, yy].set(new_tile)
                     new_dm  = g2.doormask.at[xx, yy].set(door_mask)
@@ -1823,7 +1898,11 @@ def _makeniche_body(
                         del r3c
                         return r3
 
-                    r2 = lax.cond(ironbars, _ironbars_true, lambda r3: r3, r2)
+                    # Brax-flatten: always draw, select with where.
+                    r2_ib = _ironbars_true(r2)
+                    r2 = jax.tree_util.tree_map(
+                        lambda t, f: jnp.where(ironbars, t, f), r2_ib, r2
+                    )
 
                     # mksobj_at(SCR_TELEPORTATION) → SCROLL_CLASS mksobj_init
                     # = blessorcurse(4) = rn2(4) [+ cond rn2(2)].
@@ -1843,15 +1922,22 @@ def _makeniche_body(
                     #              vendor/nle/src/mkobj.c:249-301 (mkobj).
                     r2, r3mk = rn2_jax(r2, jnp.int32(3))
                     do_mkobj = r3mk == jnp.int32(0)
-                    r2 = lax.cond(
-                        do_mkobj,
-                        lambda r3: consume_mkobj_random_draws(r3),
-                        lambda r3: r3,
-                        r2,
+                    # Brax-flatten: always consume mkobj draws, select.
+                    r2_mk = consume_mkobj_random_draws(r2)
+                    r2 = jax.tree_util.tree_map(
+                        lambda t, f: jnp.where(do_mkobj, t, f), r2_mk, r2
                     )
                     return r2, g2
 
-                r_, g_ = lax.cond(has_door, _corr_door, _corr_inaccessible, (r_, g_))
+                # Brax-flatten: call both branches, select with where.
+                r_cd, g_cd = _corr_door((r_, g_))
+                r_ci, g_ci = _corr_inaccessible((r_, g_))
+                r_ = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(has_door, t, f), r_cd, r_ci
+                )
+                g_ = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(has_door, t, f), g_cd, g_ci
+                )
                 return r_, g_
 
             # Carve niche tile at the pocket cell ONE STEP BEYOND the wall:
@@ -1865,29 +1951,46 @@ def _makeniche_body(
             # Vendor cite: vendor/nle/src/mklev.c:503-505,524.
             ny = jnp.clip(yy + dy_niche, 0, ROWNO - 1)
             new_tile = jnp.where(scorr_branch, jnp.int8(VTILE_SCORR), jnp.int8(VTILE_CORR))
+            # Brax-flatten the typ-write cond.
+            new_typ_placed = g.typ.at[xx, ny].set(new_tile)
             g = LevelGenState(
-                typ=lax.cond(
-                    placed,
-                    lambda t: t.at[xx, ny].set(new_tile),
-                    lambda t: t,
-                    g.typ,
-                ),
+                typ=jnp.where(placed, new_typ_placed, g.typ),
                 doormask=g.doormask,
                 door_x=g.door_x, door_y=g.door_y,
                 doorindex=g.doorindex, smeq=g.smeq, doorct=g.doorct,
             )
 
-            def _place_draws(rg2):
-                r_, g_ = rg2
-                return lax.cond(scorr_branch, _scorr_path, _corr_path, (r_, g_))
-
-            r, g = lax.cond(placed, _place_draws, lambda rg2: rg2, (r, g))
+            # Brax-flatten the scorr/corr branch selection AND the placed
+            # outer gate.  Always compute both _scorr_path and _corr_path
+            # outputs, then select by (placed & branch).
+            r_sc, g_sc = _scorr_path((r, g))
+            r_co, g_co = _corr_path((r, g))
+            # Inner select: scorr_branch picks scorr vs corr.
+            r_branch = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(scorr_branch, t, f), r_sc, r_co
+            )
+            g_branch = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(scorr_branch, t, f), g_sc, g_co
+            )
+            # Outer select: only apply when placed.
+            r = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(placed, t, f), r_branch, r
+            )
+            g = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(placed, t, f), g_branch, g
+            )
             return r, g, placed
 
-        r2, g2, placed = lax.cond(
-            ~done, _do_attempt,
-            lambda rg: (rg[0], rg[1], jnp.bool_(False)), (r, g),
+        # Brax-flatten: always run _do_attempt, select with where on ~done.
+        pred_attempt = ~done
+        r2_t, g2_t, placed_t = _do_attempt((r, g))
+        r2 = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred_attempt, t, f), r2_t, r
         )
+        g2 = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred_attempt, t, f), g2_t, g
+        )
+        placed = jnp.where(pred_attempt, placed_t, jnp.bool_(False))
         return (r2, g2, done | placed)
 
     rng, gs, _ = lax.fori_loop(0, 8, attempt, (rng, gs, jnp.bool_(False)))
@@ -1930,24 +2033,23 @@ def make_niches(
     def body(_, carry):
         r, g, ltptr, vamp = carry
         # rn2(6) ltptr gate — only DRAWN when ltptr is True (vendor:556).
-        def draw_lt(rg):
-            r_ = rg[0]
-            r_, v = rn2_jax(r_, jnp.int32(6))
-            return r_, v
-        r, lt_roll = lax.cond(
-            ltptr, draw_lt, lambda rg: (rg[0], jnp.int32(1)), (r,)
+        # Brax-flatten: always draw, select with where.
+        r_lt, lt_v = rn2_jax(r, jnp.int32(6))
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(ltptr, t, f), r_lt, r
         )
+        lt_roll = jnp.where(ltptr, lt_v, jnp.int32(1))
         lt_fire = ltptr & (lt_roll == jnp.int32(0))
 
         # rn2(6) vamp gate — drawn when vamp AND !lt_fire (vendor:559 in
         # else-if branch).
-        def draw_vamp(rg):
-            r_ = rg[0]
-            r_, v = rn2_jax(r_, jnp.int32(6))
-            return r_, v
-        r, vamp_roll = lax.cond(
-            vamp & ~lt_fire, draw_vamp, lambda rg: (rg[0], jnp.int32(1)), (r,)
+        # Brax-flatten: always draw, select with where.
+        pred_vamp = vamp & ~lt_fire
+        r_vp, vamp_v = rn2_jax(r, jnp.int32(6))
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred_vamp, t, f), r_vp, r
         )
+        vamp_roll = jnp.where(pred_vamp, vamp_v, jnp.int32(1))
         vamp_fire = vamp & ~lt_fire & (vamp_roll == jnp.int32(0))
 
         trap_type = jnp.where(lt_fire, LEVEL_TELEP,
