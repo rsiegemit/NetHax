@@ -294,23 +294,18 @@ def _kelp_scan(
 
         # Pool branch: draw rn2(kelp_pool) iff cell==POOL and kelp_pool!=0
         # Citation: vendor mklev.c:913 ``levl[x][y].typ == POOL && !rn2(kelp_pool)``
+        # Brax flatten: always draw, then jnp.where-select the rng state. The
+        # not-selected branch's draws are discarded along with its rng — the
+        # threaded rng matches the cond's semantics byte-for-byte.
         is_pool = (cell == _LOCAL_POOL) & (kp != jnp.int32(0))
-
-        def draw_pool(v):
-            new_v, _ = rn2_jax(v, kp)
-            return new_v
-
-        vrng = lax.cond(is_pool, draw_pool, lambda v: v, vrng)
+        vrng_pool, _ = rn2_jax(vrng, kp)
+        vrng = jax.tree.map(lambda t, f: jnp.where(is_pool, t, f), vrng_pool, vrng)
 
         # Moat branch: draw rn2(kelp_moat) iff cell==MOAT and kelp_moat!=0
         # Citation: vendor mklev.c:914 ``levl[x][y].typ == MOAT && !rn2(kelp_moat)``
         is_moat = (cell == _LOCAL_WATER) & (km != jnp.int32(0))
-
-        def draw_moat(v):
-            new_v, _ = rn2_jax(v, km)
-            return new_v
-
-        vrng = lax.cond(is_moat, draw_moat, lambda v: v, vrng)
+        vrng_moat, _ = rn2_jax(vrng, km)
+        vrng = jax.tree.map(lambda t, f: jnp.where(is_moat, t, f), vrng_moat, vrng)
         return vrng
 
     return lax.fori_loop(0, _SCAN_N, body, vendor_rng)
@@ -448,6 +443,15 @@ def _mineral_scan(
     gem_otyp   = jnp.zeros((_SCAN_N, _MAX_GEMS), dtype=jnp.int32)
     gem_qty    = jnp.zeros((_SCAN_N, _MAX_GEMS), dtype=jnp.int32)
 
+    # Brax-flatten pattern (matches step-path commits 25548a5, e8eb00c):
+    # every lax.cond in the body is replaced by "always compute both sides
+    # from the same starting state, then jnp.where-select".  The selected
+    # rng state and side-effect arrays are byte-identical to the original
+    # cond semantics — the not-selected branch's draws are discarded along
+    # with its rng, so the threaded rng matches vendor exactly.
+    def _select_rng(pred, on_true, on_false):
+        return jax.tree.map(lambda t, f: jnp.where(pred, t, f), on_true, on_false)
+
     def body(flat_i, carry):
         vrng, gpl, gq, gmp, go, gmq = carry
 
@@ -483,126 +487,103 @@ def _mineral_scan(
             & _is_stone(cell_sw)
         )
 
-        def do_eligible(c):
-            v, gpl, gq, gmp, go, gmq = c
+        # === do_eligible body, inlined with all nested conds flattened. ===
+        v0 = vrng
 
-            # --- Gold draw: rn2(1000) --- Citation: mklev.c:962
-            v, gold_roll = rn2_jax(v, jnp.int32(1000))
-            gold_hit = gold_roll < gp
+        # --- Gold draw: rn2(1000) --- Citation: mklev.c:962
+        v1, gold_roll = rn2_jax(v0, jnp.int32(1000))
+        gold_hit = gold_roll < gp
 
-            def on_gold_hit(cc):
-                vv, gpl_in, gq_in = cc
-                # rnd(goldprob*3): Citation mklev.c:965
-                vv, quan = rnd_jax(vv, gp * jnp.int32(3))
-                # vendor mklev.c:965 ``otmp->quan = 1L + rnd(goldprob*3)``.
-                quan_full = quan + jnp.int32(1)
-                # rn2(3): burial coin   Citation mklev.c:967
-                vv, coin = rn2_jax(vv, jnp.int32(3))
-                # Place on floor iff coin != 0 (vendor: !rn2(3) → buried).
-                placed = coin != jnp.int32(0)
-                gpl_in = gpl_in.at[flat_i].set(placed)
-                gq_in  = gq_in.at[flat_i].set(quan_full)
-                return (vv, gpl_in, gq_in)
+        # on_gold_hit body — always compute from v1.
+        # rnd(goldprob*3): Citation mklev.c:965
+        v_gh1, quan = rnd_jax(v1, gp * jnp.int32(3))
+        quan_full = quan + jnp.int32(1)
+        # rn2(3): burial coin   Citation mklev.c:967
+        v_gh2, coin = rn2_jax(v_gh1, jnp.int32(3))
+        gold_placed = coin != jnp.int32(0)
+        gpl_after_gold = gpl.at[flat_i].set(gold_placed)
+        gq_after_gold  = gq.at[flat_i].set(quan_full)
 
-            v, gpl, gq = lax.cond(
-                gold_hit, on_gold_hit, lambda cc: cc, (v, gpl, gq)
-            )
+        v2  = _select_rng(gold_hit, v_gh2, v1)
+        gpl = jnp.where(gold_hit, gpl_after_gold, gpl)
+        gq  = jnp.where(gold_hit, gq_after_gold,  gq)
 
-            # --- Gem draw: rn2(1000) --- Citation: mklev.c:973
-            v, gem_roll = rn2_jax(v, jnp.int32(1000))
-            gem_hit = gem_roll < gemp
+        # --- Gem draw: rn2(1000) --- Citation: mklev.c:973
+        v3, gem_roll = rn2_jax(v2, jnp.int32(1000))
+        gem_hit = gem_roll < gemp
 
-            def on_gem_hit(cc):
-                vv, gmp_in, go_in, gmq_in = cc
-                # cnt = rnd(2 + dunlev//3)  Citation mklev.c:974
-                vv, cnt = rnd_jax(vv, jnp.int32(2) + dl // jnp.int32(3))
+        # on_gem_hit body — always compute from v3.
+        # cnt = rnd(2 + dunlev//3)  Citation mklev.c:974
+        v_gem0, cnt = rnd_jax(v3, jnp.int32(2) + dl // jnp.int32(3))
 
-                # Per-gem cascade — vendor mklev.c:975-984 + mkobj.c:251,886-895.
-                def gem_body(i, inner):
-                    iv, gmp_inner, go_inner, gmq_inner = inner
+        # Per-gem cascade — vendor mklev.c:975-984 + mkobj.c:251,886-895.
+        def gem_body(i, inner):
+            iv, gmp_inner, go_inner, gmq_inner = inner
 
-                    def do_gem(g):
-                        iv2, gmp2, go2, gmq2 = g
-                        # 1. rnd(1000) type pick — vendor mkobj.c:251
-                        iv2, type_roll = rnd_jax(iv2, jnp.int32(1000))
-                        otyp = decode_picked_otyp(
-                            jnp.int32(_GEM_CLASS_ID), type_roll
-                        )
-                        is_rock      = otyp == _OTYP_ROCK
-                        is_luckstone = otyp == _OTYP_LUCKSTONE
+            active = jnp.int32(i) < cnt
 
-                        def rock_branch(rb):
-                            iv3, gmp3, go3, gmq3 = rb
-                            # rn1(6,6) quantity — vendor mkobj.c:891
-                            iv3, _q = rn1_jax(iv3, 6, 6)
-                            # ROCK is dealloc'd — no floor placement (cite:
-                            # vendor/nle/src/mklev.c:976-977).  Leave per-gem
-                            # slot as the zero default (not placed).
-                            return (iv3, gmp3, go3, gmq3)
+            # do_gem body — always compute from iv.
+            # 1. rnd(1000) type pick — vendor mkobj.c:251
+            iv1, type_roll = rnd_jax(iv, jnp.int32(1000))
+            otyp = decode_picked_otyp(jnp.int32(_GEM_CLASS_ID), type_roll)
+            is_rock      = otyp == _OTYP_ROCK
+            is_luckstone = otyp == _OTYP_LUCKSTONE
 
-                        def non_rock_branch(rb):
-                            iv3, gmp3, go3, gmq3 = rb
-                            # Vendor mkobj.c:892:
-                            #   if (otmp->otyp != LUCKSTONE && !rn2(6))
-                            #       otmp->quan = 2L;
-                            # i.e. for non-luckstone gems draw rn2(6); the
-                            # quantity is 2 iff that draw == 0, else 1.
-                            # Luckstone skips the draw entirely and keeps the
-                            # mksobj default quan = 1.
-                            def lucky(r):
-                                return (r, jnp.int32(1))
+            # rock_branch: rn1(6,6) quantity — vendor mkobj.c:891.
+            # ROCK is dealloc'd — no floor placement (mklev.c:976-977); leave
+            # gmp/go/gmq slot at its prior value.
+            iv_rock, _q = rn1_jax(iv1, 6, 6)
 
-                            def gem_quan(r):
-                                r2, k = rn2_jax(r, jnp.int32(6))
-                                q = jnp.where(
-                                    k == jnp.int32(0),
-                                    jnp.int32(2),
-                                    jnp.int32(1),
-                                )
-                                return (r2, q)
+            # non_rock_branch:
+            #   - if luckstone: no rn2(6), quan=1
+            #   - else: rn2(6), quan = 2 if k==0 else 1
+            # Flatten the luckstone vs gem_quan cond by always drawing rn2(6)
+            # and then selecting (rng, quan).  Vendor cite: mkobj.c:892.
+            iv_quan, k = rn2_jax(iv1, jnp.int32(6))
+            q_drawn = jnp.where(k == jnp.int32(0), jnp.int32(2), jnp.int32(1))
+            iv_nr_after_quan = _select_rng(is_luckstone, iv1, iv_quan)
+            gem_q = jnp.where(is_luckstone, jnp.int32(1), q_drawn)
+            # rn2(3) burial/place draw — vendor mklev.c:980.
+            iv_nr, coin = rn2_jax(iv_nr_after_quan, jnp.int32(3))
+            nr_placed = coin != jnp.int32(0)
+            gmp_nr = gmp_inner.at[flat_i, i].set(nr_placed)
+            go_nr  = go_inner .at[flat_i, i].set(otyp)
+            gmq_nr = gmq_inner.at[flat_i, i].set(gem_q)
 
-                            iv3, gem_q = lax.cond(
-                                is_luckstone, lucky, gem_quan, iv3
-                            )
-                            # rn2(3) burial/place draw — vendor mklev.c:980.
-                            iv3, coin = rn2_jax(iv3, jnp.int32(3))
-                            placed = coin != jnp.int32(0)
-                            gmp3 = gmp3.at[flat_i, i].set(placed)
-                            go3  = go3.at[flat_i, i].set(otyp)
-                            gmq3 = gmq3.at[flat_i, i].set(gem_q)
-                            return (iv3, gmp3, go3, gmq3)
+            # Select rock vs non-rock results (do_gem's inner cond).
+            iv_do  = _select_rng(is_rock, iv_rock, iv_nr)
+            gmp_do = jnp.where(is_rock, gmp_inner, gmp_nr)
+            go_do  = jnp.where(is_rock, go_inner,  go_nr)
+            gmq_do = jnp.where(is_rock, gmq_inner, gmq_nr)
 
-                        return lax.cond(
-                            is_rock, rock_branch, non_rock_branch,
-                            (iv2, gmp2, go2, gmq2),
-                        )
+            # Select active (i < cnt) vs identity (gem_body's outer cond).
+            iv_new  = _select_rng(active, iv_do, iv)
+            gmp_new = jnp.where(active, gmp_do, gmp_inner)
+            go_new  = jnp.where(active, go_do,  go_inner)
+            gmq_new = jnp.where(active, gmq_do, gmq_inner)
+            return (iv_new, gmp_new, go_new, gmq_new)
 
-                    return lax.cond(
-                        jnp.int32(i) < cnt,
-                        do_gem,
-                        lambda g: g,
-                        (iv, gmp_inner, go_inner, gmq_inner),
-                    )
-
-                vv, gmp_in, go_in, gmq_in = lax.fori_loop(
-                    0, _MAX_GEMS, gem_body,
-                    (vv, gmp_in, go_in, gmq_in),
-                )
-                return (vv, gmp_in, go_in, gmq_in)
-
-            v, gmp, go, gmq = lax.cond(
-                gem_hit, on_gem_hit, lambda cc: cc,
-                (v, gmp, go, gmq),
-            )
-
-            return (v, gpl, gq, gmp, go, gmq)
-
-        return lax.cond(
-            eligible,
-            do_eligible,
-            lambda c: c,
-            (vrng, gpl, gq, gmp, go, gmq),
+        v_gem1, gmp_after, go_after, gmq_after = lax.fori_loop(
+            0, _MAX_GEMS, gem_body,
+            (v_gem0, gmp, go, gmq),
         )
+
+        v4  = _select_rng(gem_hit, v_gem1, v3)
+        gmp = jnp.where(gem_hit, gmp_after, gmp)
+        go  = jnp.where(gem_hit, go_after,  go)
+        gmq = jnp.where(gem_hit, gmq_after, gmq)
+
+        # Outer eligibility select — fall back to original carry when
+        # ineligible (cond's identity branch).  Note: rn2/rnd state advances
+        # above are computed for every cell; the where-select discards them
+        # for ineligible cells so the threaded rng matches the cond semantics.
+        vrng_out = _select_rng(eligible, v4, vrng)
+        gpl_out  = jnp.where(eligible, gpl, carry[1])
+        gq_out   = jnp.where(eligible, gq,  carry[2])
+        gmp_out  = jnp.where(eligible, gmp, carry[3])
+        go_out   = jnp.where(eligible, go,  carry[4])
+        gmq_out  = jnp.where(eligible, gmq, carry[5])
+        return (vrng_out, gpl_out, gq_out, gmp_out, go_out, gmq_out)
 
     (vrng_out, gold_place, gold_qty, gem_place, gem_otyp, gem_qty) = (
         lax.fori_loop(
