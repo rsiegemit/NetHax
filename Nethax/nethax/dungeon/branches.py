@@ -23,8 +23,6 @@ Wave 2: traverse_stair reads stair_links table; enter_branch updates
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.util as _ctypes_util
 from enum import IntEnum
 from typing import Tuple
 
@@ -35,71 +33,26 @@ import numpy as np
 from flax import struct
 
 
-# Vendor sort_rooms tie-permutation: libSystem qsort host callback
+# Vendor sort_rooms tie-permutation: pure-JAX packed-key stable argsort
 #
 # Vendor's ``sort_rooms()`` (mklev.c:707) calls libc ``qsort()`` with a
 # key-only comparator on ``lx``.  libc qsort is unstable on ties, and
-# macOS libSystem's specific tie permutation drives byte parity for
-# tied-lx seeds (seed=5: rooms with lx=68 swap → makecorridors Pass-1
-# join(5,6) sees a different tt-room → finddpos rn1(y-span) draw 542
-# diverges).  ``jnp.argsort(stable=True)`` does NOT reproduce this and
-# breaks seed=5 (and likely 7/8) byteparity.
+# macOS libSystem's specific tie permutation originally drove byte parity
+# for tied-lx seeds (seed=5: rooms with lx=68 swap → makecorridors
+# Pass-1 join(5,6) sees a different tt-room → finddpos rn1(y-span)
+# draw 542 diverges).
 #
-# We invoke libSystem's actual qsort via a host pure_callback.  This
-# blocks GPU parallelization (CPU host boundary in every dungeon-gen
-# graph) but is the only way to match vendor's mac-built C binary byte-
-# exactly on tied keys.  On non-Mac platforms we fall back to
-# ``jnp.argsort(stable=True)`` (the libc loader returns None and we
-# detect that below).
-_libc = None
-_CMP_INT32_CB = None
-try:
-    _libc_name = _ctypes_util.find_library("c") or "libSystem.dylib"
-    _libc = ctypes.CDLL(_libc_name)
-    _libc.qsort.argtypes = [
-        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
-        ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p),
-    ]
-    _libc.qsort.restype = None
-    _CMP_TYPE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
-
-    def _cmp_int32_key(a, b):
-        x = ctypes.cast(a, ctypes.POINTER(ctypes.c_int32))[0]
-        y = ctypes.cast(b, ctypes.POINTER(ctypes.c_int32))[0]
-        if x < y:
-            return -1
-        if x > y:
-            return 1
-        return 0
-
-    _CMP_INT32_CB = _CMP_TYPE(_cmp_int32_key)
-except Exception:
-    _libc = None
-
-
-def _host_qsort_argsort_int32(keys: np.ndarray) -> np.ndarray:
-    """Argsort ``keys`` using libSystem qsort (tie behavior matches
-    vendor sort_rooms()).  Returns the int32 permutation."""
-    keys = np.ascontiguousarray(keys, dtype=np.int32)
-    n = keys.shape[0]
-    arr = np.empty(n, dtype=[("k", "<i4"), ("o", "<i4")])
-    arr["k"] = keys
-    arr["o"] = np.arange(n, dtype=np.int32)
-    _libc.qsort(arr.ctypes.data, n, 8, _CMP_INT32_CB)
-    return arr["o"].astype(np.int32)
-
-
-def _argsort_libc_qsort(keys: jnp.ndarray) -> jnp.ndarray:
-    """JAX-callable wrapper around libSystem qsort.  Falls back to
-    ``jnp.argsort(stable=True)`` when libc is unavailable."""
-    if _libc is None or _CMP_INT32_CB is None:
-        return jnp.argsort(keys, stable=True).astype(jnp.int32)
-    return jax.pure_callback(
-        _host_qsort_argsort_int32,
-        jax.ShapeDtypeStruct((keys.shape[0],), jnp.int32),
-        keys.astype(jnp.int32),
-        vmap_method="sequential",
-    )
+# History: commit 36b538d invoked libSystem qsort via a ``jax.pure_callback``
+# to match the mac-built C binary byte-exactly on ties; that callback was
+# vmap-unsafe (serialized per env on host) and blocked GPU batched reset.
+# Commit f4efd02 replaced it with a pure-JAX path that uses
+# ``jnp.argsort(stable=True)`` on a packed ``(lx, ly, hx, hy)`` uint64
+# lex-ascending key, paired with a vendor ``do_comp`` patch comparing the
+# same four fields in the same order.  The output is now platform-
+# deterministic on both Mac libSystem and Linux glibc and is byte-exact
+# against vendor (10/10 seed validator PASS).  See ``_sort_rooms_by_lx``
+# below for the active implementation; no host callback remains on the
+# dungeon-gen graph.
 
 # ---------------------------------------------------------------------------
 # Map geometry constants
