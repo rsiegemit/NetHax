@@ -5135,14 +5135,26 @@ def monster_turn(state, rng: jax.Array, monster_idx: jnp.ndarray) -> object:
                 )
                 return s2.replace(monster_ai=new_m)
 
-            new_st = jax.lax.cond(steps_onto_player, _attack, _move, st)
+            _st_attack = _attack(st)
+            _st_move = _move(st)
+            new_st = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(steps_onto_player, t, f),
+                _st_attack, _st_move,
+            )
             # --- vendor postmov() per-tile refresh (monmove.c:1455-1707) ---
             # Run after the move/attack so reveal + LoS pick up the new tile.
             return _postmov_per_monster(new_st, idx)
 
-        return jax.lax.cond(should_act, _act, lambda st: st, s)
+        _s_act = _act(s)
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(should_act, t, f), _s_act, s,
+        )
 
-    return jax.lax.cond(is_pet, _pet_branch, _hostile_branch, state)
+    _state_pet = _pet_branch(state)
+    _state_hostile = _hostile_branch(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_pet, t, f), _state_pet, _state_hostile,
+    )
 
 
 # ---------------------------------------------------------------------------
