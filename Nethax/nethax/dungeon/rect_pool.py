@@ -224,24 +224,24 @@ def rnd_rect(
         }
 
     Returns ``(pool, lx, ly, hx, hy, rng, found)``.  ``found`` is False
-    iff the pool is empty (sentinel-zero coords).  ``rng`` is consumed
-    even when ``rect_cnt == 0`` would skip vendor's draw — to honour the
-    short-circuit we use ``lax.cond``.
+    iff the pool is empty (sentinel-zero coords).  Brax-flattened: always
+    perform the draw on a clamped modulus and ``jnp.where``-select between
+    the consumed and pristine RNG so the empty-pool path emits the
+    original rng (matching vendor's short-circuit).
     """
     has = pool.rect_cnt > 0
 
-    def _draw(rng_in):
-        # ``rn2`` requires positive x; clamp the modulus to >=1 so the
-        # untaken branch never trips a divide-by-zero, but mask the
-        # result so empty-pool paths return zeros.
-        x = jnp.maximum(pool.rect_cnt, jnp.int32(1))
-        new_rng, idx = rn2_jax(rng_in, x)
-        return new_rng, idx
-
-    def _skip(rng_in):
-        return rng_in, jnp.int32(0)
-
-    rng_out, idx = lax.cond(has, _draw, _skip, rng)
+    # Brax-flatten: always compute the draw branch (clamped to >=1 so the
+    # divide is safe when the pool is empty), then jnp.where-select between
+    # the consumed and pristine rng/idx.  Preserves vendor's "rn2 only when
+    # rect_cnt > 0" RNG semantics because we ignore the draw on the empty
+    # path.
+    x = jnp.maximum(pool.rect_cnt, jnp.int32(1))
+    drawn_rng, drawn_idx = rn2_jax(rng, x)
+    rng_out = jax.tree_util.tree_map(
+        lambda d, s: jnp.where(has, d, s), drawn_rng, rng
+    )
+    idx = jnp.where(has, drawn_idx, jnp.int32(0))
     lx = jnp.where(has, pool.rect_lx[idx], jnp.int16(0))
     ly = jnp.where(has, pool.rect_ly[idx], jnp.int16(0))
     hx = jnp.where(has, pool.rect_hx[idx], jnp.int16(0))
@@ -596,11 +596,14 @@ def _split_rects_iterative(
                 jnp.int16(_YLIM + 1 + 4),
             )
             top_ok = (cr_ly - old_ly - jnp.int16(1)) > thr_top
-            pool_p = lax.cond(
-                top_ok,
-                lambda p: add_rect(p, old_lx, old_ly, old_hx, cr_ly - jnp.int16(2)),
-                lambda p: p,
-                pool_p,
+            # Brax-flatten: always invoke add_rect, jnp.where-select per field.
+            pool_top = add_rect(pool_p, old_lx, old_ly, old_hx, cr_ly - jnp.int16(2))
+            pool_p = pool_p.replace(
+                rect_lx=jnp.where(top_ok, pool_top.rect_lx, pool_p.rect_lx),
+                rect_ly=jnp.where(top_ok, pool_top.rect_ly, pool_p.rect_ly),
+                rect_hx=jnp.where(top_ok, pool_top.rect_hx, pool_p.rect_hx),
+                rect_hy=jnp.where(top_ok, pool_top.rect_hy, pool_p.rect_hy),
+                rect_cnt=jnp.where(top_ok, pool_top.rect_cnt, pool_p.rect_cnt),
             )
 
             # Vendor rect.c:181-186 — LEFT strip (left of r2):
@@ -612,11 +615,14 @@ def _split_rects_iterative(
                 jnp.int16(_XLIM + 1 + 4),
             )
             left_ok = (cr_lx - old_lx - jnp.int16(1)) > thr_left
-            pool_p = lax.cond(
-                left_ok,
-                lambda p: add_rect(p, old_lx, old_ly, cr_lx - jnp.int16(2), old_hy),
-                lambda p: p,
-                pool_p,
+            # Brax-flatten: always invoke add_rect, jnp.where-select per field.
+            pool_left = add_rect(pool_p, old_lx, old_ly, cr_lx - jnp.int16(2), old_hy)
+            pool_p = pool_p.replace(
+                rect_lx=jnp.where(left_ok, pool_left.rect_lx, pool_p.rect_lx),
+                rect_ly=jnp.where(left_ok, pool_left.rect_ly, pool_p.rect_ly),
+                rect_hx=jnp.where(left_ok, pool_left.rect_hx, pool_p.rect_hx),
+                rect_hy=jnp.where(left_ok, pool_left.rect_hy, pool_p.rect_hy),
+                rect_cnt=jnp.where(left_ok, pool_left.rect_cnt, pool_p.rect_cnt),
             )
 
             # Vendor rect.c:187-191 — BOTTOM strip (below r2):
@@ -628,11 +634,14 @@ def _split_rects_iterative(
                 jnp.int16(_YLIM + 1 + 4),
             )
             bot_ok = (old_hy - cr_hy - jnp.int16(1)) > thr_bot
-            pool_p = lax.cond(
-                bot_ok,
-                lambda p: add_rect(p, old_lx, cr_hy + jnp.int16(2), old_hx, old_hy),
-                lambda p: p,
-                pool_p,
+            # Brax-flatten: always invoke add_rect, jnp.where-select per field.
+            pool_bot = add_rect(pool_p, old_lx, cr_hy + jnp.int16(2), old_hx, old_hy)
+            pool_p = pool_p.replace(
+                rect_lx=jnp.where(bot_ok, pool_bot.rect_lx, pool_p.rect_lx),
+                rect_ly=jnp.where(bot_ok, pool_bot.rect_ly, pool_p.rect_ly),
+                rect_hx=jnp.where(bot_ok, pool_bot.rect_hx, pool_p.rect_hx),
+                rect_hy=jnp.where(bot_ok, pool_bot.rect_hy, pool_p.rect_hy),
+                rect_cnt=jnp.where(bot_ok, pool_bot.rect_cnt, pool_p.rect_cnt),
             )
 
             # Vendor rect.c:192-196 — RIGHT strip (right of r2):
@@ -644,11 +653,14 @@ def _split_rects_iterative(
                 jnp.int16(_XLIM + 1 + 4),
             )
             right_ok = (old_hx - cr_hx - jnp.int16(1)) > thr_right
-            pool_p = lax.cond(
-                right_ok,
-                lambda p: add_rect(p, cr_hx + jnp.int16(2), old_ly, old_hx, old_hy),
-                lambda p: p,
-                pool_p,
+            # Brax-flatten: always invoke add_rect, jnp.where-select per field.
+            pool_right = add_rect(pool_p, cr_hx + jnp.int16(2), old_ly, old_hx, old_hy)
+            pool_p = pool_p.replace(
+                rect_lx=jnp.where(right_ok, pool_right.rect_lx, pool_p.rect_lx),
+                rect_ly=jnp.where(right_ok, pool_right.rect_ly, pool_p.rect_ly),
+                rect_hx=jnp.where(right_ok, pool_right.rect_hx, pool_p.rect_hx),
+                rect_hy=jnp.where(right_ok, pool_right.rect_hy, pool_p.rect_hy),
+                rect_cnt=jnp.where(right_ok, pool_right.rect_cnt, pool_p.rect_cnt),
             )
 
             # Pop frame.
@@ -656,13 +668,50 @@ def _split_rects_iterative(
             return (pool_p, r1lx_p, r1ly_p, r1hx_p, r1hy_p,
                     r2lx_p, r2ly_p, r2hx_p, r2hy_p, ph_p, ii_p, sp_n)
 
-        # Dispatch on phase (0/1/2).  lax.switch ensures only one branch
-        # executes per step, preserving vendor's strict ordering.
-        new_state = lax.switch(
-            jnp.clip(f_ph.astype(jnp.int32), 0, 2),
-            [do_phase0, do_phase1, do_phase2],
-            (pool_c, r1lx, r1ly, r1hx, r1hy,
-             r2lx, r2ly, r2hx, r2hy, ph, ii, sp_in),
+        # Brax-flatten: instead of lax.switch, eagerly compute all three
+        # phase branches on the current carry and jnp.where-select per field
+        # using the active phase.  Vendor's strict per-step ordering is
+        # preserved because each invocation of ``body`` advances exactly one
+        # frame by one phase — only the branch matching ``f_ph`` contributes
+        # to the next state.
+        carry = (pool_c, r1lx, r1ly, r1hx, r1hy,
+                 r2lx, r2ly, r2hx, r2hy, ph, ii, sp_in)
+        out0 = do_phase0(carry)
+        out1 = do_phase1(carry)
+        out2 = do_phase2(carry)
+
+        phase_i = jnp.clip(f_ph.astype(jnp.int32), 0, 2)
+        is0 = phase_i == jnp.int32(0)
+        is1 = phase_i == jnp.int32(1)
+        # is2 implied by ~is0 & ~is1
+
+        def _sel(a0, a1, a2):
+            return jnp.where(is0, a0, jnp.where(is1, a1, a2))
+
+        pool0, r1lx0, r1ly0, r1hx0, r1hy0, r2lx0, r2ly0, r2hx0, r2hy0, ph0, ii0, sp0 = out0
+        pool1, r1lx1, r1ly1, r1hx1, r1hy1, r2lx1, r2ly1, r2hx1, r2hy1, ph1, ii1, sp1 = out1
+        pool2, r1lx2, r1ly2, r1hx2, r1hy2, r2lx2, r2ly2, r2hx2, r2hy2, ph2, ii2, sp2 = out2
+
+        new_pool = pool_c.replace(
+            rect_lx=_sel(pool0.rect_lx, pool1.rect_lx, pool2.rect_lx),
+            rect_ly=_sel(pool0.rect_ly, pool1.rect_ly, pool2.rect_ly),
+            rect_hx=_sel(pool0.rect_hx, pool1.rect_hx, pool2.rect_hx),
+            rect_hy=_sel(pool0.rect_hy, pool1.rect_hy, pool2.rect_hy),
+            rect_cnt=_sel(pool0.rect_cnt, pool1.rect_cnt, pool2.rect_cnt),
+        )
+        new_state = (
+            new_pool,
+            _sel(r1lx0, r1lx1, r1lx2),
+            _sel(r1ly0, r1ly1, r1ly2),
+            _sel(r1hx0, r1hx1, r1hx2),
+            _sel(r1hy0, r1hy1, r1hy2),
+            _sel(r2lx0, r2lx1, r2lx2),
+            _sel(r2ly0, r2ly1, r2ly2),
+            _sel(r2hx0, r2hx1, r2hx2),
+            _sel(r2hy0, r2hy1, r2hy2),
+            _sel(ph0, ph1, ph2),
+            _sel(ii0, ii1, ii2),
+            _sel(sp0, sp1, sp2),
         )
         return new_state
 
