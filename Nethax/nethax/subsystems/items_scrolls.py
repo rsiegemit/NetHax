@@ -1832,9 +1832,17 @@ def handle_read(state, rng):
     chosen_is_valid = valid_mask[jnp.clip(chosen_slot, 0, valid_mask.shape[0] - 1)]
     slot_idx = jnp.where(chosen_is_valid, chosen_slot, fallback_slot).astype(jnp.int32)
 
+    # Resolve `read_scroll` via sys.modules to bypass LOAD_GLOBAL — under
+    # NETHAX_BRAX_ALL=1 the brax block below deletes `read_scroll` from
+    # globals() and installs a module __getattr__, but PEP 562's
+    # __getattr__ fires for attribute access (`mod.X`), not LOAD_GLOBAL
+    # inside a function body. The lambda would raise NameError at trace
+    # time. Binding to a free var captures the __getattr__ result.
+    import sys as _sys_rs
+    _read_scroll_fn = getattr(_sys_rs.modules[__name__], "read_scroll")
     new_state = jax.lax.cond(
         found,
-        lambda s_r: read_scroll(s_r[0], s_r[1], slot_idx),
+        lambda s_r: _read_scroll_fn(s_r[0], s_r[1], slot_idx),
         lambda s_r: s_r[0],
         (state, rng),
     )

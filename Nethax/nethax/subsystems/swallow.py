@@ -297,9 +297,15 @@ def digest_tick(state, rng: jax.Array):
             ),
         )
 
+        # Resolve via sys.modules to bypass LOAD_GLOBAL — PEP 562
+        # __getattr__ fires for attribute access, not LOAD_GLOBAL inside a
+        # function body. Under NETHAX_BRAX_ALL=1 `release_from_engulf` is
+        # deleted from globals(); the lambda would NameError at trace time.
+        import sys as _sys_re
+        _release_fn = getattr(_sys_re.modules[__name__], "release_from_engulf")
         return jax.lax.cond(
             should_release,
-            lambda st: release_from_engulf(st),
+            lambda st: _release_fn(st),
             lambda st: st,
             s2,
         )

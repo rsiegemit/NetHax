@@ -1572,9 +1572,18 @@ def handle_quaff(state, rng):
     slot_idx = jnp.where(chosen_is_valid, chosen_slot, fallback_slot).astype(jnp.int32)
     found = found_any
 
+    # Resolve `quaff_potion` via module attribute lookup so the brax rebind
+    # (PEP 562 ``__getattr__`` below) is honoured.  A bare ``quaff_potion``
+    # reference inside the lambda compiles to ``LOAD_GLOBAL``, which does
+    # NOT fall through to module ``__getattr__`` and raises ``NameError``
+    # under ``NETHAX_BRAX_ALL=1`` because the name is removed from globals.
+    # Binding to a local before the lambda makes it a closure free-var.
+    import sys as _sys_qp
+    _quaff_potion_fn = getattr(_sys_qp.modules[__name__], "quaff_potion")
+
     return jax.lax.cond(
         found,
-        lambda s_r: quaff_potion(s_r[0], s_r[1], slot_idx),
+        lambda s_r: _quaff_potion_fn(s_r[0], s_r[1], slot_idx),
         lambda s_r: _quaff_no_potion(s_r[0], s_r[1]),
         (state, rng),
     )
@@ -1636,11 +1645,19 @@ def _quaff_no_potion(state, rng):
         (state, rng),
     )
 
-# Round 4 brax integration via PEP 562 lazy __getattr__.  Original names
-# are deleted from module globals; lookups fall through to __getattr__,
-# which imports the Brax versions lazily — breaks circular imports.
+# Round 4 brax integration via PEP 562 lazy __getattr__ with cycle-break.
+# Original names are deleted from module globals; module-attribute lookups
+# fall through to __getattr__, which imports the Brax versions lazily.
+# `_BRAX_ORIG` retains the originals so they can be returned during the
+# brief window when the brax module is still initialising (mirrors
+# swallow.py / items_corpses.py cycle-aware pattern).
 import os as _os_brax
+import sys as _sys_brax
 if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
+    _BRAX_ORIG = {
+        "quaff_potion": quaff_potion,
+        "apply_potion_to_monster": apply_potion_to_monster,
+    }
     _BRAX_MAP = {
         "quaff_potion": ("items_dispatch_brax", "quaff_potion_brax"),
         "apply_potion_to_monster": ("items_dispatch_brax", "apply_potion_to_monster_brax"),
@@ -1652,8 +1669,12 @@ if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
     def __getattr__(name):
         if name not in _BRAX_MAP:
             raise AttributeError(name)
+        mod_name, brax_name = _BRAX_MAP[name]
+        full = f"Nethax.nethax.subsystems.{mod_name}"
+        if full in _sys_brax.modules:
+            spec = getattr(_sys_brax.modules[full], "__spec__", None)
+            if spec is not None and getattr(spec, "_initializing", False):
+                return _BRAX_ORIG[name]
         if name not in _BRAX_CACHE:
-            mod_name, brax_name = _BRAX_MAP[name]
-            mod = __import__(f"Nethax.nethax.subsystems.{mod_name}", fromlist=[brax_name])
-            _BRAX_CACHE[name] = getattr(mod, brax_name)
+            _BRAX_CACHE[name] = getattr(__import__(full, fromlist=[brax_name]), brax_name)
         return _BRAX_CACHE[name]
