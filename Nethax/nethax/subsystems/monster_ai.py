@@ -6785,7 +6785,10 @@ def _mattackm_one_impl(state, atk_slot, key_i, conflict_active):
     def _strike(ss):
         return mattackm(ss, i32, j_idx, key_i)
 
-    return jax.lax.cond(do_strike, _strike, lambda ss: ss, state)
+    _state_strike = _strike(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(do_strike, t, f), _state_strike, state,
+    )
 
 
 _mattackm_one_jit = jax.jit(_mattackm_one_impl)
