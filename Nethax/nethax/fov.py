@@ -235,13 +235,10 @@ def compute_fov(
         # Also skip rays whose L∞ distance exceeds the actual sight_radius.
         beyond_radius = jnp.maximum(jnp.abs(dr), jnp.abs(dc)) > sight_radius_i32
         skip = ((dr == 0) & (dc == 0)) | beyond_radius
-        new_vis = jax.lax.cond(
-            skip,
-            lambda v: v,
-            lambda v: _cast_ray(v, terrain, opaque_overlay,
-                                pr, pc, dr, dc, max_steps),
-            vis,
-        )
+        # Brax-flatten: always cast ray, then mask via skip.
+        cast_vis = _cast_ray(vis, terrain, opaque_overlay,
+                             pr, pc, dr, dc, max_steps)
+        new_vis = jnp.where(skip, vis, cast_vis)
         return new_vis, None
 
     visible, _ = jax.lax.scan(cast_one, visible, jnp.arange(diameter * diameter))
@@ -684,336 +681,269 @@ def _process_segment(
     def inner_body(i, state):
         (cur, vis, qL, qR, qN, done) = state
 
-        def do_iter(_):
-            # Right-side: cur = "left" cursor; bound = right_mark; sweep up.
-            # Left-side: cur = "right" cursor; bound = left_mark; sweep down.
-            cur_in_bounds = jnp.where(
-                side_right,
-                cur <= right_mark,
-                cur >= right_mark,  # in left-side, right_mark = left_mark
-            )
+        # ----- Brax-flatten: always compute the do_iter body, then mask via done.
+        # Right-side: cur = "left" cursor; bound = right_mark; sweep up.
+        # Left-side: cur = "right" cursor; bound = left_mark; sweep down.
+        cur_in_bounds = jnp.where(
+            side_right,
+            cur <= right_mark,
+            cur >= right_mark,  # in left-side, right_mark = left_mark
+        )
 
-            def in_iter(_):
-                # right_edge = right_side ? right_ptrs[row][cur] : left_ptrs[row][cur]
-                rr = jnp.clip(row, 0, h - 1)
-                cc = jnp.clip(cur, 0, w - 1)
-                rp_val = right_ptrs[rr, cc].astype(jnp.int32)
-                lp_val = left_ptrs[rr, cc].astype(jnp.int32)
-                edge = jnp.where(side_right, rp_val, lp_val)
-                # Clamp to limit.
-                edge = jnp.where(side_right,
-                                 jnp.minimum(edge, lim_max),
-                                 jnp.maximum(edge, lim_min))
+        # ===== Always compute in_iter body; mask oob below.
+        rr = jnp.clip(row, 0, h - 1)
+        cc = jnp.clip(cur, 0, w - 1)
+        rp_val = right_ptrs[rr, cc].astype(jnp.int32)
+        lp_val = left_ptrs[rr, cc].astype(jnp.int32)
+        edge = jnp.where(side_right, rp_val, lp_val)
+        edge = jnp.where(side_right,
+                         jnp.minimum(edge, lim_max),
+                         jnp.maximum(edge, lim_min))
 
-                cell_clear = viz_clear[rr, cc]
+        cell_clear = viz_clear[rr, cc]
 
-                # Case 1: cell at `cur` is opaque — "Jump to the far side of
-                # a stone wall".
-                def opaque_case(_):
-                    # edge_overshoot test: right_side: edge > right_mark;
-                    # left_side: edge < right_mark (where right_mark = left_mark)
-                    overshoot = jnp.where(side_right,
-                                          edge > right_mark,
-                                          edge < right_mark)
-                    # Corner kludge: if cell on prev row at right_mark is clear,
-                    # extend edge by one step.
-                    prev_row = row - step
-                    pr_in_bounds = (prev_row >= 0) & (prev_row < h)
-                    pr_idx = jnp.clip(prev_row, 0, h - 1)
-                    mark_idx = jnp.clip(right_mark, 0, w - 1)
-                    prev_clear = jnp.where(
-                        pr_in_bounds,
-                        viz_clear[pr_idx, mark_idx],
-                        jnp.bool_(False),
-                    )
-                    edge2 = jnp.where(
-                        overshoot,
-                        jnp.where(side_right,
-                                  jnp.where(prev_clear, right_mark + 1, right_mark),
-                                  jnp.where(prev_clear, right_mark - 1, right_mark)),
-                        edge,
-                    )
-                    # Mark cells [cur..edge2] (right) or [edge2..cur] (left) visible.
-                    cols = jnp.arange(w, dtype=jnp.int32)
-                    in_range = jnp.where(
-                        side_right,
-                        (cols >= cur) & (cols <= edge2),
-                        (cols >= edge2) & (cols <= cur),
-                    )
-                    row_idx = jnp.clip(row, 0, h - 1)
-                    new_row = jnp.where(in_range, jnp.bool_(True), vis[row_idx])
-                    vis2 = vis.at[row_idx].set(new_row)
-                    # Advance cur past the wall: right: cur = edge2 + 1; left: cur = edge2 - 1.
-                    new_cur = jnp.where(side_right, edge2 + 1, edge2 - 1)
-                    # No recursion in the wall-jump branch.
-                    return (new_cur, vis2, qL, qR, qN, jnp.bool_(False))
+        # ===== opaque_case branch (always computed) =====
+        opq_overshoot = jnp.where(side_right,
+                                  edge > right_mark,
+                                  edge < right_mark)
+        prev_row = row - step
+        pr_in_bounds = (prev_row >= 0) & (prev_row < h)
+        pr_idx = jnp.clip(prev_row, 0, h - 1)
+        mark_idx = jnp.clip(right_mark, 0, w - 1)
+        prev_clear = jnp.where(
+            pr_in_bounds,
+            viz_clear[pr_idx, mark_idx],
+            jnp.bool_(False),
+        )
+        edge2 = jnp.where(
+            opq_overshoot,
+            jnp.where(side_right,
+                      jnp.where(prev_clear, right_mark + 1, right_mark),
+                      jnp.where(prev_clear, right_mark - 1, right_mark)),
+            edge,
+        )
+        cols_w = jnp.arange(w, dtype=jnp.int32)
+        opq_in_range = jnp.where(
+            side_right,
+            (cols_w >= cur) & (cols_w <= edge2),
+            (cols_w >= edge2) & (cols_w <= cur),
+        )
+        opq_row_idx = jnp.clip(row, 0, h - 1)
+        opq_new_row = jnp.where(opq_in_range, jnp.bool_(True), vis[opq_row_idx])
+        opq_vis = vis.at[opq_row_idx].set(opq_new_row)
+        opq_new_cur = jnp.where(side_right, edge2 + 1, edge2 - 1)
+        opq_cur_out, opq_vis_out, opq_qL_out, opq_qR_out, opq_qN_out, opq_done_out = (
+            opq_new_cur, opq_vis, qL, qR, qN, jnp.bool_(False)
+        )
 
-                def clear_case(_):
-                    # Vendor: "if (left != start_col)" — skip the left-finding
-                    # search when our cursor is already on the source column.
-                    on_source_col = cur == scol
-                    # ============================================
-                    # Find the visible-from-source end of the segment.
-                    # ============================================
-                    # For right_side:  left = first col in [cur..edge] such
-                    #   that q?_path(srow, scol, row, left) succeeds.
-                    # For left_side:   right = first col in [cur..edge] (cur
-                    #   sweeping down) such that q?_path succeeds.
-                    def find_visible(_):
-                        # Sweep from `cur` toward `edge` looking for first clear path.
-                        # Right: cur..edge ascending; Left: cur..edge descending.
-                        MAX_FIND = 80
-                        def find_body(i2, st):
-                            (pos, found, done2) = st
-                            def chk(_):
-                                cond = jnp.where(
-                                    side_right,
-                                    pos <= edge,
-                                    pos >= edge,
-                                )
-                                def do_test(_):
-                                    ok = _bresenham_clear(
-                                        viz_clear, srow, scol, row, pos
-                                    )
-                                    return jax.lax.cond(
-                                        ok,
-                                        lambda _: (pos, jnp.bool_(True),
-                                                   jnp.bool_(True)),
-                                        lambda _: (
-                                            jnp.where(side_right,
-                                                      pos + 1, pos - 1),
-                                            found,
-                                            done2,
-                                        ),
-                                        operand=None,
-                                    )
-                                return jax.lax.cond(cond, do_test,
-                                                     lambda _: (pos, found,
-                                                                jnp.bool_(True)),
-                                                     operand=None)
-                            return jax.lax.cond(done2, lambda _: st, chk,
-                                                operand=None)
-                        init = (cur, jnp.bool_(False), jnp.bool_(False))
-                        return jax.lax.fori_loop(0, MAX_FIND, find_body, init)
+        # ===== clear_case branch (always computed) =====
+        on_source_col = cur == scol
 
-                    found_pos, found_any, _ = jax.lax.cond(
-                        on_source_col,
-                        lambda _: (cur, jnp.bool_(True), jnp.bool_(True)),
-                        find_visible,
-                        operand=None,
-                    )
-                    # Vendor only does the boundary checks (lines 2414-2435 /
-                    # 2575-2590) inside the ``if (left != start_col)`` block
-                    # (lines 2391-2435).  When ``on_source_col`` is True we
-                    # skip find_visible entirely and proceed directly to the
-                    # find-right-side step.  Encode that here: ``past_limit``
-                    # / ``at_limit`` / ``backed_up`` only fire when we actually
-                    # ran the find_visible sweep.
-                    # Boundary checks (lines 2414-2424 / 2575-2585):
-                    # right_side: if (left > lim_max) return; if (left == lim_max) {mark; return}
-                    # left_side:  if (right < lim_min) return; if (right == lim_min) {mark; return}
-                    past_limit = (~on_source_col) & jnp.where(
-                        side_right,
-                        found_pos > lim_max,
-                        found_pos < lim_min,
-                    )
-                    at_limit = (~on_source_col) & jnp.where(
-                        side_right,
-                        found_pos == lim_max,
-                        found_pos == lim_min,
-                    )
+        # ---- find_visible: always run the sweep; select via on_source_col ----
+        MAX_FIND = 80
 
-                    def early_return(_):
-                        # Return from the entire while-loop: set done=True.
-                        return (cur, vis, qL, qR, qN, jnp.bool_(True))
+        def find_body(i2, st):
+            (pos, found, done2) = st
+            # Brax-flatten the inner cond chain.
+            cond_active = jnp.where(side_right, pos <= edge, pos >= edge)
+            ok = _bresenham_clear(viz_clear, srow, scol, row, pos)
+            adv_pos = jnp.where(side_right, pos + 1, pos - 1)
+            # ok-branch: (pos, True, True); not-ok: (adv_pos, found, done2)
+            test_pos = jnp.where(ok, pos, adv_pos)
+            test_found = jnp.where(ok, jnp.bool_(True), found)
+            test_done = jnp.where(ok, jnp.bool_(True), done2)
+            # chk: if cond_active use test else (pos, found, True)
+            chk_pos = jnp.where(cond_active, test_pos, pos)
+            chk_found = jnp.where(cond_active, test_found, found)
+            chk_done = jnp.where(cond_active, test_done, jnp.bool_(True))
+            # gate by done2 (already-done flag)
+            new_pos = jnp.where(done2, pos, chk_pos)
+            new_found = jnp.where(done2, found, chk_found)
+            new_done = jnp.where(done2, done2, chk_done)
+            return (new_pos, new_found, new_done)
 
-                    def at_limit_branch(_):
-                        # Mark cell (row, found_pos) visible and return.
-                        row_idx = jnp.clip(row, 0, h - 1)
-                        col_idx = jnp.clip(found_pos, 0, w - 1)
-                        vis2 = vis.at[row_idx, col_idx].set(True)
-                        return (cur, vis2, qL, qR, qN, jnp.bool_(True))
+        init_find = (cur, jnp.bool_(False), jnp.bool_(False))
+        find_pos_out, find_found_out, _ = jax.lax.fori_loop(
+            0, MAX_FIND, find_body, init_find
+        )
+        # Select find result vs on_source_col=(cur, True, True).
+        found_pos = jnp.where(on_source_col, cur, find_pos_out)
+        found_any = jnp.where(on_source_col, jnp.bool_(True), find_found_out)
 
-                    # Backed-up case (lines 2432-2435 / 2587-2590):
-                    # right_side: if (left >= right_edge): left = right_edge; continue.
-                    # left_side:  if (right <= left_edge): right = left_edge; continue.
-                    backed_up = (~on_source_col) & jnp.where(
-                        side_right,
-                        found_pos >= edge,
-                        found_pos <= edge,
-                    )
+        past_limit = (~on_source_col) & jnp.where(
+            side_right,
+            found_pos > lim_max,
+            found_pos < lim_min,
+        )
+        at_limit = (~on_source_col) & jnp.where(
+            side_right,
+            found_pos == lim_max,
+            found_pos == lim_min,
+        )
+        backed_up = (~on_source_col) & jnp.where(
+            side_right,
+            found_pos >= edge,
+            found_pos <= edge,
+        )
 
-                    def backed_up_branch(_):
-                        new_cur = edge
-                        return (new_cur, vis, qL, qR, qN, jnp.bool_(False))
+        # ---- early_return branch components ----
+        er_cur, er_vis, er_qL, er_qR, er_qN, er_done = (
+            cur, vis, qL, qR, qN, jnp.bool_(True)
+        )
 
-                    def normal_branch(_):
-                        # ``found_pos`` is the leftmost (right_side) / rightmost
-                        # (left_side) visible-from-source col.  Now find the
-                        # far end:
-                        # right_side: right = right_mark if right_mark >= edge
-                        #             else sweep right_mark..edge until q?_path fails.
-                        # left_side:  left  = left_mark  if left_mark  <= edge
-                        #             else sweep left_mark..edge descending.
-                        mark_inside_edge = jnp.where(
-                            side_right,
-                            right_mark < edge,
-                            right_mark > edge,
-                        )
+        # ---- at_limit_branch components ----
+        al_row_idx = jnp.clip(row, 0, h - 1)
+        al_col_idx = jnp.clip(found_pos, 0, w - 1)
+        al_vis = vis.at[al_row_idx, al_col_idx].set(True)
+        al_cur, al_qL, al_qR, al_qN, al_done = (
+            cur, qL, qR, qN, jnp.bool_(True)
+        )
 
-                        def far_via_sweep(_):
-                            MAX_FAR = 80
-                            def far_body(i3, st):
-                                (pos, last_ok, done3) = st
-                                def chk(_):
-                                    cond = jnp.where(
-                                        side_right,
-                                        pos <= edge,
-                                        pos >= edge,
-                                    )
-                                    def do_test(_):
-                                        ok = _bresenham_clear(
-                                            viz_clear, srow, scol, row, pos
-                                        )
-                                        return jax.lax.cond(
-                                            ok,
-                                            lambda _: (
-                                                jnp.where(side_right,
-                                                          pos + 1, pos - 1),
-                                                pos,
-                                                done3,
-                                            ),
-                                            lambda _: (pos, last_ok,
-                                                       jnp.bool_(True)),
-                                            operand=None,
-                                        )
-                                    return jax.lax.cond(cond, do_test,
-                                                         lambda _: (pos, last_ok,
-                                                                    jnp.bool_(True)),
-                                                         operand=None)
-                                return jax.lax.cond(done3, lambda _: st, chk,
-                                                    operand=None)
-                            # Vendor sweeps from right_mark to edge; we replicate.
-                            # last_ok starts as right_mark - step (so if no
-                            # iteration succeeds, the loop produces empty range
-                            # and the outer test left <= right kicks in).
-                            init_last = jnp.where(side_right,
-                                                  right_mark - jnp.int32(1),
-                                                  right_mark + jnp.int32(1))
-                            init = (right_mark, init_last, jnp.bool_(False))
-                            _, last_ok_out, _ = jax.lax.fori_loop(
-                                0, MAX_FAR, far_body, init
-                            )
-                            return last_ok_out
+        # ---- backed_up_branch components ----
+        bu_cur, bu_vis, bu_qL, bu_qR, bu_qN, bu_done = (
+            edge, vis, qL, qR, qN, jnp.bool_(False)
+        )
 
-                        far_pos = jax.lax.cond(
-                            mark_inside_edge,
-                            far_via_sweep,
-                            lambda _: edge,
-                            operand=None,
-                        )
+        # ---- normal_branch ----
+        mark_inside_edge = jnp.where(
+            side_right,
+            right_mark < edge,
+            right_mark > edge,
+        )
 
-                        # right_side: left=found_pos, right=far_pos
-                        # left_side:  right=found_pos, left=far_pos
-                        seg_lo = jnp.where(side_right, found_pos, far_pos)
-                        seg_hi = jnp.where(side_right, far_pos, found_pos)
+        # Always run far_via_sweep; select via mark_inside_edge.
+        MAX_FAR = 80
 
-                        # Ugly special case (lines 2475-2477 / 2611-2613):
-                        # right_side: if (left == right == start_col
-                        #             && start_col < COLNO-1 && !is_clear(row, start_col+1))
-                        #                 right = start_col + 1
-                        # left_side:  if (left == right == start_col
-                        #             && start_col > 0 && !is_clear(row, start_col-1))
-                        #                 left = start_col - 1
-                        sc_idx = jnp.clip(scol, 0, w - 1)
-                        sc_plus_idx = jnp.clip(scol + 1, 0, w - 1)
-                        sc_minus_idx = jnp.clip(scol - 1, 0, w - 1)
-                        row_idx0 = jnp.clip(row, 0, h - 1)
-                        adj_plus_opaque = ~viz_clear[row_idx0, sc_plus_idx]
-                        adj_minus_opaque = ~viz_clear[row_idx0, sc_minus_idx]
-                        special_right = (
-                            side_right
-                            & (seg_lo == seg_hi) & (seg_lo == scol)
-                            & (scol < (w - 1)) & adj_plus_opaque
-                        )
-                        special_left = (
-                            (~side_right)
-                            & (seg_lo == seg_hi) & (seg_hi == scol)
-                            & (scol > 0) & adj_minus_opaque
-                        )
-                        seg_hi = jnp.where(special_right, scol + 1, seg_hi)
-                        seg_lo = jnp.where(special_left, scol - 1, seg_lo)
+        def far_body(i3, st):
+            (pos, last_ok, done3) = st
+            cond_active = jnp.where(side_right, pos <= edge, pos >= edge)
+            ok = _bresenham_clear(viz_clear, srow, scol, row, pos)
+            adv_pos = jnp.where(side_right, pos + 1, pos - 1)
+            # ok-branch: (adv_pos, pos, done3); not-ok: (pos, last_ok, True)
+            test_pos = jnp.where(ok, adv_pos, pos)
+            test_last = jnp.where(ok, pos, last_ok)
+            test_done = jnp.where(ok, done3, jnp.bool_(True))
+            # chk: if cond_active use test else (pos, last_ok, True)
+            chk_pos = jnp.where(cond_active, test_pos, pos)
+            chk_last = jnp.where(cond_active, test_last, last_ok)
+            chk_done = jnp.where(cond_active, test_done, jnp.bool_(True))
+            new_pos = jnp.where(done3, pos, chk_pos)
+            new_last = jnp.where(done3, last_ok, chk_last)
+            new_done = jnp.where(done3, done3, chk_done)
+            return (new_pos, new_last, new_done)
 
-                        # Clamp to limits (lines 2479-2480 / 2615-2616).
-                        seg_lo = jnp.maximum(seg_lo, lim_min)
-                        seg_hi = jnp.minimum(seg_hi, lim_max)
+        init_last = jnp.where(side_right,
+                              right_mark - jnp.int32(1),
+                              right_mark + jnp.int32(1))
+        init_far = (right_mark, init_last, jnp.bool_(False))
+        _, far_last_ok_out, _ = jax.lax.fori_loop(
+            0, MAX_FAR, far_body, init_far
+        )
+        far_pos = jnp.where(mark_inside_edge, far_last_ok_out, edge)
 
-                        valid_seg = seg_lo <= seg_hi
+        seg_lo = jnp.where(side_right, found_pos, far_pos)
+        seg_hi = jnp.where(side_right, far_pos, found_pos)
 
-                        def emit_seg(_):
-                            # Mark [seg_lo..seg_hi] in `row` visible.
-                            cols = jnp.arange(w, dtype=jnp.int32)
-                            in_range = (cols >= seg_lo) & (cols <= seg_hi)
-                            row_idx = jnp.clip(row, 0, h - 1)
-                            new_row = jnp.where(in_range, jnp.bool_(True),
-                                                vis[row_idx])
-                            vis2 = vis.at[row_idx].set(new_row)
-                            # Push (seg_lo, seg_hi) onto next-row queue if deeper.
-                            should_push = deeper
-                            push_idx = qN
-                            qL2 = jax.lax.cond(
-                                should_push,
-                                lambda _: qL.at[push_idx].set(seg_lo),
-                                lambda _: qL,
-                                operand=None,
-                            )
-                            qR2 = jax.lax.cond(
-                                should_push,
-                                lambda _: qR.at[push_idx].set(seg_hi),
-                                lambda _: qR,
-                                operand=None,
-                            )
-                            qN2 = jnp.where(should_push, qN + 1, qN)
-                            # Advance cur past the segment.
-                            new_cur = jnp.where(side_right, seg_hi + 1,
-                                                seg_lo - 1)
-                            return (new_cur, vis2, qL2, qR2, qN2,
-                                    jnp.bool_(False))
+        sc_plus_idx = jnp.clip(scol + 1, 0, w - 1)
+        sc_minus_idx = jnp.clip(scol - 1, 0, w - 1)
+        row_idx0 = jnp.clip(row, 0, h - 1)
+        adj_plus_opaque = ~viz_clear[row_idx0, sc_plus_idx]
+        adj_minus_opaque = ~viz_clear[row_idx0, sc_minus_idx]
+        special_right = (
+            side_right
+            & (seg_lo == seg_hi) & (seg_lo == scol)
+            & (scol < (w - 1)) & adj_plus_opaque
+        )
+        special_left = (
+            (~side_right)
+            & (seg_lo == seg_hi) & (seg_hi == scol)
+            & (scol > 0) & adj_minus_opaque
+        )
+        seg_hi = jnp.where(special_right, scol + 1, seg_hi)
+        seg_lo = jnp.where(special_left, scol - 1, seg_lo)
 
-                        def skip_seg(_):
-                            # seg_lo > seg_hi — nothing to mark; advance past edge.
-                            new_cur = jnp.where(side_right, edge + 1, edge - 1)
-                            return (new_cur, vis, qL, qR, qN, jnp.bool_(False))
+        seg_lo = jnp.maximum(seg_lo, lim_min)
+        seg_hi = jnp.minimum(seg_hi, lim_max)
 
-                        return jax.lax.cond(valid_seg, emit_seg, skip_seg,
-                                             operand=None)
+        valid_seg = seg_lo <= seg_hi
 
-                    return jax.lax.cond(
-                        past_limit,
-                        early_return,
-                        lambda _: jax.lax.cond(
-                            at_limit,
-                            at_limit_branch,
-                            lambda _: jax.lax.cond(
-                                backed_up,
-                                backed_up_branch,
-                                normal_branch,
-                                operand=None,
-                            ),
-                            operand=None,
-                        ),
-                        operand=None,
-                    )
+        # emit_seg branch
+        emit_in_range = (cols_w >= seg_lo) & (cols_w <= seg_hi)
+        emit_row_idx = jnp.clip(row, 0, h - 1)
+        emit_new_row = jnp.where(emit_in_range, jnp.bool_(True),
+                                 vis[emit_row_idx])
+        emit_vis = vis.at[emit_row_idx].set(emit_new_row)
+        should_push = deeper
+        push_idx = qN
+        # Brax-flatten queue push.
+        qL_pushed = qL.at[push_idx].set(seg_lo)
+        qR_pushed = qR.at[push_idx].set(seg_hi)
+        emit_qL = jnp.where(should_push, qL_pushed, qL)
+        emit_qR = jnp.where(should_push, qR_pushed, qR)
+        emit_qN = jnp.where(should_push, qN + 1, qN)
+        emit_new_cur = jnp.where(side_right, seg_hi + 1, seg_lo - 1)
 
-                return jax.lax.cond(cell_clear, clear_case, opaque_case,
-                                     operand=None)
+        # skip_seg branch
+        skip_new_cur = jnp.where(side_right, edge + 1, edge - 1)
 
-            return jax.lax.cond(cur_in_bounds, in_iter,
-                                 lambda _: (cur, vis, qL, qR, qN,
-                                            jnp.bool_(True)),
-                                 operand=None)
+        # normal_branch = emit vs skip via valid_seg.
+        normal_cur = jnp.where(valid_seg, emit_new_cur, skip_new_cur)
+        normal_vis = jnp.where(valid_seg, emit_vis, vis)
+        normal_qL = jnp.where(valid_seg, emit_qL, qL)
+        normal_qR = jnp.where(valid_seg, emit_qR, qR)
+        normal_qN = jnp.where(valid_seg, emit_qN, qN)
+        normal_done = jnp.bool_(False)
 
-        return jax.lax.cond(done, lambda _: state, do_iter, operand=None)
+        # ---- 3-way priority: past_limit > at_limit > backed_up > normal ----
+        c_cur = jnp.where(backed_up, bu_cur, normal_cur)
+        c_vis = jnp.where(backed_up, bu_vis, normal_vis)
+        c_qL = jnp.where(backed_up, bu_qL, normal_qL)
+        c_qR = jnp.where(backed_up, bu_qR, normal_qR)
+        c_qN = jnp.where(backed_up, bu_qN, normal_qN)
+        c_done = jnp.where(backed_up, bu_done, normal_done)
+
+        c_cur = jnp.where(at_limit, al_cur, c_cur)
+        c_vis = jnp.where(at_limit, al_vis, c_vis)
+        c_qL = jnp.where(at_limit, al_qL, c_qL)
+        c_qR = jnp.where(at_limit, al_qR, c_qR)
+        c_qN = jnp.where(at_limit, al_qN, c_qN)
+        c_done = jnp.where(at_limit, al_done, c_done)
+
+        c_cur = jnp.where(past_limit, er_cur, c_cur)
+        c_vis = jnp.where(past_limit, er_vis, c_vis)
+        c_qL = jnp.where(past_limit, er_qL, c_qL)
+        c_qR = jnp.where(past_limit, er_qR, c_qR)
+        c_qN = jnp.where(past_limit, er_qN, c_qN)
+        c_done = jnp.where(past_limit, er_done, c_done)
+
+        # ---- cell_clear: select clear_case (c_*) vs opaque_case ----
+        cell_cur = jnp.where(cell_clear, c_cur, opq_cur_out)
+        cell_vis = jnp.where(cell_clear, c_vis, opq_vis_out)
+        cell_qL = jnp.where(cell_clear, c_qL, opq_qL_out)
+        cell_qR = jnp.where(cell_clear, c_qR, opq_qR_out)
+        cell_qN = jnp.where(cell_clear, c_qN, opq_qN_out)
+        cell_done = jnp.where(cell_clear, c_done, opq_done_out)
+
+        # ---- cur_in_bounds vs oob (oob -> done=True, no state change) ----
+        oob_cur, oob_vis, oob_qL, oob_qR, oob_qN, oob_done = (
+            cur, vis, qL, qR, qN, jnp.bool_(True)
+        )
+        iter_cur = jnp.where(cur_in_bounds, cell_cur, oob_cur)
+        iter_vis = jnp.where(cur_in_bounds, cell_vis, oob_vis)
+        iter_qL = jnp.where(cur_in_bounds, cell_qL, oob_qL)
+        iter_qR = jnp.where(cur_in_bounds, cell_qR, oob_qR)
+        iter_qN = jnp.where(cur_in_bounds, cell_qN, oob_qN)
+        iter_done = jnp.where(cur_in_bounds, cell_done, oob_done)
+
+        # ---- Finally gate by done (no-op if already done) ----
+        new_cur = jnp.where(done, cur, iter_cur)
+        new_vis = jnp.where(done, vis, iter_vis)
+        new_qL = jnp.where(done, qL, iter_qL)
+        new_qR = jnp.where(done, qR, iter_qR)
+        new_qN = jnp.where(done, qN, iter_qN)
+        new_done = jnp.where(done, done, iter_done)
+
+        return (new_cur, new_vis, new_qL, new_qR, new_qN, new_done)
 
     init = (left, visible, next_queue_left, next_queue_right, next_queue_count,
             jnp.bool_(False))
@@ -1061,81 +991,76 @@ def _view_from_quadrant(
     def row_body(i, state):
         (vis, seg_L, seg_R, seg_N, done) = state
 
-        def do_row(_):
-            row = start_row + step * i
-            row_in_bounds = (row >= 0) & (row < h)
-            # Compute limits for this row based on range.
-            # row_dist = abs(row - srow); circle index = circle_start[range] + (row_dist - 1).
-            row_dist = jnp.abs(row - srow).astype(jnp.int32)
-            # When range=0 (unlimited): lim_max = w-1, lim_min = 0.
-            unlimited = range_val == 0
-            range_clamped = jnp.clip(range_val, 0, MAX_RADIUS)
-            cs_idx = circle_start_arr[range_clamped] + (row_dist - 1)
-            cs_idx_safe = jnp.clip(cs_idx, 0, len(_CIRCLE_DATA) - 1)
-            limit_delta = circle_data_arr[cs_idx_safe]
-            # deeper test (vendor: limits || *limits >= *(limits+1))
-            # We compute deeper as: next row is in bounds AND (unlimited OR
-            # next row's row_dist <= range).
-            next_row_dist = row_dist + 1
-            deeper = (
-                ((row + step) >= 0) & ((row + step) < h)
-                & (unlimited | (next_row_dist.astype(jnp.int32) <= range_val))
+        # ----- Brax-flatten: always compute do_row body, then mask via done -----
+        row = start_row + step * i
+        row_in_bounds = (row >= 0) & (row < h)
+        row_dist = jnp.abs(row - srow).astype(jnp.int32)
+        unlimited = range_val == 0
+        range_clamped = jnp.clip(range_val, 0, MAX_RADIUS)
+        cs_idx = circle_start_arr[range_clamped] + (row_dist - 1)
+        cs_idx_safe = jnp.clip(cs_idx, 0, len(_CIRCLE_DATA) - 1)
+        limit_delta = circle_data_arr[cs_idx_safe]
+        next_row_dist = row_dist + 1
+        deeper = (
+            ((row + step) >= 0) & ((row + step) < h)
+            & (unlimited | (next_row_dist.astype(jnp.int32) <= range_val))
+        )
+
+        lim_max_full = jnp.where(unlimited, jnp.int32(w - 1),
+                                 jnp.minimum(scol + limit_delta,
+                                             jnp.int32(w - 1)))
+        lim_min_full = jnp.where(unlimited, jnp.int32(0),
+                                 jnp.maximum(scol - limit_delta,
+                                             jnp.int32(0)))
+
+        next_L = jnp.full((MAX_SEGS,), -1, dtype=jnp.int32)
+        next_R = jnp.full((MAX_SEGS,), -1, dtype=jnp.int32)
+        next_N = jnp.int32(0)
+
+        def seg_body(j, sstate):
+            (v, nL, nR, nN) = sstate
+            # Brax-flatten: always call _process_segment, then mask via j < seg_N.
+            L_j = seg_L[j]
+            R_j = seg_R[j]
+            cur_start = jnp.where(side_right, L_j, R_j)
+            mark = jnp.where(side_right, R_j, L_j)
+            mark = jnp.where(
+                side_right,
+                jnp.minimum(mark, lim_max_full),
+                jnp.maximum(mark, lim_min_full),
             )
-
-            lim_max_full = jnp.where(unlimited, jnp.int32(w - 1),
-                                     jnp.minimum(scol + limit_delta,
-                                                 jnp.int32(w - 1)))
-            lim_min_full = jnp.where(unlimited, jnp.int32(0),
-                                     jnp.maximum(scol - limit_delta,
-                                                 jnp.int32(0)))
-
-            # Process all segments for this row, collecting new segments for next row.
-            next_L = jnp.full((MAX_SEGS,), -1, dtype=jnp.int32)
-            next_R = jnp.full((MAX_SEGS,), -1, dtype=jnp.int32)
-            next_N = jnp.int32(0)
-
-            def seg_body(j, sstate):
-                (v, nL, nR, nN) = sstate
-                def do_seg(_):
-                    L_j = seg_L[j]   # segment low column
-                    R_j = seg_R[j]   # segment high column
-                    # _process_segment's first slot ``cur_start`` is the cursor
-                    # initial value, second slot ``mark`` is the bound:
-                    #   right_side: cursor = seg_lo (sweep up to right_mark=seg_hi)
-                    #   left_side:  cursor = seg_hi (sweep down to left_mark=seg_lo)
-                    cur_start = jnp.where(side_right, L_j, R_j)
-                    mark = jnp.where(side_right, R_j, L_j)
-                    # Vendor clamps the mark by limits (right_side: right_mark
-                    # by lim_max; left_side: left_mark by lim_min) before the loop.
-                    mark = jnp.where(
-                        side_right,
-                        jnp.minimum(mark, lim_max_full),
-                        jnp.maximum(mark, lim_min_full),
-                    )
-                    return _process_segment(
-                        v, viz_clear, left_ptrs, right_ptrs,
-                        srow, scol, row, cur_start, mark, step,
-                        side_right, lim_max_full, lim_min_full, deeper,
-                        nL, nR, nN,
-                    )
-                return jax.lax.cond(j < seg_N, do_seg,
-                                     lambda _: (v, nL, nR, nN),
-                                     operand=None)
-
-            (v_out, nL_out, nR_out, nN_out) = jax.lax.cond(
-                row_in_bounds,
-                lambda _: jax.lax.fori_loop(
-                    0, MAX_SEGS, seg_body, (vis, next_L, next_R, next_N)
-                ),
-                lambda _: (vis, next_L, next_R, jnp.int32(0)),
-                operand=None,
+            ps_v, ps_nL, ps_nR, ps_nN = _process_segment(
+                v, viz_clear, left_ptrs, right_ptrs,
+                srow, scol, row, cur_start, mark, step,
+                side_right, lim_max_full, lim_min_full, deeper,
+                nL, nR, nN,
             )
-            # If no new segments produced (or row was out of bounds), stop.
-            stop = (nN_out == 0) | (~deeper) | (~row_in_bounds)
-            return (v_out, nL_out, nR_out, nN_out, stop)
+            active = j < seg_N
+            new_v = jnp.where(active, ps_v, v)
+            new_nL = jnp.where(active, ps_nL, nL)
+            new_nR = jnp.where(active, ps_nR, nR)
+            new_nN = jnp.where(active, ps_nN, nN)
+            return (new_v, new_nL, new_nR, new_nN)
 
-        return jax.lax.cond(done | (i >= MAX_ROWS), lambda _: state, do_row,
-                             operand=None)
+        # Always run the seg fori_loop; mask via row_in_bounds.
+        loop_v, loop_nL, loop_nR, loop_nN = jax.lax.fori_loop(
+            0, MAX_SEGS, seg_body, (vis, next_L, next_R, next_N)
+        )
+        v_out = jnp.where(row_in_bounds, loop_v, vis)
+        nL_out = jnp.where(row_in_bounds, loop_nL, next_L)
+        nR_out = jnp.where(row_in_bounds, loop_nR, next_R)
+        nN_out = jnp.where(row_in_bounds, loop_nN, jnp.int32(0))
+
+        stop = (nN_out == 0) | (~deeper) | (~row_in_bounds)
+
+        # ----- Gate by done | (i >= MAX_ROWS) -----
+        skip_this = done | (i >= MAX_ROWS)
+        new_vis = jnp.where(skip_this, vis, v_out)
+        new_seg_L = jnp.where(skip_this, seg_L, nL_out)
+        new_seg_R = jnp.where(skip_this, seg_R, nR_out)
+        new_seg_N = jnp.where(skip_this, seg_N, nN_out)
+        new_done = jnp.where(skip_this, done, stop)
+        return (new_vis, new_seg_L, new_seg_R, new_seg_N, new_done)
 
     final = jax.lax.fori_loop(
         0, MAX_ROWS, row_body,
