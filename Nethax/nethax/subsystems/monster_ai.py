@@ -5041,7 +5041,10 @@ def monster_turn(state, rng: jax.Array, monster_idx: jnp.ndarray) -> object:
             def _maybe_cast(s2):
                 return monster_cast_spell(s2, rng_cast, idx)
 
-            st = jax.lax.cond(cast_now, _maybe_cast, lambda s2: s2, st)
+            _st_cast = _maybe_cast(st)
+            st = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(cast_now, t, f), _st_cast, st,
+            )
 
             # 7a: Elbereth fear check (onscary).
             # Cite: vendor/nethack/src/monmove.c::onscary lines 241-303.
