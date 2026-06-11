@@ -4355,7 +4355,10 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
         new_mai = _mai.replace(pos=_mai.pos.at[idx].set(flee_pos))
         return s.replace(monster_ai=new_mai)
 
-    state = jax.lax.cond(should_flee_low_hp, _flee_move, lambda s: s, state)
+    _state_flee = _flee_move(state)
+    state = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(should_flee_low_hp, t, f), _state_flee, state,
+    )
     mai = state.monster_ai
     # Re-derive is_pet, mpos after potential flee.
     is_pet = mai.tame[idx] & mai.alive[idx]
