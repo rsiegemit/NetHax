@@ -1257,14 +1257,18 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
     # for inv_strs rendering.
     def _boc(rng_c, chance):
         rng_c, hit = rn2_jax(rng_c, jnp.int32(chance))
-        def _hit_branch(r):
-            r2, inner = rn2_jax(r, jnp.int32(2))
-            return r2, inner
-        def _miss_branch(r):
-            return r, jnp.int32(0)
-        return jax.lax.cond(
-            hit == jnp.int32(0), _hit_branch, _miss_branch, rng_c,
+        # Brax-flatten: compute both branches; both branches' RNG advances are
+        # computed in HLO, and jnp.where selects the correct one per-element.
+        # Unselected branch's draw is discarded — byte-parity preserved.
+        rng_hit, inner_hit = rn2_jax(rng_c, jnp.int32(2))
+        rng_miss = rng_c
+        inner_miss = jnp.int32(0)
+        pred = hit == jnp.int32(0)
+        rng_out = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred, t, f), rng_hit, rng_miss,
         )
+        inner_out = jnp.where(pred, inner_hit, inner_miss)
+        return rng_out, inner_out
 
     # 1. rn1(10, 6) dagger quantity — u_init.c:750
     # rn1(x, y) == rn2(x) + y, so trquan = rn2(10) + 6 ∈ [6, 15].
@@ -1290,17 +1294,27 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
 
     def _weapon_else(r):
         r, r10 = rn2_jax(r, jnp.int32(10))
-        return jax.lax.cond(
-            r10 == jnp.int32(0), _weapon_cursed,
-            lambda rr: _boc(rr, 10),                              # blessorcurse(10)
-            r,
+        # Brax-flatten: compute both branches, jnp.where to select.
+        rng_cursed, b_cursed = _weapon_cursed(r)
+        rng_boc, b_boc = _boc(r, 10)                              # blessorcurse(10)
+        pred = r10 == jnp.int32(0)
+        rng_out = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred, t, f), rng_cursed, rng_boc,
         )
+        b_out = jnp.where(pred, b_cursed, b_boc)
+        return rng_out, b_out
 
     def _weapon_step(r):
         r, r11 = rn2_jax(r, jnp.int32(11))
-        return jax.lax.cond(
-            r11 == jnp.int32(0), _weapon_blessed, _weapon_else, r,
+        # Brax-flatten: compute both branches, jnp.where to select.
+        rng_blessed, b_blessed = _weapon_blessed(r)
+        rng_else, b_else = _weapon_else(r)
+        pred = r11 == jnp.int32(0)
+        rng_out = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred, t, f), rng_blessed, rng_else,
         )
+        b_out = jnp.where(pred, b_blessed, b_else)
+        return rng_out, b_out
 
     vendor_rng, _ss_blessed = _weapon_step(vendor_rng)           # SHORT_SWORD
     vendor_rng, _dg_blessed = _weapon_step(vendor_rng)           # DAGGER
@@ -1318,26 +1332,38 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
 
     def _armor_elif_boc(r):
         r, elif10 = rn2_jax(r, jnp.int32(10))                    # mkobj.c:1000
-        return jax.lax.cond(
-            elif10 == jnp.int32(0), _armor_blessed_branch,
-            lambda rr: _boc(rr, 10),                              # mkobj.c:1004
-            r,
+        # Brax-flatten: compute both branches, jnp.where to select.
+        rng_bless, b_bless = _armor_blessed_branch(r)
+        rng_boc, b_boc = _boc(r, 10)                              # mkobj.c:1004
+        pred = elif10 == jnp.int32(0)
+        rng_out = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred, t, f), rng_bless, rng_boc,
         )
+        b_out = jnp.where(pred, b_bless, b_boc)
+        return rng_out, b_out
 
     def _armor_outer_nonzero(r):
         r, r11 = rn2_jax(r, jnp.int32(11))                       # mkobj.c:997
-        return jax.lax.cond(
-            r11 == jnp.int32(0),
-            lambda rr: (rne_jax(rr, jnp.int32(3))[0], jnp.int32(0)),  # cursed
-            _armor_elif_boc,
-            r,
+        # Brax-flatten: compute both branches, jnp.where to select.
+        rng_cursed = rne_jax(r, jnp.int32(3))[0]                  # cursed
+        b_cursed = jnp.int32(0)
+        rng_elif, b_elif = _armor_elif_boc(r)
+        pred = r11 == jnp.int32(0)
+        rng_out = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred, t, f), rng_cursed, rng_elif,
         )
+        b_out = jnp.where(pred, b_cursed, b_elif)
+        return rng_out, b_out
 
     vendor_rng, outer = rn2_jax(vendor_rng, jnp.int32(10))      # mkobj.c:993
-    vendor_rng, _la_blessed = jax.lax.cond(
-        outer != jnp.int32(0), _armor_outer_nonzero, _armor_elif_boc,
-        vendor_rng,
+    # Brax-flatten top-level armor cond: compute both branches, jnp.where.
+    rng_nz, b_nz = _armor_outer_nonzero(vendor_rng)
+    rng_z, b_z = _armor_elif_boc(vendor_rng)
+    _armor_pred = outer != jnp.int32(0)
+    vendor_rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(_armor_pred, t, f), rng_nz, rng_z,
     )
+    _la_blessed = jnp.where(_armor_pred, b_nz, b_z)
 
     # 5. POT_SICKNESS — POTION_CLASS (mkobj.c:981-987 → blessorcurse(4))
     vendor_rng, _ps_blessed = _boc(vendor_rng, 4)
@@ -1448,46 +1474,43 @@ def _consume_attr_variation_draws(vendor_rng, stats, role: Role, race: Race):
             base = vals_c[i]
             new_base_pos = jnp.minimum(base + xd, attrmax_i)     # attrib.c:131-138
 
-            def _neg_path(args):
-                # xd < 0: may need an extra rn2 if new_base < attrmin.
-                rng_n, base_n, xd_n = args
-                tentative = base_n + xd_n
-                need_extra = tentative < attrmin_i
-                # The extra draw modulus is (attrmin - tentative + 1) which we
-                # compute jnp-side; when need_extra is False, the modulus would
-                # be <= 0 (invalid for rn2), so guard with lax.cond.
-                modulus = (attrmin_i - tentative + jnp.int32(1)).astype(jnp.int32)
-
-                def _do_draw(r):
-                    r, _ = rn2_jax(r, modulus)
-                    return r
-
-                rng_n = jax.lax.cond(need_extra, _do_draw, lambda r: r, rng_n)
-                # Brax-flatten: pure scalar select, no RNG consumed.
-                new_b = jnp.where(need_extra, attrmin_i, tentative)
-                return rng_n, new_b
-
-            def _pos_path(args):
-                rng_p, _base_p, _xd_p = args
-                return rng_p, new_base_pos
-
-            def _zero_path(args):
-                # xd == 0: adjattrib no-op, no further draw.
-                rng_z, base_z, _xd_z = args
-                return rng_z, base_z
-
-            # Three-way dispatch on sign(xd).  Use nested lax.cond.
-            rng_c, new_base = jax.lax.cond(
-                xd == jnp.int32(0),
-                _zero_path,
-                lambda args: jax.lax.cond(
-                    args[2] > jnp.int32(0),
-                    _pos_path,
-                    _neg_path,
-                    args,
-                ),
-                (rng_c, base, xd),
+            # _neg_path: xd < 0 may need an extra rn2 if tentative < attrmin.
+            # Brax-flatten the inner _do_draw gate: always draw, jnp.where to
+            # select.  Modulus is clamped to >=1 so rn2 stays valid when the
+            # unselected branch's draw would be a no-op anyway.
+            tentative_neg = base + xd
+            need_extra = tentative_neg < attrmin_i
+            modulus_raw = (attrmin_i - tentative_neg + jnp.int32(1)).astype(jnp.int32)
+            modulus = jnp.maximum(modulus_raw, jnp.int32(1))
+            rng_neg_draw, _ = rn2_jax(rng_c, modulus)
+            rng_neg = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(need_extra, t, f), rng_neg_draw, rng_c,
             )
+            new_b_neg = jnp.where(need_extra, attrmin_i, tentative_neg)
+
+            # _pos_path: xd > 0, no extra draw, base clamped to attrmax.
+            rng_pos = rng_c
+            new_b_pos = new_base_pos
+
+            # _zero_path: xd == 0, no draw, no change to base.
+            rng_zero = rng_c
+            new_b_zero = base
+
+            # Brax-flatten three-way sign dispatch: compute all three paths,
+            # jnp.where to select.  Outer pred: xd == 0; inner pred: xd > 0.
+            is_zero = xd == jnp.int32(0)
+            is_pos = xd > jnp.int32(0)
+            # Nonzero arm: select pos vs neg.
+            rng_nz = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(is_pos, t, f), rng_pos, rng_neg,
+            )
+            new_b_nz = jnp.where(is_pos, new_b_pos, new_b_neg)
+            # Outer: select zero vs nonzero.
+            rng_c = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(is_zero, t, f), rng_zero, rng_nz,
+            )
+            new_base = jnp.where(is_zero, new_b_zero, new_b_nz)
+
             vals_c = vals_c.at[i].set(new_base)
             return rng_c, vals_c
 
@@ -1495,12 +1518,14 @@ def _consume_attr_variation_draws(vendor_rng, stats, role: Role, race: Race):
             return carry
 
         vendor_rng, gate = rn2_jax(vendor_rng, jnp.int32(20))    # u_init.c:888
-        vendor_rng, vals = jax.lax.cond(
-            gate == jnp.int32(0),
-            _hit_branch,
-            _miss_branch,
-            (vendor_rng, vals),
+        # Brax-flatten outer hit/miss cond: compute both branches, jnp.where.
+        rng_hit, vals_hit = _hit_branch((vendor_rng, vals))
+        rng_miss, vals_miss = _miss_branch((vendor_rng, vals))
+        _gate_pred = gate == jnp.int32(0)
+        vendor_rng = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(_gate_pred, t, f), rng_hit, rng_miss,
         )
+        vals = jnp.where(_gate_pred, vals_hit, vals_miss)
 
     out = {name: vals[idx] for idx, name in enumerate(_STAT_NAMES)}
     return vendor_rng, out
