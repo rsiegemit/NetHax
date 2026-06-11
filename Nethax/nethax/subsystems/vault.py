@@ -161,10 +161,10 @@ def check_invault(state, rng: jax.Array):
 
     should_spawn = player_in_vault & guard_absent
 
-    def _spawn(s):
-        return _do_spawn_guard(s, pr, pc, vr, vc)
-
-    return jax.lax.cond(should_spawn, _spawn, lambda s: s, state)
+    spawned_state = _do_spawn_guard(state, pr, pc, vr, vc)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(should_spawn, t, f), spawned_state, state
+    )
 
 
 def _do_spawn_guard(state, pr, pc, vr, vc):
@@ -229,10 +229,10 @@ def guard_step(state, rng: jax.Array):
     escort_active = state.features.guard_escort_active
     guard_slot_val = state.features.guard_slot
 
-    def _do_escort(s):
-        return _escort_tick(s)
-
-    return jax.lax.cond(escort_active, _do_escort, lambda s: s, state)
+    escorted_state = _escort_tick(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(escort_active, t, f), escorted_state, state
+    )
 
 
 def _escort_tick(state):
@@ -444,4 +444,7 @@ def maybe_grddead(state):
     alive = state.monster_ai.alive[slot]
     was_tracked = guard_slot_val >= jnp.int32(0)
     died = was_tracked & (~alive)
-    return jax.lax.cond(died, grddead, lambda s: s, state)
+    dead_state = grddead(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(died, t, f), dead_state, state
+    )
