@@ -228,17 +228,26 @@ def _water_damage_one(items, slot_idx, force, rng):
         new_items, _ = erode_obj_slot(items_in, safe, ERODE_RUST, True, rng_rust)
         return new_items
 
-    items_after = lax.cond(
-        do_damage & is_scroll, _do_scroll, lambda x: x, items,
+    # Brax-flatten: compute each branch unconditionally and select via where.
+    _pred_scroll = do_damage & is_scroll
+    _scroll_res = _do_scroll(items)
+    items_after = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(_pred_scroll, t, f), _scroll_res, items,
     )
-    items_after = lax.cond(
-        do_damage & is_spbook, _do_spbook, lambda x: x, items_after,
+    _pred_spbook = do_damage & is_spbook
+    _spbook_res = _do_spbook(items_after)
+    items_after = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(_pred_spbook, t, f), _spbook_res, items_after,
     )
-    items_after = lax.cond(
-        do_damage & is_potion, _do_potion, lambda x: x, items_after,
+    _pred_potion = do_damage & is_potion
+    _potion_res = _do_potion(items_after)
+    items_after = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(_pred_potion, t, f), _potion_res, items_after,
     )
-    items_after = lax.cond(
-        do_damage & is_default, _do_rust, lambda x: x, items_after,
+    _pred_default = do_damage & is_default
+    _rust_res = _do_rust(items_after)
+    items_after = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(_pred_default, t, f), _rust_res, items_after,
     )
     return items_after
 
@@ -274,10 +283,11 @@ def water_damage_chain(state, rng):
         occupied = cat != jnp.int32(0)
         do_damage = occupied & ~saved
 
-        def _apply(items_in):
-            return _apply_per_cat(items_in, slot_idx, rng_rust)
-
-        items_new = lax.cond(do_damage, _apply, lambda x: x, items_acc)
+        # Brax-flatten: compute branch unconditionally; select via where.
+        _applied = _apply_per_cat(items_acc, slot_idx, rng_rust)
+        items_new = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(do_damage, t, f), _applied, items_acc,
+        )
         return items_new, None
 
     def _apply_per_cat(items_in, slot_idx, rng_rust):
@@ -312,10 +322,23 @@ def water_damage_chain(state, rng):
             new_it, _ = erode_obj_slot(it, slot_idx, ERODE_RUST, True, rng_rust)
             return new_it
 
-        out = lax.cond(is_scroll, _do_scroll, lambda x: x, items_in)
-        out = lax.cond(is_spbook, _do_spbook, lambda x: x, out)
-        out = lax.cond(is_potion, _do_potion, lambda x: x, out)
-        out = lax.cond(is_default, _do_rust, lambda x: x, out)
+        # Brax-flatten: compute each branch unconditionally; select via where.
+        _scroll_res = _do_scroll(items_in)
+        out = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(is_scroll, t, f), _scroll_res, items_in,
+        )
+        _spbook_res = _do_spbook(out)
+        out = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(is_spbook, t, f), _spbook_res, out,
+        )
+        _potion_res = _do_potion(out)
+        out = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(is_potion, t, f), _potion_res, out,
+        )
+        _rust_res = _do_rust(out)
+        out = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(is_default, t, f), _rust_res, out,
+        )
         return out
 
     slot_indices = jnp.arange(n, dtype=jnp.int32)
@@ -463,7 +486,12 @@ def drown(state, rng):
             done=new_done,
         )
 
-    return lax.cond(safe, _safe_submerge, _try_crawl_or_die, state)
+    # Brax-flatten: compute both branches unconditionally; select via where.
+    _safe_res = _safe_submerge(state)
+    _crawl_res = _try_crawl_or_die(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(safe, t, f), _safe_res, _crawl_res,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -506,17 +534,21 @@ def water_step(state, rng):
         # ``inpool_ok`` is what makes objects rust over time.
         r = jax.random.randint(rng_path, (), 0, 5, dtype=jnp.int32)
         apply_rust = r == jnp.int32(0)
-        return lax.cond(
-            apply_rust,
-            lambda x: water_damage_chain(x, rng_apply),
-            lambda x: x,
-            s,
+        # Brax-flatten: compute water_damage_chain unconditionally; select.
+        _rust_res = water_damage_chain(s, rng_apply)
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(apply_rust, t, f), _rust_res, s,
         )
 
     def _leave_water(s):
         return s.replace(turns_underwater=jnp.int16(0))
 
-    return lax.cond(in_water, _tick_in_water, _leave_water, state)
+    # Brax-flatten: compute both branches unconditionally; select via where.
+    _tick_res = _tick_in_water(state)
+    _leave_res = _leave_water(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(in_water, t, f), _tick_res, _leave_res,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -646,8 +678,10 @@ def lava_effects(state, rng):
     def _burn_boots(items_in):
         return _delete_slot(items_in, boot_slot)
 
-    items_after_boots = lax.cond(
-        burn_boots, _burn_boots, lambda x: x, items,
+    # Brax-flatten: compute burn-boots branch unconditionally; select via where.
+    _boots_res = _burn_boots(items)
+    items_after_boots = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(burn_boots, t, f), _boots_res, items,
     )
 
     # If boots provided Wwalking, the loss may flip usurvive.  Without an
@@ -683,12 +717,20 @@ def lava_effects(state, rng):
     def _burn_flagged(items_in):
         def step(it, idx):
             should = _organic_or_potion_burnable(it, idx)
-            return lax.cond(should, lambda x: _delete_slot(x, idx), lambda x: x, it), None
+            # Brax-flatten: compute delete unconditionally; select via where.
+            _del_res = _delete_slot(it, idx)
+            it_new = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(should, t, f), _del_res, it,
+            )
+            return it_new, None
         out, _ = lax.scan(step, items_in, jnp.arange(MAX_INVENTORY_SLOTS, dtype=jnp.int32))
         return out
 
-    items_after_burn = lax.cond(
-        ~usurvive & ~fire_res, _burn_flagged, lambda x: x, items_after_boots,
+    # Brax-flatten: compute burn-flagged branch unconditionally; select via where.
+    _burn_pred = ~usurvive & ~fire_res
+    _burn_res = _burn_flagged(items_after_boots)
+    items_after_burn = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(_burn_pred, t, f), _burn_res, items_after_boots,
     )
 
     new_inv = inv.replace(items=items_after_burn)
