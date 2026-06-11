@@ -259,37 +259,39 @@ def walkfrom_vendor(
         dirs = jnp.zeros(4, dtype=jnp.int32)
         dirs = dirs.at[slot_idx].set(jnp.arange(4, dtype=jnp.int32))
 
-        def do_pop(s):
-            r_, t_, st_, p_ = s
-            return r_, t_, st_, p_ - 1
+        # Brax-flatten: compute both pop and push branches eagerly, then
+        # select via jnp.where on the (q == 0) gate.  Mirrors lax.cond.
+        is_pop = q == 0
 
-        def do_push(s):
-            r_, t_, st_, p_ = s
-            # rn2(q): uniform int in [0, q).  Vendor mkmaze.c:1247 draws
-            # exactly one ISAAC64 word via rn2(q); _draw_rn2 dispatches to
-            # rn2_jax for vendor RNG state or Threefry for legacy callers.
-            r_, i = _draw_rn2(r_, q)
-            dir_ = dirs[i]
-            dy = _DIR_DY[dir_]
-            dx = _DIR_DX[dir_]
-            # First mz_move — wall cell — carve.
-            wy = y + dy
-            wx = x + dx
-            t_ = t_.at[wy, wx].set(jnp.int8(TILE_FLOOR))
-            # Second mz_move — new cell — push (carve happens at top of
-            # next iteration to mirror vendor's top-of-loop carve).
-            cy = y + 2 * dy
-            cx = x + 2 * dx
-            st_ = st_.at[p_].set(
-                jnp.stack(
-                    [cy.astype(jnp.int16), cx.astype(jnp.int16)]
-                )
+        # Pop branch (no RNG draw, no terrain/stack writes).
+        r_pop = rng_
+        t_pop = terrain_
+        st_pop = stack_
+        sp_pop = sp_ - 1
+
+        # Push branch (draws RNG, carves wall, pushes new cell).
+        r_push, i_push = _draw_rn2(rng_, jnp.maximum(q, jnp.int32(1)))
+        dir_push = dirs[i_push]
+        dy_push = _DIR_DY[dir_push]
+        dx_push = _DIR_DX[dir_push]
+        wy_push = y + dy_push
+        wx_push = x + dx_push
+        t_push = terrain_.at[wy_push, wx_push].set(jnp.int8(TILE_FLOOR))
+        cy_push = y + 2 * dy_push
+        cx_push = x + 2 * dx_push
+        st_push = stack_.at[sp_].set(
+            jnp.stack(
+                [cy_push.astype(jnp.int16), cx_push.astype(jnp.int16)]
             )
-            return r_, t_, st_, p_ + 1
-
-        rng_, terrain_, stack_, sp_ = lax.cond(
-            q == 0, do_pop, do_push, (rng_, terrain_, stack_, sp_)
         )
+        sp_push = sp_ + 1
+
+        rng_ = jax.tree_util.tree_map(
+            lambda tval, fval: jnp.where(is_pop, tval, fval), r_pop, r_push
+        )
+        terrain_ = jnp.where(is_pop, t_pop, t_push)
+        stack_ = jnp.where(is_pop, st_pop, st_push)
+        sp_ = jnp.where(is_pop, sp_pop, sp_push)
         return rng_, terrain_, stack_, sp_
 
     rng_out, terrain_out, _stack_out, _sp_out = lax.while_loop(
@@ -455,20 +457,11 @@ def _legacy_kruskal_maze(
         rb = _uf_find(parent_, cb)
         different = ra != rb
 
-        # Carve wall tile if different components.
-        maze_new = lax.cond(
-            different,
-            lambda m: m.at[wr, wc].set(jnp.int8(TILE_FLOOR)),
-            lambda m: m,
-            maze_,
-        )
-        # Union the components.
-        parent_new = lax.cond(
-            different,
-            lambda p: _uf_union(p, ca, cb),
-            lambda p: p,
-            parent_,
-        )
+        # Brax-flatten: compute both branches eagerly, select via jnp.where.
+        maze_carved = maze_.at[wr, wc].set(jnp.int8(TILE_FLOOR))
+        maze_new = jnp.where(different, maze_carved, maze_)
+        parent_unioned = _uf_union(parent_, ca, cb)
+        parent_new = jnp.where(different, parent_unioned, parent_)
         return (maze_new, parent_new), None
 
     edges = jnp.stack([ca_s, cb_s, wr_s, wc_s], axis=1)  # [n_edges, 4]
