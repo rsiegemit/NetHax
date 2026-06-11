@@ -1264,24 +1264,17 @@ def generate_main_branch_l1(
         # produced at least one room, so this is just a safety harness).
         has_rooms = nroom_int > jnp.int32(0)
 
-        def _draw_down_pick(args):
-            vrng_in, _ = args
-            vrng_out, idx = rn2_jax(
-                vrng_in,
-                jnp.maximum(nroom_int, jnp.int32(1)),
-            )
-            return vrng_out, idx
-
-        def _skip_down_pick(args):
-            vrng_in, _ = args
-            return vrng_in, jnp.int32(0)
-
-        vendor_rng, down_idx = lax.cond(
-            has_rooms,
-            _draw_down_pick,
-            _skip_down_pick,
-            (vendor_rng, jnp.int32(0)),
+        # Brax-flatten: always compute the rn2 draw, then jnp.where-select on
+        # ``has_rooms``.  Under vmap, lax.cond emits both branches anyway;
+        # explicit selection drops the cond-merge HLO.  Byte-identical.
+        _vrng_drawn, _down_idx_drawn = rn2_jax(
+            vendor_rng,
+            jnp.maximum(nroom_int, jnp.int32(1)),
         )
+        vendor_rng = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(has_rooms, a, b), _vrng_drawn, vendor_rng,
+        )
+        down_idx = jnp.where(has_rooms, _down_idx_drawn, jnp.int32(0))
 
         # Vendor somex/somey draws: rn1(hx-lx+1, lx), rn1(hy-ly+1, ly).
         # Both draws ALWAYS fire on the down-stair path (Is_botlevel
@@ -1304,42 +1297,25 @@ def generate_main_branch_l1(
         dn_w_safe = jnp.maximum(dn_w, jnp.int32(1))
         dn_h_safe = jnp.maximum(dn_h, jnp.int32(1))
 
-        def _draw_down_xy(args):
-            vrng_in = args
-            vrng_out, sx = rn1_jax(vrng_in, dn_w_safe, dn_lx.astype(jnp.int32))
-            vrng_out, sy = rn1_jax(vrng_out, dn_h_safe, dn_ly.astype(jnp.int32))
-            return vrng_out, sx.astype(jnp.int16), sy.astype(jnp.int16)
-
-        def _skip_down_xy(args):
-            vrng_in = args
-            return vrng_in, jnp.int16(0), jnp.int16(0)
-
-        vendor_rng, dn_sx, dn_sy = lax.cond(
-            has_rooms,
-            _draw_down_xy,
-            _skip_down_xy,
-            vendor_rng,
+        # Brax-flatten: always compute both rn1 draws, then jnp.where-select.
+        _vrng_xy, _sx_drawn = rn1_jax(vendor_rng, dn_w_safe, dn_lx.astype(jnp.int32))
+        _vrng_xy, _sy_drawn = rn1_jax(_vrng_xy, dn_h_safe, dn_ly.astype(jnp.int32))
+        vendor_rng = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(has_rooms, a, b), _vrng_xy, vendor_rng,
         )
+        dn_sx = jnp.where(has_rooms, _sx_drawn.astype(jnp.int16), jnp.int16(0))
+        dn_sy = jnp.where(has_rooms, _sy_drawn.astype(jnp.int16), jnp.int16(0))
 
         # Up-stair room pick — vendor mklev.c:715 ``if (nroom > 1)``.
         has_more_than_one = nroom_int > jnp.int32(1)
 
-        def _draw_up_pick(args):
-            vrng_in = args
-            vrng_out, _idx = rn2_jax(
-                vrng_in,
-                jnp.maximum(nroom_int - jnp.int32(1), jnp.int32(1)),
-            )
-            return vrng_out
-
-        def _skip_up_pick(args):
-            return args
-
-        vendor_rng = lax.cond(
-            has_more_than_one,
-            _draw_up_pick,
-            _skip_up_pick,
+        # Brax-flatten: always compute the up-pick rn2 draw, jnp.where-select.
+        _vrng_up, _ = rn2_jax(
             vendor_rng,
+            jnp.maximum(nroom_int - jnp.int32(1), jnp.int32(1)),
+        )
+        vendor_rng = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(has_more_than_one, a, b), _vrng_up, vendor_rng,
         )
 
         # Up-stair somex/somey on Dlvl 1 are NOT drawn (mklev.c:720
@@ -1515,13 +1491,18 @@ def generate_main_branch_l1(
         # vendor's ``do_vault`` block then drops the vault while Nethax
         # used to add it speculatively, causing an 18-byte cascade.
         # Vendor cite: vendor/nle/src/sp_lev.c:1063-1120 (check_room).
-        def _do_check_room(v):
-            return _check_room_vault_simple(v, _lgs.typ, _mk_vault_x, _mk_vault_y)
-        def _skip_check_room(v):
-            return v, jnp.bool_(False)
-        vendor_rng, _check_room_pass = lax.cond(
-            _vault_created_in_makerooms,
-            _do_check_room, _skip_check_room, vendor_rng,
+        # Brax-flatten: always run _check_room_vault_simple, then jnp.where-select
+        # on ``_vault_created_in_makerooms``.  Under vmap, lax.cond emits both
+        # branches anyway; explicit selection drops the cond-merge HLO.
+        _vrng_cr, _cr_pass_drawn = _check_room_vault_simple(
+            vendor_rng, _lgs.typ, _mk_vault_x, _mk_vault_y,
+        )
+        vendor_rng = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(_vault_created_in_makerooms, a, b),
+            _vrng_cr, vendor_rng,
+        )
+        _check_room_pass = jnp.where(
+            _vault_created_in_makerooms, _cr_pass_drawn, jnp.bool_(False),
         )
         _vault_created_in_makerooms = _vault_created_in_makerooms & _check_room_pass
         _nroom_post_vault = jnp.where(
@@ -1655,22 +1636,21 @@ def generate_main_branch_l1(
             _nroom_post_vault - jnp.int32(1),
             jnp.int32(MAX_ROOMS_PER_LEVEL - 1),
         )
+        # Brax-flatten: always compute the patched arrays, then jnp.where-select
+        # on ``_vault_created_in_makerooms``.  Under vmap, lax.cond emits both
+        # branches anyway; explicit selection drops the cond-merge HLO.
+        _rtype_patched = _rooms_box.rtype.at[_slot_idx].set(_ROOM_TYPE_VAULT)
+        _active_patched = _rooms_box.active.at[_slot_idx].set(jnp.bool_(True))
         _rooms_box_postvault = _rooms_box.replace(
             lx=_rooms_box.lx.at[_slot_idx].set(_v_lx.astype(jnp.int16)),
             ly=_rooms_box.ly.at[_slot_idx].set(_v_ly.astype(jnp.int16)),
             hx=_rooms_box.hx.at[_slot_idx].set(_v_hx.astype(jnp.int16)),
             hy=_rooms_box.hy.at[_slot_idx].set(_v_hy.astype(jnp.int16)),
-            rtype=lax.cond(
-                _vault_created_in_makerooms,
-                lambda a: a.at[_slot_idx].set(_ROOM_TYPE_VAULT),
-                lambda a: a,
-                _rooms_box.rtype,
+            rtype=jnp.where(
+                _vault_created_in_makerooms, _rtype_patched, _rooms_box.rtype,
             ),
-            active=lax.cond(
-                _vault_created_in_makerooms,
-                lambda a: a.at[_slot_idx].set(jnp.bool_(True)),
-                lambda a: a,
-                _rooms_box.active,
+            active=jnp.where(
+                _vault_created_in_makerooms, _active_patched, _rooms_box.active,
             ),
         )
 
@@ -1719,16 +1699,19 @@ def generate_main_branch_l1(
         _new_lgs_typ = jnp.where(_stamp_gate & _v_br, jnp.int8(_VBR_v), _new_lgs_typ)
         _lgs = _lgs.replace(typ=_new_lgs_typ)
 
-        def _do_vault_draws(carry):
-            v, gs_ = carry
-            return _do_vault_draws_body(v, gs_, _rooms_box_postvault, _nroom_post_vault)
-
-        def _skip_do_vault_draws(carry):
-            return carry
-
-        vendor_rng, _lgs = lax.cond(
-            _vault_created_in_makerooms,
-            _do_vault_draws, _skip_do_vault_draws, (vendor_rng, _lgs),
+        # Brax-flatten: always run _do_vault_draws_body, then jnp.where-select
+        # on ``_vault_created_in_makerooms``.  Under vmap, lax.cond emits both
+        # branches anyway; explicit selection drops the cond-merge HLO.
+        _vrng_dv, _lgs_dv = _do_vault_draws_body(
+            vendor_rng, _lgs, _rooms_box_postvault, _nroom_post_vault,
+        )
+        vendor_rng = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(_vault_created_in_makerooms, a, b),
+            _vrng_dv, vendor_rng,
+        )
+        _lgs = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(_vault_created_in_makerooms, a, b),
+            _lgs_dv, _lgs,
         )
         # Re-snapshot vendor_levl_grid from the POST-vault ``_lgs.typ`` so the
         # SCORR + SDOOR writes performed by ``_do_vault_draws_body``'s nested
