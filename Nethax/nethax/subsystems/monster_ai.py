@@ -6555,7 +6555,10 @@ def _bp_move_or_skip_impl(state, monster_idx, cur_pos, new_pos_i32,
         )
         return s.replace(monster_ai=new_m)
 
-    return jax.lax.cond(do_move, _run, lambda s: s, state)
+    _state_run = _run(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(do_move, t, f), _state_run, state,
+    )
 
 
 _bp_move_or_skip_jit = jax.jit(_bp_move_or_skip_impl)
