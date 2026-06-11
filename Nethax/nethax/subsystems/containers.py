@@ -292,7 +292,9 @@ def unlock_container(state, container_idx):
         s2, _ = fire_container_trap(s, container_idx)
         return s2
 
-    state = jax.lax.cond(was_locked & is_trapped, _fire, lambda s: s, state)
+    state = jax.tree_util.tree_map(
+        lambda f, o: jnp.where(was_locked & is_trapped, f, o), _fire(state), state,
+    )
     return state, was_locked
 
 
@@ -1054,10 +1056,10 @@ def handle_loot_floor(state, rng):
     first_idx     = jnp.argmax(usable).astype(jnp.int32)
     any_present   = jnp.any(usable)
 
-    def _open(s):
-        return open_container(s, first_idx)
-
-    return jax.lax.cond(any_present, _open, lambda s: s, state)
+    return jax.tree_util.tree_map(
+        lambda o, s: jnp.where(any_present, o, s),
+        open_container(state, first_idx), state,
+    )
 
 
 # Back-compat alias: legacy name ``handle_loot`` still referenced by
@@ -1110,10 +1112,10 @@ def handle_apply_container(state, rng):
     use_choice = have_choice & any_match
     first_idx  = jnp.where(use_choice, match_idx, fallback_idx)
 
-    def _open(s):
-        return open_container(s, first_idx)
-
-    return jax.lax.cond(any_present, _open, lambda s: s, state)
+    return jax.tree_util.tree_map(
+        lambda o, s: jnp.where(any_present, o, s),
+        open_container(state, first_idx), state,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1319,11 +1321,9 @@ def maybe_explode_on_insert(state, container_idx: int, src_slot: int):
 
     should_explode = is_mbag & (is_wan_cancel | is_nested_mbag)
 
-    return jax.lax.cond(
-        should_explode,
-        lambda s: cancel_bag_of_holding(s, container_idx, src_slot),
-        lambda s: s,
-        state,
+    return jax.tree_util.tree_map(
+        lambda c, o: jnp.where(should_explode, c, o),
+        cancel_bag_of_holding(state, container_idx, src_slot), state,
     )
 
 
@@ -1384,23 +1384,21 @@ def handle_doloot(state, rng):
     first_c_pos   = jnp.argmax(occupied_in_c).astype(jnp.int32)
     any_in_c      = jnp.any(occupied_in_c)
 
-    # Branch 1: open the container (mirrors handle_loot).
-    def _open_and_dispatch(s):
-        s = open_container(s, first_idx_signed)
-        # IN path — default when player has non-coin inventory.
-        def _put(st):
-            return put_in_container(st, first_idx_signed, first_inv_slot)
-        # OUT path — when inventory has no non-coin items.
-        def _take(st):
-            return jax.lax.cond(
-                any_in_c,
-                lambda x: take_from_container(x, first_idx_signed, first_c_pos),
-                lambda x: x,
-                st,
-            )
-        return jax.lax.cond(non_coin_present, _put, _take, s)
-
-    return jax.lax.cond(any_present, _open_and_dispatch, lambda s: s, state)
+    # Brax-flat: compute open + both put / take branches, then nested
+    # jnp.where selects on (non_coin_present, any_in_c, any_present).
+    opened = open_container(state, first_idx_signed)
+    put_result  = put_in_container(opened, first_idx_signed, first_inv_slot)
+    take_taken  = take_from_container(opened, first_idx_signed, first_c_pos)
+    take_result = jax.tree_util.tree_map(
+        lambda t, o: jnp.where(any_in_c, t, o), take_taken, opened,
+    )
+    dispatched = jax.tree_util.tree_map(
+        lambda p, t: jnp.where(non_coin_present, p, t),
+        put_result, take_result,
+    )
+    return jax.tree_util.tree_map(
+        lambda d, s: jnp.where(any_present, d, s), dispatched, state,
+    )
 
 
 # ---------------------------------------------------------------------------
