@@ -6247,10 +6247,16 @@ def _monster_turn_a_impl(state, rng, monster_idx, may_act):
                 def _maybe_cast(s2):
                     return monster_cast_spell(s2, rng_cast, idx)
 
-                st = jax.lax.cond(cast_now, _maybe_cast, lambda s2: s2, st)
+                _st_cast = _maybe_cast(st)
+                st = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(cast_now, t, f), _st_cast, st,
+                )
                 return st
 
-            ss = jax.lax.cond(should_act, _act_pre_path, lambda st: st, ss)
+            _ss_act = _act_pre_path(ss)
+            ss = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(should_act, t, f), _ss_act, ss,
+            )
             return ss, was_asleep_local
 
         # Pet branch is run separately by ``_bp_pet_or_skip_jit`` at the
@@ -6258,14 +6264,23 @@ def _monster_turn_a_impl(state, rng, monster_idx, may_act):
         # hostile-branch work for pets.
         mai = s.monster_ai
         is_pet_inner = mai.tame[idx] & mai.alive[idx]
-        return jax.lax.cond(is_pet_inner,
-                            lambda ss: (ss, jnp.bool_(False)),
-                            _hostile_branch, s)
+        _hostile_s, _hostile_was = _hostile_branch(s)
+        _state_pa = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(is_pet_inner, t, f), s, _hostile_s,
+        )
+        _was_pa = jnp.where(is_pet_inner, jnp.bool_(False), _hostile_was)
+        return _state_pa, _was_pa
 
     def _no_work(s):
         return s, jnp.bool_(False)
 
-    return jax.lax.cond(may_act, _real_work, _no_work, state)
+    _rs, _rw = _real_work(state)
+    _ns, _nw = _no_work(state)
+    _state_ma = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(may_act, t, f), _rs, _ns,
+    )
+    _was_ma = jnp.where(may_act, _rw, _nw)
+    return _state_ma, _was_ma
 
 
 _monster_turn_a_jit = jax.jit(_monster_turn_a_impl)

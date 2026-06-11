@@ -272,11 +272,10 @@ def _effect_full_healing(state, rng, buc):
         status=new_status,
     )
     rng_pl, _ = jax.random.split(rng)
-    return jax.lax.cond(
-        blessed,
-        lambda s: _pluslvl(s, rng_pl, incr=False),
-        lambda s: s,
-        mid_state,
+    _plus_state = _pluslvl(mid_state, rng_pl, incr=False)
+    return jax.tree.map(
+        lambda t, f: jnp.where(blessed, t, f),
+        _plus_state, mid_state,
     )
 
 
