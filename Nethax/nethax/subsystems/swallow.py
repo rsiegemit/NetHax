@@ -217,11 +217,8 @@ def try_engulf(
     )
 
     # No-op if already swallowed; apply engulf otherwise.
-    return jax.lax.cond(
-        already,
-        lambda s: s,
-        lambda s: swallowed_state,
-        state,
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(already, t, f), state, swallowed_state
     )
 
 
@@ -303,18 +300,14 @@ def digest_tick(state, rng: jax.Array):
         # deleted from globals(); the lambda would NameError at trace time.
         import sys as _sys_re
         _release_fn = getattr(_sys_re.modules[__name__], "release_from_engulf")
-        return jax.lax.cond(
-            should_release,
-            lambda st: _release_fn(st),
-            lambda st: st,
-            s2,
+        released = _release_fn(s2)
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(should_release, t, f), released, s2
         )
 
-    return jax.lax.cond(
-        state.swallow.swallowed,
-        _tick,
-        lambda s: s,
-        state,
+    ticked = _tick(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(state.swallow.swallowed, t, f), ticked, state
     )
 
 # Round 4 brax integration via PEP 562 lazy __getattr__ with cycle-break.
