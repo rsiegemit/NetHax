@@ -364,11 +364,12 @@ def _blessorcurse_jax(rng: Isaac64State, chance: int) -> Isaac64State:
         }
     """
     rng, hit = rn2_jax(rng, chance)                         # mkobj.c:1377
-    rng = lax.cond(
-        hit == jnp.int32(0),
-        lambda r: rn2_jax(r, 2)[0],                         # mkobj.c:1378
-        lambda r: r,
-        rng,
+    # Brax-flatten.
+    pred_hit = hit == jnp.int32(0)
+    tr_hit = rn2_jax(rng, 2)[0]                             # mkobj.c:1378
+    fr_hit = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(pred_hit, t, f), tr_hit, fr_hit
     )
     return rng
 
@@ -508,11 +509,13 @@ def _mk_artifact_anone_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64Sta
     safe_otyp = jnp.clip(otyp, 0, _ARTIFACT_ANONE_COUNT_TABLE.shape[0] - 1).astype(jnp.int32)
     n = _ARTIFACT_ANONE_COUNT_TABLE[safe_otyp]
     # rn2(0) would be ill-defined; vendor skips the draw entirely when n==0.
-    return lax.cond(
-        n > jnp.int32(0),
-        lambda r: rn2_jax(r, n)[0],
-        lambda r: r,
-        rng,
+    # Brax-flatten.
+    pred_n = n > jnp.int32(0)
+    safe_n = jnp.maximum(n, jnp.int32(1))  # guard rn2(0) in the dead branch
+    tr_n = rn2_jax(rng, safe_n)[0]
+    fr_n = rng
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(pred_n, t, f), tr_n, fr_n
     )
 
 
@@ -538,11 +541,11 @@ def _weapon_draws(
     is_poi = _WEAPON_POISONABLE_TABLE[safe_otyp]
 
     # rn1(6, 6) = rn2(6) + 7 — 1 draw, gated on is_multigen (mkobj.c:804).
-    rng = lax.cond(
-        is_mg,
-        lambda r: rn1_jax(r, 6, 6)[0],
-        lambda r: r,
-        rng,
+    # Brax-flatten.
+    tr_mg = rn1_jax(rng, 6, 6)[0]
+    fr_mg = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_mg, t, f), tr_mg, fr_mg
     )
 
     rng, r11 = rn2_jax(rng, 11)                              # mkobj.c:805
@@ -554,21 +557,27 @@ def _weapon_draws(
 
     def _branch_curse_or_boc(r):
         r, r10 = rn2_jax(r, 10)                              # mkobj.c:808
-        r = lax.cond(
-            r10 == jnp.int32(0),
-            lambda rr: rne_jax(rr, 3)[0],                   # mkobj.c:810
-            lambda rr: _blessorcurse_jax(rr, 10),           # mkobj.c:812
-            r,
+        # Brax-flatten inner cond.
+        pred_r10 = r10 == jnp.int32(0)
+        tr_r10 = rne_jax(r, 3)[0]                            # mkobj.c:810
+        fr_r10 = _blessorcurse_jax(r, 10)                    # mkobj.c:812
+        r = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred_r10, t, f), tr_r10, fr_r10
         )
         return r
 
-    rng = lax.cond(r11 == jnp.int32(0), _branch_blessed, _branch_curse_or_boc, rng)
+    # Brax-flatten outer r11 cond.
+    pred_r11 = r11 == jnp.int32(0)
+    tr_r11 = _branch_blessed(rng)
+    fr_r11 = _branch_curse_or_boc(rng)
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(pred_r11, t, f), tr_r11, fr_r11
+    )
     # mkobj.c:813 — rn2(100) only fires when is_poisonable(otmp) is true.
-    rng = lax.cond(
-        is_poi,
-        lambda r: rn2_jax(r, 100)[0],                        # mkobj.c:813
-        lambda r: r,
-        rng,
+    tr_poi = rn2_jax(rng, 100)[0]                            # mkobj.c:813
+    fr_poi = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_poi, t, f), tr_poi, fr_poi
     )
     # mkobj.c:816 — rn2(20) only fires when ``artif`` flag is TRUE.
     # When the gate succeeds (r20 == 0), vendor calls mk_artifact(otmp, A_NONE)
@@ -577,17 +586,16 @@ def _weapon_draws(
         r, r20 = rn2_jax(r, 20)                              # mkobj.c:816
         # mk_artifact(otmp, A_NONE) — vendor artifact.c:125-208.
         # Fires only when the rn2(20) gate succeeds AND n_eligible > 0.
-        return lax.cond(
-            r20 == jnp.int32(0),
-            lambda rr: _mk_artifact_anone_draws(rr, safe_otyp),
-            lambda rr: rr,
-            r,
+        pred_r20 = r20 == jnp.int32(0)
+        tr_r20 = _mk_artifact_anone_draws(r, safe_otyp)
+        fr_r20 = r
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred_r20, t, f), tr_r20, fr_r20
         )
-    rng = lax.cond(
-        artif,
-        _artif_check,
-        lambda r: r,
-        rng,
+    tr_art = _artif_check(rng)
+    fr_art = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(artif, t, f), tr_art, fr_art
     )
     return rng
 
@@ -651,14 +659,30 @@ def _armor_draws(rng: Isaac64State, otyp: jnp.ndarray, artif: jnp.ndarray) -> Is
         | (otyp == jnp.int32(_OTYP_LEVITATION_BOOTS))
     )
 
+    def _blessed_rne(r):
+        r, _ = rn2_jax(r, 2)                                 # mkobj.c:1001
+        r, _ = rne_jax(r, 3)                                 # mkobj.c:1002
+        return r
+
+    def _elif_boc(r):
+        r, r10b = rn2_jax(r, 10)                             # mkobj.c:1000
+        # Brax-flatten.
+        pred_r10b = r10b == jnp.int32(0)
+        tr_r10b = _blessed_rne(r)                            # mkobj.c:1001-1002
+        fr_r10b = _blessorcurse_jax(r, 10)                   # mkobj.c:1004
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred_r10b, t, f), tr_r10b, fr_r10b
+        )
+
     def _inner_branch(r):
         # outer != 0 AND not special: evaluate !rn2(11) in the ||-chain.
         r, r11 = rn2_jax(r, 11)                              # mkobj.c:997
-        return lax.cond(
-            r11 == jnp.int32(0),
-            lambda rr: rne_jax(rr, 3)[0],                   # mkobj.c:999
-            lambda rr: _elif_boc(rr),
-            r,
+        # Brax-flatten.
+        pred_r11 = r11 == jnp.int32(0)
+        tr_r11 = rne_jax(r, 3)[0]                            # mkobj.c:999
+        fr_r11 = _elif_boc(r)
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pred_r11, t, f), tr_r11, fr_r11
         )
 
     def _special_curse(r):
@@ -667,37 +691,28 @@ def _armor_draws(rng: Isaac64State, otyp: jnp.ndarray, artif: jnp.ndarray) -> Is
         r, _ = rne_jax(r, 3)                                 # mkobj.c:999
         return r
 
-    def _elif_boc(r):
-        r, r10b = rn2_jax(r, 10)                             # mkobj.c:1000
-        return lax.cond(
-            r10b == jnp.int32(0),
-            lambda rr: _blessed_rne(rr),                     # mkobj.c:1001-1002
-            lambda rr: _blessorcurse_jax(rr, 10),           # mkobj.c:1004
-            r,
-        )
-
-    def _blessed_rne(r):
-        r, _ = rn2_jax(r, 2)                                 # mkobj.c:1001
-        r, _ = rne_jax(r, 3)                                 # mkobj.c:1002
-        return r
-
     def _outer_truthy(r):
         # When outer != 0, the ||-chain is evaluated.  Special otyps short-
         # circuit to curse() directly; non-special otyps evaluate !rn2(11).
-        return lax.cond(is_special, _special_curse, _inner_branch, r)
+        # Brax-flatten.
+        tr_s = _special_curse(r)
+        fr_s = _inner_branch(r)
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(is_special, t, f), tr_s, fr_s
+        )
 
-    rng = lax.cond(
-        outer != jnp.int32(0),
-        _outer_truthy,
-        _elif_boc,
-        rng,
+    # Brax-flatten outer cond.
+    pred_outer = outer != jnp.int32(0)
+    tr_outer = _outer_truthy(rng)
+    fr_outer = _elif_boc(rng)
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(pred_outer, t, f), tr_outer, fr_outer
     )
     # mkobj.c:1005 — rn2(40) only fires when ``artif`` flag is TRUE.
-    rng = lax.cond(
-        artif,
-        lambda r: rn2_jax(r, 40)[0],                         # mkobj.c:1005
-        lambda r: r,
-        rng,
+    tr_a = rn2_jax(rng, 40)[0]                               # mkobj.c:1005
+    fr_a = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(artif, t, f), tr_a, fr_a
     )
     return rng
 
@@ -823,11 +838,12 @@ def _ring_draws_charged(rng: Isaac64State) -> Isaac64State:
     rng = _blessorcurse_jax(rng, 3)                          # mkobj.c:1031
     rng, r9 = rn2_jax(rng, 9)                                # mkobj.c:1032
     # All non-zero cases (1..8) call exactly one rne(3); case 0 calls none.
-    rng = lax.cond(
-        r9 != jnp.int32(0),
-        lambda r: rne_jax(r, 3)[0],                          # mkobj.c:1036/1039/1042
-        lambda r: r,
-        rng,
+    # Brax-flatten.
+    pred_r9 = r9 != jnp.int32(0)
+    tr_r9 = rne_jax(rng, 3)[0]                               # mkobj.c:1036/1039/1042
+    fr_r9 = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(pred_r9, t, f), tr_r9, fr_r9
     )
     return rng
 
@@ -861,11 +877,12 @@ def _ring_draws_uncharged(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
         | (otyp == jnp.int32(_OTYP_RIN_POLYMORPH))
     )
     # rn2(9) fires iff otyp is not one of the 4 specials (||-chain short-circuit).
-    rng = lax.cond(
-        ~is_special,
-        lambda r: rn2_jax(r, 9)[0],                          # mkobj.c:1048
-        lambda r: r,
-        rng,
+    # Brax-flatten.
+    pred_ns = ~is_special
+    tr_ns = rn2_jax(rng, 9)[0]                               # mkobj.c:1048
+    fr_ns = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(pred_ns, t, f), tr_ns, fr_ns
     )
     return rng
 
@@ -882,11 +899,11 @@ def _ring_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
     """
     safe_otyp = jnp.clip(otyp, 0, _RING_CHARGED_TABLE.shape[0] - 1).astype(jnp.int32)
     is_charged = _RING_CHARGED_TABLE[safe_otyp]
-    return lax.cond(
-        is_charged,
-        lambda r: _ring_draws_charged(r),
-        lambda r: _ring_draws_uncharged(r, safe_otyp),
-        rng,
+    # Brax-flatten.
+    tr_c = _ring_draws_charged(rng)
+    fr_c = _ring_draws_uncharged(rng, safe_otyp)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_charged, t, f), tr_c, fr_c
     )
 
 
@@ -937,11 +954,11 @@ def _amulet_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
     # Vendor short-circuits blessorcurse when (rn2(10) && special) — i.e. when
     # the rn2(10) draw was non-zero AND otyp is one of the 3 special amulets.
     skip_boc = (r10 != jnp.int32(0)) & is_special
-    rng = lax.cond(
-        skip_boc,
-        lambda r: r,
-        lambda r: _blessorcurse_jax(r, 10),                  # mkobj.c:975
-        rng,
+    # Brax-flatten.
+    tr_sb = rng
+    fr_sb = _blessorcurse_jax(rng, 10)                       # mkobj.c:975
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(skip_boc, t, f), tr_sb, fr_sb
     )
     return rng
 
@@ -1016,33 +1033,33 @@ def _food_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
     # are deferred — for our 10-seed sweep the outer gate lands on the
     # non-loop branch (seed=7 EGG: rn2(3)=1 ≠ 0 → no rndmonnum loop).
     # Cite: vendor/nle/src/mkobj.c:839 (EGG), :851-863 (TIN), :870 (KELP).
-    rng = lax.cond(
-        is_egg,
-        lambda r: rn2_jax(r, jnp.int32(3))[0],               # mkobj.c:839
-        lambda r: r,
-        rng,
+    # Brax-flatten EGG.
+    tr_egg = rn2_jax(rng, jnp.int32(3))[0]                   # mkobj.c:839
+    fr_egg = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_egg, t, f), tr_egg, fr_egg
     )
-    rng = lax.cond(
-        is_tin,
-        lambda r: _blessorcurse_jax(rn2_jax(r, jnp.int32(6))[0], 10),  # mkobj.c:851 + :863
-        lambda r: r,
-        rng,
+    # Brax-flatten TIN.
+    tr_tin = _blessorcurse_jax(rn2_jax(rng, jnp.int32(6))[0], 10)  # mkobj.c:851 + :863
+    fr_tin = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_tin, t, f), tr_tin, fr_tin
     )
-    rng = lax.cond(
-        is_kelp_frond,
-        lambda r: rnd_jax(r, jnp.int32(2))[0],               # mkobj.c:870 (rnd(2))
-        lambda r: r,
-        rng,
+    # Brax-flatten KELP.
+    tr_kelp = rnd_jax(rng, jnp.int32(2))[0]                  # mkobj.c:870 (rnd(2))
+    fr_kelp = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_kelp_frond, t, f), tr_kelp, fr_kelp
     )
 
     # Trailing !rn2(6) quantity gate (vendor mkobj.c:881).  Short-circuited
     # when otyp ∈ {pudding, CORPSE, MEAT_RING, KELP_FROND}.
     skip_draw = is_pudding | is_corpse | is_meat_ring | is_kelp_frond
-    rng = lax.cond(
-        skip_draw,
-        lambda r: r,
-        lambda r: rn2_jax(r, 6)[0],                          # mkobj.c:882
-        rng,
+    # Brax-flatten.
+    tr_sd = rng
+    fr_sd = rn2_jax(rng, 6)[0]                               # mkobj.c:882
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(skip_draw, t, f), tr_sd, fr_sd
     )
     return rng
 
@@ -1076,37 +1093,37 @@ def _food_draws_with_qty(
     is_kelp_frond = otyp == jnp.int32(_OTYP_KELP_FROND)
 
     # Per-otyp pre-case draws (EGG/TIN/KELP) — identical to _food_draws above.
-    rng = lax.cond(
-        is_egg,
-        lambda r: rn2_jax(r, jnp.int32(3))[0],
-        lambda r: r,
-        rng,
+    # Brax-flatten EGG.
+    tr_egg = rn2_jax(rng, jnp.int32(3))[0]
+    fr_egg = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_egg, t, f), tr_egg, fr_egg
     )
-    rng = lax.cond(
-        is_tin,
-        lambda r: _blessorcurse_jax(rn2_jax(r, jnp.int32(6))[0], 10),
-        lambda r: r,
-        rng,
+    # Brax-flatten TIN.
+    tr_tin = _blessorcurse_jax(rn2_jax(rng, jnp.int32(6))[0], 10)
+    fr_tin = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_tin, t, f), tr_tin, fr_tin
     )
-    rng = lax.cond(
-        is_kelp_frond,
-        lambda r: rnd_jax(r, jnp.int32(2))[0],
-        lambda r: r,
-        rng,
+    # Brax-flatten KELP.
+    tr_kelp = rnd_jax(rng, jnp.int32(2))[0]
+    fr_kelp = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_kelp_frond, t, f), tr_kelp, fr_kelp
     )
 
     # Trailing !rn2(6) qty gate.  Capture the result so the caller can set
     # ``quan = 2`` when the gate fires.
     skip_draw = is_pudding | is_corpse | is_meat_ring | is_kelp_frond
 
-    def _draw_qty(r):
-        new_r, roll = rn2_jax(r, jnp.int32(6))
-        return new_r, roll
-
-    def _skip_qty(r):
-        return r, jnp.int32(1)  # non-zero → qty stays 1
-
-    rng, qty_roll = lax.cond(skip_draw, _skip_qty, _draw_qty, rng)
+    # Brax-flatten qty gate.
+    draw_r, draw_roll = rn2_jax(rng, jnp.int32(6))
+    skip_r = rng
+    skip_roll = jnp.int32(1)
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(skip_draw, t, f), skip_r, draw_r
+    )
+    qty_roll = jnp.where(skip_draw, skip_roll, draw_roll)
     qty = jnp.where(qty_roll == jnp.int32(0), jnp.int16(2), jnp.int16(1))
     return rng, qty
 
@@ -1151,11 +1168,11 @@ def _gem_draws(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
     is_luckstone = otyp == jnp.int32(_OTYP_LUCKSTONE)
     skip_draw = is_loadstone | is_luckstone
 
-    rng = lax.cond(
-        skip_draw,
-        lambda r: r,
-        lambda r: rn2_jax(r, 6)[0],                          # mkobj.c:892
-        rng,
+    # Brax-flatten.
+    tr_sd = rng
+    fr_sd = rn2_jax(rng, 6)[0]                               # mkobj.c:892
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(skip_draw, t, f), tr_sd, fr_sd
     )
     return rng
 
@@ -1251,11 +1268,12 @@ def _tool_candle_draws(rng: Isaac64State) -> Isaac64State:
     blessorcurse(otmp, 5)     # mkobj.c:906
     """
     rng, r2 = rn2_jax(rng, 2)                                  # mkobj.c:905
-    rng = lax.cond(
-        r2 != jnp.int32(0),
-        lambda r: rn2_jax(r, 7)[0],                            # mkobj.c:905
-        lambda r: r,
-        rng,
+    # Brax-flatten.
+    pred_r2 = r2 != jnp.int32(0)
+    tr_r2 = rn2_jax(rng, 7)[0]                                 # mkobj.c:905
+    fr_r2 = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(pred_r2, t, f), tr_r2, fr_r2
     )
     return _blessorcurse_jax(rng, 5)                           # mkobj.c:906
 
@@ -1459,10 +1477,20 @@ def _mkbox_cnts_draws(rng: Isaac64State, box_otyp: jnp.ndarray) -> Isaac64State:
                 r_, _ = rnd_jax(r_, 75)                         # mkobj.c:332 rnd(75)
                 return r_
 
-            r = lax.cond(is_coin, _coin_quan, lambda r_: r_, r)
+            # Brax-flatten coin cond.
+            tr_coin = _coin_quan(r)
+            fr_coin = r
+            r = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(is_coin, t, f), tr_coin, fr_coin
+            )
             return r
 
-        rng_ = lax.cond(is_icebox_, _icebox_item, _regular_item, rng_)
+        # Brax-flatten icebox cond.
+        tr_ib = _icebox_item(rng_)
+        fr_ib = _regular_item(rng_)
+        rng_ = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(is_icebox_, t, f), tr_ib, fr_ib
+        )
         return (rng_, i + jnp.int32(1), n_items_, is_icebox_)
 
     rng, _, _, _ = lax.while_loop(
@@ -1545,7 +1573,11 @@ def _tool_draws_dispatch(rng: Isaac64State, otyp: jnp.ndarray) -> Isaac64State:
     """
     safe_otyp = jnp.clip(otyp, 0, 255).astype(jnp.int32)
     branch = _TOOL_OTYP_BRANCH_TABLE[safe_otyp]
-    return lax.switch(branch, _TOOL_OTYP_BRANCHES, rng)
+    # Brax-flatten lax.switch: compute every branch, tree_map(stack+take) on idx.
+    results = [fn(rng) for fn in _TOOL_OTYP_BRANCHES]
+    return jax.tree_util.tree_map(
+        lambda *vals: jnp.stack(vals)[branch], *results
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1578,9 +1610,11 @@ def _consume_mksobj_init_draws_inner(
     """
     if otyp is None:
         otyp = jnp.int32(0)
-    return lax.switch(
-        oclass_id, _MKSOBJ_INIT_BRANCHES,
-        rng, otyp, jnp.bool_(False),
+    # Brax-flatten lax.switch: compute every branch, stack+take on oclass_id.
+    artif_false = jnp.bool_(False)
+    results = [fn(rng, otyp, artif_false) for fn in _MKSOBJ_INIT_BRANCHES]
+    return jax.tree_util.tree_map(
+        lambda *vals: jnp.stack(vals)[oclass_id], *results
     )
 
 
@@ -1701,7 +1735,12 @@ def _rock_branch(rng, otyp, artif):
         new_r, _corpsenm = pick_monster_for_level(None, 1, vendor_rng=r)
         return new_r
 
-    return lax.cond(is_statue, _statue_path, lambda r: r, rng)
+    # Brax-flatten.
+    tr_st = _statue_path(rng)
+    fr_st = rng
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_statue, t, f), tr_st, fr_st
+    )
 
 
 _MKSOBJ_INIT_BRANCHES = [
@@ -1749,18 +1788,19 @@ def _consume_mksobj_init_draws_jit_with_tool(
     ``oclass_id == TOOL_CLASS`` — for non-TOOL callers this is a JAX no-op.
     Byte-equivalent to the inlined version: same draws, same order.
     """
-    rng = lax.switch(
-        oclass_id, _MKSOBJ_INIT_BRANCHES,
-        rng, otyp_arr, artif_arr,
+    # Brax-flatten lax.switch: compute every branch, stack+take on oclass_id.
+    results = [fn(rng, otyp_arr, artif_arr) for fn in _MKSOBJ_INIT_BRANCHES]
+    rng = jax.tree_util.tree_map(
+        lambda *vals: jnp.stack(vals)[oclass_id], *results
     )
     # TOOL_CLASS per-otyp dispatch (mkobj.c:897-966).  Only fires when
     # the picked class is TOOL_CLASS; otherwise this is a noop.
     is_tool = oclass_id == jnp.int32(int(ObjectClass.TOOL_CLASS))
-    rng = lax.cond(
-        is_tool,
-        lambda r: _tool_draws_dispatch(r, otyp_arr),
-        lambda r: r,
-        rng,
+    # Brax-flatten.
+    tr_tool = _tool_draws_dispatch(rng, otyp_arr)
+    fr_tool = rng
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_tool, t, f), tr_tool, fr_tool
     )
     return rng
 
@@ -1779,9 +1819,10 @@ def _consume_mksobj_init_draws_jit_no_tool(
     dispatch (they pass non-TOOL classes or accept the 0-draw fallback).
     Byte-equivalent to the prior inlined ``otyp is None`` branch.
     """
-    return lax.switch(
-        oclass_id, _MKSOBJ_INIT_BRANCHES,
-        rng, otyp_arr, artif_arr,
+    # Brax-flatten lax.switch: compute every branch, stack+take on oclass_id.
+    results = [fn(rng, otyp_arr, artif_arr) for fn in _MKSOBJ_INIT_BRANCHES]
+    return jax.tree_util.tree_map(
+        lambda *vals: jnp.stack(vals)[oclass_id], *results
     )
 
 
@@ -1895,14 +1936,15 @@ def consume_mksobj_init_draws_with_qty(
     _FOOD_CLASS_ID = jnp.int32(int(_IC.FOOD))
     is_food = oclass_id == _FOOD_CLASS_ID
 
-    def _food_path(r):
-        return _food_draws_with_qty(r, otyp)
-
-    def _non_food_path(r):
-        new_r = consume_mksobj_init_draws(r, oclass_id, otyp, artif=artif)
-        return new_r, jnp.int16(1)
-
-    return lax.cond(is_food, _food_path, _non_food_path, rng)
+    # Brax-flatten.
+    tr_food = _food_draws_with_qty(rng, otyp)
+    fr_food = (
+        consume_mksobj_init_draws(rng, oclass_id, otyp, artif=artif),
+        jnp.int16(1),
+    )
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_food, t, f), tr_food, fr_food
+    )
 
 
 def consume_mkobj_random_draws(
