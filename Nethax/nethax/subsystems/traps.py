@@ -658,7 +658,12 @@ def _trap_dart(state, rng):
         return s_.replace(status=new_status, player_con=new_con,
                           player_hp=new_hp)
 
-    return jax.lax.cond(poisoned, _do_poison, lambda s_: s_, s)
+    # Brax-flatten: compute both branches, jnp.where-merge.
+    _tr_dart = _do_poison(s)
+    _fr_dart = s
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(poisoned, t, f), _tr_dart, _fr_dart
+    )
 
 
 def _trap_rock(state, rng):
@@ -806,7 +811,12 @@ def _trap_landmine(state, rng):
             s4, int(TimedStatus.FROZEN), _d(k_pit_freeze, 6) + jnp.int32(1)
         )
 
-    return jax.lax.cond(skip_trigger, _do_skip, _do_fire, state)
+    # Brax-flatten: compute both branches, jnp.where-merge.
+    _tr_lm = _do_skip(state)
+    _fr_lm = _do_fire(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(skip_trigger, t, f), _tr_lm, _fr_lm
+    )
 
 
 def _trap_rolling_boulder(state, rng):
@@ -879,11 +889,12 @@ def _trap_rolling_boulder(state, rng):
         new_g = g.replace(category=new_cat, type_id=new_tid, quantity=new_qty)
         return s_.replace(ground_items=new_g)
 
-    return jax.lax.cond(
-        same_pos & any_empty,
-        _do_drop,
-        lambda s_: s_,
-        s_after,
+    # Brax-flatten: compute both branches, jnp.where-merge.
+    _pred_rb = same_pos & any_empty
+    _tr_rb = _do_drop(s_after)
+    _fr_rb = s_after
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(_pred_rb, t, f), _tr_rb, _fr_rb
     )
 
 
@@ -942,8 +953,12 @@ def _trap_rust(state, rng):
         )
         return s.replace(inventory=inv.replace(items=new_items))
 
-    return jax.lax.cond(is_iron_golem, _do_iron_golem_death,
-                        _do_normal_rust, state)
+    # Brax-flatten: compute both branches, jnp.where-merge.
+    _tr_rust = _do_iron_golem_death(state)
+    _fr_rust = _do_normal_rust(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_iron_golem, t, f), _tr_rust, _fr_rust
+    )
 
 
 def _trap_fire(state, rng):
@@ -1101,7 +1116,12 @@ def _trap_spiked_pit(state, rng):
                              jnp.int32(0))
         return s_.replace(status=new_sick, player_str=new_str, player_hp=new_hp)
 
-    return jax.lax.cond(poisoned, _do_poison, lambda s_: s_, s)
+    # Brax-flatten: compute both branches, jnp.where-merge.
+    _tr_sp = _do_poison(s)
+    _fr_sp = s
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(poisoned, t, f), _tr_sp, _fr_sp
+    )
 
 
 def _trap_hole(state, rng):
@@ -1365,7 +1385,12 @@ def _trap_statue(state, rng):
             )
         return s.replace(monster_ai=new_mai)
 
-    return jax.lax.cond(any_dead, _do_spawn, lambda s: s, state)
+    # Brax-flatten: compute both branches, jnp.where-merge.
+    _tr_st = _do_spawn(state)
+    _fr_st = state
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(any_dead, t, f), _tr_st, _fr_st
+    )
 
 
 def _trap_magic(state, rng):
@@ -1567,10 +1592,22 @@ def _trap_magic(state, rng):
         new_pw     = s1.player_pw + jnp.int32(2)
         return s1.replace(player_pw=new_pw, player_pw_max=new_pw_max)
 
-    def _do_fate(s, r):
-        return jax.lax.switch(fate_idx, fate_branches, s, r)
+    # Brax-flatten the inner lax.switch: compute every fate branch, then
+    # jnp.where-select on fate_idx.  All branches preserve pytree shape.
+    _fate_results = [_b(state, k_use) for _b in fate_branches]
+    _fate_out = _fate_results[0]
+    for _i in range(1, len(_fate_results)):
+        _sel = fate_idx == jnp.int32(_i)
+        _fate_out = jax.tree_util.tree_map(
+            lambda acc, nxt, _sel=_sel: jnp.where(_sel, nxt, acc),
+            _fate_out, _fate_results[_i],
+        )
 
-    return jax.lax.cond(is_explosion, _do_explosion, _do_fate, state, k_use)
+    # Brax-flatten the outer lax.cond: explosion vs fate.
+    _expl_out = _do_explosion(state, k_use)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_explosion, t, f), _expl_out, _fate_out
+    )
 
 
 def _trap_anti_magic(state, rng):
@@ -1687,9 +1724,19 @@ def _trap_anti_magic(state, rng):
         return s.replace(player_pw=new_pw, player_pw_max=new_pw_max)
 
     def _do_default(s):
-        return jax.lax.cond(has_antimagic, _do_antimagic, _do_pw_drain, s)
+        # Brax-flatten inner cond: antimagic vs pw_drain.
+        _tr_inner = _do_antimagic(s)
+        _fr_inner = _do_pw_drain(s)
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(has_antimagic, t, f), _tr_inner, _fr_inner
+        )
 
-    return jax.lax.cond(iron_shoes_protect, _do_iron_shoes, _do_default, state)
+    # Brax-flatten outer cond: iron_shoes_protect vs default.
+    _tr_am = _do_iron_shoes(state)
+    _fr_am = _do_default(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(iron_shoes_protect, t, f), _tr_am, _fr_am
+    )
 
 
 def _trap_poly(state, rng):
@@ -1729,11 +1776,11 @@ def _trap_poly(state, rng):
     has_unchanging = intrinsics[int(_PolyIntr.UNCHANGING)]
     block_poly = has_antimagic | has_unchanging
 
-    return jax.lax.cond(
-        block_poly,
-        lambda s: s,
-        lambda s: poly_trap_effect(s, rng_self),
-        new_state,
+    # Brax-flatten: compute both branches, jnp.where-merge.
+    _tr_poly = new_state
+    _fr_poly = poly_trap_effect(new_state, rng_self)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(block_poly, t, f), _tr_poly, _fr_poly
     )
 
 
@@ -1770,7 +1817,12 @@ def _trap_trapped_chest(state, rng):
         )
         return s_.replace(status=new_sick)
 
-    return jax.lax.cond(poisoned, _do_poison, lambda s_: s_, s)
+    # Brax-flatten: compute both branches, jnp.where-merge.
+    _tr_tc = _do_poison(s)
+    _fr_tc = s
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(poisoned, t, f), _tr_tc, _fr_tc
+    )
 
 
 # Tuple of branches indexed by TrapType value.  Order MUST match enum.
@@ -1835,4 +1887,14 @@ def trigger_trap_envstate(state, rng: jax.Array, row, col):
     new_revealed = state.traps.revealed.at[flat_lv, row_i, col_i].set(True)
     state = state.replace(traps=state.traps.replace(revealed=new_revealed))
 
-    return jax.lax.switch(safe_kind, _TRAP_BRANCHES, state, rng)
+    # Brax-flatten the lax.switch: compute every trap branch then
+    # jnp.where-select on safe_kind.  All branches preserve pytree shape.
+    _branch_results = [_b(state, rng) for _b in _TRAP_BRANCHES]
+    _out = _branch_results[0]
+    for _i in range(1, len(_branch_results)):
+        _sel = safe_kind == jnp.int32(_i)
+        _out = jax.tree_util.tree_map(
+            lambda acc, nxt, _sel=_sel: jnp.where(_sel, nxt, acc),
+            _out, _branch_results[_i],
+        )
+    return _out
