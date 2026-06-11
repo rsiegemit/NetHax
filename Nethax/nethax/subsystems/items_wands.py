@@ -726,10 +726,11 @@ def _cast_ray_terrain_predicate(state, rng, direction, target, on_tile_fn,
         cc = jnp.clip(tc, 0, map_w - 1)
         cur = s.terrain[rr, cc]
         matches = in_bounds & (cur == target_t) & ~done
-        def _do_hit(args):
-            ss, rr_ = args
-            return on_tile_fn(ss, rr_, jnp.array([rr, cc], dtype=jnp.int32))
-        s_new, r_new = jax.lax.cond(matches, _do_hit, lambda a: a, (s, r))
+        hit_s, hit_r = on_tile_fn(s, r, jnp.array([rr, cc], dtype=jnp.int32))
+        s_new = jax.tree_util.tree_map(
+            lambda h, o: jnp.where(matches, h, o), hit_s, s,
+        )
+        r_new = jnp.where(matches, hit_r, r)
         return s_new, r_new, done | matches
 
     final_state, final_rng, _ = jax.lax.fori_loop(
