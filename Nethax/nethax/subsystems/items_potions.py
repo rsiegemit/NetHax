@@ -1617,11 +1617,11 @@ def handle_quaff(state, rng):
     import sys as _sys_qp
     _quaff_potion_fn = getattr(_sys_qp.modules[__name__], "quaff_potion")
 
-    return jax.lax.cond(
-        found,
-        lambda s_r: _quaff_potion_fn(s_r[0], s_r[1], slot_idx),
-        lambda s_r: _quaff_no_potion(s_r[0], s_r[1]),
-        (state, rng),
+    _quaff_state = _quaff_potion_fn(state, rng, slot_idx)
+    _noquaff_state = _quaff_no_potion(state, rng)
+    return jax.tree.map(
+        lambda t, f: jnp.where(found, t, f),
+        _quaff_state, _noquaff_state,
     )
 
 
