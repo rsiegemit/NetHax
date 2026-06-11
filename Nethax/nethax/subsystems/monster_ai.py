@@ -4483,12 +4483,24 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
     within_follow_range = dist_to_player < jnp.int32(6)
 
     def _move_no_target(s):
-        return jax.lax.cond(within_follow_range, _follow_player, _explore, s)
+        _s_follow = _follow_player(s)
+        _s_explore = _explore(s)
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(within_follow_range, t, f),
+            _s_follow, _s_explore,
+        )
 
     def _pet_act(s):
-        return jax.lax.cond(has_target, _attack_hostile, _move_no_target, s)
+        _s_atk = _attack_hostile(s)
+        _s_move = _move_no_target(s)
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(has_target, t, f), _s_atk, _s_move,
+        )
 
-    return jax.lax.cond(is_pet, _pet_act, lambda s: s, state)
+    _state_pet = _pet_act(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_pet, t, f), _state_pet, state,
+    )
 
 
 # ---------------------------------------------------------------------------
