@@ -297,14 +297,11 @@ def _emit_dog_goal_fobj_scan(state, vendor_rng, pet_r, pet_c):
         cat = cat_slab[safe_r, safe_c, ds]
         has_obj = in_bounds & (cat != jnp.int32(0))
 
-        def do_draw(carry_rng):
-            new_rng, _ = rn2_jax(carry_rng, jnp.int64(100))
-            return new_rng
-
-        def skip_draw(carry_rng):
-            return carry_rng
-
-        return jax.lax.cond(has_obj, do_draw, skip_draw, rng)
+        # Brax-flatten: compute both branches, select with tree_map(jnp.where).
+        drawn_rng, _ = rn2_jax(rng, jnp.int64(100))
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(has_obj, t, f), drawn_rng, rng,
+        )
 
     return jax.lax.fori_loop(0, total_iters, body, vendor_rng)
 
@@ -404,14 +401,13 @@ def _scoring_loop(accepted, nrows, ncols, pet_r, pet_c, goal_r, goal_c, vendor_r
         # single "do nothing" branch).
         new_chcnt = jnp.where(is_accepted, chcnt + jnp.int32(1), chcnt)
 
-        def do_draw(carry_rng):
-            # rn2(++chcnt) -- modulus is the incremented value.
-            return rn2_jax(carry_rng, new_chcnt.astype(jnp.int64))
-
-        def skip_draw(carry_rng):
-            return carry_rng, jnp.int32(0)
-
-        new_rng, draw_val = jax.lax.cond(is_accepted, do_draw, skip_draw, rng)
+        # Brax-flatten: compute both branches, select with tree_map(jnp.where).
+        # rn2(++chcnt) -- modulus is the incremented value.
+        drawn_rng, drawn_val = rn2_jax(rng, new_chcnt.astype(jnp.int64))
+        new_rng = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(is_accepted, t, f), drawn_rng, rng,
+        )
+        draw_val = jnp.where(is_accepted, drawn_val, jnp.int32(0))
 
         # Reservoir sample: pick this candidate iff accepted and rn2(chcnt) == 0.
         # The first accepted candidate has chcnt=1, rn2(1)==0 always, so it
@@ -538,16 +534,20 @@ def vendor_pet_dog_move(state, vendor_rng: Isaac64State, pet_slot):
     is_alive = mai.alive[safe_slot]
     eligible = in_range & is_alive
 
-    def _bail(args):
-        # Return state + rng unchanged; emit ZERO ISAAC64 draws.
-        st, rng = args
-        return st, rng
-
-    def _run(args):
-        st, rng = args
-        return _run_dog_move(st, rng, safe_slot)
-
-    return jax.lax.cond(eligible, _run, _bail, (state, vendor_rng))
+    # Brax-flatten: compute both branches, select with tree_map(jnp.where).
+    # WARNING: this changes semantics from the previous lax.cond gate — the
+    # _run_dog_move body now executes (and advances ISAAC64 draws on its
+    # internal scratch rng copy) even when eligible == False.  We select the
+    # ORIGINAL (state, vendor_rng) for the ineligible branch so the public
+    # contract (zero draws / unchanged state) is preserved.
+    run_state, run_rng = _run_dog_move(state, vendor_rng, safe_slot)
+    new_state = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(eligible, t, f), run_state, state,
+    )
+    new_vendor_rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(eligible, t, f), run_rng, vendor_rng,
+    )
+    return new_state, new_vendor_rng
 
 
 def _run_dog_move(state, vendor_rng, pet_slot):
@@ -634,16 +634,12 @@ def _run_dog_move(state, vendor_rng, pet_slot):
     udist = _dist2(pet_r, pet_c, hero_r, hero_c)
     needs_room_check = udist > jnp.int32(1)
 
-    def _emit_room_rn2(rng):
-        # rn2(4) -- value discarded; only stream-advance matters for parity.
-        new_rng, _ = rn2_jax(rng, jnp.int64(4))
-        return new_rng
-
-    def _skip_room_rn2(rng):
-        return rng
-
-    vendor_rng = jax.lax.cond(
-        needs_room_check, _emit_room_rn2, _skip_room_rn2, vendor_rng,
+    # Brax-flatten: compute both branches, select with tree_map(jnp.where).
+    # rn2(4) -- value discarded; only stream-advance matters for parity.
+    room_drawn_rng, _ = rn2_jax(vendor_rng, jnp.int64(4))
+    vendor_rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(needs_room_check, t, f),
+        room_drawn_rng, vendor_rng,
     )
 
     # ------------------------------------------------------------------
