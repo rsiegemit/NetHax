@@ -6364,27 +6364,48 @@ def _monster_turn_b_impl(state, rng, monster_idx, path_step, was_asleep, may_act
                         cur_pos, new_pos_i32, wants_retreat)
 
             _zero2 = jnp.zeros(2, dtype=jnp.int32)
-            return jax.lax.cond(
-                should_act, _act_post_path,
-                lambda st: (st, jnp.bool_(False), jnp.bool_(False),
-                            _zero2, _zero2, jnp.bool_(False)),
-                ss,
+            _t = _act_post_path(ss)
+            _f = (ss, jnp.bool_(False), jnp.bool_(False),
+                  _zero2, _zero2, jnp.bool_(False))
+            return (
+                jax.tree_util.tree_map(
+                    lambda a, b: jnp.where(should_act, a, b), _t[0], _f[0],
+                ),
+                jnp.where(should_act, _t[1], _f[1]),
+                jnp.where(should_act, _t[2], _f[2]),
+                jnp.where(should_act, _t[3], _f[3]),
+                jnp.where(should_act, _t[4], _f[4]),
+                jnp.where(should_act, _t[5], _f[5]),
             )
 
         _zero2 = jnp.zeros(2, dtype=jnp.int32)
-        return jax.lax.cond(
-            is_pet,
-            lambda ss: (ss, jnp.bool_(False), jnp.bool_(False),
-                        _zero2, _zero2, jnp.bool_(False)),
-            _hostile_post, s,
+        _t2 = (s, jnp.bool_(False), jnp.bool_(False),
+               _zero2, _zero2, jnp.bool_(False))
+        _f2 = _hostile_post(s)
+        return (
+            jax.tree_util.tree_map(
+                lambda a, b: jnp.where(is_pet, a, b), _t2[0], _f2[0],
+            ),
+            jnp.where(is_pet, _t2[1], _f2[1]),
+            jnp.where(is_pet, _t2[2], _f2[2]),
+            jnp.where(is_pet, _t2[3], _f2[3]),
+            jnp.where(is_pet, _t2[4], _f2[4]),
+            jnp.where(is_pet, _t2[5], _f2[5]),
         )
 
     _zero2 = jnp.zeros(2, dtype=jnp.int32)
-    return jax.lax.cond(
-        may_act, _real_work,
-        lambda s: (s, jnp.bool_(False), jnp.bool_(False),
-                   _zero2, _zero2, jnp.bool_(False)),
-        state,
+    _t3 = _real_work(state)
+    _f3 = (state, jnp.bool_(False), jnp.bool_(False),
+           _zero2, _zero2, jnp.bool_(False))
+    return (
+        jax.tree_util.tree_map(
+            lambda a, b: jnp.where(may_act, a, b), _t3[0], _f3[0],
+        ),
+        jnp.where(may_act, _t3[1], _f3[1]),
+        jnp.where(may_act, _t3[2], _f3[2]),
+        jnp.where(may_act, _t3[3], _f3[3]),
+        jnp.where(may_act, _t3[4], _f3[4]),
+        jnp.where(may_act, _t3[5], _f3[5]),
     )
 
 
