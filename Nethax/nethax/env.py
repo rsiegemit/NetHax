@@ -1418,12 +1418,18 @@ def _dispatch_jit_impl(state, action, rng_act):
     original monolithic ``_step_impl``: a done state passes through
     unchanged so the rest-jit (which also short-circuits) sees the
     identical pytree it would have seen pre-split.
+
+    Brax-flat: replace ``lax.cond`` with eager body + ``jnp.where`` select.
+    Under vmap, ``lax.cond`` traces both branches into HLO, which on a
+    body this large explodes compile time.  Tree-map select preserves
+    byte-parity (orig selected on done, body_result on not-done — same
+    as cond) and compiles linearly.
     """
-    return jax.lax.cond(
-        state.done,
-        lambda _: state,
-        lambda _: _dispatch_body(state, action, rng_act),
-        operand=None,
+    body_result = _dispatch_body(state, action, rng_act)
+    return jax.tree_util.tree_map(
+        lambda new, orig: jnp.where(state.done, orig, new),
+        body_result,
+        state,
     )
 
 
@@ -1530,12 +1536,15 @@ def _pre_monster_jit_impl(ns, state, rng_act, rng_astral, prev_branch, prev_leve
     monolithic ``_step_impl``: when the pre-step state was done, return
     that original state unchanged so the overall ``_step_impl`` output
     is byte-identical to the pre-split implementation.
+
+    Brax-flat: replace ``lax.cond`` with eager body + ``jnp.where`` select
+    to avoid the both-branch HLO blowup under vmap.
     """
-    return jax.lax.cond(
-        state.done,
-        lambda _: state,
-        lambda _: _pre_monster_body(ns, rng_act, rng_astral, prev_branch, prev_level),
-        operand=None,
+    body_result = _pre_monster_body(ns, rng_act, rng_astral, prev_branch, prev_level)
+    return jax.tree_util.tree_map(
+        lambda new, orig: jnp.where(state.done, orig, new),
+        body_result,
+        state,
     )
 
 
@@ -1589,12 +1598,15 @@ def _monster_jit_impl(ns, state, rng_monsters, rng_regions):
     Mirrors the ``already_done`` short-circuit from the original
     monolithic ``_step_impl``: when the pre-step state was done, return
     that original state unchanged.
+
+    Brax-flat: replace ``lax.cond`` with eager body + ``jnp.where`` select
+    to avoid the both-branch HLO blowup under vmap.
     """
-    return jax.lax.cond(
-        state.done,
-        lambda _: state,
-        lambda _: _monster_body(ns, rng_monsters, rng_regions),
-        operand=None,
+    body_result = _monster_body(ns, rng_monsters, rng_regions)
+    return jax.tree_util.tree_map(
+        lambda new, orig: jnp.where(state.done, orig, new),
+        body_result,
+        state,
     )
 
 
@@ -1865,21 +1877,24 @@ def _post_monster_jit_impl(
     monolithic ``_step_impl``: when the pre-step state was done, return
     that original state unchanged so the overall ``_step_impl`` output
     is byte-identical to the pre-split implementation.
+
+    Brax-flat: replace ``lax.cond`` with eager body + ``jnp.where`` select
+    to avoid the both-branch HLO blowup under vmap.
     """
-    return jax.lax.cond(
-        state.done,
-        lambda _: state,
-        lambda _: _post_monster_body(
-            ns,
-            state,
-            prev_wizard_alive,
-            rng_status,
-            rng_poly,
-            rng_shop,
-            rng_swallow,
-            rng_explvl,
-        ),
-        operand=None,
+    body_result = _post_monster_body(
+        ns,
+        state,
+        prev_wizard_alive,
+        rng_status,
+        rng_poly,
+        rng_shop,
+        rng_swallow,
+        rng_explvl,
+    )
+    return jax.tree_util.tree_map(
+        lambda new, orig: jnp.where(state.done, orig, new),
+        body_result,
+        state,
     )
 
 
