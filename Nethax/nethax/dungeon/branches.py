@@ -1002,10 +1002,14 @@ def _check_room_vault_simple(vendor_rng, lgs_typ, vault_x, vault_y):
     )
     has_non_stone = jnp.any((lgs_typ != jnp.int8(0)) & in_area)
 
-    def _draw_rn3(v):
-        v_out, _ = _rn2_jax_cr(v, jnp.int32(3))
-        return v_out
-    vrng_out = lax.cond(has_non_stone, _draw_rn3, lambda v: v, vendor_rng)
+    # Brax-flatten: always compute the rn2(3) draw, then select via jnp.where
+    # on the gate.  Under vmap, lax.cond emits BOTH branches into HLO anyway —
+    # making the selection explicit drops the cond-merge overhead.  The
+    # selected vendor_rng is byte-identical to the cond version.
+    v_drawn, _ = _rn2_jax_cr(vendor_rng, jnp.int32(3))
+    vrng_out = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(has_non_stone, a, b), v_drawn, vendor_rng,
+    )
     success = jnp.logical_not(has_non_stone)
     return vrng_out, success
 
@@ -1029,15 +1033,20 @@ def _do_vault_draws_body(vendor_rng, lgs, rooms_box_postvault, nroom_post_vault)
     v, r3 = _rn2(v, jnp.int32(3))
     gate_fires = r3 == jnp.int32(0)
 
-    def _do_makevtele(rg):
-        r_, g_ = rg
-        r_, g_ = _makeniche(
-            r_, g_, rooms_box_postvault, nroom_post_vault,
-            _TELEP_TRAP, depth=1,
-        )
-        return r_, g_
-
-    v, lgs = lax.cond(gate_fires, _do_makevtele, lambda rg: rg, (v, lgs))
+    # Brax-flatten: always run _makeniche, then jnp.where-select between
+    # the niche-stamped state and the unchanged state on ``gate_fires``.
+    # Under vmap the cond emits both branches anyway; explicit selection
+    # drops the cond-merge HLO.  Byte-identical to the cond version.
+    v_niche, lgs_niche = _makeniche(
+        v, lgs, rooms_box_postvault, nroom_post_vault,
+        _TELEP_TRAP, depth=1,
+    )
+    v = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(gate_fires, a, b), v_niche, v,
+    )
+    lgs = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(gate_fires, a, b), lgs_niche, lgs,
+    )
     return v, lgs
 
 
@@ -3637,18 +3646,33 @@ def _place_dungeon_levels_jax(vendor_rng, num_dunlevs, protos, created_dyn=None)
                 ffr_new = ffr.at[safe_next].set(jnp.bool_(True))
                 return new_rng, next_i, ss_new, mmk_new, ffr_new
 
-            return lax.cond(
-                npossible == jnp.int32(0),
-                do_backtrack,
-                do_pick,
-                (r, i, s, mk_init, fr_init),
+            # Brax-flatten: always compute both branches, then jnp.where-
+            # select on ``npossible == 0``.  Under vmap the cond emits both
+            # branches anyway; explicit selection drops the cond-merge HLO.
+            # Byte-identical to the cond version because the SELECTED
+            # vendor_rng matches what cond would have returned.
+            pick_args = (r, i, s, mk_init, fr_init)
+            bt_out = do_backtrack(pick_args)
+            pk_out = do_pick(pick_args)
+            sel_pred = (npossible == jnp.int32(0))
+            return jax.tree_util.tree_map(
+                lambda a, b: jnp.where(sel_pred, a, b), bt_out, pk_out,
             )
 
         # Dispatch on protos[idx].created.  ``idx`` is traced; ``created`` is a
         # static array, so we index it with idx.
         is_created = created[jnp.minimum(jnp.maximum(idx, 0), _PL_MAX_PROTOS - 1)]
-        return lax.cond(is_created, place_created, skip_uncreated,
-                        (rng, idx, slots, mask, fresh))
+        # Brax-flatten: always compute both branches, jnp.where-select on
+        # ``is_created``.  Under vmap the cond emits both branches into HLO
+        # anyway; making the selection explicit drops the cond-merge cost.
+        # Byte-identical to the cond: the selected branch's rng/state matches
+        # what cond would have returned.
+        outer_args = (rng, idx, slots, mask, fresh)
+        pc_out = place_created(outer_args)
+        su_out = skip_uncreated(outer_args)
+        return jax.tree_util.tree_map(
+            lambda a, b: jnp.where(is_created, a, b), pc_out, su_out,
+        )
 
     final = lax.while_loop(cond, body, init_carry)
     final_rng, _final_idx, final_slots, _final_mask, _final_fresh = final
