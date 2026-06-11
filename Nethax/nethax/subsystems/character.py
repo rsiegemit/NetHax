@@ -1569,8 +1569,8 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         # Cite: vendor/nle/src/u_init.c:750; mkobj.c:803-1004; u_init.c:113.
         vendor_rng, dagger_qty, rogue_buc_flags = _consume_ini_inv_rogue_draws(vendor_rng)
         # Step 3: BLINDFOLD gate — u_init.c:753
-        from Nethax.nethax import vendor_rng as _vendor_rng_mod
-        vendor_rng, blindfold_roll = _vendor_rng_mod.rn2(vendor_rng, 5)
+        from Nethax.nethax.vendor_rng import rn2_jax as _rn2_jax
+        vendor_rng, blindfold_roll = _rn2_jax(vendor_rng, jnp.int32(5))
 
     # --- Stat rolls (vendor init_attr(75) parity) ---
     # Step 4: NLE_BYTEPARITY mode: consume ISAAC64 draws via consume_init_attr_draws.
