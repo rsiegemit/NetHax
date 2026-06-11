@@ -1514,7 +1514,18 @@ def quaff_potion(state, rng, slot_idx):
         )
 
         # Dispatch: operand is (state, rng, buc); each branch returns new state.
-        new_state = jax.lax.switch(effect_id, _SWITCH_BRANCHES, (s, rng, buc))
+        # Brax-flatten: compute all N_POTIONS branches per dispatch and select
+        # by one-hot effect_id mask via jax.tree.map / jnp.where.
+        _operand_q = (s, rng, buc)
+        _results_q = [br(_operand_q) for br in _SWITCH_BRANCHES]
+
+        def _select_q(*branches):
+            out = branches[0]
+            for _i in range(1, len(branches)):
+                out = jnp.where(effect_id == jnp.int32(_i), branches[_i], out)
+            return out
+
+        new_state = jax.tree.map(_select_q, *_results_q)
 
         # wave17h P0 (IDENTIFICATION #2): use-ID on drinking unknown potion.
         # Cite: vendor/nethack/src/potion.c::peffects identifies the type
