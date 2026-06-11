@@ -1108,10 +1108,11 @@ def drop(state, rng, ground_items: Item, branch: int, level: int, slot_idx: int)
     # ground stack below.  Only fires on ALTAR tile and when can_drop.
     here_tile = state.terrain[branch, level, row, col].astype(jnp.int32)
     on_altar = (here_tile == jnp.int32(int(_TileType.ALTAR))) & can_drop
-    state_altared = jax.lax.cond(
-        on_altar,
-        lambda s: _drop_at_altar(s, slot_idx),
-        lambda s: s,
+    # Brax-flatten: compute both branches, select via tree_map+where.
+    _altared = _drop_at_altar(state, slot_idx)
+    state_altared = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(on_altar, t, f),
+        _altared,
         state,
     )
     inv = state_altared.inventory.items
@@ -1452,10 +1453,11 @@ def wear_armor(state, slot_idx: int, armor_slot: ArmorSlot):
     # MiniHack skill env wears a robe (ARM_CLOAK == BODY here).
     # Cite: vendor/nle/src/do_wear.c:79.
     from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
-    new_messages = jax.lax.cond(
-        can_wear,
-        lambda m: _msg_emit(m, int(_MsgId.WEAR_ROBE)),
-        lambda m: m,
+    # Brax-flatten: compute both branches, select via tree_map+where.
+    _emitted_msgs = _msg_emit(state.messages, int(_MsgId.WEAR_ROBE))
+    new_messages = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(can_wear, t, f),
+        _emitted_msgs,
         state.messages,
     )
     new_state = state.replace(
@@ -1535,10 +1537,11 @@ def handle_pickup(state, rng, ground_items: Item, branch: int, level: int) -> tu
     role_idx = jnp.clip(state.player_role.astype(jnp.int32), 0, _ARTIFACT_IDX_BY_ROLE.shape[0] - 1)
     quest_art_id = _ARTIFACT_IDX_BY_ROLE[role_idx].astype(jnp.int16)
     is_quest_artifact = (picked_type_id == quest_art_id) & (picked_type_id > jnp.int16(0))
-    new_state = jax.lax.cond(
-        is_quest_artifact,
-        on_artifact_picked_up,
-        lambda s: s,
+    # Brax-flatten: compute both branches, select via tree_map+where.
+    _picked = on_artifact_picked_up(new_state)
+    new_state = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_quest_artifact, t, f),
+        _picked,
         new_state,
     )
     return new_state, new_gi
@@ -1606,10 +1609,11 @@ def handle_wield(state, rng):
     # (vendor/minihack reward_manager.py:467-470).
     # Cite: vendor/nle/src/wield.c:191; vendor/nle/src/invent.c:2440.
     from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
-    wielded_msg = jax.lax.cond(
-        found_weapon,
-        lambda m: _msg_emit(m, int(_MsgId.WIELD_DAGGER)),
-        lambda m: m,
+    # Brax-flatten: compute both branches, select via tree_map+where.
+    _wielded_emit = _msg_emit(new_state.messages, int(_MsgId.WIELD_DAGGER))
+    wielded_msg = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(found_weapon, t, f),
+        _wielded_emit,
         new_state.messages,
     )
     new_state = new_state.replace(messages=wielded_msg)
