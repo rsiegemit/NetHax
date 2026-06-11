@@ -2906,15 +2906,18 @@ def monster_use_item(state, rng: jax.Array, monster_idx: jnp.ndarray):
 
     rng_heal, rng_tport, rng_zap = jax.random.split(rng, 3)
 
-    s1 = jax.lax.cond(quaff_heal,
-                      lambda s: _try_heal(s, rng_heal, idx),
-                      lambda s: s, state)
-    s2 = jax.lax.cond(read_tport,
-                      lambda s: _try_scroll_teleport(s, rng_tport, idx),
-                      lambda s: s, s1)
-    s3 = jax.lax.cond(zap_wand,
-                      lambda s: _try_zap_wand(s, rng_zap, idx),
-                      lambda s: s, s2)
+    _s1_t = _try_heal(state, rng_heal, idx)
+    s1 = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(quaff_heal, t, f), _s1_t, state,
+    )
+    _s2_t = _try_scroll_teleport(s1, rng_tport, idx)
+    s2 = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(read_tport, t, f), _s2_t, s1,
+    )
+    _s3_t = _try_zap_wand(s2, rng_zap, idx)
+    s3 = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(zap_wand, t, f), _s3_t, s2,
+    )
     return s3
 
 
