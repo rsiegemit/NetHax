@@ -212,12 +212,23 @@ def tick_occupation(state):
     )
     firing = countdown_active & (rem == jnp.int32(1))
 
-    def _fire(s):
-        return jax.lax.switch(
-            s.occupation_kind.astype(jnp.int32), _OCCUPATION_CALLBACKS, s,
-        )
+    # Brax-flatten: compute all switch branches eagerly, then select via
+    # jnp.where cascade on occupation_kind; outer firing-gate select via
+    # jnp.where over the resulting pytree.
+    kind_idx = state_picked.occupation_kind.astype(jnp.int32)
+    cb_outs = tuple(cb(state_picked) for cb in _OCCUPATION_CALLBACKS)
 
-    state_post = jax.lax.cond(firing, _fire, lambda s: s, state_picked)
+    def _select_kind(*leaves):
+        acc = leaves[0]
+        for i in range(1, len(leaves)):
+            acc = jnp.where(kind_idx == jnp.int32(i), leaves[i], acc)
+        return acc
+
+    state_fired = jax.tree_util.tree_map(_select_kind, *cb_outs)
+    state_post = jax.tree_util.tree_map(
+        lambda fired, base: jnp.where(firing, fired, base),
+        state_fired, state_picked,
+    )
 
     # Clear occupation when:
     #  - countdown callback fired (firing), OR
