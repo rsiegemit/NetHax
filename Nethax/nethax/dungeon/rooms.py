@@ -719,18 +719,18 @@ def makerooms(
         room_slot_free = nroom < jnp.int32(MAXNROFROOMS)
         rnd_rect_gate = alive & room_slot_free
 
-        def do_rnd_rect(args):
-            vrng_in, pool_in = args
-            pool_out, _lx, _ly, _hx, _hy, vrng_out, has = rnd_rect(pool_in, vrng_in)
-            return vrng_out, pool_out, has
-
-        def skip_rnd_rect(args):
-            vrng_in, pool_in = args
-            return vrng_in, pool_in, jnp.bool_(False)
-
-        vrng, pool, has_rect = lax.cond(
-            rnd_rect_gate, do_rnd_rect, skip_rnd_rect, (vrng, pool),
+        # Brax-flatten: compute both branches and select via where.  The
+        # ``rnd_rect`` call always traces but the unselected branch's
+        # vrng/pool state is discarded, preserving byte parity downstream.
+        pool_t, _lx, _ly, _hx, _hy, vrng_t, has_t = rnd_rect(pool, vrng)
+        vrng_f, pool_f, has_f = vrng, pool, jnp.bool_(False)
+        vrng = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(rnd_rect_gate, t, f), vrng_t, vrng_f,
         )
+        pool = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(rnd_rect_gate, t, f), pool_t, pool_f,
+        )
+        has_rect = jnp.where(rnd_rect_gate, has_t, has_f)
 
         # ``rnd_rect_gate`` already folds the ``nroom < MAXNROFROOMS``
         # side of vendor's ``&&``; ``still_alive`` just adds the
@@ -755,18 +755,15 @@ def makerooms(
             & (nroom >= jnp.int32(_MAKEROOMS_VAULT_THRESHOLD))
         )
 
-        def do_vault_roll(args):
-            vrng_in = args
-            vrng_out, r = rn2_jax(vrng_in, jnp.int32(2))
-            return vrng_out, r
-
-        def skip_vault_roll(args):
-            vrng_in = args
-            return vrng_in, jnp.int32(0)
-
-        vrng, vault_roll = lax.cond(
-            vault_gate_lhs, do_vault_roll, skip_vault_roll, vrng,
+        # Brax-flatten: compute both branches and select via where.  The
+        # ``rn2_jax`` call always traces but the unselected branch's vrng
+        # state is discarded, preserving byte parity downstream.
+        vrng_t, r_t = rn2_jax(vrng, jnp.int32(2))
+        vrng_f, r_f = vrng, jnp.int32(0)
+        vrng = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(vault_gate_lhs, t, f), vrng_t, vrng_f,
         )
+        vault_roll = jnp.where(vault_gate_lhs, r_t, r_f)
 
         # Vendor's full ``&&`` chain only enters the if-branch (and thus
         # only sets ``tried_vault = TRUE`` and runs ``create_vault()``)
@@ -804,44 +801,41 @@ def makerooms(
         # ``_invoke_create_room``'s ``sentinel_hx`` parameter.
         do_create_branch = still_alive
 
-        def do_create_room(args):
-            (vrng_in, pool_in,
-             rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
-             level_grid_in,
-             nroom_in, vault_in) = args
-            sentinel_hx = jnp.where(
-                vault_in, jnp.int16(-1), jnp.int16(0)
-            )  # ``hx_written`` only used when vault_in==True.
-            return _invoke_create_room(
-                vrng_in, pool_in,
-                rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
-                level_grid_in,
-                nroom_in, depth=abs_depth,
-                vault=vault_in,
-                sentinel_hx=sentinel_hx,
-            )
-
-        def skip_create_room(args):
-            (vrng_in, pool_in,
-             rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
-             level_grid_in,
-             nroom_in, _vault_in) = args
-            return (
-                vrng_in, pool_in,
-                rlx_in, rly_in, rhx_in, rhy_in, rlit_in,
-                level_grid_in,
-                nroom_in, jnp.bool_(False),
-            )
-
-        (vrng, pool,
-         rlx, rly, rhx, rhy, rlit,
-         level_grid,
-         nroom, cr_success) = lax.cond(
-            do_create_branch,
-            do_create_room,
-            skip_create_room,
-            (vrng, pool, rlx, rly, rhx, rhy, rlit, level_grid, nroom, take_vault),
+        # Brax-flatten: compute both branches and select via where.  The
+        # ``_invoke_create_room`` call always traces; the unselected
+        # branch's results are discarded.  When ``do_create_branch`` is
+        # False the carry passes through unchanged (cr_success=False),
+        # matching the prior skip_create_room semantics.
+        sentinel_hx = jnp.where(
+            take_vault, jnp.int16(-1), jnp.int16(0)
         )
+        (vrng_t, pool_t,
+         rlx_t, rly_t, rhx_t, rhy_t, rlit_t,
+         level_grid_t,
+         nroom_t, cr_success_t) = _invoke_create_room(
+            vrng, pool,
+            rlx, rly, rhx, rhy, rlit,
+            level_grid,
+            nroom, depth=abs_depth,
+            vault=take_vault,
+            sentinel_hx=sentinel_hx,
+        )
+        cr_success_f = jnp.bool_(False)
+
+        vrng = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(do_create_branch, t, f), vrng_t, vrng,
+        )
+        pool = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(do_create_branch, t, f), pool_t, pool,
+        )
+        rlx = jnp.where(do_create_branch, rlx_t, rlx)
+        rly = jnp.where(do_create_branch, rly_t, rly)
+        rhx = jnp.where(do_create_branch, rhx_t, rhx)
+        rhy = jnp.where(do_create_branch, rhy_t, rhy)
+        rlit = jnp.where(do_create_branch, rlit_t, rlit)
+        level_grid = jnp.where(do_create_branch, level_grid_t, level_grid)
+        nroom = jnp.where(do_create_branch, nroom_t, nroom)
+        cr_success = jnp.where(do_create_branch, cr_success_t, cr_success_f)
 
         # Update alive: vendor exits the outer ``while`` only when
         #   (a) rnd_rect() returned 0  (already folded into still_alive),
@@ -2080,11 +2074,16 @@ def fill_ordinary_rooms(
                 # Draw a fresh somexy only while still searching.  Once
                 # ``done_`` flips True the cell is frozen and we replay
                 # zero-draw no-ops (matches vendor's loop-exit semantics).
-                def _draw(vi):
-                    return somexy(vi)
-                def _hold(vi):
-                    return (vi, r_, c_)
-                v, r_cand, c_cand = lax.cond(~done_, _draw, _hold, v)
+                # Brax-flatten: compute the somexy draw always, select via
+                # where.  When ``done_`` is True the unselected vrng_t/draw
+                # is discarded and we keep ``v`` plus the frozen (r_, c_).
+                v_t, r_t, c_t = somexy(v)
+                still_searching = ~done_
+                v = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(still_searching, t, f), v_t, v,
+                )
+                r_cand = jnp.where(still_searching, r_t, r_)
+                c_cand = jnp.where(still_searching, c_t, c_)
                 bad = _occupied(r_cand, c_cand, t_grid, tr_grid) | _bydoor(
                     r_cand, c_cand, t_grid,
                 )
@@ -2271,7 +2270,11 @@ def fill_ordinary_rooms(
                     )
                     vi = consume_mksobj_init_draws(vi, item_cls, item_otyp)
                     return vi
-                v = lax.cond(is_item_trap, _item_true, lambda vi: vi, v)
+                # Brax-flatten: always run _item_true, select via where.
+                v_t = _item_true(v)
+                v = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(is_item_trap, t, f), v_t, v,
+                )
                 # Persist the trap item (vendor mklev.c:1450 mksobj_at → object
                 # at trap cell) into ground_items.  Gate on is_item_trap so the
                 # write is a no-op for non-ARROW/DART/ROCK traps.  ARROW=otyp 1
@@ -2358,9 +2361,15 @@ def fill_ordinary_rooms(
                 def _elf_slp_true(vi):
                     vi, _ = randint_jax(vi, (), 0, 2)
                     return vi
-                v = lax.cond(
-                    is_elf_victim & (kind == SLP_GAS_TRAP) & (depth_i <= jnp.int32(2)),
-                    _elf_slp_true, lambda vi: vi, v,
+                # Brax-flatten: always draw, select via where.
+                _elf_slp_pred = (
+                    is_elf_victim
+                    & (kind == SLP_GAS_TRAP)
+                    & (depth_i <= jnp.int32(2))
+                )
+                v_t = _elf_slp_true(v)
+                v = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(_elf_slp_pred, t, f), v_t, v,
                 )
 
                 def _gnome_candle(vi):
@@ -2385,11 +2394,18 @@ def fill_ordinary_rooms(
                             vic, jnp.int32(6), candle_otyp,
                         )
                         return vic
-                    vi = lax.cond(
-                        rn10 == jnp.int32(0), _candle_true, lambda vic: vic, vi,
+                    # Brax-flatten: always run _candle_true, select via where.
+                    _cand_pred = rn10 == jnp.int32(0)
+                    vi_t = _candle_true(vi)
+                    vi = jax.tree_util.tree_map(
+                        lambda t, f: jnp.where(_cand_pred, t, f), vi_t, vi,
                     )
                     return vi
-                v = lax.cond(is_gnome_victim, _gnome_candle, lambda vi: vi, v)
+                # Brax-flatten: always run _gnome_candle, select via where.
+                v_t = _gnome_candle(v)
+                v = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(is_gnome_victim, t, f), v_t, v,
+                )
 
                 # mkcorpstat(CORPSE, NULL, &mons[victim_mnum], m.x, m.y,
                 # CORPSTAT_INIT) — vendor mklev.c:1529-1530.
@@ -2445,13 +2461,12 @@ def fill_ordinary_rooms(
                 # somexy placement, rnd(4) dead-predecessor gate, dead-pred
                 # cascade) fire only when the rn2(x) gate evaluates 0.
                 # Vendor cite: vendor/nle/src/mklev.c:825-826, 1274-1534.
-                def _draw_roll(vi):
-                    vi, r = randint_jax(vi, (), 0, trap_x)
-                    return vi, r
-                vrng_in, roll = lax.cond(
-                    continue_, _draw_roll,
-                    lambda vi: (vi, jnp.int32(1)), vrng_in,
+                # Brax-flatten: always draw the roll, select via where.
+                vrng_t, roll_t = randint_jax(vrng_in, (), 0, trap_x)
+                vrng_in = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(continue_, t, f), vrng_t, vrng_in,
                 )
+                roll = jnp.where(continue_, roll_t, jnp.int32(1))
                 hit = continue_ & (roll == jnp.int32(0))
                 should_place = hit & is_ordinary
 
@@ -2495,14 +2510,12 @@ def fill_ordinary_rooms(
                         # switch/case only draws this inside ``case HOLE``.
                         is_hole = k_raw == HOLE
 
-                        def _draw_h7(vv):
-                            vv, h = randint_jax(vv, (), 0, 7)
-                            return vv, h
-
-                        def _no_h7(vv):
-                            return vv, jnp.int32(0)
-
-                        vi, h7 = lax.cond(is_hole, _draw_h7, _no_h7, vi)
+                        # Brax-flatten: always draw, select via where.
+                        vi_t, h_t = randint_jax(vi, (), 0, 7)
+                        vi = jax.tree_util.tree_map(
+                            lambda t, f: jnp.where(is_hole, t, f), vi_t, vi,
+                        )
+                        h7 = jnp.where(is_hole, h_t, jnp.int32(0))
                         k_final = _isaac_legalise_trap_kind(k_raw, depth_i, h7)
                         # legalise() collapses rejected draws to ARROW_TRAP
                         # (==1) — but vendor RETRIES on rejection.  Detect a
@@ -2543,7 +2556,11 @@ def fill_ordinary_rooms(
                     def _sqky_true(vi):
                         vi, _ = randint_jax(vi, (), 0, 12)
                         return vi
-                    v = lax.cond(is_sqky, _sqky_true, lambda vi: vi, v)
+                    # Brax-flatten: always draw, select via where.
+                    v_t = _sqky_true(v)
+                    v = jax.tree_util.tree_map(
+                        lambda t, f: jnp.where(is_sqky, t, f), v_t, v,
+                    )
                     # Dead-predecessor gate: rnd(4) drawn AFTER mktrap fires.
                     # Vendor mklev.c:1418-1425 — the full predicate is:
                     #   kind != NO_TRAP && lvl <= rnd(4)
@@ -2580,24 +2597,35 @@ def fill_ordinary_rooms(
                     # MG_OBJPILE at (col=58, row=14) where vendor has 4 stacks
                     # (potion 76 from outer mkobj + weapon 240 / gem 422 /
                     # tool 209 from dead_pred).
-                    v, gc, gt, gq = lax.cond(
-                        kind_ok & (depth_i <= rnd4_gate_),
-                        lambda args: _dead_pred_cascade(
-                            args[0], kind_, args[1], args[2], args[3],
-                            rt_r_, rt_c_,
-                        ),
-                        lambda args: args,
-                        (v, gc, gt, gq),
+                    # Brax-flatten: always run _dead_pred_cascade, select
+                    # via where.  The unselected branch's vrng/items state
+                    # is discarded, preserving byte parity downstream.
+                    _dp_pred = kind_ok & (depth_i <= rnd4_gate_)
+                    v_t, gc_t, gt_t, gq_t = _dead_pred_cascade(
+                        v, kind_, gc, gt, gq, rt_r_, rt_c_,
                     )
+                    v = jax.tree_util.tree_map(
+                        lambda t, f: jnp.where(_dp_pred, t, f), v_t, v,
+                    )
+                    gc = jnp.where(_dp_pred, gc_t, gc)
+                    gt = jnp.where(_dp_pred, gt_t, gt)
+                    gq = jnp.where(_dp_pred, gq_t, gq)
                     return (v, new_t, new_tr, gc, gt, gq)
 
-                def _mktrap_false(carry_m):
-                    return carry_m
-
-                vrng_in, new_terrain, new_traps, gc_out, gt_out, gq_out = lax.cond(
-                    should_place, _mktrap_true, _mktrap_false,
-                    (vrng_in, terrain_in, traps_in, gc_in, gt_in, gq_in),
+                # Brax-flatten: always run _mktrap_true, select via where.
+                (vrng_t, new_terrain_t, new_traps_t,
+                 gc_t, gt_t, gq_t) = _mktrap_true(
+                    (vrng_in, terrain_in, traps_in, gc_in, gt_in, gq_in)
                 )
+                vrng_in = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(should_place, t, f),
+                    vrng_t, vrng_in,
+                )
+                new_terrain = jnp.where(should_place, new_terrain_t, terrain_in)
+                new_traps = jnp.where(should_place, new_traps_t, traps_in)
+                gc_out = jnp.where(should_place, gc_t, gc_in)
+                gt_out = jnp.where(should_place, gt_t, gt_in)
+                gq_out = jnp.where(should_place, gq_t, gq_in)
 
                 return (
                     new_terrain, new_traps, continue_ & hit, vrng_in,
@@ -2685,10 +2713,16 @@ def fill_ordinary_rooms(
                 ].set(_new_qty)
                 return (v, gcat_g, gtyp_g, gqty_g)
 
-            vrng, gcat_, gtyp_, gqty_ = lax.cond(
-                _gold_gate, _mkgold_true, lambda c: c,
-                (vrng, gcat_, gtyp_, gqty_),
+            # Brax-flatten: always run _mkgold_true, select via where.
+            v_t, gcat_t, gtyp_t, gqty_t = _mkgold_true(
+                (vrng, gcat_, gtyp_, gqty_)
             )
+            vrng = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(_gold_gate, t, f), v_t, vrng,
+            )
+            gcat_ = jnp.where(_gold_gate, gcat_t, gcat_)
+            gtyp_ = jnp.where(_gold_gate, gtyp_t, gtyp_)
+            gqty_ = jnp.where(_gold_gate, gqty_t, gqty_)
 
             # --- Fountain: !rn2(10) + mkfount internals (vendor mklev.c:831-832) ---
             # Vendor:  if (!rn2(10)) mkfount(0, croom);
@@ -2720,23 +2754,23 @@ def fill_ordinary_rooms(
                 blessed_ftn = (blessed_ == jnp.int32(0)).astype(jnp.int8)
                 # Only commit the terrain/feature writes when the retry loop
                 # actually accepted a cell; otherwise the placement bailed out.
-                def _commit(args):
-                    tt, aaa = args
-                    new_tt = tt.at[rf_, cf_].set(FOUNTAIN)
-                    new_aaa = aaa.at[flat_lv, rf_, cf_].set(blessed_ftn)
-                    return (new_tt, new_aaa)
-                new_t, new_aa = lax.cond(
-                    done_f, _commit, lambda args: args, (t, aa),
-                )
+                # Brax-flatten: always compute commit, select via where.
+                new_tt_t = t.at[rf_, cf_].set(FOUNTAIN)
+                new_aaa_t = aa.at[flat_lv, rf_, cf_].set(blessed_ftn)
+                new_t = jnp.where(done_f, new_tt_t, t)
+                new_aa = jnp.where(done_f, new_aaa_t, aa)
                 return (v, new_t, new_aa, tr)
 
-            def _fount_false(carry):
-                return carry
-
-            vrng, terrain_, features_aa, traps_tt = lax.cond(
-                place_fount, _fount_true, _fount_false,
-                (vrng, terrain_, features_aa, traps_tt),
+            # Brax-flatten: always run _fount_true, select via where.
+            v_t, terrain_t, features_aa_t, traps_tt_t = _fount_true(
+                (vrng, terrain_, features_aa, traps_tt)
             )
+            vrng = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(place_fount, t, f), v_t, vrng,
+            )
+            terrain_ = jnp.where(place_fount, terrain_t, terrain_)
+            features_aa = jnp.where(place_fount, features_aa_t, features_aa)
+            traps_tt = jnp.where(place_fount, traps_tt_t, traps_tt)
 
             # --- Sink: !rn2(60) + mksink internals (vendor mklev.c:833-834) ---
             # Vendor:  if (!rn2(60)) mksink(croom);
@@ -2763,13 +2797,15 @@ def fill_ordinary_rooms(
                 )
                 return (v, new_t, tr)
 
-            def _sink_false(carry):
-                return carry
-
-            vrng, terrain_, traps_tt = lax.cond(
-                _sink_gate, _sink_true, _sink_false,
-                (vrng, terrain_, traps_tt),
+            # Brax-flatten: always run _sink_true, select via where.
+            v_t, terrain_t, traps_tt_t = _sink_true(
+                (vrng, terrain_, traps_tt)
             )
+            vrng = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(_sink_gate, t, f), v_t, vrng,
+            )
+            terrain_ = jnp.where(_sink_gate, terrain_t, terrain_)
+            traps_tt = jnp.where(_sink_gate, traps_tt_t, traps_tt)
 
             # --- Altar: !rn2(60) + mkaltar internals (vendor mklev.c:835-836) ---
             # Vendor:  if (!rn2(60)) mkaltar(croom);
@@ -2788,23 +2824,23 @@ def fill_ordinary_rooms(
                 # draws this unconditionally after the retry loop (mklev.c:1638).
                 v, alt_align_ = randint_jax(v, (), 0, 3)
                 induced_ = alt_align_.astype(jnp.int8)
-                def _commit(args):
-                    tt, aaa = args
-                    new_tt = tt.at[ra_, ca_].set(ALTAR)
-                    new_aaa = aaa.at[flat_lv, ra_, ca_].set(induced_)
-                    return (new_tt, new_aaa)
-                new_t, new_aa = lax.cond(
-                    done_a, _commit, lambda args: args, (t, aa),
-                )
+                # Brax-flatten: always compute commit, select via where.
+                new_tt_t = t.at[ra_, ca_].set(ALTAR)
+                new_aaa_t = aa.at[flat_lv, ra_, ca_].set(induced_)
+                new_t = jnp.where(done_a, new_tt_t, t)
+                new_aa = jnp.where(done_a, new_aaa_t, aa)
                 return (v, new_t, new_aa, tr)
 
-            def _altar_false(carry):
-                return carry
-
-            vrng, terrain_, features_aa, traps_tt = lax.cond(
-                place_altar, _altar_true, _altar_false,
-                (vrng, terrain_, features_aa, traps_tt),
+            # Brax-flatten: always run _altar_true, select via where.
+            v_t, terrain_t, features_aa_t, traps_tt_t = _altar_true(
+                (vrng, terrain_, features_aa, traps_tt)
             )
+            vrng = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(place_altar, t, f), v_t, vrng,
+            )
+            terrain_ = jnp.where(place_altar, terrain_t, terrain_)
+            features_aa = jnp.where(place_altar, features_aa_t, features_aa)
+            traps_tt = jnp.where(place_altar, traps_tt_t, traps_tt)
 
             # --- Grave: !rn2(grave_x) + mkgrave internals (vendor mklev.c:840-841) ---
             # Vendor:  if (!rn2(x)) mkgrave(croom);
@@ -2838,9 +2874,11 @@ def fill_ordinary_rooms(
                     vi, _ = randint_jax(vi, (), 1, 21)        # rnd(20) — mklev.c:1673
                     vi, _ = randint_jax(vi, (), 1, 6)         # rnd(5)  — mklev.c:1673
                     return vi
-                v = lax.cond(
-                    _gold_gate_g == jnp.int32(0),
-                    _gold_grave_true, lambda vi: vi, v,
+                # Brax-flatten: always draw, select via where.
+                _gg_pred = _gold_gate_g == jnp.int32(0)
+                v_t = _gold_grave_true(v)
+                v = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(_gg_pred, t, f), v_t, v,
                 )
                 # tryct loop — vendor mkgrave mklev.c:1678-1686:
                 #   for (tryct = rn2(5); tryct; tryct--)
@@ -2860,9 +2898,11 @@ def fill_ordinary_rooms(
                         # Vendor mkgrave mklev.c:1679: mkobj(RANDOM_CLASS, TRUE) → artif=TRUE.
                         vj = consume_mksobj_init_draws(vj, oclass_g, otyp_g, artif=True)  # mkobj.c:801-1069
                         return vj
-                    return lax.cond(
-                        jnp.int32(idx) < _tryct,
-                        _do_mkobj, lambda vj: vj, vi,
+                    # Brax-flatten: always run _do_mkobj, select via where.
+                    _try_pred = jnp.int32(idx) < _tryct
+                    vi_t = _do_mkobj(vi)
+                    return jax.tree_util.tree_map(
+                        lambda t, f: jnp.where(_try_pred, t, f), vi_t, vi,
                     )
 
                 v = lax.fori_loop(0, 4, _tryct_body, v)
@@ -2874,21 +2914,23 @@ def fill_ordinary_rooms(
                 # kept for fidelity in case the table is ever updated.
                 # Vendor cite: vendor/nle/src/mklev.c:1689-1690;
                 #              vendor/nle/src/mkobj.c:897-966 (TOOL_CLASS dispatch).
-                v = lax.cond(
-                    _dobell == jnp.int32(0),
-                    lambda vi: consume_mksobj_init_draws(vi, jnp.int32(6), jnp.int32(230)),
-                    lambda vi: vi,
-                    v,
+                # Brax-flatten: always consume, select via where.
+                _bell_pred = _dobell == jnp.int32(0)
+                v_t = consume_mksobj_init_draws(
+                    v, jnp.int32(6), jnp.int32(230),
+                )
+                v = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(_bell_pred, t, f), v_t, v,
                 )
                 new_t = t.at[rg2_, cg2_].set(GRAVE)
                 return (v, new_t)
 
-            def _grave_false(carry):
-                return carry
-
-            vrng, terrain_ = lax.cond(
-                place_grave, _grave_true, _grave_false, (vrng, terrain_)
+            # Brax-flatten: always run _grave_true, select via where.
+            v_t, terrain_t = _grave_true((vrng, terrain_))
+            vrng = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(place_grave, t, f), v_t, vrng,
             )
+            terrain_ = jnp.where(place_grave, terrain_t, terrain_)
 
             # --- Statue: !rn2(20) + mkcorpstat cascade (vendor mklev.c:844-847) ---
             # Vendor: if (!rn2(20)) (void) mkcorpstat(STATUE, NULL, NULL,
@@ -2958,10 +3000,20 @@ def fill_ordinary_rooms(
                     vv, _ = randint_jax(vv, (), 0, spbook_mod)
                     return vv
 
-                v = lax.cond(_is_verysmall, lambda vv: vv, _draw_spbook, v)
+                # Brax-flatten: always draw spbook, select via where.
+                # When _is_verysmall is True we keep the original ``v``
+                # (no draw); else we keep _draw_spbook(v) (advanced).
+                v_drawn = _draw_spbook(v)
+                v = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(_is_verysmall, t, f), v, v_drawn,
+                )
                 return v
 
-            vrng = lax.cond(_statue_gate, _statue_true, lambda v: v, vrng)
+            # Brax-flatten: always run _statue_true, select via where.
+            vrng_t = _statue_true(vrng)
+            vrng = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(_statue_gate, t, f), vrng_t, vrng,
+            )
 
             # --- Box/chest: !rn2(nroom*5/2) gate (vendor mklev.c:853-855) ---
             # Short-circuit &&: rn2(3) chest/large and somexy only draw when gate
@@ -3011,12 +3063,16 @@ def fill_ordinary_rooms(
                 gq = gq.at[branch_idx, level_idx, _rbx, _cbx, slot_top].set(jnp.int16(1))
                 return vrng_in, gc, gt, gq
 
-            def _box_false(carry_b):
-                return carry_b
-
-            vrng, gcat_, gtyp_, gqty_ = lax.cond(
-                box_gate, _box_true, _box_false, (vrng, gcat_, gtyp_, gqty_),
+            # Brax-flatten: always run _box_true, select via where.
+            v_t, gcat_t, gtyp_t, gqty_t = _box_true(
+                (vrng, gcat_, gtyp_, gqty_)
             )
+            vrng = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(box_gate, t, f), v_t, vrng,
+            )
+            gcat_ = jnp.where(box_gate, gcat_t, gcat_)
+            gtyp_ = jnp.where(box_gate, gtyp_t, gtyp_)
+            gqty_ = jnp.where(box_gate, gqty_t, gqty_)
 
             # --- Graffiti: !rn2(27+3*|depth|) gate (vendor mklev.c:858-870) ---
             # Short-circuit: inner do-loop only runs when gate passes.
@@ -3086,12 +3142,13 @@ def fill_ordinary_rooms(
                     v, t = randint_jax(v, (), 0, FALSE_RUMOR_SIZE)    # rn2(false_rumor_size) (rumors.c:133)
                     return v, t
 
-                def _skip_rumor(v):
-                    return v, jnp.int32(0)
-
-                vrng_in, tidbit = lax.cond(
-                    rumor_path, _draw_rumor, _skip_rumor, vrng_in,
+                # Brax-flatten: always draw, select via where.
+                vrng_t, tidbit_t = _draw_rumor(vrng_in)
+                vrng_in = jax.tree_util.tree_map(
+                    lambda t, f: jnp.where(rumor_path, t, f),
+                    vrng_t, vrng_in,
                 )
+                tidbit = jnp.where(rumor_path, tidbit_t, jnp.int32(0))
                 # ---- wipeout_text simulation ----
                 # Pre-built per-tidbit tables (host-side, in rumors_data.py):
                 #   text_len_tab[tidbit]              : int32 strlen(rumor)
@@ -3134,20 +3191,15 @@ def fill_ordinary_rooms(
                         & (rlen > jnp.int32(0))
                     )
 
-                    def _do_extra(vv):
-                        # Clamp rlen lower bound to 1 so the false branch's
-                        # range_size argument is always positive; the result
-                        # is discarded when need_extra is false (the draw still
-                        # consumes one uint64 from the false branch — but the
-                        # lax.cond gates it, so the false branch returns vv
-                        # untouched).
-                        vv, _j = randint_jax(vv, (), 0, rlen)
-                        return vv
-
-                    def _no_extra(vv):
-                        return vv
-
-                    v = lax.cond(need_extra, _do_extra, _no_extra, v)
+                    # Brax-flatten: always draw, select via where.  Clamp
+                    # rlen lower bound to 1 so the draw range is always
+                    # positive even when need_extra is False (the result is
+                    # discarded by the where below).
+                    _rlen_safe = jnp.maximum(rlen, jnp.int32(1))
+                    v_t, _j = randint_jax(v, (), 0, _rlen_safe)
+                    v = jax.tree_util.tree_map(
+                        lambda t, f: jnp.where(need_extra, t, f), v_t, v,
+                    )
                     return v, i + jnp.int32(1)
 
                 vrng_in, _ = lax.while_loop(
@@ -3192,15 +3244,15 @@ def fill_ordinary_rooms(
                     # short-circuit on `typ == ROOM` (i.e. is_room True)
                     # SKIPS the rn2(40) draw entirely.  Use lax.cond so the
                     # ISAAC stream sees the draw only when vendor would.
-                    def _do_rn40(vv):
-                        vv, rn40 = randint_jax(vv, (), 0, 40)
-                        return vv, (rn40 == jnp.int32(0))
-
-                    def _skip_rn40(vv):
-                        # typ == ROOM ⇒ exit loop (cont=False); no draw.
-                        return vv, jnp.bool_(False)
-
-                    v, cont_next = lax.cond(is_room, _skip_rn40, _do_rn40, v)
+                    # Brax-flatten: always draw rn40, select via where.
+                    # When is_room is True we keep the original v (no draw)
+                    # and force cont_next False; else use the drawn result.
+                    v_drawn, rn40 = randint_jax(v, (), 0, 40)
+                    cont_drawn = rn40 == jnp.int32(0)
+                    v = jax.tree_util.tree_map(
+                        lambda t, f: jnp.where(is_room, t, f), v, v_drawn,
+                    )
+                    cont_next = jnp.where(is_room, jnp.bool_(False), cont_drawn)
                     return (v, cont_next, iters + jnp.int32(1))
 
                 vrng_in, _, _ = lax.while_loop(
@@ -3210,10 +3262,11 @@ def fill_ordinary_rooms(
                 )
                 return vrng_in
 
-            def _graffiti_false(vrng_in):
-                return vrng_in
-
-            vrng = lax.cond(graffiti_gate, _graffiti_true, _graffiti_false, vrng)
+            # Brax-flatten: always run _graffiti_true, select via where.
+            vrng_t = _graffiti_true(vrng)
+            vrng = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(graffiti_gate, t, f), vrng_t, vrng,
+            )
 
             # --- mkobj outer: !rn2(3) gate (vendor mklev.c:874-883) ---
             # Short-circuit: somexy + inner while loop only run when gate passes.
@@ -3333,11 +3386,14 @@ def fill_ordinary_rooms(
                         ].set(qty_i)
                         return (vi, gci, gti, gqi)
 
-                    v, gc, gt, gq = lax.cond(
-                        cont_next, _inner_true,
-                        lambda inner_carry: inner_carry,
-                        (v, gc, gt, gq),
+                    # Brax-flatten: always run _inner_true, select via where.
+                    v_t, gc_t, gt_t, gq_t = _inner_true((v, gc, gt, gq))
+                    v = jax.tree_util.tree_map(
+                        lambda t, f: jnp.where(cont_next, t, f), v_t, v,
                     )
+                    gc = jnp.where(cont_next, gc_t, gc)
+                    gt = jnp.where(cont_next, gt_t, gt)
+                    gq = jnp.where(cont_next, gq_t, gq)
                     return (v, gc, gt, gq, cont_next, iters + jnp.int32(1))
 
                 vrng_in, gcat_in, gtyp_in, gqty_in, _, _ = lax.while_loop(
@@ -3350,25 +3406,36 @@ def fill_ordinary_rooms(
                 )
                 return (vrng_in, gcat_in, gtyp_in, gqty_in)
 
-            def _mkobj_false(carry):
-                return carry
-
-            vrng, gcat_, gtyp_, gqty_ = lax.cond(
-                mkobj_gate, _mkobj_true, _mkobj_false,
-                (vrng, gcat_, gtyp_, gqty_),
+            # Brax-flatten: always run _mkobj_true, select via where.
+            v_t, gcat_t, gtyp_t, gqty_t = _mkobj_true(
+                (vrng, gcat_, gtyp_, gqty_)
             )
+            vrng = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(mkobj_gate, t, f), v_t, vrng,
+            )
+            gcat_ = jnp.where(mkobj_gate, gcat_t, gcat_)
+            gtyp_ = jnp.where(mkobj_gate, gtyp_t, gtyp_)
+            gqty_ = jnp.where(mkobj_gate, gqty_t, gqty_)
 
             return (terrain_, traps_tt, features_aa, vrng, gcat_, gtyp_, gqty_)
 
-        # Gate the entire feature-fill draw cascade on is_ordinary so
-        # inactive / non-OROOM slots consume ZERO ISAAC64 draws, matching
-        # vendor's mklev.c:803-805 loop bound + OROOM `continue`.
-        (terrain_, traps_tt, features_aa, vrng, gcat_, gtyp_, gqty_) = lax.cond(
-            is_ordinary,
-            _fill_features,
-            _skip_features,
-            (terrain_, traps_tt, features_aa, vrng, gcat_, gtyp_, gqty_),
+        # Brax-flatten: always run _fill_features, select via where.  The
+        # gate (``is_ordinary``) preserves zero-draw semantics for
+        # inactive / non-OROOM slots because the unselected branch's
+        # vrng/items state is discarded.
+        (terrain_t, traps_tt_t, features_aa_t,
+         vrng_t, gcat_t, gtyp_t, gqty_t) = _fill_features(
+            (terrain_, traps_tt, features_aa, vrng, gcat_, gtyp_, gqty_)
         )
+        terrain_ = jnp.where(is_ordinary, terrain_t, terrain_)
+        traps_tt = jnp.where(is_ordinary, traps_tt_t, traps_tt)
+        features_aa = jnp.where(is_ordinary, features_aa_t, features_aa)
+        vrng = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(is_ordinary, t, f), vrng_t, vrng,
+        )
+        gcat_ = jnp.where(is_ordinary, gcat_t, gcat_)
+        gtyp_ = jnp.where(is_ordinary, gtyp_t, gtyp_)
+        gqty_ = jnp.where(is_ordinary, gqty_t, gqty_)
 
         return (
             terrain_, features_aa, features_lit, traps_tt, vrng,
