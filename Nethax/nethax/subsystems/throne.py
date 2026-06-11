@@ -442,7 +442,12 @@ def _case9_blind_luck_or_rndcurse(state, rng):
     # Unlucky path: rndcurse (sit.c:143).
     unlucky_state = _rndcurse(state, rng_c)
 
-    return jax.lax.cond(lucky, lambda: lucky_state, lambda: unlucky_state)
+    # Brax-flatten: compute both branches eagerly + jnp.where via tree_map.
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(lucky, t, f),
+        lucky_state,
+        unlucky_state,
+    )
 
 
 def _case10_map_or_see_invis(state, rng):
@@ -467,9 +472,12 @@ def _case10_map_or_see_invis(state, rng):
         status=state.status.replace(intrinsics=new_intr),
     )
 
-    return jax.lax.cond(take_map_path,
-                       lambda: mapped_state,
-                       lambda: see_invis_state)
+    # Brax-flatten: compute both branches eagerly + jnp.where via tree_map.
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(take_map_path, t, f),
+        mapped_state,
+        see_invis_state,
+    )
 
 
 def _case11_aggravate_or_tele(state, rng):
@@ -490,7 +498,12 @@ def _case11_aggravate_or_tele(state, rng):
     )
     tele_state = _teleport_away(state, rng)
 
-    return jax.lax.cond(unlucky, lambda: aggro_state, lambda: tele_state)
+    # Brax-flatten: compute both branches eagerly + jnp.where via tree_map.
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(unlucky, t, f),
+        aggro_state,
+        tele_state,
+    )
 
 
 def _case13_confusion(state, rng):
@@ -573,19 +586,26 @@ def sit_throne(state, rng) -> "EnvState":
     case_num = rnd(rng_outcome, _N_OUTCOMES)        # 1..13 (vendor case)
     switch_idx = (case_num - jnp.int32(1)).astype(jnp.int32)
 
-    # Apply the chosen effect via lax.switch (JIT-pure dispatch).  Default
-    # arg capture avoids the late-binding closure bug in list comprehensions.
-    fired_state = jax.lax.switch(
-        switch_idx,
-        [lambda s, r, _fn=fn: _fn(s, r) for fn in _OUTCOMES],
-        state,
-        rng_effect,
-    )
+    # Brax-flatten: compute ALL 13 outcomes eagerly, then jnp.where-select
+    # via a one-hot mask on switch_idx.  This avoids lax.switch (which under
+    # vmap+jit synthesizes a branched HLO that compiles slowly on H100).
+    outcome_states = [fn(state, rng_effect) for fn in _OUTCOMES]
+    # Start from the case-0 result, then layer cases 1..12 via tree_map+where.
+    fired_state = outcome_states[0]
+    for i in range(1, _N_OUTCOMES):
+        sel = switch_idx == jnp.int32(i)
+        fired_state = jax.tree_util.tree_map(
+            lambda f, c, _sel=sel: jnp.where(_sel, c, f),
+            fired_state,
+            outcome_states[i],
+        )
 
-    # If the outer gate missed, the switch result is discarded.
-    state = jax.lax.cond(effect_fired,
-                        lambda: fired_state,
-                        lambda: state)
+    # Brax-flatten: outer gate via jnp.where via tree_map (no lax.cond).
+    state = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(effect_fired, t, f),
+        fired_state,
+        state,
+    )
 
     # Case 6 wish (sit.c:110): only fires when effect_fired AND case_num==6
     # AND the lucky-roll branch was NOT taken (luck + rn2(5) >= 0).
