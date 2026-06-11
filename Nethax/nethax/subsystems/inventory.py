@@ -981,10 +981,11 @@ def pickup(state, rng, ground_items: Item, branch: int, level: int) -> tuple:
         & (jnp.abs(pc_i - vc) <= jnp.int32(1))
     )
     witnessed = in_vault & (gold_qty > jnp.int32(0))
-    new_state = jax.lax.cond(
-        witnessed,
-        lambda s: _vault_witness(s, _GD_EATGOLD),
-        lambda s: s,
+    # Brax-flatten: compute both branches, select via tree_map+where.
+    _w_state = _vault_witness(new_state, _GD_EATGOLD)
+    new_state = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(witnessed, t, f),
+        _w_state,
         new_state,
     )
 
