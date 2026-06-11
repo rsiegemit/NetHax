@@ -997,26 +997,35 @@ def _displace_oroom_monster_on_player(state):
 
     do_displace = any_mon_at_player & any_hits
 
-    def _draw_and_move(carry):
-        v_in, mai_in = carry
-        v_out, idx = _vendor_rng.rn2_jax(v_in, jnp.maximum(count, jnp.int32(1)))
-        cum_r = jnp.cumsum(kept_ring.astype(jnp.int32))
-        match = (cum_r - jnp.int32(1) == idx) & kept_ring
-        pick = jnp.argmax(match.astype(jnp.int32)).astype(jnp.int32)
-        new_pos = jnp.stack(
-            [cands_rr_ring[pick].astype(jnp.int16),
-             cands_cc_ring[pick].astype(jnp.int16)]
-        )
-        mai_out = mai_in.replace(
-            pos=mai_in.pos.at[occupant_slot].set(new_pos),
-        )
-        return v_out, mai_out
+    # Brax-flat: always compute both the "draw + move" and "no-op" branches,
+    # then ``jnp.where``-select on ``do_displace``.  The rn2_jax draw advances
+    # the ISAAC64 stream unconditionally inside the trace, but the select
+    # below discards the new vendor_rng when ``do_displace`` is False, so the
+    # caller observes the same stream position as the vendor C path
+    # (zero draws when MON_AT(u.ux, u.uy) is false).  Byte-parity is
+    # preserved by choosing the original ``state.vendor_rng`` in the False
+    # branch — the speculative draw simply never gets committed.
+    v_drawn, idx = _vendor_rng.rn2_jax(
+        state.vendor_rng, jnp.maximum(count, jnp.int32(1))
+    )
+    cum_r = jnp.cumsum(kept_ring.astype(jnp.int32))
+    match = (cum_r - jnp.int32(1) == idx) & kept_ring
+    pick = jnp.argmax(match.astype(jnp.int32)).astype(jnp.int32)
+    new_pos = jnp.stack(
+        [cands_rr_ring[pick].astype(jnp.int16),
+         cands_cc_ring[pick].astype(jnp.int16)]
+    )
+    mai_drawn = state.monster_ai.replace(
+        pos=state.monster_ai.pos.at[occupant_slot].set(new_pos),
+    )
 
-    def _no_op(carry):
-        return carry
-
-    new_vrng, new_mai = jax.lax.cond(
-        do_displace, _draw_and_move, _no_op, (state.vendor_rng, state.monster_ai),
+    new_vrng = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(do_displace, a, b),
+        v_drawn, state.vendor_rng,
+    )
+    new_mai = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(do_displace, a, b),
+        mai_drawn, state.monster_ai,
     )
     return state.replace(vendor_rng=new_vrng, monster_ai=new_mai)
 
@@ -1198,21 +1207,26 @@ def _spawn_starting_pet(state, role: Role, vendor_rng=None):
         count = ring_count[first_ring]                                 # int32
 
         # Vendor: if any hits, draw ``rn2(count)`` ONCE; else fall back to
-        # player cell with NO draw (teleport.c:200-218).  Single ``lax.cond``
-        # keeps the stream-altering draw inside the success branch.
-        def _draw_branch(v):
-            v2, idx = _vendor_rng.rn2_jax(v, jnp.maximum(count, jnp.int32(1)))
-            cum_r = jnp.cumsum(kept_ring.astype(jnp.int32))            # [S]
-            match = (cum_r - jnp.int32(1) == idx) & kept_ring          # [S]
-            pick = jnp.argmax(match.astype(jnp.int32)).astype(jnp.int32)
-            return v2, jnp.stack([cands_rr_ring[pick], cands_cc_ring[pick]])
-
-        def _no_draw(v):
-            return v, player_pos_i32
-
-        vendor_rng, pet_pos_i32_picked = jax.lax.cond(
-            any_hits, _draw_branch, _no_draw, vendor_rng,
+        # player cell with NO draw (teleport.c:200-218).  Brax-flat: always
+        # compute the draw + pick, then ``jnp.where``-select against the
+        # original ``vendor_rng`` on ``any_hits``.  The speculative rn2_jax
+        # call advances ISAAC64 inside the trace, but ``tree_map(jnp.where)``
+        # discards that new state when ``any_hits`` is False, so the stream
+        # position is byte-identical to the lax.cond path (zero draws when
+        # no goodpos hits in any ring up to MAX_RANGE).
+        v_drawn, idx = _vendor_rng.rn2_jax(
+            vendor_rng, jnp.maximum(count, jnp.int32(1))
         )
+        cum_r = jnp.cumsum(kept_ring.astype(jnp.int32))                # [S]
+        match = (cum_r - jnp.int32(1) == idx) & kept_ring              # [S]
+        pick = jnp.argmax(match.astype(jnp.int32)).astype(jnp.int32)
+        pos_drawn = jnp.stack([cands_rr_ring[pick], cands_cc_ring[pick]])
+
+        vendor_rng = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(any_hits, a, b),
+            v_drawn, vendor_rng,
+        )
+        pet_pos_i32_picked = jnp.where(any_hits, pos_drawn, player_pos_i32)
         pet_pos = pet_pos_i32_picked.astype(jnp.int16)                 # [2]
     else:
         # Threefry path: static-shape 8 candidate offsets, pure-JAX argmax.
