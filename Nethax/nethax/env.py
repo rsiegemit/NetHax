@@ -1190,22 +1190,33 @@ def _spawn_starting_pet(state, role: Role, vendor_rng=None):
     n_wild = jnp.sum(state.monster_ai.alive.astype(jnp.int32))
     PET_SLOT = n_wild
     pm_i16 = jnp.int16(pet_pm)
-    mai = state.monster_ai.replace(
-        alive=state.monster_ai.alive.at[PET_SLOT].set(True),
-        tame=state.monster_ai.tame.at[PET_SLOT].set(True),
-        peaceful=state.monster_ai.peaceful.at[PET_SLOT].set(True),
-        mtame=state.monster_ai.mtame.at[PET_SLOT].set(jnp.int8(10)),
-        entry_idx=state.monster_ai.entry_idx.at[PET_SLOT].set(pm_i16),
-        pos=state.monster_ai.pos.at[PET_SLOT].set(pet_pos),
-        hp=state.monster_ai.hp.at[PET_SLOT].set(hp_val.astype(jnp.int32)),
-        hp_max=state.monster_ai.hp_max.at[PET_SLOT].set(hp_val.astype(jnp.int32)),
-        ac=state.monster_ai.ac.at[PET_SLOT].set(_BASE_AC[pet_pm]),
-        is_large=state.monster_ai.is_large.at[PET_SLOT].set(_IS_LARGE[pet_pm]),
-        attack_dice_n=state.monster_ai.attack_dice_n.at[PET_SLOT].set(
-            _ATK_DICE_N[pet_pm].astype(jnp.int8)
+    # vmap-safe slot write: replace `arr.at[PET_SLOT].set(value)` (which fails
+    # under vmap when PET_SLOT is a traced scalar) with a `jnp.where` mask over
+    # the slot index.  This is semantically identical for scalar PET_SLOT and
+    # remains traceable when PET_SLOT becomes a batched tracer.
+    from Nethax.nethax.subsystems.monster_ai import MAX_MONSTERS_PER_LEVEL as _MAX
+    k_arr = jnp.arange(_MAX, dtype=jnp.int32)
+    slot_mask = k_arr == n_wild                                # [_MAX] bool
+    slot_mask_2d = slot_mask[:, None]                          # [_MAX, 1] for pos
+    mai_prev = state.monster_ai
+    mai = mai_prev.replace(
+        alive=jnp.where(slot_mask, True, mai_prev.alive),
+        tame=jnp.where(slot_mask, True, mai_prev.tame),
+        peaceful=jnp.where(slot_mask, True, mai_prev.peaceful),
+        mtame=jnp.where(slot_mask, jnp.int8(10), mai_prev.mtame),
+        entry_idx=jnp.where(slot_mask, pm_i16, mai_prev.entry_idx),
+        pos=jnp.where(slot_mask_2d, pet_pos[None, :], mai_prev.pos),
+        hp=jnp.where(slot_mask, hp_val.astype(mai_prev.hp.dtype), mai_prev.hp),
+        hp_max=jnp.where(
+            slot_mask, hp_val.astype(mai_prev.hp_max.dtype), mai_prev.hp_max
         ),
-        attack_dice_sides=state.monster_ai.attack_dice_sides.at[PET_SLOT].set(
-            _ATK_DICE_S[pet_pm].astype(jnp.int8)
+        ac=jnp.where(slot_mask, _BASE_AC[pet_pm], mai_prev.ac),
+        is_large=jnp.where(slot_mask, _IS_LARGE[pet_pm], mai_prev.is_large),
+        attack_dice_n=jnp.where(
+            slot_mask, _ATK_DICE_N[pet_pm].astype(jnp.int8), mai_prev.attack_dice_n
+        ),
+        attack_dice_sides=jnp.where(
+            slot_mask, _ATK_DICE_S[pet_pm].astype(jnp.int8), mai_prev.attack_dice_sides
         ),
     )
     # Build the vendor fmon LIFO iteration order:
@@ -1213,8 +1224,6 @@ def _spawn_starting_pet(state, role: Role, vendor_rng=None):
     #   fmon_order[1..n_wild] = n_wild-1, n_wild-2, ..., 0  (wilds newest→oldest)
     #   fmon_order[n_wild+1..]  = -1                  (empty)
     # This is the order vendor `for (mtmp=fmon; mtmp; mtmp=mtmp->nmon)` walks.
-    from Nethax.nethax.subsystems.monster_ai import MAX_MONSTERS_PER_LEVEL as _MAX
-    k_arr = jnp.arange(_MAX, dtype=jnp.int32)
     fmon_order = jnp.where(
         k_arr == jnp.int32(0),
         PET_SLOT.astype(jnp.int32),
