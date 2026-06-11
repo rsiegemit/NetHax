@@ -6181,7 +6181,10 @@ def _bp_pet_or_skip_impl(state, rng, monster_idx, may_act):
         rng_pet = jax.random.split(rng, 7)[0]
         return pet_move(s, rng_pet, idx)
 
-    return jax.lax.cond(gate, _run, lambda s: s, state)
+    _state_run = _run(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(gate, t, f), _state_run, state,
+    )
 
 
 _bp_pet_or_skip_jit = jax.jit(_bp_pet_or_skip_impl)
