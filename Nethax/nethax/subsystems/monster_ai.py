@@ -6649,11 +6649,9 @@ def _monster_turn_one_bp_monolithic_impl(state, k_idx, key):
         _mt = monster_turn_brax
     else:
         _mt = monster_turn
-    return jax.lax.cond(
-        may_act,
-        lambda s: _mt(s, key, safe_slot),
-        lambda s: s,
-        state,
+    _state_mt = _mt(state, key, safe_slot)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(may_act, t, f), _state_mt, state,
     )
 
 

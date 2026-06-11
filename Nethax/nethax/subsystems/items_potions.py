@@ -385,10 +385,21 @@ def _effect_gain_ability(state, rng, buc):
         return (state.player_str, state.player_int, state.player_wis,
                 state.player_dex, state.player_con, new_ch)
 
-    (str_un, int_un, wis_un, dex_un, con_un, cha_un) = jax.lax.switch(
-        pick.astype(jnp.int32),
-        [_inc_str, _inc_int, _inc_wis, _inc_dex, _inc_con, _inc_cha],
-        None,
+    # Brax-flatten 6-way switch: compute all 6 branches, select by pick.
+    _pick_i32 = pick.astype(jnp.int32)
+    _branches = [
+        _inc_str(None), _inc_int(None), _inc_wis(None),
+        _inc_dex(None), _inc_con(None), _inc_cha(None),
+    ]
+
+    def _select_by_pick(*vals):
+        out = vals[0]
+        for _i in range(1, len(vals)):
+            out = jnp.where(_pick_i32 == jnp.int32(_i), vals[_i], out)
+        return out
+
+    (str_un, int_un, wis_un, dex_un, con_un, cha_un) = jax.tree.map(
+        _select_by_pick, *_branches,
     )
 
     # --- Select by BUC.
