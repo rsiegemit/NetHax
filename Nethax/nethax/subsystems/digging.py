@@ -593,11 +593,18 @@ def dig_tick(state, rng):
         cancelled_state = s.replace(dig=reset_dig)
         in_progress_state = s.replace(dig=still_digging)
 
-        s1 = jax.lax.cond(done, lambda _: completed_state, lambda _: in_progress_state, operand=None)
-        s2 = jax.lax.cond(cancel, lambda _: cancelled_state, lambda _: s1, operand=None)
+        s1 = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(done, t, f), completed_state, in_progress_state
+        )
+        s2 = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(cancel, t, f), cancelled_state, s1
+        )
         return s2
 
-    return jax.lax.cond(state.dig.active, _tick, lambda s: s, operand=state)
+    ticked_state = _tick(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(state.dig.active, t, f), ticked_state, state
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -617,11 +624,9 @@ def dig(state, rng, direction: int = 0):
     Cite: vendor/nethack/src/dig.c::dig (line 425, occupation callback).
     """
     started = start_dig(state, direction=direction)
-    return jax.lax.cond(
-        state.dig.active,
-        lambda s: dig_tick(s, rng),
-        lambda s: started,
-        operand=state,
+    ticked = dig_tick(state, rng)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(state.dig.active, t, f), ticked, started
     )
 
 
