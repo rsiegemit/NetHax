@@ -6523,7 +6523,10 @@ def _bp_attack_or_skip_impl(state, rng_atk, monster_idx, do_attack):
         )
         return new_s.replace(monster_ai=new_m)
 
-    return jax.lax.cond(do_attack, _run, lambda s: s, state)
+    _state_run = _run(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(do_attack, t, f), _state_run, state,
+    )
 
 
 _bp_attack_or_skip_jit = jax.jit(_bp_attack_or_skip_impl)
