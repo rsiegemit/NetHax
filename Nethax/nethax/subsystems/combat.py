@@ -2991,11 +2991,38 @@ if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
         "handle_throw": ("combat_brax", "handle_throw_brax"),
     }
     _BRAX_CACHE = {}
+    # Preserve originals so cycle-init lookups (modules that read these
+    # names while their own brax target is still loading) get the eager
+    # version instead of triggering an import recursion.
+    _BRAX_ORIG = {k: globals()[k] for k in _BRAX_MAP if k in globals()}
+
+    def _make_brax_thunk(_name):
+        def _thunk(*args, **kwargs):
+            if _name not in _BRAX_CACHE:
+                mn, bn = _BRAX_MAP[_name]
+                _BRAX_CACHE[_name] = getattr(
+                    __import__(f"Nethax.nethax.subsystems.{mn}", fromlist=[bn]), bn)
+            return _BRAX_CACHE[_name](*args, **kwargs)
+        _thunk.__name__ = _name
+        _thunk.__qualname__ = _name
+        return _thunk
+
+    # Replace each rebound name with a thunk in module globals.  Keeping
+    # the name in globals means LOAD_GLOBAL inside function bodies resolves
+    # to the thunk (and through it to the brax target), instead of raising
+    # NameError as it would after a `del globals()[name]`.
     for _name in list(_BRAX_MAP):
-        if _name in globals(): del globals()[_name]
+        if _name in globals():
+            globals()[_name] = _make_brax_thunk(_name)
+
+    import sys as _sys_brax
     def __getattr__(name):
-        if name not in _BRAX_MAP: raise AttributeError(name)
-        if name not in _BRAX_CACHE:
-            mn, bn = _BRAX_MAP[name]
-            _BRAX_CACHE[name] = getattr(__import__(f"Nethax.nethax.subsystems.{mn}", fromlist=[bn]), bn)
-        return _BRAX_CACHE[name]
+        if name not in _BRAX_MAP:
+            raise AttributeError(name)
+        mn, _bn = _BRAX_MAP[name]
+        full = f"Nethax.nethax.subsystems.{mn}"
+        if full in _sys_brax.modules:
+            spec = getattr(_sys_brax.modules[full], "__spec__", None)
+            if spec is not None and getattr(spec, "_initializing", False):
+                return _BRAX_ORIG.get(name)
+        return globals().get(name) or _BRAX_ORIG.get(name)

@@ -784,8 +784,25 @@ if _os_brax.environ.get("NETHAX_BRAX_ALL", "0") == "1":
     _BRAX_ORIG = {"apply_corpse_postfx": apply_corpse_postfx}
     _BRAX_MAP = {"apply_corpse_postfx": ("items_misc_brax", "apply_corpse_postfx_brax")}
     _BRAX_CACHE = {}
+
+    def _make_brax_thunk(_name):
+        def _thunk(*args, **kwargs):
+            if _name not in _BRAX_CACHE:
+                mn, bn = _BRAX_MAP[_name]
+                _BRAX_CACHE[_name] = getattr(
+                    __import__(f"Nethax.nethax.subsystems.{mn}", fromlist=[bn]), bn)
+            return _BRAX_CACHE[_name](*args, **kwargs)
+        _thunk.__name__ = _name
+        _thunk.__qualname__ = _name
+        return _thunk
+
+    # Install thunks in globals so LOAD_GLOBAL inside function bodies
+    # resolves to the brax target.  PEP 562 module __getattr__ alone
+    # only fires for attribute access (mod.X), not LOAD_GLOBAL.
     for _name in list(_BRAX_MAP):
-        if _name in globals(): del globals()[_name]
+        if _name in globals():
+            globals()[_name] = _make_brax_thunk(_name)
+
     def __getattr__(name):
         if name not in _BRAX_MAP:
             raise AttributeError(name)
