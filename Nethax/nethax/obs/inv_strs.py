@@ -715,12 +715,10 @@ def _write_fixed(buf: jax.Array, cursor: jax.Array,
         in_range = (c < NLE_STR_LEN)
         ch_ok    = ch != jnp.uint8(0)
         should_write = in_range & ch_ok
-        new_b = lax.cond(
-            should_write,
-            lambda _b: _b.at[c].set(ch),
-            lambda _b: _b,
-            b,
-        )
+        # Brax-flatten: replace lax.cond with jnp.where on the byte value.
+        safe_c = jnp.minimum(c, jnp.int32(NLE_STR_LEN - 1))
+        new_byte = jnp.where(should_write, ch, b[safe_c])
+        new_b = b.at[safe_c].set(new_byte)
         new_c = jnp.where(should_write, c + jnp.int32(1), c)
         return new_b, new_c
 
@@ -731,12 +729,10 @@ def _write_byte(buf: jax.Array, cursor: jax.Array,
                 ch: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Write a single byte *ch* at *cursor*, returning (new_buf, new_cursor)."""
     in_range = cursor < NLE_STR_LEN
-    new_buf = lax.cond(
-        in_range,
-        lambda b: b.at[cursor].set(ch.astype(jnp.uint8)),
-        lambda b: b,
-        buf,
-    )
+    # Brax-flatten: replace lax.cond with jnp.where on the byte value.
+    safe_cursor = jnp.minimum(cursor, jnp.int32(NLE_STR_LEN - 1))
+    new_byte = jnp.where(in_range, ch.astype(jnp.uint8), buf[safe_cursor])
+    new_buf = buf.at[safe_cursor].set(new_byte)
     new_cursor = jnp.where(in_range, cursor + jnp.int32(1), cursor)
     return new_buf, new_cursor
 
@@ -788,7 +784,10 @@ def _write_uint(buf: jax.Array, cursor: jax.Array,
         pos = nd - jnp.int32(1) - i
         ch  = digits[pos]
         in_range  = (i < nd) & (c < NLE_STR_LEN)
-        new_b = lax.cond(in_range, lambda _b: _b.at[c].set(ch), lambda _b: _b, b)
+        # Brax-flatten: replace lax.cond with jnp.where on the byte value.
+        safe_c = jnp.minimum(c, jnp.int32(NLE_STR_LEN - 1))
+        new_byte = jnp.where(in_range, ch, b[safe_c])
+        new_b = b.at[safe_c].set(new_byte)
         new_c = jnp.where(in_range, c + jnp.int32(1), c)
         return new_b, new_c, nd
 
@@ -983,12 +982,10 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         # Full just_an() exceptions via _OBJECT_USE_AN/_APP_USE_AN tables.
         # Vendor: objnam.c::just_an() lines 2108-2142.
         is_plural = quantity > jnp.int32(1)
-        b, c = lax.cond(
-            is_plural,
-            lambda bc: _write_uint_space(bc[0], bc[1], quantity),
-            lambda bc: _write_article_space(bc[0], bc[1], article_use_an),
-            (b, c),
-        )
+        # Brax-flatten: compute both branches, jnp.where-select.
+        b_t, c_t = _write_uint_space(b, c, quantity)
+        b_f, c_f = _write_article_space(b, c, article_use_an)
+        b, c = _where_bc(is_plural, (b_t, c_t), (b_f, c_f))
 
         # 2b. "empty " prefix for known-empty containers.
         # Vendor objnam.c:1301-1316: Strcat(prefix, "empty ") when
@@ -1004,12 +1001,9 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         # Use charges == 0 as proxy for !Has_contents (plain containers start
         # empty; bag-of-tricks charges are non-zero and handled separately).
         show_empty = identified & is_container & (charges == jnp.int32(0))
-        b, c = lax.cond(
-            show_empty,
-            lambda bc: _write_fixed(bc[0], bc[1], _EMPTY_PREFIX_BYTES, 7),
-            lambda bc: bc,
-            (b, c),
-        )
+        # Brax-flatten
+        b_t, c_t = _write_fixed(b, c, _EMPTY_PREFIX_BYTES, 7)
+        b, c = _where_bc(show_empty, (b_t, c_t), (b, c))
 
         # 3. BUC word (only if buc_status != UNKNOWN == 0).
         # Exception 1: holy/unholy water -- BUC is encoded in the name itself
@@ -1029,12 +1023,9 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         # weapons / charged wands & tools where the shown +/- or charges imply
         # uncursed.  "cursed"/"blessed" are unaffected.
         show_buc = buc_known & ~is_water_special & ~is_coin & ~suppress_uncursed
-        b, c = lax.cond(
-            show_buc,
-            lambda bc: _write_buc(bc[0], bc[1], buc_row),
-            lambda bc: bc,
-            (b, c),
-        )
+        # Brax-flatten
+        b_t, c_t = _write_buc(b, c, buc_row)
+        b, c = _where_bc(show_buc, (b_t, c_t), (b, c))
 
         # 3a. Vendor objnam.c prefix tokens that go into the ``prefix`` buffer
         # BEFORE add_erosion_words / enchant.  Order mirrors vendor:
@@ -1054,12 +1045,9 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             (MAX_INVENTORY_SLOTS,),
         )
         is_greased = _greased_arr[safe_idx]
-        b, c = lax.cond(
-            is_greased,
-            lambda bc: _write_fixed(bc[0], bc[1], _GREASED_BYTES, 9),
-            lambda bc: bc,
-            (b, c),
-        )
+        # Brax-flatten
+        b_t, c_t = _write_fixed(b, c, _GREASED_BYTES, 9)
+        b, c = _where_bc(is_greased, (b_t, c_t), (b, c))
 
         _opoisoned_raw = getattr(inv_state.items, "opoisoned",
                                  jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.bool_))
@@ -1069,12 +1057,9 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         )
         is_weapon_cat = category == jnp.int32(_WEAPON_CLASS_VAL)
         show_poisoned = is_weapon_cat & _opoisoned_arr[safe_idx]
-        b, c = lax.cond(
-            show_poisoned,
-            lambda bc: _write_fixed(bc[0], bc[1], _POISONED_BYTES, 10),
-            lambda bc: bc,
-            (b, c),
-        )
+        # Brax-flatten
+        b_t, c_t = _write_fixed(b, c, _POISONED_BYTES, 10)
+        b, c = _where_bc(show_poisoned, (b_t, c_t), (b, c))
 
         _oeaten_raw = getattr(inv_state.items, "oeaten",
                               jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8))
@@ -1086,12 +1071,9 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         show_partly_eaten = is_food_cat & (
             _oeaten_arr[safe_idx].astype(jnp.int32) > jnp.int32(0)
         )
-        b, c = lax.cond(
-            show_partly_eaten,
-            lambda bc: _write_fixed(bc[0], bc[1], _PARTLY_EATEN_BYTES, 14),
-            lambda bc: bc,
-            (b, c),
-        )
+        # Brax-flatten
+        b_t, c_t = _write_fixed(b, c, _PARTLY_EATEN_BYTES, 14)
+        b, c = _where_bc(show_partly_eaten, (b_t, c_t), (b, c))
 
         # 3b. Erosion prefix (rusty/burnt/corroded/rotted/rustproof/fireproof/...)
         # Canonical: vendor/nethack/src/objnam.c::add_erosion_words() lines 1142-1191.
@@ -1105,12 +1087,9 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         has_erosion = (emat_class > jnp.int32(0)) & (
             (erod_lvl1 > jnp.int32(0)) | (erod_lvl2 > jnp.int32(0)) | oerodeproof
         )
-        b, c = lax.cond(
-            has_erosion,
-            lambda bc: _write_erosion(bc[0], bc[1], emat_class, erod_lvl1, erod_lvl2, oerodeproof, identified),
-            lambda bc: bc,
-            (b, c),
-        )
+        # Brax-flatten
+        b_t, c_t = _write_erosion(b, c, emat_class, erod_lvl1, erod_lvl2, oerodeproof, identified)
+        b, c = _where_bc(has_erosion, (b_t, c_t), (b, c))
 
         # 4. Enchantment -- weapons, armor, and oc_charged rings, only if identified.
         # vendor/nethack/src/objnam.c:1500: rings with oc_charged show +N prefix.
@@ -1121,12 +1100,9 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             (obj_class == jnp.uint8(_ARMOR_CLASS_VAL))  |
             ((obj_class == jnp.uint8(_RING_CLASS_VAL)) & is_charged_ring)
         )
-        b, c = lax.cond(
-            show_enchant,
-            lambda bc: _write_enchant(bc[0], bc[1], enchantment),
-            lambda bc: bc,
-            (b, c),
-        )
+        # Brax-flatten
+        b_t, c_t = _write_enchant(b, c, enchantment)
+        b, c = _where_bc(show_enchant, (b_t, c_t), (b, c))
 
         # 5. Class prefix (e.g. "potion of ") + name or appearance.
         # Special cases handled inside _write_true_name:
@@ -1135,35 +1111,27 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         #   - tin contents (vendor eat.c:tin_details)
         # Unidentified + has appearance  -> appearance description (no prefix)
         # Identified OR no appearance    -> class prefix (if any) + canonical name
-        b, c = lax.cond(
-            show_app,
-            lambda bc: _write_appearance(bc[0], bc[1], safe_type, quantity),
-            lambda bc: _write_true_name(bc[0], bc[1], safe_type, obj_class,
-                                        quantity, category, type_id,
-                                        buc_status, identified, enchantment,
-                                        corpse_idx),
-            (b, c),
-        )
+        # Brax-flatten: compute both branches, jnp.where-select.
+        b_t, c_t = _write_appearance(b, c, safe_type, quantity)
+        b_f, c_f = _write_true_name(b, c, safe_type, obj_class,
+                                    quantity, category, type_id,
+                                    buc_status, identified, enchantment,
+                                    corpse_idx)
+        b, c = _where_bc(show_app, (b_t, c_t), (b_f, c_f))
 
         # 5b. User-given name suffix " named <name>" (Wave 6) -- emitted
         #     when inventory.user_names[slot, 0] != 0.
         name_row = inv_state.user_names[safe_idx]
         has_user_name = name_row[0] != jnp.int8(0)
-        b, c = lax.cond(
-            has_user_name,
-            lambda bc: _write_user_name(bc[0], bc[1], name_row),
-            lambda bc: bc,
-            (b, c),
-        )
+        # Brax-flatten
+        b_t, c_t = _write_user_name(b, c, name_row)
+        b, c = _where_bc(has_user_name, (b_t, c_t), (b, c))
 
         # 6. Equip status -- pass item_class so quiver can pick pouch vs bow-ammo.
         eq_idx = _equip_status_idx(inv_state, slot_idx, obj_class)
-        b, c = lax.cond(
-            eq_idx > jnp.int32(0),
-            lambda bc: _write_equip(bc[0], bc[1], eq_idx),
-            lambda bc: bc,
-            (b, c),
-        )
+        # Brax-flatten
+        b_t, c_t = _write_equip(b, c, eq_idx)
+        b, c = _where_bc(eq_idx > jnp.int32(0), (b_t, c_t), (b, c))
 
         # 7. Charges "(recharged:charges)" for wands and oc_charged tools, only
         # if identified.  vendor/nethack/src/objnam.c:1480-1486 — WAND_CLASS
@@ -1175,12 +1143,9 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             (obj_class == jnp.uint8(_WAND_CLASS_VAL)) |
             ((obj_class == jnp.uint8(_TOOL_CLASS_VAL)) & is_charged_tool)
         )
-        b, c = lax.cond(
-            show_charges,
-            lambda bc: _write_charges(bc[0], bc[1], recharged, charges),
-            lambda bc: bc,
-            (b, c),
-        )
+        # Brax-flatten
+        b_t, c_t = _write_charges(b, c, recharged, charges)
+        b, c = _where_bc(show_charges, (b_t, c_t), (b, c))
 
         # 8. Swap-weapon / two-weapon suffix.
         # NLE (the byte-parity ground truth) bundles an OLDER NetHack source
@@ -1201,21 +1166,15 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             (slot_idx.astype(jnp.int32) == swap_weapon.astype(jnp.int32))
         )
         is_swap_not_twoweap = is_swapwep & ~two_weapon
-        b, c = lax.cond(
-            is_swap_not_twoweap,
-            lambda bc: _write_alt_weapon(bc[0], bc[1]),
-            lambda bc: bc,
-            (b, c),
-        )
+        # Brax-flatten
+        b_t, c_t = _write_alt_weapon(b, c)
+        b, c = _where_bc(is_swap_not_twoweap, (b_t, c_t), (b, c))
 
         return b, c
 
-    buf, cursor = lax.cond(
-        is_empty,
-        lambda args: args,
-        render_nonempty,
-        (buf, cursor),
-    )
+    # Brax-flatten the outer empty/nonempty selector.
+    b_t, c_t = render_nonempty((buf, cursor))
+    buf, cursor = _where_bc(is_empty, (buf, cursor), (b_t, c_t))
 
     return buf
 
@@ -1249,12 +1208,9 @@ def _write_article_space(buf, cursor, use_an):
     """
     # Write 'a' always, conditionally append 'n', then a space.
     buf, cursor = _write_byte(buf, cursor, jnp.uint8(ord('a')))
-    buf, cursor = lax.cond(
-        use_an,
-        lambda bc: _write_byte(bc[0], bc[1], jnp.uint8(ord('n'))),
-        lambda bc: bc,
-        (buf, cursor),
-    )
+    # Brax-flatten
+    b_t, c_t = _write_byte(buf, cursor, jnp.uint8(ord('n')))
+    buf, cursor = _where_bc(use_an, (b_t, c_t), (buf, cursor))
     buf, cursor = _write_space(buf, cursor)
     return buf, cursor
 
@@ -1293,18 +1249,11 @@ def _write_erosion(buf, cursor, emat_class, erod_lvl1, erod_lvl2, oerodeproof, i
     show_proof = oerodeproof & identified
     proof_src = _EROSION_PROOF_BYTES[emat_class]
     is_rotproof = show_proof & (emat_class == jnp.int32(2)) & (erod_lvl2 > jnp.int32(0))
-    buf, cursor = lax.cond(
-        show_proof & ~is_rotproof,
-        lambda bc: _write_fixed(bc[0], bc[1], proof_src, _MAX_EROSION_WORD_LEN),
-        lambda bc: bc,
-        (buf, cursor),
-    )
-    buf, cursor = lax.cond(
-        is_rotproof,
-        lambda bc: _write_fixed(bc[0], bc[1], _ROTPROOF_BYTES, _MAX_EROSION_WORD_LEN),
-        lambda bc: bc,
-        (buf, cursor),
-    )
+    # Brax-flatten
+    b_t, c_t = _write_fixed(buf, cursor, proof_src, _MAX_EROSION_WORD_LEN)
+    buf, cursor = _where_bc(show_proof & ~is_rotproof, (b_t, c_t), (buf, cursor))
+    b_t, c_t = _write_fixed(buf, cursor, _ROTPROOF_BYTES, _MAX_EROSION_WORD_LEN)
+    buf, cursor = _where_bc(is_rotproof, (b_t, c_t), (buf, cursor))
     return buf, cursor
 
 
@@ -1350,12 +1299,9 @@ def _write_appearance(buf, cursor, safe_type, quantity):
 
     # Pluralise the class noun on the appearance path by appending 's' when
     # quantity > 1 (all class nouns are regular: "potions", "scrolls", ...).
-    buf, cursor = lax.cond(
-        is_plural,
-        lambda bc: _write_byte(bc[0], bc[1], jnp.uint8(ord('s'))),
-        lambda bc: bc,
-        (buf, cursor),
-    )
+    # Brax-flatten
+    b_t, c_t = _write_byte(buf, cursor, jnp.uint8(ord('s')))
+    buf, cursor = _where_bc(is_plural, (b_t, c_t), (buf, cursor))
 
     return buf, cursor
 
@@ -1453,33 +1399,23 @@ def _write_true_name(buf, cursor, safe_type, obj_class, quantity,
         b, c = bc
         # Step 1: "pair of "/"pairs of "/"set of " noun-cluster prefix
         # (precedes any class-of prefix, and applies even when plural).
-        def write_pair(_bc):
-            return lax.cond(
-                is_plural,
-                lambda x: _write_fixed(x[0], x[1], _PAIRS_OF_BYTES, 10),
-                lambda x: _write_fixed(x[0], x[1], _PAIR_OF_BYTES, 9),
-                _bc,
-            )
-
-        def write_set(_bc):
-            return _write_fixed(_bc[0], _bc[1], _SET_OF_BYTES, 8)
-
-        b, c = lax.cond(
-            is_pair,
-            write_pair,
-            lambda _bc: lax.cond(is_set, write_set, lambda x: x, _bc),
-            (b, c),
-        )
+        # Brax-flatten: compute all three branches, jnp.where-select via
+        # priority: is_pair (with is_plural sub-branch) > is_set > none.
+        b_pairs, c_pairs = _write_fixed(b, c, _PAIRS_OF_BYTES, 10)
+        b_pair,  c_pair  = _write_fixed(b, c, _PAIR_OF_BYTES, 9)
+        b_pair_sel, c_pair_sel = _where_bc(is_plural, (b_pairs, c_pairs), (b_pair, c_pair))
+        b_set, c_set = _write_fixed(b, c, _SET_OF_BYTES, 8)
+        # Inner: is_set vs identity
+        b_inner, c_inner = _where_bc(is_set, (b_set, c_set), (b, c))
+        # Outer: is_pair vs inner
+        b, c = _where_bc(is_pair, (b_pair_sel, c_pair_sel), (b_inner, c_inner))
 
         # Step 2: class-of prefix ("ring of ", "potion of ", ...).  Only when
         # singular (vendor: makeplural pluralizes the head noun, not the prefix).
         pfx_src = _CLASS_PREFIX_BYTES[cls_safe]
-        b, c = lax.cond(
-            is_plural,
-            lambda _bc: _bc,
-            lambda _bc: _write_fixed(_bc[0], _bc[1], pfx_src, _MAX_PREFIX_LEN),
-            (b, c),
-        )
+        # Brax-flatten: identity when plural, write_fixed when singular.
+        b_pfx, c_pfx = _write_fixed(b, c, pfx_src, _MAX_PREFIX_LEN)
+        b, c = _where_bc(is_plural, (b, c), (b_pfx, c_pfx))
 
         # Step 3: canonical name (singular or pluralised).  For set-of dragon
         # scales the singular row is used unconditionally (vendor objnam.c:722
@@ -1491,32 +1427,24 @@ def _write_true_name(buf, cursor, safe_type, obj_class, quantity,
         return b, c
 
     # Dispatch: water_special > corpse > spinach_tin > monster_tin > normal.
-    buf, cursor = lax.cond(
-        is_holy,
-        write_holy,
-        lambda bc: lax.cond(
-            is_unholy,
-            write_unholy,
-            lambda bc2: lax.cond(
-                is_corpse,
-                write_corpse,
-                lambda bc3: lax.cond(
-                    is_spinach_tin,
-                    write_spinach_tin,
-                    lambda bc4: lax.cond(
-                        is_monster_tin,
-                        write_monster_tin,
-                        write_normal,
-                        bc4,
-                    ),
-                    bc3,
-                ),
-                bc2,
-            ),
-            bc,
-        ),
-        (buf, cursor),
-    )
+    # Brax-flatten: compute every branch unconditionally, then jnp.where-select
+    # by priority (innermost = lowest priority = falls through).
+    bc0 = (buf, cursor)
+    b_h,  c_h  = write_holy(bc0)
+    b_uh, c_uh = write_unholy(bc0)
+    b_co, c_co = write_corpse(bc0)
+    b_sp, c_sp = write_spinach_tin(bc0)
+    b_mt, c_mt = write_monster_tin(bc0)
+    b_n,  c_n  = write_normal(bc0)
+    # Priority chain (highest first): is_holy > is_unholy > is_corpse >
+    # is_spinach_tin > is_monster_tin > normal.
+    sel_b, sel_c = b_n, c_n
+    sel_b, sel_c = _where_bc(is_monster_tin, (b_mt, c_mt), (sel_b, sel_c))
+    sel_b, sel_c = _where_bc(is_spinach_tin, (b_sp, c_sp), (sel_b, sel_c))
+    sel_b, sel_c = _where_bc(is_corpse,      (b_co, c_co), (sel_b, sel_c))
+    sel_b, sel_c = _where_bc(is_unholy,      (b_uh, c_uh), (sel_b, sel_c))
+    sel_b, sel_c = _where_bc(is_holy,        (b_h,  c_h ), (sel_b, sel_c))
+    buf, cursor = sel_b, sel_c
 
     return buf, cursor
 
