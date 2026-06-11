@@ -1812,7 +1812,11 @@ def _effect_polymorph(state, rng: jax.Array) -> dict:
         )
         return upd
 
-    new_mai = jax.lax.cond(alive0, _do_poly, lambda _: mai, operand=None)
+    # Brax-flatten: compute _do_poly eagerly, select via jnp.where on alive0.
+    poly_mai = _do_poly(None)
+    new_mai = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(alive0, t, f), poly_mai, mai,
+    )
     return {**state, "monster_ai": new_mai}
 
 
