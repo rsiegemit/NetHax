@@ -1133,9 +1133,11 @@ def consume_init_attr_draws(
         capped = cur >= cap                                  # attrib.c:633-636
         new_abase = abase_c.at[i].set(cur + jnp.int32(1))    # attrib.c:638
         # capped: tryct++ no change to abase/np.  uncapped: tryct=0, abase++, np--.
-        abase_n = jax.lax.cond(capped, lambda: abase_c, lambda: new_abase)
-        np_n    = jax.lax.cond(capped, lambda: np_c,    lambda: np_c - jnp.int32(1))
-        tryct_n = jax.lax.cond(capped, lambda: tryct_c + jnp.int32(1), lambda: jnp.int32(0))
+        # Brax-flatten: always compute both branches, jnp.where to select.
+        # No RNG consumed inside the branches, so parity is preserved.
+        abase_n = jnp.where(capped, abase_c, new_abase)
+        np_n    = jnp.where(capped, np_c,    np_c - jnp.int32(1))
+        tryct_n = jnp.where(capped, tryct_c + jnp.int32(1), jnp.int32(0))
         return rng_c, abase_n, np_n, tryct_n
 
     vendor_rng, abase1, np1, _ = jax.lax.while_loop(
@@ -1156,9 +1158,11 @@ def consume_init_attr_draws(
         floor = attrmin_arr[i]
         capped = cur <= floor                                # attrib.c:652-655
         new_abase = abase_c.at[i].set(cur - jnp.int32(1))    # attrib.c:657
-        abase_n = jax.lax.cond(capped, lambda: abase_c, lambda: new_abase)
-        np_n    = jax.lax.cond(capped, lambda: np_c,    lambda: np_c + jnp.int32(1))
-        tryct_n = jax.lax.cond(capped, lambda: tryct_c + jnp.int32(1), lambda: jnp.int32(0))
+        # Brax-flatten: always compute both branches, jnp.where to select.
+        # No RNG consumed inside the branches, so parity is preserved.
+        abase_n = jnp.where(capped, abase_c, new_abase)
+        np_n    = jnp.where(capped, np_c,    np_c + jnp.int32(1))
+        tryct_n = jnp.where(capped, tryct_c + jnp.int32(1), jnp.int32(0))
         return rng_c, abase_n, np_n, tryct_n
 
     vendor_rng, abase2, _np2, _ = jax.lax.while_loop(
@@ -1459,11 +1463,8 @@ def _consume_attr_variation_draws(vendor_rng, stats, role: Role, race: Race):
                     return r
 
                 rng_n = jax.lax.cond(need_extra, _do_draw, lambda r: r, rng_n)
-                new_b = jax.lax.cond(
-                    need_extra,
-                    lambda: attrmin_i,
-                    lambda: tentative,
-                )
+                # Brax-flatten: pure scalar select, no RNG consumed.
+                new_b = jnp.where(need_extra, attrmin_i, tentative)
                 return rng_n, new_b
 
             def _pos_path(args):
