@@ -622,19 +622,16 @@ def emit(state: MessageState, msg_id: int, *args) -> MessageState:
             max_w = max(_NUMERIC_SLOT_WIDTH, _MONSTER_NAME_SLOT_WIDTH)
             return jax.lax.fori_loop(0, max_w, _wstep, buf)
 
-        # Apply substitution conditional on kind.  NONE -> no-op.
-        new_buffer = jax.lax.cond(
-            kind == jnp.int32(_ARG_KIND_NUMERIC),
-            lambda b: _write_slot(b, numeric_bytes, offset, width),
-            lambda b: b,
-            new_buffer,
-        )
-        new_buffer = jax.lax.cond(
-            kind == jnp.int32(_ARG_KIND_MONSTER),
-            lambda b: _write_slot(b, monster_bytes, offset, width),
-            lambda b: b,
-            new_buffer,
-        )
+        # Brax-flatten: compute both write_slot outputs eagerly, select via
+        # jnp.where on the per-kind gate.  Replaces lax.cond so the dispatch
+        # lowers to a flat MUX rather than a control-flow op.
+        numeric_gate = kind == jnp.int32(_ARG_KIND_NUMERIC)
+        new_buffer_numeric = _write_slot(new_buffer, numeric_bytes, offset, width)
+        new_buffer = jnp.where(numeric_gate, new_buffer_numeric, new_buffer)
+
+        monster_gate = kind == jnp.int32(_ARG_KIND_MONSTER)
+        new_buffer_monster = _write_slot(new_buffer, monster_bytes, offset, width)
+        new_buffer = jnp.where(monster_gate, new_buffer_monster, new_buffer)
 
     return state.replace(
         message_buffer=new_buffer,
