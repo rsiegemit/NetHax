@@ -6570,11 +6570,9 @@ def _bp_postmov_or_skip_impl(state, monster_idx, did_act):
     Extracted from monster_turn_b so postmov's ~200 LOC of tile-reveal /
     LoS logic compiles to its OWN cache slot instead of being inlined.
     """
-    return jax.lax.cond(
-        did_act,
-        lambda s: _postmov_per_monster(s, monster_idx.astype(jnp.int32)),
-        lambda s: s,
-        state,
+    _state_pm = _postmov_per_monster(state, monster_idx.astype(jnp.int32))
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(did_act, t, f), _state_pm, state,
     )
 
 
