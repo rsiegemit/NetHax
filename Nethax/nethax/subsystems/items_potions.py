@@ -1563,7 +1563,12 @@ def quaff_potion(state, rng, slot_idx):
             messages=_msg_emit(new_state.messages, int(_MsgId.YOU_QUAFF_POTION)),
         )
 
-    return jax.lax.cond(glib_drop, _drop_glib, _do_quaff, state)
+    _drop_state = _drop_glib(state)
+    _quaff_state = _do_quaff(state)
+    return jax.tree.map(
+        lambda t, f: jnp.where(glib_drop, t, f),
+        _drop_state, _quaff_state,
+    )
 
 
 def handle_quaff(state, rng):
