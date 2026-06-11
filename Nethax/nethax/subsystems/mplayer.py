@@ -468,11 +468,9 @@ def create_mplayers(state, rng: jax.Array, n: int):
         # mk_mplayer no-ops on full level; an unfound pos falls back to
         # the player's tile (still safe — mk_mplayer will overlap, vendor
         # ``rloc`` would resolve in a fuller port).
-        st2 = jax.lax.cond(
-            found,
-            lambda s: mk_mplayer(s, keys[2 * i + 1], role, pos),
-            lambda s: s,
-            st,
+        spawned = mk_mplayer(st, keys[2 * i + 1], role, pos)
+        st2 = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(found, t, f), spawned, st
         )
         return st2, new_used
 
@@ -500,7 +498,7 @@ def maybe_seed_astral_mplayers(state, rng: jax.Array, prev_branch, prev_level):
     (prev != curr).  Caller is responsible for passing the *previous*
     branch / level so the predicate stays edge-triggered.
 
-    JIT-pure: uses jax.lax.cond.
+    JIT-pure: uses flattened tree_map masking.
     """
     curr_branch = state.dungeon.current_branch.astype(jnp.int32)
     curr_level  = state.dungeon.current_level.astype(jnp.int32)
@@ -513,9 +511,7 @@ def maybe_seed_astral_mplayers(state, rng: jax.Array, prev_branch, prev_level):
                    | (prev_l != jnp.int32(ASTRAL_LEVEL))
     should_spawn   = on_astral_now & was_not_astral
 
-    return jax.lax.cond(
-        should_spawn,
-        lambda s: create_mplayers(s, rng, ASTRAL_MPLAYER_COUNT),
-        lambda s: s,
-        state,
+    spawned = create_mplayers(state, rng, ASTRAL_MPLAYER_COUNT)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(should_spawn, t, f), spawned, state
     )
