@@ -1110,11 +1110,13 @@ def pray(state, rng: jax.Array):
 
     Returns the new EnvState.
     """
-    return jax.lax.cond(
-        state.player_luck.astype(jnp.int32) < jnp.int32(PRAY_LUCK_HARD_GATE),
-        lambda s: s,
-        lambda s: _pray_impl(s, rng),
+    # Brax-flatten: compute both branches and select via tree_map/jnp.where.
+    luck_gate = state.player_luck.astype(jnp.int32) < jnp.int32(PRAY_LUCK_HARD_GATE)
+    state_impl = _pray_impl(state, rng)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(luck_gate, t, f),
         state,
+        state_impl,
     )
 
 
@@ -1198,10 +1200,11 @@ def _pray_impl(state, rng: jax.Array):
     # Vendor (pray.c:1105-1160): trouble is auto-fixed whenever the player is
     # in pleased state and has any active trouble.
     fixable = (trouble != jnp.int32(TROUBLE_NONE)) & ~angry
-    state_after_fix = jax.lax.cond(
-        fixable,
-        lambda s: fix_worst(s, rng_fix, trouble),
-        lambda s: s,
+    # Brax-flatten: compute both branches and select via tree_map/jnp.where.
+    state_fixed = fix_worst(state, rng_fix, trouble)
+    state_after_fix = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(fixable, t, f),
+        state_fixed,
         state,
     )
 
@@ -1252,54 +1255,48 @@ def _pray_impl(state, rng: jax.Array):
         t_intr = t_bump + span * jnp.int32(72) // jnp.int32(85)
         t_abil = t_bump + span * jnp.int32(82) // jnp.int32(85)
 
-        # Nested lax.cond cascade — piety-biased 8-bucket switch.
-        return jax.lax.cond(
-            roll < t_bump,
-            lambda _: s_align,
-            lambda _: jax.lax.cond(
-                roll < t_heal,
-                lambda _: s_heal,
-                lambda _: jax.lax.cond(
-                    roll < t_prot,
-                    lambda _: s_prot,
-                    lambda _: jax.lax.cond(
-                        roll < t_rmc,
-                        lambda _: s_rmc,
-                        lambda _: jax.lax.cond(
-                            roll < t_luck,
-                            lambda _: s_luck,
-                            lambda _: jax.lax.cond(
-                                roll < t_intr,
-                                lambda _: s_intr,
-                                lambda _: jax.lax.cond(
-                                    roll < t_abil,
-                                    lambda _: s_abil,
-                                    lambda _: jax.lax.cond(
-                                        can_gift,
-                                        lambda _: s_gift,
-                                        # Fallback to heal when gift unavailable.
-                                        lambda _: s_heal,
-                                        operand=0,
-                                    ),
-                                    operand=0,
-                                ),
-                                operand=0,
-                            ),
-                            operand=0,
-                        ),
-                        operand=0,
-                    ),
-                    operand=0,
-                ),
-                operand=0,
-            ),
-            operand=0,
+        # Brax-flatten: piety-biased 8-bucket switch — all bucket states are
+        # computed above; select via a nested jnp.where chain mirroring the
+        # original lax.cond cascade semantics (build inside-out).
+        # Innermost: can_gift ? s_gift : s_heal  (fallback when gift unavailable)
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(can_gift, t, f), s_gift, s_heal,
         )
+        # roll < t_abil ? s_abil : sel
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(roll < t_abil, t, f), s_abil, sel,
+        )
+        # roll < t_intr ? s_intr : sel
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(roll < t_intr, t, f), s_intr, sel,
+        )
+        # roll < t_luck ? s_luck : sel
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(roll < t_luck, t, f), s_luck, sel,
+        )
+        # roll < t_rmc ? s_rmc : sel
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(roll < t_rmc, t, f), s_rmc, sel,
+        )
+        # roll < t_prot ? s_prot : sel
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(roll < t_prot, t, f), s_prot, sel,
+        )
+        # roll < t_heal ? s_heal : sel
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(roll < t_heal, t, f), s_heal, sel,
+        )
+        # roll < t_bump ? s_align : sel
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(roll < t_bump, t, f), s_align, sel,
+        )
+        return sel
 
-    state_pleased = jax.lax.cond(
-        is_pleased,
-        _pleased_branch,
-        lambda s: s,
+    # Brax-flatten: compute pleased branch unconditionally; select via tree_map.
+    state_pleased_branch = _pleased_branch(state_after_fix)
+    state_pleased = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_pleased, t, f),
+        state_pleased_branch,
         state_after_fix,
     )
 
@@ -1354,47 +1351,52 @@ def _pray_impl(state, rng: jax.Array):
         s_destroy = _apply_destroy_armor(s)
         s_summon  = _apply_summon_demon(s)
         s_bolt    = god_zaps_you(s, rng_zap)
-        return jax.lax.cond(
-            anger_bucket <= jnp.int32(1),
-            lambda _: s_warn,
-            lambda _: jax.lax.cond(
-                anger_bucket <= jnp.int32(3),
-                lambda _: s_smite,
-                lambda _: jax.lax.cond(
-                    anger_bucket <= jnp.int32(6),
-                    lambda _: s_destroy,
-                    lambda _: jax.lax.cond(
-                        anger_bucket <= jnp.int32(8),
-                        lambda _: s_summon,
-                        lambda _: s_bolt,
-                        operand=0,
-                    ),
-                    operand=0,
-                ),
-                operand=0,
-            ),
-            operand=0,
+        # Brax-flatten: all bucket states computed above; select via nested
+        # jnp.where chain (build inside-out from default s_bolt case).
+        # anger_bucket <= 8 ? s_summon : s_bolt
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(anger_bucket <= jnp.int32(8), t, f),
+            s_summon, s_bolt,
         )
+        # anger_bucket <= 6 ? s_destroy : sel
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(anger_bucket <= jnp.int32(6), t, f),
+            s_destroy, sel,
+        )
+        # anger_bucket <= 3 ? s_smite : sel
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(anger_bucket <= jnp.int32(3), t, f),
+            s_smite, sel,
+        )
+        # anger_bucket <= 1 ? s_warn : sel
+        sel = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(anger_bucket <= jnp.int32(1), t, f),
+            s_warn, sel,
+        )
+        return sel
 
-    state_final = jax.lax.cond(
-        angry,
-        _angry_branch,
-        lambda s: s,
+    # Brax-flatten: compute angry branch unconditionally; select via tree_map.
+    state_angry_branch = _angry_branch(state_pleased)
+    state_final = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(angry, t, f),
+        state_angry_branch,
         state_pleased,
     )
 
     # Cross-aligned altar short-circuit (pray.c::pleased lines 1085-1087).
     # Vendor: adjalign(-1); return; — done up-front, overriding the bucket
-    # selection above.  We apply it via a final lax.cond so all prior
+    # selection above.  We apply it via a final jnp.where so all prior
     # branches' state mutations are discarded when on_cross_altar.
     def _cross_altar_adjalign(s):
         new_record_cross = (s.prayer.alignment_record - jnp.int16(1)).astype(jnp.int16)
         return s.replace(prayer=s.prayer.replace(alignment_record=new_record_cross))
 
-    state_final = jax.lax.cond(
-        short_circuit_cross,
-        lambda s: _cross_altar_adjalign(state),  # discard bucket effects
-        lambda s: s,
+    # Brax-flatten: cross-altar short-circuit discards bucket effects and
+    # applies adjalign(-1) to the original ``state`` instead of ``state_final``.
+    state_cross = _cross_altar_adjalign(state)
+    state_final = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(short_circuit_cross, t, f),
+        state_cross,
         state_final,
     )
 
