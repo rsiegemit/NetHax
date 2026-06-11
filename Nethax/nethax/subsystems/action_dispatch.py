@@ -210,6 +210,20 @@ _CORPSE_NUTRITION: jnp.ndarray = _build_corpse_nutrition_table()
 
 
 # ---------------------------------------------------------------------------
+# Brax-style pytree where: select between two pytrees field-by-field.
+# Used to flatten lax.cond into "compute both, select via jnp.where" so the
+# resulting HLO contains a straight-line path instead of branched IR.
+# ---------------------------------------------------------------------------
+
+def _select_state(pred, on_true, on_false):
+    return jax.tree_util.tree_map(
+        lambda a, b: jnp.where(pred, a, b),
+        on_true,
+        on_false,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Movement deltas: (dy, dx) where dy=row-delta, dx=col-delta.
 # NetHack convention: north = decreasing row index.
 # ---------------------------------------------------------------------------
@@ -624,12 +638,9 @@ def _try_step(state, dy: int, dx: int, rng: jax.Array):
         ),
     )
 
-    return jax.lax.cond(
-        noop_gate,
-        lambda s: s,
-        lambda s: _try_step_inner(s, dy, dx, rng),
-        state_after_escape,
-    )
+    # Brax-flatten: compute both branches, select via pytree-where.
+    stepped = _try_step_inner(state_after_escape, dy, dx, rng)
+    return _select_state(noop_gate, state_after_escape, stepped)
 
 
 def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
@@ -714,23 +725,18 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
         kc = attacked.scoring.monsters_killed
         mcl = attacked.monster_ai.mcloned[monster_idx]
         xp_award = _xp_experience(entry_post, kc, mcloned=mcl)
-        attacked = jax.lax.cond(
-            killed,
-            lambda s_: _xp_more_experienced(s_, xp_award, jnp.int32(0)),
-            lambda s_: s_,
-            attacked,
-        )
+        # Brax-flatten xp + scoring grants: compute both, select via pytree-where.
+        attacked_xp = _xp_more_experienced(attacked, xp_award, jnp.int32(0))
+        attacked = _select_state(killed, attacked_xp, attacked)
         # Wave 30d: more_experienced is byte-equal vendor exper.c:168-203 and
         # only touches u.uexp / u.urexp.  Kill-counter and running-score side
         # effects (vendor end.c::done tracks per-genus/per-class kill counts)
         # are bumped here via scoring.record_kill, gated on the same
         # ``killed`` flag.
-        attacked = jax.lax.cond(
-            killed,
-            lambda s_: s_.replace(scoring=_scoring_record_kill(s_.scoring, xp_award)),
-            lambda s_: s_,
-            attacked,
+        attacked_scored = attacked.replace(
+            scoring=_scoring_record_kill(attacked.scoring, xp_award)
         )
+        attacked = _select_state(killed, attacked_scored, attacked)
 
         # Confuse-attack-on-hit: if confuse_attack_pending is set and the
         # strike landed (target still alive indicates a hit occurred even if
@@ -808,7 +814,10 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
             return _apply_fov(s2)
 
         s_after_rn7 = s.replace(vendor_rng=vrng)
-        return jax.lax.cond(foo, _foo_blocked, _do_swap, s_after_rn7)
+        # Brax-flatten: compute both branches, select via pytree-where.
+        s_blocked = _foo_blocked(s_after_rn7)
+        s_swapped = _do_swap(s_after_rn7)
+        return _select_state(foo, s_blocked, s_swapped)
 
     # _attack_branch must return the same pytree shape as _move_branch
     # (below).  Selection order:
@@ -816,22 +825,19 @@ def _try_step_inner(state, dy: int, dx: int, rng: jax.Array):
     #   2. Peaceful (non-tame) bump → no-op.
     #   3. Hostile bump → attack.
     #   4. Empty target tile → move.
-    return jax.lax.cond(
-        is_pet_swap,
-        _pet_swap_branch,
-        lambda s: jax.lax.cond(
-            is_peaceful_bump,
-            lambda s_: s_,                                        # peaceful bump → no-op
-            lambda s_: jax.lax.cond(
-                monster_present,
-                _attack_branch,
-                lambda s2: _move_branch(s2, eff_dy, eff_dx, rng, target, in_bounds, terrain_2d, map_h, map_w),
-                s_,
-            ),
-            s,
-        ),
-        state,
+    # Brax-flatten: compute all candidate states and pick via nested
+    # jnp.where over a pytree.  All branches share the EnvState pytree shape.
+    pet_swap_state = _pet_swap_branch(state)
+    attack_state   = _attack_branch(state)
+    move_state     = _move_branch(
+        state, eff_dy, eff_dx, rng, target, in_bounds, terrain_2d, map_h, map_w,
     )
+    # Inner: hostile bump (monster_present) -> attack else move.
+    hostile_or_move = _select_state(monster_present, attack_state, move_state)
+    # Middle: peaceful bump -> no-op (state) else hostile_or_move.
+    peaceful_or_inner = _select_state(is_peaceful_bump, state, hostile_or_move)
+    # Outer: pet swap -> swap else middle.
+    return _select_state(is_pet_swap, pet_swap_state, peaceful_or_inner)
 
 
 def _move_branch(state, dy: int, dx: int, rng: jax.Array,
@@ -885,26 +891,22 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         new_ds_ = f.door_state.at[lv_, row_, col_].set(new_val_)
         return f.replace(door_state=new_ds_, door_trapped=new_trapped_), damage_
 
-    new_features = jax.lax.cond(
-        open_on_bump,
-        # vendor lock.c::doopen checks D_TRAPPED; trap springs on bump-open too.
-        _do_open,
-        lambda f: (f, jnp.int32(0)),
-        state.features,
+    # Brax-flatten: compute both branches and select via pytree-where.
+    # vendor lock.c::doopen checks D_TRAPPED; trap springs on bump-open too.
+    _open_features, _open_damage = _do_open(state.features)
+    new_features = (
+        _select_state(open_on_bump, _open_features, state.features),
+        jnp.where(open_on_bump, _open_damage, jnp.int32(0)),
     )
 
     # Update terrain tile to OPEN_DOOR when we open it on bump.
-    new_terrain = jax.lax.cond(
-        open_on_bump,
-        lambda t: t.at[
-            state.dungeon.current_branch,
-            state.dungeon.current_level - 1,
-            safe_row,
-            safe_col,
-        ].set(jnp.int8(TileType.OPEN_DOOR)),
-        lambda t: t,
-        state.terrain,
-    )
+    _terrain_opened = state.terrain.at[
+        state.dungeon.current_branch,
+        state.dungeon.current_level - 1,
+        safe_row,
+        safe_col,
+    ].set(jnp.int8(TileType.OPEN_DOOR))
+    new_terrain = jnp.where(open_on_bump, _terrain_opened, state.terrain)
 
     # After door handling, re-read tile_val from (potentially updated) terrain.
     # For movement logic below, treat the tile as what it was before this step
@@ -1146,12 +1148,11 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     # Split a sub-key from state.rng for trap rolls.
     trap_rng, new_rng = jax.random.split(state_mid.rng)
 
-    new_traps, trap_dmg, trap_se = jax.lax.cond(
-        on_trap,
-        lambda ts: trigger_trap(ts, trap_rng, trap_pos),
-        lambda ts: (ts, jnp.int32(0), jnp.zeros(6, dtype=jnp.int32)),
-        state_mid.traps,
-    )
+    # Brax-flatten: always invoke trigger_trap, mask via on_trap.
+    _trig_traps, _trig_dmg, _trig_se = trigger_trap(state_mid.traps, trap_rng, trap_pos)
+    new_traps = _select_state(on_trap, _trig_traps, state_mid.traps)
+    trap_dmg  = jnp.where(on_trap, _trig_dmg, jnp.int32(0))
+    trap_se   = jnp.where(on_trap, _trig_se, jnp.zeros(6, dtype=jnp.int32))
 
     # Apply HP damage from trap.
     new_hp = jnp.maximum(
@@ -1498,14 +1499,9 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         actually_moved & _is_water_tile & ~_has_swimming & _new_in_water
     )
     _drown_rng, _drown_new_rng = jax.random.split(state_final.rng)
-    def _do_drown(s):
-        return _drown(s, _drown_rng).replace(rng=_drown_new_rng)
-    state_final = jax.lax.cond(
-        _entered_water,
-        _do_drown,
-        lambda s: s,
-        state_final,
-    )
+    # Brax-flatten: compute drown result unconditionally, select via pytree-where.
+    state_drowned = _drown(state_final, _drown_rng).replace(rng=_drown_new_rng)
+    state_final = _select_state(_entered_water, state_drowned, state_final)
 
     # --- mention_walls bump feedback (vendor hack.c:768-772) ---
     # NLE enables iflags.mention_walls (vendor/nle/nle/nethack/nethack.py:57),
@@ -1524,12 +1520,9 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         jnp.int32(int(_MsgId.ITS_A_WALL)),
         jnp.int32(int(_MsgId.ITS_SOLID_STONE)),
     )
-    _new_messages = jax.lax.cond(
-        _bump_wall,
-        lambda m: _msg_emit(m, _bump_msg_id),
-        lambda m: m,
-        state_final.messages,
-    )
+    # Brax-flatten: emit unconditionally, select via pytree-where.
+    _emitted_msgs = _msg_emit(state_final.messages, _bump_msg_id)
+    _new_messages = _select_state(_bump_wall, _emitted_msgs, state_final.messages)
     state_final = state_final.replace(messages=_new_messages)
 
     # Turn-consumption signal for the BL_TIME (game_moves) counter.  A move
@@ -1680,7 +1673,9 @@ def _on_quest_leader_level(state) -> object:
     on_quest_branch = state.dungeon.current_branch == jnp.int8(int(Branch.QUEST))
     on_level_1      = state.dungeon.current_level  == jnp.int8(1)
     should_enter    = on_quest_branch & on_level_1 & ~state.quest.met_leader
-    return jax.lax.cond(should_enter, on_enter_quest_level, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via pytree-where.
+    state_entered = on_enter_quest_level(state)
+    return _select_state(should_enter, state_entered, state)
 
 
 def _stair_up(state, rng):
@@ -1726,12 +1721,9 @@ def _stair_up(state, rng):
     # Emit "You climb up the stairs." when the action actually traversed.
     # Cite: vendor/nethack/src/do.c::doup — pline("You climb up the stairs.").
     from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
-    new_messages = jax.lax.cond(
-        on_stair,
-        lambda m: _msg_emit(m, int(_MsgId.GO_UP_STAIRS)),
-        lambda m: m,
-        new_state.messages,
-    )
+    # Brax-flatten: emit unconditionally, select via pytree-where.
+    _msgs_up = _msg_emit(new_state.messages, int(_MsgId.GO_UP_STAIRS))
+    new_messages = _select_state(on_stair, _msgs_up, new_state.messages)
     new_state = new_state.replace(messages=new_messages)
 
     return _on_quest_leader_level(_apply_fov(new_state))
@@ -1788,12 +1780,9 @@ def _stair_down(state, rng):
     # Emit "You climb down the stairs." when the action actually traversed.
     # Cite: vendor/nethack/src/do.c::dodown — pline("You climb down the stairs.").
     from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
-    new_messages = jax.lax.cond(
-        on_stair,
-        lambda m: _msg_emit(m, int(_MsgId.GO_DOWN_STAIRS)),
-        lambda m: m,
-        new_state.messages,
-    )
+    # Brax-flatten: emit unconditionally, select via pytree-where.
+    _msgs_down = _msg_emit(new_state.messages, int(_MsgId.GO_DOWN_STAIRS))
+    new_messages = _select_state(on_stair, _msgs_down, new_state.messages)
     new_state = new_state.replace(messages=new_messages)
 
     return _on_quest_leader_level(_apply_fov(new_state))
@@ -1914,12 +1903,9 @@ def _handle_eat(state, rng):
         jnp.int32(int(_MsgId.EAT_APPLE_DELICIOUS)),
         jnp.int32(int(_MsgId.EAT_FOOD)),
     )
-    new_messages = jax.lax.cond(
-        found,
-        lambda m: _msg_emit(m, eat_msg_id),
-        lambda m: m,
-        new_state.messages,
-    )
+    # Brax-flatten: emit unconditionally, select via pytree-where.
+    _eat_msgs = _msg_emit(new_state.messages, eat_msg_id)
+    new_messages = _select_state(found, _eat_msgs, new_state.messages)
     new_state = new_state.replace(messages=new_messages)
 
     # SATIATED-choke gate — vendor/nethack/src/eat.c:1980-1995 line
@@ -2227,13 +2213,17 @@ def _handle_cast(state, rng):
     new_magic = magic.replace(spell_memory=new_mem)
     base_state = state.replace(player_pw=new_pw, magic=new_magic)
 
-    # Effect dispatch: lax.switch traces all N_SPELLS branches at compile time
-    # but only executes the selected branch at runtime.  The noop entry fires
-    # for unknown spells.  Cite: vendor/nethack/src/spell.c::spelleffects.
+    # Brax-flatten the N_SPELLS-way switch: compute every effect under the
+    # same RNG sub-key and pick by one-hot index, then gate by will_cast.
+    # Cite: vendor/nethack/src/spell.c::spelleffects.
     rng, sub = jax.random.split(rng)
-    effect_state = jax.lax.switch(safe_slot, _MAGIC_EFFECT_DISPATCH_LIST, base_state, sub)
-
-    return jax.lax.cond(will_cast, lambda _: effect_state, lambda _: base_state, None)
+    _spell_states = [fn(base_state, sub) for fn in _MAGIC_EFFECT_DISPATCH_LIST]
+    _spell_state = _spell_states[0]
+    for _i in range(1, len(_spell_states)):
+        _spell_state = _select_state(
+            safe_slot == jnp.int32(_i), _spell_states[_i], _spell_state,
+        )
+    return _select_state(will_cast, _spell_state, base_state)
 
 
 def _handle_pickup(state, rng):
@@ -2391,18 +2381,19 @@ def _handle_put_on(state, rng):
 
     # worn.c setworn extrinsic recalc (e.g. AMULET_OF_ESP -> TELEPAT range).
     # Cite: vendor/nethack/src/worn.c lines 73-145 (setworn), 50-69 (recalc).
-    state = jax.lax.cond(can_put_amulet, _recalc_worn_props, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via pytree-where.
+    state_recalc = _recalc_worn_props(state)
+    state = _select_state(can_put_amulet, state_recalc, state)
 
     # Emit the "<letter> - <amulet> (being worn)." feedback so the MiniHack
     # add_amulet_event RewardManager (substring "amulet (being worn).") fires.
     # Cite: vendor/nethack/src/do_wear.c:2061 prinv() -> invent.c:2447 xprname.
     from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
-    state = jax.lax.cond(
-        can_put_amulet,
-        lambda s: s.replace(messages=_msg_emit(s.messages, int(_MsgId.AMULET_BEING_WORN))),
-        lambda s: s,
-        state,
+    # Brax-flatten: emit unconditionally, select via pytree-where.
+    state_worn = state.replace(
+        messages=_msg_emit(state.messages, int(_MsgId.AMULET_BEING_WORN))
     )
+    state = _select_state(can_put_amulet, state_worn, state)
     return state
 
 
@@ -2803,8 +2794,9 @@ def _handle_sit(state, rng):
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
     tile = state.terrain[br, lv, pr, pc].astype(jnp.int32)
     on_throne = tile == jnp.int32(int(TileType.THRONE))
-    return jax.lax.cond(on_throne, lambda s: sit_on_throne(s, rng),
-                        lambda s: s, state)
+    # Brax-flatten: compute both branches, select via pytree-where.
+    state_sat = sit_on_throne(state, rng)
+    return _select_state(on_throne, state_sat, state)
 
 
 def _handle_rub(state, rng):
@@ -2979,23 +2971,15 @@ def _handle_apply(state, rng):
     # isn't the wielded slot, attempt to wield it.  ``wield_tool`` itself
     # gates on the cursed-welded uwep / shield-bimanual cases.
     found_tool, tool_slot = _find_first_wield_tool_slot(state)
-    state = jax.lax.cond(
-        found_tool,
-        lambda s: _apply_wield_tool(s, tool_slot),
-        lambda s: s,
-        operand=state,
-    )
+    # Brax-flatten: compute both branches, select via pytree-where.
+    state_wielded = _apply_wield_tool(state, tool_slot)
+    state = _select_state(found_tool, state_wielded, state)
 
-    # Route pickaxe apply → start dig (north by default).
-    # jax.lax.cond requires both branches to be traced; _containers_handle_apply
-    # is the non-dig path.
+    # Brax-flatten: compute both branches, select via pytree-where.
     has_tool = _has_digging_tool(state)
-    return jax.lax.cond(
-        has_tool,
-        lambda s: start_dig(s, direction=0),  # direction 0 = NORTH
-        lambda s: _containers_handle_apply(s, rng),
-        operand=state,
-    )
+    state_dig = start_dig(state, direction=0)  # direction 0 = NORTH
+    state_container = _containers_handle_apply(state, rng)
+    return _select_state(has_tool, state_dig, state_container)
 
 
 def _handle_engrave(state, rng):
@@ -3074,7 +3058,9 @@ def _handle_invoke(state, rng):
         s = s.replace(invoke_cooldown=new_cd)
         return artifact_invoke_dispatch(s, art, rng)
 
-    return jax.lax.cond(ready, _do_invoke, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via pytree-where.
+    state_invoked = _do_invoke(state)
+    return _select_state(ready, state_invoked, state)
 
 
 def _handle_ride(state, rng):
@@ -3084,12 +3070,10 @@ def _handle_ride(state, rng):
     Otherwise → try_mount (steed.c:187).
     """
     riding = state.player_steed_mid != jnp.uint32(0)
-    return jax.lax.cond(
-        riding,
-        lambda s: _riding_try_dismount(s, rng),
-        lambda s: _riding_try_mount(s, rng),
-        operand=state,
-    )
+    # Brax-flatten: compute both branches, select via pytree-where.
+    state_dismount = _riding_try_dismount(state, rng)
+    state_mount    = _riding_try_mount(state, rng)
+    return _select_state(riding, state_dismount, state_mount)
 
 
 def _handle_enhance(state, rng):
@@ -3134,12 +3118,9 @@ def _handle_enhance(state, rng):
         cap     = sk.max_level[i].astype(jnp.int32)
         threshold = _pnta(cur_lv)
         eligible = (cur_adv >= threshold) & (cur_lv < cap) & ~done
-        new_s = jax.lax.cond(
-            eligible,
-            lambda st: _try_adv(st, jnp.int32(i)),
-            lambda st: st,
-            s,
-        )
+        # Brax-flatten: compute both branches, select via pytree-where.
+        s_advanced = _try_adv(s, jnp.int32(i))
+        new_s = _select_state(eligible, s_advanced, s)
         new_done = done | eligible
         return new_s, new_done
 
@@ -3258,7 +3239,9 @@ def _handle_dip(state, rng):
         )
         return s.replace(inventory=s.inventory.replace(items=new_items))
 
-    return jax.lax.cond(can_dip, _do_dip, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via pytree-where.
+    state_dipped = _do_dip(state)
+    return _select_state(can_dip, state_dipped, state)
 
 
 def _handle_tip_down(state, rng):
@@ -3288,12 +3271,9 @@ def _handle_tip_down(state, rng):
     first_idx     = jnp.argmax(usable).astype(jnp.int32)
     any_usable    = jnp.any(usable)
 
-    return jax.lax.cond(
-        any_usable,
-        lambda s: _containers_tip_container(s, first_idx),
-        lambda s: s,
-        state,
-    )
+    # Brax-flatten: compute both branches, select via pytree-where.
+    state_tipped = _containers_tip_container(state, first_idx)
+    return _select_state(any_usable, state_tipped, state)
 
 
 # ---------------------------------------------------------------------------
@@ -4026,10 +4006,18 @@ def dispatch_action(state, action: jnp.int32, rng: jax.Array):
     handler_idx_root = _ACTION_TO_HANDLER_IDX[root_action].astype(jnp.int32)
     compact_idx_root = _SLOT_TO_COMPACT[handler_idx_root]
     dir_idx_root     = _SLOT_TO_DIR_IDX[handler_idx_root]
-    state_after_dir = jax.lax.switch(
-        compact_idx_root, _COMPACT_HANDLERS,
-        state_for_dir_dispatch, rng, dir_idx_root,
-    )
+    # Brax-flatten the compact-handler switch: invoke every handler under the
+    # same (state, rng, dir_idx) inputs and pick by one-hot index.
+    _root_states = [
+        h(state_for_dir_dispatch, rng, dir_idx_root) for h in _COMPACT_HANDLERS
+    ]
+    state_after_dir = _root_states[0]
+    for _i in range(1, len(_root_states)):
+        state_after_dir = _select_state(
+            compact_idx_root == jnp.int32(_i),
+            _root_states[_i],
+            state_after_dir,
+        )
 
     # --- Step B: does this action open a new prompt? ---------------------
     opens_inv = action_opens_inv_letter_prompt(action_val)
@@ -4050,43 +4038,31 @@ def dispatch_action(state, action: jnp.int32, rng: jax.Array):
     handler_idx = _ACTION_TO_HANDLER_IDX[action_val].astype(jnp.int32)
     compact_idx = _SLOT_TO_COMPACT[handler_idx]
     dir_idx     = _SLOT_TO_DIR_IDX[handler_idx]
-    state_normal = jax.lax.switch(
-        compact_idx, _COMPACT_HANDLERS, state, rng, dir_idx
-    )
-
-    # Branch select for the pending case (selects between three sub-modes).
-    def _branch_pending(_):
-        # kind==2 (AWAIT_DIRECTION): execute deferred root with dir+slot.
-        # kind==3 (AWAIT_LETTER_THEN_DIR step 1): stash slot, await dir.
-        # else (kind==1, AWAIT_INV_LETTER): stash slot, fall through.
-        is_dir   = pending_kind == jnp.int32(2)
-        is_ltd   = pending_kind == jnp.int32(3)
-        return jax.lax.cond(
-            is_dir,
-            lambda _: state_after_dir,
-            lambda _: jax.lax.cond(
-                is_ltd,
-                lambda __: state_after_letter_two_step,
-                lambda __: state_after_inv_letter,
-                None,
-            ),
-            None,
+    # Brax-flatten the compact-handler switch: same pattern as above.
+    _normal_states = [h(state, rng, dir_idx) for h in _COMPACT_HANDLERS]
+    state_normal = _normal_states[0]
+    for _i in range(1, len(_normal_states)):
+        state_normal = _select_state(
+            compact_idx == jnp.int32(_i),
+            _normal_states[_i],
+            state_normal,
         )
 
-    def _branch_open(_):
-        return state_open_prompt
-
-    def _branch_normal(_):
-        return state_normal
-
-    # pending takes priority over opens_any (you can't open a new prompt
-    # while one is already open — the followup consumes the action).
-    return jax.lax.cond(
-        pending,
-        _branch_pending,
-        lambda _: jax.lax.cond(opens_any, _branch_open, _branch_normal, None),
-        None,
+    # Brax-flatten the outer / inner cond chain over pending / opens_any /
+    # is_dir / is_ltd into nested pytree-where selections.  All branches
+    # produce identically-shaped EnvState pytrees.
+    is_dir   = pending_kind == jnp.int32(2)
+    is_ltd   = pending_kind == jnp.int32(3)
+    # Innermost: ltd -> letter_two_step else inv_letter (kind==1 fall-through).
+    state_pending_inner = _select_state(
+        is_ltd, state_after_letter_two_step, state_after_inv_letter,
     )
+    # Middle: is_dir -> state_after_dir else inner.
+    state_pending = _select_state(is_dir, state_after_dir, state_pending_inner)
+    # Outer-A: opens_any -> open prompt else normal dispatch.
+    state_open_or_normal = _select_state(opens_any, state_open_prompt, state_normal)
+    # Outer-B: pending takes priority over opens_any (no new prompt mid-prompt).
+    return _select_state(pending, state_pending, state_open_or_normal)
 
 
 def _action_value_to_index(action_value: jnp.int32) -> jnp.int32:
