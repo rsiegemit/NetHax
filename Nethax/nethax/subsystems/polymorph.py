@@ -1175,22 +1175,22 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool = 
     # polys keep the *first* set of originals so revert returns to human).
     already_poly = poly.is_polymorphed
 
-    def _snap(p):
-        types, dtyps, nd, ns = _form_attacks(form_i16)
-        return p.replace(
-            orig_role_idx=state.player_role.astype(jnp.int8),
-            orig_str=state.player_str.astype(jnp.int16),
-            orig_dex=state.player_dex.astype(jnp.int8),
-            orig_con=state.player_con.astype(jnp.int8),
-            orig_hp_max=state.player_hp_max.astype(jnp.int32),
-            orig_ac=state.player_ac.astype(jnp.int32),
-            orig_attack_types=p.attack_types,
-            orig_attack_damage_types=p.attack_damage_types,
-            orig_attack_n_dice=p.attack_n_dice,
-            orig_attack_n_sides=p.attack_n_sides,
-        )
-
-    poly = jax.lax.cond(already_poly, lambda p: p, _snap, poly)
+    # Brax-flatten: compute snapshot result; select via where when not already polymorphed.
+    _snap_poly = poly.replace(
+        orig_role_idx=state.player_role.astype(jnp.int8),
+        orig_str=state.player_str.astype(jnp.int16),
+        orig_dex=state.player_dex.astype(jnp.int8),
+        orig_con=state.player_con.astype(jnp.int8),
+        orig_hp_max=state.player_hp_max.astype(jnp.int32),
+        orig_ac=state.player_ac.astype(jnp.int32),
+        orig_attack_types=poly.attack_types,
+        orig_attack_damage_types=poly.attack_damage_types,
+        orig_attack_n_dice=poly.attack_n_dice,
+        orig_attack_n_sides=poly.attack_n_sides,
+    )
+    poly = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(already_poly, t, f), poly, _snap_poly,
+    )
 
     # --- 2/3. Set new form data + adopt attacks/intrinsics.
     types, dtyps, nd, ns = _form_attacks(form_i16)
@@ -1295,17 +1295,17 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool = 
     levitating = state.status.intrinsics[int(_Intr.LEVITATION)]
     do_dismount = was_riding & (~new_form_can_ride)
 
-    def _dismount(s):
-        # Vendor: fall damage skipped if Levitating (steed.c::dismount_steed).
-        applied = jnp.where(levitating, jnp.int32(0), fall_roll)
-        new_hp = jnp.maximum(s.player_hp - applied, jnp.int32(0))
-        return s.replace(
-            player_steed_mid=jnp.uint32(0),
-            player_hp=new_hp,
-            done=s.done | (new_hp <= jnp.int32(0)),
-        )
-
-    state = jax.lax.cond(do_dismount, _dismount, lambda s: s, state)
+    # Brax-flatten: compute dismounted state unconditionally, select via where.
+    _dismount_applied = jnp.where(levitating, jnp.int32(0), fall_roll)
+    _dismount_new_hp = jnp.maximum(state.player_hp - _dismount_applied, jnp.int32(0))
+    _dismount_state = state.replace(
+        player_steed_mid=jnp.uint32(0),
+        player_hp=_dismount_new_hp,
+        done=state.done | (_dismount_new_hp <= jnp.int32(0)),
+    )
+    state = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(do_dismount, t, f), _dismount_state, state,
+    )
 
     # --- 5. Drop incompatible armor per-slot (polyself.c:1156 break_armor).
     state = _drop_worn_armor_per_slot(state, form_i16)
@@ -1338,10 +1338,11 @@ def polymorph_player(state, rng: jax.Array, target_form_idx, controlled: bool = 
     same_race = (form_flags2 & player_race_m2) != jnp.uint32(0)
 
     rng, sub_nm = jax.random.split(rng)
-    state = jax.lax.cond(same_race,
-                         lambda s: newman(s, sub_nm),
-                         lambda s: s,
-                         state)
+    # Brax-flatten: always run newman, select via where on same_race.
+    _newman_state = newman(state, sub_nm)
+    state = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(same_race, t, f), _newman_state, state,
+    )
 
     # --- 7. Conduct: POLYSELFLESS violated — bump counter + set bit.
     # Vendor: u.uconduct.polyselfs++ (polyself.c::polyself); counter consumed
@@ -1421,21 +1422,27 @@ def revert_polymorph(state, rng: jax.Array | None = None):
             safe_race = jnp.clip(race_idx, 0, n_genocided - 1)
             self_genocided = reverted.genocided_species[safe_race]
 
-            def _genocide_death(st2):
-                return st2.replace(player_hp=jnp.int32(0), done=jnp.bool_(True))
-
-            reverted = jax.lax.cond(self_genocided, _genocide_death, lambda st2: st2, reverted)
-
-            # Post-revert: if HP < 1, player dies.  polyself.c rehumanize.
-            hp_fatal = reverted.player_hp < jnp.int32(1)
-            return jax.lax.cond(
-                hp_fatal,
-                lambda st2: st2.replace(player_hp=jnp.int32(0), done=jnp.bool_(True)),
-                lambda st2: st2,
-                reverted,
+            # Brax-flatten: compute genocide-death state, select via where.
+            _genocide_dead = reverted.replace(player_hp=jnp.int32(0), done=jnp.bool_(True))
+            reverted = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(self_genocided, t, f), _genocide_dead, reverted,
             )
 
-        reverted = jax.lax.cond(has_unchanging, _unchanging_death, _normal_revert, s)
+            # Post-revert: if HP < 1, player dies.  polyself.c rehumanize.
+            # Brax-flatten: compute hp-fatal state, select via where.
+            hp_fatal = reverted.player_hp < jnp.int32(1)
+            _hp_fatal_state = reverted.replace(player_hp=jnp.int32(0), done=jnp.bool_(True))
+            return jax.tree_util.tree_map(
+                lambda t, f: jnp.where(hp_fatal, t, f), _hp_fatal_state, reverted,
+            )
+
+        # Brax-flatten: compute both branches, select via where.
+        _unchanging_state = _unchanging_death(s)
+        _normal_state = _normal_revert(s)
+        reverted = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(has_unchanging, t, f),
+            _unchanging_state, _normal_state,
+        )
         # Emit "You return to your old form." — only when actually reverting.
         # Cite: vendor/nethack/src/polyself.c::rehumanize (line ~1367)
         # pline("You return to %s form!", ...).
@@ -1444,7 +1451,11 @@ def revert_polymorph(state, rng: jax.Array | None = None):
             messages=_msg_emit(reverted.messages, int(_MsgId.YOU_RETURN_TO_HUMAN)),
         )
 
-    return jax.lax.cond(poly.is_polymorphed, _do_revert, lambda s: s, state)
+    # Brax-flatten: always compute revert result, select via where.
+    _revert_state = _do_revert(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(poly.is_polymorphed, t, f), _revert_state, state,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1573,7 +1584,11 @@ def step(state, rng: jax.Array | None = None):
 
     state = state.replace(polymorph=new_poly)
     expired = poly.is_polymorphed & (new_timer <= 0)
-    state = jax.lax.cond(expired, lambda s: revert_polymorph(s, rng), lambda s: s, state)
+    # Brax-flatten: always compute revert state, select via where.
+    _expired_state = revert_polymorph(state, rng)
+    state = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(expired, t, f), _expired_state, state,
+    )
 
     # Lycanthropy expiry: when the countdown reaches zero with a queued
     # were-form and the hero isn't currently polymorphed, force the
@@ -1584,11 +1599,12 @@ def step(state, rng: jax.Array | None = None):
         & (~state.polymorph.is_polymorphed)
     )
 
-    def _spawn_were(s):
-        form_i16 = s.polymorph.lycanthropy_form.astype(jnp.int16)
-        return polymorph_player(s, rng, form_i16, False)
-
-    state = jax.lax.cond(lyc_expired, _spawn_were, lambda s: s, state)
+    # Brax-flatten: always compute were-spawn state, select via where.
+    _spawn_form_i16 = state.polymorph.lycanthropy_form.astype(jnp.int16)
+    _spawn_were_state = polymorph_player(state, rng, _spawn_form_i16, False)
+    state = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(lyc_expired, t, f), _spawn_were_state, state,
+    )
     return state
 
 
