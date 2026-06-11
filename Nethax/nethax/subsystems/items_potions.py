@@ -1674,11 +1674,10 @@ def _quaff_no_potion(state, rng):
     """
     from Nethax.nethax.constants.tiles import TileType
     on_sink = _tile_under_player(state) == jnp.int32(int(TileType.SINK))
-    return jax.lax.cond(
-        on_sink,
-        lambda s_r: _drink_sink(s_r[0], s_r[1]),
-        lambda s_r: s_r[0],
-        (state, rng),
+    _sink_state = _drink_sink(state, rng)
+    return jax.tree.map(
+        lambda t, f: jnp.where(on_sink, t, f),
+        _sink_state, state,
     )
 
 # Round 4 brax integration via PEP 562 lazy __getattr__ with cycle-break.
