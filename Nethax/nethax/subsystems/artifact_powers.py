@@ -467,15 +467,12 @@ def apply_artifact_hit_effects(state, mon_slot, rng, dieroll=None):
     # && dieroll <= MB_MAX_DIEROLL (8).  No 25% prefilter.
     is_magicbane = (arti == jnp.int32(_ARTI_MAGICBANE)) & mai.alive[idx]
     # Only run mb path when wielded artifact is Magicbane to avoid the
-    # JIT-traced effects polluting non-Magicbane state; we use lax.cond.
-    def _mb_path(s):
-        out_state, _extra_dmg, _idx_tier = magicbane_mb_hit(
-            s, mon_slot, k_mb, dieroll=dieroll_val,
-        )
-        return out_state
-
-    state_after_mb = jax.lax.cond(
-        is_magicbane, _mb_path, lambda s: s, state_after_vorpal,
+    # JIT-traced effects polluting non-Magicbane state; we use tree_map mask.
+    mb_out, _extra_dmg, _idx_tier = magicbane_mb_hit(
+        state_after_vorpal, mon_slot, k_mb, dieroll=dieroll_val,
+    )
+    state_after_mb = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_magicbane, t, f), mb_out, state_after_vorpal
     )
 
     killed = vorpal_kill
@@ -1068,9 +1065,18 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
         _h_blinding_ray,   # 16  BLINDING_RAY
     ]
 
-    new_state = jax.lax.switch(handler_idx, handlers, state_after_pw)
+    # Flatten lax.switch: call all handlers, select via per-index tree_map mask.
+    new_state = handlers[0](state_after_pw)
+    for _i in range(1, len(handlers)):
+        candidate = handlers[_i](state_after_pw)
+        pick_i = handler_idx == jnp.int32(_i)
+        new_state = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(pick_i, t, f), candidate, new_state
+        )
     # On refused (tired + no Pw) path, return only the age-bumped state.
-    return jax.lax.cond(refused, lambda _: state_after_age, lambda s: s, new_state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(refused, t, f), state_after_age, new_state
+    )
 
 
 # ---------------------------------------------------------------------------
