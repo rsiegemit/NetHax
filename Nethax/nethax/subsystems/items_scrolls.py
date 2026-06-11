@@ -930,8 +930,9 @@ def _effect_teleportation(state, rng, buc):
     new_state = _teleds(state, rng_t)
     # When the noteleport / amulet gate fires, scroll teleport produces no
     # movement — both on-level and cross-level paths are suppressed.
-    new_state = jax.lax.cond(
-        abort_all, lambda _: state, lambda _: new_state, None
+    new_state = jax.tree.map(
+        lambda t, f: jnp.where(abort_all, t, f),
+        state, new_state,
     )
 
     # --- Cursed: invoke level_tele() → random_teleport_level() → goto_level.
@@ -972,8 +973,14 @@ def _effect_teleportation(state, rng, buc):
     # When noteleport / Yendor 1/3 gate fired, ``abort_all`` suppresses the
     # cursed cross-level branch too (vendor early-return at teleport.c:854,
     # 865 fires before scroll-effect dispatch reaches level_tele).
-    result = jax.lax.cond(cursed, lambda _: new_lvl_state, lambda _: new_state, None)
-    return jax.lax.cond(abort_all, lambda _: state, lambda _: result, None)
+    result = jax.tree.map(
+        lambda t, f: jnp.where(cursed, t, f),
+        new_lvl_state, new_state,
+    )
+    return jax.tree.map(
+        lambda t, f: jnp.where(abort_all, t, f),
+        state, result,
+    )
 
 
 def _goto_level(state, target_lvl):
@@ -1079,9 +1086,10 @@ def _effect_confuse_monster(state, rng, buc):
     # Sane branch: arm confuse-attack flag.
     sane_status = state.status.replace(confuse_attack_pending=jnp.bool_(True))
 
-    new_status = jax.lax.cond(confused,
-                              lambda: conf_status,
-                              lambda: sane_status)
+    new_status = jax.tree.map(
+        lambda t, f: jnp.where(confused, t, f),
+        conf_status, sane_status,
+    )
     return state.replace(status=new_status)
 
 
@@ -1743,12 +1751,19 @@ def read_scroll(state, rng, slot_idx):
         )
 
         # Run both branches (JIT requires static structure); select result.
-        confused_state = jax.lax.switch(
-            effect_id, _CONFUSED_BRANCHES, (s, rng, _slot_idx)
-        )
-        sane_state = jax.lax.switch(
-            effect_id, _SWITCH_BRANCHES, (s, rng, buc, _slot_idx)
-        )
+        # Brax-flatten: compute ALL N_SCROLLS branches per dispatch and select
+        # by one-hot effect_id mask via jax.tree.map / jnp.where.
+        _conf_results = [br((s, rng, _slot_idx)) for br in _CONFUSED_BRANCHES]
+        _sane_results = [br((s, rng, buc, _slot_idx)) for br in _SWITCH_BRANCHES]
+
+        def _select_by_id(*branches):
+            out = branches[0]
+            for _i in range(1, len(branches)):
+                out = jnp.where(effect_id == jnp.int32(_i), branches[_i], out)
+            return out
+
+        confused_state = jax.tree.map(_select_by_id, *_conf_results)
+        sane_state = jax.tree.map(_select_by_id, *_sane_results)
 
         new_state = jax.tree.map(
             lambda c, ns: jnp.where(use_confused, c, ns),
@@ -1796,7 +1811,11 @@ def read_scroll(state, rng, slot_idx):
         # per-scroll effect message remains the current buffer line here.
         return new_state.replace(inventory=new_inv)
 
-    return jax.lax.cond(can_read, _do_read, lambda s: s, state)
+    _read_state = _do_read(state)
+    return jax.tree.map(
+        lambda t, f: jnp.where(can_read, t, f),
+        _read_state, state,
+    )
 
 
 def handle_read(state, rng):
@@ -1840,11 +1859,10 @@ def handle_read(state, rng):
     # time. Binding to a free var captures the __getattr__ result.
     import sys as _sys_rs
     _read_scroll_fn = getattr(_sys_rs.modules[__name__], "read_scroll")
-    new_state = jax.lax.cond(
-        found,
-        lambda s_r: _read_scroll_fn(s_r[0], s_r[1], slot_idx),
-        lambda s_r: s_r[0],
-        (state, rng),
+    _read_state = _read_scroll_fn(state, rng, slot_idx)
+    new_state = jax.tree.map(
+        lambda t, f: jnp.where(found, t, f),
+        _read_state, state,
     )
     # Conduct: vendor/nethack/src/read.c::doread — ILLITERATE broken on any
     # successful scroll read (insight.c ~2147, u.uconduct.literate).
