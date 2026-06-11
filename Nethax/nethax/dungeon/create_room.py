@@ -189,18 +189,16 @@ def _draw_rlit(
     rng, lit_a = rnd_jax(rng, jnp.int32(1) + abs_depth)
     lit_a_pass = lit_a < jnp.int32(11)
 
-    # C2: lit_B = rn2(77)  -- only when lit_a_pass.  Short-circuit
-    # via ``lax.cond``: untaken branch returns the RNG unchanged + a
-    # sentinel-zero so the downstream ``(lit_a_pass & (lit_b == 0))``
-    # test still works (when ``lit_a_pass`` is False the value is
-    # masked out anyway).
-    def _draw_b(r):
-        return rn2_jax(r, jnp.int32(77))
-
-    def _skip_b(r):
-        return r, jnp.int32(0)
-
-    rng, lit_b = lax.cond(lit_a_pass, _draw_b, _skip_b, rng)
+    # C2: lit_B = rn2(77)  -- only when lit_a_pass.  Brax-flatten the
+    # short-circuit: compute both branches and select via ``jnp.where``.
+    # Under vmap both branches already execute, so this is byte-identical
+    # to ``lax.cond``.
+    rng_draw, lit_b_draw = rn2_jax(rng, jnp.int32(77))
+    rng_skip, lit_b_skip = rng, jnp.int32(0)
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(lit_a_pass, t, f), rng_draw, rng_skip
+    )
+    lit_b = jnp.where(lit_a_pass, lit_b_draw, lit_b_skip)
 
     # Vendor C: ``(... && rn2(77)) ? TRUE : FALSE``.  ``rn2(77)``
     # returns 0..76; the expression is TRUE iff *both* sub-tests are
@@ -361,54 +359,58 @@ def _scan_check_room(
                 (jnp.bool_(False), jnp.int32(-1)),
             )
 
-            def _no_hit(args):
-                # Entire padded box is stone -- vendor falls off the
-                # nested for-loops and returns TRUE.  ACCEPTED, no draw.
-                r2, lx2, ly2, hx2, hy2 = args
-                return r2, lx2, ly2, hx2, hy2, ACCEPTED
+            # Brax-flatten: compute both _no_hit and _has_hit branches and
+            # select via ``jnp.where`` on ``found``.
+            # _no_hit branch: ACCEPTED, no RNG draw, bounds unchanged.
+            no_hit_r, no_hit_lx, no_hit_ly, no_hit_hx, no_hit_hy = r, lx, ly, hx, hy
+            no_hit_status = ACCEPTED
 
-            def _has_hit(args):
-                # Non-stone cell at idx -- draw rn2(3).  Roll == 0 ->
-                # REJECTED.  Roll != 0 -> shrink + continue.
-                r2, lx2, ly2, hx2, hy2 = args
-                r3, roll = rn2_jax(r2, jnp.int32(3))
-                rejected = roll == jnp.int32(0)
-                xh = jnp.int16(idx // _ROWNO)
-                yh = jnp.int16(idx % _ROWNO)
-                # Vendor shrink (sp_lev.c:1105-1112):
-                #   if (x < *lowx) *lowx = x + xlim + 1;
-                #   else           hix   = x - xlim - 1;
-                #   if (y < *lowy) *lowy = y + ylim + 1;
-                #   else           hiy   = y - ylim - 1;
-                new_lx = jnp.where(xh < lx2, xh + xlim + jnp.int16(1), lx2)
-                new_hx = jnp.where(xh < lx2, hx2, xh - xlim - jnp.int16(1))
-                new_ly = jnp.where(yh < ly2, yh + ylim + jnp.int16(1), ly2)
-                new_hy = jnp.where(yh < ly2, hy2, yh - ylim - jnp.int16(1))
-                # Re-check collapse after shrink (vendor goto chk -> 1084).
-                collapsed = (new_hx <= new_lx) | (new_hy <= new_ly)
-                next_status = jnp.where(
-                    rejected,
-                    REJECTED,
-                    jnp.where(collapsed, REJECTED, SCANNING),
-                )
-                return r3, new_lx, new_ly, new_hx, new_hy, next_status
-
-            return lax.cond(
-                found,
-                _has_hit,
-                _no_hit,
-                (r, lx, ly, hx, hy),
+            # _has_hit branch: draw rn2(3) + shrink bounds.
+            has_hit_r, roll = rn2_jax(r, jnp.int32(3))
+            rejected = roll == jnp.int32(0)
+            xh = jnp.int16(idx // _ROWNO)
+            yh = jnp.int16(idx % _ROWNO)
+            # Vendor shrink (sp_lev.c:1105-1112):
+            #   if (x < *lowx) *lowx = x + xlim + 1;
+            #   else           hix   = x - xlim - 1;
+            #   if (y < *lowy) *lowy = y + ylim + 1;
+            #   else           hiy   = y - ylim - 1;
+            has_hit_lx = jnp.where(xh < lx, xh + xlim + jnp.int16(1), lx)
+            has_hit_hx = jnp.where(xh < lx, hx, xh - xlim - jnp.int16(1))
+            has_hit_ly = jnp.where(yh < ly, yh + ylim + jnp.int16(1), ly)
+            has_hit_hy = jnp.where(yh < ly, hy, yh - ylim - jnp.int16(1))
+            collapsed = (has_hit_hx <= has_hit_lx) | (has_hit_hy <= has_hit_ly)
+            has_hit_status = jnp.where(
+                rejected,
+                REJECTED,
+                jnp.where(collapsed, REJECTED, SCANNING),
             )
 
-        def _skip_iter(state):
-            return state
+            iter_r = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(found, t, f), has_hit_r, no_hit_r
+            )
+            iter_lx = jnp.where(found, has_hit_lx, no_hit_lx)
+            iter_ly = jnp.where(found, has_hit_ly, no_hit_ly)
+            iter_hx = jnp.where(found, has_hit_hx, no_hit_hx)
+            iter_hy = jnp.where(found, has_hit_hy, no_hit_hy)
+            iter_status = jnp.where(found, has_hit_status, no_hit_status)
+            return iter_r, iter_lx, iter_ly, iter_hx, iter_hy, iter_status
 
-        return lax.cond(
-            status_c == SCANNING,
-            _do_iter,
-            _skip_iter,
-            (rng_c, lowx_c, lowy_c, hix_c, hiy_c, status_c),
+        # Brax-flatten the outer SCANNING gate: compute _do_iter result and
+        # select against the unchanged carry via ``jnp.where``.
+        do_r, do_lx, do_ly, do_hx, do_hy, do_status = _do_iter(
+            (rng_c, lowx_c, lowy_c, hix_c, hiy_c, status_c)
         )
+        is_scanning = status_c == SCANNING
+        out_rng = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(is_scanning, t, f), do_r, rng_c
+        )
+        out_lx = jnp.where(is_scanning, do_lx, lowx_c)
+        out_ly = jnp.where(is_scanning, do_ly, lowy_c)
+        out_hx = jnp.where(is_scanning, do_hx, hix_c)
+        out_hy = jnp.where(is_scanning, do_hy, hiy_c)
+        out_status = jnp.where(is_scanning, do_status, status_c)
+        return out_rng, out_lx, out_ly, out_hx, out_hy, out_status
 
     # Worst-case restart count: each shrink loses >=1 row or column in the
     # interior box.  Initial spans are bounded by COLNO + ROWNO = 101.
@@ -477,44 +479,40 @@ def _try_one_attempt(
     # Previously D2/D3 fired whenever ``!vault`` even on the empty-pool
     # branch -- one or two extra ISAAC64 bytes per stalled attempt.
     # Citation: vendor/nle/src/sp_lev.c:1175-1192.
-    def _draw_dxdy(carry):
-        r = carry
-        wide = (p_hx - p_lx) > jnp.int16(28)
-        d2_mod = jnp.where(wide, jnp.int32(12), jnp.int32(8))
-        r, d2 = rn2_jax(r, d2_mod)
-        r, d3 = rn2_jax(r, jnp.int32(4))
-        dx = jnp.int16(2) + d2.astype(jnp.int16)
-        dy = jnp.int16(2) + d3.astype(jnp.int16)
-        # dx*dy > 50 cap (sp_lev.c:1190-1191).
-        area = dx.astype(jnp.int32) * dy.astype(jnp.int32)
-        dy_capped = jnp.where(
-            area > jnp.int32(50),
-            (jnp.int32(50) // jnp.maximum(dx.astype(jnp.int32), jnp.int32(1))).astype(jnp.int16),
-            dy,
-        )
-        return r, dx, dy_capped
-
-    def _vault_dxdy(carry):
-        r = carry
-        return r, jnp.int16(1), jnp.int16(1)
-
-    def _skip_dxdy(carry):
-        # No rect from D1 -- vendor's ``if (!r1) return FALSE`` short-
-        # circuits before reaching the dx/dy block.  Zero RNG draws.
-        # sp_lev.c:1177-1180.
-        r = carry
-        return r, jnp.int16(0), jnp.int16(0)
-
-    # Honour both vault and no-rect short-circuits in one switch.
-    # vault branch only runs when has_rect (vendor reaches dx/dy assign
-    # only after the !r1 check); when !has_rect the whole function
-    # would have returned FALSE in vendor.
-    rng, dx, dy = lax.cond(
-        has_rect,
-        lambda r: lax.cond(vault, _vault_dxdy, _draw_dxdy, r),
-        _skip_dxdy,
-        rng,
+    # Brax-flatten the nested has_rect / vault dx,dy short-circuits.
+    # _draw_dxdy branch (has_rect & ~vault): consume D2 + D3.
+    wide = (p_hx - p_lx) > jnp.int16(28)
+    d2_mod = jnp.where(wide, jnp.int32(12), jnp.int32(8))
+    rng_draw, d2 = rn2_jax(rng, d2_mod)
+    rng_draw, d3 = rn2_jax(rng_draw, jnp.int32(4))
+    draw_dx = jnp.int16(2) + d2.astype(jnp.int16)
+    draw_dy_raw = jnp.int16(2) + d3.astype(jnp.int16)
+    # dx*dy > 50 cap (sp_lev.c:1190-1191).
+    area = draw_dx.astype(jnp.int32) * draw_dy_raw.astype(jnp.int32)
+    draw_dy = jnp.where(
+        area > jnp.int32(50),
+        (jnp.int32(50) // jnp.maximum(draw_dx.astype(jnp.int32), jnp.int32(1))).astype(jnp.int16),
+        draw_dy_raw,
     )
+
+    # _vault_dxdy branch (has_rect & vault): no RNG, dx=dy=1.
+    rng_vault, vault_dx, vault_dy = rng, jnp.int16(1), jnp.int16(1)
+
+    # _skip_dxdy branch (~has_rect): no RNG, dx=dy=0.
+    rng_skip, skip_dx, skip_dy = rng, jnp.int16(0), jnp.int16(0)
+
+    # Honour both vault and no-rect short-circuits via nested where.
+    inner_rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(vault, t, f), rng_vault, rng_draw
+    )
+    inner_dx = jnp.where(vault, vault_dx, draw_dx)
+    inner_dy = jnp.where(vault, vault_dy, draw_dy)
+
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(has_rect, t, f), inner_rng, rng_skip
+    )
+    dx = jnp.where(has_rect, inner_dx, skip_dx)
+    dy = jnp.where(has_rect, inner_dy, skip_dy)
 
     # ----- Borders -- sp_lev.c:1193-1194 ----------------------------------
     # xborder = (lx > 0 && hx < COLNO - 1) ? 2*xlim : xlim + 1
@@ -545,31 +543,30 @@ def _try_one_attempt(
     #        + rn2(hx - (lx > 0 ? lx : 3) - dx - xborder + 1);
     # yabs = ly + (ly > 0 ? ylim : 2)
     #        + rn2(hy - (ly > 0 ? ly : 2) - dy - yborder + 1);
-    def _draw_xyabs(carry):
-        r = carry
-        lx_branch = jnp.where(p_lx > jnp.int16(0), p_lx, jnp.int16(3))
-        ly_branch = jnp.where(p_ly > jnp.int16(0), p_ly, jnp.int16(2))
-        x_off = jnp.where(p_lx > jnp.int16(0), xlim, jnp.int16(3))
-        y_off = jnp.where(p_ly > jnp.int16(0), ylim, jnp.int16(2))
+    # Brax-flatten the can_place gate around D4/D5.  Both branches compute
+    # unconditionally; result is selected via ``jnp.where`` on can_place.
+    lx_branch = jnp.where(p_lx > jnp.int16(0), p_lx, jnp.int16(3))
+    ly_branch = jnp.where(p_ly > jnp.int16(0), p_ly, jnp.int16(2))
+    x_off = jnp.where(p_lx > jnp.int16(0), xlim, jnp.int16(3))
+    y_off = jnp.where(p_ly > jnp.int16(0), ylim, jnp.int16(2))
 
-        # Modulus must be >=1 even on the untaken branch to keep
-        # rn2_jax (uint64 modulo) well-defined under JIT.
-        x_mod_raw = (p_hx - lx_branch - dx - xborder + jnp.int16(1)).astype(jnp.int32)
-        y_mod_raw = (p_hy - ly_branch - dy - yborder + jnp.int16(1)).astype(jnp.int32)
-        x_mod = jnp.maximum(x_mod_raw, jnp.int32(1))
-        y_mod = jnp.maximum(y_mod_raw, jnp.int32(1))
+    # Modulus must be >=1 even on the untaken branch to keep
+    # rn2_jax (uint64 modulo) well-defined under JIT.
+    x_mod_raw = (p_hx - lx_branch - dx - xborder + jnp.int16(1)).astype(jnp.int32)
+    y_mod_raw = (p_hy - ly_branch - dy - yborder + jnp.int16(1)).astype(jnp.int32)
+    x_mod = jnp.maximum(x_mod_raw, jnp.int32(1))
+    y_mod = jnp.maximum(y_mod_raw, jnp.int32(1))
 
-        r, d4 = rn2_jax(r, x_mod)
-        r, d5 = rn2_jax(r, y_mod)
-        xa = p_lx + x_off + d4.astype(jnp.int16)
-        ya = p_ly + y_off + d5.astype(jnp.int16)
-        return r, xa, ya
+    rng_xy, d4 = rn2_jax(rng, x_mod)
+    rng_xy, d5 = rn2_jax(rng_xy, y_mod)
+    xa_draw = p_lx + x_off + d4.astype(jnp.int16)
+    ya_draw = p_ly + y_off + d5.astype(jnp.int16)
 
-    def _skip_xyabs(carry):
-        r = carry
-        return r, jnp.int16(0), jnp.int16(0)
-
-    rng, xabs, yabs = lax.cond(can_place, _draw_xyabs, _skip_xyabs, rng)
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(can_place, t, f), rng_xy, rng
+    )
+    xabs = jnp.where(can_place, xa_draw, jnp.int16(0))
+    yabs = jnp.where(can_place, ya_draw, jnp.int16(0))
 
     # ----- D6, D7: centre-yabs special case -- sp_lev.c:1203-1208 --------
     # Vendor::
@@ -608,35 +605,25 @@ def _try_one_attempt(
 
     # D6 fires iff gate_ab AND nroom > 0 -- E is evaluated AFTER the
     # rn2(nroom) draw in vendor's left-to-right ``&&`` chain.
-    # sp_lev.c:1203.
-    def _draw_d6(carry):
-        r = carry
-        r, v = rn2_jax(r, jnp.maximum(nroom, jnp.int32(1)))
-        return r, v
-
-    def _skip_d6(carry):
-        r = carry
-        return r, jnp.int32(0)
-
-    rng, d6_val = lax.cond(
-        gate_ab & nroom_pos, _draw_d6, _skip_d6, rng
+    # sp_lev.c:1203.  Brax-flatten: compute both branches + jnp.where.
+    d6_gate = gate_ab & nroom_pos
+    rng_d6, d6_draw = rn2_jax(rng, jnp.maximum(nroom, jnp.int32(1)))
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(d6_gate, t, f), rng_d6, rng
     )
+    d6_val = jnp.where(d6_gate, d6_draw, jnp.int32(0))
 
     # The full predicate that triggers D7 (rn1(3, 2)) is::
     #     gate_ab AND ((nroom == 0) OR (d6_val == 0)) AND gate_e
     d7_pred = gate_ab & ((~nroom_pos) | (d6_val == jnp.int32(0))) & gate_e
 
     # D7: rn1(3, 2) -- sp_lev.c:1205.  Fires only when d7_pred is True.
-    def _draw_d7(carry):
-        r = carry
-        r, v = rn1_jax(r, jnp.int32(3), jnp.int32(2))
-        return r, v
-
-    def _skip_d7(carry):
-        r = carry
-        return r, jnp.int32(0)
-
-    rng, d7_val = lax.cond(d7_pred, _draw_d7, _skip_d7, rng)
+    # Brax-flatten: compute both branches + jnp.where.
+    rng_d7, d7_draw = rn1_jax(rng, jnp.int32(3), jnp.int32(2))
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(d7_pred, t, f), rng_d7, rng
+    )
+    d7_val = jnp.where(d7_pred, d7_draw, jnp.int32(0))
 
     # Apply the centre-yabs override + dy-decrement (sp_lev.c:1205-1207).
     # ``if (nroom < 4 && dy > 1) dy--;`` -- no RNG.
@@ -783,18 +770,14 @@ def create_room_random(
     # vs vendor on seed=1 (first divergence: draw 425).  Citation:
     # vendor/nle/src/mklev.c:38, vendor/nle/src/sp_lev.c:1153.
     # ------------------------------------------------------------------
-    def _draw_rlit_fn(args):
-        r, d = args
-        return _draw_rlit(r, d)
-
-    def _skip_rlit_fn(args):
-        r, _d = args
-        # Vault path: rlit is hard-wired TRUE (lit) per create_vault macro.
-        return r, jnp.bool_(True)
-
-    rng, rlit = lax.cond(
-        vault, _skip_rlit_fn, _draw_rlit_fn, (rng, depth),
+    # Brax-flatten: compute both branches and select via ``jnp.where``.
+    # Vault path: rlit is hard-wired TRUE (lit) per create_vault macro.
+    rng_draw_rlit, rlit_draw = _draw_rlit(rng, depth)
+    rng_skip_rlit, rlit_skip = rng, jnp.bool_(True)
+    rng = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(vault, t, f), rng_skip_rlit, rng_draw_rlit
     )
+    rlit = jnp.where(vault, rlit_skip, rlit_draw)
 
     # ------------------------------------------------------------------
     # do-while (trycnt <= 100) loop (sp_lev.c:1161-1277).
@@ -807,47 +790,43 @@ def create_room_random(
     def _body(_i, carry):
         rng_c, pool_c, done, x_c, y_c, w_c, h_c = carry
 
-        def _do_attempt(state):
-            r, p = state
-            res = _try_one_attempt(r, p, level_grid, nroom, vault)
-            return res
-
-        def _skip_attempt(state):
-            r, p = state
-            # No RNG draw, no pool mutation -- vendor has already broken
-            # out of the do-while.  Return a zero-success sentinel.
-            return AttemptResult(
-                rng=r,
-                pool=p,
-                success=jnp.bool_(False),
-                xabs=jnp.int16(0), yabs=jnp.int16(0),
-                wtmp=jnp.int16(0), htmp=jnp.int16(0),
-                r2_lx=jnp.int16(0), r2_ly=jnp.int16(0),
-                r2_hx=jnp.int16(0), r2_hy=jnp.int16(0),
-                parent_lx=jnp.int16(0), parent_ly=jnp.int16(0),
-                parent_hx=jnp.int16(0), parent_hy=jnp.int16(0),
-            )
-
-        res = lax.cond(done, _skip_attempt, _do_attempt, (rng_c, pool_c))
+        # Brax-flatten: always run an attempt; select between the attempt
+        # result and a zero-success sentinel via ``jnp.where`` on done.
+        # Under vmap both branches already executed, so this is byte-
+        # identical to the prior ``lax.cond``.
+        do_res = _try_one_attempt(rng_c, pool_c, level_grid, nroom, vault)
+        skip_res = AttemptResult(
+            rng=rng_c,
+            pool=pool_c,
+            success=jnp.bool_(False),
+            xabs=jnp.int16(0), yabs=jnp.int16(0),
+            wtmp=jnp.int16(0), htmp=jnp.int16(0),
+            r2_lx=jnp.int16(0), r2_ly=jnp.int16(0),
+            r2_hx=jnp.int16(0), r2_hy=jnp.int16(0),
+            parent_lx=jnp.int16(0), parent_ly=jnp.int16(0),
+            parent_hx=jnp.int16(0), parent_hy=jnp.int16(0),
+        )
+        res = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(done, t, f), skip_res, do_res
+        )
 
         # If this attempt succeeded (and we hadn't already finished),
         # commit the split_rects call (sp_lev.c:1281) and latch the
         # room coords.
         just_won = res.success & (~done)
 
-        def _commit_split(p):
-            return split_rects(
-                p,
-                res.parent_lx, res.parent_ly,
-                res.parent_hx, res.parent_hy,
-                res.r2_lx, res.r2_ly,
-                res.r2_hx, res.r2_hy,
-            )
-
-        def _skip_split(p):
-            return p
-
-        pool_n = lax.cond(just_won, _commit_split, _skip_split, res.pool)
+        # Brax-flatten the split_rects gate: compute the split result and
+        # the unchanged pool, then select via jnp.where on just_won.
+        split_pool = split_rects(
+            res.pool,
+            res.parent_lx, res.parent_ly,
+            res.parent_hx, res.parent_hy,
+            res.r2_lx, res.r2_ly,
+            res.r2_hx, res.r2_hy,
+        )
+        pool_n = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(just_won, t, f), split_pool, res.pool
+        )
 
         # Latch outputs on the winning attempt; otherwise carry the
         # prior values forward.
