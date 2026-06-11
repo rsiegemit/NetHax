@@ -418,11 +418,30 @@ def generate_rooms(
             new_y2   = jnp.where(accept, ny2, y2_arr_.at[i].get())
             new_x2   = jnp.where(accept, nx2, x2_arr_.at[i].get())
 
-            y1_arr_new = lax.cond(accept, lambda: y1_arr_.at[i].set(new_y1), lambda: y1_arr_)
-            x1_arr_new = lax.cond(accept, lambda: x1_arr_.at[i].set(new_x1), lambda: x1_arr_)
-            y2_arr_new = lax.cond(accept, lambda: y2_arr_.at[i].set(new_y2), lambda: y2_arr_)
-            x2_arr_new = lax.cond(accept, lambda: x2_arr_.at[i].set(new_x2), lambda: x2_arr_)
-            active_new = lax.cond(accept, lambda: active_.at[i].set(True), lambda: active_)
+            # Brax-flattened: compute both branches and select via
+            # jax.tree_util.tree_map(jnp.where) so HLO stays straight-line
+            # rather than producing a per-slot branch table.  Semantics are
+            # identical to lax.cond(accept, set, identity).
+            y1_arr_t = y1_arr_.at[i].set(new_y1)
+            y1_arr_new = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(accept, t, f), y1_arr_t, y1_arr_
+            )
+            x1_arr_t = x1_arr_.at[i].set(new_x1)
+            x1_arr_new = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(accept, t, f), x1_arr_t, x1_arr_
+            )
+            y2_arr_t = y2_arr_.at[i].set(new_y2)
+            y2_arr_new = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(accept, t, f), y2_arr_t, y2_arr_
+            )
+            x2_arr_t = x2_arr_.at[i].set(new_x2)
+            x2_arr_new = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(accept, t, f), x2_arr_t, x2_arr_
+            )
+            active_t = active_.at[i].set(True)
+            active_new = jax.tree_util.tree_map(
+                lambda t, f: jnp.where(accept, t, f), active_t, active_
+            )
             placed_new = placed | accept
 
             return (placed_new, y1_arr_new, x1_arr_new, y2_arr_new, x2_arr_new, active_new), None
@@ -546,35 +565,28 @@ def _invoke_create_room(
     success = res.success
     write_idx = jnp.minimum(nroom, jnp.int32(MAX_ROOMS_PER_LEVEL - 1))
 
-    rooms_lx = lax.cond(
-        success,
-        lambda a: a.at[write_idx].set(res.xabs.astype(jnp.int16)),
-        lambda a: a,
-        rooms_lx,
+    # Brax-flattened: compute both branches and select via jnp.where so HLO
+    # contains a single straight-line write per array rather than a branched
+    # subgraph.  Behaviour identical to lax.cond(success, write, identity).
+    rooms_lx_t = rooms_lx.at[write_idx].set(res.xabs.astype(jnp.int16))
+    rooms_lx = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(success, t, f), rooms_lx_t, rooms_lx
     )
-    rooms_ly = lax.cond(
-        success,
-        lambda a: a.at[write_idx].set(res.yabs.astype(jnp.int16)),
-        lambda a: a,
-        rooms_ly,
+    rooms_ly_t = rooms_ly.at[write_idx].set(res.yabs.astype(jnp.int16))
+    rooms_ly = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(success, t, f), rooms_ly_t, rooms_ly
     )
-    rooms_hx = lax.cond(
-        success,
-        lambda a: a.at[write_idx].set(hx_written),
-        lambda a: a,
-        rooms_hx,
+    rooms_hx_t = rooms_hx.at[write_idx].set(hx_written)
+    rooms_hx = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(success, t, f), rooms_hx_t, rooms_hx
     )
-    rooms_hy = lax.cond(
-        success,
-        lambda a: a.at[write_idx].set(hy),
-        lambda a: a,
-        rooms_hy,
+    rooms_hy_t = rooms_hy.at[write_idx].set(hy)
+    rooms_hy = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(success, t, f), rooms_hy_t, rooms_hy
     )
-    rooms_lit = lax.cond(
-        success,
-        lambda a: a.at[write_idx].set(res.rlit.astype(jnp.int8)),
-        lambda a: a,
-        rooms_lit,
+    rooms_lit_t = rooms_lit.at[write_idx].set(res.rlit.astype(jnp.int8))
+    rooms_lit = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(success, t, f), rooms_lit_t, rooms_lit
     )
     # Vendor only increments nroom on the OROOM branch (sp_lev.c:1284
     # ``add_room`` -> ``smeq[nroom] = nroom; ++nroom``); the VAULT branch
