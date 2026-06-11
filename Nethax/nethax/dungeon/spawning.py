@@ -45,6 +45,22 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import jax.tree_util as _jtu
+
+
+def _brax_select(pred, drawn, original):
+    """Brax-style cond flatten: select drawn vs original pytree by ``pred``.
+
+    Replaces ``lax.cond(pred, _draw_fn, lambda v: v, original)`` where
+    ``drawn = _draw_fn(original)`` was always computed.  When ``pred`` is
+    True, the drawn pytree is selected; otherwise the original.  Used to
+    flatten the vendor-monster-generation cond cascade so XLA emits a
+    single straight-line HLO sequence instead of branching control flow
+    under vmap.  Byte parity preserved because both branches advance the
+    ISAAC64 stream identically when the predicate is True, and the
+    original ``vrng`` is returned untouched when False.
+    """
+    return _jtu.tree_map(lambda d, o: jnp.where(pred, d, o), drawn, original)
 
 from Nethax.nethax.constants.monsters import (
     MONSTERS,
@@ -1581,35 +1597,29 @@ def _roll_hp(rng: jax.Array, level: jnp.ndarray, vendor_rng=None,
 
         def _run_normal(vrng):
             # m_lev==0 → single traced rnd(4); m_lev>0 → m_lev untraced d8.
-            def _lev0(v):
-                v, zero_roll = rnd_jax(v, 4)            # rnd(4): makemon.c:1038
-                return v, zero_roll
-            def _levN(v):
-                v, total_n = _roll_dn(v, level_i32, jnp.int32(8))
-                return v, total_n
-            v3, hp_n = jax.lax.cond(
-                level_i32 == jnp.int32(0), _lev0, _levN, vrng,
-            )
+            # Brax-flatten: compute both, select on level_i32 == 0.
+            v_lev0, zero_roll = rnd_jax(vrng, 4)
+            v_levN, total_n = _roll_dn(vrng, level_i32, jnp.int32(8))
+            is_lev0 = level_i32 == jnp.int32(0)
+            v3 = _brax_select(is_lev0, v_lev0, v_levN)
+            hp_n = jnp.where(is_lev0, zero_roll, total_n)
             return v3, jnp.maximum(hp_n, jnp.int32(1))
 
         # Dispatch: golem → no draws; rider → rider scan; dragon → dragon
-        # scan; else → normal scan.  jax.lax.cond is JIT-safe.
-        vrng_final, rolled_hp = jax.lax.cond(
-            is_golem_flag,
-            lambda v: (v, golem_fixed_hp),
-            lambda v: jax.lax.cond(
-                is_rider_flag,
-                _run_rider,
-                lambda v2: jax.lax.cond(
-                    is_adragon_flag,
-                    _run_dragon,
-                    _run_normal,
-                    v2,
-                ),
-                v,
-            ),
-            vendor_rng,
-        )
+        # scan; else → normal scan.  Brax-flatten: compute all four
+        # candidate (vrng, hp) results and select by predicate.
+        _vr_golem = vendor_rng
+        _hp_golem = golem_fixed_hp
+        _vr_rider, _hp_rider = _run_rider(vendor_rng)
+        _vr_dragon, _hp_dragon = _run_dragon(vendor_rng)
+        _vr_normal, _hp_normal = _run_normal(vendor_rng)
+        # Selection priority: golem > rider > dragon > normal.
+        vrng_after_dragon = _brax_select(is_adragon_flag, _vr_dragon, _vr_normal)
+        hp_after_dragon = jnp.where(is_adragon_flag, _hp_dragon, _hp_normal)
+        vrng_after_rider = _brax_select(is_rider_flag, _vr_rider, vrng_after_dragon)
+        hp_after_rider = jnp.where(is_rider_flag, _hp_rider, hp_after_dragon)
+        vrng_final = _brax_select(is_golem_flag, _vr_golem, vrng_after_rider)
+        rolled_hp = jnp.where(is_golem_flag, _hp_golem, hp_after_rider)
         return vrng_final, rolled_hp
 
     # ---- Threefry path (no vendor_rng) ----
@@ -1840,11 +1850,10 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
     # spawning so we approximate with the flag2 gate.  Previously gated
     # on M2_NEUTER which suppressed draws for neuters (vendor still
     # draws for neuters — flag means "ignored", not "skipped").
-    def _draw_female(v):
-        new_v, _ = randint_jax(v, (), 0, 2)
-        return new_v
-
-    vrng = jax.lax.cond(has_fixed_gen, lambda v: v, _draw_female, vrng)
+    # Brax flatten: always draw female; select based on inverted predicate
+    # (skip when has_fixed_gen).
+    _drawn_female, _ = randint_jax(vrng, (), 0, 2)
+    vrng = _brax_select(~has_fixed_gen, _drawn_female, vrng)
 
     # --- 2. peace_minded co-aligned tail — vendor makemon.c:2039-2041 ---
     #   return (boolean) (!!rn2(16 + ...) && !!rn2(2 + abs(mal)));
@@ -1852,38 +1861,28 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
     # non-zero.  The first returns 0 with probability 1/(16+record).
     peace_fires = peace_needs & co_aligned
 
-    def _do_peace(v):
-        v1, r1 = randint_jax(v, (), 0, rn2_arg_a)
-
-        def _draw_peace_second(vv):
-            new_v, _ = randint_jax(vv, (), 0, rn2_arg_b)
-            return new_v
-
-        return jax.lax.cond(
-            r1 != jnp.int32(0), _draw_peace_second, lambda vv: vv, v1
-        )
-
-    vrng = jax.lax.cond(peace_fires, _do_peace, lambda v: v, vrng)
+    # Brax flatten: always compute peace_minded both draws and select.
+    _vrng_peace1, _peace_r1 = randint_jax(vrng, (), 0, rn2_arg_a)
+    _vrng_peace2, _ = randint_jax(_vrng_peace1, (), 0, rn2_arg_b)
+    # Inner short-circuit: second draw only when r1 != 0.
+    _vrng_peace_done = _brax_select(
+        _peace_r1 != jnp.int32(0), _vrng_peace2, _vrng_peace1,
+    )
+    vrng = _brax_select(peace_fires, _vrng_peace_done, vrng)
 
     # --- 3. in_mklev sleep gate — vendor makemon.c:1319-1322 ---
     #   if ((is_ndemon(ptr) || PM_WUMPUS || PM_LONG_WORM || PM_GIANT_EEL)
     #        && !u.uhave.amulet && rn2(5))
     # u.uhave.amulet is False during initial spawn; the rn2(5) is the
     # final operand and is evaluated for every species in the predicate.
-    def _draw_sleep(v):
-        new_v, _ = randint_jax(v, (), 0, 5)
-        return new_v
-
     sleep_fires = jnp.bool_(in_mklev) & is_dwe
-    vrng = jax.lax.cond(sleep_fires, _draw_sleep, lambda v: v, vrng)
+    _drawn_sleep, _ = randint_jax(vrng, (), 0, 5)
+    vrng = _brax_select(sleep_fires, _drawn_sleep, vrng)
 
     # --- 4. long-worm initworm — vendor makemon.c:1345 ---
     #   initworm(mtmp, rn2(5));
-    def _draw_lworm(v):
-        new_v, _ = randint_jax(v, (), 0, 5)
-        return new_v
-
-    vrng = jax.lax.cond(is_lworm, _draw_lworm, lambda v: v, vrng)
+    _drawn_lworm, _ = randint_jax(vrng, (), 0, 5)
+    vrng = _brax_select(is_lworm, _drawn_lworm, vrng)
 
     # --- 5. group rolls — vendor makemon.c:1369-1378 ---
     #   if (anymon && !(mmflags & MM_NOGRP)) {
@@ -1897,18 +1896,12 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
     # Cite: vendor/nle/src/makemon.c:1369-1378; mklev.c:816 (MM_NOGRP).
     grp_allowed = not bool(mm_nogrp)
 
-    def _draw_sgrp(v):
-        new_v, _ = randint_jax(v, (), 0, 2)
-        return new_v
-
-    def _draw_lgrp(v):
-        new_v, _ = randint_jax(v, (), 0, 3)
-        return new_v
-
     if grp_allowed:
-        vrng = jax.lax.cond(is_sgrp, _draw_sgrp, lambda v: v, vrng)
+        _drawn_sgrp, _ = randint_jax(vrng, (), 0, 2)
+        vrng = _brax_select(is_sgrp, _drawn_sgrp, vrng)
         # LGROUP branch only fires when SGROUP is absent (vendor "else if").
-        vrng = jax.lax.cond(is_lgrp & ~is_sgrp, _draw_lgrp, lambda v: v, vrng)
+        _drawn_lgrp, _ = randint_jax(vrng, (), 0, 3)
+        vrng = _brax_select(is_lgrp & ~is_sgrp, _drawn_lgrp, vrng)
 
     # --- 6/6b/7. initweap + initinv — gated by allow_minvent ---------------
     #
@@ -1979,28 +1972,18 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             #       vendor/nle/src/makemon.c:148-160 (m_initthrow rn1).
             def _draw_kobold_initweap(vc):
                 vc, gate = randint_jax(vc, (), 0, 4)
+                # m_initthrow(DART, 12) — vendor makemon.c:148-160:
+                #   1. mksobj(DART, TRUE, FALSE) — DART (otyp 7) is
+                #      multigen+poisonable so cascade draws rn1(6,6) +
+                #      rn2(100) = 2 ISAAC64 words.  artif=FALSE skips
+                #      the rn2(20) artifact roll.
+                #   2. otmp->quan = rn1(12, 3) — 1 ISAAC64 word.
+                _vc_thrown = _weapon_draws(vc, jnp.int32(7), jnp.bool_(False))
+                _vc_thrown, _ = randint_jax(_vc_thrown, (), 3, 15)
+                return _brax_select(gate == jnp.int32(0), _vc_thrown, vc)
 
-                def _draw_initthrow(vd):
-                    # m_initthrow(DART, 12) — vendor makemon.c:148-160:
-                    #   1. mksobj(DART, TRUE, FALSE) — DART (otyp 7) is
-                    #      multigen+poisonable so cascade draws rn1(6,6) +
-                    #      rn2(100) = 2 ISAAC64 words.  artif=FALSE skips
-                    #      the rn2(20) artifact roll.
-                    #   2. otmp->quan = rn1(12, 3) — 1 ISAAC64 word.
-                    vd = _weapon_draws(vd, jnp.int32(7), jnp.bool_(False))
-                    nv, _ = randint_jax(vd, (), 3, 15)
-                    return nv
-
-                return jax.lax.cond(
-                    gate == jnp.int32(0),
-                    _draw_initthrow,
-                    lambda vd: vd,
-                    vc,
-                )
-
-            v_after = jax.lax.cond(
-                _MLET_KOBOLD[tid], _draw_kobold_initweap, lambda vc: vc, v_after
-            )
+            _vc_kobold = _draw_kobold_initweap(v_after)
+            v_after = _brax_select(_MLET_KOBOLD[tid], _vc_kobold, v_after)
 
             # S_CENTAUR: explicit gate + m_initthrow draw — vendor makemon.c:461-471
             #   case S_CENTAUR:
@@ -2027,30 +2010,20 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             #       vendor/nle/src/makemon.c:148-160 (m_initthrow rn1).
             def _draw_centaur_initweap(vc):
                 vc, gate = randint_jax(vc, (), 0, 2)
+                # m_initthrow(ARROW/CROSSBOW_BOLT, 12) — vendor
+                # makemon.c:148-160:
+                #   1. mksobj(ARROW/CROSSBOW_BOLT, TRUE, FALSE) — both
+                #      multigen+poisonable so cascade draws rn1(6,6) +
+                #      rn2(100) = 2 ISAAC64 words.  ARROW=1 and
+                #      CROSSBOW_BOLT=6 both fall in vendor is_multigen
+                #      range [-P_SHURIKEN, -P_BOW]; bytes are identical.
+                #   2. otmp->quan = rn1(12, 3) — 1 ISAAC64 word.
+                _vc_thrown = _weapon_draws(vc, jnp.int32(1), jnp.bool_(False))
+                _vc_thrown, _ = randint_jax(_vc_thrown, (), 3, 15)
+                return _brax_select(gate != jnp.int32(0), _vc_thrown, vc)
 
-                def _draw_initthrow(vd):
-                    # m_initthrow(ARROW/CROSSBOW_BOLT, 12) — vendor
-                    # makemon.c:148-160:
-                    #   1. mksobj(ARROW/CROSSBOW_BOLT, TRUE, FALSE) — both
-                    #      multigen+poisonable so cascade draws rn1(6,6) +
-                    #      rn2(100) = 2 ISAAC64 words.  ARROW=1 and
-                    #      CROSSBOW_BOLT=6 both fall in vendor is_multigen
-                    #      range [-P_SHURIKEN, -P_BOW]; bytes are identical.
-                    #   2. otmp->quan = rn1(12, 3) — 1 ISAAC64 word.
-                    vd = _weapon_draws(vd, jnp.int32(1), jnp.bool_(False))
-                    nv, _ = randint_jax(vd, (), 3, 15)
-                    return nv
-
-                return jax.lax.cond(
-                    gate != jnp.int32(0),
-                    _draw_initthrow,
-                    lambda vd: vd,
-                    vc,
-                )
-
-            v_after = jax.lax.cond(
-                _MLET_CENTAUR[tid], _draw_centaur_initweap, lambda vc: vc, v_after
-            )
+            _vc_centaur = _draw_centaur_initweap(v_after)
+            v_after = _brax_select(_MLET_CENTAUR[tid], _vc_centaur, v_after)
 
             # S_KOP: explicit two-gate cascade — vendor makemon.c:389-396
             #   case S_KOP:
@@ -2072,43 +2045,24 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             def _draw_kop_initweap(vc):
                 # Gate 1: rn2(4)
                 vc, gate1 = randint_jax(vc, (), 0, 4)
-
-                def _draw_creampie(vd):
-                    # m_initthrow(CREAM_PIE, 2) — vendor makemon.c:148-160:
-                    #   1. mksobj(CREAM_PIE, TRUE, FALSE) — CREAM_PIE (otyp
-                    #      262) is FOOD_CLASS; `_food_draws` draws rn2(6)
-                    #      for non-CORPSE/MEAT_RING/KELP_FROND/pudding food
-                    #      (1 byte).
-                    #   2. otmp->quan = rn1(2, 3) — 1 ISAAC64 word.
-                    vd = _food_draws(vd, jnp.int32(262))
-                    nv, _ = randint_jax(vd, (), 3, 5)
-                    return nv
-
-                vc = jax.lax.cond(
-                    gate1 == jnp.int32(0),
-                    _draw_creampie,
-                    lambda vd: vd,
-                    vc,
-                )
+                # m_initthrow(CREAM_PIE, 2) — vendor makemon.c:148-160:
+                #   1. mksobj(CREAM_PIE, TRUE, FALSE) — CREAM_PIE (otyp
+                #      262) is FOOD_CLASS; `_food_draws` draws rn2(6)
+                #      for non-CORPSE/MEAT_RING/KELP_FROND/pudding food
+                #      (1 byte).
+                #   2. otmp->quan = rn1(2, 3) — 1 ISAAC64 word.
+                _vc_pie = _food_draws(vc, jnp.int32(262))
+                _vc_pie, _ = randint_jax(_vc_pie, (), 3, 5)
+                vc = _brax_select(gate1 == jnp.int32(0), _vc_pie, vc)
 
                 # Gate 2: rn2(3)
                 vc, gate2 = randint_jax(vc, (), 0, 3)
+                # rn2(2) — CLUB vs RUBBER_HOSE pick.
+                _vc_pick, _ = randint_jax(vc, (), 0, 2)
+                return _brax_select(gate2 == jnp.int32(0), _vc_pick, vc)
 
-                def _draw_weapon_pick(vd):
-                    # rn2(2) — CLUB vs RUBBER_HOSE pick.
-                    nv, _ = randint_jax(vd, (), 0, 2)
-                    return nv
-
-                return jax.lax.cond(
-                    gate2 == jnp.int32(0),
-                    _draw_weapon_pick,
-                    lambda vd: vd,
-                    vc,
-                )
-
-            v_after = jax.lax.cond(
-                _MLET_KOP[tid], _draw_kop_initweap, lambda vc: vc, v_after
-            )
+            _vc_kop = _draw_kop_initweap(v_after)
+            v_after = _brax_select(_MLET_KOP[tid], _vc_kop, v_after)
 
             # S_ZOMBIE: three independent gates each launching a
             # mongets()/mksobj_init cascade — vendor makemon.c:477-481.
@@ -2141,33 +2095,20 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             def _draw_zombie_initweap(vc):
                 # Gate 1: rn2(4) — RING_MAIL armor.
                 vc, gate1 = randint_jax(vc, (), 0, 4)
-                vc = jax.lax.cond(
-                    gate1 == jnp.int32(0),
-                    lambda vd: _armor_draws(vd, jnp.int32(0), jnp.bool_(False)),
-                    lambda vd: vd,
-                    vc,
-                )
+                _vc_armor = _armor_draws(vc, jnp.int32(0), jnp.bool_(False))
+                vc = _brax_select(gate1 == jnp.int32(0), _vc_armor, vc)
                 # Gate 2: rn2(4) — LONG_SWORD weapon.
                 vc, gate2 = randint_jax(vc, (), 0, 4)
-                vc = jax.lax.cond(
-                    gate2 == jnp.int32(0),
-                    lambda vd: _weapon_draws(vd, jnp.int32(0), jnp.bool_(False)),
-                    lambda vd: vd,
-                    vc,
-                )
+                _vc_wpn2 = _weapon_draws(vc, jnp.int32(0), jnp.bool_(False))
+                vc = _brax_select(gate2 == jnp.int32(0), _vc_wpn2, vc)
                 # Gate 3: rn2(3) — mlet_zombie_weap[mlev] weapon.
                 vc, gate3 = randint_jax(vc, (), 0, 3)
-                vc = jax.lax.cond(
-                    gate3 == jnp.int32(0),
-                    lambda vd: _weapon_draws(vd, jnp.int32(0), jnp.bool_(False)),
-                    lambda vd: vd,
-                    vc,
-                )
+                _vc_wpn3 = _weapon_draws(vc, jnp.int32(0), jnp.bool_(False))
+                vc = _brax_select(gate3 == jnp.int32(0), _vc_wpn3, vc)
                 return vc
 
-            v_after = jax.lax.cond(
-                _MLET_ZOMBIE[tid], _draw_zombie_initweap, lambda vc: vc, v_after
-            )
+            _vc_zombie = _draw_zombie_initweap(v_after)
+            v_after = _brax_select(_MLET_ZOMBIE[tid], _vc_zombie, v_after)
 
             # S_TROLL: gate rn2(2) gates an inner rn2(4) gem-type pick which
             # picks one of RUBY/DIAMOND/SAPPHIRE/BLACK_OPAL.  Vendor
@@ -2197,28 +2138,18 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             def _draw_troll_initweap(vc):
                 # Outer gate: rn2(2)
                 vc, gate = randint_jax(vc, (), 0, 2)
+                # Inner rn2(4) picks the gem type (RUBY/DIAMOND/
+                # SAPPHIRE/BLACK_OPAL).  All four take the same
+                # GEM_CLASS draw path so the picked otyp doesn't
+                # affect byte cost.
+                _vc_gem, _r4 = randint_jax(vc, (), 0, 4)
+                # GEM_CLASS mksobj_init — rn2(6) one draw for non-
+                # LUCKSTONE/LOADSTONE gems.
+                _vc_gem = _gem_draws(_vc_gem, jnp.int32(0))
+                return _brax_select(gate == jnp.int32(0), _vc_gem, vc)
 
-                def _draw_gem_pick(vd):
-                    # Inner rn2(4) picks the gem type (RUBY/DIAMOND/
-                    # SAPPHIRE/BLACK_OPAL).  All four take the same
-                    # GEM_CLASS draw path so the picked otyp doesn't
-                    # affect byte cost.
-                    vd, _r4 = randint_jax(vd, (), 0, 4)
-                    # GEM_CLASS mksobj_init — rn2(6) one draw for non-
-                    # LUCKSTONE/LOADSTONE gems.
-                    vd = _gem_draws(vd, jnp.int32(0))
-                    return vd
-
-                return jax.lax.cond(
-                    gate == jnp.int32(0),
-                    _draw_gem_pick,
-                    lambda vd: vd,
-                    vc,
-                )
-
-            v_after = jax.lax.cond(
-                _MLET_TROLL[tid], _draw_troll_initweap, lambda vc: vc, v_after
-            )
+            _vc_troll = _draw_troll_initweap(v_after)
+            v_after = _brax_select(_MLET_TROLL[tid], _vc_troll, v_after)
 
             # S_OGRE: per-subtype rn2(N) gate that conditionally launches a
             # mongets(WAR_HAMMER) mksobj_init cascade.  Vendor makemon.c:
@@ -2242,16 +2173,11 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             def _draw_ogre_initweap(vc):
                 divisor = _OGRE_GATE_DIVISOR[tid]
                 vc, gate = randint_jax(vc, (), 0, divisor)
-                return jax.lax.cond(
-                    gate == jnp.int32(0),
-                    lambda vd: _weapon_draws(vd, jnp.int32(0), jnp.bool_(False)),
-                    lambda vd: vd,
-                    vc,
-                )
+                _vc_wpn = _weapon_draws(vc, jnp.int32(0), jnp.bool_(False))
+                return _brax_select(gate == jnp.int32(0), _vc_wpn, vc)
 
-            v_after = jax.lax.cond(
-                _MLET_OGRE[tid], _draw_ogre_initweap, lambda vc: vc, v_after
-            )
+            _vc_ogre = _draw_ogre_initweap(v_after)
+            v_after = _brax_select(_MLET_OGRE[tid], _vc_ogre, v_after)
 
             # S_ORC: rn2(2) ORCISH_HELM gate + per-PM subtype branches.
             # Vendor makemon.c:397-432:
@@ -2315,12 +2241,8 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
                 # rn2(2) ORCISH_HELM gate.  Vendor uses `if (rn2(2))` (NO `!`)
                 # — gate fires when result is NON-zero (probability 1/2).
                 vc, helm_gate = randint_jax(vc, (), 0, 2)
-                vc = jax.lax.cond(
-                    helm_gate != jnp.int32(0),
-                    lambda vd: _armor_draws(vd, jnp.int32(0), jnp.bool_(False)),
-                    lambda vd: vd,
-                    vc,
-                )
+                _vc_helm = _armor_draws(vc, jnp.int32(0), jnp.bool_(False))
+                vc = _brax_select(helm_gate != jnp.int32(0), _vc_helm, vc)
 
                 # Subtype branches (mutually exclusive).
                 is_mordor = _IS_PM_MORDOR_ORC[tid]
@@ -2331,69 +2253,36 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
                 def _draw_mordor(vd):
                     # rn2(3) → ORCISH_SHORT_SWORD on 0.
                     vd, g1 = randint_jax(vd, (), 0, 3)
-                    vd = jax.lax.cond(
-                        g1 == jnp.int32(0),
-                        lambda ve: _weapon_draws(
-                            ve, jnp.int32(0), jnp.bool_(False)),
-                        lambda ve: ve,
-                        vd,
-                    )
+                    _vd_ss = _weapon_draws(vd, jnp.int32(0), jnp.bool_(False))
+                    vd = _brax_select(g1 == jnp.int32(0), _vd_ss, vd)
                     # rn2(2) → ORCISH_BOW + m_initthrow(ORCISH_ARROW, 12) on 0.
                     vd, g2 = randint_jax(vd, (), 0, 2)
-
-                    def _draw_bow_and_arrows(ve):
-                        # ORCISH_BOW mksobj_init (non-multigen).
-                        ve = _weapon_draws(ve, jnp.int32(0), jnp.bool_(False))
-                        # m_initthrow body for ORCISH_ARROW:
-                        #   1. mksobj_init for ORCISH_ARROW (multigen+poisonable
-                        #      → otyp=3 to trigger rn1(6,6) + rn2(100)).
-                        #   2. rn1(12, 3) = rn2(12) + 3 — 1 draw for quan.
-                        ve = _weapon_draws(ve, jnp.int32(3), jnp.bool_(False))
-                        ve, _q = randint_jax(ve, (), 3, 15)
-                        return ve
-
-                    vd = jax.lax.cond(
-                        g2 == jnp.int32(0),
-                        _draw_bow_and_arrows,
-                        lambda ve: ve,
-                        vd,
-                    )
+                    # ORCISH_BOW mksobj_init (non-multigen).
+                    _vd_ba = _weapon_draws(vd, jnp.int32(0), jnp.bool_(False))
+                    # m_initthrow body for ORCISH_ARROW:
+                    #   1. mksobj_init for ORCISH_ARROW (multigen+poisonable
+                    #      → otyp=3 to trigger rn1(6,6) + rn2(100)).
+                    #   2. rn1(12, 3) = rn2(12) + 3 — 1 draw for quan.
+                    _vd_ba = _weapon_draws(_vd_ba, jnp.int32(3), jnp.bool_(False))
+                    _vd_ba, _q = randint_jax(_vd_ba, (), 3, 15)
+                    vd = _brax_select(g2 == jnp.int32(0), _vd_ba, vd)
                     return vd
 
                 def _draw_uruk(vd):
                     # rn2(3) → IRON_SKULL_CAP (= ORCISH_HELM, ARMOR) on 0.
                     vd, g1 = randint_jax(vd, (), 0, 3)
-                    vd = jax.lax.cond(
-                        g1 == jnp.int32(0),
-                        lambda ve: _armor_draws(
-                            ve, jnp.int32(0), jnp.bool_(False)),
-                        lambda ve: ve,
-                        vd,
-                    )
+                    _vd_isc = _armor_draws(vd, jnp.int32(0), jnp.bool_(False))
+                    vd = _brax_select(g1 == jnp.int32(0), _vd_isc, vd)
                     # rn2(3) → ORCISH_SHORT_SWORD on 0.
                     vd, g2 = randint_jax(vd, (), 0, 3)
-                    vd = jax.lax.cond(
-                        g2 == jnp.int32(0),
-                        lambda ve: _weapon_draws(
-                            ve, jnp.int32(0), jnp.bool_(False)),
-                        lambda ve: ve,
-                        vd,
-                    )
+                    _vd_ss = _weapon_draws(vd, jnp.int32(0), jnp.bool_(False))
+                    vd = _brax_select(g2 == jnp.int32(0), _vd_ss, vd)
                     # rn2(3) → ORCISH_BOW + m_initthrow(ORCISH_ARROW, 12) on 0.
                     vd, g3 = randint_jax(vd, (), 0, 3)
-
-                    def _draw_bow_and_arrows(ve):
-                        ve = _weapon_draws(ve, jnp.int32(0), jnp.bool_(False))
-                        ve = _weapon_draws(ve, jnp.int32(3), jnp.bool_(False))
-                        ve, _q = randint_jax(ve, (), 3, 15)
-                        return ve
-
-                    vd = jax.lax.cond(
-                        g3 == jnp.int32(0),
-                        _draw_bow_and_arrows,
-                        lambda ve: ve,
-                        vd,
-                    )
+                    _vd_ba = _weapon_draws(vd, jnp.int32(0), jnp.bool_(False))
+                    _vd_ba = _weapon_draws(_vd_ba, jnp.int32(3), jnp.bool_(False))
+                    _vd_ba, _q = randint_jax(_vd_ba, (), 3, 15)
+                    vd = _brax_select(g3 == jnp.int32(0), _vd_ba, vd)
                     return vd
 
                 def _draw_cap_or_sham(vd):
@@ -2405,19 +2294,6 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
                     vd = _weapon_draws(vd, jnp.int32(0), jnp.bool_(False))
                     return vd
 
-                # Mutually-exclusive dispatch — vendor uses `if / else if /
-                # else if`.  Build a single switch index over four cases:
-                #   0 = no subtype branch (goblin / hobgoblin / orc / hill orc)
-                #   1 = PM_MORDOR_ORC
-                #   2 = PM_URUK_HAI
-                #   3 = PM_ORC_CAPTAIN or PM_ORC_SHAMAN
-                idx = jnp.where(
-                    is_mordor, jnp.int32(1),
-                    jnp.where(
-                        is_uruk, jnp.int32(2),
-                        jnp.where(is_cap | is_sham, jnp.int32(3), jnp.int32(0)),
-                    ),
-                )
                 def _draw_default_orc(vd):
                     # Vendor makemon.c:426-430 — default subtype branch
                     # for PM_GOBLIN / PM_HOBGOBLIN / PM_ORC / PM_HILL_ORC
@@ -2428,39 +2304,31 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
                     #               ? ORCISH_DAGGER : SCIMITAR);
                     is_goblin = _IS_PM_GOBLIN[tid]
                     vd, gate = randint_jax(vd, (), 0, 2)
-
-                    def _gate_hit(ve):
-                        def _non_goblin(vf):
-                            vf, _pick = randint_jax(vf, (), 0, 2)
-                            return vf
-                        ve = jax.lax.cond(is_goblin, lambda vf: vf, _non_goblin, ve)
-                        # mongets(picked) — both ORCISH_DAGGER (multigen) and
-                        # SCIMITAR (non-multigen) consume the same _weapon_draws
-                        # cascade with otyp=0 sentinel; the otyp-dependent
-                        # is_multigen rn1(6,6) gate is skipped (otyp=0 → False).
-                        ve = _weapon_draws(ve, jnp.int32(0), jnp.bool_(False))
-                        return ve
-
-                    vd = jax.lax.cond(
-                        gate != jnp.int32(0), _gate_hit, lambda ve: ve, vd,
+                    # Gate-hit body: optionally draw rn2(2) when not goblin,
+                    # then _weapon_draws.
+                    _vd_ng, _pick = randint_jax(vd, (), 0, 2)
+                    _vd_after_pick = _brax_select(is_goblin, vd, _vd_ng)
+                    _vd_hit = _weapon_draws(
+                        _vd_after_pick, jnp.int32(0), jnp.bool_(False),
                     )
+                    vd = _brax_select(gate != jnp.int32(0), _vd_hit, vd)
                     return vd
 
-                vc = jax.lax.switch(
-                    idx,
-                    [
-                        _draw_default_orc,       # 0 — goblin/hobgoblin/orc/hill orc
-                        _draw_mordor,            # 1
-                        _draw_uruk,              # 2
-                        _draw_cap_or_sham,       # 3 (TODO: split shaman→case 0)
-                    ],
-                    vc,
-                )
+                # Mutually-exclusive dispatch — vendor uses `if / else if /
+                # else if`.  Brax-flatten: compute all 4 subtype branches and
+                # select via nested jnp.where over their predicates.  The
+                # branches share input vc so each gets a fresh vrng start.
+                _vc_default = _draw_default_orc(vc)
+                _vc_mordor  = _draw_mordor(vc)
+                _vc_uruk    = _draw_uruk(vc)
+                _vc_cap     = _draw_cap_or_sham(vc)
+                vc = _brax_select(is_mordor, _vc_mordor,
+                      _brax_select(is_uruk, _vc_uruk,
+                        _brax_select(is_cap | is_sham, _vc_cap, _vc_default)))
                 return vc
 
-            v_after = jax.lax.cond(
-                _MLET_ORC[tid], _draw_orc_initweap, lambda vc: vc, v_after
-            )
+            _vc_orc = _draw_orc_initweap(v_after)
+            v_after = _brax_select(_MLET_ORC[tid], _vc_orc, v_after)
 
             # S_LIZARD: PM_SALAMANDER chained-ternary weapon pick —
             # vendor makemon.c:482-486:
@@ -2492,22 +2360,12 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             #       vendor/nle/src/mkobj.c:803-818 (WEAPON_CLASS mksobj_init).
             def _draw_lizard_initweap(vc):
                 vc, r7 = randint_jax(vc, (), 0, 7)
-
-                def _trident_or_stiletto(vd):
-                    vd, _r3 = randint_jax(vd, (), 0, 3)
-                    return vd
-
-                vc = jax.lax.cond(
-                    r7 == jnp.int32(0),
-                    _trident_or_stiletto,
-                    lambda vd: vd,
-                    vc,
-                )
+                _vc_ts, _r3 = randint_jax(vc, (), 0, 3)
+                vc = _brax_select(r7 == jnp.int32(0), _vc_ts, vc)
                 return _weapon_draws(vc, jnp.int32(0), jnp.bool_(False))
 
-            v_after = jax.lax.cond(
-                _IS_PM_SALAMANDER[tid], _draw_lizard_initweap, lambda vc: vc, v_after
-            )
+            _vc_lizard = _draw_lizard_initweap(v_after)
+            v_after = _brax_select(_IS_PM_SALAMANDER[tid], _vc_lizard, v_after)
 
             # S_ANGEL: humanoid-gated cascade — vendor makemon.c:326-348.
             #   case S_ANGEL:
@@ -2550,44 +2408,28 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
 
                 def _humanoid_body(vd):
                     # !rn2(20) || is_lord artiname gate.
-                    def _non_lord_artiname(ve):
-                        ve, r20 = randint_jax(ve, (), 0, 20)
-
-                        def _draw_artname(vf):
-                            vf, _ = randint_jax(vf, (), 0, 2)
-                            return vf
-
-                        return jax.lax.cond(
-                            r20 == jnp.int32(0),
-                            _draw_artname,
-                            lambda vf: vf,
-                            ve,
-                        )
-
-                    def _lord_artiname(ve):
-                        # rn2(20) short-circuited; rn2(2) ALWAYS drawn (LHS of || true).
-                        ve, _ = randint_jax(ve, (), 0, 2)
-                        return ve
-
-                    vd = jax.lax.cond(is_lord, _lord_artiname, _non_lord_artiname, vd)
+                    # Non-lord variant: rn2(20), then maybe rn2(2).
+                    _vd_nl, r20 = randint_jax(vd, (), 0, 20)
+                    _vd_nl_art, _ = randint_jax(_vd_nl, (), 0, 2)
+                    _vd_nl = _brax_select(
+                        r20 == jnp.int32(0), _vd_nl_art, _vd_nl,
+                    )
+                    # Lord variant: rn2(20) short-circuited; rn2(2) ALWAYS drawn.
+                    _vd_l, _ = randint_jax(vd, (), 0, 2)
+                    vd = _brax_select(is_lord, _vd_l, _vd_nl)
                     # spe = rn2(4) — ALWAYS
                     vd, _ = randint_jax(vd, (), 0, 4)
-
                     # !rn2(4) || is_lord shield-type gate.
-                    def _shield_pick(ve):
-                        ve, _ = randint_jax(ve, (), 0, 4)
-                        return ve
-
-                    vd = jax.lax.cond(is_lord, lambda ve: ve, _shield_pick, vd)
+                    # Non-lord variant: draw rn2(4); lord variant: no draw.
+                    _vd_shield, _ = randint_jax(vd, (), 0, 4)
+                    vd = _brax_select(is_lord, vd, _vd_shield)
                     return vd
 
-                return jax.lax.cond(
-                    _IS_HUMANOID[tid], _humanoid_body, lambda vd: vd, vc,
-                )
+                _vc_humanoid = _humanoid_body(vc)
+                return _brax_select(_IS_HUMANOID[tid], _vc_humanoid, vc)
 
-            v_after = jax.lax.cond(
-                _MLET_ANGEL[tid], _draw_angel_initweap, lambda vc: vc, v_after
-            )
+            _vc_angel = _draw_angel_initweap(v_after)
+            v_after = _brax_select(_MLET_ANGEL[tid], _vc_angel, v_after)
 
             # S_HUMANOID PM_HOBBIT: switch(rn2(3)) DAGGER/ELVEN_DAGGER/SLING
             # weapon-pick + 2× rn2(10) armor gates — vendor makemon.c:351-366.
@@ -2623,9 +2465,8 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
                 vc, _ = randint_jax(vc, (), 0, 10)
                 return vc
 
-            v_after = jax.lax.cond(
-                _IS_PM_HOBBIT[tid], _draw_hobbit_initweap, lambda vc: vc, v_after
-            )
+            _vc_hobbit = _draw_hobbit_initweap(v_after)
+            v_after = _brax_select(_IS_PM_HOBBIT[tid], _vc_hobbit, v_after)
 
             # S_DEMON inner per-PM switch — vendor makemon.c:487-505:
             #   case S_DEMON:
@@ -2672,33 +2513,20 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             #       vendor/nle/src/mkobj.c:1019-1027 (WAND_CLASS mksobj_init).
             def _draw_demon_inner_switch(vc):
                 # PM_ORCUS: WAN_DEATH mongets cascade.
-                vc = jax.lax.cond(
-                    _IS_PM_ORCUS[tid],
-                    lambda vd: _wand_draws(vd),
-                    lambda vd: vd,
-                    vc,
-                )
+                _vc_orcus = _wand_draws(vc)
+                vc = _brax_select(_IS_PM_ORCUS[tid], _vc_orcus, vc)
                 # PM_HORNED_DEVIL: rn2(4) ternary (TRIDENT vs BULLWHIP).
-                vc = jax.lax.cond(
-                    _IS_PM_HORNED_DEVIL[tid],
-                    lambda vd: randint_jax(vd, (), 0, 4)[0],
-                    lambda vd: vd,
-                    vc,
-                )
+                _vc_hd, _ = randint_jax(vc, (), 0, 4)
+                vc = _brax_select(_IS_PM_HORNED_DEVIL[tid], _vc_hd, vc)
                 # PM_DISPATER: WAN_STRIKING mongets cascade.
-                vc = jax.lax.cond(
-                    _IS_PM_DISPATER[tid],
-                    lambda vd: _wand_draws(vd),
-                    lambda vd: vd,
-                    vc,
-                )
+                _vc_disp = _wand_draws(vc)
+                vc = _brax_select(_IS_PM_DISPATER[tid], _vc_disp, vc)
                 # PM_BALROG and PM_YEENOGHU: only non-multigen WEAPONs, 0 bytes.
                 # No explicit draws needed.
                 return vc
 
-            v_after = jax.lax.cond(
-                _MLET_DEMON[tid], _draw_demon_inner_switch, lambda vc: vc, v_after
-            )
+            _vc_demon = _draw_demon_inner_switch(v_after)
+            v_after = _brax_select(_MLET_DEMON[tid], _vc_demon, v_after)
 
             # Default-case — vendor makemon.c:512-553.  Fires for:
             #   (a) any armed monster whose mlet is NOT in the explicit case
@@ -2790,25 +2618,19 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
                 is_strong = _IS_STRONG_MASK[tid]
 
                 def _case1(vd):
-                    def _strong(ve):
-                        return ve  # BATTLE_AXE non-multigen → 0 bytes
-                    def _weak(ve):
-                        # m_initthrow(DART, 12): mksobj cascade FIRST, then rn1.
-                        ve = _weapon_draws(ve, _OTYP_DART, jnp.bool_(False))
-                        ve, _ = randint_jax(ve, (), 3, 15)  # rn1(12, 3)
-                        return ve
-                    return jax.lax.cond(is_strong, _strong, _weak, vd)
+                    # _strong: BATTLE_AXE non-multigen → 0 bytes (no-op).
+                    # _weak: m_initthrow(DART, 12): mksobj cascade FIRST, then rn1.
+                    _vd_w = _weapon_draws(vd, _OTYP_DART, jnp.bool_(False))
+                    _vd_w, _ = randint_jax(_vd_w, (), 3, 15)
+                    return _brax_select(is_strong, vd, _vd_w)
 
                 def _case2(vd):
-                    def _strong(ve):
-                        return ve  # TWO_HANDED_SWORD non-multigen → 0 bytes
-                    def _weak(ve):
-                        # mongets(CROSSBOW) — non-multigen → 0 bytes
-                        # m_initthrow(CROSSBOW_BOLT, 12)
-                        ve = _weapon_draws(ve, _OTYP_CROSSBOW_BOLT, jnp.bool_(False))
-                        ve, _ = randint_jax(ve, (), 3, 15)  # rn1(12, 3)
-                        return ve
-                    return jax.lax.cond(is_strong, _strong, _weak, vd)
+                    # _strong: TWO_HANDED_SWORD non-multigen → 0 bytes.
+                    # _weak: mongets(CROSSBOW) (0 bytes) +
+                    #        m_initthrow(CROSSBOW_BOLT, 12).
+                    _vd_w = _weapon_draws(vd, _OTYP_CROSSBOW_BOLT, jnp.bool_(False))
+                    _vd_w, _ = randint_jax(_vd_w, (), 3, 15)
+                    return _brax_select(is_strong, vd, _vd_w)
 
                 def _case3(vd):
                     # mongets(BOW) — non-multigen → 0 bytes
@@ -2818,41 +2640,42 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
                     return vd
 
                 def _case4(vd):
-                    def _strong(ve):
-                        return ve  # LONG_SWORD non-multigen → 0 bytes
-                    def _weak(ve):
-                        # m_initthrow(DAGGER, 3) — DAGGER non-multigen (0 bytes)
-                        ve, _ = randint_jax(ve, (), 3, 6)  # rn1(3, 3)
-                        return ve
-                    return jax.lax.cond(is_strong, _strong, _weak, vd)
+                    # _strong: LONG_SWORD non-multigen → 0 bytes.
+                    # _weak: m_initthrow(DAGGER, 3) — DAGGER non-multigen (0 bytes)
+                    _vd_w, _ = randint_jax(vd, (), 3, 6)  # rn1(3, 3)
+                    return _brax_select(is_strong, vd, _vd_w)
 
                 def _case5(vd):
                     # LUCERN_HAMMER or AKLYS — both non-multigen → 0 bytes
                     return vd
 
-                def _default_case(vd):
-                    return vd  # cases 6..14 → no draw
-
-                # rnd returns 1..N.  Map to switch index [0..5] where
-                # index 5 catches all "default" cases (r >= 6).
+                # rnd returns 1..N.  Brax-flatten the 6-way switch: compute
+                # every case body and select via nested jnp.where indexed by
+                # the rolled selector (idx ∈ [0..5]; idx 5 catches r >= 6).
                 idx = jnp.clip(r - jnp.int32(1), 0, 5)
-                vc = jax.lax.switch(
-                    idx,
-                    [_case1, _case2, _case3, _case4, _case5, _default_case],
-                    vc,
-                )
+                _vc_c1 = _case1(vc)
+                _vc_c2 = _case2(vc)
+                _vc_c3 = _case3(vc)
+                _vc_c4 = _case4(vc)
+                _vc_c5 = _case5(vc)
+                # _vc_c6 (default) = vc unchanged.
+                vc = _brax_select(idx == jnp.int32(0), _vc_c1,
+                     _brax_select(idx == jnp.int32(1), _vc_c2,
+                      _brax_select(idx == jnp.int32(2), _vc_c3,
+                       _brax_select(idx == jnp.int32(3), _vc_c4,
+                        _brax_select(idx == jnp.int32(4), _vc_c5, vc)))))
                 return vc
 
-            v_after = jax.lax.cond(
-                _DEFAULT_ELIGIBLE[tid], _draw_default_case, lambda vc: vc, v_after
-            )
+            _vc_defcase = _draw_default_case(v_after)
+            v_after = _brax_select(_DEFAULT_ELIGIBLE[tid], _vc_defcase, v_after)
 
             # Trailing offensive-item check — vendor makemon.c:556
             #   if ((int) mtmp->m_lev > rn2(75)) (void) mongets(...)
             v_after, _ = randint_jax(v_after, (), 0, 75)
             return v_after
 
-        v = jax.lax.cond(is_armed, _draw_initweap, lambda vv: vv, v)
+        _v_armed = _draw_initweap(v)
+        v = _brax_select(is_armed, _v_armed, v)
 
         # --- 6b. m_initinv per-class body — vendor makemon.c:589-788 ---
         # Only classes with rn2() calls listed; others are 0 draws.
@@ -2900,15 +2723,10 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
         # Cite: vendor/nle/src/makemon.c:778-779.
         def _draw_gnome(vv):
             nv, r_outer = randint_jax(vv, (), 0, 60)
-
-            def _draw_candle_pick(vc):
-                nvc, _ = randint_jax(vc, (), 0, 4)
-                return nvc
-
-            return jax.lax.cond(
-                r_outer == jnp.int32(0), _draw_candle_pick, lambda vc: vc, nv,
-            )
-        v = jax.lax.cond(is_gnome, _draw_gnome, lambda vv: vv, v)
+            _nv_candle, _ = randint_jax(nv, (), 0, 4)
+            return _brax_select(r_outer == jnp.int32(0), _nv_candle, nv)
+        _v_gnome = _draw_gnome(v)
+        v = _brax_select(is_gnome, _v_gnome, v)
 
         # S_NYMPH: rn2(2) gate + optional mongets(MIRROR), then rn2(2) gate +
         # optional mongets(POT_OBJECT_DETECTION).  Vendor makemon.c:700-705:
@@ -2932,20 +2750,15 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             v2, r2 = randint_jax(v1, (), 0, 2)
             # On second gate fire (r2 == 0), consume POTION_CLASS mksobj_init
             # blessorcurse(4) draws via _potion_scroll_draws.
-            v3 = jax.lax.cond(
-                r2 == jnp.int32(0),
-                _potion_scroll_draws,
-                lambda vc: vc,
-                v2,
-            )
+            _v2_pot = _potion_scroll_draws(v2)
+            v3 = _brax_select(r2 == jnp.int32(0), _v2_pot, v2)
             return v3
-        v = jax.lax.cond(is_nymph, _draw_nymph, lambda vv: vv, v)
+        _v_nymph = _draw_nymph(v)
+        v = _brax_select(is_nymph, _v_nymph, v)
 
         # S_MUMMY: rn2(7) — vendor makemon.c:741
-        def _draw_mummy(vv):
-            nv, _ = randint_jax(vv, (), 0, 7)
-            return nv
-        v = jax.lax.cond(is_mummy, _draw_mummy, lambda vv: vv, v)
+        _v_mummy, _ = randint_jax(v, (), 0, 7)
+        v = _brax_select(is_mummy, _v_mummy, v)
 
         # S_QUANTMECH: rn2(20) gate — vendor makemon.c:744-762.
         #
@@ -2972,10 +2785,8 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
         #       vendor/nle/src/mkobj.c:801 (init=FALSE skips mksobj_init);
         #       vendor/nle/src/mkobj.c:822-836 (FOOD_CLASS CORPSE cascade
         #         — deferred, needs rndmonnum port).
-        def _draw_qmech(vv):
-            nv, _ = randint_jax(vv, (), 0, 20)
-            return nv
-        v = jax.lax.cond(is_qmech, _draw_qmech, lambda vv: vv, v)
+        _v_qmech, _ = randint_jax(v, (), 0, 20)
+        v = _brax_select(is_qmech, _v_qmech, v)
 
         # S_LEPRECHAUN: d(level_difficulty(), 30) gold — vendor makemon.c:765
         # Vendor:  mkmonmoney(mtmp, (long) d(level_difficulty(), 30));
@@ -3010,7 +2821,8 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             v_after, _ = jax.lax.while_loop(_cond, _body, (vv, jnp.int32(0)))
             return v_after
 
-        v = jax.lax.cond(is_lep, _draw_lep, lambda vv: vv, v)
+        _v_lep = _draw_lep(v)
+        v = _brax_select(is_lep, _v_lep, v)
 
         # S_DEMON: rn2(4) ice-devil gate — vendor makemon.c:770
         #   if (ptr == &mons[PM_ICE_DEVIL] && !rn2(4)) ...
@@ -3019,10 +2831,8 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
         # _MLET_DEMON mask drew rn2(4) for every S_DEMON entry (succubus,
         # vrock, balrog, asmodeus, orcus, ...) when vendor draws 0 for them.
         # Cite: vendor/nle/src/makemon.c:770.
-        def _draw_ice_devil(vv):
-            nv, _ = randint_jax(vv, (), 0, 4)
-            return nv
-        v = jax.lax.cond(is_ice_devil, _draw_ice_devil, lambda vv: vv, v)
+        _v_icedev, _ = randint_jax(v, (), 0, 4)
+        v = _brax_select(is_ice_devil, _v_icedev, v)
 
         # S_GIANT: split into minotaur vs other-giant branches — vendor
         # makemon.c:706-719:
@@ -3059,33 +2869,20 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             v1, r1 = randint_jax(vv, (), 0, 3)
             # Gate fires when rn2(3) == 0 (Is_earthlevel FALSE on Dlvl 1).
             # On fire: mongets(WAN_DIGGING) consumes _wand_draws cascade.
-            v2 = jax.lax.cond(
-                r1 == jnp.int32(0),
-                _wand_draws,
-                lambda vc: vc,
-                v1,
-            )
-            return v2
+            _v1_wand = _wand_draws(v1)
+            return _brax_select(r1 == jnp.int32(0), _v1_wand, v1)
 
         # Non-minotaur S_GIANT entries (is_giant branch): rn2(m_lev/2) gem-loop
         # count, approximated as rn2(50).  Per-iteration mksobj(rnd_class(...))
         # is init=FALSE so the GEM_CLASS mksobj_init body is skipped; only the
         # rnd_class draw + rn1(2,3) quan draw fire — those remain unmodelled
         # here as a separate follow-up.
-        def _draw_giant_cls(vv):
-            nv, _ = randint_jax(vv, (), 0, 50)
-            return nv
-
-        # Dispatch: minotaur takes its own branch; other S_GIANT entries
-        # fall through to the existing gem-loop approximation.
-        v = jax.lax.cond(
-            is_minotaur,
-            _draw_minotaur,
-            lambda vv: jax.lax.cond(
-                is_giant_cls, _draw_giant_cls, lambda vc: vc, vv,
-            ),
-            v,
-        )
+        # Dispatch (Brax-flattened): minotaur takes its own branch; other
+        # S_GIANT entries fall through to the gem-loop approximation.
+        _v_mino = _draw_minotaur(v)
+        _v_giant_cls, _ = randint_jax(v, (), 0, 50)
+        _v_giant_fallback = _brax_select(is_giant_cls, _v_giant_cls, v)
+        v = _brax_select(is_minotaur, _v_mino, _v_giant_fallback)
 
         # S_LICH: per-species gated draws — vendor makemon.c:727-738.
         # Vendor structure:
@@ -3116,31 +2913,21 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
         # otherwise model).
         def _draw_master_lich(vv):
             v1, r1 = randint_jax(vv, (), 0, 13)
+            _v1_inner, _ = randint_jax(v1, (), 0, 7)
+            return _brax_select(r1 == jnp.int32(0), _v1_inner, v1)
 
-            def _draw_inner(vc):
-                nv, _ = randint_jax(vc, (), 0, 7)
-                return nv
-
-            return jax.lax.cond(
-                r1 == jnp.int32(0), _draw_inner, lambda vc: vc, v1
-            )
-
-        v = jax.lax.cond(is_master_lich, _draw_master_lich, lambda vv: vv, v)
+        _v_ml = _draw_master_lich(v)
+        v = _brax_select(is_master_lich, _v_ml, v)
 
         def _draw_arch_lich(vv):
             v1, r1 = randint_jax(vv, (), 0, 3)
+            vc2, _ = randint_jax(v1,  (), 0, 3)   # rn2(3) ATHAME vs QUARTERSTAFF
+            vc3, _ = randint_jax(vc2, (), 0, 13)  # rn2(13) blessed flag
+            vc4, _ = randint_jax(vc3, (), 0, 4)   # rn2(4) erodeproof
+            return _brax_select(r1 == jnp.int32(0), vc4, v1)
 
-            def _draw_inner(vc):
-                vc2, _ = randint_jax(vc,  (), 0, 3)   # rn2(3) ATHAME vs QUARTERSTAFF
-                vc3, _ = randint_jax(vc2, (), 0, 13)  # rn2(13) blessed flag
-                vc4, _ = randint_jax(vc3, (), 0, 4)   # rn2(4) erodeproof
-                return vc4
-
-            return jax.lax.cond(
-                r1 == jnp.int32(0), _draw_inner, lambda vc: vc, v1
-            )
-
-        v = jax.lax.cond(is_arch_lich, _draw_arch_lich, lambda vv: vv, v)
+        _v_al = _draw_arch_lich(v)
+        v = _brax_select(is_arch_lich, _v_al, v)
 
         # S_HUMAN / mercenary armor chain — vendor makemon.c:622-672.
         # Straight-line conditional draws (no loop): up to 9 rn2 calls in
@@ -3176,76 +2963,33 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
         # The cap-8 fori_loop approximated this but ignored short-circuits.
         # Replace with explicit vendor-faithful sequence.
         def _draw_hmerc(vv):
-            # Block 1: armor chain (rn2(5) gated cascade).
-            # mac<-1 first: a single rn2(5) draw fires unconditionally
-            # for any mercenary entering this branch.  If it succeeds
-            # (returned non-zero), inner rn2(5) for plate pick also fires.
+            # Block 1: armor chain (rn2(5) gated cascade), Brax-flattened.
+            # Vendor (mac<-1 if/else-if/else-if) is modelled as:
+            #   r_a1 = rn2(5); if r_a1 != 0: rn2(5)  [armor_a]
+            #   else: r_a2 = rn2(5); if r_a2 != 0: rn2(3)  [armor_b]
+            #         else: r_a3 = rn2(5); if r_a3 != 0: rn2(3)  [armor_c]
             v1, r_a1 = randint_jax(vv, (), 0, 5)
-
-            def _armor_branch_a(vc):
-                # mac<-1 branch took: pick plate vs crystal plate
-                nv, _ = randint_jax(vc, (), 0, 5)
-                return nv
-
-            def _armor_branch_skip_a(vc):
-                # mac<-1 outer was 0 OR mac>=−1: fall to next else-if.
-                # Always draw rn2(5) (mac<3 gate is type-specific; we
-                # assume mac<3 holds, which is true for all non-WATCH
-                # initial mercenaries except SOLDIER/WATCHMAN where the
-                # earlier branch's rn2(5) was zero).
-                nvc, r_a2 = randint_jax(vc, (), 0, 5)
-
-                def _armor_branch_b(vd):
-                    nv, _ = randint_jax(vd, (), 0, 3)
-                    return nv
-
-                def _armor_branch_skip_b(vd):
-                    # mac<3 inner zero → fall to "else if (rn2(5))".
-                    nv, r_a3 = randint_jax(vd, (), 0, 5)
-
-                    def _armor_branch_c(ve):
-                        new_v, _ = randint_jax(ve, (), 0, 3)
-                        return new_v
-
-                    return jax.lax.cond(
-                        r_a3 != jnp.int32(0),
-                        _armor_branch_c,
-                        lambda ve: ve,
-                        nv,
-                    )
-
-                return jax.lax.cond(
-                    r_a2 != jnp.int32(0),
-                    _armor_branch_b,
-                    _armor_branch_skip_b,
-                    nvc,
-                )
-
-            v_after_armor = jax.lax.cond(
-                r_a1 != jnp.int32(0),
-                _armor_branch_a,
-                _armor_branch_skip_a,
-                v1,
+            # Armor branch A: extra rn2(5).
+            _va_a, _ = randint_jax(v1, (), 0, 5)
+            # Skip-a: extra rn2(5), then branch b/skip-b.
+            _va_sa, r_a2 = randint_jax(v1, (), 0, 5)
+            _va_sa_b, _ = randint_jax(_va_sa, (), 0, 3)
+            _va_sa_sb, r_a3 = randint_jax(_va_sa, (), 0, 5)
+            _va_sa_sb_c, _ = randint_jax(_va_sa_sb, (), 0, 3)
+            _va_sa_sb_done = _brax_select(
+                r_a3 != jnp.int32(0), _va_sa_sb_c, _va_sa_sb,
             )
+            _va_sa_done = _brax_select(
+                r_a2 != jnp.int32(0), _va_sa_b, _va_sa_sb_done,
+            )
+            v_after_armor = _brax_select(r_a1 != jnp.int32(0), _va_a, _va_sa_done)
 
             # Blocks 2-5: helmet / shield / boots / gloves-cloak.
-            # Each is: if (mac<10 && rn2(N)) X else if (mac<10 && rn2(M)) Y
-            # We model mac<10 as TRUE (vendor reality for initial spawn —
-            # see comment above).  The 2nd rn2 in the else-if fires only
-            # when the first rn2 returned 0 (C && short-circuit).
+            # Each: rn2(n_outer); if 0, rn2(n_inner).
             def _pair_block(vc, n_outer, n_inner):
                 nvc, r1 = randint_jax(vc, (), 0, n_outer)
-
-                def _inner_skip(vd):
-                    new_v, _ = randint_jax(vd, (), 0, n_inner)
-                    return new_v
-
-                return jax.lax.cond(
-                    r1 != jnp.int32(0),
-                    lambda vd: vd,        # first rn2 nonzero -> branch taken, no 2nd draw
-                    _inner_skip,
-                    nvc,
-                )
+                _nvc_in, _ = randint_jax(nvc, (), 0, n_inner)
+                return _brax_select(r1 != jnp.int32(0), nvc, _nvc_in)
 
             v_after_helm = _pair_block(v_after_armor, 3, 2)
             v_after_shld = _pair_block(v_after_helm,  3, 2)
@@ -3253,55 +2997,30 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             v_after_glov = _pair_block(v_after_boot,  3, 2)
 
             # Per-subtype tail — vendor makemon.c:653-672.
-            #   if (ptr == WATCH_CAPTAIN) { /* no rn2 */ }
-            #   else if (ptr == WATCHMAN)  { if (rn2(3)) mongets(TIN_WHISTLE); }
-            #   else if (ptr == GUARD)     { /* unconditional curse(whistle) */ }
-            #   else { /* soldiers + officers */
-            #       if (!rn2(3)) mongets(K_RATION);
-            #       if (!rn2(2)) mongets(C_RATION);
-            #       if (ptr != SOLDIER && !rn2(3)) mongets(BUGLE);
-            #   }
-            # WATCH_CAPTAIN and GUARD draw zero in this tail.  WATCHMAN
-            # draws exactly one rn2(3).  The else-branch (soldier and the
-            # officer ranks SERGEANT/LIEUTENANT/CAPTAIN) draws rn2(3) +
-            # rn2(2) unconditionally, plus rn2(3) when not PM_SOLDIER.
-            # Cite: vendor/nle/src/makemon.c:653-672.
-            def _watchman_tail(vc):
-                nv, _ = randint_jax(vc, (), 0, 3)
-                return nv
-
-            def _soldier_officer_tail(vc):
-                vc1, _ = randint_jax(vc,  (), 0, 3)   # K_RATION gate
-                vc2, _ = randint_jax(vc1, (), 0, 2)   # C_RATION gate
-
-                def _bugle(vd):
-                    nvd, _ = randint_jax(vd, (), 0, 3)
-                    return nvd
-
-                # rn2(3) bugle only when ptr != PM_SOLDIER.
-                return jax.lax.cond(
-                    is_pm_soldier, lambda vd: vd, _bugle, vc2,
-                )
-
-            # Dispatch via nested cond — WATCH_CAPTAIN / GUARD: zero;
-            # WATCHMAN: one rn2(3); else: soldier/officer tail.
-            v_tail = jax.lax.cond(
-                is_pm_watch_captain | is_pm_guard,
-                lambda vc: vc,
-                lambda vc: jax.lax.cond(
-                    is_pm_watchman, _watchman_tail, _soldier_officer_tail, vc,
-                ),
-                v_after_glov,
+            #   WATCH_CAPTAIN / GUARD: 0 draws
+            #   WATCHMAN: rn2(3)
+            #   else (soldier/officer): rn2(3) + rn2(2) + (rn2(3) if !PM_SOLDIER)
+            # Brax-flatten: compute all 3 candidate states and select.
+            # Watchman tail.
+            _vt_wm, _ = randint_jax(v_after_glov, (), 0, 3)
+            # Soldier/officer tail.
+            _vt_so1, _ = randint_jax(v_after_glov, (), 0, 3)   # K_RATION
+            _vt_so2, _ = randint_jax(_vt_so1, (), 0, 2)        # C_RATION
+            _vt_so_bugle, _ = randint_jax(_vt_so2, (), 0, 3)   # BUGLE
+            _vt_so = _brax_select(is_pm_soldier, _vt_so2, _vt_so_bugle)
+            # Dispatch.
+            _vt_else = _brax_select(is_pm_watchman, _vt_wm, _vt_so)
+            v_tail = _brax_select(
+                is_pm_watch_captain | is_pm_guard, v_after_glov, _vt_else,
             )
             return v_tail
 
-        v = jax.lax.cond(is_hmerc, _draw_hmerc, lambda vv: vv, v)
+        _v_hmerc = _draw_hmerc(v)
+        v = _brax_select(is_hmerc, _v_hmerc, v)
 
         # S_HUMAN / shopkeeper: rn2(4) — vendor makemon.c:675
-        def _draw_hsk(vv):
-            nv, _ = randint_jax(vv, (), 0, 4)
-            return nv
-        v = jax.lax.cond(is_hsk, _draw_hsk, lambda vv: vv, v)
+        _v_hsk, _ = randint_jax(v, (), 0, 4)
+        v = _brax_select(is_hsk, _v_hsk, v)
 
         # S_HUMAN / priest: rn2(7) + optional rn2(3) + rn2(10).
         # Vendor makemon.c:691-695:
@@ -3318,14 +3037,8 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
         def _draw_hpr(vv):
             # Cloak choice (rn2(7) ternary, rn2(3) short-circuited per 634daf8).
             v1, r1 = randint_jax(vv, (), 0, 7)
-
-            def _draw_inner_3(vc):
-                nv, _ = randint_jax(vc, (), 0, 3)
-                return nv
-
-            v2 = jax.lax.cond(
-                r1 == jnp.int32(0), _draw_inner_3, lambda vc: vc, v1
-            )
+            _v1_inner, _ = randint_jax(v1, (), 0, 3)
+            v2 = _brax_select(r1 == jnp.int32(0), _v1_inner, v1)
             # Vendor mongets(cloak) then mongets(SMALL_SHIELD) each call
             # mksobj(otyp, init=TRUE, artif=FALSE) → mksobj_init ARMOR_CLASS
             # body (mkobj.c:992-1005).  ROBE/CLOAK_OF_PROTECTION/
@@ -3346,7 +3059,8 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
             # mkgold: amount > 0 path skips the rnd(2)/rnd(3) gold cascade).
             v5, _ = randint_jax(v4, (), 0, 10)
             return v5
-        v = jax.lax.cond(is_hpr, _draw_hpr, lambda vv: vv, v)
+        _v_hpr = _draw_hpr(v)
+        v = _brax_select(is_hpr, _v_hpr, v)
 
         # --- 7. m_initinv tail — vendor makemon.c:794,796,798 ---
         #   if ((int) mtmp->m_lev > rn2(50))   rnd_defensive_item
@@ -3361,11 +3075,8 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
         v, _ = randint_jax(v, (), 0, 50)
         v, _ = randint_jax(v, (), 0, 100)
 
-        def _draw_gold_tail(vv):
-            nv, _ = randint_jax(vv, (), 0, 5)
-            return nv
-
-        v = jax.lax.cond(likes_gold, _draw_gold_tail, lambda vv: vv, v)
+        _v_gold, _ = randint_jax(v, (), 0, 5)
+        v = _brax_select(likes_gold, _v_gold, v)
 
         return v
 
@@ -3429,12 +3140,10 @@ def _consume_makemon_post_hp_draws_body(vrng, type_id,
 
     # Dispatch: shapechangers get newcham draws; others get initweap/initinv.
     # Cite: vendor/nethack/src/makemon.c:1356-1368 + 1441-1444.
-    vrng = jax.lax.cond(
-        is_shapeshifter,
-        _draw_newcham,
-        _draw_normal_inv,
-        vrng,
-    )
+    # Brax-flatten: compute BOTH cascades and select via is_shapeshifter.
+    _vrng_newcham = _draw_newcham(vrng)
+    _vrng_normal  = _draw_normal_inv(vrng)
+    vrng = _brax_select(is_shapeshifter, _vrng_newcham, _vrng_normal)
 
     # --- 8. saddle check — vendor makemon.c:1447-1454 ---
     # ``!rn2(100) && is_domestic(ptr) && can_saddle(mtmp) && ...``
