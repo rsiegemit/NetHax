@@ -2006,12 +2006,7 @@ if _os_brax_env.environ.get("NETHAX_BRAX_ALL", "0") == "1":
         _post_monster_body_brax,
     )
     def _pre_monster_jit_impl_brax(ns, state, rng_act, rng_astral, prev_branch, prev_level):
-        return jax.lax.cond(
-            state.done,
-            lambda _: state,
-            lambda _: _pre_monster_body_brax(ns, rng_act, rng_astral, prev_branch, prev_level),
-            operand=None,
-        )
+        return _pre_monster_body_brax(ns, state, rng_act, rng_astral, prev_branch, prev_level)
     _pre_monster_jit = jax.jit(_pre_monster_jit_impl_brax)
 
     def _post_monster_jit_impl_brax(ns, state, prev_wizard_alive,
