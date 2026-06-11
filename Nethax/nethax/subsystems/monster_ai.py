@@ -3499,8 +3499,8 @@ def _apply_spell_effect(state, rng: jax.Array, idx: jnp.ndarray,
     is_clone = sn == jnp.int32(MCAST_CLONE_WIZ)
     rng_clone = jax.random.fold_in(rng, jnp.int32(0xC10E))
     cloned_state = clone_mon(intermediate, idx, rng_clone)
-    return jax.lax.cond(
-        is_clone, lambda _: cloned_state, lambda _: intermediate, None
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_clone, t, f), cloned_state, intermediate,
     )
 
 
@@ -3562,7 +3562,10 @@ def monster_cast_spell(state, rng: jax.Array, monster_idx: jnp.ndarray,
             player_hp=new_hp, done=new_done, monster_ai=new_mai,
         )
 
-    return jax.lax.cond(can_cast, _cast, lambda s: s, state)
+    _state_cast = _cast(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(can_cast, t, f), _state_cast, state,
+    )
 
 
 def monster_castmu(state, rng: jax.Array, monster_idx: jnp.ndarray,
@@ -3618,7 +3621,10 @@ def monster_castmu(state, rng: jax.Array, monster_idx: jnp.ndarray,
         new_mspec = s.monster_ai.mspec_used.at[idx].set(cd)
         return s.replace(monster_ai=s.monster_ai.replace(mspec_used=new_mspec))
 
-    return jax.lax.cond(can_cast, _cast, lambda s: s, state)
+    _state_cast = _cast(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(can_cast, t, f), _state_cast, state,
+    )
 
 
 # ---------------------------------------------------------------------------
