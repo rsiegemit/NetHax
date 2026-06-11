@@ -6694,7 +6694,12 @@ def _mcalc_one_bp_impl(state, k_idx, pre_round):
     def _nodraw(vr):
         return vr, jnp.int32(0)
 
-    vrng2, v = jax.lax.cond(need_draw, _draw, _nodraw, state.vendor_rng)
+    _vrng_drawn, _v_drawn = _draw(state.vendor_rng)
+    vrng2 = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(need_draw, t, f),
+        _vrng_drawn, state.vendor_rng,
+    )
+    v = jnp.where(need_draw, _v_drawn, jnp.int32(0))
     add_pts = jnp.where(need_draw & (v < adj), floored + NS, floored)
     add_pts = jnp.where(valid & alive_s, add_pts, jnp.int32(0))
     new_mp = jnp.clip(

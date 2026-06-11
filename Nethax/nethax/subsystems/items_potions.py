@@ -507,7 +507,10 @@ def _effect_gain_level(state, rng, buc):
     # --- Non-cursed: pluslvl(blessed) — XL+1 + HP/Pw reroll, urexp bumped ---
     state_lvlup = _pluslvl(state, rng, incr=True)
 
-    return jax.lax.cond(cursed, lambda _: state_cursed, lambda _: state_lvlup, None)
+    return jax.tree.map(
+        lambda t, f: jnp.where(cursed, t, f),
+        state_cursed, state_lvlup,
+    )
 
 
 # ---- vision group ---------------------------------------------------------

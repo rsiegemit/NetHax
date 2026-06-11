@@ -1649,22 +1649,20 @@ def _single_melee_strike(
         from Nethax.nethax.subsystems.timer_queue import (
             start_corpse_timer as _start_corpse_timer,
         )
-        s3 = jax.lax.cond(
-            can_place,
-            lambda ss: _start_corpse_timer(
-                ss, branch, level, d_row, d_col, safe_gs,
-                corpse_entry.astype(jnp.int32),
-            ),
-            lambda ss: ss,
-            s2,
+        # Brax-flatten: compute both branches; jnp.where on the result.
+        _s3_timed = _start_corpse_timer(
+            s2, branch, level, d_row, d_col, safe_gs,
+            corpse_entry.astype(jnp.int32),
+        )
+        s3 = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(can_place, t, f), _s3_timed, s2,
         )
         return s3
 
-    new_state = jax.lax.cond(
-        killed,
-        _place_corpse,
-        lambda s: s,
-        new_state,
+    # Brax-flatten: compute both branches; jnp.where on the result.
+    _ns_corpse = _place_corpse(new_state)
+    new_state = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(killed, t, f), _ns_corpse, new_state,
     )
 
     # vendor steal.c::relobj — drop the slain monster's carried inventory at
@@ -1678,11 +1676,10 @@ def _single_melee_strike(
     role_idx_q = jnp.clip(new_state.player_role.astype(jnp.int32), 0, _NEMESIS_IDX_BY_ROLE.shape[0] - 1)
     nemesis_entry = _NEMESIS_IDX_BY_ROLE[role_idx_q].astype(jnp.int32)
     is_nemesis_kill = killed & (mai.entry_idx[idx].astype(jnp.int32) == nemesis_entry)
-    new_state = jax.lax.cond(
-        is_nemesis_kill,
-        lambda s: on_nemesis_killed(s, mai.entry_idx[idx]),
-        lambda s: s,
-        new_state,
+    # Brax-flatten: compute both branches; jnp.where on the result.
+    _ns_nemesis = on_nemesis_killed(new_state, mai.entry_idx[idx])
+    new_state = jax.tree_util.tree_map(
+        lambda t, f: jnp.where(is_nemesis_kill, t, f), _ns_nemesis, new_state,
     )
 
     # vendor/nethack/src/artifact.c::artifact_hit lines 1220-1255 (Vorpal Blade)
