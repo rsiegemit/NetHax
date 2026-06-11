@@ -2962,11 +2962,9 @@ def monster_muse_full(state, rng: jax.Array, monster_idx: jnp.ndarray):
     # when has_defense/has_misc/has_offense is still 0.  We model that with
     # an `acted` flag carried through the branches.
     def _branch(s, predicate, fn, sub_key):
-        return jax.lax.cond(
-            predicate,
-            lambda st: fn(st, sub_key, idx),
-            lambda st: st,
-            s,
+        _s_t = fn(s, sub_key, idx)
+        return jax.tree_util.tree_map(
+            lambda t, f: jnp.where(predicate, t, f), _s_t, s,
         )
 
     # ----- Defensive cascade --------------------------------------------
