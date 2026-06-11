@@ -425,7 +425,9 @@ def _m_throw_ray(
         # Apply hit_fn only when: not yet stopped, not OOB/blocker, on player.
         do_hit = (~stopped) & (~oob) & (~is_blocker) & is_player_tile
 
-        s = jax.lax.cond(do_hit, hit_fn, lambda x: x, s)
+        # Brax-flatten: compute both branches, select via tree_map.
+        s_hit = hit_fn(s)
+        s = jax.tree_util.tree_map(lambda t, f: jnp.where(do_hit, t, f), s_hit, s)
 
         new_hit = hit | do_hit
         # Beam halts on: blocker, OOB, or after hitting the player.
@@ -598,8 +600,15 @@ def _nymph_steal(state, slot: jnp.ndarray, rng: jax.Array):
         def _do_unpunish(s2):
             return s2.replace(is_punished=jnp.bool_(False))
 
-        s = jax.lax.cond(steal_allowed, _do_steal, lambda s2: s2, s)
-        s = jax.lax.cond(do_unpunish, _do_unpunish, lambda s2: s2, s)
+        # Brax-flatten: compute both branches, select via tree_map.
+        s_stolen = _do_steal(s)
+        s = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(steal_allowed, t, f), s_stolen, s
+        )
+        s_unpun = _do_unpunish(s)
+        s = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(do_unpunish, t, f), s_unpun, s
+        )
 
         # Teleport nymph to random valid tile.
         raw_tele = jax.random.randint(rng_tele, (), 0, _N_TELE_TILES)
@@ -611,7 +620,11 @@ def _nymph_steal(state, slot: jnp.ndarray, rng: jax.Array):
         )
         return s.replace(monster_ai=new_mai)
 
-    return jax.lax.cond(adjacent, _apply, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via tree_map.
+    s_applied = _apply(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(adjacent, t, f), s_applied, state
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +781,11 @@ def _leprechaun_steal_gold(state, slot: jnp.ndarray, rng: jax.Array):
             ground_items=new_ground,
         )
 
-    return jax.lax.cond(adjacent, _apply, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via tree_map.
+    s_applied = _apply(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(adjacent, t, f), s_applied, state
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -820,7 +837,11 @@ def _succubus_drain(state, slot: jnp.ndarray, rng: jax.Array):
             player_hp=new_hp,
         )
 
-    return jax.lax.cond(adjacent, _apply, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via tree_map.
+    s_applied = _apply(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(adjacent, t, f), s_applied, state
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -893,7 +914,11 @@ def _lich_cast(state, slot: jnp.ndarray, rng: jax.Array):
             status=new_status,
         )
 
-    return jax.lax.cond(in_range, _apply, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via tree_map.
+    s_applied = _apply(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(in_range, t, f), s_applied, state
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1000,12 +1025,23 @@ def _dragon_breath(state, slot: jnp.ndarray, rng: jax.Array):
             new_items, _ = erode_obj_slot(items_in, safe_b, ERODE_CORRODE, True)
             return new_items
 
-        items_after = jax.lax.cond(do_burn, _erode_burn, lambda x: x, s.inventory.items)
-        items_after = jax.lax.cond(do_corrode, _erode_corrode, lambda x: x, items_after)
+        # Brax-flatten: compute both branches, select via tree_map.
+        items_burned = _erode_burn(s.inventory.items)
+        items_after = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(do_burn, t, f), items_burned, s.inventory.items
+        )
+        items_corroded = _erode_corrode(items_after)
+        items_after = jax.tree_util.tree_map(
+            lambda t, f: jnp.where(do_corrode, t, f), items_corroded, items_after
+        )
         new_inv = s.inventory.replace(items=items_after)
         return s.replace(inventory=new_inv)
 
-    return jax.lax.cond(in_range, _apply, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via tree_map.
+    s_applied = _apply(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(in_range, t, f), s_applied, state
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1043,7 +1079,11 @@ def _kraken_grab(state, slot: jnp.ndarray, rng: jax.Array):
         new_status = s.status.replace(timed_statuses=new_timed)
         return s.replace(player_in_water=jnp.bool_(True), status=new_status)
 
-    return jax.lax.cond(adjacent, _apply, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via tree_map.
+    s_applied = _apply(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(adjacent, t, f), s_applied, state
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1155,7 +1195,11 @@ def _spit_attack(state, slot: jnp.ndarray, rng: jax.Array):
         )
         return new_s
 
-    return jax.lax.cond(in_range, _apply, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via tree_map.
+    s_applied = _apply(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(in_range, t, f), s_applied, state
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1262,7 +1306,11 @@ def _gaze_attack(state, slot: jnp.ndarray, rng: jax.Array):
         new_status = s.status.replace(timed_statuses=new_timed)
         return s.replace(status=new_status)
 
-    return jax.lax.cond(in_range, _apply, lambda s: s, state)
+    # Brax-flatten: compute both branches, select via tree_map.
+    s_applied = _apply(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(in_range, t, f), s_applied, state
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1299,18 +1347,33 @@ def monster_special_action(state, slot: jnp.ndarray, rng: jax.Array):
 
     rng_a, rng_b, rng_c, rng_d, rng_e, rng_f, rng_g, rng_h = jax.random.split(rng, 8)
 
-    # Each branch is a closure over its dedicated RNG key; only the matching
-    # branch executes (lax.switch is JIT-pure with static num_branches).
-    branches = [
-        lambda s: s,                                             # 0: NONE
-        lambda s: _nymph_steal(s, slot, rng_a),                 # 1: NYMPH
-        lambda s: _leprechaun_steal_gold(s, slot, rng_b),       # 2: LEPREC
-        lambda s: _succubus_drain(s, slot, rng_c),              # 3: SEDU
-        lambda s: _lich_cast(s, slot, rng_d),                   # 4: LICH
-        lambda s: _dragon_breath(s, slot, rng_e),               # 5: BREATH
-        lambda s: _kraken_grab(s, slot, rng_f),                 # 6: KRAKEN
-        lambda s: _spit_attack(s, slot, rng_g),                 # 7: SPIT
-        lambda s: _gaze_attack(s, slot, rng_h),                 # 8: GAZE
-    ]
+    # Brax-flatten: compute all 9 branches unconditionally, then select via
+    # tree_map + jnp.where chain on ``act``.  This keeps HLO size O(N) instead
+    # of O(2^N) which is what lax.switch produces under vmap.
+    s_none   = state                                          # 0: NONE
+    s_nymph  = _nymph_steal(state, slot, rng_a)              # 1: NYMPH
+    s_lep    = _leprechaun_steal_gold(state, slot, rng_b)    # 2: LEPREC
+    s_sedu   = _succubus_drain(state, slot, rng_c)           # 3: SEDU
+    s_lich   = _lich_cast(state, slot, rng_d)                # 4: LICH
+    s_breath = _dragon_breath(state, slot, rng_e)            # 5: BREATH
+    s_kraken = _kraken_grab(state, slot, rng_f)              # 6: KRAKEN
+    s_spit   = _spit_attack(state, slot, rng_g)              # 7: SPIT
+    s_gaze   = _gaze_attack(state, slot, rng_h)              # 8: GAZE
 
-    return jax.lax.switch(act, branches, state)
+    def _pick(a0, a1, a2, a3, a4, a5, a6, a7, a8):
+        # Chain of jnp.where: act==k selects branch k, else falls through.
+        out = a0
+        out = jnp.where(act == jnp.int32(1), a1, out)
+        out = jnp.where(act == jnp.int32(2), a2, out)
+        out = jnp.where(act == jnp.int32(3), a3, out)
+        out = jnp.where(act == jnp.int32(4), a4, out)
+        out = jnp.where(act == jnp.int32(5), a5, out)
+        out = jnp.where(act == jnp.int32(6), a6, out)
+        out = jnp.where(act == jnp.int32(7), a7, out)
+        out = jnp.where(act == jnp.int32(8), a8, out)
+        return out
+
+    return jax.tree_util.tree_map(
+        _pick, s_none, s_nymph, s_lep, s_sedu, s_lich,
+        s_breath, s_kraken, s_spit, s_gaze,
+    )
