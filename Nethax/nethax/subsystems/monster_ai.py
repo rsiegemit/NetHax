@@ -5344,7 +5344,10 @@ def clone_mon(state, mon_idx: jnp.ndarray, rng: jax.Array) -> object:
         )
         return s.replace(monster_ai=new_m)
 
-    return jax.lax.cond(can_clone, _do_clone, lambda s: s, state)
+    _state_clone = _do_clone(state)
+    return jax.tree_util.tree_map(
+        lambda t, f: jnp.where(can_clone, t, f), _state_clone, state,
+    )
 
 
 # ---------------------------------------------------------------------------
