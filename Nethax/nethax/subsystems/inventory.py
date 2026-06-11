@@ -305,45 +305,47 @@ def _items_from_list(item_list: list) -> Item:
 
 
 def _stack_items(items: list) -> Item:
-    """Stack a fixed-length list of Items into a single batched Item."""
+    """Stack a fixed-length list of Items into a single batched Item.
+
+    Uses ``jnp.stack`` per field so each item's scalar field can be
+    EITHER a concrete Python value OR a traced JAX scalar — the latter
+    is required for vmap-safety, e.g. when ``create_character`` builds
+    a Rogue inventory with vendor_rng-derived DAGGER quantity / BUC
+    flags / BLINDFOLD gate that are traced under ``vmap(reset)``.
+
+    Equivalent to the old ``jnp.array([int(it.field) for it in items])``
+    on concrete inputs (no byte-parity change).
+    """
+    def _stack(field: str, dtype):
+        return jnp.stack([jnp.asarray(getattr(it, field), dtype=dtype) for it in items])
     return Item(
-        category=jnp.array([int(it.category) for it in items], dtype=jnp.int8),
-        type_id=jnp.array([int(it.type_id) for it in items], dtype=jnp.int16),
-        buc_status=jnp.array([int(it.buc_status) for it in items], dtype=jnp.int8),
-        enchantment=jnp.array([int(it.enchantment) for it in items], dtype=jnp.int8),
-        charges=jnp.array([int(it.charges) for it in items], dtype=jnp.int8),
-        identified=jnp.array([bool(it.identified) for it in items], dtype=jnp.bool_),
-        quantity=jnp.array([int(it.quantity) for it in items], dtype=jnp.int16),
-        weight=jnp.array([int(it.weight) for it in items], dtype=jnp.int32),
-        ac_bonus=jnp.array([int(it.ac_bonus) for it in items], dtype=jnp.int8),
-        is_two_handed=jnp.array([bool(it.is_two_handed) for it in items], dtype=jnp.bool_),
-        greased=jnp.array([bool(it.greased) for it in items], dtype=jnp.bool_),
-        oeroded=jnp.array([int(it.oeroded) for it in items], dtype=jnp.int8),
-        oeroded2=jnp.array([int(it.oeroded2) for it in items], dtype=jnp.int8),
-        oerodeproof=jnp.array([bool(it.oerodeproof) for it in items], dtype=jnp.bool_),
-        bknown=jnp.array([bool(it.bknown) for it in items], dtype=jnp.bool_),
-        lamplit=jnp.array([bool(it.lamplit) for it in items], dtype=jnp.bool_),
-        olocked=jnp.array([bool(it.olocked) for it in items], dtype=jnp.bool_),
-        corpse_entry_idx=jnp.array(
-            [int(it.corpse_entry_idx) for it in items], dtype=jnp.int16
-        ),
-        recharged=jnp.array([int(it.recharged) for it in items], dtype=jnp.int8),
-        corpse_creation_turn=jnp.array(
-            [int(it.corpse_creation_turn) for it in items], dtype=jnp.int32
-        ),
-        tin_poisoned=jnp.array(
-            [bool(it.tin_poisoned) for it in items], dtype=jnp.bool_
-        ),
-        dknown=jnp.array([bool(it.dknown) for it in items], dtype=jnp.bool_),
-        rknown=jnp.array([bool(it.rknown) for it in items], dtype=jnp.bool_),
-        age=jnp.array([int(it.age) for it in items], dtype=jnp.int32),
-        artifact_idx=jnp.array(
-            [int(it.artifact_idx) for it in items], dtype=jnp.int8
-        ),
-        oeaten=jnp.array([int(it.oeaten) for it in items], dtype=jnp.int8),
-        opoisoned=jnp.array(
-            [bool(it.opoisoned) for it in items], dtype=jnp.bool_
-        ),
+        category=_stack("category", jnp.int8),
+        type_id=_stack("type_id", jnp.int16),
+        buc_status=_stack("buc_status", jnp.int8),
+        enchantment=_stack("enchantment", jnp.int8),
+        charges=_stack("charges", jnp.int8),
+        identified=_stack("identified", jnp.bool_),
+        quantity=_stack("quantity", jnp.int16),
+        weight=_stack("weight", jnp.int32),
+        ac_bonus=_stack("ac_bonus", jnp.int8),
+        is_two_handed=_stack("is_two_handed", jnp.bool_),
+        greased=_stack("greased", jnp.bool_),
+        oeroded=_stack("oeroded", jnp.int8),
+        oeroded2=_stack("oeroded2", jnp.int8),
+        oerodeproof=_stack("oerodeproof", jnp.bool_),
+        bknown=_stack("bknown", jnp.bool_),
+        lamplit=_stack("lamplit", jnp.bool_),
+        olocked=_stack("olocked", jnp.bool_),
+        corpse_entry_idx=_stack("corpse_entry_idx", jnp.int16),
+        recharged=_stack("recharged", jnp.int8),
+        corpse_creation_turn=_stack("corpse_creation_turn", jnp.int32),
+        tin_poisoned=_stack("tin_poisoned", jnp.bool_),
+        dknown=_stack("dknown", jnp.bool_),
+        rknown=_stack("rknown", jnp.bool_),
+        age=_stack("age", jnp.int32),
+        artifact_idx=_stack("artifact_idx", jnp.int8),
+        oeaten=_stack("oeaten", jnp.int8),
+        opoisoned=_stack("opoisoned", jnp.bool_),
     )
 
 

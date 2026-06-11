@@ -1605,12 +1605,13 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     # its value (6 + rn2(10)) to rebuild the DAGGER item.  Byte-stream unchanged.
     # Cite: vendor/nle/src/u_init.c:750; rnd.c::rn1.
     if dagger_qty is not None and role == Role.ROGUE:
-        items_list = [
-            _weapon(ObjType.DAGGER, int(dagger_qty))
-            if int(it.type_id) == int(ObjType.DAGGER)
-            else it
-            for it in items_list
-        ]
+        # Static slot index — Rogue inventory order is fixed (see
+        # STARTING_INVENTORY[Role.ROGUE] above): slot 1 = DAGGER.
+        # Using slot index instead of `int(it.type_id) == DAGGER` lookup
+        # avoids extracting `int(dagger_qty)` from a (potentially traced)
+        # JAX scalar — required for vmap-safety of create_character.
+        items_list = list(items_list)
+        items_list[1] = _weapon(ObjType.DAGGER, dagger_qty)
     # Apply per-item BUC overrides from vendor's ini_inv mksobj cascade.
     # Only SHORT_SWORD + LEATHER_ARMOR keep mksobj's rolled blessed bit;
     # DAGGER + POT_SICKNESS are forced UNCURSED via trbless=0.  ini_inv
@@ -1619,18 +1620,16 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     # already consumed in _consume_ini_inv_rogue_draws.
     # Cite: vendor/nle/src/u_init.c:113-128.
     if rogue_buc_flags is not None and role == Role.ROGUE:
-        _buc_by_type = {
-            int(ObjType.SHORT_SWORD):   int(rogue_buc_flags[0]),
-            int(ObjType.DAGGER):        int(rogue_buc_flags[1]),
-            int(ObjType.LEATHER_ARMOR): int(rogue_buc_flags[2]),
-            int(ObjType.POT_SICKNESS):  int(rogue_buc_flags[3]),
-        }
-        items_list = [
-            it.replace(buc_status=jnp.int8(_buc_by_type[int(it.type_id)]))
-            if int(it.type_id) in _buc_by_type
-            else it
-            for it in items_list
-        ]
+        # Static slot indexing (see DAGGER comment above):
+        #   slot 0 = SHORT_SWORD, 1 = DAGGER, 2 = LEATHER_ARMOR, 3 = POT_SICKNESS
+        # rogue_buc_flags[0..3] index in the same order.  Avoids
+        # `int(rogue_buc_flags[i])` extractions on traced JAX scalars —
+        # required for vmap-safety of create_character.
+        items_list = list(items_list)
+        items_list[0] = items_list[0].replace(buc_status=rogue_buc_flags[0].astype(jnp.int8))
+        items_list[1] = items_list[1].replace(buc_status=rogue_buc_flags[1].astype(jnp.int8))
+        items_list[2] = items_list[2].replace(buc_status=rogue_buc_flags[2].astype(jnp.int8))
+        items_list[3] = items_list[3].replace(buc_status=rogue_buc_flags[3].astype(jnp.int8))
     # Rogue's BLINDFOLD slot is gated `!rn2(5)` in vendor u_init.c:753-754:
     #     Rogue[R_DAGGERS].trquan = rn1(10, 6);
     #     ini_inv(Rogue);
@@ -1642,21 +1641,30 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     # this roll (validator confirms inv_oclasses[6]=18 == MAXOCLASSES sentinel).
     # Cite: vendor/nle/src/u_init.c:753-754.
     if blindfold_roll is not None and role == Role.ROGUE:
-        # NLE_BYTEPARITY: blindfold_roll was consumed above
-        if blindfold_roll != 0:
-            # rn2(5) != 0 → !rn2(5) is False → skip BLINDFOLD
-            items_list = [
-                it for it in items_list
-                if int(it.type_id) != int(ObjType.BLINDFOLD)
-            ]
-        # else: rn2(5) == 0 → !rn2(5) is True → keep BLINDFOLD in kit
+        # NLE_BYTEPARITY (vmap-safe):
+        # vendor u_init.c:753-754: BLINDFOLD added iff !rn2(5) — i.e.
+        # blindfold_roll == 0.  Slot 6 in Rogue's STARTING_INVENTORY is
+        # the BLINDFOLD; swap it for make_empty_item() when the roll
+        # fails.  We KEEP the slot (constant list length) and let the
+        # downstream `_items_from_list` pad with empties — same byte
+        # output as removing the slot entirely, but no Python `if` on
+        # a traced scalar (required for vmap of create_character).
+        from Nethax.nethax.subsystems.inventory import make_empty_item
+        items_list = list(items_list)
+        keep_blindfold = jnp.equal(blindfold_roll, 0)
+        bf = items_list[6]
+        empty = make_empty_item()
+        items_list[6] = jax.tree_util.tree_map(
+            lambda b, e: jnp.where(keep_blindfold, b, e), bf, empty,
+        )
     elif _is_nle() and role == Role.ROGUE:
         # Static fallback (plain NLE / Threefry): strip BLINDFOLD.
         # Cite: vendor/nle/src/u_init.c:753-754.
-        items_list = [
-            it for it in items_list
-            if int(it.type_id) != int(ObjType.BLINDFOLD)
-        ]
+        # Use the same slot-swap pattern so the downstream shape is
+        # constant whether or not vendor_rng is in play.
+        from Nethax.nethax.subsystems.inventory import make_empty_item
+        items_list = list(items_list)
+        items_list[6] = make_empty_item()
     inv_state  = InventoryState.from_items(items_list)
 
     # --- Wield primary weapon ---
