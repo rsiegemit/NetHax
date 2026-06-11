@@ -713,11 +713,73 @@ class NethaxEnv:
         path — every env runs in parallel on the device.  ``role``/``race``/
         ``alignment`` are static hyperparameters (broadcast to every env).
 
-        Under ``ParityMode.NLE_BYTEPARITY`` the ISAAC64 init in
-        :meth:`reset` is host-only (Python ISAAC64 ref impl), so this
-        falls back to a Python loop in that mode.
+        Under ``ParityMode.NLE_BYTEPARITY`` the ISAAC64 init in :meth:`reset`
+        was historically host-only (Python ISAAC64 ref impl), so this fell
+        back to a Python for-loop in that mode.  On H100 this serializes
+        every reset and dominated cold-start (~1455s for 8 seeds).
+
+        Dual-mode env var ``NETHAX_VMAP_RESET`` (default ``0``):
+
+        * ``0`` — preserve the legacy Python-loop fallback in
+          ``NLE_BYTEPARITY`` mode.  This is what the byte-parity validator
+          relies on today (10/10 PASS at current ``main``).
+        * ``1`` — attempt ``jax.vmap(self.reset, in_axes=(0, None, None, None))
+          (rngs, role, race, alignment)`` regardless of parity mode.  This
+          is the target state — once the remaining host-only ops inside
+          ``reset`` (``_spawn_starting_pet`` ``PET_SLOT`` lookups, any
+          residual ``init_jax`` Python int-casts, etc.) are removed, the
+          vmap path will work and the H100 cold-start collapses.
+
+          Today (2026-06-11) the vmap path is **expected to fail at trace
+          time** under ``NLE_BYTEPARITY`` because:
+            - ``_spawn_starting_pet`` still uses host-Python ``int`` /
+              ``PET_SLOT`` lookups on the traced state.
+            - A handful of ``state.replace(...)`` paths in ``reset`` call
+              ``int(role)`` / ``int(race)`` / ``int(alignment)`` on
+              traced argument values when those are themselves traced
+              (they are ``None`` defaults today but the vmap pathway can
+              still hit Python-int casts via downstream subsystem code).
+
+          When the vmap path fails we print the full traceback so the
+          next agent has a precise file:line:reason to target, then
+          re-raise so the caller sees the failure.
         """
+        import os as _os
+        want_vmap = _os.environ.get("NETHAX_VMAP_RESET", "0") == "1"
+
+        if want_vmap:
+            # vmap path — target state.  Today this is expected to fail
+            # under NLE_BYTEPARITY; surface the traceback informatively
+            # so the next agent can target the remaining blocker.
+            try:
+                return jax.vmap(
+                    self.reset,
+                    in_axes=(0, None, None, None),
+                )(rngs, role, race, alignment)
+            except Exception as exc:
+                import traceback as _tb
+                import sys as _sys
+                print(
+                    "[reset_batched] NETHAX_VMAP_RESET=1 vmap(reset) failed:",
+                    file=_sys.stderr,
+                )
+                print(
+                    f"  {type(exc).__name__}: {exc}",
+                    file=_sys.stderr,
+                )
+                print("--- full traceback ---", file=_sys.stderr)
+                _tb.print_exc(file=_sys.stderr)
+                print(
+                    "[reset_batched] If you wanted the Python-loop "
+                    "fallback, unset NETHAX_VMAP_RESET.",
+                    file=_sys.stderr,
+                )
+                raise
+
         if use_vendor_rng():
+            # NLE_BYTEPARITY legacy fallback: host-Python loop.  Required
+            # for the 10/10 byte-parity validator pass while the vmap
+            # blockers above are still being chipped away.
             n = int(rngs.shape[0])
             per_states = []
             per_obs = []
