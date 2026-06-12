@@ -719,6 +719,14 @@ def _isaac64_refill_jax(rng: "Isaac64State") -> "Isaac64State":
     )
 
 
+def _isaac64_passthrough(rng: "Isaac64State") -> "Isaac64State":
+    # Stable-id identity for the no-refill branch of next_uint64_jax — an
+    # inline `lambda r: r` re-created a fresh function object per call
+    # site, busting JAX's tracing cache (~1200 misses per reset under
+    # JAX_EXPLAIN_CACHE_MISSES=1, cluster 21961491).
+    return rng
+
+
 def next_uint64_jax(rng: "Isaac64State") -> Tuple["Isaac64State", jax.Array]:
     """JAX-traceable counterpart to ``next_uint64_py``.
 
@@ -729,7 +737,7 @@ def next_uint64_jax(rng: "Isaac64State") -> Tuple["Isaac64State", jax.Array]:
     refilled = jax.lax.cond(
         needs_refill,
         _isaac64_refill_jax,
-        lambda r: r,
+        _isaac64_passthrough,
         rng,
     )
     new_n = refilled.n - jnp.int32(1)
