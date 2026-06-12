@@ -719,12 +719,12 @@ def _isaac64_refill_jax(rng: "Isaac64State") -> "Isaac64State":
     )
 
 
-def _isaac64_passthrough(rng: "Isaac64State") -> "Isaac64State":
-    # Stable-id identity for the no-refill branch of next_uint64_jax — an
-    # inline `lambda r: r` re-created a fresh function object per call
-    # site, busting JAX's tracing cache (~1200 misses per reset under
-    # JAX_EXPLAIN_CACHE_MISSES=1, cluster 21961491).
-    return rng
+# Module-level lambda: stable id (evaluated once at import) AND keeps the
+# `<lambda>` qualname so HLO module names match what historically inlined
+# `lambda r: r` produced — preserves persistent compilation cache keys
+# established by prior cluster runs (vs naming this `def _isaac64_passthrough`,
+# which changes the qualname embedded in HLO text and busts cache).
+_isaac64_passthrough = lambda r: r
 
 
 def next_uint64_jax(rng: "Isaac64State") -> Tuple["Isaac64State", jax.Array]:
