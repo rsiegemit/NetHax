@@ -741,6 +741,20 @@ def _write_space(buf: jax.Array, cursor: jax.Array) -> tuple[jax.Array, jax.Arra
     return _write_byte(buf, cursor, jnp.uint8(ord(' ')))
 
 
+def _where_bc(pred, true_bc, false_bc):
+    """Brax-style select between two (buf, cursor) pairs by `pred`.
+
+    Used by the Brax-flatten path in ``_render_slot`` and ``_write_true_name``
+    where both write paths are always computed and only one is committed.
+    """
+    t_buf, t_cur = true_bc
+    f_buf, f_cur = false_bc
+    return (
+        jnp.where(pred, t_buf, f_buf),
+        jnp.where(pred, t_cur, f_cur),
+    )
+
+
 def _write_uint(buf: jax.Array, cursor: jax.Array,
                 value: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Write a non-negative integer (up to 6 digits) as ASCII bytes.
