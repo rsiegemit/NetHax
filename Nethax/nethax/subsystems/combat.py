@@ -1530,11 +1530,8 @@ def _single_melee_strike(
 
     # Skill practice on hit (legacy CombatState path).
     skill_id = _wielded_skill_id(new_state)
-    new_state = jax.lax.cond(
-        hit,
-        lambda s: practice_skill(s, skill_id),
-        lambda s: s,
-        new_state,
+    new_state = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(hit, a, b), practice_skill(new_state, skill_id), new_state,
     )
 
     # SkillState advancement — use_skill increments state.skills.advance.
@@ -1543,11 +1540,8 @@ def _single_melee_strike(
     wep_type_id = _wielded_type_id(new_state)
     safe_type_id = jnp.clip(wep_type_id.astype(jnp.int32), 0, _SKILL_WEAPON_TYPE_TO_SKILL.shape[0] - 1)
     wep_skill_id = _SKILL_WEAPON_TYPE_TO_SKILL[safe_type_id]
-    new_state = jax.lax.cond(
-        hit,
-        lambda s: _skills_use_skill(s, wep_skill_id, 1),
-        lambda s: s,
-        new_state,
+    new_state = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(hit, a, b), _skills_use_skill(new_state, wep_skill_id, 1), new_state,
     )
 
     from Nethax.nethax.subsystems.conduct import Conduct, mark_violated_if
@@ -1570,11 +1564,9 @@ def _single_melee_strike(
     kill_count = _scoring_died_for_pm(new_state.scoring, entry)
     mcloned = new_state.monster_ai.mcloned[idx]
     xp_award = _xp_experience(entry, kill_count, mcloned=mcloned)
-    new_state = jax.lax.cond(
-        killed,
-        lambda s: _xp_more_experienced(s, xp_award, jnp.int32(0)),
-        lambda s: s,
-        new_state,
+    new_state = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(killed, a, b),
+        _xp_more_experienced(new_state, xp_award, jnp.int32(0)), new_state,
     )
     # Wave 30d: more_experienced is byte-equal vendor exper.c:168-203 and
     # only touches u.uexp / u.urexp.  Kill-counter and running-score side
@@ -1582,13 +1574,11 @@ def _single_melee_strike(
     # u.urexp drives the score via topten.c:675) are bumped here via
     # scoring.record_kill, gated on the same ``killed`` flag.  The per-PM
     # mvitals.died counter is also bumped (vendor mondead.c::xkilled).
-    new_state = jax.lax.cond(
-        killed,
-        lambda s: s.replace(scoring=_scoring_record_kill_pm(
-            _scoring_record_kill(s.scoring, xp_award), entry
-        )),
-        lambda s: s,
-        new_state,
+    _scored = new_state.replace(scoring=_scoring_record_kill_pm(
+        _scoring_record_kill(new_state.scoring, xp_award), entry,
+    ))
+    new_state = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(killed, a, b), _scored, new_state,
     )
 
     # vendor/nethack/src/mondead.c::xkilled — death drops a corpse on the floor.
@@ -1686,12 +1676,12 @@ def _single_melee_strike(
     # vendor/nethack/src/artifact.c::magicbane_hit lines 1090-1170 (Magicbane)
     # Apply special on-hit artifact effects only when a hit landed and not poly.
     key_arti_hit = jax.random.fold_in(rng, jnp.uint32(0xB33F))
-    new_state, arti_killed = jax.lax.cond(
-        hit & ~is_poly,
-        lambda s: _arti_hit_effects(s, idx, key_arti_hit),
-        lambda s: (s, jnp.bool_(False)),
-        new_state,
+    _ah_s, _ah_k = _arti_hit_effects(new_state, idx, key_arti_hit)
+    _ah_gate = hit & ~is_poly
+    new_state = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(_ah_gate, a, b), _ah_s, new_state,
     )
+    arti_killed = jnp.where(_ah_gate, _ah_k, jnp.bool_(False))
     killed = killed | arti_killed
 
     return new_state, dmg, hit
@@ -1735,17 +1725,20 @@ def melee_attack(
 
     rng_a, rng_b = split_n(rng, 2)
 
-    new_state, dmg, hit_landed = jax.lax.cond(
-        two_weap, _double, _single, (rng_a, rng_b)
+    _ds, _dd, _dh = _double((rng_a, rng_b))
+    _ss, _sd, _sh = _single((rng_a, rng_b))
+    new_state = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(two_weap, a, b), _ds, _ss,
     )
+    dmg = jnp.where(two_weap, _dd, _sd)
+    hit_landed = jnp.where(two_weap, _dh, _sh)
 
     # Emit "You hit the monster." message on landing a melee strike.
     # Cite: vendor/nethack/src/uhitm.c::hmon — pline("You hit %s.", ...).
     from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
-    new_messages = jax.lax.cond(
-        hit_landed,
-        lambda m: _msg_emit(m, int(_MsgId.YOU_HIT_MONSTER)),
-        lambda m: m,
+    new_messages = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(hit_landed, a, b),
+        _msg_emit(new_state.messages, int(_MsgId.YOU_HIT_MONSTER)),
         new_state.messages,
     )
     new_state = new_state.replace(messages=new_messages)
@@ -1960,23 +1953,28 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
             s.status.intrinsics[int(_DRIntr.RESIST_DRAIN)]
             | (s.status.timed_intrinsics[int(_DRIntr.RESIST_DRAIN)] > jnp.int32(0))
         )
-        s2 = jax.lax.cond(drli_res, lambda st: st, _losexp, s)
+        _le = _losexp(s)
+        s2 = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(drli_res, a, b), s, _le,
+        )
         return s2, base
 
     # Apply switch.  When hit=False we still run the switch (purity), but the
     # final dmg is zeroed by the outer gate; side-effect branches (sleep/drain)
     # are gated below via lax.cond on `hit`.
-    def _do_switch(s):
-        return jax.lax.switch(
-            branch_idx,
-            [_b_phys, _b_fire, _b_cold, _b_slee, _b_elec, _b_acid, _b_dren],
-            (s, raw_dmg),
+    _branches = [_b_phys, _b_fire, _b_cold, _b_slee, _b_elec, _b_acid, _b_dren]
+    _br_results = [b((state, raw_dmg)) for b in _branches]
+    _br_sel = _br_results[0]
+    for i in range(1, len(_br_results)):
+        _br_sel = jax.tree_util.tree_map(
+            lambda a, b, i=i: jnp.where(branch_idx == jnp.int32(i), a, b),
+            _br_results[i], _br_sel,
         )
-
-    def _skip_switch(s):
-        return s, raw_dmg
-
-    state_post_dispatch, eff_dmg = jax.lax.cond(hit, _do_switch, _skip_switch, state)
+    _do_s, _do_d = _br_sel
+    state_post_dispatch = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(hit, a, b), _do_s, state,
+    )
+    eff_dmg = jnp.where(hit, _do_d, raw_dmg)
 
     dmg = jnp.where(hit, eff_dmg, jnp.int32(0)).astype(jnp.int32)
 
@@ -2007,11 +2005,9 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
     from Nethax.nethax.subsystems.polymorph import trigger_lycanthropy as _trigger_lycan
     were_form = mai.entry_idx[idx].astype(jnp.int32)
 
-    new_state = jax.lax.cond(
-        infect_cond,
-        lambda s: _trigger_lycan(s, rng, were_form),
-        lambda s: s,
-        new_state,
+    new_state = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(infect_cond, a, b),
+        _trigger_lycan(new_state, rng, were_form), new_state,
     )
 
     # ------------------------------------------------------------------
@@ -2022,20 +2018,17 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
     is_engulfer = _ENGULFER_TABLE[safe_entry]
     engulf_cond = hit & is_engulfer
 
-    new_state = jax.lax.cond(
-        engulf_cond,
-        lambda s: _try_engulf(s, idx, rng_engulf),
-        lambda s: s,
-        new_state,
+    new_state = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(engulf_cond, a, b),
+        _try_engulf(new_state, idx, rng_engulf), new_state,
     )
 
     # Emit "The monster hits!" message when a hit landed.
     # Cite: vendor/nethack/src/mhitu.c::mattacku — pline("%s hits!", ...).
     from Nethax.nethax.subsystems.messages import emit as _msg_emit, MessageId as _MsgId
-    new_messages = jax.lax.cond(
-        hit,
-        lambda m: _msg_emit(m, int(_MsgId.MONSTER_HITS_YOU)),
-        lambda m: m,
+    new_messages = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(hit, a, b),
+        _msg_emit(new_state.messages, int(_MsgId.MONSTER_HITS_YOU)),
         new_state.messages,
     )
     new_state = new_state.replace(messages=new_messages)
@@ -2343,16 +2336,16 @@ def thrown_attack(
         s2 = s.replace(monster_ai=new_mai)
         s3 = apply_potion_to_monster(s2, key_pot, potion_type_id, target_idx)
         # D22: player-side breathe when adjacent to shatter point.
-        return jax.lax.cond(player_adjacent, _apply_breathe, lambda x: x, s3)
+        return jax.tree_util.tree_map(
+            lambda a, b: jnp.where(player_adjacent, a, b), _apply_breathe(s3), s3,
+        )
 
     def _no_shatter(s):
         return s.replace(monster_ai=new_mai)
 
-    state_after_hit = jax.lax.cond(
-        is_potion & found_hit,
-        _shatter,
-        _no_shatter,
-        state,
+    _sh_gate = is_potion & found_hit
+    state_after_hit = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(_sh_gate, a, b), _shatter(state), _no_shatter(state),
     )
     new_mai = state_after_hit.monster_ai
 
@@ -2952,7 +2945,9 @@ def handle_throw(state, rng):
             state, rng, slot, jnp.array([0, 1], dtype=jnp.int32),
         )
 
-    return jax.lax.cond(can_throw, _do_throw, lambda _: state, operand=None)
+    return jax.tree_util.tree_map(
+        lambda a, b: jnp.where(can_throw, a, b), _do_throw(None), state,
+    )
 
 
 # ---------------------------------------------------------------------------
