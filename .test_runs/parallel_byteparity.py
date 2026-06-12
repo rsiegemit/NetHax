@@ -51,9 +51,15 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 # Persistent cache opt-in (was net-negative — write stalls on cluster NFS).
-# Set NETHAX_USE_CACHE=1 to enable.
-if os.environ.get("NETHAX_USE_CACHE") == "1":
+# Set NETHAX_USE_CACHE=1 to enable. Honors JAX_COMPILATION_CACHE_DIR if
+# already set (cluster runs override to node-local scratch).
+_USE_CACHE = os.environ.get("NETHAX_USE_CACHE") == "1"
+if _USE_CACHE:
     os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", os.path.join(_REPO, ".jax_cache"))
+    os.environ.setdefault("JAX_EXPLAIN_CACHE_MISSES", "1")
+    _CACHE_DIR = os.environ["JAX_COMPILATION_CACHE_DIR"]
+    _pre = len(os.listdir(_CACHE_DIR)) if os.path.isdir(_CACHE_DIR) else 0
+    print(f"[cache] dir={_CACHE_DIR} entries_before={_pre}", flush=True)
 if os.environ.get("NETHAX_EAGER") == "1":
     import jax
     jax.config.update("jax_disable_jit", True)
@@ -417,4 +423,8 @@ if __name__ == "__main__":
     n_seeds = int(args[0]) if len(args) > 0 else 4
     n_steps = int(args[1]) if len(args) > 1 else 5
     n_workers = int(args[2]) if len(args) > 2 else None
-    sys.exit(run(n_seeds, n_steps, n_workers))
+    rc = run(n_seeds, n_steps, n_workers)
+    if _USE_CACHE and os.path.isdir(_CACHE_DIR):
+        _post = len(os.listdir(_CACHE_DIR))
+        print(f"[cache] entries_after={_post} delta={_post - _pre}", flush=True)
+    sys.exit(rc)
