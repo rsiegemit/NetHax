@@ -719,14 +719,6 @@ def _isaac64_refill_jax(rng: "Isaac64State") -> "Isaac64State":
     )
 
 
-# Module-level lambda: stable id (evaluated once at import) AND keeps the
-# `<lambda>` qualname so HLO module names match what historically inlined
-# `lambda r: r` produced — preserves persistent compilation cache keys
-# established by prior cluster runs (vs naming this `def _isaac64_passthrough`,
-# which changes the qualname embedded in HLO text and busts cache).
-_isaac64_passthrough = lambda r: r
-
-
 def next_uint64_jax(rng: "Isaac64State") -> Tuple["Isaac64State", jax.Array]:
     """JAX-traceable counterpart to ``next_uint64_py``.
 
@@ -748,6 +740,15 @@ def next_uint64_jax(rng: "Isaac64State") -> Tuple["Isaac64State", jax.Array]:
         n=new_n,
         draws=refilled.draws + jnp.int64(1),
     ), val
+
+
+# Late-bound identity for the no-refill branch above.  Placed AFTER
+# next_uint64_jax so the function's source-position line numbers match
+# the pre-edit baseline byte-for-byte — JAX embeds source positions in
+# HLO, so any shift in the def line drifts every persistent cache key
+# that involves this function.  Python late-binding resolves the name
+# at call time, so define-after-use is safe.
+_isaac64_passthrough = lambda r: r
 
 
 def rn2_jax(rng: "Isaac64State", x) -> Tuple["Isaac64State", jax.Array]:
