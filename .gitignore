@@ -13,6 +13,7 @@ __pycache__/
 .hypothesis/
 .mypy_cache/
 .ruff_cache/
+.jax_cache/
 build/
 dist/
 
