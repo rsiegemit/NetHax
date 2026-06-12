@@ -51,6 +51,9 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", os.path.join(_REPO, ".jax_cache"))
+if os.environ.get("NETHAX_EAGER") == "1":
+    import jax
+    jax.config.update("jax_disable_jit", True)
 
 
 # ---------------------------------------------------------------------------
