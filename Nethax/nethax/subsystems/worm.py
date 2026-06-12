@@ -234,7 +234,7 @@ def worm_move(state, slot: jnp.ndarray, hr: jnp.ndarray, hc: jnp.ndarray,
             (s, jnp.int32(0), jnp.int32(0)),
         )
 
-    new_seg_pos = jax.lax.cond(will_grow, _append, _shift, worms.seg_pos)
+    new_seg_pos = jnp.where(will_grow, _append(worms.seg_pos), _shift(worms.seg_pos))
 
     new_count = jnp.where(
         will_grow,
@@ -392,12 +392,7 @@ def cutworm(state, slot: jnp.ndarray, x: jnp.ndarray, y: jnp.ndarray,
         def body(carry, args):
             kp, p = args
             out_idx, out_arr = carry
-            new_arr = jax.lax.cond(
-                kp,
-                lambda a: a.at[out_idx].set(p),
-                lambda a: a,
-                out_arr,
-            )
+            new_arr = jnp.where(kp, out_arr.at[out_idx].set(p), out_arr)
             new_idx = jnp.where(kp, out_idx + 1, out_idx)
             return (new_idx, new_arr), None
 
@@ -451,7 +446,9 @@ def cutworm(state, slot: jnp.ndarray, x: jnp.ndarray, y: jnp.ndarray,
             seg_count=w.seg_count.at[s].set(new_count_val),
         )
 
-    new_worms = jax.lax.cond(do_split, _do_split, _do_shrink, worms)
+    new_worms = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(do_split, a, b), _do_split(worms), _do_shrink(worms),
+    )
     final_slot = jnp.where(do_split, new_slot, jnp.int32(-1))
     return _replace_worms(state, new_worms), do_split, final_slot
 
@@ -676,12 +673,7 @@ def place_worm_tail_randomly(state, slot: jnp.ndarray,
         # (count - 2 - i).
         tgt_idx = jnp.maximum(count - jnp.int32(2) - i, jnp.int32(0))
         write = is_active
-        new_pos_arr = jax.lax.cond(
-            write,
-            lambda a: a.at[tgt_idx].set(new_seg),
-            lambda a: a,
-            pos_arr,
-        )
+        new_pos_arr = jnp.where(write, pos_arr.at[tgt_idx].set(new_seg), pos_arr)
         new_prev = jnp.where(ok, new_seg, prev_pos)
         new_truncated = truncated | (is_active & ~ok)
         return (i + jnp.int32(1), new_prev, new_pos_arr, new_truncated), None
