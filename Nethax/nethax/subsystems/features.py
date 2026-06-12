@@ -1260,11 +1260,8 @@ def handle_open(state, rng: jax.Array):
         state.features, pos, rng_trap, level_difficulty=lvl_diff,
     )
     # On resist failure the door does not transition and no damage applies.
-    new_features = jax.lax.cond(
-        opens,
-        lambda _: new_features_opened,
-        lambda _: state.features,
-        operand=None,
+    new_features = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(opens, a, b), new_features_opened, state.features,
     )
     applied_dmg = jnp.where(opens, trap_dmg, jnp.int32(0))
     new_hp = jnp.maximum(jnp.int32(0), state.player_hp - applied_dmg)
@@ -1426,15 +1423,17 @@ def handle_kick(state, rng: jax.Array):
             new_features, _ = kick_door(s_.features, rng, pos)
             return s_.replace(features=new_features)
 
-        return jax.lax.cond(any_monster, _kick_monster, _kick_door, s)
+        return jax.tree_util.tree_map(
+            lambda a, b: jnp.where(any_monster, a, b), _kick_monster(s), _kick_door(s),
+        )
 
     # Vendor priority (dokick.c:1271-1278): if riding, kick the steed; else
     # the wounded-legs check (1279-1281) blocks ordinary kicks.
-    return jax.lax.cond(
-        is_riding,
-        _do_kick_steed,
-        lambda s: jax.lax.cond(is_wounded, lambda x: x, _do_kick, s),
-        state,
+    _ground = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(is_wounded, a, b), state, _do_kick(state),
+    )
+    return jax.tree_util.tree_map(
+        lambda a, b: jnp.where(is_riding, a, b), _do_kick_steed(state), _ground,
     )
 
 
@@ -1623,16 +1622,14 @@ def sit_on_altar(state, rng):
     # branch that triggered.  Mirror with MessageId emits gated on the two
     # outcome gates above.
     from Nethax.nethax.subsystems.messages import emit as _msg_emit_a, MessageId as _MsgId_a
-    msgs_after_wrath = jax.lax.cond(
-        do_wrath_same,
-        lambda m: _msg_emit_a(m, int(_MsgId_a.ALTAR_WRATH)),
-        lambda m: m,
+    msgs_after_wrath = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(do_wrath_same, a, b),
+        _msg_emit_a(state.messages, int(_MsgId_a.ALTAR_WRATH)),
         state.messages,
     )
-    msgs_after_luck = jax.lax.cond(
-        luck_active,
-        lambda m: _msg_emit_a(m, int(_MsgId_a.ALTAR_LUCK_LOSS)),
-        lambda m: m,
+    msgs_after_luck = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(luck_active, a, b),
+        _msg_emit_a(msgs_after_wrath, int(_MsgId_a.ALTAR_LUCK_LOSS)),
         msgs_after_wrath,
     )
 
@@ -1861,7 +1858,13 @@ def quaff_fountain(state, rng):
         _moist,           # 14
         _wish,            # 15
     )
-    new_state = jax.lax.switch(bucket, branches, state)
+    _fb_results = [b(state) for b in branches]
+    new_state = _fb_results[0]
+    for i in range(1, len(_fb_results)):
+        new_state = jax.tree_util.tree_map(
+            lambda a, b, i=i: jnp.where(bucket == jnp.int32(i), a, b),
+            _fb_results[i], new_state,
+        )
 
     # Post-step: dryup() — 1-in-3 chance the fountain disappears, always on GUSH.
     dry_roll = jax.random.randint(rng_dry, (), 0, 3, dtype=jnp.int32)
@@ -2001,7 +2004,13 @@ def dip_fountain(state, rng, slot_idx):
         _curse_item, _uncurse_item, _water_demon, _water_nymph,
         _snakes, _find_gold, _bath_lose_gold, _corrode,
     )
-    base_state = jax.lax.switch(bucket, branches, state)
+    _dip_results = [b(state) for b in branches]
+    base_state = _dip_results[0]
+    for i in range(1, len(_dip_results)):
+        base_state = jax.tree_util.tree_map(
+            lambda a, b, i=i: jnp.where(bucket == jnp.int32(i), a, b),
+            _dip_results[i], base_state,
+        )
 
     # Excalibur path overrides the bucket outcome when eligible.
     def _grant_excal(s):
@@ -2022,13 +2031,13 @@ def dip_fountain(state, rng, slot_idx):
         new_items = s.inventory.items.replace(buc_status=new_buc)
         return s.replace(inventory=s.inventory.replace(items=new_items))
 
-    def _no_excal_branch(_):
-        return base_state
-
-    def _excal_branch(_):
-        return jax.lax.cond(grants_excalibur, _grant_excal, _deny_excal, state)
-
-    out_state = jax.lax.cond(excal_eligible, _excal_branch, _no_excal_branch, operand=None)
+    _excal_inner = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(grants_excalibur, a, b),
+        _grant_excal(state), _deny_excal(state),
+    )
+    out_state = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(excal_eligible, a, b), _excal_inner, base_state,
+    )
 
     # Mark fountain used in some outcomes (always on Excalibur path).
     drain_roll = jax.random.randint(rng_dry, (), 0, 3, dtype=jnp.int32)
@@ -2164,7 +2173,13 @@ def sit_on_throne(state, rng):
         _curse_items, _map_or_confuse, _teleport, _identify,
         _confuse,
     )
-    new_state = jax.lax.switch(effect, branches, state)
+    _tr_results = [b(state) for b in branches]
+    new_state = _tr_results[0]
+    for i in range(1, len(_tr_results)):
+        new_state = jax.tree_util.tree_map(
+            lambda a, b, i=i: jnp.where(effect == jnp.int32(i), a, b),
+            _tr_results[i], new_state,
+        )
 
     # Emit per-effect flavor message — mirrors vendor/nethack/src/sit.c
     # throne_sit_effect pline lines (one per case 1..13).
@@ -2361,7 +2376,13 @@ def drink_sink(state, rng):
         _noise,             # 10
         _stench,            # 11
     )
-    new_state = jax.lax.switch(bucket, branches, state)
+    _sk_results = [b(state) for b in branches]
+    new_state = _sk_results[0]
+    for i in range(1, len(_sk_results)):
+        new_state = jax.tree_util.tree_map(
+            lambda a, b, i=i: jnp.where(bucket == jnp.int32(i), a, b),
+            _sk_results[i], new_state,
+        )
     return new_state
 
 
