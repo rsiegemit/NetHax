@@ -298,11 +298,17 @@ def _run_batch(
         # (run_validator) exactly: PRNGKey(seed + step_idx) per env.
         step_rngs = jnp_mod.stack([jax_mod.random.PRNGKey(s + step_idx)
                                    for s in seeds])
+        print(f"[step {step_idx}] calling step_batched...", flush=True)
         t_nx0 = time.time()
         nax_states, nax_obs, _, nax_done = nethax_env.step_batched(
             nax_states, action_batched, step_rngs, static_action=action)
+        t_call = time.time() - t_nx0
+        print(f"[step {step_idx}] step_batched returned in {t_call:.1f}s "
+              f"(includes trace+compile+dispatch, NOT block)", flush=True)
         jax_mod.tree_util.tree_map(lambda x: x.block_until_ready(), nax_states)
         nx_dt = time.time() - t_nx0
+        print(f"[step {step_idx}] block_until_ready done, total {nx_dt:.1f}s "
+              f"(GPU exec = {nx_dt - t_call:.1f}s)", flush=True)
 
         nax_done_np = np.asarray(nax_done)
         nax_dict = {k: np.asarray(v) for k, v in nax_obs.items()}
