@@ -101,17 +101,15 @@ def add_light_source(
         state.timestep.astype(jnp.int32) + duration.astype(jnp.int32),
     )
 
-    new_lighting = jax.lax.cond(
-        any_free,
-        lambda ls: ls.replace(
-            source_pos=ls.source_pos.at[slot].set(pos.astype(jnp.int16)),
-            source_radius=ls.source_radius.at[slot].set(jnp.int8(radius)),
-            source_type=ls.source_type.at[slot].set(jnp.int8(ltype)),
-            source_owner=ls.source_owner.at[slot].set(jnp.int16(owner)),
-            source_until_turn=ls.source_until_turn.at[slot].set(until_turn),
-        ),
-        lambda ls: ls,
-        lighting,
+    _ls_set = lighting.replace(
+        source_pos=lighting.source_pos.at[slot].set(pos.astype(jnp.int16)),
+        source_radius=lighting.source_radius.at[slot].set(jnp.int8(radius)),
+        source_type=lighting.source_type.at[slot].set(jnp.int8(ltype)),
+        source_owner=lighting.source_owner.at[slot].set(jnp.int16(owner)),
+        source_until_turn=lighting.source_until_turn.at[slot].set(until_turn),
+    )
+    new_lighting = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(any_free, a, b), _ls_set, lighting,
     )
     return state.replace(lighting=new_lighting)
 

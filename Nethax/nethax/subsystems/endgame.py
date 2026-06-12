@@ -177,9 +177,7 @@ def try_ascend(state):
         EnvState — state.done=True and Achievement.ASCENDED recorded if the
         ascension condition is met; otherwise state is returned unchanged.
     """
-    return jax.lax.cond(
-        check_ascension(state),
-        ascend,
-        lambda s: s,
-        state,
+    _is_asc = check_ascension(state)
+    return jax.tree_util.tree_map(
+        lambda a, b: jnp.where(_is_asc, a, b), ascend(state), state,
     )

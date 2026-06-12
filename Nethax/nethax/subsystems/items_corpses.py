@@ -409,11 +409,9 @@ def apply_corpse_postfx(
     is_wraith  = is_corpse & (safe_idx == jnp.int32(_WRAITH_IDX_NP))
     from Nethax.nethax.subsystems.experience import pluslvl as _xp_pluslvl
     rng, rng_wraith = jax.random.split(rng)
-    state = jax.lax.cond(
-        is_wraith,
-        lambda s: _xp_pluslvl(s, rng_wraith, incr=False),
-        lambda s: s,
-        state,
+    state = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(is_wraith, a, b),
+        _xp_pluslvl(state, rng_wraith, incr=False), state,
     )
 
     # Newt: eye_of_newt_buzz — small chance to bump pw_max

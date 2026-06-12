@@ -648,11 +648,9 @@ def newexplevel(state, rng):
     uexp = jnp.int64(state.player_xp)
     thresh = newuexp(ulev)
     should = (ulev < jnp.int32(MAXULEV)) & (uexp >= thresh)
-    return jax.lax.cond(
-        should,
-        lambda s: pluslvl(s, rng, incr=True),
-        lambda s: s,
-        state,
+    return jax.tree_util.tree_map(
+        lambda a, b: jnp.where(should, a, b),
+        pluslvl(state, rng, incr=True), state,
     )
 
 

@@ -765,7 +765,10 @@ def consume_disp_for_obs(env_state):
         # otherwise leave the stream untouched.  Mirrors vendor's
         # per-slot ``if (visible) rn2_on_display_rng(...)`` gate.
         drew_rng, _ = _vendor_rng.next_uint64_jax(rng)
-        return jax.lax.cond(mask_bit, lambda _: drew_rng, lambda _: rng, operand=None), None
+        sel = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(mask_bit, a, b), drew_rng, rng,
+        )
+        return sel, None
 
     rng_after_mon, _ = jax.lax.scan(_maybe_draw, env_state.vendor_rng_disp, mon_mask)
 
