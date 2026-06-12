@@ -730,19 +730,19 @@ class NethaxEnv:
           residual ``init_jax`` Python int-casts, etc.) are removed, the
           vmap path will work and the H100 cold-start collapses.
 
-          Today (2026-06-11) the vmap path is **expected to fail at trace
-          time** under ``NLE_BYTEPARITY`` because:
-            - ``_spawn_starting_pet`` still uses host-Python ``int`` /
-              ``PET_SLOT`` lookups on the traced state.
-            - A handful of ``state.replace(...)`` paths in ``reset`` call
-              ``int(role)`` / ``int(race)`` / ``int(alignment)`` on
-              traced argument values when those are themselves traced
-              (they are ``None`` defaults today but the vmap pathway can
-              still hit Python-int casts via downstream subsystem code).
+          As of commit 61df6e1, the vmap path is structurally clean:
+          ``_spawn_starting_pet`` uses ``jnp.where``-masked slot writes
+          (no traced ``arr.at[PET_SLOT].set(...)``).  ``int(role)`` /
+          ``int(race)`` / ``int(alignment)`` calls in ``reset`` only act
+          on the ``role``/``race``/``alignment`` Python arguments, which
+          arrive as concrete ints under ``in_axes=(0, None, None, None)``.
+          The remaining cost is **trace time**, not correctness — cold
+          XLA compile on H100 is the gating factor, not vmap-safety.
 
-          When the vmap path fails we print the full traceback so the
-          next agent has a precise file:line:reason to target, then
-          re-raise so the caller sees the failure.
+          The ``try/except`` below is kept for diagnostic value: if a
+          future regression reintroduces a host-Python op on a traced
+          value, surface the full traceback so the regression is
+          immediately attributable.
         """
         import os as _os
         want_vmap = _os.environ.get("NETHAX_VMAP_RESET", "0") == "1"
