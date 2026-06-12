@@ -402,7 +402,15 @@ def _cursed_book_backfire(state, rng: jax.Array, slot_idx: int, book_level: int)
     # lax.switch clamps the index into [0, len(branches)-1], so an
     # accidental lev=8 still selects the rndcurse default.
     rn2_lev = rn2(rng_branch, lev).astype(jnp.int32)
-    return jax.lax.switch(rn2_lev, branches, state)
+    # Brax-flat: compute all branches, cascading jnp.where on rn2_lev.
+    results = [b(state) for b in branches]
+    selected = results[0]
+    for i in range(1, len(results)):
+        selected = jax.tree_util.tree_map(
+            lambda a, b, i=i: jnp.where(rn2_lev == jnp.int32(i), a, b),
+            results[i], selected,
+        )
+    return selected
 
 
 def read_spellbook(state, rng: jax.Array, slot_idx: int):
