@@ -257,22 +257,13 @@ def enter_level(
     folded = jax.random.fold_in(rng, 0)
     seed_val = jax.random.bits(folded, shape=(), dtype=jnp.uint32)
 
-    # --- Conditionally apply: only write when not already generated ---
-    new_cached_map = lax.cond(
-        already,
-        lambda: state.cached_map,
-        lambda: state.cached_map.at[b, lv].set(terrain_new),
-    )
-    new_generated = lax.cond(
-        already,
-        lambda: state.generated,
-        lambda: state.generated.at[b, lv].set(True),
-    )
-    new_seeds = lax.cond(
-        already,
-        lambda: state.level_rng_seed,
-        lambda: state.level_rng_seed.at[b, lv].set(seed_val),
-    )
+    # --- Brax-flatten: compute both branches eagerly, select via jnp.where. ---
+    cached_map_updated = state.cached_map.at[b, lv].set(terrain_new)
+    new_cached_map = jnp.where(already, state.cached_map, cached_map_updated)
+    generated_updated = state.generated.at[b, lv].set(True)
+    new_generated = jnp.where(already, state.generated, generated_updated)
+    seeds_updated = state.level_rng_seed.at[b, lv].set(seed_val)
+    new_seeds = jnp.where(already, state.level_rng_seed, seeds_updated)
 
     return LevelMemoryState(
         generated=new_generated,
