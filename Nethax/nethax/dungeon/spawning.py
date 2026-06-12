@@ -3585,12 +3585,14 @@ def spawn_oroom_monster_scanbody(
             )
             return mai_g, v_g, slot_g + jnp.int32(1)
 
-        return jax.lax.cond(
-            gate_pass, _gate_true, lambda c: c, (mai_in, v_in, slot_in),
+        gp = _gate_true((mai_in, v_in, slot_in))
+        return jax.tree_util.tree_map(
+            lambda a, b: jnp.where(gate_pass, a, b), gp, (mai_in, v_in, slot_in),
         )
 
-    return jax.lax.cond(
-        spawn_gate, _do_spawn, lambda c: c, (monster_ai, vrng, next_slot),
+    sg = _do_spawn((monster_ai, vrng, next_slot))
+    return jax.tree_util.tree_map(
+        lambda a, b: jnp.where(spawn_gate, a, b), sg, (monster_ai, vrng, next_slot),
     )
 
 
@@ -3876,7 +3878,9 @@ def populate_level_with_monsters(
             st2 = _place_tail(st1, wslot, r_, c_, k_tail)
             return st2
 
-        st_new = jax.lax.cond(do_init, _do, lambda s: s, st)
+        st_new = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(do_init, a, b), _do(st), st,
+        )
         return (st_new, key), None
 
     rng_worm, _ = jax.random.split(rng)
@@ -4029,6 +4033,8 @@ def makemon(state, rng: jax.Array, entry_idx: jnp.ndarray,
             mstrategy=new_strat,
         )
 
-    new_mai = jax.lax.cond(do_spawn, _apply, lambda m: m, mai)
+    new_mai = jax.tree_util.tree_map(
+        lambda a, b: jnp.where(do_spawn, a, b), _apply(mai), mai,
+    )
     new_state = state.replace(monster_ai=new_mai)
     return new_state, slot, do_spawn
