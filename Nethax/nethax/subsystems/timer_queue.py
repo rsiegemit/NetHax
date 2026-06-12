@@ -602,11 +602,9 @@ def start_corpse_timer(
     when = jnp.where(is_troll, troll_when, rot_when)
 
     # Inert corpses (lizard/lichen) skip the timer entirely.
-    return jax.lax.cond(
-        is_inert,
-        lambda s: s,
-        lambda s: _start_timer_dyn(s, when, func_val, tid),
-        state,
+    timed = _start_timer_dyn(state, when, func_val, tid)
+    return jax.tree_util.tree_map(
+        lambda a, b: jnp.where(is_inert, a, b), state, timed,
     )
 
 
@@ -701,10 +699,18 @@ def tick_timers(state):
         fidx = ts.func_idx[slot_idx].astype(jnp.int32)
         tgt  = ts.target_id[slot_idx]
 
-        def _do_fire(s_):
-            return jax.lax.switch(fidx, TIMER_CALLBACKS, s_, tgt)
-
-        s2 = jax.lax.cond(fire, _do_fire, lambda x: x, s)
+        # Brax-flat: compute all timer callbacks then cascading jnp.where on fidx,
+        # then mask the whole result by `fire`.
+        cb_results = [cb(s, tgt) for cb in TIMER_CALLBACKS]
+        cb_sel = cb_results[0]
+        for i in range(1, len(cb_results)):
+            cb_sel = jax.tree_util.tree_map(
+                lambda a, b, i=i: jnp.where(fidx == jnp.int32(i), a, b),
+                cb_results[i], cb_sel,
+            )
+        s2 = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(fire, a, b), cb_sel, s,
+        )
         return s2, None
 
     final_state, _ = jax.lax.scan(
