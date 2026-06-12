@@ -200,11 +200,8 @@ def _maybe_dry(state, flat_lv: jnp.ndarray, rng_dry: jax.Array) -> object:
     roll = jax.random.randint(rng_dry, (), 0, 3, dtype=jnp.int32)
     should_dry = roll == jnp.int32(0)
     pos = jnp.stack([flat_lv, r, c])
-    return jax.lax.cond(
-        should_dry,
-        lambda s: dry_fountain(s, pos),
-        lambda s: s,
-        state,
+    return jax.tree_util.tree_map(
+        lambda a, b: jnp.where(should_dry, a, b), dry_fountain(state, pos), state,
     )
 
 
@@ -346,7 +343,12 @@ def dip_fountain(state, rng: jax.Array, slot_idx: int) -> object:
                     m_lev=m.m_lev.at[slot].set(mlev.astype(jnp.int16)),
                     peaceful=m.peaceful.at[slot].set(jnp.bool_(False)),
                 ))
-            return jax.lax.cond(any_dead, _spawn, lambda s: s, st)
+            # Brax-flatten: compute both branches, select via tree_map.
+            _tr_spawn = _spawn(st)
+            _fr_spawn = st
+            return jax.tree_util.tree_map(
+                lambda t, f: jnp.where(any_dead, t, f), _tr_spawn, _fr_spawn
+            )
 
         # --- WATER_NYMPH (fountain.c:479 case 22) — steal an item ---
         def _nymph(st):
@@ -387,7 +389,14 @@ def dip_fountain(state, rng: jax.Array, slot_idx: int) -> object:
             _noop,    # 9 BATH
             _noop,    # 10 COINS
         ]
-        return jax.lax.switch(out, branches, s)
+        results = [b(s) for b in branches]
+        sel = results[0]
+        for i in range(1, len(results)):
+            sel = jax.tree_util.tree_map(
+                lambda a, b, i=i: jnp.where(out == jnp.int32(i), a, b),
+                results[i], sel,
+            )
+        return sel
 
     # Apply Excalibur or normal dip outcome.
     def _grant_excalibur(s):
@@ -412,11 +421,9 @@ def dip_fountain(state, rng: jax.Array, slot_idx: int) -> object:
         s = _maybe_dry(s, flat_lv, rng_dry)
         return s
 
-    return jax.lax.cond(
-        excalibur_eligible,
-        _grant_excalibur,
-        _normal_dip,
-        state,
+    return jax.tree_util.tree_map(
+        lambda a, b: jnp.where(excalibur_eligible, a, b),
+        _grant_excalibur(state), _normal_dip(state),
     )
 
 
@@ -632,11 +639,16 @@ def drink_fountain(state, rng: jax.Array) -> object:
         _gush,            # 29  (vendor case 30)
     ]
 
-    state = jax.lax.cond(
-        take_moist,
-        _moist,
-        lambda s: jax.lax.switch(fate, branches, s),
-        state,
+    moist_result = _moist(state)
+    fate_results = [b(state) for b in branches]
+    fate_sel = fate_results[0]
+    for i in range(1, len(fate_results)):
+        fate_sel = jax.tree_util.tree_map(
+            lambda a, b, i=i: jnp.where(fate == jnp.int32(i), a, b),
+            fate_results[i], fate_sel,
+        )
+    state = jax.tree_util.tree_map(
+        lambda m, f: jnp.where(take_moist, m, f), moist_result, fate_sel,
     )
     state = _maybe_dry(state, flat_lv, rng_dry)
     return state
