@@ -478,7 +478,9 @@ def _spawn_quest_leader(state) -> object:
             movement_points=m.movement_points.at[free_slot].set(jnp.int16(12)),
         )
 
-    new_mai = jax.lax.cond(has_free, _do_spawn, lambda m: m, mai)
+    new_mai = jax.tree_util.tree_map(
+        lambda s, o: jnp.where(has_free, s, o), _do_spawn(mai), mai,
+    )
     new_quest = state.quest.replace(leader_pos=leader_pos)
     return state.replace(monster_ai=new_mai, quest=new_quest)
 

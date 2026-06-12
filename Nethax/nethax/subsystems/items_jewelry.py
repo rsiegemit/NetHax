@@ -774,7 +774,9 @@ def check_life_saving(state):
         )
 
     import jax
-    new_state = jax.lax.cond(should_save, _save, lambda s: s, state)
+    new_state = jax.tree_util.tree_map(
+        lambda s, o: jnp.where(should_save, s, o), _save(state), state,
+    )
     return new_state, should_save
 
 import os as _os_brax

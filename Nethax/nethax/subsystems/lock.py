@@ -332,7 +332,9 @@ def _tick_box(state, rng):
         s2, _ = fire_container_trap(s, c_idx)
         return s2
 
-    state = jax.lax.cond(do_unlock & is_trapped, _fire_trap, lambda s: s, state)
+    state = jax.tree_util.tree_map(
+        lambda f, o: jnp.where(do_unlock & is_trapped, f, o), _fire_trap(state), state,
+    )
     return state, succeeded
 
 
