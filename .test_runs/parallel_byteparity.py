@@ -300,7 +300,7 @@ def _run_batch(
                                    for s in seeds])
         t_nx0 = time.time()
         nax_states, nax_obs, _, nax_done = nethax_env.step_batched(
-            nax_states, action_batched, step_rngs)
+            nax_states, action_batched, step_rngs, static_action=action)
         jax_mod.tree_util.tree_map(lambda x: x.block_until_ready(), nax_states)
         nx_dt = time.time() - t_nx0
 

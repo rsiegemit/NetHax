@@ -683,6 +683,7 @@ class NethaxEnv:
         states: EnvState,
         actions: jax.Array,
         rngs: jax.Array,
+        static_action: int | None = None,
     ) -> Tuple[EnvState, Dict[str, jax.Array], jax.Array, jax.Array]:
         """Vectorised step over a leading batch dim B.
 
@@ -691,6 +692,13 @@ class NethaxEnv:
         states  : pytree where every leaf has a leading ``[B, ...]`` axis.
         actions : int array ``[B]``.
         rngs    : PRNGKey array ``[B, 2]``.
+        static_action : optional Python int. When set, signals every env
+            in the batch takes this same action (e.g. the byte-parity
+            validator's ``action=0`` broadcast).  Routes phase-1 dispatch
+            through :func:`_dispatch_jit_validator` so only that single
+            handler enters HLO, instead of inlining all 46.  ``actions``
+            must still be passed (used by post-dispatch phases) but is
+            ignored by the dispatch itself.
 
         Returns
         -------
@@ -698,7 +706,8 @@ class NethaxEnv:
         info is omitted (per-env Python dicts don't vmap; callers can
         attach metadata after the call).
         """
-        return _step_impl_batched(states, actions, rngs)
+        return _step_impl_batched(states, actions, rngs,
+                                   static_action=static_action)
 
     def reset_batched(
         self,
@@ -2017,6 +2026,20 @@ def _obs_jit(prev_state, new_state):
 # extraction stay in Python (host-side) so the per-batch fan-out is
 # explicit.
 _VMAP_DISPATCH = jax.vmap(_dispatch_jit, in_axes=(0, 0, 0))
+
+# Per-static-action vmap'd validator dispatch.  Built lazily so each
+# distinct ``static_action`` int gets its own jit cache slot (the inner
+# ``_dispatch_jit_validator`` is already ``static_argnums=(1,)`` —
+# vmapping with ``in_axes=(0, None, 0)`` keeps the int unmapped).
+_VMAP_DISPATCH_VALIDATOR_CACHE: dict = {}
+
+
+def _get_vmap_dispatch_validator(static_action: int):
+    fn = _VMAP_DISPATCH_VALIDATOR_CACHE.get(static_action)
+    if fn is None:
+        fn = jax.vmap(_dispatch_jit_validator, in_axes=(0, None, 0))
+        _VMAP_DISPATCH_VALIDATOR_CACHE[static_action] = fn
+    return fn
 _VMAP_PRE_MONSTER = jax.vmap(
     _pre_monster_jit,
     in_axes=(0, 0, 0, 0, 0, 0),
@@ -2033,12 +2056,18 @@ _VMAP_BUILD_OBS = jax.vmap(build_nle_observation)
 _VMAP_OBS = jax.vmap(_obs_jit, in_axes=(0, 0))
 
 
-def _step_impl_batched(states, actions, rngs):
+def _step_impl_batched(states, actions, rngs, static_action: int | None = None):
     """Batched (vmap-parallel) version of ``_step_impl``.
 
     See ``_step_impl`` for the per-env semantics; this function is the
     Seam-C+B-aware batched orchestrator that vmaps the four inner jits
     independently so each retains its own compile cache.
+
+    When ``static_action`` is provided, phase-1 dispatch is routed through
+    a vmap'd ``_dispatch_jit_validator`` so only that single handler
+    enters HLO (instead of inlining all 46 via the ``lax.switch`` in
+    ``dispatch_action``).  This is the batched analogue of the host-side
+    int-action fast path in ``_step_impl``.
     """
     # Per-env RNG fan-out — ``jax.random.split(r, 9)`` per env, batched
     # via vmap.  Result shape: ``[B, 9, 2]``; unstack along axis=1 to
@@ -2065,7 +2094,12 @@ def _step_impl_batched(states, actions, rngs):
     prev_level  = states.dungeon.current_level.astype(jnp.int32)
 
     # Phase 1 (vmapped).
-    ns = _VMAP_DISPATCH(states, actions, rng_act)
+    if static_action is not None:
+        ns = _get_vmap_dispatch_validator(static_action)(
+            states, static_action, rng_act
+        )
+    else:
+        ns = _VMAP_DISPATCH(states, actions, rng_act)
 
     # Phase 1a/1b (vmapped) — astral mplayer seed + dig tick.
     ns = _VMAP_PRE_MONSTER(ns, states, rng_act, rng_astral, prev_branch, prev_level)
