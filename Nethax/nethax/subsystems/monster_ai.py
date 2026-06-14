@@ -6930,14 +6930,19 @@ def monsters_step_all(state, rng: jax.Array) -> object:
         mhit_keys = keys[MAX_MONSTERS_PER_LEVEL:]
 
         # Craftax-pattern path: lax.scan over slot index with (state)
-        # carry.  ``NETHAX_CRAFTAX_SCAN=1`` selects this (default: Python
-        # for-loop from Fix 1).  Research finding (2026-06-09): under vmap
-        # the Python for-loop unrolls into 400× HLO copies of the per-slot
-        # body, while ``lax.scan`` compiles body ONCE and uses an HLO
-        # ``While`` for iteration — same compile result as a single
-        # per-slot body's HLO.  Byte-equivalent: scan is sequential, RNG
-        # threads via the ``vendor_rng`` field inside state.
-        _use_scan = _os.environ.get("NETHAX_CRAFTAX_SCAN", "0") == "1"
+        # carry.  Default ON as of 2026-06-13 — Mac and AMD validators
+        # both OOM-killed during _monster_jit_impl compile when the
+        # 400× Python-for-loop HLO unroll was active (cluster job 323525
+        # was killed at "99.76% memory"; Mac smoke at 2 seeds × 5 steps
+        # silently exited compiling jit__monster_jit_impl).  Research
+        # finding (2026-06-09): under vmap the Python for-loop unrolls
+        # into 400× HLO copies of the per-slot body, while ``lax.scan``
+        # compiles body ONCE and uses an HLO ``While`` for iteration.
+        # Byte-equivalent: scan is sequential, RNG threads via the
+        # ``vendor_rng`` field inside state.  Set NETHAX_CRAFTAX_SCAN=0
+        # to restore the old Python-for-loop path if needed for parity
+        # debugging.
+        _use_scan = _os.environ.get("NETHAX_CRAFTAX_SCAN", "1") == "1"
 
         if _use_scan:
             def _turn_body(carry, args):
@@ -7059,10 +7064,10 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     else:
         atk_indices_arr = indices
 
-    # Per-attacker strike.  Craftax pattern (NETHAX_CRAFTAX_SCAN=1) uses
-    # lax.scan over (atk_slot, key) pairs with (state) carry — compiles
-    # body ONCE.  Default Fix 1 path is Python for-loop.
-    if _os.environ.get("NETHAX_CRAFTAX_SCAN", "0") == "1":
+    # Per-attacker strike.  Default ON as of 2026-06-13 — see Phase C
+    # comment above for OOM rationale.  Set NETHAX_CRAFTAX_SCAN=0 to
+    # restore the Python-for-loop path for parity debugging.
+    if _os.environ.get("NETHAX_CRAFTAX_SCAN", "1") == "1":
         def _strike_body(carry, args):
             atk_slot, key_i = args
             return _mattackm_one_jit(carry, atk_slot, key_i, _conflict_active), None
