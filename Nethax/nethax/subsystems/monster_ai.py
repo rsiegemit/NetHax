@@ -6823,47 +6823,6 @@ def monsters_step_all_batched_orchestrate(
     raise NotImplementedError("see env.py::_step_impl_batched_static_v2")
 
 
-def _monster_turn_phase_body(state, turn_keys):
-    """Phase C: per-monster turn loop (400-iter scan/for-loop dispatch).
-
-    Extracted from monsters_step_all so it can be JIT'd independently of
-    _monster_jit_impl.  Phase 2 of the 5-way monster-jit split.
-
-    Body branches on the NETHAX_CRAFTAX_SCAN env var (default "1"):
-      * scan path  — lax.scan over slot index, body compiles ONCE and
-        uses an HLO ``While`` for iteration.  This is the OOM-safe path
-        under vmap (research finding 2026-06-09: the Python for-loop
-        unrolls into 400× HLO copies of the per-slot body).
-      * for-loop path (NETHAX_CRAFTAX_SCAN=0) — Python for-loop driving
-        the jit'd body.  Retained for parity debugging.
-
-    Byte-equivalent: scan is sequential, RNG threads via the
-    ``vendor_rng`` field inside state.  RNG split + turn_keys slice
-    happens in the caller (monsters_step_all) so mhit_keys downstream
-    is unaffected by this extraction.
-    """
-    _use_scan = _os.environ.get("NETHAX_CRAFTAX_SCAN", "1") == "1"
-
-    if _use_scan:
-        def _turn_body(carry, args):
-            st = carry
-            k_idx, key = args
-            return _monster_turn_one_bp_jit(st, k_idx, key), None
-
-        indices_arr = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
-        final_state, _ = jax.lax.scan(
-            _turn_body, state, (indices_arr, turn_keys),
-        )
-    else:
-        # Per-slot turn dispatch — Python for-loop driving the jit'd body.
-        final_state = state
-        for _k_int in range(MAX_MONSTERS_PER_LEVEL):
-            final_state = _monster_turn_one_bp_jit(
-                final_state, jnp.int32(_k_int), turn_keys[_k_int],
-            )
-    return final_state
-
-
 def monsters_step_all(state, rng: jax.Array) -> object:
     """Advance all monster slots by one game tick.
 
@@ -6970,18 +6929,38 @@ def monsters_step_all(state, rng: jax.Array) -> object:
         turn_keys = keys[:MAX_MONSTERS_PER_LEVEL]
         mhit_keys = keys[MAX_MONSTERS_PER_LEVEL:]
 
-        # Phase C (per-monster turn loop) extracted to a separate function
-        # `_monster_turn_phase_body` so it can be JIT'd independently of
-        # _monster_jit_impl.  We still call it inline here to preserve
-        # byte parity; the env.py wiring as its own JIT module is a
-        # follow-up step.  See the function definition below for the
-        # NETHAX_CRAFTAX_SCAN scan/for-loop branch + OOM rationale.
-        final_state = _monster_turn_phase_body(state, turn_keys)
-
-        # NETHAX_CRAFTAX_SCAN gate — also controls the mcalcmove + mattackm
-        # loops below.  Was previously defined inside the extracted Phase C
-        # block; re-read here so the remaining loops keep their behavior.
+        # Craftax-pattern path: lax.scan over slot index with (state)
+        # carry.  Default ON as of 2026-06-13 — Mac and AMD validators
+        # both OOM-killed during _monster_jit_impl compile when the
+        # 400× Python-for-loop HLO unroll was active (cluster job 323525
+        # was killed at "99.76% memory"; Mac smoke at 2 seeds × 5 steps
+        # silently exited compiling jit__monster_jit_impl).  Research
+        # finding (2026-06-09): under vmap the Python for-loop unrolls
+        # into 400× HLO copies of the per-slot body, while ``lax.scan``
+        # compiles body ONCE and uses an HLO ``While`` for iteration.
+        # Byte-equivalent: scan is sequential, RNG threads via the
+        # ``vendor_rng`` field inside state.  Set NETHAX_CRAFTAX_SCAN=0
+        # to restore the old Python-for-loop path if needed for parity
+        # debugging.
         _use_scan = _os.environ.get("NETHAX_CRAFTAX_SCAN", "1") == "1"
+
+        if _use_scan:
+            def _turn_body(carry, args):
+                st = carry
+                k_idx, key = args
+                return _monster_turn_one_bp_jit(st, k_idx, key), None
+
+            indices_arr = jnp.arange(MAX_MONSTERS_PER_LEVEL, dtype=jnp.int32)
+            final_state, _ = jax.lax.scan(
+                _turn_body, state, (indices_arr, turn_keys),
+            )
+        else:
+            # Per-slot turn dispatch — Python for-loop driving the jit'd body.
+            final_state = state
+            for _k_int in range(MAX_MONSTERS_PER_LEVEL):
+                final_state = _monster_turn_one_bp_jit(
+                    final_state, jnp.int32(_k_int), turn_keys[_k_int],
+                )
 
         # ---- (B) mcalcmove rn2(NORMAL_SPEED) per fmon entry ----
         # Vendor allmain.c:233-234.  Cite: mon.c::mcalcmove lines 1126-1167.
