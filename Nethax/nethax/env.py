@@ -1978,6 +1978,10 @@ def _step_impl(state, action, rng):
     # inside ``_monster_body`` as a ``lax.cond`` — no host-side branch.
     ns = _monster_jit(ns, state, rng_monsters, rng_regions)
 
+    # Phase 2d: status timer tick + vault-guard cleanup (extracted from
+    # monsters_step_all as part of the 5-way split — Phase G).
+    ns = _monster_status_tick_jit(ns)
+
     # Phase 3..8a: turn counter through Wizard-intervene
     # (Seam B carve-out 3/3).
     new_state = _post_monster_jit(
@@ -2048,6 +2052,16 @@ _VMAP_MONSTER = jax.vmap(
     _monster_jit,
     in_axes=(0, 0, 0, 0),
 )
+# Phase G extraction — status timer tick + vault-guard cleanup as its own
+# JIT module.  Carved out of monsters_step_all (monster_ai.py) so its HLO
+# doesn't bloat _monster_jit_impl.  Tiny module; the win is partial cache
+# stability when other phases change, not raw compile-time reduction (G
+# itself is small).  This is Phase 1 of the 5-way split.
+from Nethax.nethax.subsystems.monster_ai import (
+    _monster_status_tick_body as _monster_status_tick_impl,
+)
+_monster_status_tick_jit = jax.jit(_monster_status_tick_impl)
+_VMAP_STATUS_TICK = jax.vmap(_monster_status_tick_jit, in_axes=(0,))
 _VMAP_POST_MONSTER = jax.vmap(
     _post_monster_jit,
     in_axes=(0, 0, 0, 0, 0, 0, 0, 0),
@@ -2106,6 +2120,11 @@ def _step_impl_batched(states, actions, rngs, static_action: int | None = None):
 
     # Phase 2/2b/2c (vmapped) — monster turn + region tick + stinking cloud.
     ns = _VMAP_MONSTER(ns, states, rng_monsters, rng_regions)
+
+    # Phase 2d (vmapped) — status timer tick + vault-guard cleanup.
+    # Extracted from monsters_step_all to compile as a separate, tiny
+    # JIT module.  Phase 1 of the 5-way monster-jit split.
+    ns = _VMAP_STATUS_TICK(ns)
 
     # Phase 3..8a (vmapped) — turn counter through Wizard-intervene.
     new_states = _VMAP_POST_MONSTER(
