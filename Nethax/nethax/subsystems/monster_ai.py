@@ -7082,22 +7082,8 @@ def monsters_step_all(state, rng: jax.Array) -> object:
                 _conflict_active,
             )
 
-    # Phase G (status tick + vault guard cleanup) extracted to a separate
-    # JIT in env.py so it compiles as an independent module and doesn't
-    # bloat _monster_jit_impl's HLO.  See _monster_status_tick_body below.
-    return final_state
-
-
-def _monster_status_tick_body(state):
-    """Phase G: tick monster status timers + vault-guard death cleanup.
-
-    Pure no-RNG function — vectorized arithmetic over per-monster int16
-    arrays.  Extracted from monsters_step_all so it can be JIT'd
-    independently of _monster_jit_impl, keeping the per-phase HLO small
-    and enabling partial cache hits when other phases change.
-    """
     # Tick status timers (vendor src/timeout.c::run_timers pattern).
-    mai = state.monster_ai
+    mai = final_state.monster_ai
     # NOTE: sleep_timer / asleep are NOT decremented here.
     # Vendor msleeping is a boolean flag cleared only by disturb() (wakeup on
     # LoS/sound/attack) — vendor/nethack/src/mon.c::wakeup lines 4333-4338.
@@ -7121,7 +7107,7 @@ def _monster_status_tick_body(state):
         blind_timer=new_blind,
         mspec_used=new_mspec,
     )
-    state = state.replace(monster_ai=mai)
+    final_state = final_state.replace(monster_ai=mai)
 
     # Vault-guard death cleanup (vendor vault.c::grddead, lines 174-189).
     # If the guard at VAULT_GUARD_SLOT died during this tick (its alive bit
@@ -7129,8 +7115,9 @@ def _monster_status_tick_body(state):
     # corridor tiles and clear the guard tracking fields.  No-op when the
     # guard is alive or never existed.
     from Nethax.nethax.subsystems.vault import maybe_grddead as _maybe_grddead
-    state = _maybe_grddead(state)
-    return state
+    final_state = _maybe_grddead(final_state)
+
+    return final_state
 
 
 # ---------------------------------------------------------------------------
