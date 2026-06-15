@@ -1538,6 +1538,26 @@ def _pre_monster_body(ns, rng_act, rng_astral, prev_branch, prev_level):
     return ns
 
 
+# ---------------------------------------------------------------------------
+# Monster-JIT split gate.
+#
+# When ``NETHAX_JIT_SPLIT=1`` the monster turn is driven by three
+# independently-JIT'd phases hoisted into the orchestrator (pre_c /
+# Phase C / post_c) plus the Phase G status-tick JIT, giving each its
+# own compile-cache slot.  When the var is unset or ``"0"`` (default),
+# the original monolithic path is used: the monster AI step is gated
+# inline inside ``_monster_body`` and the status tick / vault-guard
+# cleanup remain inside ``monsters_step_all`` — byte-identical to the
+# pre-split implementation at ``7c70135``.
+#
+# Computed once at module import so the per-call cost is a Python
+# attribute load, and the captured value selects the trace at jit
+# trace time.
+# ---------------------------------------------------------------------------
+import os as _os_split
+_USE_JIT_SPLIT = _os_split.environ.get("NETHAX_JIT_SPLIT", "0") == "1"
+
+
 def _pre_monster_jit_impl(ns, state, rng_act, rng_astral, prev_branch, prev_level):
     """JIT-compiled wrapper around ``_pre_monster_body``.
 
@@ -1563,28 +1583,32 @@ _pre_monster_jit = jax.jit(_pre_monster_jit_impl)
 def _monster_body(ns, rng_monsters, rng_regions):
     """Phase-2/2b/2c body: monster turn + region tick + stinking cloud.
 
-    Seam B carve-out 2/3.  The ``lax.cond`` gating the monster AI on
-    ``action_consumed_turn`` stays *inside* this body (no host-side
-    branching) so byte-parity with the pre-split ``_rest_body`` is
-    preserved.  The caller (monster-jit) wraps this in a
-    ``jax.lax.cond`` on ``state.done``.
+    When ``NETHAX_JIT_SPLIT=1`` the monster AI step is hoisted to the
+    orchestrator as three separate JITs (``_monster_pre_c_jit`` /
+    ``_monster_turn_jit2`` / ``_monster_post_c_jit``) and this body
+    runs only the region + stinking-cloud sub-phases — ``rng_monsters``
+    is consumed at the orchestrator level.
+
+    When the gate is off (default) the monster AI step runs inline
+    here gated on ``action_consumed_turn`` (byte-identical to the
+    pre-split ``_rest_body``), and the post-monster status tick runs
+    inside ``monsters_step_all`` rather than in its own JIT.
     """
-    # 2. Monster turn — allmain.c line 212 (movemon).
-    # Vendor moveloop only enters the per-turn block (movemon + mcalcmove
-    # + maintenance) when "actual time passed" — i.e. the player's action
-    # consumed a turn.  A wall-bump returns early from domove without
-    # decrementing ``youmonst.movement``, so the do-while at allmain.c:103
-    # short-circuits and monsters do not act.  Gate the call on
-    # ``action_consumed_turn`` so wall-bump turns leave monsters AND the
-    # vendor_rng stream untouched.  Without this gate Nethax monsters
-    # drift relative to vendor on every non-time-consuming step.
-    # Cite: vendor/nle/src/allmain.c lines 88-112 (do-while turn loop).
-    ns = jax.lax.cond(
-        ns.action_consumed_turn,
-        lambda s: _monster_ai_step(s, rng_monsters),
-        lambda s: s,
-        ns,
-    )
+    if not _USE_JIT_SPLIT:
+        # 2. Monster turn — allmain.c line 212 (movemon).
+        # Vendor moveloop only enters the per-turn block when "actual
+        # time passed" — a wall-bump returns early from domove without
+        # decrementing ``youmonst.movement``, so the do-while at
+        # allmain.c:103 short-circuits and monsters do not act.
+        # Cite: vendor/nle/src/allmain.c lines 88-112.
+        ns = jax.lax.cond(
+            ns.action_consumed_turn,
+            lambda s: _monster_ai_step(s, rng_monsters),
+            lambda s: s,
+            ns,
+        )
+    else:
+        del rng_monsters  # consumed by pre_c / turn / post_c at caller level
 
     # 2b. Per-turn region tick — vendor/nethack/src/region.c::run_regions
     #     (line 414).  Ages every active region by 1 and applies
@@ -1973,10 +1997,32 @@ def _step_impl(state, action, rng):
     # Phase 1a/1b: astral mplayer seed + dig tick (Seam B carve-out 1/3).
     ns = _pre_monster_jit(ns, state, rng_act, rng_astral, prev_branch, prev_level)
 
-    # Phase 2/2b/2c: monster turn + region tick + stinking cloud
-    # (Seam B carve-out 2/3).  The ``action_consumed_turn`` gate lives
-    # inside ``_monster_body`` as a ``lax.cond`` — no host-side branch.
+    # Phase 2 carve-out: Monster turn (vendor allmain.c:212 movemon).
+    # Under ``NETHAX_JIT_SPLIT=1`` the turn runs as three independently-
+    # jit'd phases — pre_c (A+B), Phase C (per-monster turn loop),
+    # post_c (D+E+F) — each gated on ``state.done`` and
+    # ``ns.action_consumed_turn`` inside the wrapper, then a separate
+    # Phase G status-tick JIT.  Default (gate off) leaves the AI step
+    # inside ``_monster_jit`` and the status tick inside
+    # ``monsters_step_all`` (byte-identical to the pre-split path).
+    if _USE_JIT_SPLIT:
+        _orig_ns = ns
+        ns, _pre_round, _turn_keys, _mhit_keys = _monster_pre_c_jit(
+            ns, state, rng_monsters,
+        )
+        ns = _monster_turn_jit2(ns, state, _orig_ns, _turn_keys)
+        ns = _monster_post_c_jit(ns, state, _orig_ns, _pre_round, _mhit_keys)
+
+    # Phase 2b/2c: region tick + stinking cloud (Seam B carve-out 2/3).
+    # When the split gate is OFF, ``_monster_jit`` ALSO runs the monster
+    # AI step inline (see ``_monster_body``); when ON it only runs the
+    # region tick + stinking cloud.
     ns = _monster_jit(ns, state, rng_monsters, rng_regions)
+
+    if _USE_JIT_SPLIT:
+        # Phase 2d: status timer tick + vault-guard cleanup (extracted
+        # from monsters_step_all as part of the 5-way split — Phase G).
+        ns = _monster_status_tick_jit(ns)
 
     # Phase 3..8a: turn counter through Wizard-intervene
     # (Seam B carve-out 3/3).
@@ -2048,6 +2094,90 @@ _VMAP_MONSTER = jax.vmap(
     _monster_jit,
     in_axes=(0, 0, 0, 0),
 )
+# Phase G extraction — status timer tick + vault-guard cleanup as its own
+# JIT module.  Carved out of monsters_step_all (monster_ai.py) so its HLO
+# doesn't bloat _monster_jit_impl.  Tiny module; the win is partial cache
+# stability when other phases change, not raw compile-time reduction (G
+# itself is small).  This is Phase 1 of the 5-way split.
+from Nethax.nethax.subsystems.monster_ai import (
+    _monster_status_tick_body as _monster_status_tick_impl,
+    _monsters_step_pre_c as _monsters_step_pre_c_impl,
+    _monster_turn_phase_body as _monster_turn_phase_impl,
+    _monsters_step_post_c as _monsters_step_post_c_impl,
+)
+_monster_status_tick_jit = jax.jit(_monster_status_tick_impl)
+_VMAP_STATUS_TICK = jax.vmap(_monster_status_tick_jit, in_axes=(0,))
+
+# Phase 2 of the 5-way monster-jit split — hoist Phases A+B (pre_c),
+# Phase C (per-monster turn loop) and Phases D+E+F (post_c) out of
+# `_monster_jit_impl` so each compiles as its own module.  Only the
+# byte-parity (NLE_BYTEPARITY) path is split; the threefry branch
+# stays inline in `monsters_step_all`.
+#
+# Gating: each phase is wrapped in a small jit that takes the pre-step
+# ``orig_state`` and ``action_consumed_turn`` and returns
+# ``orig_state`` unchanged when the action did not consume a turn
+# (matches the vendor moveloop's do-while short-circuit at
+# allmain.c:88-112).  ``jnp.where`` select avoids the both-branch HLO
+# blowup under vmap (Brax-flat pattern, see _monster_jit_impl).
+def _monster_pre_c_jit_impl(ns, pre_state, rng_monsters):
+    """JIT wrapper for Phase A+B (pre_c).
+
+    ``ns`` is the post-dispatch state; ``pre_state`` is the step-start
+    state used for the ``done`` short-circuit (mirrors
+    ``_monster_jit_impl``).  Returns ``(state, pre_round, turn_keys,
+    mhit_keys)`` gated against ``pre_state.done`` AND
+    ``ns.action_consumed_turn``.  When either gate is closed the
+    returned state equals ``ns`` (no monster work done); the
+    pre_round/turn_keys/mhit_keys outputs are still computed but
+    downstream phases gate identically so their values are inert.
+    """
+    new_state, pre_round, turn_keys, mhit_keys = _monsters_step_pre_c_impl(
+        ns, rng_monsters,
+    )
+    run_gate = ns.action_consumed_turn & (~pre_state.done)
+    gated = jax.tree_util.tree_map(
+        lambda new, orig: jnp.where(run_gate, new, orig),
+        new_state,
+        ns,
+    )
+    return gated, pre_round, turn_keys, mhit_keys
+
+
+def _monster_turn_jit2_impl(ns, pre_state, orig_ns, turn_keys):
+    """JIT wrapper for Phase C.  ``orig_ns`` is the post-dispatch /
+    pre-pre_c snapshot used as the no-op fallback; ``pre_state`` is the
+    step-start state used for the ``done`` short-circuit.
+    """
+    new_state = _monster_turn_phase_impl(ns, turn_keys)
+    run_gate = orig_ns.action_consumed_turn & (~pre_state.done)
+    return jax.tree_util.tree_map(
+        lambda new, orig: jnp.where(run_gate, new, orig),
+        new_state,
+        orig_ns,
+    )
+
+
+def _monster_post_c_jit_impl(ns, pre_state, orig_ns, pre_round, mhit_keys):
+    """JIT wrapper for Phase D+E+F (post_c).  ``orig_ns`` is the
+    post-dispatch / pre-pre_c snapshot used as the no-op fallback;
+    ``pre_state`` is the step-start state used for the ``done`` gate.
+    """
+    new_state = _monsters_step_post_c_impl(ns, pre_round, mhit_keys)
+    run_gate = orig_ns.action_consumed_turn & (~pre_state.done)
+    return jax.tree_util.tree_map(
+        lambda new, orig: jnp.where(run_gate, new, orig),
+        new_state,
+        orig_ns,
+    )
+
+
+_monster_pre_c_jit  = jax.jit(_monster_pre_c_jit_impl)
+_monster_turn_jit2  = jax.jit(_monster_turn_jit2_impl)
+_monster_post_c_jit = jax.jit(_monster_post_c_jit_impl)
+_VMAP_MONSTER_PRE_C  = jax.vmap(_monster_pre_c_jit,  in_axes=(0, 0, 0))
+_VMAP_MONSTER_TURN   = jax.vmap(_monster_turn_jit2,  in_axes=(0, 0, 0, 0))
+_VMAP_MONSTER_POST_C = jax.vmap(_monster_post_c_jit, in_axes=(0, 0, 0, 0, 0))
 _VMAP_POST_MONSTER = jax.vmap(
     _post_monster_jit,
     in_axes=(0, 0, 0, 0, 0, 0, 0, 0),
@@ -2104,8 +2234,28 @@ def _step_impl_batched(states, actions, rngs, static_action: int | None = None):
     # Phase 1a/1b (vmapped) — astral mplayer seed + dig tick.
     ns = _VMAP_PRE_MONSTER(ns, states, rng_act, rng_astral, prev_branch, prev_level)
 
-    # Phase 2/2b/2c (vmapped) — monster turn + region tick + stinking cloud.
+    # Phase 2 carve-out (vmapped) — monster turn split into pre_c +
+    # Phase C + post_c when ``NETHAX_JIT_SPLIT=1``; otherwise the AI
+    # step runs inline inside ``_VMAP_MONSTER``.  See ``_step_impl``
+    # for rationale.
+    if _USE_JIT_SPLIT:
+        _orig_ns = ns
+        ns, _pre_round, _turn_keys, _mhit_keys = _VMAP_MONSTER_PRE_C(
+            ns, states, rng_monsters,
+        )
+        ns = _VMAP_MONSTER_TURN(ns, states, _orig_ns, _turn_keys)
+        ns = _VMAP_MONSTER_POST_C(ns, states, _orig_ns, _pre_round, _mhit_keys)
+
+    # Phase 2b/2c (vmapped) — region tick + stinking cloud.
+    # Also drives the monster AI step inline when ``_USE_JIT_SPLIT`` is
+    # False (see ``_monster_body``).
     ns = _VMAP_MONSTER(ns, states, rng_monsters, rng_regions)
+
+    if _USE_JIT_SPLIT:
+        # Phase 2d (vmapped) — status timer tick + vault-guard cleanup.
+        # Extracted from monsters_step_all to compile as a separate,
+        # tiny JIT module.  Phase 1 of the 5-way monster-jit split.
+        ns = _VMAP_STATUS_TICK(ns)
 
     # Phase 3..8a (vmapped) — turn counter through Wizard-intervene.
     new_states = _VMAP_POST_MONSTER(
