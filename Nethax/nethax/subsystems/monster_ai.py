@@ -36,6 +36,7 @@ TODO — later Wave 5 phases:
 """
 
 import functools
+import os as _os
 from enum import IntEnum
 
 import jax
@@ -54,7 +55,12 @@ _MAP_W: int = 80
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_MONSTERS_PER_LEVEL: int = 400
+# Override via NETHAX_MAX_MONSTERS env var to shrink the per-level monster
+# array size.  Default 400 matches vendor NetHack's monster slot capacity;
+# smaller values let us trade byte parity for dramatically faster Mac CPU
+# runtime (operations on monster arrays scale linearly with this value).
+# Test scenarios that spawn ≤N monsters preserve byte parity at N slots.
+MAX_MONSTERS_PER_LEVEL: int = int(_os.environ.get("NETHAX_MAX_MONSTERS", "400"))
 
 # Wave 6 Mission: per-monster inventory width.
 # Vendor monsters can carry arbitrary inventory chains (struct obj *minvent in
