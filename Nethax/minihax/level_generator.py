@@ -803,11 +803,18 @@ def _apply_directives(
         _engine = _NethaxEnv(static=static)
         # Archeologist-Human-Lawful is the canonical MiniHack character
         # ("arc-hum-law-mal" — .test_runs/minihax_byteparity.py:149).
+        # ``fast_reset=True``: skip mklev dungeon-gen / pet spawn / view_from
+        # since LG directives below stamp the terrain authoritatively and the
+        # ``default_lit`` block at the tail of this factory seeds FoV.
+        # The ISAAC64 stream is still advanced through init_objects ->
+        # role_init -> init_dungeons -> u_init so descr_idx + inventory
+        # remain byte-aligned with vendor MiniHack.
         state, _ = _engine.reset(
             _raw_key,
             role=_Role.ARCHEOLOGIST,
             race=_Race.HUMAN,
             alignment=0,
+            fast_reset=True,
         )
         # NethaxEnv.reset populated the state with a full vendor dungeon
         # level — rooms, fountains, sleeping monsters, dropped items,
@@ -1117,13 +1124,12 @@ def _apply_directives(
     # last_seen sentinel and renders every interior cell as stone, breaking
     # byte-parity against vendor MiniHack Room envs (vendor preflood lights
     # the room because LevelGenerator(lit=True) -> rlit=1).
-    # Wave 6 reroute (cfc2db6): under NLE_BYTEPARITY, NethaxEnv.reset already
-    # runs view_from for FoV before _apply_directives sees this state, so the
-    # LG-side preflood here is pure redundant compile work.  Skip it under the
-    # vendor-RNG path; keep it for the legacy Threefry path where LG still
-    # needs to seed FoV.
-    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vrng_bootstrap
-    if lg.default_lit and not _use_vrng_bootstrap():
+    # Wave 6 reroute (cfc2db6): the vendor-RNG bootstrap calls NethaxEnv.reset
+    # with ``fast_reset=True``, which SKIPS the engine-side view_from FoV
+    # seed (view_from on 21x79 is the dominant Mac compile cost).  We must
+    # therefore run the LG-side preflood under BOTH the vendor-RNG path AND
+    # the legacy Threefry path so the starting room renders as lit floor.
+    if lg.default_lit:
         from Nethax.nethax.fov import view_from as _view_from
         terrain_l0 = state.terrain[0, 0]
         couldsee = _view_from(

@@ -84,6 +84,7 @@ class NethaxEnv:
         race: "Race | None" = None,
         alignment: int = 0,
         disp_seed: int | None = None,
+        fast_reset: bool = False,
     ) -> Tuple[EnvState, Dict[str, jax.Array]]:
         """Return (initial_state, initial_observation).
 
@@ -100,6 +101,18 @@ class NethaxEnv:
                     Cite: vendor/nle/src/nle.c:530-532
                           ``nle_set_seed(core, disp, reseed)`` seeds the
                           two ``rnglist[]`` entries independently.
+        fast_reset : Minihax bootstrap mode.  When True, runs ONLY the
+                    pre-mklev portion of vendor newgame:
+                      set_random -> init_objects -> role_init ->
+                      init_dungeons -> u_init -> moonphase.
+                    Skips mklev (dungeon-gen + per-OROOM monster spawn),
+                    makedog pet spawn, the makedog trailer rnd cascade,
+                    and the level-entry view_from/lit_room_flood FoV
+                    seed.  Caller (LevelGenerator._apply_directives) is
+                    responsible for stamping terrain + seeding FoV.
+                    Cuts ~25-min Mac compile (dungeon-gen scan +
+                    view_from on 21x79 grid) for the minihax byte-parity
+                    path which overwrites those fields anyway.
         """
         if role is None:
             role = Role.VALKYRIE
@@ -362,6 +375,30 @@ class NethaxEnv:
                 player_luck=(state.player_luck.astype(jnp.int8)
                              + jnp.int8(_luck_delta)),
             )
+
+        # ------------------------------------------------------------------
+        # FAST-RESET EARLY RETURN  (minihax bootstrap path)
+        # ------------------------------------------------------------------
+        # At this point we have executed exactly the pre-mklev portion of
+        # vendor allmain.c::newgame:
+        #
+        #   set_random -> init_objects -> role_init -> init_dungeons ->
+        #   u_init -> moonphase
+        #
+        # That covers the ISAAC64 draws that affect MiniHack reset-time
+        # observations:
+        #   * descr_idx     (init_objects shuffle, drives inv_glyphs ids)
+        #   * inventory     (u_init Archeologist ini_inv + rn2 cascade)
+        #   * player stats  (create_character, init_skills)
+        #
+        # Everything after this point (mklev dungeon-gen + monster spawn,
+        # makedog pet spawn + d(1,8)/rnd(9000) cascade, view_from + lit
+        # room flood) operates on tiles that LevelGenerator overwrites
+        # before the validator sees them.  Skipping it cuts the dominant
+        # JAX compile time (dungeon-gen lax.scan, view_from on 21x79).
+        if fast_reset:
+            obs = build_nle_observation(state)
+            return state, obs
 
         # Vendor mklev() begins by reseeding BOTH streams (vendor
         # mklev.c:996-997)::
