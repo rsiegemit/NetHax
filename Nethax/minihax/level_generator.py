@@ -961,27 +961,39 @@ def _apply_directives(
             features=state.features.replace(door_state=ds_arr),
         )
 
-    # 4c. Materialise starting-inventory directives (vendor des ``INV:``).
-    # Build a list of Items in declaration order, then hand off to
-    # InventoryState.from_items so slot 0 -> 'a', slot 1 -> 'b', etc.
-    if starting_inv:
-        from Nethax.nethax.subsystems.inventory import (
-            InventoryState as _InventoryState,
-            make_item as _make_item,
+    # 4c. Materialise starting inventory.
+    #
+    # Vendor MiniHack envs run NetHack's full startup, so every hero spawns
+    # with the role's ``ini_inv(...)`` items (vendor/nethack/src/u_init.c)
+    # FIRST, and only then do des ``INV:`` directives append additional
+    # carried items (vendor/nle/src/sp_lev.c::create_object with INV flag).
+    # Minihax defaults the hero to Archeologist (see EnvState.default
+    # ``player_role=0`` and tests pass ``character="arc-hum-law-mal"``),
+    # so seed STARTING_INVENTORY[Role.ARCHEOLOGIST] before INV: items.
+    # Without this, ``inv_glyphs`` slot 0 was NO_GLYPH (5976) instead of
+    # the BULLWHIP glyph (1906+64=1970) the vendor RL channel emits.
+    from Nethax.nethax.subsystems.inventory import (
+        InventoryState as _InventoryState,
+        make_item as _make_item,
+    )
+    from Nethax.nethax.subsystems.character import (
+        STARTING_INVENTORY as _STARTING_INVENTORY,
+        Role as _Role,
+    )
+    items = list(_STARTING_INVENTORY[_Role.ARCHEOLOGIST])
+    items.extend(
+        _make_item(
+            category=d.category,
+            type_id=d.type_id,
+            quantity=d.quantity,
+            weight=d.weight,
+            buc_status=d.buc_status,
+            identified=d.identified,
+            bknown=True, dknown=True, rknown=True,
         )
-        items = [
-            _make_item(
-                category=d.category,
-                type_id=d.type_id,
-                quantity=d.quantity,
-                weight=d.weight,
-                buc_status=d.buc_status,
-                identified=d.identified,
-                bknown=True, dknown=True, rknown=True,
-            )
-            for d in starting_inv
-        ]
-        state = state.replace(inventory=_InventoryState.from_items(items))
+        for d in starting_inv
+    )
+    state = state.replace(inventory=_InventoryState.from_items(items))
 
     # 5. Apply player start position (default: any free floor tile).
     if lg.last_player_pos is not None:

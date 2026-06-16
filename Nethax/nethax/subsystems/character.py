@@ -524,11 +524,11 @@ STARTING_INVENTORY: dict = {
         _weapon(ObjType.BULLWHIP, enchant=2),
         _armor(ObjType.LEATHER_JACKET),
         _armor(ObjType.FEDORA),
+        _food(ObjType.FOOD_RATION, 3),
         _tool(ObjType.PICK_AXE),
         _tool(ObjType.TINNING_KIT),
-        _tool(ObjType.SACK),
         _tool(ObjType.TOUCHSTONE),
-        _food(ObjType.FOOD_RATION, 3),
+        _tool(ObjType.SACK),
     ],
     # Bar variant 0: two-handed sword+0, axe+0, ring mail+0, food ration.
     # u_init.c Barbarian_0 (54-67): TWO_HANDED_SWORD, AXE, RING_MAIL,
