@@ -999,6 +999,48 @@ def _apply_directives(
             )
             lg.last_player_pos = (int(c), int(r))
 
+    # 6. Seed initial FOV / last_seen_terrain so the starting room renders as
+    # lit floor (S_room, cmap=19, glyph=2378) instead of S_stone (glyph=2359).
+    # Mirrors Nethax/nethax/env.py:556-631 (vendor vision_recalc on level
+    # entry).  Without this, build_nle_observation falls back to the -1
+    # last_seen sentinel and renders every interior cell as stone, breaking
+    # byte-parity against vendor MiniHack Room envs (vendor preflood lights
+    # the room because LevelGenerator(lit=True) -> rlit=1).
+    if lg.default_lit:
+        from Nethax.nethax.fov import view_from as _view_from
+        terrain_l0 = state.terrain[0, 0]
+        couldsee = _view_from(
+            terrain_l0,
+            state.player_pos.astype(jnp.int32),
+            max_radius=0,
+        )
+        # "Lit" mask: any non-VOID tile is part of the lit room/corridor when
+        # default_lit=True.  This intentionally treats the whole carved area
+        # as lit, matching LevelGenerator(lit=True) where every add_room /
+        # fill_terrain carves lit floor.
+        lit_mask = terrain_l0 != jnp.int8(int(TileType.VOID))
+        # Hero-radius (Chebyshev<=1) fallback for cells outside any room.
+        pr = state.player_pos[0].astype(jnp.int32)
+        pc = state.player_pos[1].astype(jnp.int32)
+        _h_g, _w_g = terrain_l0.shape
+        rows_g = jnp.arange(_h_g, dtype=jnp.int32)[:, None]
+        cols_g = jnp.arange(_w_g, dtype=jnp.int32)[None, :]
+        within_light = (
+            (jnp.abs(rows_g - pr) <= jnp.int32(1))
+            & (jnp.abs(cols_g - pc) <= jnp.int32(1))
+        )
+        vis = couldsee & (lit_mask | within_light)
+        old_lst = state.last_seen_terrain[0, 0]
+        new_lst = jnp.where(vis, terrain_l0.astype(jnp.int8), old_lst)
+        new_explored = state.explored.at[0, 0].set(
+            state.explored[0, 0] | vis
+        )
+        state = state.replace(
+            explored=new_explored,
+            visible=vis,
+            last_seen_terrain=state.last_seen_terrain.at[0, 0].set(new_lst),
+        )
+
     return state
 
 
