@@ -1117,7 +1117,13 @@ def _apply_directives(
     # last_seen sentinel and renders every interior cell as stone, breaking
     # byte-parity against vendor MiniHack Room envs (vendor preflood lights
     # the room because LevelGenerator(lit=True) -> rlit=1).
-    if lg.default_lit:
+    # Wave 6 reroute (cfc2db6): under NLE_BYTEPARITY, NethaxEnv.reset already
+    # runs view_from for FoV before _apply_directives sees this state, so the
+    # LG-side preflood here is pure redundant compile work.  Skip it under the
+    # vendor-RNG path; keep it for the legacy Threefry path where LG still
+    # needs to seed FoV.
+    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vrng_bootstrap
+    if lg.default_lit and not _use_vrng_bootstrap():
         from Nethax.nethax.fov import view_from as _view_from
         terrain_l0 = state.terrain[0, 0]
         couldsee = _view_from(
