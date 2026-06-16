@@ -404,18 +404,52 @@ def _make_factory(builder: Callable[[LevelGenerator], None],
 # ---------------------------------------------------------------------------
 # Room envs (Group A)
 # ---------------------------------------------------------------------------
+# Vendor MiniHack Room envs emit ``GEOMETRY:center,center`` in every LG header
+# (vendor/minihack/minihack/level_generator.py:127), which centers the
+# size×size MAP block on the 80×21 NetHack dungeon level.  The C-side
+# centering formula lives in vendor/nle/src/sp_lev.c:4943-4967:
+#     xstart = 2 + ((x_maze_max - 2 - xsize) / 2)
+#     ystart = 2 + ((y_maze_max - 2 - ysize) / 2)
+#     if (!(xstart % 2)) xstart++
+#     if (!(ystart % 2)) ystart++
+# with x_maze_max=78 (COLNO-1) and y_maze_max=20 (ROWNO-1).
+#
+# Without this centering, minihax stamped the room at terrain[0:size, 0:size]
+# instead of the centered location, which placed the agent at obs (y=0,x=0)
+# inside a wall — see MiniHack-Room-5x5 byte-parity failure where vendor has
+# glyph 2359 (stone) at (0,0) but minihax had glyph 327 (the @).
+def _vendor_geometry_center(size: int) -> tuple[int, int]:
+    """Return (xstart, ystart) absolute (col, row) for a ``size``×``size`` MAP
+    block under ``GEOMETRY:center,center`` on the 80×21 dungeon."""
+    x_maze_max = 78  # COLNO - 1
+    y_maze_max = 20  # ROWNO - 1
+    xstart = 2 + ((x_maze_max - 2 - size) // 2)
+    ystart = 2 + ((y_maze_max - 2 - size) // 2)
+    if (xstart % 2) == 0:
+        xstart += 1
+    if (ystart % 2) == 0:
+        ystart += 1
+    return xstart, ystart
+
+
 def _room_builder(size: int, *, random: bool, lit: bool,
                   n_monster: int, n_trap: int) -> Callable[[LevelGenerator], None]:
+    x0, y0 = _vendor_geometry_center(size)
+    x1, y1 = x0 + size - 1, y0 + size - 1
+
     def build(lg: LevelGenerator) -> None:
-        # The level itself is a single ``size x size`` room with floor fill.
-        # We carve walls around the room border so the goal-stair sits inside
-        # a clearly bounded space.
+        # The LG is full-size (80×21) with VOID fill; carve a size×size FLOOR
+        # rectangle at the vendor-centered location so the room sits where
+        # ``GEOMETRY:center,center`` would put it.
+        lg.fill_terrain(".", x0, y0, x1, y1)
         if random:
-            lg.add_stair_down()    # any floor cell
+            lg.add_stair_down()    # any floor cell (only FLOOR is in the room)
         else:
             # Deterministic: stair at bottom-right, start at top-left.
-            lg.add_stair_down(x=size - 1, y=size - 1)
-            lg.set_start_pos(0, 0)
+            # Vendor MiniHackRoom passes MAP-relative (size-1, size-1) and
+            # (0, 0); we add the centering offset here.
+            lg.add_stair_down(x=x1, y=y1)
+            lg.set_start_pos(x0, y0)
         for _ in range(n_monster):
             lg.add_monster()
         for _ in range(n_trap):
@@ -444,7 +478,10 @@ def _register_room_envs(register_fn) -> None:
         builder = _room_builder(
             size, random=random, lit=lit, n_monster=nm, n_trap=nt,
         )
-        factory = _make_factory(builder, w=size, h=size, lit=lit)
+        # Full 80×21 LG with VOID fill (" ") so only the explicitly carved
+        # centered FLOOR rect is walkable, matching vendor's
+        # ``INIT_MAP:solidfill,' '`` + ``GEOMETRY:center,center`` MAP block.
+        factory = _make_factory(builder, w=80, h=21, fill=" ", lit=lit)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=size * 20, category="Room")
 
