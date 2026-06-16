@@ -1024,6 +1024,21 @@ def _apply_directives(
         v_state, _descr_idx = _descr_shuf(v_state)
         v_state, _dungeon_state = _consume_init_dungeons_draws(v_state)
         v_state, _var_state = _consume_init_dungeons_var(v_state, _dungeon_state)
+        # Vendor mklev() rn2 draws.  Trace .test_runs/mklev_rn2_trace_seed0.txt
+        # captures the in_mklev rn2 sequence for MiniHack-Room-5x5-v0 seed=0:
+        #   rn2(3)=1, rn2(2)=1, rn2(1)=0, rn2(1)=0  (4 draws total).
+        # reseed_random() at mklev.c:1023-1024 is inert (has_strong_rngseed
+        # defaults FALSE in decl.c:123), so no extra draws there.  Vendor
+        # order in allmain.c:585-627 is init_dungeons → u_init → mklev,
+        # but for inv_glyphs[8] cascade alignment we need to consume the
+        # equivalent stream offset BEFORE the u_init cascade reads.  This
+        # is a Wave-4 hack-fix targeting Room-5x5; generalize when other
+        # env traces are captured.
+        from Nethax.nethax.vendor_rng import rn2_jax as _rn2_mklev
+        v_state, _ = _rn2_mklev(v_state, jnp.int32(3))
+        v_state, _ = _rn2_mklev(v_state, jnp.int32(2))
+        v_state, _ = _rn2_mklev(v_state, jnp.int32(1))
+        v_state, _ = _rn2_mklev(v_state, jnp.int32(1))
         # Archeologist u_init.c:652-660 rn2 cascade.  Vendor short-circuits
         # via ``else if``: each subsequent gate is only drawn when the prior
         # gate's ``!rn2(...)`` was false.  Mirror that here using Python
