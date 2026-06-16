@@ -2,9 +2,40 @@
 import jax
 import jax.numpy as jnp
 
-from Nethax.minihax.constants import Action, NUM_ACTIONS_TIER4
+from Nethax.minihax.constants import Action, NUM_ACTIONS_TIER4, TileType
 from Nethax.minihax.primitives.movement import move_player, check_stair_goal, push_boulder
 from Nethax.minihax.primitives.visibility import compute_visible, update_seen_map
+
+
+def count_pits(terrain_2d):
+    """Count PIT tiles on a 2-D terrain slice. Pure JAX, vmappable.
+
+    Args:
+        terrain_2d: int8[H, W] terrain tile-id grid (one level slice).
+
+    Returns:
+        jnp.int32 — number of TileType.PIT cells.
+    """
+    return jnp.sum(terrain_2d == TileType.PIT).astype(jnp.int32)
+
+
+def sokoban_reward(prev_terrain_2d, new_terrain_2d):
+    """Vendor MiniHack Sokoban shaping (envs/sokoban.py _reward_fn lines 47-60):
+    reward = penalty_time + (pits_before - pits_after) * reward_shaping_coefficient
+    with vendor MiniHackSokoban1a-4b defaults penalty_time=-0.001 and
+    reward_shaping_coefficient=+0.1.
+
+    Args:
+        prev_terrain_2d: int8[H, W] terrain BEFORE the step.
+        new_terrain_2d:  int8[H, W] terrain AFTER the step.
+
+    Returns:
+        jnp.float32 scalar — shaping reward to add to the per-step reward.
+    """
+    pits_before = count_pits(prev_terrain_2d)
+    pits_after = count_pits(new_terrain_2d)
+    filled = jnp.maximum(jnp.int32(0), pits_before - pits_after)
+    return jnp.float32(0.1) * filled.astype(jnp.float32) - jnp.float32(0.001)
 
 
 def sokoban_step(rng, state, action, params, static_params):

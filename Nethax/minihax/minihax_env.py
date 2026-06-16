@@ -61,6 +61,7 @@ from Nethax.minihax.registry import (
     EnvSpec,
     get_spec,
 )
+from Nethax.minihax.game_logic.sokoban import sokoban_reward, count_pits
 
 
 class MinihaxEnv:
@@ -143,9 +144,15 @@ class MinihaxEnv:
         get a Python int.
         """
         state = self._level_factory(rng)
+        # Vendor parity: vendor/minihack/minihack/envs/sokoban.py:32-45
+        # gates TASK_SUCCESSFUL on len(pits) == 0; we must remember whether
+        # there were any pits at reset so an episode with zero pits never
+        # auto-terminates on "all pits filled".
+        pits_at_reset = count_pits(state.terrain[0, 0])
         info: Dict[str, Any] = {
             "fired_mask": self._reward_manager.initial_fired_mask(),
             "step_count": jnp.int32(0),
+            "pits_at_reset": pits_at_reset,
         }
         return state, info
 
@@ -157,6 +164,7 @@ class MinihaxEnv:
         *,
         fired_mask: Optional[jax.Array] = None,
         step_count: Any = 0,
+        pits_at_reset: Any = None,
     ) -> Tuple[EnvState, jax.Array, jax.Array, Dict[str, Any]]:
         """Apply ``action``, evaluate reward, return updated state.
 
@@ -191,6 +199,9 @@ class MinihaxEnv:
         if fired_mask is None:
             fired_mask = self._reward_manager.initial_fired_mask()
 
+        # Capture pre-step terrain slice for shaping deltas (Sokoban etc.).
+        prev_terrain_2d = state.terrain[0, 0]
+
         new_state, _obs, _engine_reward, _engine_done, _engine_info = (
             self._engine.step(state, action, rng)
         )
@@ -224,6 +235,38 @@ class MinihaxEnv:
         # in vendor it is paid each step when frozen (tasks.py:55-80).
         reward = jnp.asarray(reward, dtype=jnp.float32) + jnp.float32(self._penalty_step)
 
+        # ------------------------------------------------------------------
+        # Sokoban pit-fill shaping
+        # ------------------------------------------------------------------
+        # Vendor parity: vendor/minihack/minihack/envs/sokoban.py:47-60
+        # `_reward_fn` returns
+        #     penalty_time + (pits_before - pits_after) * shaping_coefficient
+        # with all MiniHack-Sokoban<N><a|b>-v0 ids setting
+        # ``penalty_time = -0.001`` and ``reward_shaping_coefficient = +0.1``
+        # (vendor envs/sokoban.py lines 71-72 / 77-78 / etc.).  Vendor
+        # additionally returns +1 on TASK_SUCCESSFUL (line 49), which our
+        # RewardManager already supplies via the stair-down event.
+        #
+        # We dispatch on ``self.category`` because the category is a Python-
+        # side constant captured at construction; this keeps the JAX trace
+        # branchless.
+        new_terrain_2d = new_state.terrain[0, 0]
+        if self._spec.category == "Sokoban":
+            shaping = sokoban_reward(prev_terrain_2d, new_terrain_2d)
+            reward = reward + shaping
+            # Terminal on all-pits-filled.  Only fires if there *were* pits at
+            # reset (vendor envs/sokoban.py:36-38 — empty-pits envs never hit
+            # TASK_SUCCESSFUL via this path).
+            pits_now = count_pits(new_terrain_2d)
+            if pits_at_reset is None:
+                pits_at_reset_j = jnp.int32(0)
+            else:
+                pits_at_reset_j = jnp.asarray(pits_at_reset, dtype=jnp.int32)
+            all_pits_filled = (pits_now == jnp.int32(0)) & (
+                pits_at_reset_j > jnp.int32(0)
+            )
+            done = jnp.logical_or(done, all_pits_filled)
+
         info: Dict[str, Any] = {
             "fired_mask": new_fired,
             "step_count": new_step_count,
@@ -231,6 +274,12 @@ class MinihaxEnv:
             "engine_done": engine_done_b,
             "reward_manager_done": rm_done_b,
         }
+        if self._spec.category == "Sokoban":
+            # Thread pits_at_reset through so callers can pass it back to step.
+            info["pits_at_reset"] = (
+                jnp.int32(0) if pits_at_reset is None
+                else jnp.asarray(pits_at_reset, dtype=jnp.int32)
+            )
         return new_state, reward, done, info
 
     # ------------------------------------------------------------------
