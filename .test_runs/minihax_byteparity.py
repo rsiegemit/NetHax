@@ -140,7 +140,13 @@ def vendor_dump(env_id: str, seed: int) -> dict:
     # vendor base.py reset() branch (line 373) is skipped (no Python random
     # burn).
     random.seed(seed)  # neutralise any other ad-hoc random use during setup
-    env = cls(observation_keys=_OBS_KEYS)
+    # Minihax MinihaxEnv stores defaults as player_role=0=ARCHEOLOGIST,
+    # player_race=0=HUMAN, player_align=0=LAWFUL on the EnvState (verified
+    # at reset via key(0)).  Despite env.py:105 saying Role.VALKYRIE is the
+    # reset default, the MinihaxEnv path keeps the EnvState zero-init,
+    # producing @ glyph 327 (Archeologist PM).  Vendor character format
+    # is "role-race-align-gender" (vendor/minihack/minihack/navigation.py:38).
+    env = cls(observation_keys=_OBS_KEYS, character="arc-hum-law-mal")
     assert env._level_seeds is None, (
         "vendor env should have _level_seeds=None to avoid silent draw"
     )
