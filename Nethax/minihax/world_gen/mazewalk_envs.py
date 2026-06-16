@@ -185,7 +185,7 @@ def _place_stair_in_region(rng, game_map, tile_type, stair_tile,
 # mazewalk.des: 12x13 room, MAZEWALK from (col=5,row=5), stairs random
 # ============================================================================
 
-def generate_mazewalk(rng, params, static_params):
+def generate_mazewalk(rng, params, static_params, *, premapped: bool = False):
     """Generate a 12x13 maze with random stair placement.
 
     .des spec:
@@ -193,6 +193,11 @@ def generate_mazewalk(rng, params, static_params):
         MAZEWALK:(5,5),east  -> start at (row=5, col=5)
         STAIR:random,up
         STAIR:random,down
+
+    Args:
+        premapped: if True, ``seen_map`` starts as all-True (full layout
+            known to the agent on reset), matching MiniHack ``-Mapped``
+            variants.
     """
     rng, rng_maze, rng_up, rng_down = jax.random.split(rng, 4)
 
@@ -234,12 +239,13 @@ def generate_mazewalk(rng, params, static_params):
 
     lit_map = compute_lit_map(game_map)
     visible_map = compute_visible(upstair_pos, game_map, static_params.map_height, static_params.map_width, lit_map)
+    seen_map = jnp.ones_like(visible_map) if premapped else visible_map
     return NavigationState(
         map=game_map,
         player_position=upstair_pos,
         downstair_position=downstair_pos,
         ground_items=_empty_ground_items(static_params.max_ground_items),
-        seen_map=visible_map,
+        seen_map=seen_map,
         visible_map=visible_map,
         lit_map=lit_map,
         timestep=0,
@@ -321,14 +327,17 @@ def _make_explore_easy_map(rng):
     return rng, game_map, active_h, active_w
 
 
-def generate_explore_maze_easy(rng, params, static_params):
-    """ExploreMazeEasy: 21x11 two-half maze, not premapped.
+def generate_explore_maze_easy(rng, params, static_params, *, premapped: bool = False):
+    """ExploreMazeEasy: 21x11 two-half maze.
 
     .des spec:
         STAIR:(09,01,09,09),(0,0,0,0),down  -> col=9, row 1..9
         BRANCH:(01,01,01,09),(0,0,0,0)      -> col=1, row 1..9 (player start)
         LOOP [4] { OBJECT:('%',"apple"),rndcoord(fillrect(19,1,19,09)) }
             -> 4 apples at col=19, rows 1..9
+
+    Args:
+        premapped: if True, ``seen_map`` starts as all-True.
     """
     rng, rng_stair, rng_branch, rng_apples = jax.random.split(rng, 4)
     rng_rest, game_map, active_h, active_w = _make_explore_easy_map(rng)
@@ -359,12 +368,13 @@ def generate_explore_maze_easy(rng, params, static_params):
 
     lit_map = compute_lit_map(game_map)
     visible_map = compute_visible(upstair_pos, game_map, static_params.map_height, static_params.map_width, lit_map)
+    seen_map = jnp.ones_like(visible_map) if premapped else visible_map
     return NavigationState(
         map=game_map,
         player_position=upstair_pos,
         downstair_position=downstair_pos,
         ground_items=ground_items,
-        seen_map=visible_map,
+        seen_map=seen_map,
         visible_map=visible_map,
         lit_map=lit_map,
         timestep=0,
@@ -375,8 +385,8 @@ def generate_explore_maze_easy(rng, params, static_params):
 
 
 def generate_explore_maze_easy_premapped(rng, params, static_params):
-    """ExploreMazeEasy premapped -- same generation, flag only."""
-    return generate_explore_maze_easy(rng, params, static_params)
+    """ExploreMazeEasy premapped -- same generation, seen_map all-True."""
+    return generate_explore_maze_easy(rng, params, static_params, premapped=True)
 
 
 # ============================================================================
@@ -441,14 +451,17 @@ def _make_explore_hard_map(rng):
     return rng, game_map, active_h, active_w
 
 
-def generate_explore_maze_hard(rng, params, static_params):
-    """ExploreMazeHard: 29x15 two-half maze, not premapped.
+def generate_explore_maze_hard(rng, params, static_params, *, premapped: bool = False):
+    """ExploreMazeHard: 29x15 two-half maze.
 
     .des spec:
         STAIR:(14,01,14,09),(0,0,0,0),down  -> col=14, row 1..9
         BRANCH:(01,01,01,13),(0,0,0,0)      -> col=1, row 1..13
         LOOP [4] { OBJECT:('%',"apple"),rndcoord(fillrect(27,1,27,13)) }
             -> 4 apples at col=27, rows 1..13
+
+    Args:
+        premapped: if True, ``seen_map`` starts as all-True.
     """
     rng, rng_stair, rng_branch, rng_apples = jax.random.split(rng, 4)
     rng_rest, game_map, active_h, active_w = _make_explore_hard_map(rng)
@@ -479,12 +492,13 @@ def generate_explore_maze_hard(rng, params, static_params):
 
     lit_map = compute_lit_map(game_map)
     visible_map = compute_visible(upstair_pos, game_map, static_params.map_height, static_params.map_width, lit_map)
+    seen_map = jnp.ones_like(visible_map) if premapped else visible_map
     return NavigationState(
         map=game_map,
         player_position=upstair_pos,
         downstair_position=downstair_pos,
         ground_items=ground_items,
-        seen_map=visible_map,
+        seen_map=seen_map,
         visible_map=visible_map,
         lit_map=lit_map,
         timestep=0,
@@ -495,5 +509,5 @@ def generate_explore_maze_hard(rng, params, static_params):
 
 
 def generate_explore_maze_hard_premapped(rng, params, static_params):
-    """ExploreMazeHard premapped -- same generation, flag only."""
-    return generate_explore_maze_hard(rng, params, static_params)
+    """ExploreMazeHard premapped -- same generation, seen_map all-True."""
+    return generate_explore_maze_hard(rng, params, static_params, premapped=True)
