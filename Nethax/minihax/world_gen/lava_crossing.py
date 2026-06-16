@@ -1,8 +1,12 @@
-"""World generator for Minihax-LavaCrossing-v0.
+"""World generator for Minihax-LavaCrossing-v0 and the MiniGrid-ported
+LavaCrossingS{W}N{n_strips}-v0 family.
 
-From lava_crossing.des: 13x7 map with walls, floor interior, lava column
-at col 6. Random item (levitation or cold) on left bank. Player on left
-bank, stair on right bank.
+Vendor reference: MiniGrid's ``LavaCrossingEnv`` carves ``n_strips`` vertical
+lava barriers at (approximately) equally-spaced x positions across a WxH
+interior.  Each strip has exactly one random opening so the agent can pass
+through.  The default ``n_strips=1`` matches the shipped
+``vendor/minihack/minihack/dat/lava_crossing.des`` (13x7, single column at
+col 6).
 
 .des coordinate convention: (col, row). Our code: (row, col).
 """
@@ -19,55 +23,88 @@ from Nethax.minihax.primitives.visibility import compute_visible, compute_lit_ma
 from Nethax.minihax.primitives.leveling import compute_initial_stats
 
 
-# Active map: 13 wide x 7 tall
-_ACTIVE_W = 13
-_ACTIVE_H = 7
-
-# Left bank: cols 1-5, rows 1-5  (in row,col)
-# Right bank: cols 7-11, rows 1-5
+# Default active map (single-strip variant): 13 wide x 7 tall.  Left bank
+# cols 1-5, right bank cols 7-11, lava column at col 6.
+_DEFAULT_W = 13
+_DEFAULT_H = 7
 
 
-def _make_lava_crossing_map():
-    """Build the static lava crossing map."""
-    game_map = jnp.full((_ACTIVE_H, _ACTIVE_W), TileType.VOID, dtype=jnp.int32)
+def _strip_cols_list(active_w: int, n_strips: int) -> list:
+    """Return the ``n_strips`` x-coordinates (cols) at which to carve lava
+    as a plain Python list of ints (static under JIT).
+
+    Mirrors MiniGrid LavaCrossingEnv: strips are evenly spaced across the
+    interior so positions are ``round(i * active_w / (n_strips + 1))`` for
+    ``i in 1..n_strips``.  Clamped to ``[1, active_w - 2]`` so a strip never
+    overlaps the bounding wall.
+    """
+    cols = []
+    for i in range(1, n_strips + 1):
+        c = int(round(i * active_w / (n_strips + 1)))
+        c = max(1, min(active_w - 2, c))
+        cols.append(c)
+    return cols
+
+
+def _make_lava_crossing_map(active_w: int, active_h: int,
+                            strip_cols: list) -> jnp.ndarray:
+    """Build the static lava crossing map (walls + floor + lava strips).
+
+    ``strip_cols`` is a plain Python list (static under JIT).  Openings in
+    the lava strips are NOT carved here — they are stamped in
+    ``generate_lava_crossing`` once the per-reset openings are sampled.
+    """
+    game_map = jnp.full((active_h, active_w), TileType.VOID, dtype=jnp.int32)
 
     # Walls: top and bottom rows
     game_map = game_map.at[0, :].set(TileType.HWALL)
-    game_map = game_map.at[_ACTIVE_H - 1, :].set(TileType.HWALL)
+    game_map = game_map.at[active_h - 1, :].set(TileType.HWALL)
 
     # Walls: left and right columns (interior rows)
-    game_map = game_map.at[1:_ACTIVE_H - 1, 0].set(TileType.VWALL)
-    game_map = game_map.at[1:_ACTIVE_H - 1, _ACTIVE_W - 1].set(TileType.VWALL)
+    game_map = game_map.at[1:active_h - 1, 0].set(TileType.VWALL)
+    game_map = game_map.at[1:active_h - 1, active_w - 1].set(TileType.VWALL)
 
     # Floor interior
-    rows = jnp.arange(_ACTIVE_H)[:, None]
-    cols = jnp.arange(_ACTIVE_W)[None, :]
-    interior = (rows >= 1) & (rows <= 5) & (cols >= 1) & (cols <= 11)
+    rows = jnp.arange(active_h)[:, None]
+    cols = jnp.arange(active_w)[None, :]
+    interior = (
+        (rows >= 1) & (rows <= active_h - 2)
+        & (cols >= 1) & (cols <= active_w - 2)
+    )
     game_map = jnp.where(interior, TileType.FLOOR, game_map)
 
-    # Lava column at col 6, rows 1-5
-    lava_col = (cols == 6) & (rows >= 1) & (rows <= 5)
-    game_map = jnp.where(lava_col, TileType.LAVA, game_map)
+    # Lava strips: each strip col is a full-height interior column.
+    # Python loop over a static list keeps the trace flat.
+    for c in strip_cols:
+        game_map = game_map.at[1:active_h - 1, c].set(TileType.LAVA)
 
     return game_map
 
 
-def _pad_to_static(game_map, static_params):
+def _pad_to_static(game_map, static_params, active_h, active_w):
     """Pad map to static dimensions."""
     sh = static_params.map_height
     sw = static_params.map_width
     padded = jnp.full((sh, sw), TileType.VOID, dtype=jnp.int32)
-    padded = padded.at[:_ACTIVE_H, :_ACTIVE_W].set(game_map)
+    padded = padded.at[:active_h, :active_w].set(game_map)
     return padded
 
 
-def generate_lava_crossing(rng, params, static_params):
+def generate_lava_crossing(rng, params, static_params, *,
+                           n_strips: int = 1,
+                           active_w: int = _DEFAULT_W,
+                           active_h: int = _DEFAULT_H):
     """Generate a LavaCrossing environment state.
 
     Args:
-        rng: JAX PRNG key
-        params: EnvParams
-        static_params: HazardStaticParams
+        rng: JAX PRNG key.
+        params: EnvParams.
+        static_params: HazardStaticParams.
+        n_strips: Number of vertical lava strips to carve.  ``n_strips=1``
+            (default) preserves the shipped lava_crossing.des layout.
+        active_w / active_h: Active map dimensions.  Defaults to 13x7 for
+            the single-strip variant; MiniGrid-ported variants pass the
+            grid size encoded in the env_id (e.g. S9N1 → 9x9, S11N5 → 11x11).
 
     Returns:
         HazardState
@@ -81,24 +118,46 @@ def generate_lava_crossing(rng, params, static_params):
 
     player_stats = compute_initial_stats(rng_stats, RoleType.MONK, RaceType.HUMAN)
 
-    game_map = _make_lava_crossing_map()
+    strip_cols = _strip_cols_list(active_w, n_strips)
+    game_map = _make_lava_crossing_map(active_w, active_h, strip_cols)
 
-    # Player position: random in left bank (rows 1-5, cols 1-5)
-    player_r = jax.random.randint(rng_player, (), 1, 6)
-    rng, rng_pc = jax.random.split(rng)
-    player_c = jax.random.randint(rng_pc, (), 1, 6)
-    player_pos = jnp.array([player_r, player_c], dtype=jnp.int32)
+    # One random opening per strip (jax-random determined per reset).
+    # Each opening is a row in [1, active_h - 2].  Width-1 buffer prevents
+    # a zero-size sample when n_strips == 0.
+    rng, rng_openings = jax.random.split(rng)
+    opening_rows = jax.random.randint(
+        rng_openings, (max(n_strips, 1),), 1, active_h - 1,
+    )
+    # n_strips and strip_cols are static — a Python loop keeps the trace flat
+    # and avoids a needless lax.scan with a tiny trip count.
+    for i, c in enumerate(strip_cols):
+        game_map = game_map.at[opening_rows[i], c].set(TileType.FLOOR)
 
-    # Stair position: random in right bank (rows 1-5, cols 7-11)
-    stair_r = jax.random.randint(rng_stair, (), 1, 6)
-    rng, rng_sc = jax.random.split(rng)
-    stair_c = jax.random.randint(rng_sc, (), 7, 12)
-    stair_pos = jnp.array([stair_r, stair_c], dtype=jnp.int32)
+    if n_strips <= 1 and active_w == _DEFAULT_W and active_h == _DEFAULT_H:
+        # Backward-compatible single-strip path matches the shipped
+        # lava_crossing.des: player and stair randomly placed in the
+        # left/right banks around the single col-6 lava strip.
+        player_r = jax.random.randint(rng_player, (), 1, 6)
+        rng, rng_pc = jax.random.split(rng)
+        player_c = jax.random.randint(rng_pc, (), 1, 6)
+        player_pos = jnp.array([player_r, player_c], dtype=jnp.int32)
+
+        stair_r = jax.random.randint(rng_stair, (), 1, 6)
+        rng, rng_sc = jax.random.split(rng)
+        stair_c = jax.random.randint(rng_sc, (), 7, 12)
+        stair_pos = jnp.array([stair_r, stair_c], dtype=jnp.int32)
+    else:
+        # MiniGrid-ported variants: deterministic start/goal corners
+        # (vendor: lg.set_start_pos(0, 0); lg.add_stair_down(x=_w-1, y=_h-1)).
+        player_pos = jnp.array([1, 1], dtype=jnp.int32)
+        stair_pos = jnp.array([active_h - 2, active_w - 2], dtype=jnp.int32)
 
     # Place downstair on map
     game_map = game_map.at[stair_pos[0], stair_pos[1]].set(TileType.DOWNSTAIR)
 
-    # Random item on left bank
+    # Random item on the player's side (cols 1..first_strip-1).  Falls back
+    # to col 1 when the player sits flush against the first strip.
+    first_strip_col = strip_cols[0] if n_strips > 0 else active_w - 1
     # 50% levitation branch, 50% cold branch
     # Levitation: 33% potion, 33% ring, 34% boots
     # Cold: 50% wand, 50% frost horn
@@ -112,10 +171,12 @@ def generate_lava_crossing(rng, params, static_params):
     cold_item = jnp.where(sub_roll2 < 0.5, ItemType.WAND_COLD, ItemType.FROST_HORN)
     item_type = jnp.where(branch, lev_item, cold_item)
 
-    # Random item position on left bank
+    # Random item position left of the first strip.  randint upper is
+    # exclusive; clamp to ≥2 so the range is non-empty.
     rng, rng_ir, rng_ic = jax.random.split(rng, 3)
-    item_r = jax.random.randint(rng_ir, (), 1, 6)
-    item_c = jax.random.randint(rng_ic, (), 1, 6)
+    item_r = jax.random.randint(rng_ir, (), 1, active_h - 1)
+    item_c_hi = max(2, first_strip_col)
+    item_c = jax.random.randint(rng_ic, (), 1, item_c_hi)
 
     # Ground items
     gi_positions = jnp.zeros((max_gi, 2), dtype=jnp.int32)
@@ -126,7 +187,7 @@ def generate_lava_crossing(rng, params, static_params):
     gi_mask = gi_mask.at[0].set(True)
 
     # Pad map
-    padded_map = _pad_to_static(game_map, static_params)
+    padded_map = _pad_to_static(game_map, static_params, active_h, active_w)
 
     # Empty inventory
     inv = Inventory(
