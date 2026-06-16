@@ -38,7 +38,7 @@ import sys
 
 # JAX setup: CPU + eager mode (matches multiseed_byteparity.py defaults).
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-if os.environ.get("NETHAX_EAGER", "1") == "1":
+if os.environ.get("NETHAX_EAGER", "0") == "1":
     import jax
     jax.config.update("jax_disable_jit", True)
 

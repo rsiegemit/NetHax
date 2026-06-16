@@ -762,8 +762,85 @@ def _apply_directives(
     lg.last_player_pos = None
     lg.last_goal_pos = None
 
-    # 1. Allocate a default EnvState.
-    state = EnvState.default(rng, static)
+    # 1. Allocate the base EnvState.
+    #
+    # Under NLE_BYTEPARITY, route the bootstrap through ``NethaxEnv.reset``
+    # so the ISAAC64 CORE stream is advanced through the full vendor
+    # init_objects -> role_init -> init_dungeons -> u_init -> mklev sequence
+    # (339 pre-cascade draws + the Archeologist u_init optional-item rn2
+    # cascade at u_init.c:652-660).  This produces a state whose
+    # ``vendor_rng``, character stats, starting inventory (incl. the
+    # OIL_LAMP / TIN_OPENER / MAGIC_MARKER bonus item at slot 8) and
+    # DISP-stream offsets are byte-aligned with vendor MiniHack.  LG
+    # directives below then overwrite the dungeon-shaped fields
+    # (terrain, features, traps, ground_items, monster_ai, FOV) on top of
+    # the vendor-aligned base — no inventory or RNG cascade work is
+    # needed in this factory anymore.
+    #
+    # Outside NLE_BYTEPARITY we keep the lightweight default path: minihax
+    # consumers in Threefry mode don't care about ISAAC64 alignment and
+    # spinning up a full NethaxEnv.reset adds non-trivial latency.
+    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vrng_bootstrap
+    if _use_vrng_bootstrap():
+        from Nethax.nethax.env import NethaxEnv as _NethaxEnv
+        from Nethax.nethax.constants.roles import Role as _Role
+        from Nethax.nethax.constants.races import Race as _Race
+        from Nethax.nethax.subsystems.features import FeaturesState as _FeaturesState
+        from Nethax.nethax.subsystems.traps import TrapState as _TrapState
+        from Nethax.nethax.subsystems.monster_ai import (
+            make_monster_ai_state as _make_monster_ai_state,
+        )
+        from Nethax.nethax.state import _empty_ground_items_array as _empty_gi
+        # NethaxEnv.reset's vendor-rng branch indexes rng[0]/rng[1] to
+        # rebuild the uint64 ISAAC64 seed (env.py:168-170).  Callers from
+        # the minihax harness pass a typed PRNGKey (jax.random.key(...))
+        # which is 0-D and cannot be subscripted; unwrap to the raw
+        # uint32 pair.
+        try:
+            _raw_key = jax.random.key_data(rng)
+        except (TypeError, ValueError):
+            _raw_key = rng
+        _engine = _NethaxEnv(static=static)
+        # Archeologist-Human-Lawful is the canonical MiniHack character
+        # ("arc-hum-law-mal" — .test_runs/minihax_byteparity.py:149).
+        state, _ = _engine.reset(
+            _raw_key,
+            role=_Role.ARCHEOLOGIST,
+            race=_Race.HUMAN,
+            alignment=0,
+        )
+        # NethaxEnv.reset populated the state with a full vendor dungeon
+        # level — rooms, fountains, sleeping monsters, dropped items,
+        # traps.  LG owns terrain authorship in minihax, so wipe those
+        # entity planes back to EnvState.default empties before applying
+        # LG directives.  Vendor-aligned bits we want to KEEP are:
+        #   - vendor_rng / vendor_rng_disp (ISAAC64 stream offsets)
+        #   - descr_idx (object-description shuffle)
+        #   - inventory (Archeologist ini_inv + u_init rn2 cascade bonus)
+        #   - player stats (HP / AC / role / race / align / luck)
+        #   - messages (role-intro line)
+        _b = static.n_branches
+        _l = static.max_levels_per_branch
+        _hf = static.map_h
+        _wf = static.map_w
+        state = state.replace(
+            terrain=jnp.zeros((_b, _l, _hf, _wf), dtype=jnp.int8),
+            explored=jnp.zeros((_b, _l, _hf, _wf), dtype=jnp.bool_),
+            visible=jnp.zeros((_hf, _wf), dtype=jnp.bool_),
+            last_seen_terrain=jnp.full(
+                (_b, _l, _hf, _wf), -1, dtype=jnp.int8,
+            ),
+            features=_FeaturesState.default(
+                num_levels=_b * _l, map_h=_hf, map_w=_wf,
+            ),
+            traps=_TrapState.default(
+                num_levels=_b * _l, map_h=_hf, map_w=_wf,
+            ),
+            ground_items=_empty_gi(_b, _l, _hf, _wf),
+            monster_ai=_make_monster_ai_state(),
+        )
+    else:
+        state = EnvState.default(rng, static)
 
     # 2. Initialise terrain[0, 0] sub-region with the fill character.
     fill_tile = int(TERRAIN_CHAR_TO_TILE[fill])
@@ -967,121 +1044,55 @@ def _apply_directives(
     # with the role's ``ini_inv(...)`` items (vendor/nethack/src/u_init.c)
     # FIRST, and only then do des ``INV:`` directives append additional
     # carried items (vendor/nle/src/sp_lev.c::create_object with INV flag).
-    # Minihax defaults the hero to Archeologist (see EnvState.default
-    # ``player_role=0`` and tests pass ``character="arc-hum-law-mal"``),
-    # so seed STARTING_INVENTORY[Role.ARCHEOLOGIST] before INV: items.
-    # Without this, ``inv_glyphs`` slot 0 was NO_GLYPH (5976) instead of
-    # the BULLWHIP glyph (1906+64=1970) the vendor RL channel emits.
+    #
+    # Under NLE_BYTEPARITY, ``state.inventory`` was already populated by the
+    # NethaxEnv.reset bootstrap at the top of this function — that runs the
+    # full vendor u_init path (ini_inv + the Archeologist rn2(10)/rn2(4)/
+    # rn2(5) optional-item cascade at u_init.c:652-660) reading the same
+    # ISAAC64 stream offsets vendor C reads.  No further inventory work
+    # needed here.  LG ``add_inventory_item`` directives are not used by
+    # any canonical Room/Corridor/MazeWalk/etc env builder today (verified
+    # by grep over Nethax/minihax/{envs,world_gen}); if a future env wires
+    # INV: directives, extend this branch to read existing item slots out
+    # of ``state.inventory.items`` and rebuild via InventoryState.from_items.
+    #
+    # Outside NLE_BYTEPARITY (legacy Threefry path) the state inventory is
+    # the EnvState.default zero-init, so we still need to seed the
+    # role-specific ini_inv items here.  No rn2 cascade in that mode — the
+    # ISAAC64 stream is not modelled, so the optional bonus item is
+    # deterministically omitted (matches Threefry behaviour before Lead
+    # E/G's commits).
     from Nethax.nethax.subsystems.inventory import (
         InventoryState as _InventoryState,
         make_item as _make_item,
     )
-    from Nethax.nethax.subsystems.character import (
-        STARTING_INVENTORY as _STARTING_INVENTORY,
-        Role as _Role,
-        ItemCategory as _ItemCategory,
-        ObjType as _ObjType,
-    )
-    items = list(_STARTING_INVENTORY[_Role.ARCHEOLOGIST])
-
-    # Vendor u_init.c:652-660 — after ``ini_inv(Archeologist)``, the Arc role
-    # rolls a 3-step rn2 cascade for one optional bonus item:
-    #     if (!rn2(10))      ini_inv(Tinopener);    // ~10%  → TIN_OPENER (214)
-    #     else if (!rn2(4))  ini_inv(Lamp);         // ~22.5% → OIL_LAMP   (202)
-    #     else if (!rn2(5))  ini_inv(Magicmarker);  // ~13.5% → MAGIC_MARKER (217)
-    # Only the first branch that fires draws past its gate.  We replay this
-    # via the vendor ISAAC64 stream so the optional item lands at slot 8
-    # (right after the 8 base items, before des INV directives).
-    #
-    # Stream alignment: vendor allmain.c::newgame order is
-    #   init_objects → role_init → init_dungeons → init_artifacts → u_init
-    # We seed ISAAC64 from rng (same recipe as env.py), then consume
-    # init_objects (descr shuffle) + init_dungeons draws so the cascade
-    # below reads the same uint64s vendor C reads at u_init.c:653.
-    # Cite: vendor/nethack/src/u_init.c:652-660; vendor/nle/src/allmain.c:585-627.
-    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng
-    if _use_vendor_rng():
-        from Nethax.nethax import vendor_rng as _vrng_mod
-        from Nethax.nethax.dungeon.branches import (
-            consume_init_dungeons_draws as _consume_init_dungeons_draws,
-            consume_init_dungeons_variable_draws as _consume_init_dungeons_var,
+    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng_inv
+    if _use_vendor_rng_inv():
+        assert not starting_inv, (
+            "minihax NLE_BYTEPARITY path: LG add_inventory_item directives "
+            "(starting_inv) are not wired through the NethaxEnv.reset "
+            "bootstrap.  Extend _apply_directives to read existing inventory "
+            "slots out of state.inventory.items before appending."
         )
-        # Use the same seeding recipe as env.py.  ``rng`` here may be a
-        # typed PRNGKey (jax.random.key) or a raw uint32 pair (legacy
-        # PRNGKey); unwrap via ``jax.random.key_data`` when needed.
-        try:
-            raw_key = jax.random.key_data(rng)
-        except (TypeError, ValueError):
-            raw_key = rng
-        seed_hi = jnp.uint64(raw_key[0])
-        seed_lo = jnp.uint64(raw_key[1])
-        seed_arr = (seed_hi << jnp.uint64(32)) | seed_lo
-        v_state = _vrng_mod.init_jax(seed_arr)
-        # Mirror env.py: init_objects (descr shuffle) then init_dungeons.
-        from Nethax.nethax.obs.glyph_shuffle import (
-            compute_descr_shuffle as _descr_shuf,
+    else:
+        from Nethax.nethax.subsystems.character import (
+            STARTING_INVENTORY as _STARTING_INVENTORY,
+            Role as _Role,
         )
-        v_state, _descr_idx = _descr_shuf(v_state)
-        v_state, _dungeon_state = _consume_init_dungeons_draws(v_state)
-        v_state, _var_state = _consume_init_dungeons_var(v_state, _dungeon_state)
-        # Vendor mklev() rn2 draws.  Trace .test_runs/mklev_rn2_trace_seed0.txt
-        # captures the in_mklev rn2 sequence for MiniHack-Room-5x5-v0 seed=0:
-        #   rn2(3)=1, rn2(2)=1, rn2(1)=0, rn2(1)=0  (4 draws total).
-        # reseed_random() at mklev.c:1023-1024 is inert (has_strong_rngseed
-        # defaults FALSE in decl.c:123), so no extra draws there.  Vendor
-        # order in allmain.c:585-627 is init_dungeons → u_init → mklev,
-        # but for inv_glyphs[8] cascade alignment we need to consume the
-        # equivalent stream offset BEFORE the u_init cascade reads.  This
-        # is a Wave-4 hack-fix targeting Room-5x5; generalize when other
-        # env traces are captured.
-        from Nethax.nethax.vendor_rng import rn2_jax as _rn2_mklev
-        v_state, _ = _rn2_mklev(v_state, jnp.int32(3))
-        v_state, _ = _rn2_mklev(v_state, jnp.int32(2))
-        v_state, _ = _rn2_mklev(v_state, jnp.int32(1))
-        v_state, _ = _rn2_mklev(v_state, jnp.int32(1))
-        # Archeologist u_init.c:652-660 rn2 cascade.  Vendor short-circuits
-        # via ``else if``: each subsequent gate is only drawn when the prior
-        # gate's ``!rn2(...)`` was false.  Mirror that here using Python
-        # branching (NETHAX_EAGER=1 makes int() on traced scalars concrete).
-        # Vendor object IDs (constants/objects.py): TIN_OPENER=214,
-        # OIL_LAMP=202, MAGIC_MARKER=217 (also _ObjType.MAGIC_MARKER).
-        from Nethax.nethax.vendor_rng import rn2_jax as _rn2
-        bonus_tid = None
-        v_state, r10 = _rn2(v_state, jnp.int32(10))
-        if int(r10) == 0:
-            bonus_tid = 214  # TIN_OPENER
-        else:
-            v_state, r4 = _rn2(v_state, jnp.int32(4))
-            if int(r4) == 0:
-                bonus_tid = 202  # OIL_LAMP
-            else:
-                v_state, r5 = _rn2(v_state, jnp.int32(5))
-                if int(r5) == 0:
-                    bonus_tid = int(_ObjType.MAGIC_MARKER)  # 217
-        if bonus_tid is not None:
-            items.append(_make_item(
-                category=_ItemCategory.TOOL,
-                type_id=bonus_tid,
-                quantity=1,
-                weight=30,
-                buc_status=0,  # UNCURSED
-                identified=True,
+        items = list(_STARTING_INVENTORY[_Role.ARCHEOLOGIST])
+        items.extend(
+            _make_item(
+                category=d.category,
+                type_id=d.type_id,
+                quantity=d.quantity,
+                weight=d.weight,
+                buc_status=d.buc_status,
+                identified=d.identified,
                 bknown=True, dknown=True, rknown=True,
-            ))
-
-    items.extend(
-        _make_item(
-            category=d.category,
-            type_id=d.type_id,
-            quantity=d.quantity,
-            weight=d.weight,
-            buc_status=d.buc_status,
-            identified=d.identified,
-            bknown=True, dknown=True, rknown=True,
+            )
+            for d in starting_inv
         )
-        for d in starting_inv
-    )
-    state = state.replace(inventory=_InventoryState.from_items(items))
+        state = state.replace(inventory=_InventoryState.from_items(items))
 
     # 5. Apply player start position (default: any free floor tile).
     if lg.last_player_pos is not None:
