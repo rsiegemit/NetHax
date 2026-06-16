@@ -979,8 +979,81 @@ def _apply_directives(
     from Nethax.nethax.subsystems.character import (
         STARTING_INVENTORY as _STARTING_INVENTORY,
         Role as _Role,
+        ItemCategory as _ItemCategory,
+        ObjType as _ObjType,
     )
     items = list(_STARTING_INVENTORY[_Role.ARCHEOLOGIST])
+
+    # Vendor u_init.c:652-660 — after ``ini_inv(Archeologist)``, the Arc role
+    # rolls a 3-step rn2 cascade for one optional bonus item:
+    #     if (!rn2(10))      ini_inv(Tinopener);    // ~10%  → TIN_OPENER (214)
+    #     else if (!rn2(4))  ini_inv(Lamp);         // ~22.5% → OIL_LAMP   (202)
+    #     else if (!rn2(5))  ini_inv(Magicmarker);  // ~13.5% → MAGIC_MARKER (217)
+    # Only the first branch that fires draws past its gate.  We replay this
+    # via the vendor ISAAC64 stream so the optional item lands at slot 8
+    # (right after the 8 base items, before des INV directives).
+    #
+    # Stream alignment: vendor allmain.c::newgame order is
+    #   init_objects → role_init → init_dungeons → init_artifacts → u_init
+    # We seed ISAAC64 from rng (same recipe as env.py), then consume
+    # init_objects (descr shuffle) + init_dungeons draws so the cascade
+    # below reads the same uint64s vendor C reads at u_init.c:653.
+    # Cite: vendor/nethack/src/u_init.c:652-660; vendor/nle/src/allmain.c:585-627.
+    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng
+    if _use_vendor_rng():
+        from Nethax.nethax import vendor_rng as _vrng_mod
+        from Nethax.nethax.dungeon.branches import (
+            consume_init_dungeons_draws as _consume_init_dungeons_draws,
+            consume_init_dungeons_variable_draws as _consume_init_dungeons_var,
+        )
+        # Use the same seeding recipe as env.py.  ``rng`` here may be a
+        # typed PRNGKey (jax.random.key) or a raw uint32 pair (legacy
+        # PRNGKey); unwrap via ``jax.random.key_data`` when needed.
+        try:
+            raw_key = jax.random.key_data(rng)
+        except (TypeError, ValueError):
+            raw_key = rng
+        seed_hi = jnp.uint64(raw_key[0])
+        seed_lo = jnp.uint64(raw_key[1])
+        seed_arr = (seed_hi << jnp.uint64(32)) | seed_lo
+        v_state = _vrng_mod.init_jax(seed_arr)
+        # Mirror env.py: init_objects (descr shuffle) then init_dungeons.
+        from Nethax.nethax.obs.glyph_shuffle import (
+            compute_descr_shuffle as _descr_shuf,
+        )
+        v_state, _descr_idx = _descr_shuf(v_state)
+        v_state, _dungeon_state = _consume_init_dungeons_draws(v_state)
+        v_state, _var_state = _consume_init_dungeons_var(v_state, _dungeon_state)
+        # Archeologist u_init.c:652-660 rn2 cascade.  Vendor short-circuits
+        # via ``else if``: each subsequent gate is only drawn when the prior
+        # gate's ``!rn2(...)`` was false.  Mirror that here using Python
+        # branching (NETHAX_EAGER=1 makes int() on traced scalars concrete).
+        # Vendor object IDs (constants/objects.py): TIN_OPENER=214,
+        # OIL_LAMP=202, MAGIC_MARKER=217 (also _ObjType.MAGIC_MARKER).
+        from Nethax.nethax.vendor_rng import rn2_jax as _rn2
+        bonus_tid = None
+        v_state, r10 = _rn2(v_state, jnp.int32(10))
+        if int(r10) == 0:
+            bonus_tid = 214  # TIN_OPENER
+        else:
+            v_state, r4 = _rn2(v_state, jnp.int32(4))
+            if int(r4) == 0:
+                bonus_tid = 202  # OIL_LAMP
+            else:
+                v_state, r5 = _rn2(v_state, jnp.int32(5))
+                if int(r5) == 0:
+                    bonus_tid = int(_ObjType.MAGIC_MARKER)  # 217
+        if bonus_tid is not None:
+            items.append(_make_item(
+                category=_ItemCategory.TOOL,
+                type_id=bonus_tid,
+                quantity=1,
+                weight=30,
+                buc_status=0,  # UNCURSED
+                identified=True,
+                bknown=True, dknown=True, rknown=True,
+            ))
+
     items.extend(
         _make_item(
             category=d.category,
