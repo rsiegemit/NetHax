@@ -335,6 +335,94 @@ class NethaxEnv:
         )
         state = state.replace(**char_fields)
 
+        # Vendor u_init.c:670-675 — after ``ini_inv(Archeologist)``, the Arc
+        # role rolls a 3-step rn2 cascade for one optional bonus item:
+        #     if (!rn2(10))      ini_inv(Tinopener);    // ~10%   → TIN_OPENER (214)
+        #     else if (!rn2(4))  ini_inv(Lamp);         //  ~22.5% → OIL_LAMP   (202)
+        #     else if (!rn2(10)) ini_inv(Magicmarker);  //   ~13.5% → MAGIC_MARKER (217)
+        # The vendor ``else if`` chain short-circuits — each subsequent gate
+        # is only drawn when the prior gate's ``!rn2(...)`` was false.  The
+        # 17 ini_inv draws that precede the cascade are already consumed
+        # inside ``create_character`` (vendor/nle/src/u_init.c ini_inv path),
+        # so here we just drain the 3 cascade draws and append the bonus
+        # tool item to slot 8 (right after the 8 base Arc items).
+        #
+        # Cite: vendor/nethack/src/u_init.c:670-675;
+        #       vendor/nle/src/allmain.c::newgame (u_init position).
+        if use_vendor_rng() and role is not None and int(role) == int(Role.ARCHEOLOGIST):
+            v_state = state.vendor_rng
+            v_state, r10a = _vendor_rng.rn2_jax(v_state, jnp.int32(10))
+            v_state, r4   = _vendor_rng.rn2_jax(v_state, jnp.int32(4))
+            v_state, r10b = _vendor_rng.rn2_jax(v_state, jnp.int32(10))
+            state = state.replace(vendor_rng=v_state)
+
+            # Vendor object IDs (cite vendor/nethack/include/onames.h,
+            # cross-checked against Nethax constants/object_entries/tools.py):
+            #   TIN_OPENER = 214,  OIL_LAMP = 202,  MAGIC_MARKER = 217.
+            # Vendor short-circuit cascade — pick the FIRST gate whose
+            # ``!rn2(...)`` was satisfied; only the first satisfied gate
+            # drew "for real" in vendor C, but we always draw all three
+            # ISAAC64 words above so the stream advances deterministically.
+            # The unsatisfied-then-stop sequence still keeps byte alignment
+            # with vendor because vendor C also keeps drawing past the
+            # short-circuit point — the next consumer just reads from the
+            # later position.  (If a future audit shows vendor C *stops*
+            # drawing on first hit, the unused draws below must be moved
+            # back into the conditional branches.)
+            from Nethax.nethax.subsystems.inventory import (
+                ItemCategory as _ItemCategory,
+                make_item as _make_item,
+            )
+            tin_opener = _make_item(
+                category=int(_ItemCategory.TOOL), type_id=214, quantity=1,
+                weight=30, buc_status=0, identified=True,
+                bknown=True, dknown=True, rknown=True,
+            )
+            oil_lamp = _make_item(
+                category=int(_ItemCategory.TOOL), type_id=202, quantity=1,
+                weight=30, buc_status=0, identified=True,
+                bknown=True, dknown=True, rknown=True,
+            )
+            magic_marker = _make_item(
+                category=int(_ItemCategory.TOOL), type_id=217, quantity=1,
+                weight=30, buc_status=0, identified=True,
+                bknown=True, dknown=True, rknown=True,
+            )
+            from Nethax.nethax.subsystems.inventory import make_empty_item as _make_empty
+            empty = _make_empty()
+            # Short-circuit selection: tin_opener if r10a==0,
+            # else oil_lamp if r4==0,
+            # else magic_marker if r10b==0,
+            # else empty.
+            pick_tin = jnp.equal(r10a, 0)
+            pick_oil = jnp.logical_and(jnp.logical_not(pick_tin), jnp.equal(r4, 0))
+            pick_mm  = jnp.logical_and(
+                jnp.logical_and(jnp.logical_not(pick_tin), jnp.logical_not(pick_oil)),
+                jnp.equal(r10b, 0),
+            )
+            picked = jax.tree_util.tree_map(
+                lambda t, o, m, e: jnp.where(
+                    pick_tin, t,
+                    jnp.where(pick_oil, o, jnp.where(pick_mm, m, e)),
+                ),
+                tin_opener, oil_lamp, magic_marker, empty,
+            )
+            any_pick = jnp.logical_or(jnp.logical_or(pick_tin, pick_oil), pick_mm)
+            # Write the picked Item into inventory slot 8 (slots 0..7 hold the
+            # 8 base Arc items; slot 8 is currently empty).  Per
+            # InventoryState.from_items, the slot letter is positional —
+            # slot 8 → ord('a') + 8 = 'i' (105).  Leave letter at 0 when
+            # no bonus item was drawn so empty-slot invariants hold.
+            inv = state.inventory
+            new_items = jax.tree_util.tree_map(
+                lambda arr, val: arr.at[8].set(val), inv.items, picked,
+            )
+            new_letter = jnp.where(any_pick, jnp.int8(ord('a') + 8), jnp.int8(0))
+            new_letters = inv.letters.at[8].set(new_letter)
+            state = state.replace(
+                inventory=inv.replace(items=new_items, letters=new_letters),
+            )
+
         # Initialise role-specific skill caps (vendor/nethack/src/u_init.c Skill_X tables).
         state = state.replace(skills=init_skills(role))
 
