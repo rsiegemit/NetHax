@@ -82,3 +82,12 @@ def list_envs(category: Optional[str] = None) -> list:
 from Nethax.minihax.envs import canonical as _canonical  # noqa: E402
 
 _canonical.register_all()
+
+# Override SimpleCrossing entries with the N-strip builders that honour
+# the ``N`` parameter in env_ids like ``MiniHack-SimpleCrossingS9N3-v0``.
+# Cite: vendor/minihack/minihack/envs/minigrid.py:511-529.
+from Nethax.minihax.world_gen.simple_crossing import (  # noqa: E402
+    register_simplecrossing_envs as _register_simplecrossing_nstrip,
+)
+
+_register_simplecrossing_nstrip()
