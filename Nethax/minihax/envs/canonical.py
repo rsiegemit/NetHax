@@ -348,19 +348,32 @@ def _skill_wod_kill_rm() -> RewardManager:
 
 
 def _exploremaze_rm() -> RewardManager:
-    """Vendor ExploreMaze: shaping via add_eat_event("apple") plus stairs_down.
+    """Vendor ExploreMaze (exploremaze.py:22-47): three events.
 
-    Vendor scatters apples and pays an eat-event each; the env still terminates
-    on stairs_down.  We mirror by registering both an apple-eat event
-    (repeatable, non-terminal) and the default stairs-down terminal.
+    1. ``add_eat_event("apple", reward=0.5, repeatable=True, terminal_required=False,
+       terminal_sufficient=False)`` — dense shaping.
+    2. ``add_message_event(["Mission Complete."], terminal_required=True,
+       terminal_sufficient=True)`` — dead message kept so the env keeps running
+       past the stairs-down terminal of the default goal.
+    3. ``add_custom_reward_fn(stairs_reward_function)`` — +1 when the agent
+       stands on stairs_down (vendor stairs_reward_function in exploremaze.py:12-16).
+
+    We mirror via a location_event for the stairs-down +1 (functionally
+    equivalent to the vendor custom fn under our state model).
     """
     rm = RewardManager()
     rm.add_eat_event(
         "apple",
-        reward=1.0,
+        reward=0.5,
         repeatable=True,
         terminal_required=False,
         terminal_sufficient=False,
+    )
+    rm.add_message_event(
+        ["Mission Complete."],
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
     )
     rm.add_location_event(
         "stairs_down",
