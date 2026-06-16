@@ -277,6 +277,22 @@ class _MazeWalkDirective:
 
 
 @dataclasses.dataclass
+class _StartingInventoryDirective:
+    """Pre-populate a starting-inventory slot at reset time.
+
+    Mirrors the vendor des ``INV:`` directive (placed-on-hero starting kit).
+    Used by LavaCross-Levitate ``-Inv-`` variants where the levitation item
+    must be carried at episode start rather than scattered on the floor.
+    """
+    category: int       # ItemCategory enum value (e.g. POTION=8, RING=4)
+    type_id: int        # vendor object index (e.g. POT_LEVITATION=278)
+    quantity: int
+    weight: int
+    buc_status: int     # 0=unknown / 1=cursed / 2=uncursed / 3=blessed
+    identified: bool
+
+
+@dataclasses.dataclass
 class _SetMapDirective:
     """A literal ``MAP`` block from a vendor ``.des`` file.
 
@@ -661,6 +677,34 @@ class LevelGenerator:
         # No directive emitted: rooms are already navigable floor regions.
         return None
 
+    def add_starting_inventory_item(
+        self,
+        category: int,
+        type_id: int,
+        *,
+        quantity: int = 1,
+        weight: int = 0,
+        buc_status: int = 2,  # _BUC_UNCURSED — matches vendor ini_inv defaults
+        identified: bool = True,
+    ) -> None:
+        """Place an item directly into the hero's starting inventory.
+
+        Mirrors the vendor des ``INV:`` directive.  Used by LavaCross-Levitate
+        ``-Inv-`` variants whose vendor counterparts ship with the levitation
+        item already carried (vendor/minihack/minihack/envs/skills_lava.py
+        ``MiniHackLCLevitatePotionInv`` / ``MiniHackLCLevitateRingInv``).
+
+        Args mirror ``Nethax.nethax.subsystems.inventory.make_item``.
+        """
+        self._directives.append(_StartingInventoryDirective(
+            category=int(category),
+            type_id=int(type_id),
+            quantity=int(quantity),
+            weight=int(weight),
+            buc_status=int(buc_status),
+            identified=bool(identified),
+        ))
+
     def mazewalk(self, row=None, col=None, direction: str = "east") -> None:
         """Vendor ``MAZEWALK`` directive via row/col emitter kwargs.
 
@@ -747,6 +791,11 @@ def _apply_directives(
     # Accumulate (row, col, DoorState) so doors get their open/closed/locked
     # status written into ``state.features.door_state`` at commit time.
     door_states: List[Tuple[int, int, int]] = []
+
+    # Accumulate starting-inventory directives (vendor des INV: equivalent).
+    # Materialised into ``state.inventory`` once at the end so item letters
+    # are assigned positionally (see InventoryState.from_items).
+    starting_inv: List[_StartingInventoryDirective] = []
 
     # Trap state buffer (we modify state.traps once at the end).
     trap_type_arr = jnp.asarray(state.traps.trap_type)
@@ -886,6 +935,10 @@ def _apply_directives(
             terrain_np = _carve_maze(
                 terrain_np, d.x, d.y, w, h, _next_key,
             )
+        elif isinstance(d, _StartingInventoryDirective):
+            # Buffer; committed after the walk so all items are assigned
+            # contiguous letters via InventoryState.from_items.
+            starting_inv.append(d)
         else:
             # Defensive: an unknown directive class signals a programming bug.
             raise RuntimeError(f"unhandled directive type: {type(d).__name__}")
@@ -907,6 +960,28 @@ def _apply_directives(
         state = state.replace(
             features=state.features.replace(door_state=ds_arr),
         )
+
+    # 4c. Materialise starting-inventory directives (vendor des ``INV:``).
+    # Build a list of Items in declaration order, then hand off to
+    # InventoryState.from_items so slot 0 -> 'a', slot 1 -> 'b', etc.
+    if starting_inv:
+        from Nethax.nethax.subsystems.inventory import (
+            InventoryState as _InventoryState,
+            make_item as _make_item,
+        )
+        items = [
+            _make_item(
+                category=d.category,
+                type_id=d.type_id,
+                quantity=d.quantity,
+                weight=d.weight,
+                buc_status=d.buc_status,
+                identified=d.identified,
+                bknown=True, dknown=True, rknown=True,
+            )
+            for d in starting_inv
+        ]
+        state = state.replace(inventory=_InventoryState.from_items(items))
 
     # 5. Apply player start position (default: any free floor tile).
     if lg.last_player_pos is not None:
