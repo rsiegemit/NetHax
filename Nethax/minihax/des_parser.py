@@ -2045,7 +2045,26 @@ class _RealLGAdapter:
 
     def replace_terrain(self, **kwargs: Any) -> None:
         self._rec("replace_terrain", (), kwargs)
-        # No real-LG counterpart yet.
+        inner = self._inner
+        if not _has(inner, "replace_terrain"):
+            return
+        row = kwargs.get("row")
+        col = kwargs.get("col")
+        height = kwargs.get("height", 1)
+        width = kwargs.get("width", 1)
+        from_glyph = kwargs.get("from_glyph")
+        to_glyph = kwargs.get("to_glyph")
+        chance = kwargs.get("chance", 100)
+        if row is None or col is None or from_glyph is None or to_glyph is None:
+            return
+        try:
+            inner.replace_terrain(
+                from_glyph, to_glyph,
+                col, row, col + width - 1, row + height - 1,
+                int(chance),
+            )
+        except Exception:
+            pass
 
     def add_room(self, **kwargs: Any) -> str:
         self._rec("add_room", (), kwargs)

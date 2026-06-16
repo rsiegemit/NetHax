@@ -64,6 +64,12 @@ TERRAIN_CHAR_TO_TILE: dict = {
     "\\": TileType.THRONE,
     "<": TileType.STAIRCASE_UP,
     ">": TileType.STAIRCASE_DOWN,
+    # HideNSeek line-of-sight overlays.  Canonical TileType has no walkable
+    # CLOUD tile, so we map both vendor glyphs to TREE: TREE is walkable AND
+    # opaque (vendor/nethack vision.c:166-169) which matches CLOUD's role as
+    # a hide-mechanic occluder.  vendor des: hidenseek*.des REPLACE_TERRAIN.
+    "T": TileType.TREE,
+    "C": TileType.TREE,
 }
 
 #: MiniHack trap-name to nethax ``TrapType``.
@@ -209,6 +215,22 @@ class _FillTerrainDirective:
     y1: int
     x2: int
     y2: int
+
+
+@dataclasses.dataclass
+class _ReplaceTerrainDirective:
+    """REPLACE_TERRAIN: probabilistic per-cell tile swap.
+
+    Mirrors vendor des ``REPLACE_TERRAIN:(x1,y1,x2,y2), from, to, chance%``.
+    Used by HideNSeek to scatter TREE/CLOUD line-of-sight occluders.
+    """
+    from_terrain: str
+    to_terrain: str
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    chance: int        # 0..100
 
 
 @dataclasses.dataclass
@@ -483,6 +505,32 @@ class LevelGenerator:
             terrain=terrain, x1=x1, y1=y1, x2=x2, y2=y2,
         ))
 
+    def replace_terrain(
+        self,
+        from_terrain: str,
+        to_terrain: str,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        chance: int = 100,
+    ) -> None:
+        """Probabilistically replace ``from_terrain`` with ``to_terrain``.
+
+        Mirrors vendor des ``REPLACE_TERRAIN:(x1,y1,x2,y2), from, to, chance%``.
+        Per-cell Bernoulli sampling at factory time uses the directive-walk
+        PRNG so generation is deterministic per reset key.
+        """
+        if from_terrain not in TERRAIN_CHAR_TO_TILE:
+            raise ValueError(f"unknown from_terrain char: {from_terrain!r}")
+        if to_terrain not in TERRAIN_CHAR_TO_TILE:
+            raise ValueError(f"unknown to_terrain char: {to_terrain!r}")
+        c = max(0, min(100, int(chance)))
+        self._directives.append(_ReplaceTerrainDirective(
+            from_terrain=from_terrain, to_terrain=to_terrain,
+            x1=x1, y1=y1, x2=x2, y2=y2, chance=c,
+        ))
+
     def set_start_pos(self, x, y: int = -1) -> None:
         """Place the player at MiniHack ``(x, y)``.
 
@@ -755,6 +803,10 @@ def _apply_directives(
                 door_states.append((d.y, d.x, _DOOR_STATE_VALUE[d.state]))
         elif isinstance(d, _FillTerrainDirective):
             terrain_np = _fill_terrain_rect(terrain_np, d, w, h)
+        elif isinstance(d, _ReplaceTerrainDirective):
+            terrain_np = _replace_terrain_rect(
+                terrain_np, d, w, h, _next_key,
+            )
         elif isinstance(d, _StairDirective):
             terrain_np, pos = _place_stair(
                 terrain_np, d, w, h, resolved_rooms, _next_key,
@@ -1021,6 +1073,39 @@ def _fill_terrain_rect(
         return terrain_np
     block = jnp.full((y_hi - y_lo + 1, x_hi - x_lo + 1), jnp.int8(tile), dtype=jnp.int8)
     return terrain_np.at[0, 0, y_lo:y_hi + 1, x_lo:x_hi + 1].set(block)
+
+
+def _replace_terrain_rect(
+    terrain_np: jax.Array,
+    d: _ReplaceTerrainDirective,
+    w: int,
+    h: int,
+    next_key,
+) -> jax.Array:
+    """Probabilistic per-cell tile swap (vendor REPLACE_TERRAIN).
+
+    Bernoulli draws derived from the directive-walk PRNG; cells holding
+    ``from_terrain`` flip to ``to_terrain`` when draw < chance.  Other
+    cells (e.g. corridor-carved floor, stairs) are left untouched, matching
+    vendor behaviour where REPLACE_TERRAIN runs before TERRAIN:randline.
+    """
+    from_tile = int(TERRAIN_CHAR_TO_TILE[d.from_terrain])
+    to_tile = int(TERRAIN_CHAR_TO_TILE[d.to_terrain])
+    y_lo, y_hi = sorted((d.y1, d.y2))
+    x_lo, x_hi = sorted((d.x1, d.x2))
+    y_lo = max(0, y_lo); y_hi = min(h - 1, y_hi)
+    x_lo = max(0, x_lo); x_hi = min(w - 1, x_hi)
+    if y_lo > y_hi or x_lo > x_hi or d.chance <= 0:
+        return terrain_np
+    rh = y_hi - y_lo + 1
+    rw = x_hi - x_lo + 1
+    key = next_key()
+    draws = jax.random.uniform(key, (rh, rw), minval=0.0, maxval=100.0)
+    flip = draws < float(d.chance)
+    region = terrain_np[0, 0, y_lo:y_hi + 1, x_lo:x_hi + 1]
+    eligible = region == jnp.int8(from_tile)
+    new_region = jnp.where(eligible & flip, jnp.int8(to_tile), region)
+    return terrain_np.at[0, 0, y_lo:y_hi + 1, x_lo:x_hi + 1].set(new_region)
 
 
 def _place_stair(
