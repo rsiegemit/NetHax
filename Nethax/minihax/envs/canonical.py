@@ -250,6 +250,46 @@ def _skill_sink_rm() -> RewardManager:
     return rm
 
 
+def _skill_door_rm() -> RewardManager:
+    """Vendor ClosedDoor / LockedDoor: message-event reward.
+    Triggers on the door interaction messages.
+    """
+    rm = RewardManager()
+    rm.add_message_event(
+        ["closed door", "locked"],
+        reward=1.0, terminal_required=True, terminal_sufficient=True,
+    )
+    return rm
+
+
+def _memento_rm() -> RewardManager:
+    """Vendor Memento (memento.py:11-26): kill grid bug = +1 terminal;
+    "squeak" message = -1 terminal (stepping on the trap ends the episode).
+    """
+    rm = RewardManager()
+    rm.add_kill_event(
+        "grid bug",
+        reward=1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    rm.add_message_event(
+        ["squeak"],
+        reward=-1.0,
+        terminal_required=True,
+        terminal_sufficient=True,
+    )
+    return rm
+
+
+def _keyroom_rm() -> RewardManager:
+    """Vendor KeyRoom (keyroom.py): no custom RewardManager — MiniHackKeyDoor
+    inherits the sparse stairs_down terminal from MiniHackNavigation.
+    Kept as a named alias so call sites read intentionally.
+    """
+    return _default_goal_reward_manager()
+
+
 # Vendor levitation message list (skills_levitate.py:7-13).
 _LEVITATION_MSGS = [
     "You float up",
@@ -612,7 +652,7 @@ def _register_keyroom_envs(register_fn) -> None:
             _keyroom_builder(rs, ss, lit),
             w=max(20, rs + 2), h=max(20, rs + 2), lit=lit,
         )
-        register_fn(env_id, factory, _default_goal_reward_manager(),
+        register_fn(env_id, factory, _keyroom_rm(),
                     max_steps=ms, category="KeyRoom")
 
 
@@ -1027,7 +1067,7 @@ def _register_memento_envs(register_fn) -> None:
     for env_id, v, ms, des_name in variants:
         fallback = _make_factory(_memento_builder(v), w=22, h=12)
         factory = _des_factory(des_name, fallback=fallback)
-        register_fn(env_id, factory, _default_goal_reward_manager(),
+        register_fn(env_id, factory, _memento_rm(),
                     max_steps=ms, category="Memento")
 
 
@@ -1341,17 +1381,17 @@ def _register_skill_door_envs(register_fn) -> None:
 
     factory = _make_factory(closed_builder, w=6, h=5)
     register_fn("MiniHack-ClosedDoor-v0", factory,
-                _default_goal_reward_manager(),
+                _skill_door_rm(),
                 max_steps=50, category="Skill")
 
     factory = _make_factory(locked_builder, w=6, h=5)
     register_fn("MiniHack-LockedDoor-v0", factory,
-                _default_goal_reward_manager(),
+                _skill_door_rm(),
                 max_steps=50, category="Skill")
 
     factory = _make_factory(locked_builder, w=6, h=5)
     register_fn("MiniHack-LockedDoor-Fixed-v0", factory,
-                _default_goal_reward_manager(),
+                _skill_door_rm(),
                 max_steps=50, category="Skill")
 
 
