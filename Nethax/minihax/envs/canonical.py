@@ -682,6 +682,27 @@ def _lavacross_builder(*, with_potion: bool,
         else:
             item = "levitation boots"
             symbol = "["
+        if inv and (with_potion or with_ring):
+            # ``-Inv-`` variants start with the levitation item already
+            # carried.  Vendor counterparts (skills_lava.py
+            # MiniHackLCLevitate{Potion,Ring}Inv) rely on autopickup at the
+            # player's start tile; we pre-populate the inventory directly so
+            # the hero is carrying it at reset (no on-floor copy).
+            # Cite: vendor/nethack/src/objects.c indices
+            #   278 = POT_LEVITATION, 160 = RIN_LEVITATION.
+            if with_potion:
+                lg.add_starting_inventory_item(
+                    category=8,   # ItemCategory.POTION
+                    type_id=278,  # POT_LEVITATION
+                    weight=20,
+                )
+            else:
+                lg.add_starting_inventory_item(
+                    category=4,   # ItemCategory.RING
+                    type_id=160,  # RIN_LEVITATION
+                    weight=3,
+                )
+            return
         place_x = 2 if inv else 6
         try:
             lg.add_object(item, symbol, place=(place_x, 4))
@@ -918,40 +939,11 @@ def _register_river_envs(register_fn) -> None:
 
 # ---------------------------------------------------------------------------
 # MultiRoom envs (Group C — MiniGrid ports)
+# Procedural recursive room+door placement lives in
+# ``Nethax/minihax/world_gen/multiroom.py`` (MiniGrid-style: per-reset
+# topology randomisation).
 # ---------------------------------------------------------------------------
-def _multiroom_builder(n_rooms: int, *, lava_walls: bool,
-                       locked: bool, monster: bool,
-                       open_door: bool,
-                       extreme: bool) -> Callable[[LevelGenerator], None]:
-    def build(lg: LevelGenerator) -> None:
-        positions = []
-        for i in range(n_rooms):
-            x = 1 + i * 8
-            y = 1 + (i % 3) * 5
-            x = min(x, 70)
-            y = min(y, 14)
-            rid = lg.add_room(x=x, y=y, w=4, h=4)
-            positions.append((rid, x + 1, y + 1))
-        # Connect consecutive rooms via corridors.
-        for i in range(len(positions) - 1):
-            _, x1, y1 = positions[i]
-            _, x2, y2 = positions[i + 1]
-            lg.add_corridor((x1 + 2, y1), (x2, y2))
-            # Door at the corridor source.
-            door_state = "locked" if locked else ("open" if open_door else "closed")
-            lg.add_door(x1 + 2, y1, state=door_state)
-        # Optional environmental hazards.
-        if lava_walls or extreme:
-            lg.fill_terrain("L", 30, 9, 32, 9)
-        if monster or extreme:
-            for _ in range(min(3, n_rooms)):
-                lg.add_monster()
-        # Start in first, goal in last room.
-        _, sx, sy = positions[0]
-        _, gx, gy = positions[-1]
-        lg.set_start_pos(sx, sy)
-        lg.add_stair_down(x=gx, y=gy)
-    return build
+from Nethax.minihax.world_gen.multiroom import multiroom_factory as _multiroom_factory
 
 
 def _register_multiroom_envs(register_fn) -> None:
@@ -985,11 +977,10 @@ def _register_multiroom_envs(register_fn) -> None:
         ("MiniHack-MultiRoom-N6-LavaMonsters-v0",   6,  True,  False, True,  False, False, 240),
     ]
     for (env_id, n, lava, locked, monster, open_door, extreme, ms) in variants:
-        builder = _multiroom_builder(
+        factory = _multiroom_factory(
             n, lava_walls=lava, locked=locked, monster=monster,
             open_door=open_door, extreme=extreme,
         )
-        factory = _make_factory(builder, w=76, h=21)
         rm = _lava_avoid_reward_manager() if lava else _default_goal_reward_manager()
         register_fn(env_id, factory, rm,
                     max_steps=ms, category="MultiRoom")
