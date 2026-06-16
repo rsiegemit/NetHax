@@ -1,0 +1,23 @@
+# vendor NLE rn2() trace from mklev() for MiniHack-Room-5x5-v0 seed=0
+# Captured: 2026-06-16
+# Method: Option B - patched vendor/nle/src/rnd.c::rn2() to fprintf stderr,
+#   gated on env NETHAX_RN2_TRACE=1 AND in_mklev flag (set by mklev() at
+#   vendor/nle/src/mklev.c:1030, cleared at line 1034).
+# Build: PATH=.venv/bin:$PATH .venv/bin/pip install -e vendor/nle/ --no-build-isolation --no-deps
+# Run:   NETHAX_RN2_TRACE=1 JAX_PLATFORMS=cpu NETHAX_EAGER=1 .venv/bin/python <reset-snippet>
+# Format: idx N result   (one line per rn2(N) call inside mklev())
+#
+# Caveats:
+#   - Only counts rn2 calls while in_mklev==TRUE (i.e. between the two assignments
+#     in mklev.c lines 1030/1034). reseed_random() draws at the top of mklev() and
+#     init_mapseen()/getbones() before in_mklev flips are EXCLUDED.
+#   - bones.c and worn.c also toggle in_mklev briefly; for a fresh seed=0 reset
+#     getbones() returns FALSE (no bones file) so those paths are inert here.
+#   - MiniHack-Room-5x5 loads a des-file template; the small call count (4) is
+#     expected — the room geometry is fixed and only a handful of random
+#     placement choices remain inside makelevel().
+#   - rn2_on_display_rng() draws are on the separate DISP rng and are NOT traced.
+0 3 1
+1 2 1
+2 1 0
+3 1 0
