@@ -109,6 +109,10 @@ def _build_quest_easy_map():
     game_map = jnp.where(all_floor, TileType.FLOOR, game_map)
     game_map = jnp.where(lava, TileType.LAVA, game_map)
 
+    # Closed door at goal-room entrance (col 22, row 3) — gates progression
+    # from corridor into the goal room.  Matches vendor goal_lwall opening.
+    game_map = game_map.at[3, 22].set(TileType.DOOR_CLOSED)
+
     return game_map
 
 

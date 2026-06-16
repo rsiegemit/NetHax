@@ -70,6 +70,10 @@ def _build_quest_medium_map():
     game_map = jnp.where(corr_r1 | corr_r2 | corr_r3 | corr_entry, TileType.CORRIDOR, game_map)
     game_map = jnp.where(lava, TileType.LAVA, game_map)
 
+    # Closed door at the corridor-to-goal-room entry (col 12, row 3) — gates
+    # progression from corridor into the lava room.
+    game_map = game_map.at[3, 12].set(TileType.DOOR_CLOSED)
+
     return game_map
 
 
