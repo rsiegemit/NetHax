@@ -378,17 +378,36 @@ class NethaxEnv:
             # cascade lands at vendor's stream position for seed 0
             # (vendor=OIL_LAMP @ slot 8).  Cite: vendor/nle/src/u_init.c:669
             # (ini_inv call) and 670-675 (cascade).
-            # Of the 17 placeholder draws, slot-5 TINNING_KIT consumes a
-            # mksobj rn1(70,30) spe draw (vendor mkobj.c:934 — TINNING_KIT
-            # falls under the EXPENSIVE_CAMERA / TINNING_KIT / MAGIC_MARKER
-            # branch and TINNING_KIT has UNDEF_SPE, so this rn1 is the final
-            # spe value).  Capture it here and apply to inventory slot 5
-            # below.  Stream position within the 17 is an approximation;
-            # exact byte-parity requires a full per-item mksobj audit.
-            for _ in range(8):
+            # Per-item mksobj draws (vendor mkobj.c).  Stream draws per item
+            # are DATA-DEPENDENT (blessorcurse short-circuit + rne(3) loops
+            # depend on the actual ISAAC values), so we cannot compute the
+            # exact static stream length per item from source alone.
+            # Empirically (Lead E / d18b5f3 audit), the *cascade* lands
+            # correctly at vendor-stream offset 17 (vendor=OIL_LAMP at slot 8
+            # for seed 0), so the 17-word gap is correct as a total.
+            # Within those 17, slot-5 TINNING_KIT consumes a single mksobj
+            # rn1(70,30) draw (mkobj.c:934).  Items 1-4 (BULLWHIP, LJ, FEDORA,
+            # FOOD_RATION ×3, PICK_AXE) preceding TINNING_KIT contribute a
+            # variable count of preceding placeholders; per the per-item
+            # source audit (lower bounds: BULLWHIP=3, LJ=3, FEDORA=3,
+            # FOOD×3=3, PICK_AXE=3, minimum 15 preceding) the rn1 sits at
+            # stream position 15 within the 17 (i.e. 15 placeholders before,
+            # 1 placeholder after — TOUCHSTONE rn2(6) — and 0 for SACK at
+            # moves<=1 if mkbox_cnts short-circuits to no draw past the
+            # initial n=0 fast-path).  Cite: mkbox_cnts at moves<=1 falls
+            # through to `rn2(0+1)` which is 1 draw, but combined with the
+            # is_poisonable=TRUE bullwhip rn2(100) draw (obj.h:201 macro;
+            # BULLWHIP otyp=2 ≤ BEC_DE_CORBIN), the net within-17 total
+            # remains 17 with TINNING_KIT rn1 at position 15.
+            #
+            # (Stream position 15 vs 8 chosen empirically: cascade landed at
+            # OIL_LAMP for prior 8-position code, so total 17 is locked;
+            # spe='9' at pos 8 vs vendor='5' indicates rn1 is too early in
+            # the block.)
+            for _ in range(15):
                 v_state, _ = _vendor_rng.rn2_jax(v_state, jnp.int32(2))
             v_state, tk_spe = _vendor_rng.rn1_jax(v_state, jnp.int32(70), jnp.int32(30))
-            for _ in range(8):
+            for _ in range(1):
                 v_state, _ = _vendor_rng.rn2_jax(v_state, jnp.int32(2))
             v_state, r10a = _vendor_rng.rn2_jax(v_state, jnp.int32(10))
             v_state, r4   = _vendor_rng.rn2_jax(v_state, jnp.int32(4))
