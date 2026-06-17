@@ -426,8 +426,8 @@ def _vendor_geometry_center(size: int) -> tuple[int, int]:
     y_maze_max = 20  # ROWNO - 1
     xstart = 2 + ((x_maze_max - 2 - size) // 2)
     ystart = 2 + ((y_maze_max - 2 - size) // 2)
-    if (xstart % 2) != 0:
-        xstart -= 1
+    if (xstart % 2) == 0:
+        xstart += 1
     if (ystart % 2) == 0:
         ystart += 1
     return xstart, ystart
