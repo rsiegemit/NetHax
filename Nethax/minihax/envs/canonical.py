@@ -569,16 +569,11 @@ def _wrap_trap_room_placement(
 
     def wrapped(rng: jax.Array):
         state = factory(rng)
+        # Per-trap 2× rn2(5) + 5× (rn2(79), rn2(21)) somxy pairs are now
+        # consumed inside the build by ``_resolve_trap`` (level_generator.py)
+        # so that the trap's actual placement uses the vendor stream.  We
+        # only need to drive the player-spawn 7-pair somxy loop here.
         vrng = state.vendor_rng
-        # Per-trap: 2× rn2(5) + 5× (rn2(79), rn2(21)) pairs.
-        for _ in range(n_trap):
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-            for _ in range(5):
-                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
-                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
-        # Player random-spawn: 7× (rn2(79), rn2(21)); last pair is the
-        # accepted cell inside the centered room rect.
         last_x = jnp.int32(0)
         last_y = jnp.int32(0)
         for _ in range(7):
