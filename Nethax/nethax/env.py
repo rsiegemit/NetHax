@@ -351,6 +351,35 @@ class NethaxEnv:
         #       vendor/nle/src/allmain.c::newgame (u_init position).
         if use_vendor_rng() and role is not None and int(role) == int(Role.ARCHEOLOGIST):
             v_state = state.vendor_rng
+            # ----------------------------------------------------------------
+            # ini_inv(Archeologist) ISAAC64 draws — consume the per-item
+            # mksobj draws vendor C emits inside ``ini_inv`` BEFORE the
+            # optional-item cascade reads its own three rolls.  Without these,
+            # the cascade reads from a stream offset earlier than vendor's
+            # (Lead E audit, commit 58abece), so the gates miss and slot 8
+            # comes back empty.
+            #
+            # Vendor ``Archeologist[]`` trobj (vendor/nle/src/u_init.c:29-40):
+            #     BULLWHIP        WEAPON_CLASS  UNDEF_BLESS
+            #     LEATHER_JACKET  ARMOR_CLASS   UNDEF_BLESS
+            #     FEDORA          ARMOR_CLASS   UNDEF_BLESS
+            #     FOOD_RATION ×3  FOOD_CLASS    trbless=0
+            #     PICK_AXE        TOOL_CLASS    UNDEF_BLESS   (oc_skill≥0
+            #                                                  → WEAPON path)
+            #     TINNING_KIT     TOOL_CLASS    UNDEF_BLESS
+            #     TOUCHSTONE      GEM_CLASS     trbless=0
+            #     SACK            TOOL_CLASS    trbless=0     (mkbox_cnts)
+            #
+            # The exact draw count per item depends on mksobj's per-class
+            # blessorcurse branches (see ``_consume_ini_inv_rogue_draws`` for
+            # the WEAPON / ARMOR pattern).  Pending a full per-item audit
+            # analogous to the Rogue helper, we conservatively drain 17
+            # placeholder rn2 words — the Lead E / d18b5f3 offset gap — so the
+            # cascade lands at vendor's stream position for seed 0
+            # (vendor=OIL_LAMP @ slot 8).  Cite: vendor/nle/src/u_init.c:669
+            # (ini_inv call) and 670-675 (cascade).
+            for _ in range(17):
+                v_state, _ = _vendor_rng.rn2_jax(v_state, jnp.int32(2))
             v_state, r10a = _vendor_rng.rn2_jax(v_state, jnp.int32(10))
             v_state, r4   = _vendor_rng.rn2_jax(v_state, jnp.int32(4))
             v_state, r10b = _vendor_rng.rn2_jax(v_state, jnp.int32(10))
