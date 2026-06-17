@@ -486,6 +486,12 @@ def _wrap_random_room_placement(
         # a valid in-room cell even if no candidate happens to land inside.
         acc_x = jnp.int32((x1 + x2) // 2)
         acc_y = jnp.int32((y1 + y2) // 2)
+        # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) emitted
+        # BEFORE the 7 player-spawn somxy pairs (trace offsets 339-342).
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
         for _ in range(7):
             vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
@@ -535,20 +541,45 @@ def _wrap_monster_room_placement(
     use the final accepted ``(x, y)`` as ``player_pos`` for n_monster=1.
     """
     from Nethax.nethax import vendor_rng as _vendor_rng
-    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    from Nethax.minihax.level_generator import (
+        seed_hero_fov as _seed_hero_fov,
+        _write_monster,
+    )
     import jax.numpy as jnp
 
     def wrapped(rng: jax.Array):
         state = factory(rng)
         vrng = state.vendor_rng
+        x1, y1 = _vendor_geometry_center(size)
+        x2 = x1 + size - 1
+        y2 = y1 + size - 1
         # Per-monster: 11 small-modulus mklev draws (monster type/class) +
-        # 2 (rn2(79), rn2(21)) coord pairs (mkmonster somxy() loop).
+        # 2 (rn2(79), rn2(21)) coord pairs (mkmonster somxy() loop).  Track
+        # the last in-room accepted (mx, my) from the 2 pairs and stamp a
+        # monster at that cell so byte-parity sees a monster glyph instead
+        # of lit floor.  Fallback: room center.
         for _ in range(n_monster):
             for mod in (3, 2, 5, 5, 3, 5, 5, 2, 50, 100, 100):
                 vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(mod))
+            mon_x = jnp.int32((x1 + x2) // 2)
+            mon_y = jnp.int32((y1 + y2) // 2)
             for _ in range(2):
-                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
-                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+                vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+                vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+                in_room = (
+                    (cand_x >= jnp.int32(x1))
+                    & (cand_x <= jnp.int32(x2))
+                    & (cand_y >= jnp.int32(y1))
+                    & (cand_y <= jnp.int32(y2))
+                )
+                mon_x = jnp.where(in_room, cand_x, mon_x)
+                mon_y = jnp.where(in_room, cand_y, mon_y)
+            # Stamp monster (mon_idx=0 = canonical first MONSTERS entry —
+            # exact type tuning is a followup; presence advances past the
+            # lit-floor vs monster-glyph diff).
+            state = state.replace(vendor_rng=vrng)
+            state = _write_monster(state, (int(mon_y), int(mon_x)), mon_idx=0)
+            vrng = state.vendor_rng
         # Player random-spawn: 7× (rn2(79), rn2(21)); track the LAST ACCEPTED
         # in-room pair so player_pos always lands inside the centered room
         # rect (matches the Random/Trap wrappers).  Falling back to the last
@@ -560,6 +591,12 @@ def _wrap_monster_room_placement(
         y2 = y1 + size - 1
         acc_x = jnp.int32((x1 + x2) // 2)
         acc_y = jnp.int32((y1 + y2) // 2)
+        # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) emitted
+        # BEFORE the 7 player-spawn somxy pairs (trace offsets 339-342).
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
         for _ in range(7):
             vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
@@ -624,6 +661,12 @@ def _wrap_trap_room_placement(
         # cell even if no candidate happens to land inside the rect.
         acc_x = jnp.int32((x1 + x2) // 2)
         acc_y = jnp.int32((y1 + y2) // 2)
+        # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) emitted
+        # BEFORE the 7 player-spawn somxy pairs (trace offsets 339-342).
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
         for _ in range(7):
             vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
