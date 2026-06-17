@@ -479,15 +479,28 @@ def _wrap_random_room_placement(
     def wrapped(rng: jax.Array):
         state = factory(rng)
         vrng = state.vendor_rng
-        last_x = jnp.int32(0)
-        last_y = jnp.int32(0)
+        x1, y1 = _vendor_geometry_center(size)
+        x2 = x1 + size - 1
+        y2 = y1 + size - 1
+        # Fallback to room center (always in room) so player_pos is always
+        # a valid in-room cell even if no candidate happens to land inside.
+        acc_x = jnp.int32((x1 + x2) // 2)
+        acc_y = jnp.int32((y1 + y2) // 2)
         for _ in range(7):
-            vrng, last_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
-            vrng, last_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            in_room = (
+                (cand_x >= jnp.int32(x1))
+                & (cand_x <= jnp.int32(x2))
+                & (cand_y >= jnp.int32(y1))
+                & (cand_y <= jnp.int32(y2))
+            )
+            acc_x = jnp.where(in_room, cand_x, acc_x)
+            acc_y = jnp.where(in_room, cand_y, acc_y)
         state = state.replace(
             vendor_rng=vrng,
             player_pos=jnp.stack(
-                [last_y.astype(jnp.int16), last_x.astype(jnp.int16)]
+                [acc_y.astype(jnp.int16), acc_x.astype(jnp.int16)]
             ),
         )
         # Seed the hero's Chebyshev<=1 torchlight at the vendor-accepted
