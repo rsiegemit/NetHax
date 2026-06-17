@@ -954,14 +954,14 @@ def _apply_directives(
         elif isinstance(d, _StartPosDirective):
             lg.last_player_pos = (d.x, d.y)
         elif isinstance(d, _MonsterDirective):
-            pos_rc, mon_idx = _resolve_monster(
-                d, terrain_np, w, h, resolved_rooms, _next_key,
+            pos_rc, mon_idx, state = _resolve_monster(
+                d, terrain_np, w, h, resolved_rooms, _next_key, state,
             )
             state = _write_monster(state, pos_rc, mon_idx)
             lg.last_monster_entry_ids.append(mon_idx)
         elif isinstance(d, _TrapDirective):
-            pos_rc, trap_type = _resolve_trap(
-                d, terrain_np, w, h, resolved_rooms, _next_key,
+            pos_rc, trap_type, state = _resolve_trap(
+                d, terrain_np, w, h, resolved_rooms, _next_key, state,
             )
             trap_type_arr = trap_type_arr.at[
                 trap_lvl_idx, pos_rc[0], pos_rc[1]
@@ -1129,40 +1129,47 @@ def _apply_directives(
     # seed (view_from on 21x79 is the dominant Mac compile cost).  We must
     # therefore run the LG-side preflood under BOTH the vendor-RNG path AND
     # the legacy Threefry path so the starting room renders as lit floor.
+    # Hero-radius (Chebyshev<=1) torchlight seeding runs for BOTH lit and
+    # dark rooms — vendor vision_recalc lights the hero's own 3x3 even in
+    # dark rooms, so the starting cell must render as S_room not S_stone.
+    # The flood-fill "lit_mask" path is gated on ``default_lit`` because
+    # only LevelGenerator(lit=True) marks every carved tile as rlit=1.
+    # Mirrors Nethax/nethax/env.py:796-836.
+    from Nethax.nethax.fov import view_from as _view_from
+    terrain_l0 = state.terrain[0, 0]
+    couldsee = _view_from(
+        terrain_l0,
+        state.player_pos.astype(jnp.int32),
+        max_radius=0,
+    )
+    # "Lit" mask: any non-VOID tile is part of the lit room/corridor when
+    # default_lit=True.  For dark rooms (lit=False) the mask is all-False
+    # so only the hero's Chebyshev<=1 torchlight cells become visible.
     if lg.default_lit:
-        from Nethax.nethax.fov import view_from as _view_from
-        terrain_l0 = state.terrain[0, 0]
-        couldsee = _view_from(
-            terrain_l0,
-            state.player_pos.astype(jnp.int32),
-            max_radius=0,
-        )
-        # "Lit" mask: any non-VOID tile is part of the lit room/corridor when
-        # default_lit=True.  This intentionally treats the whole carved area
-        # as lit, matching LevelGenerator(lit=True) where every add_room /
-        # fill_terrain carves lit floor.
         lit_mask = terrain_l0 != jnp.int8(int(TileType.VOID))
-        # Hero-radius (Chebyshev<=1) fallback for cells outside any room.
-        pr = state.player_pos[0].astype(jnp.int32)
-        pc = state.player_pos[1].astype(jnp.int32)
-        _h_g, _w_g = terrain_l0.shape
-        rows_g = jnp.arange(_h_g, dtype=jnp.int32)[:, None]
-        cols_g = jnp.arange(_w_g, dtype=jnp.int32)[None, :]
-        within_light = (
-            (jnp.abs(rows_g - pr) <= jnp.int32(1))
-            & (jnp.abs(cols_g - pc) <= jnp.int32(1))
-        )
-        vis = couldsee & (lit_mask | within_light)
-        old_lst = state.last_seen_terrain[0, 0]
-        new_lst = jnp.where(vis, terrain_l0.astype(jnp.int8), old_lst)
-        new_explored = state.explored.at[0, 0].set(
-            state.explored[0, 0] | vis
-        )
-        state = state.replace(
-            explored=new_explored,
-            visible=vis,
-            last_seen_terrain=state.last_seen_terrain.at[0, 0].set(new_lst),
-        )
+    else:
+        lit_mask = jnp.zeros_like(terrain_l0, dtype=jnp.bool_)
+    # Hero-radius (Chebyshev<=1) torchlight — applies to any room.
+    pr = state.player_pos[0].astype(jnp.int32)
+    pc = state.player_pos[1].astype(jnp.int32)
+    _h_g, _w_g = terrain_l0.shape
+    rows_g = jnp.arange(_h_g, dtype=jnp.int32)[:, None]
+    cols_g = jnp.arange(_w_g, dtype=jnp.int32)[None, :]
+    within_light = (
+        (jnp.abs(rows_g - pr) <= jnp.int32(1))
+        & (jnp.abs(cols_g - pc) <= jnp.int32(1))
+    )
+    vis = couldsee & (lit_mask | within_light)
+    old_lst = state.last_seen_terrain[0, 0]
+    new_lst = jnp.where(vis, terrain_l0.astype(jnp.int8), old_lst)
+    new_explored = state.explored.at[0, 0].set(
+        state.explored[0, 0] | vis
+    )
+    state = state.replace(
+        explored=new_explored,
+        visible=vis,
+        last_seen_terrain=state.last_seen_terrain.at[0, 0].set(new_lst),
+    )
 
     return state
 
@@ -1452,8 +1459,26 @@ def _resolve_monster(
     h: int,
     resolved_rooms: dict,
     next_key,
-) -> Tuple[Tuple[int, int], int]:
-    """Return ``((row, col), monster_idx)`` for a monster directive."""
+    state: Optional[EnvState] = None,
+) -> Tuple[Tuple[int, int], int, Optional[EnvState]]:
+    """Resolve a monster directive to ``((row, col), monster_idx, new_state)``.
+
+    Under ``use_vendor_rng()``, draws come from ``state.vendor_rng`` so that
+    monster placement consumes the same ISAAC64 stream offsets vendor
+    ``mkmonster`` consumes (vendor/nethack/src/makemon.c + mklev.c somxy
+    loop).  Per the seed-0 5x5 trace diff vs the Trap variant
+    (.test_runs/full_init_rn2_trace_room_monster_5x5_seed0.txt offsets
+    345-369), the monster directive consumes:
+
+    * 5× small-modulus draws for monster-type / makemon internal picks:
+      ``rn2(5)``, ``rn2(2)``, ``rn2(50)``, ``rn2(100)``, ``rn2(100)``.
+    * 10× ``(rn2(79), rn2(21))`` somxy() coordinate pairs (retry loop;
+      we accept the first FLOOR cell, otherwise keep the last drawn pair —
+      matches the bounded-retry pattern used by ``_resolve_trap``).
+
+    The new ``state`` (with advanced ``vendor_rng``) is returned; callers
+    MUST adopt it.
+    """
     if d.name == "random":
         # Wave 5+ TODO: depth-aware random pick.  For Wave 4 we substitute a
         # deterministic fallback so the directive always produces a monster.
@@ -1469,10 +1494,43 @@ def _resolve_monster(
                 f"unknown monster name {d.name!r}; not present in MONSTERS table"
             )
         idx = _MONSTER_NAME_TO_IDX[lookup]
+
+    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng
+    if state is not None and _use_vendor_rng():
+        from Nethax.nethax import vendor_rng as _vendor_rng
+        vrng = state.vendor_rng
+        # 5× small-mod draws: monster-type / makemon internal picks
+        # (rn2(5), rn2(2), rn2(50), rn2(100), rn2(100)) per the seed-0
+        # trace diff vs the Trap variant.
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        # somxy() retry loop: 10× (rn2(79), rn2(21)).  Accept the first
+        # FLOOR cell; otherwise fall back to the last drawn pair.
+        floor = int(TileType.FLOOR)
+        sub = terrain_np[0, 0, :h, :w]
+        rc: Optional[Tuple[int, int]] = None
+        last_xy: Optional[Tuple[int, int]] = None
+        for _ in range(10):
+            vrng, x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            vrng, y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            xi = int(x)
+            yi = int(y)
+            last_xy = (yi, xi)
+            if 0 <= yi < h and 0 <= xi < w and int(sub[yi, xi]) == floor:
+                rc = (yi, xi)
+                break
+        if rc is None:
+            rc = last_xy if last_xy is not None else (0, 0)
+        new_state = state.replace(vendor_rng=vrng)
+        return rc, idx, new_state
+
     rc = _resolve_place(d.place, terrain_np, w, h, resolved_rooms, next_key)
     if rc is None:
         rc = (0, 0)
-    return rc, idx
+    return rc, idx, state
 
 
 def _resolve_object(
@@ -1505,15 +1563,58 @@ def _resolve_trap(
     h: int,
     resolved_rooms: dict,
     next_key,
-) -> Tuple[Tuple[int, int], int]:
+    state: Optional[EnvState] = None,
+) -> Tuple[Tuple[int, int], int, Optional[EnvState]]:
+    """Resolve a trap directive to ``((row, col), trap_kind, new_state)``.
+
+    Under ``use_vendor_rng()``, draws come from ``state.vendor_rng`` so that
+    trap placement consumes the same ISAAC64 stream offsets vendor
+    ``mktrap`` consumes (vendor/nethack/src/mklev.c:1318-1366 trap-kind
+    picker + somxy loop): 2× ``rn2(5)`` for type/internal selection, then
+    up to 5× ``(rn2(79), rn2(21))`` coordinate pairs (somxy retry loop),
+    accepting the first FLOOR cell.  The new ``state`` (with advanced
+    ``vendor_rng``) is returned; callers MUST adopt it.
+    """
     if d.name == "random":
         trap_kind = int(TrapType.TELEP_TRAP)
     else:
         trap_kind = int(TRAP_NAME_TO_TYPE[d.name])
+
+    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng
+    if state is not None and _use_vendor_rng():
+        from Nethax.nethax import vendor_rng as _vendor_rng
+        vrng = state.vendor_rng
+        # 2× rn2(5): trap-kind / mktrap internal selection
+        # (vendor/nethack/src/mklev.c:1318-1366 traptype_rnd cascade).
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        # somxy() retry loop: up to 5× (rn2(79), rn2(21)).  Empirically the
+        # 5x5 seed-0 trace (.test_runs/full_init_rn2_trace_room_trap_5x5_seed0.txt)
+        # consumes exactly 5 pairs.  We accept the first FLOOR cell; if all
+        # 5 are non-floor we keep the last pair (vendor falls back to the
+        # last drawn cell after 20 tries — for parity we use a bounded 5).
+        floor = int(TileType.FLOOR)
+        sub = terrain_np[0, 0, :h, :w]
+        rc: Optional[Tuple[int, int]] = None
+        last_xy: Optional[Tuple[int, int]] = None
+        for _ in range(5):
+            vrng, x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            vrng, y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            xi = int(x)
+            yi = int(y)
+            last_xy = (yi, xi)
+            if 0 <= yi < h and 0 <= xi < w and int(sub[yi, xi]) == floor:
+                rc = (yi, xi)
+                break
+        if rc is None:
+            rc = last_xy if last_xy is not None else (0, 0)
+        new_state = state.replace(vendor_rng=vrng)
+        return rc, trap_kind, new_state
+
     rc = _resolve_place(d.place, terrain_np, w, h, resolved_rooms, next_key)
     if rc is None:
         rc = (0, 0)
-    return rc, trap_kind
+    return rc, trap_kind, state
 
 
 # ---------------------------------------------------------------------------
