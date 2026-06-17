@@ -514,6 +514,7 @@ def _wrap_monster_room_placement(
     use the final accepted ``(x, y)`` as ``player_pos`` for n_monster=1.
     """
     from Nethax.nethax import vendor_rng as _vendor_rng
+    import jax.numpy as jnp
 
     def wrapped(rng: jax.Array):
         state = factory(rng)
@@ -564,6 +565,7 @@ def _wrap_trap_room_placement(
     15x15 / Ultimate variants (single 5x5 trace ground-truthed).
     """
     from Nethax.nethax import vendor_rng as _vendor_rng
+    import jax.numpy as jnp
 
     def wrapped(rng: jax.Array):
         state = factory(rng)
