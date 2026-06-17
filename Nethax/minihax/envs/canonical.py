@@ -549,17 +549,32 @@ def _wrap_monster_room_placement(
             for _ in range(2):
                 vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
                 vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
-        # Player random-spawn: 7× (rn2(79), rn2(21)); last pair is the
-        # accepted cell inside the centered room rect.
-        last_x = jnp.int32(0)
-        last_y = jnp.int32(0)
+        # Player random-spawn: 7× (rn2(79), rn2(21)); track the LAST ACCEPTED
+        # in-room pair so player_pos always lands inside the centered room
+        # rect (matches the Random/Trap wrappers).  Falling back to the last
+        # drawn pair places @ outside the room when vendor's final draw
+        # lands out-of-rect — that was the Monster-5x5 (2,18) and
+        # Ultimate-5x5 (7,56) symptom.
+        x1, y1 = _vendor_geometry_center(size)
+        x2 = x1 + size - 1
+        y2 = y1 + size - 1
+        acc_x = jnp.int32((x1 + x2) // 2)
+        acc_y = jnp.int32((y1 + y2) // 2)
         for _ in range(7):
-            vrng, last_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
-            vrng, last_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            in_room = (
+                (cand_x >= jnp.int32(x1))
+                & (cand_x <= jnp.int32(x2))
+                & (cand_y >= jnp.int32(y1))
+                & (cand_y <= jnp.int32(y2))
+            )
+            acc_x = jnp.where(in_room, cand_x, acc_x)
+            acc_y = jnp.where(in_room, cand_y, acc_y)
         state = state.replace(
             vendor_rng=vrng,
             player_pos=jnp.stack(
-                [last_y.astype(jnp.int16), last_x.astype(jnp.int16)]
+                [acc_y.astype(jnp.int16), acc_x.astype(jnp.int16)]
             ),
         )
         # Seed the hero's Chebyshev<=1 torchlight at the vendor-accepted
