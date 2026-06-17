@@ -474,6 +474,7 @@ def _wrap_random_room_placement(
     override ``player_pos`` with the last drawn pair.
     """
     from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TileType
     from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
 
     def wrapped(rng: jax.Array):
@@ -488,10 +489,18 @@ def _wrap_random_room_placement(
         acc_y = jnp.int32((y1 + y2) // 2)
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) emitted
         # BEFORE the 7 player-spawn somxy pairs (trace offsets 339-342).
+        # The two rn2(5) draws are the (x_off, y_off) into the room rect
+        # used by vendor mkstairs to place the down-stair (commit 6152cb5
+        # consumed them without applying — fix(minihax) stamps them here).
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, stair_x_off = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, stair_y_off = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        stair_x = jnp.int32(x1) + stair_x_off
+        stair_y = jnp.int32(y1) + stair_y_off
+        new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
+            jnp.int8(int(_TileType.STAIRCASE_DOWN))
+        )
         for _ in range(7):
             vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
@@ -505,6 +514,7 @@ def _wrap_random_room_placement(
             acc_y = jnp.where(in_room, cand_y, acc_y)
         state = state.replace(
             vendor_rng=vrng,
+            terrain=new_terrain,
             player_pos=jnp.stack(
                 [acc_y.astype(jnp.int16), acc_x.astype(jnp.int16)]
             ),
@@ -644,6 +654,7 @@ def _wrap_trap_room_placement(
     15x15 / Ultimate variants (single 5x5 trace ground-truthed).
     """
     from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TileType
     from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
     import jax.numpy as jnp
 
@@ -663,10 +674,18 @@ def _wrap_trap_room_placement(
         acc_y = jnp.int32((y1 + y2) // 2)
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) emitted
         # BEFORE the 7 player-spawn somxy pairs (trace offsets 339-342).
+        # The two rn2(5) draws are the (x_off, y_off) into the room rect
+        # used by vendor mkstairs to place the down-stair (commit 6152cb5
+        # consumed them without applying — fix(minihax) stamps them here).
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, stair_x_off = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, stair_y_off = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        stair_x = jnp.int32(x1) + stair_x_off
+        stair_y = jnp.int32(y1) + stair_y_off
+        new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
+            jnp.int8(int(_TileType.STAIRCASE_DOWN))
+        )
         for _ in range(7):
             vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
@@ -680,6 +699,7 @@ def _wrap_trap_room_placement(
             acc_y = jnp.where(in_room, cand_y, acc_y)
         state = state.replace(
             vendor_rng=vrng,
+            terrain=new_terrain,
             player_pos=jnp.stack(
                 [acc_y.astype(jnp.int16), acc_x.astype(jnp.int16)]
             ),
