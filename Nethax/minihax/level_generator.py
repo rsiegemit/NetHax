@@ -1102,7 +1102,15 @@ def _apply_directives(
         state = state.replace(inventory=_InventoryState.from_items(items))
 
     # 5. Apply player start position (default: any free floor tile).
-    if lg.last_player_pos is not None:
+    # Track whether the position came from an explicit ``set_start_pos`` so
+    # step 6 can skip FoV seeding when the actual hero cell will be picked
+    # later by a vendor-RNG wrapper (e.g. ``_wrap_random_room_placement`` in
+    # canonical.py).  Without this guard, FoV seeds at the auto-found
+    # top-left corner of the first room and over-lights its Chebyshev<=1
+    # neighbourhood, which becomes wrong as soon as the wrapper rewrites
+    # ``player_pos`` to the vendor-accepted random cell.
+    explicit_start_pos = lg.last_player_pos is not None
+    if explicit_start_pos:
         px, py = lg.last_player_pos
         state = state.replace(
             player_pos=jnp.array([py, px], dtype=jnp.int16),
@@ -1119,22 +1127,35 @@ def _apply_directives(
 
     # 6. Seed initial FOV / last_seen_terrain so the starting room renders as
     # lit floor (S_room, cmap=19, glyph=2378) instead of S_stone (glyph=2359).
-    # Mirrors Nethax/nethax/env.py:556-631 (vendor vision_recalc on level
-    # entry).  Without this, build_nle_observation falls back to the -1
-    # last_seen sentinel and renders every interior cell as stone, breaking
-    # byte-parity against vendor MiniHack Room envs (vendor preflood lights
-    # the room because LevelGenerator(lit=True) -> rlit=1).
-    # Wave 6 reroute (cfc2db6): the vendor-RNG bootstrap calls NethaxEnv.reset
-    # with ``fast_reset=True``, which SKIPS the engine-side view_from FoV
-    # seed (view_from on 21x79 is the dominant Mac compile cost).  We must
-    # therefore run the LG-side preflood under BOTH the vendor-RNG path AND
-    # the legacy Threefry path so the starting room renders as lit floor.
-    # Hero-radius (Chebyshev<=1) torchlight seeding runs for BOTH lit and
-    # dark rooms — vendor vision_recalc lights the hero's own 3x3 even in
-    # dark rooms, so the starting cell must render as S_room not S_stone.
-    # The flood-fill "lit_mask" path is gated on ``default_lit`` because
-    # only LevelGenerator(lit=True) marks every carved tile as rlit=1.
-    # Mirrors Nethax/nethax/env.py:796-836.
+    # Skipped when the player position is not explicit — the random-room
+    # wrappers in ``Nethax/minihax/envs/canonical.py`` call
+    # :func:`seed_hero_fov` themselves after pinning ``player_pos`` to the
+    # vendor-accepted cell.
+    if explicit_start_pos:
+        state = seed_hero_fov(state, lg.default_lit)
+
+    return state
+
+
+def seed_hero_fov(state: EnvState, default_lit: bool) -> EnvState:
+    """Seed ``visible`` / ``explored`` / ``last_seen_terrain`` for the
+    hero's current cell on level (branch=0, level=0).
+
+    Mirrors ``Nethax/nethax/env.py:796-836`` (vendor ``vision_recalc`` on
+    level entry).  Without this seed the engine-side ``fast_reset=True``
+    bootstrap leaves ``last_seen_terrain`` at the -1 sentinel and every
+    interior cell renders as stone (S_stone, glyph 2359) instead of lit
+    floor (S_room, glyph 2378).
+
+    Hero-radius (Chebyshev<=1) torchlight applies to both lit and dark
+    rooms (vendor lights the hero's own 3x3 even in dark rooms).  The
+    flood-fill ``lit_mask`` path is gated on ``default_lit`` because only
+    ``LevelGenerator(lit=True)`` marks every carved tile as rlit=1.
+
+    Per-cell visibility is gated by ``view_from`` so walls correctly block
+    line-of-sight; this prevents over-lighting cells through a wall when
+    the hero stands adjacent to the room boundary.
+    """
     from Nethax.nethax.fov import view_from as _view_from
     terrain_l0 = state.terrain[0, 0]
     couldsee = _view_from(
@@ -1142,14 +1163,10 @@ def _apply_directives(
         state.player_pos.astype(jnp.int32),
         max_radius=0,
     )
-    # "Lit" mask: any non-VOID tile is part of the lit room/corridor when
-    # default_lit=True.  For dark rooms (lit=False) the mask is all-False
-    # so only the hero's Chebyshev<=1 torchlight cells become visible.
-    if lg.default_lit:
+    if default_lit:
         lit_mask = terrain_l0 != jnp.int8(int(TileType.VOID))
     else:
         lit_mask = jnp.zeros_like(terrain_l0, dtype=jnp.bool_)
-    # Hero-radius (Chebyshev<=1) torchlight — applies to any room.
     pr = state.player_pos[0].astype(jnp.int32)
     pc = state.player_pos[1].astype(jnp.int32)
     _h_g, _w_g = terrain_l0.shape
@@ -1165,13 +1182,11 @@ def _apply_directives(
     new_explored = state.explored.at[0, 0].set(
         state.explored[0, 0] | vis
     )
-    state = state.replace(
+    return state.replace(
         explored=new_explored,
         visible=vis,
         last_seen_terrain=state.last_seen_terrain.at[0, 0].set(new_lst),
     )
-
-    return state
 
 
 # ---------------------------------------------------------------------------

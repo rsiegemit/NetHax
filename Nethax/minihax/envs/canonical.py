@@ -459,7 +459,7 @@ def _room_builder(size: int, *, random: bool, lit: bool,
 
 
 def _wrap_random_room_placement(
-    factory: Callable[[jax.Array], "EnvState"], size: int,
+    factory: Callable[[jax.Array], "EnvState"], size: int, lit: bool = True,
 ) -> Callable[[jax.Array], "EnvState"]:
     """Wrap ``factory`` so it consumes 7 ``(rn2(79), rn2(21))`` ISAAC64 pairs
     from ``state.vendor_rng`` (matching vendor MiniHack-Room-Random mklev),
@@ -474,6 +474,7 @@ def _wrap_random_room_placement(
     override ``player_pos`` with the last drawn pair.
     """
     from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
 
     def wrapped(rng: jax.Array):
         state = factory(rng)
@@ -483,12 +484,17 @@ def _wrap_random_room_placement(
         for _ in range(7):
             vrng, last_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, last_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
-        return state.replace(
+        state = state.replace(
             vendor_rng=vrng,
             player_pos=jnp.stack(
                 [last_y.astype(jnp.int16), last_x.astype(jnp.int16)]
             ),
         )
+        # Seed the hero's Chebyshev<=1 torchlight at the vendor-accepted
+        # cell.  The level_generator's _apply_directives skipped this when
+        # no explicit start_pos was set so we wouldn't over-light the
+        # auto-found top-left corner of the room.
+        return _seed_hero_fov(state, lit)
 
     return wrapped
 
@@ -634,7 +640,7 @@ def _register_room_envs(register_fn) -> None:
                 # is materialised; use the final accepted (x, y) (inside the
                 # centered room rect) to set ``player_pos`` so the draws are
                 # not a no-op.
-                factory = _wrap_random_room_placement(factory, size)
+                factory = _wrap_random_room_placement(factory, size, lit=lit)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=size * 20, category="Room")
 
