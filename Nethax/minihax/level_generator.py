@@ -1507,15 +1507,24 @@ def _resolve_monster(
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
-        # somxy() retry loop: 10× (rn2(79), rn2(21)).  Accept the first
-        # FLOOR cell; otherwise fall back to the last drawn pair.
+        # somxy() retry loop: 10× (rn1(width, x1), rn1(height, y1)) per
+        # vendor mklev.c:184-187 — picks room-local coords within the
+        # room rect, NOT map-global rn2(79)/rn2(21).
         floor = int(TileType.FLOOR)
         sub = terrain_np[0, 0, :h, :w]
+        # Single resolved room for canonical 5x5 envs; default to map
+        # bounds if no room was resolved.
+        if resolved_rooms:
+            ry1, rx1, ry2, rx2 = next(iter(resolved_rooms.values()))
+            room_w = rx2 - rx1 + 1
+            room_h = ry2 - ry1 + 1
+        else:
+            rx1, ry1, room_w, room_h = 0, 0, w, h
         rc: Optional[Tuple[int, int]] = None
         last_xy: Optional[Tuple[int, int]] = None
         for _ in range(10):
-            vrng, x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
-            vrng, y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            vrng, x = _vendor_rng.rn1_jax(vrng, jnp.int32(room_w), jnp.int32(rx1))
+            vrng, y = _vendor_rng.rn1_jax(vrng, jnp.int32(room_h), jnp.int32(ry1))
             xi = int(x)
             yi = int(y)
             last_xy = (yi, xi)
@@ -1588,18 +1597,24 @@ def _resolve_trap(
         # (vendor/nethack/src/mklev.c:1318-1366 traptype_rnd cascade).
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-        # somxy() retry loop: up to 5× (rn2(79), rn2(21)).  Empirically the
-        # 5x5 seed-0 trace (.test_runs/full_init_rn2_trace_room_trap_5x5_seed0.txt)
-        # consumes exactly 5 pairs.  We accept the first FLOOR cell; if all
-        # 5 are non-floor we keep the last pair (vendor falls back to the
-        # last drawn cell after 20 tries — for parity we use a bounded 5).
+        # somxy() retry loop: up to 5× (rn1(width, x1), rn1(height, y1))
+        # per vendor mklev.c:184-187 — room-local coords within the room
+        # rect, NOT map-global rn2(79)/rn2(21).  Empirically the 5x5 seed-0
+        # trace consumes exactly 5 pairs; we accept the first FLOOR cell
+        # or fall back to the last pair after 5 retries.
         floor = int(TileType.FLOOR)
         sub = terrain_np[0, 0, :h, :w]
+        if resolved_rooms:
+            ry1, rx1, ry2, rx2 = next(iter(resolved_rooms.values()))
+            room_w = rx2 - rx1 + 1
+            room_h = ry2 - ry1 + 1
+        else:
+            rx1, ry1, room_w, room_h = 0, 0, w, h
         rc: Optional[Tuple[int, int]] = None
         last_xy: Optional[Tuple[int, int]] = None
         for _ in range(5):
-            vrng, x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
-            vrng, y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            vrng, x = _vendor_rng.rn1_jax(vrng, jnp.int32(room_w), jnp.int32(rx1))
+            vrng, y = _vendor_rng.rn1_jax(vrng, jnp.int32(room_h), jnp.int32(ry1))
             xi = int(x)
             yi = int(y)
             last_xy = (yi, xi)
