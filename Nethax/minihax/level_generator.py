@@ -814,7 +814,7 @@ def _apply_directives(
             role=_Role.ARCHEOLOGIST,
             race=_Race.HUMAN,
             alignment=0,
-            fast_reset=False,
+            fast_reset=True,
         )
         # NethaxEnv.reset populated the state with a full vendor dungeon
         # level — rooms, fountains, sleeping monsters, dropped items,
