@@ -1117,10 +1117,16 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         # vendor/nethack/src/objnam.c:1500: rings with oc_charged show +N prefix.
         obj_class   = _OBJECT_CLASS[jnp.clip(type_id, 0, _MAX_OBJ - 1)]
         is_charged_ring = _OBJECT_IS_CHARGED[safe_type]
+        # WEPTOOL items (pick-axe, grappling hook etc) — TOOL_CLASS with
+        # oc_skill != 0 — show +N enchant like weapons per vendor objnam.c.
+        is_weptool = _OBJECT_OC_CHARGED[safe_type] & (
+            obj_class == jnp.uint8(_TOOL_CLASS_VAL)
+        )
         show_enchant = identified & (
             (obj_class == jnp.uint8(_WEAPON_CLASS_VAL)) |
             (obj_class == jnp.uint8(_ARMOR_CLASS_VAL))  |
-            ((obj_class == jnp.uint8(_RING_CLASS_VAL)) & is_charged_ring)
+            ((obj_class == jnp.uint8(_RING_CLASS_VAL)) & is_charged_ring) |
+            is_weptool
         )
         b, c = lax.cond(
             show_enchant,
