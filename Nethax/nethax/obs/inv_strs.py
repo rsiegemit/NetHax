@@ -270,6 +270,7 @@ _OBJECT_OC_CHARGED: jnp.ndarray = jnp.array(
                         ObjectClass.WAND_CLASS))
         or (obj.class_ == ObjectClass.RING_CLASS and obj.name in _CHARGED_RING_NAMES)
         or (obj.class_ == ObjectClass.TOOL_CLASS and obj.oc_charge > 0)
+        or (obj.class_ == ObjectClass.TOOL_CLASS and obj.oc_skill != 0)
         for obj in OBJECTS
     ],
     dtype=jnp.bool_,
