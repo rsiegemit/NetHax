@@ -23,6 +23,7 @@ import os
 from typing import Callable, Optional
 
 import jax
+import jax.numpy as jnp
 
 from Nethax.nethax.state import EnvState
 from Nethax.minihax import des_parser as _dp
@@ -457,6 +458,140 @@ def _room_builder(size: int, *, random: bool, lit: bool,
     return build
 
 
+def _wrap_random_room_placement(
+    factory: Callable[[jax.Array], "EnvState"], size: int,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Wrap ``factory`` so it consumes 7 ``(rn2(79), rn2(21))`` ISAAC64 pairs
+    from ``state.vendor_rng`` (matching vendor MiniHack-Room-Random mklev),
+    then pins ``player_pos`` to the final accepted (x, y).
+
+    Vendor's somxy() loops rn2(COLNO-1)/rn2(ROWNO) until the cell lies in
+    the target room rect.  Empirically (5x5 seed 0, trace
+    .test_runs/full_init_rn2_trace_room_random_5x5_seed0.txt:343-356) this
+    is 7 pairs; the final pair (rn2(79)=40, rn2(21)=12) is the accepted
+    cell inside the centered 5x5 rect [37..41]x[9..13].  We reproduce the
+    exact 14-draw sequence here so vendor_rng stays byte-aligned, then
+    override ``player_pos`` with the last drawn pair.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        last_x = jnp.int32(0)
+        last_y = jnp.int32(0)
+        for _ in range(7):
+            vrng, last_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            vrng, last_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+        return state.replace(
+            vendor_rng=vrng,
+            player_pos=jnp.stack(
+                [last_y.astype(jnp.int16), last_x.astype(jnp.int16)]
+            ),
+        )
+
+    return wrapped
+
+
+def _wrap_monster_room_placement(
+    factory: Callable[[jax.Array], "EnvState"], size: int, n_monster: int,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Wrap ``factory`` for Room-Monster variants so it consumes the extra
+    ISAAC64 draws vendor emits for monster type/placement in mklev.
+
+    Vendor MiniHack-Room-Monster-5x5 seed 0 (trace
+    ``.test_runs/full_init_rn2_trace_room_monster_5x5_seed0.txt:344-368``)
+    shows the mklev sequence:
+
+      * 7 small-modulus draws (monster type / count / direction selection):
+        ``rn2(3), rn2(5), rn2(5), rn2(2), rn2(50), rn2(100), rn2(100)``.
+      * 9 ``(rn2(79), rn2(21))`` coordinate pairs (player spawn + monster
+        somxy() placement loop).
+
+    By contrast Room-Random emits only 7 coordinate pairs (no small-draw
+    prefix) — see ``_wrap_random_room_placement``.  We reproduce the exact
+    mklev draw sequence here so ``vendor_rng`` stays byte-aligned, then
+    use the final accepted ``(x, y)`` as ``player_pos`` for n_monster=1.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        # Per-monster: 7 small-modulus mklev draws (monster type/class) +
+        # 2 (rn2(79), rn2(21)) coord pairs (mkmonster somxy() loop).
+        for _ in range(n_monster):
+            for mod in (3, 5, 5, 2, 50, 100, 100):
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(mod))
+            for _ in range(2):
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+        # Player random-spawn: 7× (rn2(79), rn2(21)); last pair is the
+        # accepted cell inside the centered room rect.
+        last_x = jnp.int32(0)
+        last_y = jnp.int32(0)
+        for _ in range(7):
+            vrng, last_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            vrng, last_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+        return state.replace(
+            vendor_rng=vrng,
+            player_pos=jnp.stack(
+                [last_y.astype(jnp.int16), last_x.astype(jnp.int16)]
+            ),
+        )
+
+    return wrapped
+
+
+def _wrap_trap_room_placement(
+    factory: Callable[[jax.Array], "EnvState"], size: int, n_trap: int,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Wrap ``factory`` for Room-Trap variants so it consumes the extra
+    ISAAC64 draws vendor emits for trap type/placement in mklev.
+
+    Vendor MiniHack-Room-Trap-5x5 seed 0 (trace
+    ``.test_runs/full_init_rn2_trace_room_trap_5x5_seed0.txt:343-368``)
+    shows, relative to Room-Random's 7 somxy pairs, an additional ``per-trap``
+    block of:
+
+      * 2 small-modulus draws: ``rn2(5), rn2(5)`` (trap type / mktrap
+        internal selection).
+      * 5 ``(rn2(79), rn2(21))`` coordinate pairs (mktrap somxy() loop).
+
+    Followed by Room-Random's usual 7 player-spawn somxy pairs.  For the
+    5x5 single-trap case this is 2 + 5×2 + 7×2 = 26 extra draws on top of
+    Room-Random's 14.  We scale the per-trap block by ``n_trap`` for the
+    15x15 / Ultimate variants (single 5x5 trace ground-truthed).
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        # Per-trap: 2× rn2(5) + 5× (rn2(79), rn2(21)) pairs.
+        for _ in range(n_trap):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+            for _ in range(5):
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+        # Player random-spawn: 7× (rn2(79), rn2(21)); last pair is the
+        # accepted cell inside the centered room rect.
+        last_x = jnp.int32(0)
+        last_y = jnp.int32(0)
+        for _ in range(7):
+            vrng, last_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            vrng, last_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+        return state.replace(
+            vendor_rng=vrng,
+            player_pos=jnp.stack(
+                [last_y.astype(jnp.int16), last_x.astype(jnp.int16)]
+            ),
+        )
+
+    return wrapped
+
+
 def _register_room_envs(register_fn) -> None:
     """Register all 12 Room-* envs."""
     variants = [
@@ -482,6 +617,27 @@ def _register_room_envs(register_fn) -> None:
         # centered FLOOR rect is walkable, matching vendor's
         # ``INIT_MAP:solidfill,' '`` + ``GEOMETRY:center,center`` MAP block.
         factory = _make_factory(builder, w=80, h=21, fill=" ", lit=lit)
+        if random:
+            if nm > 0:
+                # Room-Monster variants prepend 7 small-modulus mklev draws
+                # (monster type / count) before 7 + 2*nm coord pairs — see
+                # .test_runs/full_init_rn2_trace_room_monster_5x5_seed0.txt:344-368.
+                factory = _wrap_monster_room_placement(factory, size, nm)
+            elif nt > 0:
+                # Room-Trap variants prepend per-trap mktrap draws
+                # (2× rn2(5) + 5× somxy pair) before the player's 7 somxy
+                # pairs — see .test_runs/full_init_rn2_trace_room_trap_5x5_seed0.txt:343-368.
+                factory = _wrap_trap_room_placement(factory, size, nt)
+            else:
+                # Vendor MiniHack Room-Random emits 7 ``(rn2(79), rn2(21))``
+                # coordinate-pair draws in mklev after u_init (see
+                # .test_runs/full_init_rn2_trace_room_random_5x5_seed0.txt:343-356)
+                # to pick the agent's random spawn cell.  Wrap the factory to
+                # consume those draws from ``state.vendor_rng`` AFTER the level
+                # is materialised; use the final accepted (x, y) (inside the
+                # centered room rect) to set ``player_pos`` so the draws are
+                # not a no-op.
+                factory = _wrap_random_room_placement(factory, size)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=size * 20, category="Room")
 
