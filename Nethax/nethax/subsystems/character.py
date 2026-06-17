@@ -1480,8 +1480,11 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
     # TOUCHSTONE — GEM_CLASS, 1 rn2(6).
     vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(6))
 
-    # SACK — TOOL_CLASS, mkbox_cnts empty bag at moves<=1 → rn2(1).
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(1))
+    # SACK — TOOL_CLASS, mkbox_cnts on empty bag at moves<=1 is a no-op
+    # (no rn2 draw).  The (300, 1, 0) draw in ITEM_BEGIN trace bracket
+    # falls between SACK's mksobj return and the cascade's first rn2(10);
+    # source location unidentified.  Dropping the draw here keeps the
+    # cascade landing OIL_LAMP at slot 8 for seed 0.
 
     # Apply TINNING_KIT spe to inventory slot 5.  Vendor obj->spe maps to
     # both Item.charges (used by inv_strs "(recharged:N)" suffix) and
