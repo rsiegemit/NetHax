@@ -501,16 +501,18 @@ def _wrap_random_room_placement(
 
 def _wrap_monster_room_placement(
     factory: Callable[[jax.Array], "EnvState"], size: int, n_monster: int,
+    lit: bool = True,
 ) -> Callable[[jax.Array], "EnvState"]:
     """Wrap ``factory`` for Room-Monster variants so it consumes the extra
     ISAAC64 draws vendor emits for monster type/placement in mklev.
 
     Vendor MiniHack-Room-Monster-5x5 seed 0 (trace
-    ``.test_runs/full_init_rn2_trace_room_monster_5x5_seed0.txt:344-368``)
+    ``.test_runs/full_init_rn2_trace_room_monster_5x5_seed0.txt:339-349``)
     shows the mklev sequence:
 
-      * 7 small-modulus draws (monster type / count / direction selection):
-        ``rn2(3), rn2(5), rn2(5), rn2(2), rn2(50), rn2(100), rn2(100)``.
+      * 11 small-modulus draws (monster type / count / direction selection):
+        ``rn2(3), rn2(2), rn2(5), rn2(5), rn2(3), rn2(5), rn2(5), rn2(2),
+        rn2(50), rn2(100), rn2(100)``.
       * 9 ``(rn2(79), rn2(21))`` coordinate pairs (player spawn + monster
         somxy() placement loop).
 
@@ -520,15 +522,16 @@ def _wrap_monster_room_placement(
     use the final accepted ``(x, y)`` as ``player_pos`` for n_monster=1.
     """
     from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
     import jax.numpy as jnp
 
     def wrapped(rng: jax.Array):
         state = factory(rng)
         vrng = state.vendor_rng
-        # Per-monster: 7 small-modulus mklev draws (monster type/class) +
+        # Per-monster: 11 small-modulus mklev draws (monster type/class) +
         # 2 (rn2(79), rn2(21)) coord pairs (mkmonster somxy() loop).
         for _ in range(n_monster):
-            for mod in (3, 5, 5, 2, 50, 100, 100):
+            for mod in (3, 2, 5, 5, 3, 5, 5, 2, 50, 100, 100):
                 vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(mod))
             for _ in range(2):
                 vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
@@ -540,12 +543,16 @@ def _wrap_monster_room_placement(
         for _ in range(7):
             vrng, last_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, last_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
-        return state.replace(
+        state = state.replace(
             vendor_rng=vrng,
             player_pos=jnp.stack(
                 [last_y.astype(jnp.int16), last_x.astype(jnp.int16)]
             ),
         )
+        # Seed the hero's Chebyshev<=1 torchlight at the vendor-accepted
+        # cell (matches Random wrapper); otherwise the room renders as
+        # S_stone since _apply_directives skipped it (no explicit start_pos).
+        return _seed_hero_fov(state, lit)
 
     return wrapped
 
@@ -625,7 +632,7 @@ def _register_room_envs(register_fn) -> None:
                 # Room-Monster variants prepend 7 small-modulus mklev draws
                 # (monster type / count) before 7 + 2*nm coord pairs — see
                 # .test_runs/full_init_rn2_trace_room_monster_5x5_seed0.txt:344-368.
-                factory = _wrap_monster_room_placement(factory, size, nm)
+                factory = _wrap_monster_room_placement(factory, size, nm, lit=lit)
             elif nt > 0:
                 # Room-Trap variants prepend per-trap mktrap draws
                 # (2× rn2(5) + 5× somxy pair) before the player's 7 somxy
