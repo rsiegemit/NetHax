@@ -1710,6 +1710,11 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     # Cite: vendor/nethack/src/u_init.c:123, vendor/nethack/src/objnam.c:1619.
     if role == Role.ROGUE:
         inv_state = inv_state.replace(swap_weapon=jnp.int8(1))
+    # Archeologist: BULLWHIP is wielded (slot 0), PICK_AXE is is_weptool()
+    # and falls into the !uswapwep branch of u_init.c:1144 → setuswapwep.
+    # PICK_AXE lives at slot 4 in STARTING_INVENTORY[ARCHEOLOGIST].
+    if role == Role.ARCHEOLOGIST:
+        inv_state = inv_state.replace(swap_weapon=jnp.int8(4))
 
     # --- Wear starting armor ---
     worn_armor = jnp.full((7,), -1, dtype=jnp.int8)

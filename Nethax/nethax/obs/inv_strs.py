@@ -276,6 +276,16 @@ _OBJECT_OC_CHARGED: jnp.ndarray = jnp.array(
     dtype=jnp.bool_,
 )  # bool[NUM_OBJECTS] — full oc_charged (vendor objects.h BITS chrg arg)
 
+# WEPTOOL items: TOOL_CLASS with oc_skill != 0 (pick-axe, grappling hook,
+# unicorn horn etc).  Vendor shows +N enchant for these like weapons.
+_OBJECT_IS_WEPTOOL: jnp.ndarray = jnp.array(
+    [
+        obj.class_ == ObjectClass.TOOL_CLASS and obj.oc_skill != 0
+        for obj in OBJECTS
+    ],
+    dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS]
+
 # Monster name byte table — for corpse/tin rendering.
 # vendor/nethack/src/objnam.c:1824 (corpse_xname), eat.c:1456 (tin monster meat).
 _MAX_MONSTER_NAME_LEN = 32
@@ -1119,9 +1129,7 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         is_charged_ring = _OBJECT_IS_CHARGED[safe_type]
         # WEPTOOL items (pick-axe, grappling hook etc) — TOOL_CLASS with
         # oc_skill != 0 — show +N enchant like weapons per vendor objnam.c.
-        is_weptool = _OBJECT_OC_CHARGED[safe_type] & (
-            obj_class == jnp.uint8(_TOOL_CLASS_VAL)
-        )
+        is_weptool = _OBJECT_IS_WEPTOOL[safe_type]
         show_enchant = identified & (
             (obj_class == jnp.uint8(_WEAPON_CLASS_VAL)) |
             (obj_class == jnp.uint8(_ARMOR_CLASS_VAL))  |
