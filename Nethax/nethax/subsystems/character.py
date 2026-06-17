@@ -524,7 +524,7 @@ STARTING_INVENTORY: dict = {
         _weapon(ObjType.BULLWHIP, enchant=2),
         _armor(ObjType.LEATHER_JACKET),
         _armor(ObjType.FEDORA),
-        _food(ObjType.FOOD_RATION, 3),
+        _food(ObjType.FOOD_RATION, 4),
         _tool(ObjType.PICK_AXE),
         _tool(ObjType.TINNING_KIT),
         _tool(ObjType.TOUCHSTONE),
