@@ -352,89 +352,17 @@ class NethaxEnv:
         if use_vendor_rng() and role is not None and int(role) == int(Role.ARCHEOLOGIST):
             v_state = state.vendor_rng
             # ----------------------------------------------------------------
-            # ini_inv(Archeologist) ISAAC64 draws — consume the per-item
-            # mksobj draws vendor C emits inside ``ini_inv`` BEFORE the
-            # optional-item cascade reads its own three rolls.  Without these,
-            # the cascade reads from a stream offset earlier than vendor's
-            # (Lead E audit, commit 58abece), so the gates miss and slot 8
-            # comes back empty.
-            #
-            # Vendor ``Archeologist[]`` trobj (vendor/nle/src/u_init.c:29-40):
-            #     BULLWHIP        WEAPON_CLASS  UNDEF_BLESS
-            #     LEATHER_JACKET  ARMOR_CLASS   UNDEF_BLESS
-            #     FEDORA          ARMOR_CLASS   UNDEF_BLESS
-            #     FOOD_RATION ×3  FOOD_CLASS    trbless=0
-            #     PICK_AXE        TOOL_CLASS    UNDEF_BLESS   (oc_skill≥0
-            #                                                  → WEAPON path)
-            #     TINNING_KIT     TOOL_CLASS    UNDEF_BLESS
-            #     TOUCHSTONE      GEM_CLASS     trbless=0
-            #     SACK            TOOL_CLASS    trbless=0     (mkbox_cnts)
-            #
-            # The exact draw count per item depends on mksobj's per-class
-            # blessorcurse branches (see ``_consume_ini_inv_rogue_draws`` for
-            # the WEAPON / ARMOR pattern).  Pending a full per-item audit
-            # analogous to the Rogue helper, we conservatively drain 17
-            # placeholder rn2 words — the Lead E / d18b5f3 offset gap — so the
-            # cascade lands at vendor's stream position for seed 0
-            # (vendor=OIL_LAMP @ slot 8).  Cite: vendor/nle/src/u_init.c:669
-            # (ini_inv call) and 670-675 (cascade).
-            # Per-item mksobj draws (vendor mkobj.c).  Stream draws per item
-            # are DATA-DEPENDENT (blessorcurse short-circuit + rne(3) loops
-            # depend on the actual ISAAC values), so we cannot compute the
-            # exact static stream length per item from source alone.
-            # Empirically (Lead E / d18b5f3 audit), the *cascade* lands
-            # correctly at vendor-stream offset 17 (vendor=OIL_LAMP at slot 8
-            # for seed 0), so the 17-word gap is correct as a total.
-            # Within those 17, slot-5 TINNING_KIT consumes a single mksobj
-            # rn1(70,30) draw (mkobj.c:934).  Items 1-4 (BULLWHIP, LJ, FEDORA,
-            # FOOD_RATION ×3, PICK_AXE) preceding TINNING_KIT contribute a
-            # variable count of preceding placeholders; per the per-item
-            # source audit (lower bounds: BULLWHIP=3, LJ=3, FEDORA=3,
-            # FOOD×3=3, PICK_AXE=3, minimum 15 preceding) the rn1 sits at
-            # stream position 15 within the 17 (i.e. 15 placeholders before,
-            # 1 placeholder after — TOUCHSTONE rn2(6) — and 0 for SACK at
-            # moves<=1 if mkbox_cnts short-circuits to no draw past the
-            # initial n=0 fast-path).  Cite: mkbox_cnts at moves<=1 falls
-            # through to `rn2(0+1)` which is 1 draw, but combined with the
-            # is_poisonable=TRUE bullwhip rn2(100) draw (obj.h:201 macro;
-            # BULLWHIP otyp=2 ≤ BEC_DE_CORBIN), the net within-17 total
-            # remains 17 with TINNING_KIT rn1 at position 15.
-            #
-            # (Stream position 15 vs 8 chosen empirically: cascade landed at
-            # OIL_LAMP for prior 8-position code, so total 17 is locked;
-            # spe='9' at pos 8 vs vendor='5' indicates rn1 is too early in
-            # the block.)
-            for _ in range(15):
-                v_state, _ = _vendor_rng.rn2_jax(v_state, jnp.int32(2))
-            v_state, tk_spe = _vendor_rng.rn1_jax(v_state, jnp.int32(70), jnp.int32(30))
-            for _ in range(1):
-                v_state, _ = _vendor_rng.rn2_jax(v_state, jnp.int32(2))
+            # ini_inv(Archeologist) per-item mksobj draws are now consumed
+            # inside ``create_character`` via
+            # ``_consume_ini_inv_archeologist_draws`` (the 18 draws + the
+            # TINNING_KIT slot-5 spe apply land there).  This block only
+            # handles the optional-item cascade that follows.
+            # Cite: vendor/nle/src/u_init.c:669 (ini_inv call) and 670-675
+            # (cascade).
             v_state, r10a = _vendor_rng.rn2_jax(v_state, jnp.int32(10))
             v_state, r4   = _vendor_rng.rn2_jax(v_state, jnp.int32(4))
             v_state, r10b = _vendor_rng.rn2_jax(v_state, jnp.int32(10))
-            # Apply rn1(70,30) to TINNING_KIT spe at slot 5 (vendor
-            # mkobj.c:934).  inventory layout (per STARTING_INVENTORY,
-            # subsystems/character.py:523-532): 0=BULLWHIP, 1=LEATHER_JACKET,
-            # 2=FEDORA, 3=FOOD_RATION×4, 4=PICK_AXE, 5=TINNING_KIT.
-            # Vendor obj->spe maps to BOTH Item.enchantment and Item.charges
-            # (Item docstring lines 128-129 — split for clarity, vendor reuses
-            # spe).  For TOOL_CLASS items (TINNING_KIT), inv_strs renders spe
-            # via Item.charges in the "(recharged:charges)" suffix
-            # (obs/inv_strs.py:903, 1183-1195, vendor objnam.c:1486), so
-            # update charges (and mirror to enchantment to keep the two
-            # views consistent).
-            inv0 = state.inventory
-            tk_spe_charges = tk_spe.astype(inv0.items.charges.dtype)
-            tk_spe_enchant = tk_spe.astype(inv0.items.enchantment.dtype)
-            new_charges = inv0.items.charges.at[5].set(tk_spe_charges)
-            new_enchantment = inv0.items.enchantment.at[5].set(tk_spe_enchant)
-            new_items = inv0.items.replace(
-                charges=new_charges, enchantment=new_enchantment,
-            )
-            state = state.replace(
-                vendor_rng=v_state,
-                inventory=inv0.replace(items=new_items),
-            )
+            state = state.replace(vendor_rng=v_state)
 
             # Vendor object IDs (cite vendor/nethack/include/onames.h,
             # cross-checked against Nethax constants/object_entries/tools.py):

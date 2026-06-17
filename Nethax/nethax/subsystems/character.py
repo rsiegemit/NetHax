@@ -1402,6 +1402,106 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
 
 
 # ---------------------------------------------------------------------------
+# _consume_ini_inv_archeologist_draws  — vendor ISAAC64 ini_inv replay for Arc
+# ---------------------------------------------------------------------------
+
+def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
+    """Consume ISAAC64 CORE draws emitted by ``ini_inv(Archeologist)`` during
+    ``mksobj`` initialisation of the 8 fixed Archeologist starting items and
+    apply the ``rn1(70, 30)`` TINNING_KIT spe to ``inventory`` slot 5.
+
+    Vendor order (u_init.c:42-53 → mksobj per item, confirmed by ISAAC64
+    trace ``.test_runs/ini_inv_item_trace_seed0.txt``):
+
+      1. BULLWHIP        (WEAPON_CLASS)  — 4 draws: rn2(11), rn2(10),
+                                                    rn2(10), rn2(2)
+      2. LEATHER_JACKET  (ARMOR_CLASS)   — 4 draws: rn2(10), rn2(11),
+                                                    rn2(10), rn2(10)
+      3. FEDORA          (ARMOR_CLASS)   — 4 draws: rn2(10), rn2(11),
+                                                    rn2(10), rn2(10)
+      4. FOOD_RATION ×3  (FOOD_CLASS)    — 1 rn2(6) each (qty loop) = 3
+      5. PICK_AXE        (TOOL_CLASS)    — 0 draws (mksobj deterministic
+                                                    for WEPTOOL path)
+      6. TINNING_KIT     (TOOL_CLASS)    — 1 rn1(70, 30) for spe; applied
+                                                    to inventory slot 5
+      7. TOUCHSTONE      (GEM_CLASS)     — 1 rn2(6)
+      8. SACK            (TOOL_CLASS)    — 1 rn2(1) (mkbox_cnts empty bag)
+
+    Total: 18 draws.
+
+    The TINNING_KIT ``rn1(70, 30) = rn2(70) + 30`` result is written to
+    inventory slot 5 ``charges`` (used by ``inv_strs`` for the
+    "(recharged:N)" suffix per ``objnam.c:1486``) and mirrored to
+    ``enchantment`` to keep the two views consistent (vendor reuses
+    ``obj->spe`` for both).  Cite: vendor/nle/src/mkobj.c:934.
+
+    Returns ``(vendor_rng, inventory)`` with the 18 ISAAC64 draws consumed
+    and the TINNING_KIT spe applied.
+
+    Citations
+    ---------
+    vendor/nle/src/u_init.c:42-53        — PM_ARCHEOLOGIST trobj table
+    vendor/nle/src/mkobj.c:803-818       — WEAPON_CLASS init
+    vendor/nle/src/mkobj.c:992-1004      — ARMOR_CLASS init
+    vendor/nle/src/mkobj.c:934           — TINNING_KIT rn1(70, 30) spe
+    vendor/nle/src/mkobj.c:309           — mkbox_cnts rn2(n+1)
+    .test_runs/ini_inv_item_trace_seed0.txt — confirmed per-item modulus
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax, rn1_jax
+
+    # BULLWHIP — WEAPON_CLASS, 4 draws (rn2(11), rn2(10), rn2(10), rn2(2)).
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(11))
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(2))
+
+    # LEATHER_JACKET — ARMOR_CLASS, 4 draws (rn2(10), rn2(11), rn2(10), rn2(10)).
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(11))
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
+
+    # FEDORA — ARMOR_CLASS, 4 draws (rn2(10), rn2(11), rn2(10), rn2(10)).
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(11))
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
+
+    # FOOD_RATION ×3 — FOOD_CLASS, qty loop, 1 rn2(6) per ration.
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(6))
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(6))
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(6))
+
+    # PICK_AXE — TOOL_CLASS WEPTOOL path: 0 draws.
+
+    # TINNING_KIT — TOOL_CLASS, rn1(70, 30) for spe (mkobj.c:934).
+    vendor_rng, tk_spe = rn1_jax(vendor_rng, jnp.int32(70), jnp.int32(30))
+
+    # TOUCHSTONE — GEM_CLASS, 1 rn2(6).
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(6))
+
+    # SACK — TOOL_CLASS, mkbox_cnts empty bag at moves<=1 → rn2(1).
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(1))
+
+    # Apply TINNING_KIT spe to inventory slot 5.  Vendor obj->spe maps to
+    # both Item.charges (used by inv_strs "(recharged:N)" suffix) and
+    # Item.enchantment; mirror to both so the views stay consistent.
+    # Cite: subsystems/character.py STARTING_INVENTORY[ARCHEOLOGIST]
+    # slot 5 = TINNING_KIT; obs/inv_strs.py:903, 1183-1195;
+    # vendor/nle/src/objnam.c:1486.
+    items = inventory.items
+    tk_spe_charges = tk_spe.astype(items.charges.dtype)
+    tk_spe_enchant = tk_spe.astype(items.enchantment.dtype)
+    new_items = items.replace(
+        charges=items.charges.at[5].set(tk_spe_charges),
+        enchantment=items.enchantment.at[5].set(tk_spe_enchant),
+    )
+    inventory = inventory.replace(items=new_items)
+
+    return vendor_rng, inventory
+
+
+# ---------------------------------------------------------------------------
 # _consume_attr_variation_draws  — vendor u_init.c:887-894 post-init_attr loop
 # ---------------------------------------------------------------------------
 
@@ -1692,6 +1792,17 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         items_list = list(items_list)
         items_list[6] = make_empty_item()
     inv_state  = InventoryState.from_items(items_list)
+
+    # --- NLE_BYTEPARITY: Archeologist ini_inv per-item mksobj draws ---
+    # Consume the 18 ISAAC64 draws emitted by mksobj for the 8 Arc starting
+    # items (BULLWHIP=4, LEATHER_JACKET=4, FEDORA=4, FOOD_RATION×3=3,
+    # PICK_AXE=0, TINNING_KIT=1[rn1(70,30)], TOUCHSTONE=1, SACK=1) and
+    # apply the rn1(70,30) result to inventory slot 5 (TINNING_KIT) spe.
+    # Cite: vendor/nle/src/u_init.c:42-53; mkobj.c:803-1004, 934, 309.
+    if vendor_rng is not None and role == Role.ARCHEOLOGIST:
+        vendor_rng, inv_state = _consume_ini_inv_archeologist_draws(
+            vendor_rng, inv_state,
+        )
 
     # --- Wield primary weapon ---
     wielded = jnp.int8(-1)
