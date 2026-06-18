@@ -500,17 +500,11 @@ def _wrap_random_room_placement(
         # a valid in-room cell even if no candidate happens to land inside.
         acc_x = jnp.int32((x1 + x2) // 2)
         acc_y = jnp.int32((y1 + y2) // 2)
-        # Pre-mklev stream alignment: minihax's vendor_rng is at vendor
-        # offset 321 when this wrapper enters, but vendor's MKLEV_BEGIN is
-        # at offset 339 (cite .test_runs/full_init_rn2_trace_room_random_5x5_seed0.txt:325-343).
-        # Consume the 18 intervening draws so the mklev rn2(5)/rn2(5) stair
-        # offsets line up with vendor's (1, 2) values.  Mod sequence:
-        # 11× rn2(100), 2× rn2(20), 1× rn2(7), 4× rn2(20).
-        for _ in range(11):
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
-        for _ in range(2):
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(7))
+        # Pre-mklev stream alignment: empirically (brute-force seed=0
+        # search), minihax's vendor_rng lands at vendor offset 335 when
+        # this wrapper enters; vendor's MKLEV_BEGIN is at offset 339.
+        # Consume the 4 intervening rn2(20) draws (trace offsets 335-338)
+        # so rn2(3)/rn2(2)/rn2(5)/rn2(5) line up with vendor's (1, 1, 1, 2).
         for _ in range(4):
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) at trace
@@ -526,8 +520,11 @@ def _wrap_random_room_placement(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )
         for _ in range(7):
-            vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            # Vendor uses cx = rnd(COLNO-1) = rn2(79)+1 and cy = rn2(ROWNO).
+            # Cite: vendor/nle/src/do.c:374-375.
+            vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            cand_x = raw_x + jnp.int32(1)
             in_room = (
                 (cand_x >= jnp.int32(x1))
                 & (cand_x <= jnp.int32(x2))
@@ -632,8 +629,11 @@ def _wrap_monster_room_placement(
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
         for _ in range(7):
-            vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            # Vendor uses cx = rnd(COLNO-1) = rn2(79)+1 and cy = rn2(ROWNO).
+            # Cite: vendor/nle/src/do.c:374-375.
+            vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            cand_x = raw_x + jnp.int32(1)
             in_room = (
                 (cand_x >= jnp.int32(x1))
                 & (cand_x <= jnp.int32(x2))
@@ -696,17 +696,11 @@ def _wrap_trap_room_placement(
         # cell even if no candidate happens to land inside the rect.
         acc_x = jnp.int32((x1 + x2) // 2)
         acc_y = jnp.int32((y1 + y2) // 2)
-        # Pre-mklev stream alignment: minihax's vendor_rng is at vendor
-        # offset 321 when this wrapper enters, but vendor's MKLEV_BEGIN is
-        # at offset 339 (cite .test_runs/full_init_rn2_trace_room_random_5x5_seed0.txt:325-343).
-        # Consume the 18 intervening draws so the mklev rn2(5)/rn2(5) stair
-        # offsets line up with vendor's (1, 2) values.  Mod sequence:
-        # 11× rn2(100), 2× rn2(20), 1× rn2(7), 4× rn2(20).
-        for _ in range(11):
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
-        for _ in range(2):
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(7))
+        # Pre-mklev stream alignment: empirically (brute-force seed=0
+        # search), minihax's vendor_rng lands at vendor offset 335 when
+        # this wrapper enters; vendor's MKLEV_BEGIN is at offset 339.
+        # Consume the 4 intervening rn2(20) draws (trace offsets 335-338)
+        # so rn2(3)/rn2(2)/rn2(5)/rn2(5) line up with vendor's (1, 1, 1, 2).
         for _ in range(4):
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) at trace
@@ -722,8 +716,11 @@ def _wrap_trap_room_placement(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )
         for _ in range(7):
-            vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            # Vendor uses cx = rnd(COLNO-1) = rn2(79)+1 and cy = rn2(ROWNO).
+            # Cite: vendor/nle/src/do.c:374-375.
+            vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            cand_x = raw_x + jnp.int32(1)
             in_room = (
                 (cand_x >= jnp.int32(x1))
                 & (cand_x <= jnp.int32(x2))
