@@ -519,6 +519,11 @@ def _wrap_random_room_placement(
         new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )
+        # First-accept semantics: vendor's somxy() returns on the FIRST in-room
+        # candidate; subsequent draws still advance the rng but don't overwrite
+        # the accepted (x, y).  This matters for 15x15 where the rect is large
+        # enough that early pairs land in-room.
+        has_accepted = jnp.bool_(False)
         for _ in range(7):
             # Vendor uses cx = rnd(COLNO-1) = rn2(79)+1 and cy = rn2(ROWNO).
             # Cite: vendor/nle/src/do.c:374-375.
@@ -531,8 +536,10 @@ def _wrap_random_room_placement(
                 & (cand_y >= jnp.int32(y1))
                 & (cand_y <= jnp.int32(y2))
             )
-            acc_x = jnp.where(in_room, cand_x, acc_x)
-            acc_y = jnp.where(in_room, cand_y, acc_y)
+            this_takes = in_room & ~has_accepted
+            acc_x = jnp.where(this_takes, cand_x, acc_x)
+            acc_y = jnp.where(this_takes, cand_y, acc_y)
+            has_accepted = has_accepted | in_room
         state = state.replace(
             vendor_rng=vrng,
             terrain=new_terrain,
@@ -628,6 +635,8 @@ def _wrap_monster_room_placement(
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        # First-accept semantics (see Random wrapper).
+        has_accepted = jnp.bool_(False)
         for _ in range(7):
             # Vendor uses cx = rnd(COLNO-1) = rn2(79)+1 and cy = rn2(ROWNO).
             # Cite: vendor/nle/src/do.c:374-375.
@@ -640,8 +649,10 @@ def _wrap_monster_room_placement(
                 & (cand_y >= jnp.int32(y1))
                 & (cand_y <= jnp.int32(y2))
             )
-            acc_x = jnp.where(in_room, cand_x, acc_x)
-            acc_y = jnp.where(in_room, cand_y, acc_y)
+            this_takes = in_room & ~has_accepted
+            acc_x = jnp.where(this_takes, cand_x, acc_x)
+            acc_y = jnp.where(this_takes, cand_y, acc_y)
+            has_accepted = has_accepted | in_room
         state = state.replace(
             vendor_rng=vrng,
             player_pos=jnp.stack(
@@ -715,6 +726,8 @@ def _wrap_trap_room_placement(
         new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )
+        # First-accept semantics (see Random wrapper).
+        has_accepted = jnp.bool_(False)
         for _ in range(7):
             # Vendor uses cx = rnd(COLNO-1) = rn2(79)+1 and cy = rn2(ROWNO).
             # Cite: vendor/nle/src/do.c:374-375.
@@ -727,8 +740,10 @@ def _wrap_trap_room_placement(
                 & (cand_y >= jnp.int32(y1))
                 & (cand_y <= jnp.int32(y2))
             )
-            acc_x = jnp.where(in_room, cand_x, acc_x)
-            acc_y = jnp.where(in_room, cand_y, acc_y)
+            this_takes = in_room & ~has_accepted
+            acc_x = jnp.where(this_takes, cand_x, acc_x)
+            acc_y = jnp.where(this_takes, cand_y, acc_y)
+            has_accepted = has_accepted | in_room
         state = state.replace(
             vendor_rng=vrng,
             terrain=new_terrain,
