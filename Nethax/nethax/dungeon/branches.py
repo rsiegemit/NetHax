@@ -3648,8 +3648,13 @@ def _place_dungeon_levels_jax(vendor_rng, num_dunlevs, protos, created_dyn=None)
         # Brax-flatten: always compute both branches, jnp.where-select on
         # ``is_created``.  Under vmap the cond emits both branches into HLO
         # anyway; making the selection explicit drops the cond-merge cost.
-        # Byte-identical to the cond: the selected branch's rng/state matches
-        # what cond would have returned.
+        #
+        # CRITICAL: ``place_created`` calls ``_rn2_jax`` inside ``do_pick``,
+        # advancing the rng stream.  Vendor ``place_level`` (dungeon.c:655-656)
+        # returns IMMEDIATELY with NO rn2 draw when ``lev`` is NULL (i.e.
+        # proto not created).  To preserve byte-exact rng stream alignment,
+        # we explicitly select the *unchanged* input rng when ``is_created``
+        # is False, even though ``place_created`` was traced.
         outer_args = (rng, idx, slots, mask, fresh)
         pc_out = place_created(outer_args)
         su_out = skip_uncreated(outer_args)
@@ -3750,18 +3755,17 @@ def consume_init_dungeons_draws(vendor_rng):
     # vendor/nle/build/.../dat/dungeon binary: medusa.chance=100.
     # Cite: vendor/nle/util/dgn_comp.y lines 188-209;
     # vendor/nle/dat/dungeon.def medusa/minetn/minend/soko entries.
+    # 6th DoD init_level gate — MiniHack injects a ``mylevel`` prototype as the
+    # FIRST DoD proto (confirmed at offset 120 in
+    # vendor/minihack/minihack/lib/dungeon binary).  Vendor trace shows 6 rn2(100)
+    # draws between DUNGEON_I=0_INIT_LEVEL_LOOP and DUNGEON_I=0_PLACE_LEVEL
+    # in .test_runs/full_init_rn2_trace_seed0_marked.txt.
+    vendor_rng, gate_mylevel = _rn2(vendor_rng, 100)  # mylevel chance=100 (MiniHack-injected)
     vendor_rng, gate_rogue  = _rn2(vendor_rng, 100)  # rogue   chance=100 (LEVEL)
     vendor_rng, gate_oracle = _rn2(vendor_rng, 100)  # oracle  chance=100 (LEVEL)
     vendor_rng, gate_bigrm  = _rn2(vendor_rng, 100)  # bigrm   chance=40  (RNDLEVEL 2-int)
     vendor_rng, gate_medusa = _rn2(vendor_rng, 100)  # medusa  chance=100 (RNDLEVEL 1-int → default)
     vendor_rng, gate_castle = _rn2(vendor_rng, 100)  # castle  chance=100 (LEVEL)
-    # 6th DoD init_level gate — per C-instrumented vendor trace, the DoD
-    # init_level loop has 6 rn2(100) draws, not 5.  Source: 6 markers between
-    # DUNGEON_I=0_INIT_LEVEL_LOOP and DUNGEON_I=0_PLACE_LEVEL in
-    # .test_runs/full_init_rn2_trace_seed0_marked.txt.  TODO: identify 6th
-    # prototype (possible CHAINLEVEL or duplicated init_level call); for now
-    # a placeholder rn2(100) preserves byte alignment downstream.
-    vendor_rng, _ = _rn2(vendor_rng, 100)            # TODO: identify 6th DoD prototype
 
     bigrm_placed  = gate_bigrm < jnp.int32(40)          # traced bool
     medusa_placed = jnp.bool_(True)  # chance=100 → always placed (1-INT RNDLEVEL default)
@@ -3772,6 +3776,7 @@ def consume_init_dungeons_draws(vendor_rng):
     # place_level recursion — dungeon.c:637-679.  See ``_place_dungeon_levels_jax``.
     dod_num_dunlevs = dod_levels + jnp.int32(25)
     dod_protos = [
+        {"name": "mylevel", "base": 1, "rand": 1, "chain_idx": None, "created": True},   # MiniHack-injected
         {"name": "rogue",  "base": 15, "rand": 4, "chain_idx": None, "created": True},
         {"name": "oracle", "base": 5,  "rand": 5, "chain_idx": None, "created": True},
         {"name": "bigrm",  "base": 10, "rand": 3, "chain_idx": None, "created": True},   # dyn override below
@@ -3779,7 +3784,12 @@ def consume_init_dungeons_draws(vendor_rng):
         {"name": "castle", "base": -1, "rand": 0, "chain_idx": None, "created": True},
     ]
     dod_created_dyn = jnp.stack([
-        jnp.bool_(True), jnp.bool_(True), bigrm_placed, medusa_placed, jnp.bool_(True),
+        jnp.bool_(True),   # mylevel
+        jnp.bool_(True),   # rogue
+        jnp.bool_(True),   # oracle
+        bigrm_placed,
+        medusa_placed,
+        jnp.bool_(True),   # castle
     ])
     vendor_rng, _ = _place_dungeon_levels_jax(
         vendor_rng, dod_num_dunlevs, dod_protos, created_dyn=dod_created_dyn
