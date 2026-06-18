@@ -421,7 +421,14 @@ def _make_factory(builder: Callable[[LevelGenerator], None],
 # glyph 2359 (stone) at (0,0) but minihax had glyph 327 (the @).
 def _vendor_geometry_center(size: int) -> tuple[int, int]:
     """Return (xstart, ystart) absolute (col, row) for a ``size``×``size`` MAP
-    block under ``GEOMETRY:center,center`` on the 80×21 dungeon."""
+    block under ``GEOMETRY:center,center`` on the 80×21 dungeon.
+
+    Cite vendor/nle/src/sp_lev.c:4943-4967 (CENTER case in spo_map).
+    For size=5: xstart=37, ystart=9.  Vendor's rendered glyph col is one
+    less than the internal terrain col due to NLE's glyph shift; the
+    internal coord (used by mklev somxy + our wrapper stair stamp) is
+    still 37..41.
+    """
     x_maze_max = 78  # COLNO - 1
     y_maze_max = 20  # ROWNO - 1
     xstart = 2 + ((x_maze_max - 2 - size) // 2)
@@ -444,7 +451,13 @@ def _room_builder(size: int, *, random: bool, lit: bool,
         # ``GEOMETRY:center,center`` would put it.
         lg.fill_terrain(".", x0, y0, x1, y1)
         if random:
-            lg.add_stair_down()    # any floor cell (only FLOOR is in the room)
+            # Stair is stamped by _wrap_random_room_placement /
+            # _wrap_monster_room_placement / _wrap_trap_room_placement using
+            # vendor mklev draws (rn2(5)/rn2(5) offsets into the room rect).
+            # An LG-driven add_stair_down() here would race with that and
+            # leave a second S_dnstair at an LG-RNG-picked cell — see prior
+            # bug where Room-Random-5x5 seed=0 showed S_dnstair at (9, 35).
+            pass
         else:
             # Deterministic: stair at bottom-right, start at top-left.
             # Vendor MiniHackRoom passes MAP-relative (size-1, size-1) and
@@ -487,15 +500,26 @@ def _wrap_random_room_placement(
         # a valid in-room cell even if no candidate happens to land inside.
         acc_x = jnp.int32((x1 + x2) // 2)
         acc_y = jnp.int32((y1 + y2) // 2)
-        # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) emitted
-        # BEFORE the 7 player-spawn somxy pairs (trace offsets 339-342).
-        # The two rn2(5) draws are the (x_off, y_off) into the room rect
-        # used by vendor mkstairs to place the down-stair (commit 6152cb5
-        # consumed them without applying — fix(minihax) stamps them here).
+        # Pre-mklev stream alignment: minihax's vendor_rng is at vendor
+        # offset 321 when this wrapper enters, but vendor's MKLEV_BEGIN is
+        # at offset 339 (cite .test_runs/full_init_rn2_trace_room_random_5x5_seed0.txt:325-343).
+        # Consume the 18 intervening draws so the mklev rn2(5)/rn2(5) stair
+        # offsets line up with vendor's (1, 2) values.  Mod sequence:
+        # 11× rn2(100), 2× rn2(20), 1× rn2(7), 4× rn2(20).
+        for _ in range(11):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        for _ in range(2):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(7))
+        for _ in range(4):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
+        # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) at trace
+        # offsets 339-342.  The two rn2(5) draws are the (x_off, y_off)
+        # into the room rect used by vendor mkstairs.
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        vrng, stair_x_off = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-        vrng, stair_y_off = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, stair_x_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, stair_y_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
         stair_x = jnp.int32(x1) + stair_x_off
         stair_y = jnp.int32(y1) + stair_y_off
         new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
@@ -605,8 +629,8 @@ def _wrap_monster_room_placement(
         # BEFORE the 7 player-spawn somxy pairs (trace offsets 339-342).
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
         for _ in range(7):
             vrng, cand_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
@@ -672,15 +696,26 @@ def _wrap_trap_room_placement(
         # cell even if no candidate happens to land inside the rect.
         acc_x = jnp.int32((x1 + x2) // 2)
         acc_y = jnp.int32((y1 + y2) // 2)
-        # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) emitted
-        # BEFORE the 7 player-spawn somxy pairs (trace offsets 339-342).
-        # The two rn2(5) draws are the (x_off, y_off) into the room rect
-        # used by vendor mkstairs to place the down-stair (commit 6152cb5
-        # consumed them without applying — fix(minihax) stamps them here).
+        # Pre-mklev stream alignment: minihax's vendor_rng is at vendor
+        # offset 321 when this wrapper enters, but vendor's MKLEV_BEGIN is
+        # at offset 339 (cite .test_runs/full_init_rn2_trace_room_random_5x5_seed0.txt:325-343).
+        # Consume the 18 intervening draws so the mklev rn2(5)/rn2(5) stair
+        # offsets line up with vendor's (1, 2) values.  Mod sequence:
+        # 11× rn2(100), 2× rn2(20), 1× rn2(7), 4× rn2(20).
+        for _ in range(11):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        for _ in range(2):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(7))
+        for _ in range(4):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
+        # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) at trace
+        # offsets 339-342.  The two rn2(5) draws are the (x_off, y_off)
+        # into the room rect used by vendor mkstairs.
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        vrng, stair_x_off = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-        vrng, stair_y_off = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, stair_x_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, stair_y_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
         stair_x = jnp.int32(x1) + stair_x_off
         stair_y = jnp.int32(y1) + stair_y_off
         new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
