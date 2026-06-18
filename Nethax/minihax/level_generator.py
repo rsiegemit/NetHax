@@ -1657,6 +1657,11 @@ def _write_monster(
 
     new_mai = mai.replace(
         pos=mai.pos.at[slot].set(jnp.array([row, col], dtype=jnp.int16)),
+        # entry_idx selects the monster glyph (GLYPH_MON_OFF + entry_idx ==
+        # nle glyph; constants/glyphs.py: GLYPH_MON_OFF=0).  Previously left
+        # default (0 = uninitialized), which rendered as NUL on the map and
+        # produced glyph-table divergence for Monster-* room variants.
+        entry_idx=mai.entry_idx.at[slot].set(jnp.int16(mon_idx_clipped)),
         hp=mai.hp.at[slot].set(jnp.int32(8)),
         hp_max=mai.hp_max.at[slot].set(jnp.int32(8)),
         alive=mai.alive.at[slot].set(jnp.bool_(True)),

@@ -612,12 +612,15 @@ def _wrap_monster_room_placement(
                 )
                 mon_x = jnp.where(in_room, cand_x, mon_x)
                 mon_y = jnp.where(in_room, cand_y, mon_y)
-            # Stamp monster (mon_idx=0 = canonical first MONSTERS entry —
-            # exact type tuning is a followup; presence advances past the
-            # lit-floor vs monster-glyph diff).
+            # NOTE: do NOT _write_monster here.  The LG's add_monster()
+            # directive (queued by _room_builder) already produces a
+            # _MonsterDirective which apply_directives resolves via
+            # _resolve_monster + _write_monster — writing here would
+            # double-stamp (n_monster slots become 2*n_monster).  The
+            # 11 small + 2 coord draws above keep vendor_rng aligned with
+            # vendor mklev's per-monster prefix; placement itself is owned
+            # by _resolve_monster (room-local rn1 somxy retry loop).
             state = state.replace(vendor_rng=vrng)
-            state = _write_monster(state, (int(mon_y), int(mon_x)), mon_idx=0)
-            vrng = state.vendor_rng
         # Player random-spawn: 7× (rn2(79), rn2(21)); track the LAST ACCEPTED
         # in-room pair so player_pos always lands inside the centered room
         # rect (matches the Random/Trap wrappers).  Falling back to the last
@@ -770,6 +773,85 @@ def _wrap_trap_room_placement(
     return wrapped
 
 
+def _wrap_ultimate_room_placement(
+    factory: Callable[[jax.Array], "EnvState"], size: int, n_monster: int,
+    n_trap: int, lit: bool = True,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Wrap ``factory`` for Room-Ultimate variants (n_monster>=1 AND n_trap>=1).
+
+    Vendor MiniHack-Room-Ultimate-5x5 seed 0 (trace
+    ``.test_runs/full_init_rn2_trace_room_ultimate_5x5_seed0.txt:335-353``)
+    shows the mklev sequence:
+
+      * 4× rn2(20) pre-mklev alignment (offsets 335-338).
+      * Stair: rn2(3), rn2(2), rn2(size), rn2(size) (339-342).
+      * 9 small-modulus monster+trap setup draws (343-351):
+        ``rn2(3), rn2(5), rn2(5), rn2(2), rn2(50), rn2(100), rn2(100),
+        rn2(5), rn2(5)``.
+      * 7× (rn2(79), rn2(21)) player-spawn somxy() pairs (352+).
+
+    The 9-draw small-modulus block fuses the Monster wrapper's 11-mod block
+    (minus the leading rn2(3), rn2(2) which were absorbed by the stair) with
+    the Trap wrapper's 2× rn2(5). For Ultimate-15x15 (n_monster=3, n_trap=15)
+    we use the same 9-draw template; trace adaptation is followup.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TileType
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    import jax.numpy as jnp
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        x1, y1 = _vendor_geometry_center(size)
+        x2 = x1 + size - 1
+        y2 = y1 + size - 1
+        # Pre-mklev alignment: 4× rn2(20) (offsets 335-338).
+        for _ in range(4):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
+        # mklev stair selection (339-342).
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+        vrng, stair_x_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, stair_y_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        stair_x = jnp.int32(x1) + stair_x_off
+        stair_y = jnp.int32(y1) + stair_y_off
+        new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
+            jnp.int8(int(_TileType.STAIRCASE_DOWN))
+        )
+        # 9-draw small-modulus monster+trap setup block (343-351).
+        for mod in (3, 5, 5, 2, 50, 100, 100, 5, 5):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(mod))
+        # 7× player-spawn pairs with first-accept semantics.
+        acc_x = jnp.int32((x1 + x2) // 2)
+        acc_y = jnp.int32((y1 + y2) // 2)
+        has_accepted = jnp.bool_(False)
+        for _ in range(7):
+            vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            cand_x = raw_x + jnp.int32(1)
+            in_room = (
+                (cand_x >= jnp.int32(x1))
+                & (cand_x <= jnp.int32(x2))
+                & (cand_y >= jnp.int32(y1))
+                & (cand_y <= jnp.int32(y2))
+            )
+            this_takes = in_room & ~has_accepted
+            acc_x = jnp.where(this_takes, cand_x, acc_x)
+            acc_y = jnp.where(this_takes, cand_y, acc_y)
+            has_accepted = has_accepted | in_room
+        state = state.replace(
+            vendor_rng=vrng,
+            terrain=new_terrain,
+            player_pos=jnp.stack(
+                [acc_y.astype(jnp.int16), acc_x.astype(jnp.int16)]
+            ),
+        )
+        return _seed_hero_fov(state, lit)
+
+    return wrapped
+
+
 def _register_room_envs(register_fn) -> None:
     """Register all 12 Room-* envs."""
     variants = [
@@ -796,7 +878,14 @@ def _register_room_envs(register_fn) -> None:
         # ``INIT_MAP:solidfill,' '`` + ``GEOMETRY:center,center`` MAP block.
         factory = _make_factory(builder, w=80, h=21, fill=" ", lit=lit)
         if random:
-            if nm > 0:
+            if nm > 0 and nt > 0:
+                # Room-Ultimate variants (monster+trap): 9-draw fused
+                # small-modulus block between stair and player spawn — see
+                # .test_runs/full_init_rn2_trace_room_ultimate_5x5_seed0.txt:343-351.
+                factory = _wrap_ultimate_room_placement(
+                    factory, size, nm, nt, lit=lit
+                )
+            elif nm > 0:
                 # Room-Monster variants prepend 7 small-modulus mklev draws
                 # (monster type / count) before 7 + 2*nm coord pairs — see
                 # .test_runs/full_init_rn2_trace_room_monster_5x5_seed0.txt:344-368.
