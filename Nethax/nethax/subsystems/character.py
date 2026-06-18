@@ -1474,11 +1474,6 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
 
     # PICK_AXE — TOOL_CLASS WEPTOOL path: 0 draws.
 
-    # Empirical alignment: one extra rn2(70) draw before TINNING_KIT to make
-    # spe=50 match vendor seed 0.  Source location for the missing draw not
-    # yet identified; tracked as a stream-offset patch.
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(70))
-
     # TINNING_KIT — TOOL_CLASS, rn1(70, 30) for spe (mkobj.c:934).
     vendor_rng, tk_spe = rn1_jax(vendor_rng, jnp.int32(70), jnp.int32(30))
 
@@ -1571,69 +1566,59 @@ def _consume_attr_variation_draws(vendor_rng, stats, role: Role, race: Race):
     # apply adjattrib(i, xd, TRUE) which mutates vals[i] (clamp up to attrmax
     # on positive; on deeply-negative, draw rn2(attrmin-new+1) and clamp to
     # attrmin — never reached at init for current targets but kept for parity).
+    #
+    # vmap-compat byte-parity pattern: compute the candidate next-state via
+    # rn2_jax, then conditionally adopt it via jnp.where(gate, advanced, prev).
+    # ISAAC64 state is functional, so the "discarded" branch leaves the stream
+    # unchanged — matching vendor's short-circuit consumption.  This fixes the
+    # 12-extra-draw drift the old Brax-flatten pattern produced (it always
+    # advanced past rn2(7)/rn2(modulus) even on gate-miss iterations).
+    def _conditional_advance(rng_orig, rng_advanced, take):
+        """Adopt rng_advanced iff ``take``, else keep rng_orig."""
+        return jax.tree_util.tree_map(
+            lambda a, o: jnp.where(take, a, o), rng_advanced, rng_orig,
+        )
+
     for i in range(6):
         attrmin_i = attrmin_arr[i]
         attrmax_i = attrmax_arr[i]
 
-        def _hit_branch(carry):
-            rng_c, vals_c = carry
-            rng_c, xd_raw = rn2_jax(rng_c, jnp.int32(7))         # u_init.c:889
-            xd = xd_raw - jnp.int32(2)
-            base = vals_c[i]
-            new_base_pos = jnp.minimum(base + xd, attrmax_i)     # attrib.c:131-138
-
-            # _neg_path: xd < 0 may need an extra rn2 if tentative < attrmin.
-            # Brax-flatten the inner _do_draw gate: always draw, jnp.where to
-            # select.  Modulus is clamped to >=1 so rn2 stays valid when the
-            # unselected branch's draw would be a no-op anyway.
-            tentative_neg = base + xd
-            need_extra = tentative_neg < attrmin_i
-            modulus_raw = (attrmin_i - tentative_neg + jnp.int32(1)).astype(jnp.int32)
-            modulus = jnp.maximum(modulus_raw, jnp.int32(1))
-            rng_neg_draw, _ = rn2_jax(rng_c, modulus)
-            rng_neg = jax.tree_util.tree_map(
-                lambda t, f: jnp.where(need_extra, t, f), rng_neg_draw, rng_c,
-            )
-            new_b_neg = jnp.where(need_extra, attrmin_i, tentative_neg)
-
-            # _pos_path: xd > 0, no extra draw, base clamped to attrmax.
-            rng_pos = rng_c
-            new_b_pos = new_base_pos
-
-            # _zero_path: xd == 0, no draw, no change to base.
-            rng_zero = rng_c
-            new_b_zero = base
-
-            # Brax-flatten three-way sign dispatch: compute all three paths,
-            # jnp.where to select.  Outer pred: xd == 0; inner pred: xd > 0.
-            is_zero = xd == jnp.int32(0)
-            is_pos = xd > jnp.int32(0)
-            # Nonzero arm: select pos vs neg.
-            rng_nz = jax.tree_util.tree_map(
-                lambda t, f: jnp.where(is_pos, t, f), rng_pos, rng_neg,
-            )
-            new_b_nz = jnp.where(is_pos, new_b_pos, new_b_neg)
-            # Outer: select zero vs nonzero.
-            rng_c = jax.tree_util.tree_map(
-                lambda t, f: jnp.where(is_zero, t, f), rng_zero, rng_nz,
-            )
-            new_base = jnp.where(is_zero, new_b_zero, new_b_nz)
-
-            vals_c = vals_c.at[i].set(new_base)
-            return rng_c, vals_c
-
-        def _miss_branch(carry):
-            return carry
-
         vendor_rng, gate = rn2_jax(vendor_rng, jnp.int32(20))    # u_init.c:888
-        # Brax-flatten outer hit/miss cond: compute both branches, jnp.where.
-        rng_hit, vals_hit = _hit_branch((vendor_rng, vals))
-        rng_miss, vals_miss = _miss_branch((vendor_rng, vals))
-        _gate_pred = gate == jnp.int32(0)
-        vendor_rng = jax.tree_util.tree_map(
-            lambda t, f: jnp.where(_gate_pred, t, f), rng_hit, rng_miss,
-        )
-        vals = jnp.where(_gate_pred, vals_hit, vals_miss)
+        hit = gate == jnp.int32(0)
+
+        # rn2(7): vendor draws this only when gate==0.  Compute candidate
+        # advance, conditionally adopt.
+        rng_after_xd, xd_raw = rn2_jax(vendor_rng, jnp.int32(7))   # u_init.c:889
+        vendor_rng = _conditional_advance(vendor_rng, rng_after_xd, hit)
+        xd = xd_raw - jnp.int32(2)
+
+        base = vals[i]
+        tentative = base + xd
+
+        # _neg_path inner gate: vendor's `attrib.c:131-138` draws an extra
+        # rn2(attrmin - new + 1) only on deeply-negative incr.  Same pattern:
+        # compute candidate, conditionally adopt under (hit & need_extra).
+        need_extra = jnp.logical_and(hit, tentative < attrmin_i)
+        modulus_raw = (attrmin_i - tentative + jnp.int32(1)).astype(jnp.int32)
+        modulus = jnp.maximum(modulus_raw, jnp.int32(1))
+        rng_after_neg, _ = rn2_jax(vendor_rng, modulus)
+        vendor_rng = _conditional_advance(vendor_rng, rng_after_neg, need_extra)
+
+        # Apply adjattrib effect only when hit.  On hit & need_extra, base
+        # clamps to attrmin; on hit & xd > 0, clamps to attrmax; on hit &
+        # xd == 0, no change.
+        new_base_pos = jnp.minimum(tentative, attrmax_i)
+        # Selection (only matters when hit):
+        #   xd == 0   → base unchanged
+        #   xd > 0    → min(base+xd, attrmax)
+        #   xd < 0    → if need_extra then attrmin else (base+xd)
+        is_zero = xd == jnp.int32(0)
+        is_pos = xd > jnp.int32(0)
+        new_b_neg = jnp.where(need_extra, attrmin_i, tentative)
+        new_b_nz = jnp.where(is_pos, new_base_pos, new_b_neg)
+        new_base_hit = jnp.where(is_zero, base, new_b_nz)
+        new_base = jnp.where(hit, new_base_hit, base)
+        vals = vals.at[i].set(new_base)
 
     out = {name: vals[idx] for idx, name in enumerate(_STAT_NAMES)}
     return vendor_rng, out
