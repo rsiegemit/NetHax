@@ -1477,10 +1477,11 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
     # Empirical alignment placeholder: vendor consumes 1 more rn2 between
     # FOOD_RATION and TINNING_KIT than our cascade accounts for.  Source
     # location not yet identified — held in as a band-aid until the deeper
-    # 43-draw misalignment between role_init / init_attr and U_INIT entry
+    # ~35-draw misalignment between role_init / init_attr and U_INIT entry
     # is audited (per agent adc2bd5d1e6b49349's findings; trace shows
-    # TINNING_KIT spe at offset 298 = rn2(70) = 20 → 50).  Restored after
-    # 9756be6's removal regressed 6 envs from glyph-clean to fail.
+    # TINNING_KIT spe at offset 298 = rn2(70) = 20 → 50).  After the 8 dgn_comp
+    # chance-check draws landed (dungeon.c:776 / dgn_comp.y:447), the gap
+    # narrowed from 43 to ~35 — the hack is still needed.
     vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(70))
 
     # TINNING_KIT — TOOL_CLASS, rn1(70, 30) for spe (mkobj.c:934).

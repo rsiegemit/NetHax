@@ -3671,7 +3671,10 @@ def consume_init_dungeons_draws(vendor_rng):
 
     1. Dungeon-skip gate (only if ``tmpdungeon[i].chance > 0``)::
            if (!wizard && tmpdungeon[i].chance && (tmpdungeon[i].chance <= rn2(100)))
-       Cite: dungeon.c:775-776.  Only Fort Ludios (chance=10) triggers this.
+       Cite: dungeon.c:775-776.  Every dungeon's ``chance`` defaults to 100 per
+       ``dgn_comp.y:447`` (Fort Ludios is the one DUNGEON entry that overrides
+       it, to 10), so the ``rn2(100)`` ALWAYS fires — once per dungeon, for all
+       8 dungeons.
 
     2. Dungeon depth (only if ``tmpdungeon[i].lev.rand > 0``)::
            dungeons[i].num_dunlevs = rn1(lev.rand, lev.base);  // == rn2(rand)+base
@@ -3712,11 +3715,14 @@ def consume_init_dungeons_draws(vendor_rng):
 
     # =======================================================================
     # i = 0 : "The Dungeons of Doom" (25, 5)
-    #         tmpdungeon[0].chance = 0 → no skip-gate
+    #         tmpdungeon[0].chance = 100 (dgn_comp.y:447 default) → skip-gate fires
     #         lev.rand = 5            → depth draw fires
     #         i == 0                  → no add_branch
     #         5 prototype levels: rogue, oracle, bigrm, medusa, castle
     # =======================================================================
+
+    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
+    vendor_rng, _ = _rn2(vendor_rng, 100)
 
     # depth draw — dungeon.c:797-798
     vendor_rng, dod_levels = _rn2(vendor_rng, 5)   # rn1(5, 25)
@@ -3761,12 +3767,15 @@ def consume_init_dungeons_draws(vendor_rng):
 
     # =======================================================================
     # i = 1 : "Gehennom" (20, 5)
-    #         tmpdungeon.chance = 0 → no skip-gate
+    #         tmpdungeon.chance = 100 (dgn_comp.y:447 default) → skip-gate fires
     #         lev.rand = 5          → depth draw
     #         i > 0                 → parent_dlevel rn2; CHAINBRANCH "castle"+(0,0) → num=1
     #         11 levels: valley, sanctum, juiblex, baalz, asmodeus,
     #                    wizard1, wizard2, wizard3, orcus, fakewiz1, fakewiz2
     # =======================================================================
+
+    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
+    vendor_rng, _ = _rn2(vendor_rng, 100)
 
     vendor_rng, geh_levels = _rn2(vendor_rng, 5)   # dungeon.c:797-798 rn1(5, 20)
     drawn["geh_levels"] = geh_levels + jnp.int32(20)
@@ -3811,9 +3820,12 @@ def consume_init_dungeons_draws(vendor_rng):
 
     # =======================================================================
     # i = 2 : "The Gnomish Mines" (8, 2)
-    #         chance=0, lev.rand=2, i>0 (BRANCH @ (2,3) → num=3)
+    #         chance=100 (dgn_comp.y:447 default), lev.rand=2, i>0 (BRANCH @ (2,3) → num=3)
     #         2 RNDLEVEL levels: minetn (ch=7), minend (ch=3)
     # =======================================================================
+
+    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
+    vendor_rng, _ = _rn2(vendor_rng, 100)
 
     vendor_rng, mines_levels = _rn2(vendor_rng, 2)  # dungeon.c:797-798 rn1(2, 8)
     drawn["mines_levels"] = mines_levels + jnp.int32(8)
@@ -3835,9 +3847,12 @@ def consume_init_dungeons_draws(vendor_rng):
 
     # =======================================================================
     # i = 3 : "The Quest" (5, 2)
-    #         chance=0, lev.rand=2, i>0 (CHAINBRANCH "oracle"+(6,2) portal → num=2)
+    #         chance=100 (dgn_comp.y:447 default), lev.rand=2, i>0 (CHAINBRANCH "oracle"+(6,2) portal → num=2)
     #         3 LEVEL levels: x-strt, x-loca, x-goal
     # =======================================================================
+
+    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
+    vendor_rng, _ = _rn2(vendor_rng, 100)
 
     vendor_rng, quest_levels = _rn2(vendor_rng, 2)  # dungeon.c:797-798 rn1(2, 5)
     drawn["quest_levels"] = quest_levels + jnp.int32(5)
@@ -3858,10 +3873,13 @@ def consume_init_dungeons_draws(vendor_rng):
 
     # =======================================================================
     # i = 4 : "Sokoban" (4, 0)
-    #         chance=0, lev.rand=0 → NO depth draw
+    #         chance=100 (dgn_comp.y:447 default), lev.rand=0 → NO depth draw
     #         i>0 (CHAINBRANCH "oracle"+(1,0) up → num=1)
     #         4 RNDLEVEL levels: soko1..soko4 (ch=2 each)
     # =======================================================================
+
+    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
+    vendor_rng, _ = _rn2(vendor_rng, 100)
 
     vendor_rng, _ = _rn2(vendor_rng, 1)             # dungeon.c:398 parent_dlevel num=1
 
@@ -3885,15 +3903,18 @@ def consume_init_dungeons_draws(vendor_rng):
 
     # =======================================================================
     # i = 5 : "Fort Ludios" (1, 0)
-    #         chance=0 (NOT 10!) per binary parse of
-    #         vendor/nle/build/.../dat/dungeon — DUNGEON line in
-    #         dungeon.def has no INT, so dgn_comp.y's optional_int rule
-    #         (line ~158) defaults chance to 0.  init_dungeons short-circuits
-    #         at ``pd.tmpdungeon[i].chance && ...`` (dungeon.c:775) so NO
-    #         skip-gate rn2 fires.  Always placed.
+    #         chance=10 — Fort Ludios is the one DUNGEON entry whose
+    #         dungeon.def line overrides the dgn_comp.y:447 default of 100.
+    #         The short-circuit at ``pd.tmpdungeon[i].chance && ...``
+    #         (dungeon.c:775) does NOT short-circuit (10 is truthy), so the
+    #         ``rn2(100)`` STILL fires.  ``10 <= rn2(100)`` skips ~91% of the
+    #         time at runtime, but the draw itself is unconditional.
     #         lev.rand=0 → no depth draw; 1 LEVEL: knox (chance=100 LEVEL).
     #         BRANCH @ (18,4) portal in Main → parent_dlevel num=4.
     # =======================================================================
+
+    # chance-check (dungeon.c:776) — chance=10, draw still fires
+    vendor_rng, _ = _rn2(vendor_rng, 100)
 
     vendor_rng, _ = _rn2(vendor_rng, 4)         # dungeon.c:398 parent_dlevel num=4
     vendor_rng, _ = _rn2(vendor_rng, 100)       # dungeon.c:548 knox
@@ -3904,9 +3925,12 @@ def consume_init_dungeons_draws(vendor_rng):
 
     # =======================================================================
     # i = 6 : "Vlad's Tower" (3, 0)
-    #         chance=0, lev.rand=0 (no depth), i>0 (BRANCH @ (9,5) up in Gehennom → num=5)
+    #         chance=100 (dgn_comp.y:447 default), lev.rand=0 (no depth), i>0 (BRANCH @ (9,5) up in Gehennom → num=5)
     #         3 LEVEL: tower1, tower2, tower3
     # =======================================================================
+
+    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
+    vendor_rng, _ = _rn2(vendor_rng, 100)
 
     vendor_rng, _ = _rn2(vendor_rng, 5)             # dungeon.c:398 parent_dlevel num=5
 
@@ -3923,9 +3947,12 @@ def consume_init_dungeons_draws(vendor_rng):
 
     # =======================================================================
     # i = 7 : "The Elemental Planes" (6, 0)
-    #         chance=0, lev.rand=0 (no depth), i>0 (BRANCH @ (1,0) no_down up → num=1)
+    #         chance=100 (dgn_comp.y:447 default), lev.rand=0 (no depth), i>0 (BRANCH @ (1,0) no_down up → num=1)
     #         6 LEVEL: astral, water, fire, air, earth, dummy
     # =======================================================================
+
+    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
+    vendor_rng, _ = _rn2(vendor_rng, 100)
 
     vendor_rng, _ = _rn2(vendor_rng, 1)             # dungeon.c:398 parent_dlevel num=1
 
