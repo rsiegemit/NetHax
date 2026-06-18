@@ -299,6 +299,18 @@ class NethaxEnv:
         # The prior order was REVERSED — every ISAAC64 draw from position 195+
         # was offset, causing the entire downstream dungeon-gen to mis-align.
         # Citation: vendor/nle/src/allmain.c:604-615; vendor/nle/src/dungeon.c:714.
+        # Vendor role.c:2071 — role_init() calls rn2(100)<50 to randomize the
+        # quest leader's gender when the leader entry lacks M2_MALE/M2_FEMALE/
+        # M2_NEUTER bits.  Per C-instrumented trace
+        # (.test_runs/full_init_rn2_trace_seed0_marked.txt), vendor draw [195]
+        # = (100, 49) lands between ROLE_INIT_BEGIN and INIT_DUNGEONS_BEGIN
+        # markers — for Archeologist (Lord Carnarvon).  This was previously
+        # misattributed to init_dungeons.
+        if use_vendor_rng() and role is not None and int(role) == int(Role.ARCHEOLOGIST):
+            v_state = state.vendor_rng
+            v_state, _ = _vendor_rng.rn2_jax(v_state, jnp.int32(100))
+            state = state.replace(vendor_rng=v_state)
+
         if use_vendor_rng():
             new_vrng, _dungeon_state = consume_init_dungeons_draws(state.vendor_rng)
             # Variable-count draws: place_level slot picks (dungeon.c:661) and

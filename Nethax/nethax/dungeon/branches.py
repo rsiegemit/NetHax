@@ -3671,10 +3671,14 @@ def consume_init_dungeons_draws(vendor_rng):
 
     1. Dungeon-skip gate (only if ``tmpdungeon[i].chance > 0``)::
            if (!wizard && tmpdungeon[i].chance && (tmpdungeon[i].chance <= rn2(100)))
-       Cite: dungeon.c:775-776.  Every dungeon's ``chance`` defaults to 100 per
-       ``dgn_comp.y:447`` (Fort Ludios is the one DUNGEON entry that overrides
-       it, to 10), so the ``rn2(100)`` ALWAYS fires — once per dungeon, for all
-       8 dungeons.
+       Cite: dungeon.c:775-776.  EMPIRICAL: per C-instrumented vendor trace
+       (.test_runs/full_init_rn2_trace_seed0_marked.txt), every
+       ``DUNGEON_I=<n>_CHANCE_CHECK`` marker is directly followed by
+       ``DUNGEON_I=<n>_DEPTH`` with NO rn2 draw between, for ALL 8 dungeons.
+       This means ``tmpdungeon[i].chance`` is 0 in the compiled binary for
+       every dungeon (the short-circuit at ``tmpdungeon[i].chance && ...``
+       skips the rn2(100)).  The dgn_comp.y:447 source default of 100 does
+       NOT appear in the binary — so the chance gate NEVER draws.
 
     2. Dungeon depth (only if ``tmpdungeon[i].lev.rand > 0``)::
            dungeons[i].num_dunlevs = rn1(lev.rand, lev.base);  // == rn2(rand)+base
@@ -3729,8 +3733,9 @@ def consume_init_dungeons_draws(vendor_rng):
     # =======================================================================
     _marker("I=0_DOD_BEGIN")
 
-    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
-    vendor_rng, _ = _rn2(vendor_rng, 100)
+    # NOTE: chance-check (dungeon.c:776) does NOT fire — tmpdungeon[i].chance
+    # is 0 in the compiled binary (short-circuit skips rn2).  See docstring
+    # Section 1 above.  Removed per C-instrumented vendor trace.
 
     # depth draw — dungeon.c:797-798
     vendor_rng, dod_levels = _rn2(vendor_rng, 5)   # rn1(5, 25)
@@ -3750,6 +3755,13 @@ def consume_init_dungeons_draws(vendor_rng):
     vendor_rng, gate_bigrm  = _rn2(vendor_rng, 100)  # bigrm   chance=40  (RNDLEVEL 2-int)
     vendor_rng, gate_medusa = _rn2(vendor_rng, 100)  # medusa  chance=100 (RNDLEVEL 1-int → default)
     vendor_rng, gate_castle = _rn2(vendor_rng, 100)  # castle  chance=100 (LEVEL)
+    # 6th DoD init_level gate — per C-instrumented vendor trace, the DoD
+    # init_level loop has 6 rn2(100) draws, not 5.  Source: 6 markers between
+    # DUNGEON_I=0_INIT_LEVEL_LOOP and DUNGEON_I=0_PLACE_LEVEL in
+    # .test_runs/full_init_rn2_trace_seed0_marked.txt.  TODO: identify 6th
+    # prototype (possible CHAINLEVEL or duplicated init_level call); for now
+    # a placeholder rn2(100) preserves byte alignment downstream.
+    vendor_rng, _ = _rn2(vendor_rng, 100)            # TODO: identify 6th DoD prototype
 
     bigrm_placed  = gate_bigrm < jnp.int32(40)          # traced bool
     medusa_placed = jnp.bool_(True)  # chance=100 → always placed (1-INT RNDLEVEL default)
@@ -3783,8 +3795,7 @@ def consume_init_dungeons_draws(vendor_rng):
     # =======================================================================
     _marker("I=1_GEHENNOM_BEGIN")
 
-    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
-    vendor_rng, _ = _rn2(vendor_rng, 100)
+    # chance-check (dungeon.c:776) does NOT fire — see docstring Section 1.
 
     vendor_rng, geh_levels = _rn2(vendor_rng, 5)   # dungeon.c:797-798 rn1(5, 20)
     drawn["geh_levels"] = geh_levels + jnp.int32(20)
@@ -3834,8 +3845,7 @@ def consume_init_dungeons_draws(vendor_rng):
     # =======================================================================
     _marker("I=2_MINES_BEGIN")
 
-    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
-    vendor_rng, _ = _rn2(vendor_rng, 100)
+    # chance-check (dungeon.c:776) does NOT fire — see docstring Section 1.
 
     vendor_rng, mines_levels = _rn2(vendor_rng, 2)  # dungeon.c:797-798 rn1(2, 8)
     drawn["mines_levels"] = mines_levels + jnp.int32(8)
@@ -3862,8 +3872,7 @@ def consume_init_dungeons_draws(vendor_rng):
     # =======================================================================
     _marker("I=3_QUEST_BEGIN")
 
-    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
-    vendor_rng, _ = _rn2(vendor_rng, 100)
+    # chance-check (dungeon.c:776) does NOT fire — see docstring Section 1.
 
     vendor_rng, quest_levels = _rn2(vendor_rng, 2)  # dungeon.c:797-798 rn1(2, 5)
     drawn["quest_levels"] = quest_levels + jnp.int32(5)
@@ -3890,8 +3899,7 @@ def consume_init_dungeons_draws(vendor_rng):
     # =======================================================================
     _marker("I=4_SOKOBAN_BEGIN")
 
-    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
-    vendor_rng, _ = _rn2(vendor_rng, 100)
+    # chance-check (dungeon.c:776) does NOT fire — see docstring Section 1.
 
     vendor_rng, _ = _rn2(vendor_rng, 1)             # dungeon.c:398 parent_dlevel num=1
 
@@ -3926,8 +3934,7 @@ def consume_init_dungeons_draws(vendor_rng):
     # =======================================================================
     _marker("I=5_LUDIOS_BEGIN")
 
-    # chance-check (dungeon.c:776) — chance=10, draw still fires
-    vendor_rng, _ = _rn2(vendor_rng, 100)
+    # chance-check (dungeon.c:776) does NOT fire — see docstring Section 1.
 
     vendor_rng, _ = _rn2(vendor_rng, 4)         # dungeon.c:398 parent_dlevel num=4
     vendor_rng, _ = _rn2(vendor_rng, 100)       # dungeon.c:548 knox
@@ -3943,8 +3950,7 @@ def consume_init_dungeons_draws(vendor_rng):
     # =======================================================================
     _marker("I=6_VLAD_BEGIN")
 
-    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
-    vendor_rng, _ = _rn2(vendor_rng, 100)
+    # chance-check (dungeon.c:776) does NOT fire — see docstring Section 1.
 
     vendor_rng, _ = _rn2(vendor_rng, 5)             # dungeon.c:398 parent_dlevel num=5
 
@@ -3966,8 +3972,7 @@ def consume_init_dungeons_draws(vendor_rng):
     # =======================================================================
     _marker("I=7_PLANES_BEGIN")
 
-    # chance-check (dungeon.c:776) — chance defaults to 100, always fires
-    vendor_rng, _ = _rn2(vendor_rng, 100)
+    # chance-check (dungeon.c:776) does NOT fire — see docstring Section 1.
 
     vendor_rng, _ = _rn2(vendor_rng, 1)             # dungeon.c:398 parent_dlevel num=1
 

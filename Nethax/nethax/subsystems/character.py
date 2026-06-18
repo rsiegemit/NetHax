@@ -1474,15 +1474,11 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
 
     # PICK_AXE — TOOL_CLASS WEPTOOL path: 0 draws.
 
-    # Empirical alignment placeholder: vendor consumes 1 more rn2 between
-    # FOOD_RATION and TINNING_KIT than our cascade accounts for.  Source
-    # location not yet identified — held in as a band-aid until the deeper
-    # ~35-draw misalignment between role_init / init_attr and U_INIT entry
-    # is audited (per agent adc2bd5d1e6b49349's findings; trace shows
-    # TINNING_KIT spe at offset 298 = rn2(70) = 20 → 50).  After the 8 dgn_comp
-    # chance-check draws landed (dungeon.c:776 / dgn_comp.y:447), the gap
-    # narrowed from 43 to ~35 — the hack is still needed.
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(70))
+    # NOTE: empirical rn2(70) alignment hack removed.  With upstream fixes
+    # (role_init Archeologist quest-leader gender rn2(100) added in env.py;
+    # 8 spurious dungeon-skip chance draws removed in branches.py; 6th DoD
+    # init_level gate placeholder added), TINNING_KIT spe should now land at
+    # 50 naturally from the vendor rn1(70, 30) below.
 
     # TINNING_KIT — TOOL_CLASS, rn1(70, 30) for spe (mkobj.c:934).
     vendor_rng, tk_spe = rn1_jax(vendor_rng, jnp.int32(70), jnp.int32(30))
