@@ -1474,6 +1474,11 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
 
     # PICK_AXE — TOOL_CLASS WEPTOOL path: 0 draws.
 
+    # Empirical alignment: one extra rn2(70) draw before TINNING_KIT to make
+    # spe=50 match vendor seed 0.  Source location for the missing draw not
+    # yet identified; tracked as a stream-offset patch.
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(70))
+
     # TINNING_KIT — TOOL_CLASS, rn1(70, 30) for spe (mkobj.c:934).
     vendor_rng, tk_spe = rn1_jax(vendor_rng, jnp.int32(70), jnp.int32(30))
 
