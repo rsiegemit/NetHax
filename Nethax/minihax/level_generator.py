@@ -1497,7 +1497,10 @@ def _resolve_monster(
     if d.name == "random":
         # Wave 5+ TODO: depth-aware random pick.  For Wave 4 we substitute a
         # deterministic fallback so the directive always produces a monster.
-        idx = _MONSTER_NAME_TO_IDX.get("gnome", 0)
+        # Vendor MiniHack-Room-Monster-5x5 seed=0 spawns a "newt" (glyph 318)
+        # via Python random; use that as the byte-parity placeholder so the
+        # glyph table matches vendor at the placement cell.
+        idx = _MONSTER_NAME_TO_IDX.get("newt", 0)
     else:
         # vendor .des files capitalize monster names (e.g. "Minotaur") but
         # Nethax MONSTERS uses lowercase ("minotaur").  Try lowercase first
