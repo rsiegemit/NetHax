@@ -695,10 +695,11 @@ def _wrap_trap_room_placement(
 
     def wrapped(rng: jax.Array):
         state = factory(rng)
-        # Per-trap 2× rn2(5) + 5× (rn2(79), rn2(21)) somxy pairs are now
-        # consumed inside the build by ``_resolve_trap`` (level_generator.py)
-        # so that the trap's actual placement uses the vendor stream.  We
-        # only need to drive the player-spawn 7-pair somxy loop here.
+        # Vendor mklev order for Room-Trap is: mkstairs (4 draws) THEN
+        # mktrap (2× rn2(5) + 5× (rn2(79), rn2(21)) per trap) THEN player
+        # spawn (7× (rn2(79), rn2(21))).  ``_resolve_trap`` in
+        # level_generator.py no longer touches vendor_rng; we drive the
+        # mktrap consumption here AFTER the stair stamp.
         vrng = state.vendor_rng
         x1, y1 = _vendor_geometry_center(size)
         x2 = x1 + size - 1
@@ -726,6 +727,15 @@ def _wrap_trap_room_placement(
         new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )
+        # mktrap consumption: trace offsets 343-354 for n_trap=1 show
+        # 2× rn2(5) (trap kind / mktrap internal) + 5× (rn2(79), rn2(21))
+        # somxy retry loop.  Scale per-trap block by ``n_trap``.
+        for _ in range(n_trap):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+            for _ in range(5):
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
         # First-accept semantics (see Random wrapper).
         has_accepted = jnp.bool_(False)
         for _ in range(7):

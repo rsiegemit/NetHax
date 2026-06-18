@@ -1606,40 +1606,24 @@ def _resolve_trap(
 
     from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng
     if state is not None and _use_vendor_rng():
-        from Nethax.nethax import vendor_rng as _vendor_rng
-        vrng = state.vendor_rng
-        # 2× rn2(5): trap-kind / mktrap internal selection
-        # (vendor/nethack/src/mklev.c:1318-1366 traptype_rnd cascade).
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-        # somxy() retry loop: up to 5× (rn1(width, x1), rn1(height, y1))
-        # per vendor mklev.c:184-187 — room-local coords within the room
-        # rect, NOT map-global rn2(79)/rn2(21).  Empirically the 5x5 seed-0
-        # trace consumes exactly 5 pairs; we accept the first FLOOR cell
-        # or fall back to the last pair after 5 retries.
+        # Vendor-rng draws for the trap (2× rn2(5) kind + 5× somxy pairs)
+        # are now consumed in ``_wrap_trap_room_placement`` AFTER the stair
+        # stamp, matching vendor mklev order (mkstairs precedes mktrap).
+        # We pick a deterministic placeholder position here without
+        # touching the vendor stream; full trap-glyph parity is a follow-up.
         floor = int(TileType.FLOOR)
         sub = terrain_np[0, 0, :h, :w]
-        if resolved_rooms:
-            ry1, rx1, ry2, rx2 = next(iter(resolved_rooms.values()))
-            room_w = rx2 - rx1 + 1
-            room_h = ry2 - ry1 + 1
-        else:
-            rx1, ry1, room_w, room_h = 0, 0, w, h
         rc: Optional[Tuple[int, int]] = None
-        last_xy: Optional[Tuple[int, int]] = None
-        for _ in range(5):
-            vrng, x = _vendor_rng.rn1_jax(vrng, jnp.int32(room_w), jnp.int32(rx1))
-            vrng, y = _vendor_rng.rn1_jax(vrng, jnp.int32(room_h), jnp.int32(ry1))
-            xi = int(x)
-            yi = int(y)
-            last_xy = (yi, xi)
-            if 0 <= yi < h and 0 <= xi < w and int(sub[yi, xi]) == floor:
-                rc = (yi, xi)
+        for yi in range(h):
+            for xi in range(w):
+                if int(sub[yi, xi]) == floor:
+                    rc = (yi, xi)
+                    break
+            if rc is not None:
                 break
         if rc is None:
-            rc = last_xy if last_xy is not None else (0, 0)
-        new_state = state.replace(vendor_rng=vrng)
-        return rc, trap_kind, new_state
+            rc = (0, 0)
+        return rc, trap_kind, state
 
     rc = _resolve_place(d.place, terrain_np, w, h, resolved_rooms, next_key)
     if rc is None:
