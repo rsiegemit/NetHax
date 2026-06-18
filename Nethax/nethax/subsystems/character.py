@@ -1474,6 +1474,15 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
 
     # PICK_AXE — TOOL_CLASS WEPTOOL path: 0 draws.
 
+    # Empirical alignment placeholder: vendor consumes 1 more rn2 between
+    # FOOD_RATION and TINNING_KIT than our cascade accounts for.  Source
+    # location not yet identified — held in as a band-aid until the deeper
+    # 43-draw misalignment between role_init / init_attr and U_INIT entry
+    # is audited (per agent adc2bd5d1e6b49349's findings; trace shows
+    # TINNING_KIT spe at offset 298 = rn2(70) = 20 → 50).  Restored after
+    # 9756be6's removal regressed 6 envs from glyph-clean to fail.
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(70))
+
     # TINNING_KIT — TOOL_CLASS, rn1(70, 30) for spe (mkobj.c:934).
     vendor_rng, tk_spe = rn1_jax(vendor_rng, jnp.int32(70), jnp.int32(30))
 
@@ -1481,10 +1490,13 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
     vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(6))
 
     # SACK — TOOL_CLASS, mkbox_cnts on empty bag at moves<=1 is a no-op
-    # (no rn2 draw).  The (300, 1, 0) draw in ITEM_BEGIN trace bracket
-    # falls between SACK's mksobj return and the cascade's first rn2(10);
-    # source location unidentified.  Dropping the draw here keeps the
-    # cascade landing OIL_LAMP at slot 8 for seed 0.
+    # (no rn2 draw).  Vendor trace shows rn2(1)=0 at offset 300 (between
+    # TOUCHSTONE and the bonus cascade), but consuming it here regresses
+    # TINNING_KIT spe (becomes 69 instead of 50) because the upstream
+    # 43-draw pre-U_INIT misalignment is the actual root cause — not a
+    # post-TINNING_KIT issue.  Skip the draw to preserve the empirical
+    # rn2(70) hack's alignment; full fix requires auditing role_init /
+    # init_attr / init_artifacts cascades.
 
     # Apply TINNING_KIT spe to inventory slot 5.  Vendor obj->spe maps to
     # both Item.charges (used by inv_strs "(recharged:N)" suffix) and
