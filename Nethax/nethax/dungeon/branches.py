@@ -3710,6 +3710,13 @@ def consume_init_dungeons_draws(vendor_rng):
         small dict of the values caller may want for downstream wiring.
     """
     from Nethax.nethax.vendor_rng import rn2_jax as _rn2
+    import os as _os
+    import sys as _sys
+    _DUNGEON_TRACE = bool(_os.environ.get('NETHAX_DUNGEON_TRACE'))
+
+    def _marker(name):
+        if _DUNGEON_TRACE:
+            print(f"NETHAX_DUNGEON_{name}", file=_sys.stderr, flush=True)
 
     drawn = {}
 
@@ -3720,6 +3727,7 @@ def consume_init_dungeons_draws(vendor_rng):
     #         i == 0                  → no add_branch
     #         5 prototype levels: rogue, oracle, bigrm, medusa, castle
     # =======================================================================
+    _marker("I=0_DOD_BEGIN")
 
     # chance-check (dungeon.c:776) — chance defaults to 100, always fires
     vendor_rng, _ = _rn2(vendor_rng, 100)
@@ -3773,6 +3781,7 @@ def consume_init_dungeons_draws(vendor_rng):
     #         11 levels: valley, sanctum, juiblex, baalz, asmodeus,
     #                    wizard1, wizard2, wizard3, orcus, fakewiz1, fakewiz2
     # =======================================================================
+    _marker("I=1_GEHENNOM_BEGIN")
 
     # chance-check (dungeon.c:776) — chance defaults to 100, always fires
     vendor_rng, _ = _rn2(vendor_rng, 100)
@@ -3823,6 +3832,7 @@ def consume_init_dungeons_draws(vendor_rng):
     #         chance=100 (dgn_comp.y:447 default), lev.rand=2, i>0 (BRANCH @ (2,3) → num=3)
     #         2 RNDLEVEL levels: minetn (ch=7), minend (ch=3)
     # =======================================================================
+    _marker("I=2_MINES_BEGIN")
 
     # chance-check (dungeon.c:776) — chance defaults to 100, always fires
     vendor_rng, _ = _rn2(vendor_rng, 100)
@@ -3850,6 +3860,7 @@ def consume_init_dungeons_draws(vendor_rng):
     #         chance=100 (dgn_comp.y:447 default), lev.rand=2, i>0 (CHAINBRANCH "oracle"+(6,2) portal → num=2)
     #         3 LEVEL levels: x-strt, x-loca, x-goal
     # =======================================================================
+    _marker("I=3_QUEST_BEGIN")
 
     # chance-check (dungeon.c:776) — chance defaults to 100, always fires
     vendor_rng, _ = _rn2(vendor_rng, 100)
@@ -3877,6 +3888,7 @@ def consume_init_dungeons_draws(vendor_rng):
     #         i>0 (CHAINBRANCH "oracle"+(1,0) up → num=1)
     #         4 RNDLEVEL levels: soko1..soko4 (ch=2 each)
     # =======================================================================
+    _marker("I=4_SOKOBAN_BEGIN")
 
     # chance-check (dungeon.c:776) — chance defaults to 100, always fires
     vendor_rng, _ = _rn2(vendor_rng, 100)
@@ -3912,6 +3924,7 @@ def consume_init_dungeons_draws(vendor_rng):
     #         lev.rand=0 → no depth draw; 1 LEVEL: knox (chance=100 LEVEL).
     #         BRANCH @ (18,4) portal in Main → parent_dlevel num=4.
     # =======================================================================
+    _marker("I=5_LUDIOS_BEGIN")
 
     # chance-check (dungeon.c:776) — chance=10, draw still fires
     vendor_rng, _ = _rn2(vendor_rng, 100)
@@ -3928,6 +3941,7 @@ def consume_init_dungeons_draws(vendor_rng):
     #         chance=100 (dgn_comp.y:447 default), lev.rand=0 (no depth), i>0 (BRANCH @ (9,5) up in Gehennom → num=5)
     #         3 LEVEL: tower1, tower2, tower3
     # =======================================================================
+    _marker("I=6_VLAD_BEGIN")
 
     # chance-check (dungeon.c:776) — chance defaults to 100, always fires
     vendor_rng, _ = _rn2(vendor_rng, 100)
@@ -3950,6 +3964,7 @@ def consume_init_dungeons_draws(vendor_rng):
     #         chance=100 (dgn_comp.y:447 default), lev.rand=0 (no depth), i>0 (BRANCH @ (1,0) no_down up → num=1)
     #         6 LEVEL: astral, water, fire, air, earth, dummy
     # =======================================================================
+    _marker("I=7_PLANES_BEGIN")
 
     # chance-check (dungeon.c:776) — chance defaults to 100, always fires
     vendor_rng, _ = _rn2(vendor_rng, 100)
@@ -3977,6 +3992,7 @@ def consume_init_dungeons_draws(vendor_rng):
     # After the per-dungeon loop: tune string — dungeon.c:917-918
     #     for (i = 0; i < 5; i++) tune[i] = 'A' + rn2(7);
     # =======================================================================
+    _marker("TUNE_BEGIN")
     vendor_rng, _ = _rn2(vendor_rng, 7)              # dungeon.c:918 tune[0]
     vendor_rng, _ = _rn2(vendor_rng, 7)              # dungeon.c:918 tune[1]
     vendor_rng, _ = _rn2(vendor_rng, 7)              # dungeon.c:918 tune[2]
