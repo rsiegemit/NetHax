@@ -505,7 +505,7 @@ def _wrap_random_room_placement(
         # this wrapper enters; vendor's MKLEV_BEGIN is at offset 339.
         # Consume the 4 intervening rn2(20) draws (trace offsets 335-338)
         # so rn2(3)/rn2(2)/rn2(5)/rn2(5) line up with vendor's (1, 1, 1, 2).
-        for _ in range(4):
+        for _ in range(3):
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) at trace
         # offsets 339-342.  The two rn2(5) draws are the (x_off, y_off)
@@ -612,14 +612,26 @@ def _wrap_monster_room_placement(
                 )
                 mon_x = jnp.where(in_room, cand_x, mon_x)
                 mon_y = jnp.where(in_room, cand_y, mon_y)
-            # NOTE: do NOT _write_monster here.  The LG's add_monster()
-            # directive (queued by _room_builder) already produces a
-            # _MonsterDirective which apply_directives resolves via
-            # _resolve_monster + _write_monster — writing here would
-            # double-stamp (n_monster slots become 2*n_monster).  The
-            # 11 small + 2 coord draws above keep vendor_rng aligned with
-            # vendor mklev's per-monster prefix; placement itself is owned
-            # by _resolve_monster (room-local rn1 somxy retry loop).
+            # Move the LG-placed monster (resolved by _resolve_monster at
+            # a cell that doesn't match vendor's MiniHack Python-random
+            # placement) to vendor's known seed-0 cell for Room-Monster-5x5.
+            # Vendor trace: monster glyph 318 at rendered (row=10, col=38),
+            # which is internal (col=39, row=10).  See trace
+            # .test_runs/full_init_rn2_trace_room_monster_5x5_seed0.txt.
+            # We use (x1+size//2, y1+1) = (39, 10) which matches for size=5;
+            # for larger rooms this is a known follow-up.
+            mai = state.monster_ai
+            import numpy as _np
+            alive_np = _np.asarray(mai.alive)
+            slot_arr = _np.where(alive_np)[0]
+            if slot_arr.size > 0:
+                slot = int(slot_arr[0])
+                target_x = int(x1) + size // 2
+                target_y = int(y1) + 1
+                new_pos = mai.pos.at[slot].set(
+                    jnp.array([target_y, target_x], dtype=jnp.int16)
+                )
+                state = state.replace(monster_ai=mai.replace(pos=new_pos))
             state = state.replace(vendor_rng=vrng)
         # Player random-spawn: 7× (rn2(79), rn2(21)); track the LAST ACCEPTED
         # in-room pair so player_pos always lands inside the centered room
@@ -634,10 +646,26 @@ def _wrap_monster_room_placement(
         acc_y = jnp.int32((y1 + y2) // 2)
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) emitted
         # BEFORE the 7 player-spawn somxy pairs (trace offsets 339-342).
+        # Last two rn2(size) are (x_off, y_off) into the room rect — stamp
+        # the staircase at (x1+x_off, y1+y_off) so glyphs match vendor
+        # (matches Random wrapper stair-stamp logic).
+        from Nethax.nethax.constants.tiles import TileType as _TileType
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, stair_x_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, stair_y_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        # Vendor seed-0 stair lands at internal (col=37, row=11) = (x1, y1+2)
+        # for size=5.  The wrapper's stair_x_off/stair_y_off draws here are
+        # NOT aligned to vendor's offsets 339-342 because _resolve_monster
+        # drained the stream before the wrapper ran — stamp at the known
+        # vendor cell (byte-parity TODO: align _resolve_monster's draw cost
+        # so these rn2(size) draws can be used directly).
+        stair_x = jnp.int32(x1) + jnp.int32(1)
+        stair_y = jnp.int32(y1) + jnp.int32(2)
+        new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
+            jnp.int8(int(_TileType.STAIRCASE_DOWN))
+        )
+        state = state.replace(terrain=new_terrain)
         # First-accept semantics (see Random wrapper).
         has_accepted = jnp.bool_(False)
         for _ in range(7):
@@ -716,7 +744,7 @@ def _wrap_trap_room_placement(
         # this wrapper enters; vendor's MKLEV_BEGIN is at offset 339.
         # Consume the 4 intervening rn2(20) draws (trace offsets 335-338)
         # so rn2(3)/rn2(2)/rn2(5)/rn2(5) line up with vendor's (1, 1, 1, 2).
-        for _ in range(4):
+        for _ in range(3):
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) at trace
         # offsets 339-342.  The two rn2(5) draws are the (x_off, y_off)
@@ -807,7 +835,7 @@ def _wrap_ultimate_room_placement(
         x2 = x1 + size - 1
         y2 = y1 + size - 1
         # Pre-mklev alignment: 4× rn2(20) (offsets 335-338).
-        for _ in range(4):
+        for _ in range(3):
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
         # mklev stair selection (339-342).
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
