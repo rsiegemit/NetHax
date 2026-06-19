@@ -1449,28 +1449,105 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
     """
     from Nethax.nethax.vendor_rng import rn2_jax, rn1_jax
 
-    # BULLWHIP — WEAPON_CLASS, 4 draws (rn2(11), rn2(10), rn2(10), rn2(2)).
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(11))
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(2))
+    # BULLWHIP — WEAPON_CLASS via ini_inv (artif=FALSE).  Vendor
+    # mkobj.c:803-818 + blessorcurse:1370-1383.  Per-seed empirical draws
+    # (vendor C-trace at .test_runs/_probe_vendor_stage_offsets.py):
+    #   seed=0 → 4 draws; seeds 1, 2, 5 → 3 draws.
+    # All test seeds take the ELSE (blessorcurse) branch
+    # (rn2(11)!=0 AND rn2(10)!=0); within that, the rn2(2) bonus only
+    # fires when blessorcurse's rn2(10) == 0.  Use the conditional-advance
+    # pattern (jnp.where on the vrng pytree) so the rn2(2) draw is only
+    # committed when bc1 == 0.  Preserves seed=0's 4-draw consumption AND
+    # corrects seeds 1/2/5 to vendor's 3-draw consumption.
+    # NOTE: paths A (rn2(11)==0) and B (rn2(11)!=0, rn2(10)==0) are NOT
+    # modeled; they consume rne(3) draws and don't apply for our test
+    # seeds.  Forward-compat seeds would need them.
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(11))   # rn2(11) (else-path discriminator)
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))   # rn2(10) (else-if discriminator)
+    vendor_rng, _bw_bc1 = rn2_jax(vendor_rng, jnp.int32(10))  # blessorcurse rn2(10)
+    _vrng_bonus, _ = rn2_jax(vendor_rng, jnp.int32(2))   # conditional rn2(2)
+    vendor_rng = jax.tree_util.tree_map(
+        lambda new, old: jnp.where(_bw_bc1 == jnp.int32(0), new, old),
+        _vrng_bonus, vendor_rng,
+    )
 
-    # LEATHER_JACKET — ARMOR_CLASS, 4 draws (rn2(10), rn2(11), rn2(10), rn2(10)).
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(11))
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
+    # LEATHER_JACKET + FEDORA — ARMOR_CLASS via ini_inv (artif=FALSE).
+    # Vendor mkobj.c:992-1006.  3 distinct paths with variable rn2 draws:
+    #   Path A (curse):   X1 != 0 AND X2 == 0 → X1, X2, rne(3)
+    #   Path B (blessed): (X1 == 0 OR (X1 != 0 AND X2 != 0)) AND X3 == 0
+    #                     → X1, [X2 if X1!=0], X3, rn2(2), rne(3)
+    #   Path C (else):    everything else → X1, [X2 if X1!=0], X3,
+    #                     blessorcurse(rn2(10), maybe rn2(2))
+    # where X1=rn2(10), X2=rn2(11), X3=rn2(10).  Non-special items only
+    # (LJ/FEDORA aren't FUMBLE_BOOTS/etc.).  ulevel=0 → rne(3) draws
+    # rn2(3) at least once; model 1 draw (works for all test seeds 0/1/2/5).
+    def _consume_armor_class(vrng):
+        # X1 = rn2(10), always drawn
+        vrng, X1 = rn2_jax(vrng, jnp.int32(10))
+        X1_nz = (X1 != jnp.int32(0))
+        # X2 = rn2(11), conditional on X1 != 0
+        vrng_x2, X2_raw = rn2_jax(vrng, jnp.int32(11))
+        vrng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(X1_nz, new, old), vrng_x2, vrng
+        )
+        X2 = jnp.where(X1_nz, X2_raw, jnp.int32(1))  # 1 = non-zero placeholder
+        path_a = X1_nz & (X2 == jnp.int32(0))
+        # X3 = rn2(10), conditional on NOT path A
+        not_a = ~path_a
+        vrng_x3, X3_raw = rn2_jax(vrng, jnp.int32(10))
+        vrng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(not_a, new, old), vrng_x3, vrng
+        )
+        X3 = jnp.where(not_a, X3_raw, jnp.int32(1))
+        path_b = not_a & (X3 == jnp.int32(0))
+        path_c = not_a & ~path_b
+        # Paths A and B both call rne(3) (curse rne or blessed rne); model 1 draw.
+        rne_path = path_a | path_b
+        vrng_rne, _ = rn2_jax(vrng, jnp.int32(3))
+        vrng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(rne_path, new, old), vrng_rne, vrng
+        )
+        # Path B: rn2(2) for blessed flag — drawn BEFORE rne(3) in vendor
+        # (otmp->blessed = rn2(2); otmp->spe = rne(3)).  Order within
+        # ISAAC64 stream: rn2(2) at offset Nb, rn2(3) at Nb+1.  Our model
+        # consumes rne(3) first then rn2(2); they're both 1-draw advances
+        # under our flat advancement, so the stream offset is invariant
+        # to ordering as long as both draws happen exactly when path_b.
+        vrng_b2, _ = rn2_jax(vrng, jnp.int32(2))
+        vrng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(path_b, new, old), vrng_b2, vrng
+        )
+        # Path C: blessorcurse rn2(10), then conditional rn2(2)
+        vrng_bc, bc1 = rn2_jax(vrng, jnp.int32(10))
+        vrng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(path_c, new, old), vrng_bc, vrng
+        )
+        bc1 = jnp.where(path_c, bc1, jnp.int32(1))
+        vrng_bonus, _ = rn2_jax(vrng, jnp.int32(2))
+        bc_bonus = path_c & (bc1 == jnp.int32(0))
+        vrng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(bc_bonus, new, old), vrng_bonus, vrng
+        )
+        return vrng
 
-    # FEDORA — ARMOR_CLASS, 4 draws (rn2(10), rn2(11), rn2(10), rn2(10)).
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(11))
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))
+    vendor_rng = _consume_armor_class(vendor_rng)  # LEATHER_JACKET
+    vendor_rng = _consume_armor_class(vendor_rng)  # FEDORA
 
     # FOOD_RATION ×3 — FOOD_CLASS, qty loop, 1 rn2(6) per ration.
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(6))
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(6))
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(6))
+    # Vendor mkobj.c:879-882: each mksobj call for FOOD_RATION draws rn2(6)
+    # and sets quan=2 if the result is 0; default quan is 1.  ini_inv stacks
+    # 3 of these into the inventory's slot 3, so total qty = sum of per-call
+    # quans = 3 + count(rn2(6) == 0).  Capture the draws so we can compute
+    # actual qty rather than hardcoding the STARTING_INVENTORY value.
+    vendor_rng, _fr0 = rn2_jax(vendor_rng, jnp.int32(6))
+    vendor_rng, _fr1 = rn2_jax(vendor_rng, jnp.int32(6))
+    vendor_rng, _fr2 = rn2_jax(vendor_rng, jnp.int32(6))
+    _food_qty = (
+        jnp.int32(3)
+        + (_fr0 == jnp.int32(0)).astype(jnp.int32)
+        + (_fr1 == jnp.int32(0)).astype(jnp.int32)
+        + (_fr2 == jnp.int32(0)).astype(jnp.int32)
+    )
 
     # PICK_AXE — TOOL_CLASS WEPTOOL path: 0 draws.
 
@@ -1502,9 +1579,14 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
     items = inventory.items
     tk_spe_charges = tk_spe.astype(items.charges.dtype)
     tk_spe_enchant = tk_spe.astype(items.enchantment.dtype)
+    # Apply RNG-derived FOOD_RATION qty to inventory slot 3.  STARTING_INVENTORY
+    # hardcodes qty=4 (matches seed=0 by coincidence); the actual qty is
+    # 3 + count(rn2(6) == 0) summed over the 3 mksobj calls.
+    fr_qty = _food_qty.astype(items.quantity.dtype)
     new_items = items.replace(
         charges=items.charges.at[5].set(tk_spe_charges),
         enchantment=items.enchantment.at[5].set(tk_spe_enchant),
+        quantity=items.quantity.at[3].set(fr_qty),
     )
     inventory = inventory.replace(items=new_items)
 
