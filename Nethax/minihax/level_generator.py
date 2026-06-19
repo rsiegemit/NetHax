@@ -1539,20 +1539,20 @@ def _resolve_monster(
         else:
             rx1, ry1, rx2, ry2 = 0, 0, w - 1, h - 1
         rc: Optional[Tuple[int, int]] = None
-        # 8 unconditional somxy draws per vendor's seed=0 monster block.
-        # Vendor's somxy continues until a valid cell is found; for our
-        # test seeds the 8 attempts captured in the trace cover the
-        # iterations needed.  Accept the first FLOOR cell.
+        # Up to 8 somxy attempts with early-stop on first FLOOR accept.
+        # For small rooms (5x5) most candidates land outside the room
+        # and reject, so vendor consumes all 8 draws (the seed=0 trace
+        # case).  For large rooms (15x15) the first candidate often lands
+        # in-room and accepts, consuming only 2 draws (1 pair).  Adaptive
+        # behavior matches vendor's bad_location early-return semantics.
         for _ in range(8):
+            if rc is not None:
+                break
             vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
             cand_x = int(raw_x) + 1
             yi, xi = int(cand_y), cand_x
-            if (
-                rc is None
-                and 0 <= yi < h and 0 <= xi < w
-                and int(sub[yi, xi]) == floor
-            ):
+            if 0 <= yi < h and 0 <= xi < w and int(sub[yi, xi]) == floor:
                 rc = (yi, xi)
         if rc is None:
             # Fallback: room center (vendor uses enexto/similar fallback).
