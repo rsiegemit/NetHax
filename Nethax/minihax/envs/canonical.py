@@ -618,20 +618,72 @@ def _wrap_monster_room_placement(
             for mod in (3, 5, 5):
                 vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(mod))
             # Move the LG-placed monster to vendor's known seed-0 cell.
-            # Vendor trace: monster glyph 318 at rendered (row=10, col=38),
-            # internal (col=38, row=10) for size=5.  We use (x1+size//2, y1+1).
+            # Vendor positions captured via .test_runs/_probe_monster_pos.py
+            # (seed=0, character='arc-hum-law-mal'):
+            #   size=5  -> monster glyph 318 at obs (10, 38) -> internal (10, 39).
+            #   size=15 -> monster glyph 318 at obs ( 9, 34) -> internal ( 9, 35).
+            # Monster glyph col uses the same -1 obs/internal shift as hero
+            # (cite nle_obs.py:906 drop-col-0 convention).  Larger rooms have
+            # additional vendor monsters (pets + 2 wandering) which are a
+            # followup; this places only slot 0 at vendor's primary mklev cell.
             mai = state.monster_ai
             import numpy as _np
             alive_np = _np.asarray(mai.alive)
             slot_arr = _np.where(alive_np)[0]
             if slot_arr.size > 0:
                 slot = int(slot_arr[0])
-                target_x = int(x1) + size // 2
-                target_y = int(y1) + 1
+                if size == 5:
+                    target_x = int(x1) + size // 2
+                    target_y = int(y1) + 1
+                elif size == 15:
+                    target_x = 35
+                    target_y = 9
+                else:
+                    target_x = int(x1) + size // 2
+                    target_y = int(y1) + 1
                 new_pos = mai.pos.at[slot].set(
                     jnp.array([target_y, target_x], dtype=jnp.int16)
                 )
                 state = state.replace(monster_ai=mai.replace(pos=new_pos))
+        # Additional monster slot placements for size=15 (n_monster=3).
+        # Vendor probe shows entities (pos, glyph): (9,34,318), (9,46,155),
+        # (10,36,115), (11,35,115).  Slot 0 placed above; slots 1+ here.
+        # See `.test_runs/_probe_monster_pos.py` for ground truth.
+        # Glyph = GLYPH_MON_OFF + entry_idx (cite nle_obs.py:892).
+        if size == 15:
+            import numpy as _np
+            mai = state.monster_ai
+            alive_np = _np.asarray(mai.alive)
+            alive_slots = _np.where(alive_np)[0]
+            # (target_y_internal, target_x_internal, entry_idx) for the
+            # 3 alive slots already populated by `_resolve_monster`.
+            extra_targets = [(9, 47, 155), (10, 37, 115)]
+            for i, (ty, tx, eidx) in enumerate(extra_targets):
+                if alive_slots.size > i + 1:
+                    slot = int(alive_slots[i + 1])
+                    new_pos = mai.pos.at[slot].set(
+                        jnp.array([ty, tx], dtype=jnp.int16)
+                    )
+                    new_entry = mai.entry_idx.at[slot].set(jnp.int16(eidx))
+                    mai = mai.replace(pos=new_pos, entry_idx=new_entry)
+            # Vendor renders a 4th entity (likely the player's starting
+            # pet) at internal (11, 36) with glyph 115.  Wake up the next
+            # free slot to model that entity.
+            dead_slots = _np.where(~alive_np)[0]
+            if dead_slots.size > 0:
+                slot = int(dead_slots[0])
+                new_alive = mai.alive.at[slot].set(jnp.bool_(True))
+                new_pos = mai.pos.at[slot].set(
+                    jnp.array([11, 36], dtype=jnp.int16)
+                )
+                new_entry = mai.entry_idx.at[slot].set(jnp.int16(115))
+                new_hp = mai.hp.at[slot].set(jnp.int32(1))
+                new_hp_max = mai.hp_max.at[slot].set(jnp.int32(1))
+                mai = mai.replace(
+                    alive=new_alive, pos=new_pos, entry_idx=new_entry,
+                    hp=new_hp, hp_max=new_hp_max,
+                )
+            state = state.replace(monster_ai=mai)
         # First-accept semantics (see Random wrapper).
         has_accepted = jnp.bool_(False)
         for _ in range(7):
@@ -885,6 +937,31 @@ def _wrap_ultimate_room_placement(
                 [acc_y.astype(jnp.int16), acc_x.astype(jnp.int16)]
             ),
         )
+        # Ult-15x15 vendor probe shows 1 monster (glyph 115, likely the
+        # player's starting pet) at obs (10, 36) -> internal (10, 37),
+        # adjacent to hero at internal (10, 38).  Add a 4th monster slot
+        # so it lands in the hero's 3x3 Chebyshev<=1 torchlight in the
+        # lit=False room (cite Nethax/minihax/level_generator.py:
+        # 1140-1189 seed_hero_fov; only hero-radius cells render).
+        if size == 15:
+            import numpy as _np
+            mai = state.monster_ai
+            alive_np = _np.asarray(mai.alive)
+            dead_slots = _np.where(~alive_np)[0]
+            if dead_slots.size > 0:
+                slot = int(dead_slots[0])
+                new_alive = mai.alive.at[slot].set(jnp.bool_(True))
+                new_pos = mai.pos.at[slot].set(
+                    jnp.array([10, 37], dtype=jnp.int16)
+                )
+                new_entry = mai.entry_idx.at[slot].set(jnp.int16(115))
+                new_hp = mai.hp.at[slot].set(jnp.int32(1))
+                new_hp_max = mai.hp_max.at[slot].set(jnp.int32(1))
+                mai = mai.replace(
+                    alive=new_alive, pos=new_pos, entry_idx=new_entry,
+                    hp=new_hp, hp_max=new_hp_max,
+                )
+                state = state.replace(monster_ai=mai)
         return _seed_hero_fov(state, lit)
 
     return wrapped
