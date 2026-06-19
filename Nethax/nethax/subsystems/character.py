@@ -1486,14 +1486,12 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
     # TOUCHSTONE — GEM_CLASS, 1 rn2(6).
     vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(6))
 
-    # SACK — TOOL_CLASS, mkbox_cnts on empty bag at moves<=1 is a no-op
-    # (no rn2 draw).  Vendor trace shows rn2(1)=0 at offset 300 (between
-    # TOUCHSTONE and the bonus cascade), but consuming it here regresses
-    # TINNING_KIT spe (becomes 69 instead of 50) because the upstream
-    # 43-draw pre-U_INIT misalignment is the actual root cause — not a
-    # post-TINNING_KIT issue.  Skip the draw to preserve the empirical
-    # rn2(70) hack's alignment; full fix requires auditing role_init /
-    # init_attr / init_artifacts cascades.
+    # SACK — TOOL_CLASS, mkbox_cnts emits rn2(1) at offset 300.  Now that
+    # the ini_inv→cascade→init_attr reorder has restored vendor offset
+    # alignment, this draw is required so the bonus cascade lands at vendor
+    # offsets 301-303 rather than 300-302.
+    # Cite: vendor/nle/src/mkobj.c:309 (mkbox_cnts rn2(n+1) for SACK).
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(1))
 
     # Apply TINNING_KIT spe to inventory slot 5.  Vendor obj->spe maps to
     # both Item.charges (used by inv_strs "(recharged:N)" suffix) and
@@ -1700,32 +1698,17 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         from Nethax.nethax.vendor_rng import rn2_jax as _rn2_jax
         vendor_rng, blindfold_roll = _rn2_jax(vendor_rng, jnp.int32(5))
 
-    # --- Stat rolls (vendor init_attr(75) parity) ---
-    # Step 4: NLE_BYTEPARITY mode: consume ISAAC64 draws via consume_init_attr_draws.
-    # Plain mode: fall back to Threefry-based _init_attr_vendor.
-    # Cite: vendor/nle/src/attrib.c:614-660; u_init.c:882.
-    if vendor_rng is not None:
-        vendor_rng, stats_raw = consume_init_attr_draws(vendor_rng, role, race)
-        stats = {k: jnp.int32(v) for k, v in stats_raw.items()}
-    else:
-        stats = _init_attr_vendor(rng_stats, role, race, np_total=75)
-
-    # --- NLE_BYTEPARITY: attr variation loop (all roles) ---
-    # Step 5: 6 rn2(20) draws + conditional rn2(7) per hit, applying the
-    # biased adjattrib() variation to the stat values.  Cite:
-    # vendor/nle/src/u_init.c:886-894.
-    if vendor_rng is not None:
-        # consume_init_attr_draws returns Python ints; vary on those then
-        # re-wrap as int32 so the downstream EnvState fields stay typed.
-        vendor_rng, stats_raw = _consume_attr_variation_draws(
-            vendor_rng, stats_raw, role, race,
-        )
-        stats = {k: jnp.int32(v) for k, v in stats_raw.items()}
-
-    # --- HP / Pw (vendor ini_hpwp parity, u.ulevel == 0 branch) ---
-    hp, pw = _ini_hpwp_vendor(rng_hp, role, race)
-
     # --- Build inventory ---
+    # NLE_BYTEPARITY: vendor u_init.c:668-894 runs `ini_inv(<role>)` BEFORE
+    # init_attr / attr_variation.  We build the inventory + consume Arc
+    # ini_inv draws + Arc bonus cascade here so subsequent ISAAC64 draws
+    # (init_attr at u_init.c:883, attr_variation at u_init.c:887-894) land
+    # at vendor-aligned offsets.  Rogue ini_inv draws were already consumed
+    # above (dagger_qty / rogue_buc_flags / blindfold_roll); this block only
+    # applies their effects to items_list.
+    # Cite: vendor/nle/src/u_init.c:668-679 (Archeologist case),
+    #       vendor/nle/src/u_init.c:749-757 (Rogue case),
+    #       vendor/nle/src/u_init.c:882-894 (post-ini_inv init_attr+vary).
     items_list = STARTING_INVENTORY[role]
     # Rogue DAGGER stack quantity is vendor rn1(10, 6) (u_init.c:750), not the
     # static placeholder 10.  In NLE_BYTEPARITY mode the rn2(10) was already
@@ -1805,6 +1788,97 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         vendor_rng, inv_state = _consume_ini_inv_archeologist_draws(
             vendor_rng, inv_state,
         )
+
+    # --- NLE_BYTEPARITY: Archeologist bonus item cascade ---
+    # Vendor u_init.c:670-675 — after ``ini_inv(Archeologist)``, the Arc role
+    # rolls a 3-step rn2 cascade for one optional bonus item, BEFORE init_attr:
+    #     if (!rn2(10))      ini_inv(Tinopener);     // TIN_OPENER  (214)
+    #     else if (!rn2(4))  ini_inv(Lamp);          // OIL_LAMP    (202)
+    #     else if (!rn2(10)) ini_inv(Magicmarker);   // MAGIC_MARKER(217)
+    # We always draw all three ISAAC64 words so the stream advances
+    # deterministically (vmap-safe); the short-circuit selection picks at
+    # most one bonus item and writes it to inventory slot 8.
+    # Cite: vendor/nle/src/u_init.c:670-675.
+    if vendor_rng is not None and role == Role.ARCHEOLOGIST:
+        from Nethax.nethax.vendor_rng import rn2_jax as _rn2_jax_arc
+        from Nethax.nethax.subsystems.inventory import (
+            ItemCategory as _ItemCategory_arc,
+            make_item as _make_item_arc,
+            make_empty_item as _make_empty_arc,
+        )
+        vendor_rng, _arc_r10a = _rn2_jax_arc(vendor_rng, jnp.int32(10))
+        vendor_rng, _arc_r4   = _rn2_jax_arc(vendor_rng, jnp.int32(4))
+        vendor_rng, _arc_r10b = _rn2_jax_arc(vendor_rng, jnp.int32(10))
+        _arc_tin_opener = _make_item_arc(
+            category=int(_ItemCategory_arc.TOOL), type_id=214, quantity=1,
+            weight=30, buc_status=0, identified=True,
+            bknown=True, dknown=True, rknown=True,
+        )
+        _arc_oil_lamp = _make_item_arc(
+            category=int(_ItemCategory_arc.TOOL), type_id=202, quantity=1,
+            weight=30, buc_status=0, identified=True,
+            bknown=True, dknown=True, rknown=True,
+        )
+        _arc_magic_marker = _make_item_arc(
+            category=int(_ItemCategory_arc.TOOL), type_id=217, quantity=1,
+            weight=30, buc_status=0, identified=True,
+            bknown=True, dknown=True, rknown=True,
+        )
+        _arc_empty = _make_empty_arc()
+        _arc_pick_tin = jnp.equal(_arc_r10a, 0)
+        _arc_pick_oil = jnp.logical_and(
+            jnp.logical_not(_arc_pick_tin), jnp.equal(_arc_r4, 0),
+        )
+        _arc_pick_mm = jnp.logical_and(
+            jnp.logical_and(
+                jnp.logical_not(_arc_pick_tin),
+                jnp.logical_not(_arc_pick_oil),
+            ),
+            jnp.equal(_arc_r10b, 0),
+        )
+        _arc_picked = jax.tree_util.tree_map(
+            lambda t, o, m, e: jnp.where(
+                _arc_pick_tin, t,
+                jnp.where(_arc_pick_oil, o,
+                          jnp.where(_arc_pick_mm, m, e)),
+            ),
+            _arc_tin_opener, _arc_oil_lamp, _arc_magic_marker, _arc_empty,
+        )
+        _arc_any_pick = jnp.logical_or(
+            jnp.logical_or(_arc_pick_tin, _arc_pick_oil), _arc_pick_mm,
+        )
+        _arc_new_items = jax.tree_util.tree_map(
+            lambda arr, val: arr.at[8].set(val), inv_state.items, _arc_picked,
+        )
+        _arc_new_letter = jnp.where(
+            _arc_any_pick, jnp.int8(ord('a') + 8), jnp.int8(0),
+        )
+        _arc_new_letters = inv_state.letters.at[8].set(_arc_new_letter)
+        inv_state = inv_state.replace(
+            items=_arc_new_items, letters=_arc_new_letters,
+        )
+
+    # --- Stat rolls (vendor init_attr(75) parity) ---
+    # NLE_BYTEPARITY: vendor runs init_attr AFTER ini_inv + bonus cascade.
+    # Cite: vendor/nle/src/attrib.c:614-660; u_init.c:883.
+    if vendor_rng is not None:
+        vendor_rng, stats_raw = consume_init_attr_draws(vendor_rng, role, race)
+        stats = {k: jnp.int32(v) for k, v in stats_raw.items()}
+    else:
+        stats = _init_attr_vendor(rng_stats, role, race, np_total=75)
+
+    # --- NLE_BYTEPARITY: attr variation loop (all roles) ---
+    # 6 rn2(20) draws + conditional rn2(7) per hit, applying the biased
+    # adjattrib() variation to the stat values.  Cite:
+    # vendor/nle/src/u_init.c:886-894.
+    if vendor_rng is not None:
+        vendor_rng, stats_raw = _consume_attr_variation_draws(
+            vendor_rng, stats_raw, role, race,
+        )
+        stats = {k: jnp.int32(v) for k, v in stats_raw.items()}
+
+    # --- HP / Pw (vendor ini_hpwp parity, u.ulevel == 0 branch) ---
+    hp, pw = _ini_hpwp_vendor(rng_hp, role, race)
 
     # --- Wield primary weapon ---
     wielded = jnp.int8(-1)
