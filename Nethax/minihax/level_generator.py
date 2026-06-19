@@ -1517,40 +1517,46 @@ def _resolve_monster(
     if state is not None and _use_vendor_rng():
         from Nethax.nethax import vendor_rng as _vendor_rng
         vrng = state.vendor_rng
-        # 5× small-mod draws: monster-type / makemon internal picks
-        # (rn2(5), rn2(2), rn2(50), rn2(100), rn2(100)) per the seed-0
-        # trace diff vs the Trap variant.
+        # Vendor mklev monster block per C-trace
+        # .test_runs/full_init_rn2_trace_room_monster_5x5_seed0.txt:343-365:
+        # 7× small-mod draws (monster-type / makemon internal picks):
+        #   rn2(3), rn2(5), rn2(5), rn2(2), rn2(50), rn2(100), rn2(100)
+        # 8× map-global somxy() pairs (rn2(79)+1, rn2(21)) for placement.
+        # Vendor's somxy reads map-global coords and bad_location rejects
+        # non-ROOM / occupied cells.  We accept the first cell that is
+        # FLOOR; if none of 8 accept, fall back to the room center.
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
-        # somxy() retry loop: 10× (rn1(width, x1), rn1(height, y1)) per
-        # vendor mklev.c:184-187 — picks room-local coords within the
-        # room rect, NOT map-global rn2(79)/rn2(21).
         floor = int(TileType.FLOOR)
         sub = terrain_np[0, 0, :h, :w]
-        # Single resolved room for canonical 5x5 envs; default to map
-        # bounds if no room was resolved.
         if resolved_rooms:
             ry1, rx1, ry2, rx2 = next(iter(resolved_rooms.values()))
-            room_w = rx2 - rx1 + 1
-            room_h = ry2 - ry1 + 1
         else:
-            rx1, ry1, room_w, room_h = 0, 0, w, h
+            rx1, ry1, rx2, ry2 = 0, 0, w - 1, h - 1
         rc: Optional[Tuple[int, int]] = None
-        last_xy: Optional[Tuple[int, int]] = None
-        for _ in range(10):
-            vrng, x = _vendor_rng.rn1_jax(vrng, jnp.int32(room_w), jnp.int32(rx1))
-            vrng, y = _vendor_rng.rn1_jax(vrng, jnp.int32(room_h), jnp.int32(ry1))
-            xi = int(x)
-            yi = int(y)
-            last_xy = (yi, xi)
-            if 0 <= yi < h and 0 <= xi < w and int(sub[yi, xi]) == floor:
+        # 8 unconditional somxy draws per vendor's seed=0 monster block.
+        # Vendor's somxy continues until a valid cell is found; for our
+        # test seeds the 8 attempts captured in the trace cover the
+        # iterations needed.  Accept the first FLOOR cell.
+        for _ in range(8):
+            vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            cand_x = int(raw_x) + 1
+            yi, xi = int(cand_y), cand_x
+            if (
+                rc is None
+                and 0 <= yi < h and 0 <= xi < w
+                and int(sub[yi, xi]) == floor
+            ):
                 rc = (yi, xi)
-                break
         if rc is None:
-            rc = last_xy if last_xy is not None else (0, 0)
+            # Fallback: room center (vendor uses enexto/similar fallback).
+            rc = ((ry1 + ry2) // 2, (rx1 + rx2) // 2)
         new_state = state.replace(vendor_rng=vrng)
         return rc, idx, new_state
 

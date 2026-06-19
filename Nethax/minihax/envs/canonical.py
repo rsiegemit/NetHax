@@ -601,16 +601,10 @@ def _wrap_monster_room_placement(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )
         state = state.replace(terrain=new_terrain)
-        # Per-monster TOP-OFF draws.  Vendor mklev consumes 7 small-mod +
-        # 8 (rn2(79), rn2(21)) pairs = 23 draws for the monster block (trace
-        # offsets 343-365).  ``_resolve_monster`` already consumed 5 + 10×2 =
-        # 25 draws during factory build.  Net delta: consume 3 alignment
-        # draws here so the stream lands at vendor offset 350 (the first
-        # player-spawn rn2(79) pair).  (Previously 4 draws produced a 1-pair
-        # overshoot; the trailing rn2(2) is dropped.)
+        # ``_resolve_monster`` now consumes vendor's exact 23-draw monster
+        # block (7 small-mods + 8 somxy pairs per .test_runs/full_init_
+        # rn2_trace_room_monster_5x5_seed0.txt:343-365).  No top-off needed.
         for _ in range(n_monster):
-            for mod in (3, 5, 5):
-                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(mod))
             # Move the LG-placed monster to vendor's known seed-0 cell.
             # Vendor positions captured via .test_runs/_probe_monster_pos.py
             # (seed=0, character='arc-hum-law-mal'):
