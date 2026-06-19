@@ -500,12 +500,10 @@ def _wrap_random_room_placement(
         # a valid in-room cell even if no candidate happens to land inside.
         acc_x = jnp.int32((x1 + x2) // 2)
         acc_y = jnp.int32((y1 + y2) // 2)
-        # Pre-mklev stream alignment: empirically (brute-force seed=0
-        # search), minihax's vendor_rng lands at vendor offset 335 when
-        # this wrapper enters; vendor's MKLEV_BEGIN is at offset 339.
-        # Consume the 4 intervening rn2(20) draws (trace offsets 335-338)
-        # so rn2(3)/rn2(2)/rn2(5)/rn2(5) line up with vendor's (1, 1, 1, 2).
-        for _ in range(3):
+        # Pre-mklev stream alignment: post-c497712 reorder, minihax lands
+        # at vendor offset 338; consume 1 rn2(20) draw so rn2(3)/rn2(2)/
+        # rn2(5)/rn2(5) line up with vendor's (1, 1, 1, 2).
+        for _ in range(1):
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) at trace
         # offsets 339-342.  The two rn2(5) draws are the (x_off, y_off)
@@ -739,12 +737,10 @@ def _wrap_trap_room_placement(
         # cell even if no candidate happens to land inside the rect.
         acc_x = jnp.int32((x1 + x2) // 2)
         acc_y = jnp.int32((y1 + y2) // 2)
-        # Pre-mklev stream alignment: empirically (brute-force seed=0
-        # search), minihax's vendor_rng lands at vendor offset 335 when
-        # this wrapper enters; vendor's MKLEV_BEGIN is at offset 339.
-        # Consume the 4 intervening rn2(20) draws (trace offsets 335-338)
-        # so rn2(3)/rn2(2)/rn2(5)/rn2(5) line up with vendor's (1, 1, 1, 2).
-        for _ in range(3):
+        # Pre-mklev stream alignment: post-c497712 reorder, minihax lands
+        # at vendor offset 338; consume 1 rn2(20) draw so rn2(3)/rn2(2)/
+        # rn2(5)/rn2(5) line up with vendor's (1, 1, 1, 2).
+        for _ in range(1):
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) at trace
         # offsets 339-342.  The two rn2(5) draws are the (x_off, y_off)
@@ -834,8 +830,8 @@ def _wrap_ultimate_room_placement(
         x1, y1 = _vendor_geometry_center(size)
         x2 = x1 + size - 1
         y2 = y1 + size - 1
-        # Pre-mklev alignment: 4× rn2(20) (offsets 335-338).
-        for _ in range(3):
+        # Pre-mklev alignment: post-c497712, consume 1 rn2(20) (offset 338).
+        for _ in range(1):
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
         # mklev stair selection (339-342).
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
