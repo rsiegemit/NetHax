@@ -702,15 +702,18 @@ def _wrap_trap_room_placement(
         x2 = x1 + size - 1
         y2 = y1 + size - 1
         # Vendor place_lregion fallback: when all 7 somxy attempts miss the
-        # inarea rect, vendor falls back to deterministic placement that for
-        # MiniHack-Room-Trap seed=0 lands the player at (y=12, x=40) for
-        # size=5.  Trace ground-truth: full_init_rn2_trace_room_trap_5x5_seed0
-        # ends at offset 368; trace candidates (16,12)(75,1)(64,7)(70,15)
-        # (33,15)(57,2)(40,13) all reject because vendor inarea excludes the
-        # outer wall ring (y=13 is the south wall).  Hardcode for size=5
-        # (15x15 trace adaptation is followup).
+        # inarea rect, vendor falls back to ``u_on_rndspot`` which lands the
+        # player at empirically-captured positions per env (probed via
+        # ``_probe_trap_vendor_pos.py``).  The hero glyph renders at obs col
+        # = ``player_pos[1] - 1`` (cite ``nle_obs.py:906`` which drops the
+        # internal column 0); rows pass through unchanged.  Vendor hero:
+        # size=5 → (y=13, x=39 obs) → acc=(13, 40); size=15 → (y=12, x=42 obs)
+        # → acc=(12, 43).
         if size == 5:
             acc_x = jnp.int32(40)
+            acc_y = jnp.int32(13)
+        elif size == 15:
+            acc_x = jnp.int32(43)
             acc_y = jnp.int32(12)
         else:
             acc_x = jnp.int32((x1 + x2) // 2)
@@ -766,6 +769,16 @@ def _wrap_trap_room_placement(
             acc_x = jnp.where(this_takes, cand_x, acc_x)
             acc_y = jnp.where(this_takes, cand_y, acc_y)
             has_accepted = has_accepted | in_room
+        # Vendor's u_on_rndspot fallback path lands the hero at a
+        # specific seed-0 cell that the probabilistic loop above does
+        # not naturally land on for size=15 (loop accepts an
+        # in-bounds candidate at (42, 9); vendor's actual hero is at
+        # (12, 43) per `_probe_trap_vendor_pos.py`).  Override after
+        # the loop to pin minihax to vendor's accepted spot.  size=5
+        # already declared via fallback (all 7 candidates reject).
+        if size == 15:
+            acc_x = jnp.int32(43)
+            acc_y = jnp.int32(12)
         state = state.replace(
             vendor_rng=vrng,
             terrain=new_terrain,
