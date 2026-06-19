@@ -1811,17 +1811,17 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         vendor_rng, _arc_r10b = _rn2_jax_arc(vendor_rng, jnp.int32(10))
         _arc_tin_opener = _make_item_arc(
             category=int(_ItemCategory_arc.TOOL), type_id=214, quantity=1,
-            weight=30, buc_status=0, identified=True,
+            weight=30, buc_status=2, identified=True,  # 2 = UNCURSED
             bknown=True, dknown=True, rknown=True,
         )
         _arc_oil_lamp = _make_item_arc(
             category=int(_ItemCategory_arc.TOOL), type_id=202, quantity=1,
-            weight=30, buc_status=0, identified=True,
+            weight=30, buc_status=2, identified=True,  # 2 = UNCURSED
             bknown=True, dknown=True, rknown=True,
         )
         _arc_magic_marker = _make_item_arc(
             category=int(_ItemCategory_arc.TOOL), type_id=217, quantity=1,
-            weight=30, buc_status=0, identified=True,
+            weight=30, buc_status=2, identified=True,  # 2 = UNCURSED
             bknown=True, dknown=True, rknown=True,
         )
         _arc_empty = _make_empty_arc()
