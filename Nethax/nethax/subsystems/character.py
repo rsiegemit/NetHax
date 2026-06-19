@@ -1888,9 +1888,42 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
             make_item as _make_item_arc,
             make_empty_item as _make_empty_arc,
         )
+        # Vendor's cascade is short-circuit: rn2(4) is drawn only if rn2(10)
+        # picked nothing; rn2(10) again only if neither prior fired.  Use the
+        # conditional-advance pattern to match vendor's draw count exactly.
+        # Then for whichever bonus item was picked, replay the item's mksobj
+        # draws (rn2(500), rn2(5) for OIL_LAMP per vendor trace).  TIN_OPENER
+        # and MAGIC_MARKER mksobj draws are NOT modelled yet — forward-compat
+        # seeds picking those bonuses would still misalign.
         vendor_rng, _arc_r10a = _rn2_jax_arc(vendor_rng, jnp.int32(10))
-        vendor_rng, _arc_r4   = _rn2_jax_arc(vendor_rng, jnp.int32(4))
-        vendor_rng, _arc_r10b = _rn2_jax_arc(vendor_rng, jnp.int32(10))
+        _arc_pick_tin = jnp.equal(_arc_r10a, jnp.int32(0))
+        _not_tin = jnp.logical_not(_arc_pick_tin)
+        _vrng_r4, _arc_r4_raw = _rn2_jax_arc(vendor_rng, jnp.int32(4))
+        vendor_rng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(_not_tin, new, old),
+            _vrng_r4, vendor_rng,
+        )
+        _arc_r4 = jnp.where(_not_tin, _arc_r4_raw, jnp.int32(1))
+        _arc_pick_oil = jnp.logical_and(_not_tin, jnp.equal(_arc_r4, jnp.int32(0)))
+        _not_oil_path = jnp.logical_and(_not_tin, jnp.logical_not(jnp.equal(_arc_r4, jnp.int32(0))))
+        _vrng_r10b, _arc_r10b_raw = _rn2_jax_arc(vendor_rng, jnp.int32(10))
+        vendor_rng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(_not_oil_path, new, old),
+            _vrng_r10b, vendor_rng,
+        )
+        _arc_r10b = jnp.where(_not_oil_path, _arc_r10b_raw, jnp.int32(1))
+        # OIL_LAMP mksobj: rn2(500), rn2(5) per vendor trace at seed=0.
+        # Cite: vendor/nle/src/mkobj.c TOOL_CLASS (artif=FALSE).
+        _vrng_oil1, _ = _rn2_jax_arc(vendor_rng, jnp.int32(500))
+        vendor_rng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(_arc_pick_oil, new, old),
+            _vrng_oil1, vendor_rng,
+        )
+        _vrng_oil2, _ = _rn2_jax_arc(vendor_rng, jnp.int32(5))
+        vendor_rng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(_arc_pick_oil, new, old),
+            _vrng_oil2, vendor_rng,
+        )
         _arc_tin_opener = _make_item_arc(
             category=int(_ItemCategory_arc.TOOL), type_id=214, quantity=1,
             weight=30, buc_status=2, identified=True,  # 2 = UNCURSED

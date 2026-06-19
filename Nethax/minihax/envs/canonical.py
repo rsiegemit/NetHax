@@ -500,11 +500,10 @@ def _wrap_random_room_placement(
         # a valid in-room cell even if no candidate happens to land inside.
         acc_x = jnp.int32((x1 + x2) // 2)
         acc_y = jnp.int32((y1 + y2) // 2)
-        # Pre-mklev stream alignment: post-c497712 reorder, minihax lands
-        # at vendor offset 338; consume 1 rn2(20) draw so rn2(3)/rn2(2)/
-        # rn2(5)/rn2(5) line up with vendor's (1, 1, 1, 2).
-        for _ in range(1):
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
+        # Post-bonus-cascade RNG should now match vendor at MKLEV_BEGIN
+        # exactly (no pre-mklev alignment draw needed).  See
+        # `_consume_ini_inv_archeologist_draws` cascade conditional advance
+        # which models vendor's short-circuit + OIL_LAMP mksobj draws.
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) at trace
         # offsets 339-342.  The two rn2(5) draws are the (x_off, y_off)
         # into the room rect used by vendor mkstairs.
@@ -517,27 +516,22 @@ def _wrap_random_room_placement(
         new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )
-        # First-accept semantics: vendor's somxy() returns on the FIRST in-room
-        # candidate; subsequent draws still advance the rng but don't overwrite
-        # the accepted (x, y).  This matters for 15x15 where the rect is large
-        # enough that early pairs land in-room.
-        has_accepted = jnp.bool_(False)
-        for _ in range(7):
-            # Vendor uses cx = rnd(COLNO-1) = rn2(79)+1 and cy = rn2(ROWNO).
-            # Cite: vendor/nle/src/do.c:374-375.
+        # Vendor place_lregion (mkmaze.c:275-319): 200-iter probabilistic
+        # somxy() with EARLY-RETURN on first bad_location accept (typ ==
+        # ROOM ↔ terrain == FLOOR in minihax).  See
+        # .test_runs/vendor_placement_model.md for full derivation.
+        # Eager-mode break supersedes lax.cond — JIT-safety is a followup.
+        from Nethax.nethax.constants.tiles import TileType as _TT
+        terrain_l0 = new_terrain[0, 0]
+        _FLOOR = int(_TT.FLOOR)
+        for _ in range(200):
             vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
             cand_x = raw_x + jnp.int32(1)
-            in_room = (
-                (cand_x >= jnp.int32(x1))
-                & (cand_x <= jnp.int32(x2))
-                & (cand_y >= jnp.int32(y1))
-                & (cand_y <= jnp.int32(y2))
-            )
-            this_takes = in_room & ~has_accepted
-            acc_x = jnp.where(this_takes, cand_x, acc_x)
-            acc_y = jnp.where(this_takes, cand_y, acc_y)
-            has_accepted = has_accepted | in_room
+            if int(terrain_l0[cand_y, cand_x]) == _FLOOR:
+                acc_x = cand_x
+                acc_y = cand_y
+                break
         state = state.replace(
             vendor_rng=vrng,
             terrain=new_terrain,
@@ -684,33 +678,25 @@ def _wrap_monster_room_placement(
                     hp=new_hp, hp_max=new_hp_max,
                 )
             state = state.replace(monster_ai=mai)
-        # First-accept semantics (see Random wrapper).
-        has_accepted = jnp.bool_(False)
-        for _ in range(7):
-            # Vendor uses cx = rnd(COLNO-1) = rn2(79)+1 and cy = rn2(ROWNO).
-            # Cite: vendor/nle/src/do.c:374-375.
+        # 200-iter probabilistic somxy with FLOOR early-stop (see Random
+        # wrapper for derivation).
+        from Nethax.nethax.constants.tiles import TileType as _TT
+        terrain_l0 = state.terrain[0, 0]
+        _FLOOR = int(_TT.FLOOR)
+        for _ in range(200):
             vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
             cand_x = raw_x + jnp.int32(1)
-            in_room = (
-                (cand_x >= jnp.int32(x1))
-                & (cand_x <= jnp.int32(x2))
-                & (cand_y >= jnp.int32(y1))
-                & (cand_y <= jnp.int32(y2))
-            )
-            this_takes = in_room & ~has_accepted
-            acc_x = jnp.where(this_takes, cand_x, acc_x)
-            acc_y = jnp.where(this_takes, cand_y, acc_y)
-            has_accepted = has_accepted | in_room
+            if int(terrain_l0[cand_y, cand_x]) == _FLOOR:
+                acc_x = cand_x
+                acc_y = cand_y
+                break
         state = state.replace(
             vendor_rng=vrng,
             player_pos=jnp.stack(
                 [acc_y.astype(jnp.int16), acc_x.astype(jnp.int16)]
             ),
         )
-        # Seed the hero's Chebyshev<=1 torchlight at the vendor-accepted
-        # cell (matches Random wrapper); otherwise the room renders as
-        # S_stone since _apply_directives skipped it (no explicit start_pos).
         return _seed_hero_fov(state, lit)
 
     return wrapped
@@ -770,11 +756,8 @@ def _wrap_trap_room_placement(
         else:
             acc_x = jnp.int32((x1 + x2) // 2)
             acc_y = jnp.int32((y1 + y2) // 2)
-        # Pre-mklev stream alignment: post-c497712 reorder, minihax lands
-        # at vendor offset 338; consume 1 rn2(20) draw so rn2(3)/rn2(2)/
-        # rn2(5)/rn2(5) line up with vendor's (1, 1, 1, 2).
-        for _ in range(1):
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
+        # Post-cascade RNG matches vendor at MKLEV_BEGIN; no extra alignment
+        # draw needed.  See _consume_ini_inv_archeologist_draws cascade fix.
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) at trace
         # offsets 339-342.  The two rn2(5) draws are the (x_off, y_off)
         # into the room rect used by vendor mkstairs.
@@ -880,9 +863,8 @@ def _wrap_ultimate_room_placement(
         x1, y1 = _vendor_geometry_center(size)
         x2 = x1 + size - 1
         y2 = y1 + size - 1
-        # Pre-mklev alignment: post-c497712, consume 1 rn2(20) (offset 338).
-        for _ in range(1):
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(20))
+        # Post-cascade RNG matches vendor at MKLEV_BEGIN; no extra alignment
+        # draw needed.  See _consume_ini_inv_archeologist_draws cascade fix.
         # mklev stair selection (339-342).
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
