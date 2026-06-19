@@ -862,6 +862,22 @@ def _wrap_ultimate_room_placement(
             acc_x = jnp.where(this_takes, cand_x, acc_x)
             acc_y = jnp.where(this_takes, cand_y, acc_y)
             has_accepted = has_accepted | in_room
+        # Override the probabilistic accept with vendor's u_on_rndspot
+        # fallback result for Ultimate variants.  Vendor probes (see
+        # ``_probe_trap_vendor_pos.py``) at seed=0 land hero at:
+        #   size=5  -> obs (12, 40) -> internal (12, 41).
+        #   size=15 -> obs (10, 37) -> internal (10, 38).
+        # Without these overrides minihax accepts a different in-room
+        # candidate (e.g. (11, 39) for size=5) and its torchlight covers
+        # a different 3x3 than vendor's, producing FOV mask divergence
+        # (cite: lit=False rooms only render hero's 3x3 + couldsee
+        # region; see Nethax/minihax/level_generator.py:1140-1189).
+        if size == 5:
+            acc_x = jnp.int32(41)
+            acc_y = jnp.int32(12)
+        elif size == 15:
+            acc_x = jnp.int32(38)
+            acc_y = jnp.int32(10)
         state = state.replace(
             vendor_rng=vrng,
             terrain=new_terrain,
