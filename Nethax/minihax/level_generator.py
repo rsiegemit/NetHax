@@ -945,6 +945,7 @@ def _apply_directives(
                 )
                 break
 
+    _mklev_stair_cell = None  # (row, col) of the vendor mkstairs down-stair
     if (
         state is not None
         and _use_vendor_rng_dl()
@@ -958,9 +959,11 @@ def _apply_directives(
         vrng = state.vendor_rng
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(room_w))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(room_h))
+        # mkstairs down-stair offset within the room (rn2(W), rn2(W)).
+        vrng, _stair_xoff = _vendor_rng.rn2_jax(vrng, jnp.int32(room_w))
+        vrng, _stair_yoff = _vendor_rng.rn2_jax(vrng, jnp.int32(room_h))
         state = state.replace(vendor_rng=vrng)
+        _mklev_stair_cell = (ry1 + int(_stair_yoff), rx1 + int(_stair_xoff))
 
     # Pass 2: everything else.
     for d in directives:
@@ -1079,6 +1082,17 @@ def _apply_directives(
         else:
             # Defensive: an unknown directive class signals a programming bug.
             raise RuntimeError(f"unhandled directive type: {type(d).__name__}")
+
+    # Stamp the vendor mkstairs down-stair at its real (seed-dependent) cell,
+    # computed from the rn2(W)/rn2(W) offsets consumed in the 4-prefix block
+    # above (Monster/Ultimate envs).  Done AFTER the pass-2 FLOOR fill so it
+    # isn't overwritten; replaces the per-wrapper hardcoded stair stamp.
+    if _mklev_stair_cell is not None:
+        _scy, _scx = _mklev_stair_cell
+        if 0 <= _scy < h and 0 <= _scx < w:
+            terrain_np = terrain_np.at[0, 0, _scy, _scx].set(
+                jnp.int8(int(TileType.STAIRCASE_DOWN))
+            )
 
     # 4. Commit accumulated terrain/traps/grounds.
     new_traps = state.traps.replace(trap_type=trap_type_arr)
@@ -1612,7 +1626,15 @@ def _resolve_monster(
         vrng, mkclass_val = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, mx_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_w))
         vrng, my_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_h))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(21))  # untraced rnd(21)
+        # The untraced rnd(21) IS vendor's rndmonst monster pick:
+        # MONSTER:random -> create_monster(class=0) -> makemon(NULL) ->
+        # rndmonst() draws rnd(choice_count) (choice_count==21 at depth 1,
+        # matching the stream's rnd(21)) and walks the freq-weighted table.
+        # Compute the real monster identity from it instead of a fixed newt.
+        from Nethax.nethax.dungeon.spawning import pick_monster_for_level
+        vrng, _picked_idx = pick_monster_for_level(None, 1, vendor_rng=vrng)
+        if d.name == "random":
+            idx = int(_picked_idx)
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))   # untraced rnd(4)
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
         # m_initgrp group-spawn extras: when the PREVIOUS monster's mkclass

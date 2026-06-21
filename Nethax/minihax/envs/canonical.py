@@ -586,21 +586,9 @@ def _wrap_monster_room_placement(
         # Fallback to room center so player_pos is always valid.
         acc_x = jnp.int32((x1 + x2) // 2)
         acc_y = jnp.int32((y1 + y2) // 2)
-        # ``_resolve_monster`` already consumed 5 small-mod + 10 (rn1(w), rn1(h))
-        # draws from state.vendor_rng during factory build (level_generator.py:
-        # _resolve_monster).  Vendor's mklev order is mkstairs (4 draws) BEFORE
-        # the monster block, so by the time the wrapper runs the stream is past
-        # the mkstairs offsets and into the somxy region.  Stamp the staircase
-        # at vendor's seed-0 internal cell (38, 11) = (x1+1, y1+2) for size=5
-        # (vendor rendered col 37 maps to internal col 38 per the glyph shift
-        # noted in _vendor_geometry_center).  Larger rooms are a follow-up.
-        from Nethax.nethax.constants.tiles import TileType as _TileType
-        stair_x = jnp.int32(x1) + jnp.int32(1)
-        stair_y = jnp.int32(y1) + jnp.int32(2)
-        new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
-            jnp.int8(int(_TileType.STAIRCASE_DOWN))
-        )
-        state = state.replace(terrain=new_terrain)
+        # The down-stair is stamped by ``_apply_directives`` at the real
+        # vendor mkstairs cell (from the 4-prefix rn2(W)/rn2(W) offsets) —
+        # no wrapper-level hardcoded stair stamp needed.
         # ``_resolve_monster`` now consumes vendor's exact 7-draw template
         # per monster (rn2(3), rn2(W), rn2(W), rn2(2), rn2(50), rn2(100),
         # rn2(100)) and places at (rx1 + rn2(W), ry1 + rn2(W)) — see
@@ -831,77 +819,67 @@ def _wrap_ultimate_room_placement(
         x1, y1 = _vendor_geometry_center(size)
         x2 = x1 + size - 1
         y2 = y1 + size - 1
-        # 4-stair prefix (rn2(3), rn2(2), rn2(W), rn2(W)) is now consumed
-        # inside the LG directive loop at start of pass 2 (cite
-        # level_generator.py "Vendor mklev opens..."), so the factory's
-        # ``_resolve_monster`` calls see the correct vrng offset.  We
-        # don't have the stair_x_off/stair_y_off values here, so stamp
-        # at vendor's known seed-0 cell for now (placement-only; the
-        # actual values are buried in the factory's per-monster blocks).
-        stair_x = jnp.int32(x1) + jnp.int32(1)
-        stair_y = jnp.int32(y1) + jnp.int32(2)
-        new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
-            jnp.int8(int(_TileType.STAIRCASE_DOWN))
-        )
-        # Per-trap 2-draw template (vendor sp_lev.c:create_trap calls
-        # get_location_coord -> somexy -> 2× rn2(W) for room-relative
-        # coords).  Vendor trap block trace (Ult-15x15 seed=0):
-        # .test_runs/full_init_rn2_trace_room_ultimate_15x15_seed0.txt:
-        # 370-399 = 15 × (rn2(15), rn2(15)).  Stamp each trap as
-        # TELEP_TRAP (placeholder; trap-kind variant per .des is a
-        # followup) at the resolved cell when it lands on FLOOR.
+        # Stair (4-prefix) and monster blocks are consumed by the LG /
+        # _resolve_monster (Ult has monster directives), and the LG stamps
+        # the real down-stair.  The wrapper consumes ONLY the per-trap
+        # blocks, then the player place_lregion.  Ground truth from
+        # .test_runs/full_rnd_stream_*_Ultimate_5x5_*_seed0.txt:352-356.
+        # Per-trap block = 2× rn2(size) + ONE untraced rnd(4).
         from Nethax.nethax.subsystems.traps import TrapType as _TrapType
+        import numpy as _np
         trap_type_arr = state.traps.trap_type
-        floor_int = jnp.int8(int(_TileType.FLOOR))
+        _floor_int = int(_TileType.FLOOR)
+        _terr_np = _np.asarray(state.terrain[0, 0])
+        _H, _W = _terr_np.shape
         for _ in range(n_trap):
             vrng, tx_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
             vrng, ty_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
-            tx = jnp.int32(x1) + tx_off
-            ty = jnp.int32(y1) + ty_off
-            on_floor = new_terrain[0, 0, ty, tx] == floor_int
-            trap_type_arr = trap_type_arr.at[0, ty, tx].set(
-                jnp.where(on_floor, jnp.int8(int(_TrapType.TELEP_TRAP)),
-                          trap_type_arr[0, ty, tx])
-            )
-        # Player place_lregion: vendor's u_on_lregion (mkmaze.c:275-319)
-        # somxy loop with first-accept on inarea bounds.  Trace shows up
-        # to 7 (rn2(79), rn2(21)) pairs.  Drive player_pos from the
-        # accepted candidate.  For size=5 (rn2(79)+1 ∈ [1..79], room
-        # x∈[37..41]) the per-try in-room probability is only 5/79 ≈ 6%,
-        # so ~7-iter often rejects all candidates and falls through to
-        # vendor's u_on_rndspot fallback (mkmaze.c:445).  The fallback
-        # lands hero at a deterministic seed-0 cell that we capture here
-        # rather than re-implement u_on_rndspot's enexto+stair logic.
-        # For size=15 the loop converges (15/79 ≈ 19% per try).
-        if size == 5:
-            # u_on_rndspot output for Ult-5x5 seed-0 (cite
-            # _probe_trap_vendor_pos.py).
-            acc_x = jnp.int32(41)
-            acc_y = jnp.int32(12)
-        else:
-            acc_x = jnp.int32((x1 + x2) // 2)
-            acc_y = jnp.int32((y1 + y2) // 2)
-        has_accepted = jnp.bool_(False)
-        for _ in range(7):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))  # untraced rnd(4)
+            tx = int(x1) + int(tx_off)
+            ty = int(y1) + int(ty_off)
+            if 0 <= ty < _H and 0 <= tx < _W and _terr_np[ty, tx] == _floor_int:
+                trap_type_arr = trap_type_arr.at[0, ty, tx].set(
+                    jnp.int8(int(_TrapType.TELEP_TRAP))
+                )
+        # Faithful place_lregion (mkmaze.c:275-319): 200-try rn2(79)+1/
+        # rn2(21) accept first FLOOR & not-occupied (stair = non-FLOOR;
+        # trap + monster cells excluded), then deterministic row-major scan.
+        _trap_np = _np.asarray(trap_type_arr[0])
+        _ok = (_terr_np == _floor_int) & (_trap_np == 0)
+        mai = state.monster_ai
+        _alive = _np.asarray(mai.alive)
+        _mpos = _np.asarray(mai.pos)
+        for _si in _np.where(_alive)[0]:
+            my, mx = int(_mpos[_si, 0]), int(_mpos[_si, 1])
+            if 0 <= my < _H and 0 <= mx < _W:
+                _ok[my, mx] = False
+        acc_x_i = int((x1 + x2) // 2)
+        acc_y_i = int((y1 + y2) // 2)
+        _accepted = False
+        for _ in range(200):
             vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
-            cand_x = raw_x + jnp.int32(1)
-            in_room = (
-                (cand_x >= jnp.int32(x1))
-                & (cand_x <= jnp.int32(x2))
-                & (cand_y >= jnp.int32(y1))
-                & (cand_y <= jnp.int32(y2))
-            )
-            this_takes = in_room & ~has_accepted
-            acc_x = jnp.where(this_takes, cand_x, acc_x)
-            acc_y = jnp.where(this_takes, cand_y, acc_y)
-            has_accepted = has_accepted | in_room
+            cx = int(raw_x) + 1
+            cy = int(cand_y)
+            if 0 <= cy < _H and 0 <= cx < _W and bool(_ok[cy, cx]):
+                acc_x_i, acc_y_i = cx, cy
+                _accepted = True
+                break
+        if not _accepted:
+            for sx in range(1, _W):
+                for sy in range(0, _H):
+                    if bool(_ok[sy, sx]):
+                        acc_x_i, acc_y_i = sx, sy
+                        _accepted = True
+                        break
+                if _accepted:
+                    break
         state = state.replace(
             vendor_rng=vrng,
-            terrain=new_terrain,
             traps=state.traps.replace(trap_type=trap_type_arr),
             player_pos=jnp.stack(
-                [acc_y.astype(jnp.int16), acc_x.astype(jnp.int16)]
+                [jnp.int32(acc_y_i).astype(jnp.int16),
+                 jnp.int32(acc_x_i).astype(jnp.int16)]
             ),
         )
         return _seed_hero_fov(state, lit)
