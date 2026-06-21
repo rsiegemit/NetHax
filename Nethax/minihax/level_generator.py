@@ -761,6 +761,7 @@ def _apply_directives(
     lg.last_trap_types = []
     lg.last_player_pos = None
     lg.last_goal_pos = None
+    lg._prev_monster_mkclass = -1  # track mkclass(rn2(3)) for m_initgrp one-shot extras
 
     # 1. Allocate the base EnvState.
     #
@@ -982,9 +983,14 @@ def _apply_directives(
         elif isinstance(d, _StartPosDirective):
             lg.last_player_pos = (d.x, d.y)
         elif isinstance(d, _MonsterDirective):
-            pos_rc, mon_idx, state = _resolve_monster(
-                d, terrain_np, w, h, resolved_rooms, _next_key, state,
+            prev_mkclass_was_2 = bool(
+                getattr(lg, "_prev_monster_mkclass", -1) == 2
             )
+            pos_rc, mon_idx, state, mkclass_val = _resolve_monster(
+                d, terrain_np, w, h, resolved_rooms, _next_key, state,
+                prev_mkclass_was_2=prev_mkclass_was_2,
+            )
+            lg._prev_monster_mkclass = mkclass_val
             state = _write_monster(state, pos_rc, mon_idx)
             lg.last_monster_entry_ids.append(mon_idx)
         elif isinstance(d, _TrapDirective):
@@ -1503,8 +1509,9 @@ def _resolve_monster(
     resolved_rooms: dict,
     next_key,
     state: Optional[EnvState] = None,
-) -> Tuple[Tuple[int, int], int, Optional[EnvState]]:
-    """Resolve a monster directive to ``((row, col), monster_idx, new_state)``.
+    prev_mkclass_was_2: bool = False,
+) -> Tuple[Tuple[int, int], int, Optional[EnvState], int]:
+    """Resolve a monster directive to ``((row, col), monster_idx, new_state, mkclass_val)``.
 
     Under ``use_vendor_rng()``, draws come from ``state.vendor_rng`` so that
     monster placement consumes the same ISAAC64 stream offsets vendor
@@ -1567,13 +1574,33 @@ def _resolve_monster(
         # The monster lands at (rx1 + x_off, ry1 + y_off).  Variable-length
         # extras for grouping monsters (m_initgrp / m_initweap class
         # branches in makemon.c:163-800) are followup.
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, mkclass_val = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, mx_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_w))
         vrng, my_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_h))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+        # m_initgrp interleaved extras: when the previous monster's
+        # rn2(3) mkclass pick == 2 (a group-spawning monster class),
+        # vendor's makemon calls m_initgrp which fires extra rn2 draws
+        # interleaved into the CURRENT monster's block.  Observed
+        # signature (Ult-15x15 + Mon-15x15 traces seeds 0/5):
+        #   * 3 retry/genocide draws between rn2(2) and rn2(50):
+        #     rn2(2), rn2(10), rn2(2)
+        #   * 3 extra m_initweap draws after the standard rn2(100):
+        #     rn2(50), rn2(100), rn2(100)
+        # Trigger is one-shot — only the immediate next monster gets
+        # extras, not cascading.  Seeds 1/2 (M1.rn2(3) in {0, 1}) skip
+        # this path entirely.
+        if prev_mkclass_was_2:
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(10))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        if prev_mkclass_was_2:
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
         xi = rx1 + int(mx_off)
         yi = ry1 + int(my_off)
         # Verify FLOOR (vendor enexto fallback when occupied).  Fall back
@@ -1585,12 +1612,12 @@ def _resolve_monster(
         else:
             rc = ((ry1 + ry2) // 2, (rx1 + rx2) // 2)
         new_state = state.replace(vendor_rng=vrng)
-        return rc, idx, new_state
+        return rc, idx, new_state, int(mkclass_val)
 
     rc = _resolve_place(d.place, terrain_np, w, h, resolved_rooms, next_key)
     if rc is None:
         rc = (0, 0)
-    return rc, idx, state
+    return rc, idx, state, 0
 
 
 def _resolve_object(
