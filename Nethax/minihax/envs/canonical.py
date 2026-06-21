@@ -764,15 +764,27 @@ def _wrap_trap_room_placement(
         new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )
-        # mktrap consumption: trace offsets 343-354 for n_trap=1 show
-        # 2× rn2(5) (trap kind / mktrap internal) + 5× (rn2(79), rn2(21))
-        # somxy retry loop.  Scale per-trap block by ``n_trap``.
-        for _ in range(n_trap):
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-            for _ in range(5):
-                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
-                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+        # mktrap consumption: vendor mklev runs `create_trap` per trap
+        # whose placement uses `get_room_loc` -> 2× rn2(W) (room-local
+        # coords).  For size=5 the trap's NO_LOC_WARN path fails (room
+        # too small to satisfy mktrap's location check) and vendor
+        # retries via somxy(rn2(79), rn2(21)) — trace
+        # .test_runs/full_init_rn2_trace_room_trap_5x5_seed0.txt:343-356
+        # shows 2× rn2(5) + ~6× (rn2(79), rn2(21)) for n_trap=1.  For
+        # size=15 the room-local pick succeeds first try — trace
+        # ..._room_trap_15x15_seed0.txt shows just 2× rn2(15) per trap
+        # for the n_trap=15 block (15× rn2(15)/rn2(15) = 30 draws).
+        if size == 5:
+            for _ in range(n_trap):
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+                for _ in range(5):
+                    vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+                    vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+        else:
+            for _ in range(n_trap):
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
         # Vendor place_lregion: 7 somxy probabilistic attempts, using inarea
         # bounds (interior of room, excluding wall edges).  For size=5 with
         # GEOMETRY:center, inarea is x∈[38..40], y∈[10..12] (3x3 interior).
@@ -798,16 +810,12 @@ def _wrap_trap_room_placement(
             acc_x = jnp.where(this_takes, cand_x, acc_x)
             acc_y = jnp.where(this_takes, cand_y, acc_y)
             has_accepted = has_accepted | in_room
-        # Vendor's u_on_rndspot fallback path lands the hero at a
-        # specific seed-0 cell that the probabilistic loop above does
-        # not naturally land on for size=15 (loop accepts an
-        # in-bounds candidate at (42, 9); vendor's actual hero is at
-        # (12, 43) per `_probe_trap_vendor_pos.py`).  Override after
-        # the loop to pin minihax to vendor's accepted spot.  size=5
-        # already declared via fallback (all 7 candidates reject).
-        if size == 15:
-            acc_x = jnp.int32(43)
-            acc_y = jnp.int32(12)
+        # Post-cleanup: size=15 hero now drives off the corrected
+        # 2×rn2(15) per-trap consumption above (vrng aligned with
+        # vendor at start of player place_lregion).  size=5 still
+        # falls back to the u_on_rndspot deterministic hero (see acc
+        # init above) because the 7-pair somxy rejection rate is too
+        # high to converge.
         state = state.replace(
             vendor_rng=vrng,
             terrain=new_terrain,
