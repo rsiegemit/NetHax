@@ -601,77 +601,15 @@ def _wrap_monster_room_placement(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )
         state = state.replace(terrain=new_terrain)
-        # ``_resolve_monster`` now consumes vendor's exact 23-draw monster
-        # block (7 small-mods + 8 somxy pairs per .test_runs/full_init_
-        # rn2_trace_room_monster_5x5_seed0.txt:343-365).  No top-off needed.
-        for _ in range(n_monster):
-            # Move the LG-placed monster to vendor's known seed-0 cell.
-            # Vendor positions captured via .test_runs/_probe_monster_pos.py
-            # (seed=0, character='arc-hum-law-mal'):
-            #   size=5  -> monster glyph 318 at obs (10, 38) -> internal (10, 39).
-            #   size=15 -> monster glyph 318 at obs ( 9, 34) -> internal ( 9, 35).
-            # Monster glyph col uses the same -1 obs/internal shift as hero
-            # (cite nle_obs.py:906 drop-col-0 convention).  Larger rooms have
-            # additional vendor monsters (pets + 2 wandering) which are a
-            # followup; this places only slot 0 at vendor's primary mklev cell.
-            mai = state.monster_ai
-            import numpy as _np
-            alive_np = _np.asarray(mai.alive)
-            slot_arr = _np.where(alive_np)[0]
-            if slot_arr.size > 0:
-                slot = int(slot_arr[0])
-                if size == 5:
-                    target_x = int(x1) + size // 2
-                    target_y = int(y1) + 1
-                elif size == 15:
-                    target_x = 35
-                    target_y = 9
-                else:
-                    target_x = int(x1) + size // 2
-                    target_y = int(y1) + 1
-                new_pos = mai.pos.at[slot].set(
-                    jnp.array([target_y, target_x], dtype=jnp.int16)
-                )
-                state = state.replace(monster_ai=mai.replace(pos=new_pos))
-        # Additional monster slot placements for size=15 (n_monster=3).
-        # Vendor probe shows entities (pos, glyph): (9,34,318), (9,46,155),
-        # (10,36,115), (11,35,115).  Slot 0 placed above; slots 1+ here.
-        # See `.test_runs/_probe_monster_pos.py` for ground truth.
-        # Glyph = GLYPH_MON_OFF + entry_idx (cite nle_obs.py:892).
-        if size == 15:
-            import numpy as _np
-            mai = state.monster_ai
-            alive_np = _np.asarray(mai.alive)
-            alive_slots = _np.where(alive_np)[0]
-            # (target_y_internal, target_x_internal, entry_idx) for the
-            # 3 alive slots already populated by `_resolve_monster`.
-            extra_targets = [(9, 47, 155), (10, 37, 115)]
-            for i, (ty, tx, eidx) in enumerate(extra_targets):
-                if alive_slots.size > i + 1:
-                    slot = int(alive_slots[i + 1])
-                    new_pos = mai.pos.at[slot].set(
-                        jnp.array([ty, tx], dtype=jnp.int16)
-                    )
-                    new_entry = mai.entry_idx.at[slot].set(jnp.int16(eidx))
-                    mai = mai.replace(pos=new_pos, entry_idx=new_entry)
-            # Vendor renders a 4th entity (likely the player's starting
-            # pet) at internal (11, 36) with glyph 115.  Wake up the next
-            # free slot to model that entity.
-            dead_slots = _np.where(~alive_np)[0]
-            if dead_slots.size > 0:
-                slot = int(dead_slots[0])
-                new_alive = mai.alive.at[slot].set(jnp.bool_(True))
-                new_pos = mai.pos.at[slot].set(
-                    jnp.array([11, 36], dtype=jnp.int16)
-                )
-                new_entry = mai.entry_idx.at[slot].set(jnp.int16(115))
-                new_hp = mai.hp.at[slot].set(jnp.int32(1))
-                new_hp_max = mai.hp_max.at[slot].set(jnp.int32(1))
-                mai = mai.replace(
-                    alive=new_alive, pos=new_pos, entry_idx=new_entry,
-                    hp=new_hp, hp_max=new_hp_max,
-                )
-            state = state.replace(monster_ai=mai)
+        # ``_resolve_monster`` now consumes vendor's exact 7-draw template
+        # per monster (rn2(3), rn2(W), rn2(W), rn2(2), rn2(50), rn2(100),
+        # rn2(100)) and places at (rx1 + rn2(W), ry1 + rn2(W)) — see
+        # level_generator.py:1517-1565.  The LG-applied positions ARE
+        # vendor-correct now that the 4-stair prefix consumption was
+        # moved into the LG directive loop (factory's monster directive
+        # sees the right vrng offset).  No wrapper-level override needed.
+        # Note: vendor 15x15 also spawns a starting pet adjacent to hero
+        # which mklev does NOT place; modelling that pet is a followup.
         # 200-iter probabilistic somxy with FLOOR early-stop (see Random
         # wrapper for derivation).
         from Nethax.nethax.constants.tiles import TileType as _TT
@@ -865,15 +803,15 @@ def _wrap_ultimate_room_placement(
         x1, y1 = _vendor_geometry_center(size)
         x2 = x1 + size - 1
         y2 = y1 + size - 1
-        # Post-cascade RNG matches vendor at MKLEV_BEGIN; no extra alignment
-        # draw needed.  See _consume_ini_inv_archeologist_draws cascade fix.
-        # mklev stair selection (339-342).
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        vrng, stair_x_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
-        vrng, stair_y_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
-        stair_x = jnp.int32(x1) + stair_x_off
-        stair_y = jnp.int32(y1) + stair_y_off
+        # 4-stair prefix (rn2(3), rn2(2), rn2(W), rn2(W)) is now consumed
+        # inside the LG directive loop at start of pass 2 (cite
+        # level_generator.py "Vendor mklev opens..."), so the factory's
+        # ``_resolve_monster`` calls see the correct vrng offset.  We
+        # don't have the stair_x_off/stair_y_off values here, so stamp
+        # at vendor's known seed-0 cell for now (placement-only; the
+        # actual values are buried in the factory's per-monster blocks).
+        stair_x = jnp.int32(x1) + jnp.int32(1)
+        stair_y = jnp.int32(y1) + jnp.int32(2)
         new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )

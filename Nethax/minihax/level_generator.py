@@ -914,6 +914,34 @@ def _apply_directives(
             )
             resolved_rooms[d.room_id] = bbox
 
+    # Vendor mklev opens with a 4-draw stair selection block
+    # (rn2(3), rn2(2), rn2(W), rn2(W)) at offsets 339-342 — see
+    # .test_runs/full_init_rn2_trace_room_ultimate_15x15_seed0.txt:344-347.
+    # When this LG run is processing a single-room env with monsters AND
+    # we're in vendor_rng mode, consume the prefix here so subsequent
+    # ``_resolve_monster`` calls see the same vrng offset vendor's
+    # makemon does.  Single-room + has-monster matches Room-Monster and
+    # Room-Ultimate; Trap/Random/Dark wrappers handle the prefix
+    # themselves and don't have monster directives.
+    has_monster_dir = any(isinstance(d, _MonsterDirective) for d in directives)
+    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng_dl
+    if (
+        state is not None
+        and _use_vendor_rng_dl()
+        and has_monster_dir
+        and len(resolved_rooms) == 1
+    ):
+        from Nethax.nethax import vendor_rng as _vendor_rng
+        ry1, rx1, ry2, rx2 = next(iter(resolved_rooms.values()))
+        room_w = max(1, rx2 - rx1 + 1)
+        room_h = max(1, ry2 - ry1 + 1)
+        vrng = state.vendor_rng
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(room_w))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(room_h))
+        state = state.replace(vendor_rng=vrng)
+
     # Pass 2: everything else.
     for d in directives:
         if isinstance(d, _RoomDirective):
