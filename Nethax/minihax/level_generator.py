@@ -1517,45 +1517,44 @@ def _resolve_monster(
     if state is not None and _use_vendor_rng():
         from Nethax.nethax import vendor_rng as _vendor_rng
         vrng = state.vendor_rng
-        # Vendor mklev monster block per C-trace
-        # .test_runs/full_init_rn2_trace_room_monster_5x5_seed0.txt:343-365:
-        # 7× small-mod draws (monster-type / makemon internal picks):
-        #   rn2(3), rn2(5), rn2(5), rn2(2), rn2(50), rn2(100), rn2(100)
-        # 8× map-global somxy() pairs (rn2(79)+1, rn2(21)) for placement.
-        # Vendor's somxy reads map-global coords and bad_location rejects
-        # non-ROOM / occupied cells.  We accept the first cell that is
-        # FLOOR; if none of 8 accept, fall back to the room center.
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
-        floor = int(TileType.FLOOR)
-        sub = terrain_np[0, 0, :h, :w]
+        # Resolve room geometry (vendor: croom->lx/hx/ly/hy).
         if resolved_rooms:
             ry1, rx1, ry2, rx2 = next(iter(resolved_rooms.values()))
         else:
             rx1, ry1, rx2, ry2 = 0, 0, w - 1, h - 1
-        rc: Optional[Tuple[int, int]] = None
-        # Up to 8 somxy attempts with early-stop on first FLOOR accept.
-        # For small rooms (5x5) most candidates land outside the room
-        # and reject, so vendor consumes all 8 draws (the seed=0 trace
-        # case).  For large rooms (15x15) the first candidate often lands
-        # in-room and accepts, consuming only 2 draws (1 pair).  Adaptive
-        # behavior matches vendor's bad_location early-return semantics.
-        for _ in range(8):
-            if rc is not None:
-                break
-            vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
-            vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
-            cand_x = int(raw_x) + 1
-            yi, xi = int(cand_y), cand_x
-            if 0 <= yi < h and 0 <= xi < w and int(sub[yi, xi]) == floor:
-                rc = (yi, xi)
-        if rc is None:
-            # Fallback: room center (vendor uses enexto/similar fallback).
+        room_w = max(1, rx2 - rx1 + 1)
+        room_h = max(1, ry2 - ry1 + 1)
+        # Vendor per-monster 7-draw template (sp_lev.c:create_monster ->
+        # get_location_coord -> mkroom.c:somexy + makemon.c:makemon ->
+        # m_initweap).  Captured in
+        # .test_runs/full_init_rn2_trace_room_ultimate_15x15_seed0.txt:343-349
+        # and ..._room_monster_5x5_seed0.txt:343-349:
+        #   rn2(3)        — mkclass mlet pick (3-class slice)
+        #   rn2(room_w)   — somex(croom) (x offset in room)
+        #   rn2(room_h)   — somey(croom) (y offset in room)
+        #   rn2(2)        — somexy post-check / mk_roamer align
+        #   rn2(50)       — m_initweap defensive item check (m_lev > rn2(50))
+        #   rn2(100)      — m_initweap misc item check
+        #   rn2(100)      — m_initweap follow-up (rnd_misc_item internal)
+        # The monster lands at (rx1 + x_off, ry1 + y_off).  Variable-length
+        # extras for grouping monsters (m_initgrp / m_initweap class
+        # branches in makemon.c:163-800) are followup.
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, mx_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_w))
+        vrng, my_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_h))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        xi = rx1 + int(mx_off)
+        yi = ry1 + int(my_off)
+        # Verify FLOOR (vendor enexto fallback when occupied).  Fall back
+        # to room center if the candidate cell is not FLOOR.
+        floor = int(TileType.FLOOR)
+        sub = terrain_np[0, 0, :h, :w]
+        if 0 <= yi < h and 0 <= xi < w and int(sub[yi, xi]) == floor:
+            rc = (yi, xi)
+        else:
             rc = ((ry1 + ry2) // 2, (rx1 + rx2) // 2)
         new_state = state.replace(vendor_rng=vrng)
         return rc, idx, new_state

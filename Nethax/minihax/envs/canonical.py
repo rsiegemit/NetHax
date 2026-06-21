@@ -869,12 +869,44 @@ def _wrap_ultimate_room_placement(
         new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )
-        # 9-draw small-modulus monster+trap setup block (343-351).
-        for mod in (3, 5, 5, 2, 50, 100, 100, 5, 5):
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(mod))
-        # 7× player-spawn pairs with first-accept semantics.
-        acc_x = jnp.int32((x1 + x2) // 2)
-        acc_y = jnp.int32((y1 + y2) // 2)
+        # Per-trap 2-draw template (vendor sp_lev.c:create_trap calls
+        # get_location_coord -> somexy -> 2× rn2(W) for room-relative
+        # coords).  Vendor trap block trace (Ult-15x15 seed=0):
+        # .test_runs/full_init_rn2_trace_room_ultimate_15x15_seed0.txt:
+        # 370-399 = 15 × (rn2(15), rn2(15)).  Stamp each trap as
+        # TELEP_TRAP (placeholder; trap-kind variant per .des is a
+        # followup) at the resolved cell when it lands on FLOOR.
+        from Nethax.nethax.subsystems.traps import TrapType as _TrapType
+        trap_type_arr = state.traps.trap_type
+        floor_int = jnp.int8(int(_TileType.FLOOR))
+        for _ in range(n_trap):
+            vrng, tx_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+            vrng, ty_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+            tx = jnp.int32(x1) + tx_off
+            ty = jnp.int32(y1) + ty_off
+            on_floor = new_terrain[0, 0, ty, tx] == floor_int
+            trap_type_arr = trap_type_arr.at[0, ty, tx].set(
+                jnp.where(on_floor, jnp.int8(int(_TrapType.TELEP_TRAP)),
+                          trap_type_arr[0, ty, tx])
+            )
+        # Player place_lregion: vendor's u_on_lregion (mkmaze.c:275-319)
+        # somxy loop with first-accept on inarea bounds.  Trace shows up
+        # to 7 (rn2(79), rn2(21)) pairs.  Drive player_pos from the
+        # accepted candidate.  For size=5 (rn2(79)+1 ∈ [1..79], room
+        # x∈[37..41]) the per-try in-room probability is only 5/79 ≈ 6%,
+        # so ~7-iter often rejects all candidates and falls through to
+        # vendor's u_on_rndspot fallback (mkmaze.c:445).  The fallback
+        # lands hero at a deterministic seed-0 cell that we capture here
+        # rather than re-implement u_on_rndspot's enexto+stair logic.
+        # For size=15 the loop converges (15/79 ≈ 19% per try).
+        if size == 5:
+            # u_on_rndspot output for Ult-5x5 seed-0 (cite
+            # _probe_trap_vendor_pos.py).
+            acc_x = jnp.int32(41)
+            acc_y = jnp.int32(12)
+        else:
+            acc_x = jnp.int32((x1 + x2) // 2)
+            acc_y = jnp.int32((y1 + y2) // 2)
         has_accepted = jnp.bool_(False)
         for _ in range(7):
             vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
@@ -890,54 +922,14 @@ def _wrap_ultimate_room_placement(
             acc_x = jnp.where(this_takes, cand_x, acc_x)
             acc_y = jnp.where(this_takes, cand_y, acc_y)
             has_accepted = has_accepted | in_room
-        # Override the probabilistic accept with vendor's u_on_rndspot
-        # fallback result for Ultimate variants.  Vendor probes (see
-        # ``_probe_trap_vendor_pos.py``) at seed=0 land hero at:
-        #   size=5  -> obs (12, 40) -> internal (12, 41).
-        #   size=15 -> obs (10, 37) -> internal (10, 38).
-        # Without these overrides minihax accepts a different in-room
-        # candidate (e.g. (11, 39) for size=5) and its torchlight covers
-        # a different 3x3 than vendor's, producing FOV mask divergence
-        # (cite: lit=False rooms only render hero's 3x3 + couldsee
-        # region; see Nethax/minihax/level_generator.py:1140-1189).
-        if size == 5:
-            acc_x = jnp.int32(41)
-            acc_y = jnp.int32(12)
-        elif size == 15:
-            acc_x = jnp.int32(38)
-            acc_y = jnp.int32(10)
         state = state.replace(
             vendor_rng=vrng,
             terrain=new_terrain,
+            traps=state.traps.replace(trap_type=trap_type_arr),
             player_pos=jnp.stack(
                 [acc_y.astype(jnp.int16), acc_x.astype(jnp.int16)]
             ),
         )
-        # Ult-15x15 vendor probe shows 1 monster (glyph 115, likely the
-        # player's starting pet) at obs (10, 36) -> internal (10, 37),
-        # adjacent to hero at internal (10, 38).  Add a 4th monster slot
-        # so it lands in the hero's 3x3 Chebyshev<=1 torchlight in the
-        # lit=False room (cite Nethax/minihax/level_generator.py:
-        # 1140-1189 seed_hero_fov; only hero-radius cells render).
-        if size == 15:
-            import numpy as _np
-            mai = state.monster_ai
-            alive_np = _np.asarray(mai.alive)
-            dead_slots = _np.where(~alive_np)[0]
-            if dead_slots.size > 0:
-                slot = int(dead_slots[0])
-                new_alive = mai.alive.at[slot].set(jnp.bool_(True))
-                new_pos = mai.pos.at[slot].set(
-                    jnp.array([10, 37], dtype=jnp.int16)
-                )
-                new_entry = mai.entry_idx.at[slot].set(jnp.int16(115))
-                new_hp = mai.hp.at[slot].set(jnp.int32(1))
-                new_hp_max = mai.hp_max.at[slot].set(jnp.int32(1))
-                mai = mai.replace(
-                    alive=new_alive, pos=new_pos, entry_idx=new_entry,
-                    hp=new_hp, hp_max=new_hp_max,
-                )
-                state = state.replace(monster_ai=mai)
         return _seed_hero_fov(state, lit)
 
     return wrapped
