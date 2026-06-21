@@ -1593,25 +1593,39 @@ def _resolve_monster(
         # The monster lands at (rx1 + x_off, ry1 + y_off).  Variable-length
         # extras for grouping monsters (m_initgrp / m_initweap class
         # branches in makemon.c:163-800) are followup.
+        # Per-monster template — GROUND-TRUTHED against the COMPLETE CORE
+        # draw stream (NETHAX_RND, captures untraced rnd()/d() too).  See
+        # .test_runs/full_rnd_stream_*_Monster_{5x5,15x15}_*_seed0.txt.
+        # Monster-5x5 M1 (offsets 343-351) and Mon-15x15 M1 (343-351):
+        #   rn2(3)   — mkclass mlet pick
+        #   rn2(W)   — somex room x offset
+        #   rn2(W)   — somey room y offset
+        #   rnd(21)  — UNTRACED (RND#346; makemon mon setup)
+        #   rnd(4)   — UNTRACED (RND#347)
+        #   rn2(2)   — mk_roamer align / peace
+        #   rn2(50)  — m_initweap defensive-item check
+        #   rn2(100) — m_initweap misc-item check
+        #   rn2(100) — m_initweap follow-up
+        # Note: rn2_jax consumes exactly one ISAAC64 u64 per call regardless
+        # of modulus (vendor RND = isaac64_next_uint64 % x, no rejection),
+        # so the untraced fillers' moduli only matter for faithfulness.
         vrng, mkclass_val = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, mx_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_w))
         vrng, my_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_h))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(21))  # untraced rnd(21)
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))   # untraced rnd(4)
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        # m_initgrp interleaved extras: when the previous monster's
-        # rn2(3) mkclass pick == 2 (a group-spawning monster class),
-        # vendor's makemon calls m_initgrp which fires extra rn2 draws
-        # interleaved into the CURRENT monster's block.  Observed
-        # signature (Ult-15x15 + Mon-15x15 traces seeds 0/5):
-        #   * 3 retry/genocide draws between rn2(2) and rn2(50):
-        #     rn2(2), rn2(10), rn2(2)
-        #   * 3 extra m_initweap draws after the standard rn2(100):
-        #     rn2(50), rn2(100), rn2(100)
-        # Trigger is one-shot — only the immediate next monster gets
-        # extras, not cascading.  Seeds 1/2 (M1.rn2(3) in {0, 1}) skip
-        # this path entirely.
+        # m_initgrp group-spawn extras: when the PREVIOUS monster's mkclass
+        # rn2(3) == 2 (a G_SGROUP/G_LGROUP class), vendor's makemon spawns a
+        # group, injecting extra draws into THIS monster's block.  Ground
+        # truth from Mon-15x15 M2 (offsets 357-368):
+        #   interleaved after rn2(2): rn2(2), rnd(3), rn2(10), rnd(4), rn2(2)
+        #   appended after m_initweap: rn2(50), rn2(100), rn2(100)
         if prev_mkclass_was_2:
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(10))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))

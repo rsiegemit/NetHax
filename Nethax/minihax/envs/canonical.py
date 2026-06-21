@@ -610,19 +610,49 @@ def _wrap_monster_room_placement(
         # sees the right vrng offset).  No wrapper-level override needed.
         # Note: vendor 15x15 also spawns a starting pet adjacent to hero
         # which mklev does NOT place; modelling that pet is a followup.
-        # 200-iter probabilistic somxy with FLOOR early-stop (see Random
-        # wrapper for derivation).
+        # Faithful vendor place_lregion (mkmaze.c:275-319): 200-try loop
+        # x=rn2(79)+1, y=rn2(21); accept first cell where !bad_location =
+        # tile==ROOM (FLOOR) AND not occupied.  ``occupied`` = the stair
+        # (non-FLOOR tile, excluded by the FLOOR test) plus any monster cell
+        # (state.monster_ai positions — vendor rejects MON_AT cells).  Then
+        # a deterministic row-major scan if all 200 reject.
+        import numpy as _np
         from Nethax.nethax.constants.tiles import TileType as _TT
-        terrain_l0 = state.terrain[0, 0]
         _FLOOR = int(_TT.FLOOR)
+        _terr_np = _np.asarray(state.terrain[0, 0])
+        _H, _W = _terr_np.shape
+        _ok = (_terr_np == _FLOOR)
+        # Exclude occupied monster cells.
+        mai = state.monster_ai
+        _alive = _np.asarray(mai.alive)
+        _mpos = _np.asarray(mai.pos)
+        for _si in _np.where(_alive)[0]:
+            my, mx = int(_mpos[_si, 0]), int(_mpos[_si, 1])
+            if 0 <= my < _H and 0 <= mx < _W:
+                _ok[my, mx] = False
+        acc_x_i = int(acc_x)
+        acc_y_i = int(acc_y)
+        _accepted = False
         for _ in range(200):
             vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
-            cand_x = raw_x + jnp.int32(1)
-            if int(terrain_l0[cand_y, cand_x]) == _FLOOR:
-                acc_x = cand_x
-                acc_y = cand_y
+            cx = int(raw_x) + 1
+            cy = int(cand_y)
+            if 0 <= cy < _H and 0 <= cx < _W and bool(_ok[cy, cx]):
+                acc_x_i, acc_y_i = cx, cy
+                _accepted = True
                 break
+        if not _accepted:
+            for sx in range(1, _W):
+                for sy in range(0, _H):
+                    if bool(_ok[sy, sx]):
+                        acc_x_i, acc_y_i = sx, sy
+                        _accepted = True
+                        break
+                if _accepted:
+                    break
+        acc_x = jnp.int32(acc_x_i)
+        acc_y = jnp.int32(acc_y_i)
         state = state.replace(
             vendor_rng=vrng,
             player_pos=jnp.stack(
@@ -702,58 +732,56 @@ def _wrap_trap_room_placement(
         new_terrain = state.terrain.at[0, 0, stair_y, stair_x].set(
             jnp.int8(int(_TileType.STAIRCASE_DOWN))
         )
-        # mktrap consumption: vendor mklev runs `create_trap` per trap
-        # whose placement uses `get_room_loc` -> 2× rn2(W) (room-local
-        # coords).  For size=5 the trap's NO_LOC_WARN path fails (room
-        # too small to satisfy mktrap's location check) and vendor
-        # retries via somxy(rn2(79), rn2(21)) — trace
-        # .test_runs/full_init_rn2_trace_room_trap_5x5_seed0.txt:343-356
-        # shows 2× rn2(5) + ~6× (rn2(79), rn2(21)) for n_trap=1.  For
-        # size=15 the room-local pick succeeds first try — trace
-        # ..._room_trap_15x15_seed0.txt shows just 2× rn2(15) per trap
-        # for the n_trap=15 block (15× rn2(15)/rn2(15) = 30 draws).
-        if size == 5:
-            for _ in range(n_trap):
-                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
-                for _ in range(5):
-                    vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
-                    vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
-        else:
-            for _ in range(n_trap):
-                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
-                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
-        # Vendor place_lregion: 7 somxy probabilistic attempts, using inarea
-        # bounds (interior of room, excluding wall edges).  For size=5 with
-        # GEOMETRY:center, inarea is x∈[38..40], y∈[10..12] (3x3 interior).
-        # Cite: vendor/nle/src/mkmaze.c:304-309 + sp_lev.c inarea derivation.
-        # First-accept semantics: take the first candidate that lands in the
-        # inarea rect.  If none accept (size=5 seed=0 case), fall through to
-        # the deterministic hardcode above.
-        ix1, iy1 = x1 + 1, y1 + 1
-        ix2, iy2 = x2 - 1, y2 - 1
-        has_accepted = jnp.bool_(False)
-        for _ in range(7):
-            # Vendor uses cx = rnd(COLNO-1) = rn2(79)+1 and cy = rn2(ROWNO).
+        # mktrap consumption — ground-truthed against the COMPLETE CORE
+        # draw stream (NETHAX_RND, which traces rnd()/d() too, not just
+        # rn2()).  See .test_runs/full_rnd_stream_*_Trap_5x5_*_seed0.txt:
+        # the per-trap block is 2× rn2(5) (get_room_loc room-relative x,y)
+        # + ONE untraced rnd(4) (RND#345, invisible to the rn2-only trace).
+        # The somxy pairs that follow are the PLAYER place_lregion, NOT the
+        # trap.  size=15: 2× rn2(15) per trap (room-relative, first-try).
+        # Per-trap block = 2× rn2(W) (room-relative x,y via get_room_loc)
+        # + ONE untraced rnd(4) — confirmed identical for size=5 and
+        # size=15 against the full NETHAX_RND stream
+        # (.test_runs/full_rnd_stream_*_Trap_{5x5,15x15}_*_seed0.txt).
+        for _ in range(n_trap):
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))
+        # Faithful vendor place_lregion (mkmaze.c:275-319): 200-try loop
+        # x=rn2(79)+1, y=rn2(21); accept first cell where !bad_location =
+        # tile==ROOM (FLOOR) AND not occupied (stair / trap).  Then a
+        # deterministic row-major scan if all 200 reject.  With the rnd(4)
+        # alignment above, the player accepts at vendor's exact cell
+        # (Trap-5x5 seed0: pair 12 -> (40,13) internal).
+        import numpy as _np
+        _floor_int = int(_TileType.FLOOR)
+        _terr_np = _np.asarray(new_terrain[0, 0])
+        _trap_np = _np.asarray(state.traps.trap_type[0])
+        _H, _W = _terr_np.shape
+        _ok = (_terr_np == _floor_int) & (_trap_np == 0)
+        acc_x_i = int(acc_x)
+        acc_y_i = int(acc_y)
+        _accepted = False
+        for _ in range(200):
             vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
-            cand_x = raw_x + jnp.int32(1)
-            in_room = (
-                (cand_x >= jnp.int32(ix1))
-                & (cand_x <= jnp.int32(ix2))
-                & (cand_y >= jnp.int32(iy1))
-                & (cand_y <= jnp.int32(iy2))
-            )
-            this_takes = in_room & ~has_accepted
-            acc_x = jnp.where(this_takes, cand_x, acc_x)
-            acc_y = jnp.where(this_takes, cand_y, acc_y)
-            has_accepted = has_accepted | in_room
-        # Post-cleanup: size=15 hero now drives off the corrected
-        # 2×rn2(15) per-trap consumption above (vrng aligned with
-        # vendor at start of player place_lregion).  size=5 still
-        # falls back to the u_on_rndspot deterministic hero (see acc
-        # init above) because the 7-pair somxy rejection rate is too
-        # high to converge.
+            cx = int(raw_x) + 1
+            cy = int(cand_y)
+            if 0 <= cy < _H and 0 <= cx < _W and bool(_ok[cy, cx]):
+                acc_x_i, acc_y_i = cx, cy
+                _accepted = True
+                break
+        if not _accepted:
+            for sx in range(1, _W):
+                for sy in range(0, _H):
+                    if bool(_ok[sy, sx]):
+                        acc_x_i, acc_y_i = sx, sy
+                        _accepted = True
+                        break
+                if _accepted:
+                    break
+        acc_x = jnp.int32(acc_x_i)
+        acc_y = jnp.int32(acc_y_i)
         state = state.replace(
             vendor_rng=vrng,
             terrain=new_terrain,
