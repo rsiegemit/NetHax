@@ -147,6 +147,28 @@ _MONSTER_NAME_TO_IDX: dict = _build_monster_name_lookup()
 _OBJECT_NAME_TO_IDX: dict = _build_object_name_lookup()
 
 
+def _build_monster_group_flags():
+    """Per-monster (G_SGROUP, G_LGROUP) booleans for m_initgrp triggering.
+
+    Vendor makemon.c:1370-1377 — a freshly-made monster with G_SGROUP (or
+    G_LGROUP) spawns a same-type group via m_initgrp.  Cite monst.c geno
+    flags; mirrored on ``MonsterEntry.generation_mask``.
+    """
+    import numpy as _np
+    from Nethax.nethax.constants.monsters import MONSTERS, G_SGROUP, G_LGROUP
+    n = len(MONSTERS)
+    sg = _np.zeros(n, dtype=bool)
+    lg = _np.zeros(n, dtype=bool)
+    for i, m in enumerate(MONSTERS):
+        gm = int(m.generation_mask)
+        sg[i] = bool(gm & G_SGROUP)
+        lg[i] = bool(gm & G_LGROUP)
+    return sg, lg
+
+
+_MON_SGROUP, _MON_LGROUP = _build_monster_group_flags()
+
+
 # ---------------------------------------------------------------------------
 # Directive dataclasses
 # ---------------------------------------------------------------------------
@@ -761,7 +783,6 @@ def _apply_directives(
     lg.last_trap_types = []
     lg.last_player_pos = None
     lg.last_goal_pos = None
-    lg._prev_monster_mkclass = -1  # track mkclass(rn2(3)) for m_initgrp one-shot extras
 
     # 1. Allocate the base EnvState.
     #
@@ -1005,16 +1026,26 @@ def _apply_directives(
         elif isinstance(d, _StartPosDirective):
             lg.last_player_pos = (d.x, d.y)
         elif isinstance(d, _MonsterDirective):
-            prev_mkclass_was_2 = bool(
-                getattr(lg, "_prev_monster_mkclass", -1) == 2
-            )
-            pos_rc, mon_idx, state, mkclass_val = _resolve_monster(
+            # Build the occupancy set (earlier monsters + the down-stair) so
+            # enexto places m_initgrp members on free cells like vendor.
+            _occ = set()
+            if _mklev_stair_cell is not None:
+                _occ.add(_mklev_stair_cell)
+            import numpy as _np_occ
+            _al = _np_occ.asarray(state.monster_ai.alive)
+            _mp = _np_occ.asarray(state.monster_ai.pos)
+            for _si in _np_occ.where(_al)[0]:
+                _occ.add((int(_mp[_si, 0]), int(_mp[_si, 1])))
+            pos_rc, mon_idx, state, members = _resolve_monster(
                 d, terrain_np, w, h, resolved_rooms, _next_key, state,
-                prev_mkclass_was_2=prev_mkclass_was_2,
+                occupied=_occ,
             )
-            lg._prev_monster_mkclass = mkclass_val
             state = _write_monster(state, pos_rc, mon_idx)
             lg.last_monster_entry_ids.append(mon_idx)
+            # Write any m_initgrp group members as additional monsters.
+            for _mpos, _midx in members:
+                state = _write_monster(state, _mpos, _midx)
+                lg.last_monster_entry_ids.append(_midx)
         elif isinstance(d, _TrapDirective):
             pos_rc, trap_type, state = _resolve_trap(
                 d, terrain_np, w, h, resolved_rooms, _next_key, state,
@@ -1534,6 +1565,72 @@ def _random_floor_cell(
 # Monster / object / trap directive resolution
 # ---------------------------------------------------------------------------
 
+def _enexto(terrain_np, occupied: set, xx: int, yy: int, w: int, h: int,
+            vrng):
+    """Replicate vendor ``enexto_core`` (teleport.c:126-218).
+
+    Walk the borders of expanding squares centred on ``(xx, yy)`` (xx=col,
+    yy=row), collecting ``goodpos`` cells; stop at the first range that has
+    any, then pick one via ``rn2(num_good)``.  ``goodpos`` here = in-bounds
+    FLOOR tile not in ``occupied`` (set of ``(row, col)``).  Returns
+    ``((row, col)|None, vrng)``.  The ``rn2(num_good)`` draw is the same one
+    vendor's m_initgrp consumes, so consuming it here keeps vrng aligned.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    floor = int(TileType.FLOOR)
+    sub = terrain_np[0, 0]
+    MAX_GOOD = 15
+
+    def goodpos(x, y):
+        if not (0 <= y < h and 0 <= x < w):
+            return False
+        if (y, x) in occupied:
+            return False
+        return int(sub[y, x]) == floor
+
+    xmax0 = max(xx - 1, (w - 1) - xx)
+    ymax0 = max(yy - 0, (h - 1) - yy)
+    rangemax = max(xmax0, ymax0)
+    good = []
+    full = False
+    rng = 1
+    while True:
+        xmin = max(1, xx - rng)
+        xmax = min(w - 1, xx + rng)
+        ymin = max(0, yy - rng)
+        ymax = min(h - 1, yy + rng)
+        for x in range(xmin, xmax + 1):
+            if goodpos(x, ymin):
+                good.append((ymin, x))
+                if len(good) == MAX_GOOD:
+                    full = True
+                    break
+            if goodpos(x, ymax):
+                good.append((ymax, x))
+                if len(good) == MAX_GOOD:
+                    full = True
+                    break
+        if not full:
+            for y in range(ymin, ymax):
+                if goodpos(xmin, y):
+                    good.append((y, xmin))
+                    if len(good) == MAX_GOOD:
+                        full = True
+                        break
+                if goodpos(xmax, y):
+                    good.append((y, xmax))
+                    if len(good) == MAX_GOOD:
+                        full = True
+                        break
+        rng += 1
+        if full or good or rng > rangemax:
+            break
+    if not good:
+        return None, vrng
+    vrng, i = _vendor_rng.rn2_jax(vrng, jnp.int32(len(good)))
+    return good[int(i)], vrng
+
+
 def _resolve_monster(
     d: _MonsterDirective,
     terrain_np: jax.Array,
@@ -1542,9 +1639,14 @@ def _resolve_monster(
     resolved_rooms: dict,
     next_key,
     state: Optional[EnvState] = None,
-    prev_mkclass_was_2: bool = False,
-) -> Tuple[Tuple[int, int], int, Optional[EnvState], int]:
-    """Resolve a monster directive to ``((row, col), monster_idx, new_state, mkclass_val)``.
+    occupied: Optional[set] = None,
+) -> Tuple[Tuple[int, int], int, Optional[EnvState], list]:
+    """Resolve a monster directive to ``((row, col), monster_idx, new_state, members)``.
+
+    ``members`` is a list of ``((row, col), member_idx)`` for any m_initgrp
+    group members spawned by a group-flagged monster (empty otherwise).
+    ``occupied`` is a set of ``(row, col)`` cells already taken by earlier
+    monsters / the stair, used by ``enexto`` for member placement.
 
     Under ``use_vendor_rng()``, draws come from ``state.vendor_rng`` so that
     monster placement consumes the same ISAAC64 stream offsets vendor
@@ -1637,42 +1739,75 @@ def _resolve_monster(
             idx = int(_picked_idx)
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))   # untraced rnd(4)
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        # m_initgrp group-spawn extras: when the PREVIOUS monster's mkclass
-        # rn2(3) == 2 (a G_SGROUP/G_LGROUP class), vendor's makemon spawns a
-        # group, injecting extra draws into THIS monster's block.  Ground
-        # truth from Mon-15x15 M2 (offsets 357-368):
-        #   interleaved after rn2(2): rn2(2), rnd(3), rn2(10), rnd(4), rn2(2)
-        #   appended after m_initweap: rn2(50), rn2(100), rn2(100)
-        if prev_mkclass_was_2:
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(10))
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
-        if prev_mkclass_was_2:
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        # Leader cell (vendor mkroom.c somexy: room-relative offsets).
         xi = rx1 + int(mx_off)
         yi = ry1 + int(my_off)
-        # Verify FLOOR (vendor enexto fallback when occupied).  Fall back
-        # to room center if the candidate cell is not FLOOR.
         floor = int(TileType.FLOOR)
         sub = terrain_np[0, 0, :h, :w]
         if 0 <= yi < h and 0 <= xi < w and int(sub[yi, xi]) == floor:
             rc = (yi, xi)
         else:
             rc = ((ry1 + ry2) // 2, (rx1 + rx2) // 2)
+        # m_initgrp group spawn (vendor makemon.c:1369-1378).  A freshly-made
+        # G_SGROUP / G_LGROUP monster spawns a same-type group:
+        #     if ((geno & G_SGROUP) && rn2(2))       m_initgrp(n=3)
+        #     else if (geno & G_LGROUP)              rn2(3) ? lgrp(10) : sgrp(3)
+        # m_initgrp (makemon.c:79-144): cnt = rnd(n); cnt /= (ulevel<3)?4 ...;
+        # if (!cnt) cnt++; then for each member: enexto() + makemon(member).
+        # u.ulevel==1 at mklev so the divisor is 4.  Each member draws
+        # enexto's rn2(num_good) + the member makemon draws; afterwards the
+        # leader's own m_initweap runs.  All branch on the picked monster's
+        # group flag (computed from MONSTERS.generation_mask) — no hardcodes.
+        # Ground truth: full_rnd_stream_*_Monster_15x15_*_seed0.txt M2 (gridbug).
+        _ULEVEL_DIV = 4  # u.ulevel == 1 at mklev: (ulevel<3)?4:(ulevel<5)?2:1
+        members: list = []
+        is_sgroup = bool(_MON_SGROUP[idx]) if 0 <= idx < _MON_SGROUP.shape[0] else False
+        is_lgroup = bool(_MON_LGROUP[idx]) if 0 <= idx < _MON_LGROUP.shape[0] else False
+        grp_n = 0
+        if is_sgroup:
+            vrng, _gate = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+            if int(_gate) != 0:
+                grp_n = 3
+        elif is_lgroup:
+            vrng, _lg = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+            grp_n = 10 if int(_lg) != 0 else 3
+        if grp_n > 0:
+            # cnt = rnd(grp_n) (== rn2(grp_n)+1), divided by the ulevel
+            # factor, floored, min 1.
+            vrng, _cnt_raw = _vendor_rng.rn2_jax(vrng, jnp.int32(grp_n))
+            cnt = (int(_cnt_raw) + 1) // _ULEVEL_DIV
+            if cnt < 1:
+                cnt = 1
+            occ = set(occupied) if occupied else set()
+            occ.add(rc)  # leader occupies its own cell
+            for _m in range(cnt):
+                mpos, vrng = _enexto(terrain_np, occ, xi, yi, w, h, vrng)
+                # member makemon draws (newmonhp/init + m_initweap):
+                # rn2(4), rn2(2), rn2(50), rn2(100), rn2(100).
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+                if mpos is not None:
+                    members.append((mpos, idx))
+                    occ.add(mpos)
+            # Leader's own m_initweap (after the group is built).
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        else:
+            # Non-group (or gate==0): just the leader's m_initweap.
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
         new_state = state.replace(vendor_rng=vrng)
-        return rc, idx, new_state, int(mkclass_val)
+        return rc, idx, new_state, members
 
     rc = _resolve_place(d.place, terrain_np, w, h, resolved_rooms, next_key)
     if rc is None:
         rc = (0, 0)
-    return rc, idx, state, 0
+    return rc, idx, state, []
 
 
 def _resolve_object(

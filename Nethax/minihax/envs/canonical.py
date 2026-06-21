@@ -697,15 +697,11 @@ def _wrap_trap_room_placement(
         # internal column 0); rows pass through unchanged.  Vendor hero:
         # size=5 → (y=13, x=39 obs) → acc=(13, 40); size=15 → (y=12, x=42 obs)
         # → acc=(12, 43).
-        if size == 5:
-            acc_x = jnp.int32(40)
-            acc_y = jnp.int32(13)
-        elif size == 15:
-            acc_x = jnp.int32(43)
-            acc_y = jnp.int32(12)
-        else:
-            acc_x = jnp.int32((x1 + x2) // 2)
-            acc_y = jnp.int32((y1 + y2) // 2)
+        # Room-center fallback for player_pos; the faithful place_lregion
+        # below (200-try + deterministic scan) overrides it with vendor's
+        # actual accepted cell, so this is only a safety default.
+        acc_x = jnp.int32((x1 + x2) // 2)
+        acc_y = jnp.int32((y1 + y2) // 2)
         # Post-cascade RNG matches vendor at MKLEV_BEGIN; no extra alignment
         # draw needed.  See _consume_ini_inv_archeologist_draws cascade fix.
         # mklev stair selection: rn2(3), rn2(2), rn2(5), rn2(5) at trace
