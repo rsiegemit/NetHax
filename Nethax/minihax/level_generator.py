@@ -926,6 +926,24 @@ def _apply_directives(
     # themselves and don't have monster directives.
     has_monster_dir = any(isinstance(d, _MonsterDirective) for d in directives)
     from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng_dl
+    # Room envs carve via _FillTerrainDirective (not _RoomDirective) so
+    # ``resolved_rooms`` is empty.  Derive the room bbox from the carved
+    # FLOOR rectangle so the 4-prefix uses vendor's rn2(W) modulus and
+    # ``_resolve_monster`` lands monsters in-room (vs the (10, 39) map-
+    # center fallback when room_w defaults to map_w=80).
+    _floor_int = int(TileType.FLOOR)
+    _sub_for_bbox = jnp.asarray(terrain_np[0, 0, :h, :w]) == jnp.int8(_floor_int)
+    _floor_rows = jnp.where(jnp.any(_sub_for_bbox, axis=1))[0]
+    _floor_cols = jnp.where(jnp.any(_sub_for_bbox, axis=0))[0]
+    if _floor_rows.size and _floor_cols.size and not resolved_rooms:
+        _carved_ry1 = int(_floor_rows[0])
+        _carved_ry2 = int(_floor_rows[-1])
+        _carved_rx1 = int(_floor_cols[0])
+        _carved_rx2 = int(_floor_cols[-1])
+        resolved_rooms["__carved_fill__"] = (
+            _carved_ry1, _carved_rx1, _carved_ry2, _carved_rx2,
+        )
+
     if (
         state is not None
         and _use_vendor_rng_dl()
