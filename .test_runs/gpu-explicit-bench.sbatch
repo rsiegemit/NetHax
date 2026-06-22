@@ -15,9 +15,14 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=01:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=gpu-explicit-bench-%j.out
 #SBATCH --error=gpu-explicit-bench-%j.err
+
+# B=1 exec1 alone ran >56min (job 24036479). Long --time lets exec1 FINISH at
+# least once -> the decisive test: is the wall a ONE-TIME first-launch cost
+# (60k+ CUDA module loads -> warm steps fast -> throughput scales with B = GOOD)
+# or fundamental per-step latency (warm == exec1 = BAD)? Sweep climbs from B=1.
 
 set -euo pipefail
 cd /n/netscratch/sompolinsky_lab/Lab/rsiegelmann/nethax_parity
@@ -38,7 +43,7 @@ source .venv/bin/activate
 PYTHONPATH=. python -u .test_runs/_bench_jit_explicit.py \
     --env MiniHack-Room-15x15-v0 \
     --batches 1,4,16,64,256 \
-    --warm 20 \
+    --warm 5 \
     --compile-watchdog 2400 \
     --json .test_runs/gpu_explicit_$SLURM_JOB_ID.json
 
