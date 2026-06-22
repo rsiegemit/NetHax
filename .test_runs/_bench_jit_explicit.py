@@ -44,12 +44,17 @@ class _CompileTimeout(Exception):
     pass
 
 
+class _ExecTimeout(Exception):
+    pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--env", default="MiniHack-Room-15x15-v0")
     ap.add_argument("--batches", default="1,4,16,64,256")
     ap.add_argument("--warm", type=int, default=20)
     ap.add_argument("--compile-watchdog", type=int, default=3600)  # per-B compile bound
+    ap.add_argument("--exec-watchdog", type=int, default=0)  # per-B exec1 bound (0=off)
     ap.add_argument("--json", default="")
     args = ap.parse_args()
     batches = [int(b) for b in args.batches.split(",") if b]
@@ -114,10 +119,20 @@ def main():
             rec["compile_s"] = time.perf_counter() - t
             log(f"  B={B} COMPILE DONE {rec['compile_s']:.1f}s")
 
+            if args.exec_watchdog:
+                def _exec_alarm(signum, frame):
+                    raise _ExecTimeout()
+                signal.signal(signal.SIGALRM, _exec_alarm)
+                signal.alarm(args.exec_watchdog)
+                log(f"  B={B} exec1 (watchdog {args.exec_watchdog}s) ...")
             t = time.perf_counter()
-            r = compiled(st, acts, rngs)
-            jax.block_until_ready(r)
+            try:
+                r = compiled(st, acts, rngs)
+                jax.block_until_ready(r)
+            finally:
+                signal.alarm(0)
             rec["exec1_s"] = time.perf_counter() - t
+            log(f"  B={B} EXEC#1 DONE {rec['exec1_s']:.2f}s")
 
             st2 = r[0]
             ts = []
@@ -135,6 +150,9 @@ def main():
         except _CompileTimeout:
             rec["error"] = f"compile exceeded {args.compile_watchdog}s watchdog"
             log(f"{B:>7}  COMPILE WATCHDOG: exceeded {args.compile_watchdog}s")
+        except _ExecTimeout:
+            rec["error"] = f"exec1 exceeded {args.exec_watchdog}s watchdog (exec is the wall, not compile)"
+            log(f"{B:>7}  EXEC WATCHDOG: exec1 exceeded {args.exec_watchdog}s")
         except Exception as e:
             rec["error"] = f"{type(e).__name__}: {str(e)[:200]}"
             log(f"{B:>7}  ERROR: {rec['error']}")
