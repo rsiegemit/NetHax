@@ -66,14 +66,30 @@ MAP_W: int = 80   # canonical NLE / NetHack map width  (cols)
 # Branch / dungeon-count constants
 # ---------------------------------------------------------------------------
 
-N_BRANCHES: int = 7  # number of branches with full state-array slots
+import os as _os
+
+# NETHAX_SINGLE_LEVEL: shrink per-branch/per-level state arrays for single-level
+# MiniHack TRAINING.  The agent only ever touches [branch 0, level 0], but
+# ground_items et al. are dimensioned [N_BRANCHES, MAX_LEVELS, H, W, STACK] =
+# ~125 MB/env (ground_items alone ~100 MB), which blocks large-batch GPU rollouts
+# (B>=16 OOMs a 40 GB A100).  Gated so the byte-parity path (run WITHOUT the gate)
+# keeps the full 7x32 dims.  Tunable via NETHAX_DUNGEON_BRANCHES /
+# NETHAX_DUNGEON_LEVELS (defaults 1 / 2 when single-level => ~224/2 = 112x smaller
+# multi-level arrays -> ~1.1 MB/env -> 1000+ envs fit).
+_SINGLE_LEVEL = _os.environ.get("NETHAX_SINGLE_LEVEL", "0") == "1"
+
+N_BRANCHES: int = (
+    int(_os.environ.get("NETHAX_DUNGEON_BRANCHES", "1")) if _SINGLE_LEVEL else 7
+)  # number of branches with full state-array slots
 # Audit-N #7 Commit 7: Branch.LUDIOS = 7 is defined below for vendor-cite
 # completeness (dungeon.def line 27).  It is intentionally NOT counted in
 # N_BRANCHES yet — bumping that constant would resize every per-branch
 # state array in state.py / level_memory.py, which is outside the scope
 # of this wave.  Callers that want Ludios entry/spec metadata can read
 # the constants directly; the state arrays do not yet have a slot for it.
-MAX_LEVELS_PER_BRANCH: int = 32  # MAXLEVEL from vendor/nethack/include/global.h
+MAX_LEVELS_PER_BRANCH: int = (  # MAXLEVEL from vendor/nethack/include/global.h
+    int(_os.environ.get("NETHAX_DUNGEON_LEVELS", "2")) if _SINGLE_LEVEL else 32
+)
 
 
 # ---------------------------------------------------------------------------
