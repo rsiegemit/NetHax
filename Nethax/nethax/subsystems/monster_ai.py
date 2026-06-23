@@ -7195,16 +7195,28 @@ def monsters_step_all(state, rng: jax.Array) -> object:
         turn_keys = keys[:MAX_MONSTERS_PER_LEVEL]
         mhit_keys = keys[MAX_MONSTERS_PER_LEVEL:]
 
-        def _body(carry, xs):
-            slot_idx, key, may_act = xs
+        if _os.environ.get("NETHAX_VEC_MONSTERS", "1") == "1":
+            # Fast training path: all monsters act SIMULTANEOUSLY vs the frozen
+            # start-of-turn state, run as one wide vmap instead of a 400-deep
+            # serial scan (collapses the ~27.3M serial op-executions => GPU-
+            # parallel).  Non-vendor branch only — byte-parity stays serial.
+            from Nethax.nethax.subsystems.vec_monster_turns import (
+                vectorized_monster_turns,
+            )
+            final_state = vectorized_monster_turns(
+                state, monster_turn, indices, turn_keys, can_act,
+            )
+        else:
+            def _body(carry, xs):
+                slot_idx, key, may_act = xs
 
-            def _do_turn(s):
-                return monster_turn(s, key, slot_idx)
+                def _do_turn(s):
+                    return monster_turn(s, key, slot_idx)
 
-            new_carry = jax.lax.cond(may_act, _do_turn, lambda s: s, carry)
-            return new_carry, None
+                new_carry = jax.lax.cond(may_act, _do_turn, lambda s: s, carry)
+                return new_carry, None
 
-        final_state, _ = jax.lax.scan(_body, state, (indices, turn_keys, can_act))
+            final_state, _ = jax.lax.scan(_body, state, (indices, turn_keys, can_act))
 
     # ---- Monster-vs-monster melee (mattackm) ----
     _status = getattr(state, "status", None)
