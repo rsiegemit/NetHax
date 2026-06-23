@@ -209,6 +209,17 @@ leaves per-monster ([B,400,leaf], e.g. visible [B,400,21,79]); fix = merge only 
 leaves a turn actually writes, freeze the rest. (2) full step_batched still hangs —
 NOT the monster step (now 27 ms) but FOV (depth-3 nested ray-cast) / timer / obs.
 
+### Update 2026-06-23 (jobs 24263295, 24263369) — both follow-ups re-scoped
+- **FOV is NOT the hang.** GPU `view_from` warm = **101 ms** (compiles 3.3s,
+  completes; CPU 1.8ms). Don't rewrite FOV. The full-step hang is the **timer
+  queue** (`timer_queue.py:710`, body 13003×64) or **obs** (`nle_obs.py:2732`) —
+  still to isolate.
+- **OOM fix (freeze shared leaves) FAILED** — B=64 still OOMs at the same
+  22.97 MiB. Real cause: **per-monster activation memory inside the vmapped
+  monster_turn body** ([B,400,grid] BFS/LoS intermediates), not the merge output.
+  Fix = CHUNK the monster vmap (vmap K≈32–64 monsters/chunk, scan ⌈400/K⌉ chunks)
+  to cut peak activations, or cap MAX_MONSTERS for training. B=1 stays 27 ms.
+
 ### Bottom line for the JIT/GPU path
 This step graph (scan-based monster AI) is unusable under JIT on GPU at any batch
 size — not because of compile (solved: 7 s cached) but because a single fused step
