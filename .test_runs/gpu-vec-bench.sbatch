@@ -22,7 +22,9 @@ export JAX_COMPILATION_CACHE_DIR=$PWD/.jax_compile_cache_gpu_vec
 mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 export NETHAX_BENCH_NO_PARITY=1     # default Threefry training mode (vec path)
 export NETHAX_VEC_MONSTERS=1        # vectorized simultaneous-move monster step
-export NETHAX_SINGLE_LEVEL=1        # single-level state (1.4 MB/env vs 125 MB) -> 1000+ envs fit
+export NETHAX_SINGLE_LEVEL=1
+export NETHAX_DUNGEON_LEVELS=1
+export NETHAX_GROUND_STACK=4
 
 echo "[sbatch] node:    $(hostname)"
 echo "[sbatch] commit:  $(git rev-parse --short HEAD)"
@@ -33,7 +35,7 @@ source .venv/bin/activate
 
 PYTHONPATH=. python -u .test_runs/_bench_jit_explicit.py \
     --env MiniHack-Room-Monster-15x15-v0 \
-    --batches 1,256,1024,4096 \
+    --batches 1,1024,2048 \
     --warm 10 \
     --compile-watchdog 2400 \
     --json .test_runs/gpu_vec_$SLURM_JOB_ID.json

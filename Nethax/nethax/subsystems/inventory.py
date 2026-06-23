@@ -87,7 +87,15 @@ N_ARMOR_SLOTS = 7  # body, shield, helm, gloves, boots, cloak, shirt
 N_WORN_NON_ARMOR_SLOTS = 5  # wielded, off_hand, amulet, ring_L, ring_R
 
 # Ground stack depth per tile — max items on one floor tile.
-MAX_GROUND_STACK = 8
+# NETHAX_SINGLE_LEVEL training mode: shrink (the vec monster step replicates
+# ground_items [.,.,21,80,STACK] per-monster x400; at STACK=8 that's the 43MB/env
+# intermediate that OOMs large batch). 4 is ample for MiniHack tiles. Gated so the
+# byte-parity path keeps 8.
+import os as _os
+MAX_GROUND_STACK = (
+    int(_os.environ.get("NETHAX_GROUND_STACK", "4"))
+    if _os.environ.get("NETHAX_SINGLE_LEVEL", "0") == "1" else 8
+)
 
 # Base AC with no armor worn (NetHack: u.uac starts at 10).
 BASE_AC = 10

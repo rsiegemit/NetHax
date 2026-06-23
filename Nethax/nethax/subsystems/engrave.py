@@ -45,7 +45,17 @@ from flax import struct
 # This is wide enough for any realistic engraving while keeping the per-level
 # state under 1.3 MB (21*80*80 bytes).
 # Cite: vendor/nethack/include/engrave.h struct engr.engr_txt.
-ENGRAVE_TEXT_LEN: int = 80
+import os as _os
+# NETHAX_SINGLE_LEVEL training mode: shrink to 8 ("Elbereth" length). The
+# vectorized monster step vmaps monster_turn over 400 slots, replicating the
+# threaded engrave.text [H,W,LEN] per-monster -> [400,21,80,80] int32 = 215 MB/env
+# (the sole large per-env activation; blocks B>=256 on a 40 GB A100).  LEN=8 still
+# detects Elbereth (8 chars); longer engravings are truncated, fine for training.
+# Gated so the byte-parity path (no gate) keeps the full 80.
+ENGRAVE_TEXT_LEN: int = (
+    int(_os.environ.get("NETHAX_ENGRAVE_LEN", "8"))
+    if _os.environ.get("NETHAX_SINGLE_LEVEL", "0") == "1" else 80
+)
 
 # Engraving kinds (mirrors engrave.h ENGR_DUST / ENGR_BURN / ENGR_ENGRAVE / ENGR_MARK / ENGR_BLOOD).
 ENGR_NONE: int    = 0
