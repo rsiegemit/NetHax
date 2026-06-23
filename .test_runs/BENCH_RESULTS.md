@@ -209,6 +209,25 @@ leaves per-monster ([B,400,leaf], e.g. visible [B,400,21,79]); fix = merge only 
 leaves a turn actually writes, freeze the rest. (2) full step_batched still hangs —
 NOT the monster step (now 27 ms) but FOV (depth-3 nested ray-cast) / timer / obs.
 
+### Update 2026-06-23 (job 24300653) — 1000+ ENVS AT ONCE
+Single-level + engrave/ground gates + NETHAX_MAX_MONSTERS=128 (the x400 per-monster
+vmap replication multiplier). A100, Room-Monster, vec, non-vendor:
+
+| B | compile | exec1 | warm | env-steps/s | µs/env |
+|--:|--------:|------:|-----:|------------:|-------:|
+| 1    | 81 s  | 0.41 s | 294 ms | 3.4   | 294,000 |
+| **1024** | 120 s | 0.90 s | **809 ms** | **1,266** | **790** |
+| 2048 | — | — | OOM (−15.9 GiB) | | |
+| 4096 | — | — | OOM (−37.5 GiB) | | |
+
+**B=1024 runs at 1,266 env-steps/s.** Latency grew only 294→809 ms (2.7×) for 1024×
+envs → ~373× throughput scaling; per-env cost 294 ms → 790 µs. (This step was a
+>8 h hang before vectorization.) The chain of memory fixes (all gated under
+NETHAX_SINGLE_LEVEL): state 124.8→1.4 MB/env (DUNGEON_BRANCHES=1/LEVELS=1) +
+ENGRAVE_TEXT_LEN=8 (215 MB/env engrave intermediate) + MAX_MONSTERS=128 (the x400
+replication multiplier — cuts ALL per-monster intermediates ~3×). B≥2048 needs
+H100-80 GB or MAX_MONSTERS=64.
+
 ### Update 2026-06-23 (job 24269333) — FULL STEP WORKS after FOV vectorization
 With the parallel FOV (`view_from_auto` → `view_from_parallel`), the full
 `step_batched` on A100 (Room-Monster, vec, non-vendor) **completes**:
