@@ -209,6 +209,26 @@ leaves per-monster ([B,400,leaf], e.g. visible [B,400,21,79]); fix = merge only 
 leaves a turn actually writes, freeze the rest. (2) full step_batched still hangs —
 NOT the monster step (now 27 ms) but FOV (depth-3 nested ray-cast) / timer / obs.
 
+### Update 2026-06-23 (job 24269333) — FULL STEP WORKS after FOV vectorization
+With the parallel FOV (`view_from_auto` → `view_from_parallel`), the full
+`step_batched` on A100 (Room-Monster, vec, non-vendor) **completes**:
+
+| B | compile | exec1 | warm | note |
+|--:|--------:|------:|-----:|------|
+| 1  | 105 s | 0.53 s | **355 ms** | full step — was **>48 min hang** pre-FOV-vec |
+| 16 | 107 s | 0.86 s | OOM | exec1 *succeeds*; warm-loop 7.43 GiB transient tips 40 GB |
+| 256| 116 s | — | OOM (2.87 GiB) | |
+
+- **FOV was the full-step hang** — vectorizing it dropped B=1 from >48 min → 355 ms.
+  (The earlier "isolated view_from = 101 ms / not the hang" was misleading: in the
+  full step the serial shadow-cast sweep dominated; the parallel FOV fixes it.)
+- The earlier "full-step bench produces zero stdout" was a **filename typo** in the
+  poller (`gpu-explicit-bench` vs the sbatch's `gpu-vec-bench-%j.out`) — the job was
+  succeeding all along.
+- B≥16 OOM is a 40 GB **capacity edge** (B=16 exec1 fits; the warm-loop's 2nd
+  allocation OOMs). Batch training: B≤~8 on A100-40GB, or H100-80GB, or reduce the
+  step's peak transients (timer/obs still serial; vectorizing them also cuts memory).
+
 ### Update 2026-06-23 (jobs 24263295, 24263369) — both follow-ups re-scoped
 - **FOV is NOT the hang.** GPU `view_from` warm = **101 ms** (compiles 3.3s,
   completes; CPU 1.8ms). Don't rewrite FOV. The full-step hang is the **timer
