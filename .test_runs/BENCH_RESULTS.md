@@ -161,14 +161,38 @@ overhead, so CPU "only" pays 162 s.
 up. Keep it as a scan → compile fine, but GPU exec serializes. Neither single-env
 path is usable.
 
-**The way out is batch-parallelism, not single-env speed.** Real RL training runs
-thousands of envs; the GPU parallelizes the scan body across the **B** (env)
-dimension while each env's 400-iter scan stays serial. Per-step *latency* stays
-high, but *throughput* (env-steps/s) should scale with B if the wall is
-launch-bound. **Whether throughput actually recovers at large B is the open
-question** — and the reason the B-sweep (`gpu-explicit-bench.sbatch`, B up to 256)
-matters. It is expensive (each B = ~90 s compile + a multi-min/hung exec), so it
-needs a dedicated multi-hour job, not the 1 h `gpu_test` cap.
+**The way out was hypothesized to be batch-parallelism, not single-env speed** —
+GPU parallelizing the scan body across the B (env) dim. To test it (and to settle
+whether the >56 min was a ONE-TIME first-launch cost — 60k+ CUDA module loads —
+vs fundamental), the B-sweep was given an **8 h** wall (`gpu-explicit-bench.sbatch`,
+job 24053786, B=1,4,16,64,256).
+
+### FINAL VERDICT (job 24053786, A100, 8 h) — fundamental, GPU is NOT viable
+```
+reset 8.9s · B=1 compile 7.1s (CACHE HIT) · exec1 ran ~8 HOURS, NEVER finished
+→ SLURM TIMEOUT 08:00:16, still inside the single B=1 exec1; never reached B=4
+```
+- **One-time-cost hypothesis REFUTED.** A single B=1 step did not complete in
+  ~8 hours on an A100 (vs 162 s on CPU = **>175× slower and unbounded**). RSS flat
+  at 4.1 GB throughout → not module-loading / not memory growth, just stuck serial
+  compute. A one-time module-load would have finished; this did not.
+- **The GPU exec wall is FUNDAMENTAL.** The `lax.scan` monster loop is
+  catastrophic on GPU — a deep serial dependency chain emitting a flood of tiny
+  serial kernels. The B-sweep is **moot**: B=1 alone exhausts an 8 h job, so
+  per-env throughput at large B is untestable on this graph as-built.
+- **Compile is fully solved and reusable:** B=1 compile fell 89.6 s → **7.1 s** on
+  cache hit (`.jax_compile_cache_gpu`, persistent, target-specific). Compile was
+  never the wall.
+
+### Bottom line for the JIT/GPU path
+This step graph (scan-based monster AI) is unusable under JIT on GPU at any batch
+size — not because of compile (solved: 7 s cached) but because a single fused step
+executes for hours. Neither single-env path works: unroll → compile blowup; scan →
+GPU exec serializes for hours. **The only real fix is a different, GPU-parallel
+step-graph design** (vectorize the monster update across slots with masking instead
+of a serial scan — the REVERSE of the Craftax scan that fixed compile). That is a
+substantial rewrite, not a flag. For now: **CPU + eager is the only working path**
+(byte-parity validation 8–11 s/step); GPU JIT is a dead end for this graph.
 
 > NOTE: the `--exec-watchdog` SIGALRM in `_bench_jit_explicit.py` does **not**
 > interrupt a blocked native exec (the main thread is inside XLA C++; the Python
