@@ -7232,7 +7232,20 @@ def monsters_step_all(state, rng: jax.Array) -> object:
     else:
         atk_indices_arr = indices
 
-    if _os.environ.get("NETHAX_CRAFTAX_SCAN", "1") == "1":
+    if (not _use_vendor_rng()
+            and _os.environ.get("NETHAX_VEC_MONSTERS", "1") == "1"):
+        # Fast training path: all strikes resolved simultaneously vs the frozen
+        # post-move state (scatter-sum HP damage to defenders) instead of a
+        # 400-deep serial scan.  Non-vendor only — byte-parity strike order
+        # (fmon LIFO) is preserved by the serial path below.
+        from Nethax.nethax.subsystems.vec_monster_turns import (
+            vectorized_mattackm_strikes,
+        )
+        final_state = vectorized_mattackm_strikes(
+            final_state, _mattackm_one_impl, atk_indices_arr, mhit_keys,
+            _conflict_active,
+        )
+    elif _os.environ.get("NETHAX_CRAFTAX_SCAN", "1") == "1":
         def _strike_body(carry, args):
             atk_slot, key_i = args
             return _mattackm_one_jit(carry, atk_slot, key_i, _conflict_active), None

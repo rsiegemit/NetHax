@@ -116,3 +116,34 @@ def _resolve_collisions(s0, merged, can_act):
     conflict = jnp.any(same & alive_pair & lower, axis=1) & moved
     new_pos = jnp.where(conflict[:, None], mai0.pos, mai.pos)
     return merged.replace(monster_ai=mai.replace(pos=new_pos))
+
+
+def vectorized_mattackm_strikes(state, mattackm_one, indices, mhit_keys,
+                                conflict_active):
+    """Simultaneous-move replacement for the serial monster-vs-monster strike
+    scan (the 2744-eqn-body x400 loop = the next-biggest serial chain after the
+    turn loop).
+
+    ``mattackm_one(state, atk_slot, key, conflict_active)`` is the existing
+    per-attacker strike body (reused verbatim).  Each attacker picks its adjacent
+    different-faction defender and applies HP damage to that DEFENDER's slot.
+
+    Write surface (verified, .test_runs/_mattackm_write_surface.py): a strike
+    writes ONLY ``monster_ai.hp`` at the defender slot (death/cleanup is derived
+    from HP downstream).  So the merge is a clean SCATTER-SUM of damage: every
+    attacker runs against the FROZEN start state, and total damage to each
+    defender is summed.  Multiple attackers hitting one defender compose
+    additively (vs vendor-sequential, where the second sees reduced HP — the
+    accepted simultaneous-move approximation, training path only).
+    """
+    s0 = state
+    hp0 = s0.monster_ai.hp
+
+    def _one(atk, key):
+        out = mattackm_one(s0, atk, key, conflict_active)
+        return out.monster_ai.hp                          # [N] — only hp changes
+
+    hps = jax.vmap(_one)(indices, mhit_keys)              # [N_attackers, N_slots]
+    total_dmg = jnp.sum(hp0[None].astype(jnp.int32) - hps.astype(jnp.int32), axis=0)
+    new_hp = (hp0.astype(jnp.int32) - total_dmg).astype(hp0.dtype)
+    return s0.replace(monster_ai=s0.monster_ai.replace(hp=new_hp))
