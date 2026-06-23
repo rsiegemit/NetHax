@@ -1622,12 +1622,19 @@ def build_inv_strs(state) -> jnp.ndarray:
     # vmap over slot indices [0..54]
     slot_indices = jnp.arange(NLE_INV_SLOTS, dtype=jnp.int32)
 
-    # lax.map applies f sequentially (lower memory than vmap for large arrays)
     def render_one(slot_idx):
         return _render_slot(inv_state, id_state, slot_idx, two_weapon,
                             alt_slot_i32, swap_weapon_i32)
 
-    result = lax.map(render_one, slot_indices)  # uint8[55, 80]
+    # lax.map applies render_one SEQUENTIALLY (55-deep scan, ~230k serial op-
+    # executions) for low memory.  Under NETHAX_VEC_MONSTERS (training-speed mode)
+    # use vmap: each slot is independent so the output is BYTE-IDENTICAL, but it
+    # runs as one wide [55,...] GPU-parallel op.  Default keeps lax.map.
+    import os as _os
+    if _os.environ.get("NETHAX_VEC_MONSTERS", "0") == "1":
+        result = jax.vmap(render_one)(slot_indices)  # uint8[55, 80] — wide
+    else:
+        result = lax.map(render_one, slot_indices)   # uint8[55, 80] — sequential
     return result
 
 
