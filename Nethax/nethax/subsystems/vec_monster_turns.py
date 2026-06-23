@@ -50,11 +50,15 @@ from jax import tree_util as jtu
 # (player_hp, gold, score) merged and freezes everything bigger.
 _SHARED_MERGE_MAX_ELEMS = 64
 
-# Monsters processed per vmap chunk (jax.lax.map batch_size).  Caps peak per-
-# monster activation memory under the env x monster double-vmap.  Override via
-# NETHAX_VEC_CHUNK; smaller = less memory, more (but short, GPU-fast) scan steps.
+# Monsters processed per vmap chunk (jax.lax.map batch_size) — OPT-IN, default OFF.
+# NOTE (2026-06-23): chunking does NOT fix the B>=64 A100 OOM — that OOM is the
+# batched full EnvState (multi-level terrain / ground_items / 25 subsystems)
+# replicated x B by vmap(step), a capacity limit independent of the monster vmap
+# (the failing allocation is the same 22.97MiB regardless of chunk size).  Chunking
+# only slowed B=1 (27ms -> 83ms).  So default = flat vmap (fast); set
+# NETHAX_VEC_CHUNK>0 to chunk only if a future activation-bound case needs it.
 import os as _os
-_VEC_CHUNK = int(_os.environ.get("NETHAX_VEC_CHUNK", "32"))
+_VEC_CHUNK = int(_os.environ.get("NETHAX_VEC_CHUNK", "0"))  # 0 = flat vmap
 
 
 def _under_monster_ai(path):
@@ -93,11 +97,12 @@ def vectorized_monster_turns(state, monster_turn, indices, turn_keys, can_act):
     # heavy monster_turn body (per-monster BFS dist-field / LoS -> [B,N,grid]
     # under the env x monster vmaps) is bounded to K, not N.  Flat vmap-over-400
     # OOM'd the A100 at B>=64 (job 24263295); chunking is the fix.  B=1 unaffected.
-    batched = jax.lax.map(
-        lambda a: _one(a[0], a[1], a[2]),
-        (indices, turn_keys, can_act),
-        batch_size=_VEC_CHUNK,
-    )
+    if _VEC_CHUNK > 0:
+        batched = jax.lax.map(
+            lambda a: _one(a[0], a[1], a[2]),
+            (indices, turn_keys, can_act), batch_size=_VEC_CHUNK)
+    else:
+        batched = jax.vmap(_one)(indices, turn_keys, can_act)
 
     def _merge(path, s0_leaf, b_leaf):
         if _is_per_slot(path, s0_leaf, n):
@@ -168,9 +173,11 @@ def vectorized_mattackm_strikes(state, mattackm_one, indices, mhit_keys,
         j = jnp.argmax(jnp.abs(delta)).astype(jnp.int32)    # the struck defender
         return j, delta[j]                                  # two scalars — compact
 
-    js, dmgs = jax.lax.map(                                  # chunked vmap (memory)
-        lambda a: _one(a[0], a[1]), (indices, mhit_keys),
-        batch_size=_VEC_CHUNK)                               # [N], [N] (not [N,N])
+    if _VEC_CHUNK > 0:
+        js, dmgs = jax.lax.map(lambda a: _one(a[0], a[1]),
+                               (indices, mhit_keys), batch_size=_VEC_CHUNK)
+    else:
+        js, dmgs = jax.vmap(_one)(indices, mhit_keys)        # [N], [N] (not [N,N])
     total_dmg = jnp.zeros((n,), jnp.int32).at[js].add(dmgs)  # scatter-sum damage
     new_hp = (hp0 - total_dmg).astype(s0.monster_ai.hp.dtype)
     return s0.replace(monster_ai=s0.monster_ai.replace(hp=new_hp))
