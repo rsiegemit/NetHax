@@ -184,6 +184,31 @@ reset 8.9s · B=1 compile 7.1s (CACHE HIT) · exec1 ran ~8 HOURS, NEVER finished
   cache hit (`.jax_compile_cache_gpu`, persistent, target-specific). Compile was
   never the wall.
 
+## Vectorized monster step (NETHAX_VEC_MONSTERS) — GPU VALIDATED (2026-06-23)
+
+Branch `feat/vectorize-monster-step`. Replace the serial 400-slot monster scans
+(turn loop + m-vs-m) with wide vmap + field-merge; non-vendor (training) only,
+byte-parity path untouched. Isolated `monsters_step_all` on A100 (`gpu-monster-
+step.sbatch`, job 24252793, non-vendor):
+
+| config | B | compile | exec1 | warm | note |
+|--------|--:|--------:|------:|-----:|------|
+| vec ON  | 1    | 40.6 s | 0.059 s | **27.1 ms** | was >8 h serial — ~10⁶× |
+| vec ON  | 64   | 49 s   | — | **OOM** | batch intermediates too big |
+| vec ON  | 1024 | 50.5 s | — | **OOM** | |
+| vec OFF (serial), MAX_MONSTERS=8 | 1 | 28.3 s | 0.046 s | **8.1 ms** | short scan = fast |
+
+**The "~1ms/serial-op" model is WRONG.** vec-OFF with 8 monsters (~544k serial
+ops) ran in 8 ms (~15 ns/op); vec-OFF with 400 monsters ran >8 h. The serial cost
+is **wildly super-linear in scan length** — short serial scans are fine on GPU,
+long ones explode. That's exactly why vectorizing (wide/short) pays off ~10⁶×, and
+it means the remaining serial scans matter by their LENGTH/DEPTH, not raw op count.
+
+**Two follow-ups:** (1) batch OOM at B≥64 — the vec merge returns all small SHARED
+leaves per-monster ([B,400,leaf], e.g. visible [B,400,21,79]); fix = merge only the
+leaves a turn actually writes, freeze the rest. (2) full step_batched still hangs —
+NOT the monster step (now 27 ms) but FOV (depth-3 nested ray-cast) / timer / obs.
+
 ### Bottom line for the JIT/GPU path
 This step graph (scan-based monster AI) is unusable under JIT on GPU at any batch
 size — not because of compile (solved: 7 s cached) but because a single fused step

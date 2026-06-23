@@ -39,10 +39,16 @@ import jax
 import jax.numpy as jnp
 from jax import tree_util as jtu
 
-# Leaves with more than this many elements are "big" shared arrays (multi-level
-# terrain/explored/last_seen_terrain/ground_items) — kept frozen, never replicated
-# across the N-way vmap.  Small per-level arrays (visible [H,W] ~1.6k) stay merged.
-_BIG_LEAF_ELEMS = 100_000
+# Shared (non-monster_ai) leaves with more than this many elements are kept FROZEN
+# from the start-of-turn state — never replicated across the N-way vmap.  This is
+# both a correctness fact and the OOM fix: the verified monster_turn write surface
+# (.test_runs/_monster_attack_surface.py) is monster_ai per-slot + player_hp +
+# messages ONLY — every larger shared leaf (visible [H,W], status arrays,
+# multi-level terrain, ground_items, ...) is untouched by a turn, so replicating
+# it [B, N, ...] under the batch+slot vmaps was pure waste (e.g. visible became
+# [B, 400, 21, 79] -> A100 OOM at B>=64).  Threshold 64 keeps scalars/tiny vectors
+# (player_hp, gold, score) merged and freezes everything bigger.
+_SHARED_MERGE_MAX_ELEMS = 64
 
 
 def _under_monster_ai(path):
@@ -70,9 +76,9 @@ def vectorized_monster_turns(state, monster_turn, indices, turn_keys, can_act):
         def _compact(path, leaf):
             if _is_per_slot(path, leaf, n):
                 return leaf[idx]                    # this monster's own slot
-            if leaf.size > _BIG_LEAF_ELEMS:
-                return jnp.zeros((), leaf.dtype)    # drop big -> placeholder
-            return leaf                             # small shared -> keep
+            if leaf.size > _SHARED_MERGE_MAX_ELEMS:
+                return jnp.zeros((), leaf.dtype)    # frozen shared -> placeholder
+            return leaf                             # tiny shared (hp,...) -> keep
         return jtu.tree_map_with_path(_compact, out)
 
     batched = jax.vmap(_one)(indices, turn_keys, can_act)
@@ -82,8 +88,8 @@ def vectorized_monster_turns(state, monster_turn, indices, turn_keys, can_act):
             # b_leaf is [N, per-slot] == original full array; row i = monster i's
             # own-slot write. This IS the diagonal merge.
             return b_leaf.astype(s0_leaf.dtype)
-        if s0_leaf.size > _BIG_LEAF_ELEMS:
-            return s0_leaf                          # frozen big array
+        if s0_leaf.size > _SHARED_MERGE_MAX_ELEMS:
+            return s0_leaf                          # frozen shared leaf
         if s0_leaf.dtype == jnp.bool_:
             return jnp.any(b_leaf, axis=0)          # reveal union
         if jnp.issubdtype(s0_leaf.dtype, jnp.number):
@@ -137,13 +143,16 @@ def vectorized_mattackm_strikes(state, mattackm_one, indices, mhit_keys,
     accepted simultaneous-move approximation, training path only).
     """
     s0 = state
-    hp0 = s0.monster_ai.hp
+    hp0 = s0.monster_ai.hp.astype(jnp.int32)
+    n = indices.shape[0]
 
     def _one(atk, key):
         out = mattackm_one(s0, atk, key, conflict_active)
-        return out.monster_ai.hp                          # [N] — only hp changes
+        delta = hp0 - out.monster_ai.hp.astype(jnp.int32)   # [N], nonzero @defender
+        j = jnp.argmax(jnp.abs(delta)).astype(jnp.int32)    # the struck defender
+        return j, delta[j]                                  # two scalars — compact
 
-    hps = jax.vmap(_one)(indices, mhit_keys)              # [N_attackers, N_slots]
-    total_dmg = jnp.sum(hp0[None].astype(jnp.int32) - hps.astype(jnp.int32), axis=0)
-    new_hp = (hp0.astype(jnp.int32) - total_dmg).astype(hp0.dtype)
+    js, dmgs = jax.vmap(_one)(indices, mhit_keys)           # [N], [N] (not [N,N])
+    total_dmg = jnp.zeros((n,), jnp.int32).at[js].add(dmgs)  # scatter-sum damage
+    new_hp = (hp0 - total_dmg).astype(s0.monster_ai.hp.dtype)
     return s0.replace(monster_ai=s0.monster_ai.replace(hp=new_hp))
