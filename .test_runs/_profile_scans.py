@@ -49,26 +49,26 @@ def main():
 
     scans = []
 
+    from jax._src import source_info_util as _siu
+
     def _src(e):
-        si = getattr(e, "source_info", None)
-        tb = getattr(si, "traceback", None) if si else None
-        if tb is None:
-            return "?"
+        # Walk the user-frame stack; return the first few Nethax frames so we can
+        # see which subsystem owns the scan (skip the vec/profiler frames).
         try:
-            for frame in tb.frames if hasattr(tb, "frames") else []:
-                fn = frame.file_name
-                if "Nethax" in fn and "vec_monster" not in fn:
-                    return f"{fn.split('/Nethax/')[-1]}:{frame.line_number}"
+            tb = e.source_info.traceback
+            frames = []
+            for f in tb.raw_frames() if hasattr(tb, "raw_frames") else []:
+                pass
         except Exception:
             pass
-        # fallback: walk formatted frames
         try:
-            for line in tb.format() if hasattr(tb, "format") else []:
-                if "/Nethax/" in line and ".py" in line:
-                    return line.strip().split('/Nethax/')[-1][:70]
-        except Exception:
-            pass
-        return "?"
+            s = _siu.summarize(e.source_info, num_frames=6)
+            # keep the Nethax-relevant fragments
+            parts = [p for p in s.split() if "/Nethax/" in p or "nethax/" in p]
+            picks = [p.split("nethax/")[-1] for p in parts if "vec_monster" not in p]
+            return " <- ".join(picks[:3]) if picks else s[:80]
+        except Exception as ex:
+            return f"?({ex})"
 
     def walk(jx, depth=0):
         for e in jx.eqns:
