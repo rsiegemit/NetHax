@@ -66,13 +66,20 @@ def main():
 
     import jax
     import jax.numpy as jnp
-    from Nethax.nethax.parity_mode import set_parity_mode, ParityMode
-    set_parity_mode(ParityMode.NLE)
+    from Nethax.nethax.parity_mode import set_parity_mode, ParityMode, use_vendor_rng
+    # NETHAX_BENCH_NO_PARITY=1 => default (Threefry) training mode, which is the
+    # path the vectorized monster step (NETHAX_VEC_MONSTERS) runs in. Without it,
+    # NLE byte-parity mode forces the serial vendor scan (the >8h path).
+    if os.environ.get("NETHAX_BENCH_NO_PARITY", "0") != "1":
+        set_parity_mode(ParityMode.NLE)
     from Nethax.minihax.minihax_env import MinihaxEnv
 
     out = {"env": args.env, "backend": jax.default_backend(),
            "device": str(jax.devices()[0]), "path": "explicit-lower-compile",
+           "vendor_rng": bool(use_vendor_rng()),
+           "vec_monsters": os.environ.get("NETHAX_VEC_MONSTERS", "1"),
            "scaling": []}
+    log(f"vendor_rng={out['vendor_rng']} vec_monsters={out['vec_monsters']}")
     log(f"backend={out['backend']} device={out['device']} env={args.env}")
 
     env = MinihaxEnv(args.env)
