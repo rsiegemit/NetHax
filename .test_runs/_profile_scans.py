@@ -49,6 +49,27 @@ def main():
 
     scans = []
 
+    def _src(e):
+        si = getattr(e, "source_info", None)
+        tb = getattr(si, "traceback", None) if si else None
+        if tb is None:
+            return "?"
+        try:
+            for frame in tb.frames if hasattr(tb, "frames") else []:
+                fn = frame.file_name
+                if "Nethax" in fn and "vec_monster" not in fn:
+                    return f"{fn.split('/Nethax/')[-1]}:{frame.line_number}"
+        except Exception:
+            pass
+        # fallback: walk formatted frames
+        try:
+            for line in tb.format() if hasattr(tb, "format") else []:
+                if "/Nethax/" in line and ".py" in line:
+                    return line.strip().split('/Nethax/')[-1][:70]
+        except Exception:
+            pass
+        return "?"
+
     def walk(jx, depth=0):
         for e in jx.eqns:
             if e.primitive.name == "scan":
@@ -57,7 +78,7 @@ def main():
                 be = count_eqns(body)
                 ln = e.params.get("length")
                 serial = be * (ln if isinstance(ln, int) else 1)
-                scans.append((serial, be, ln, depth))
+                scans.append((serial, be, ln, depth, _src(e)))
             for v in e.params.values():
                 s = getattr(v, "jaxpr", None)
                 if s is not None:
@@ -71,9 +92,9 @@ def main():
     scans.sort(reverse=True)
     total_serial = sum(s[0] for s in scans)
     log(f"total scans={len(scans)}  sum(serial=body_eqns*len)={total_serial:,}")
-    log("TOP 20 by serial op-executions (serial, body_eqns, length, depth):")
+    log("TOP 20 by serial op-executions (serial, body_eqns, length, depth, src):")
     for s in scans[:20]:
-        log(f"   serial={s[0]:>10,}  body_eqns={s[1]:>7}  len={str(s[2]):>6}  depth={s[3]}")
+        log(f"   serial={s[0]:>10,}  body={s[1]:>7}  len={str(s[2]):>5}  d={s[3]}  {s[4]}")
     log("DONE")
 
 
