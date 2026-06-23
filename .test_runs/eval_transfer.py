@@ -23,8 +23,16 @@ spec = importlib.util.spec_from_file_location("ppo_minihack",
 ppo = importlib.util.module_from_spec(spec); spec.loader.exec_module(ppo)
 crop_glyphs, Agent = ppo.crop_glyphs, ppo.Agent
 
-ORDS = [107, 108, 106, 104, 117, 110, 98, 121]  # N E S W NE SE SW NW (vi keys)
 MAXSTEPS = 100
+
+
+def env_ords(env_cls_name):
+    """ASCII ords for this real env's action list (agent index -> ord)."""
+    import importlib
+    mod = importlib.import_module("minihack.envs.room")
+    e = getattr(mod, env_cls_name)()
+    acts = e._actions if hasattr(e, "_actions") else e.actions
+    return [int(a) for a in acts]
 
 
 def load_agent(ckpt):
@@ -58,7 +66,7 @@ def eval_real(ag, env_cls_name, episodes):
     return float(np.mean(rets)), succ / episodes
 
 
-def eval_minihax(ag, env_name, episodes):
+def eval_minihax(ag, env_name, episodes, ords):
     import jax
     from Nethax.minihax.minihax_env import MinihaxEnv
     from Nethax.nethax.obs.nle_obs import build_nle_observation
@@ -72,7 +80,7 @@ def eval_minihax(ag, env_name, episodes):
             ob = build_nle_observation(s)
             crop = crop_glyphs(np.asarray(ob["glyphs"]), np.asarray(ob["blstats"]))
             i = act(ag, crop)
-            s, r, done, info = env.step(s, ORDS[i], jax.random.key(7000 + ep * 200 + t),
+            s, r, done, info = env.step(s, ords[i], jax.random.key(7000 + ep * 200 + t),
                                         fired_mask=fm, step_count=t, pits_at_reset=par)
             fm = info["fired_mask"]
             r = float(r); R += r
@@ -91,12 +99,15 @@ def main():
     ap.add_argument("--episodes", type=int, default=20)
     args = ap.parse_args()
     ag = load_agent(args.ckpt)
+    ords = env_ords(args.real_env)
 
     print(f"[transfer] ckpt={args.ckpt} episodes={args.episodes}", flush=True)
-    mr, sr = eval_real(ag, args.real_env, args.episodes)
-    print(f"  REAL MiniHack   : mean_return {mr:+.3f}  success {sr:.0%}", flush=True)
-    mr, sr = eval_minihax(ag, args.minihax_env, args.episodes)
-    print(f"  Minihax (vec)   : mean_return {mr:+.3f}  success {sr:.0%}", flush=True)
+    rr, rs = eval_real(ag, args.real_env, args.episodes)
+    print(f"  REAL MiniHack   : mean_return {rr:+.3f}  success {rs:.0%}", flush=True)
+    mr, ms = eval_minihax(ag, args.minihax_env, args.episodes, ords)
+    print(f"  Minihax (vec)   : mean_return {mr:+.3f}  success {ms:.0%}", flush=True)
+    print(f"RESULT {args.real_env} real_ret={rr:.3f} real_succ={rs:.2f} "
+          f"mhx_ret={mr:.3f} mhx_succ={ms:.2f}", flush=True)
 
 
 if __name__ == "__main__":
