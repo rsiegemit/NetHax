@@ -1144,6 +1144,84 @@ def _view_from_quadrant(
     return final[0]
 
 
+def view_from_auto(
+    terrain: jnp.ndarray,
+    player_pos: jnp.ndarray,
+    max_radius: int = 0,
+    opaque_overlay: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """FOV dispatch: GPU-parallel per-cell LoS (:func:`view_from_parallel`) in the
+    vectorized non-parity training path, else vendor shadow-cast (:func:`view_from`).
+
+    Gate: ``NETHAX_VEC_FOV`` (default on) AND not vendor-RNG mode — byte-parity
+    requires the exact vendor algorithm, so it always keeps :func:`view_from`.
+    On open rooms the two agree exactly (IoU 1.0); they may diverge on complex
+    pillar/corner geometry, which is acceptable for training (vec mode only).
+    """
+    import os as _os
+    from Nethax.nethax.parity_mode import use_vendor_rng
+    if _os.environ.get("NETHAX_VEC_FOV", "1") == "1" and not use_vendor_rng():
+        return view_from_parallel(terrain, player_pos, max_radius, opaque_overlay)
+    return view_from(terrain, player_pos, max_radius, opaque_overlay)
+
+
+def view_from_parallel(
+    terrain: jnp.ndarray,
+    player_pos: jnp.ndarray,
+    max_radius: int = 0,
+    opaque_overlay: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """GPU-parallel FOV for the vectorized (non-parity) training path.
+
+    Drop-in alternative to :func:`view_from` (vendor shadow-casting) that trades
+    exact vendor visibility for a fully PARALLEL per-cell line-of-sight: each cell
+    casts a DDA ray back to the source and is visible iff no opaque cell lies
+    strictly between.  vmapped over all H*W cells -> one wide fori_loop of
+    ~H+W steps, instead of vendor's depth-3 nested row/segment/column sweep
+    (fov.py:1024, the ~1.8M-serial-op cluster that is slow on GPU: 101 ms warm).
+
+    NOT byte-parity (differs from shadow-casting around corners / lit rooms), so
+    this is used ONLY in vec mode.  Returns bool[H, W] could_see mask.
+    """
+    h, w = terrain.shape
+    opaque = _build_terrain_opaque(terrain)
+    if opaque_overlay is not None:
+        opaque = opaque | opaque_overlay
+    sr = player_pos[0].astype(jnp.int32)
+    sc = player_pos[1].astype(jnp.int32)
+    rng_v = jnp.int32(max_radius)
+    max_steps = h + w
+
+    rr_grid, cc_grid = jnp.meshgrid(
+        jnp.arange(h, dtype=jnp.int32), jnp.arange(w, dtype=jnp.int32),
+        indexing="ij")
+
+    def _los(tr, tc):
+        dr = tr - sr
+        dc = tc - sc
+        steps = jnp.maximum(jnp.abs(dr), jnp.abs(dc)).astype(jnp.int32)
+        steps_safe = jnp.maximum(steps, 1)
+
+        def body(k, blocked):
+            # Intermediate cells are 1..steps-1; endpoints excluded.
+            inter = (k >= 1) & (k < steps)
+            # DDA sample along the line at fraction k/steps (round to nearest).
+            rr = sr + jnp.round(dr * k / steps_safe).astype(jnp.int32)
+            cc = sc + jnp.round(dc * k / steps_safe).astype(jnp.int32)
+            rr = jnp.clip(rr, 0, h - 1)
+            cc = jnp.clip(cc, 0, w - 1)
+            return blocked | (inter & opaque[rr, cc])
+
+        blocked = jax.lax.fori_loop(1, max_steps, body, jnp.bool_(False))
+        within = (rng_v == 0) | (steps <= rng_v)
+        return within & ~blocked
+
+    vis = jax.vmap(jax.vmap(_los))(rr_grid, cc_grid)        # [H, W]
+    src_r = jnp.clip(sr, 0, h - 1)
+    src_c = jnp.clip(sc, 0, w - 1)
+    return vis.at[src_r, src_c].set(True)
+
+
 def view_from(
     terrain: jnp.ndarray,
     player_pos: jnp.ndarray,

@@ -50,6 +50,12 @@ from jax import tree_util as jtu
 # (player_hp, gold, score) merged and freezes everything bigger.
 _SHARED_MERGE_MAX_ELEMS = 64
 
+# Monsters processed per vmap chunk (jax.lax.map batch_size).  Caps peak per-
+# monster activation memory under the env x monster double-vmap.  Override via
+# NETHAX_VEC_CHUNK; smaller = less memory, more (but short, GPU-fast) scan steps.
+import os as _os
+_VEC_CHUNK = int(_os.environ.get("NETHAX_VEC_CHUNK", "32"))
+
 
 def _under_monster_ai(path):
     return any(getattr(p, "name", None) == "monster_ai" for p in path)
@@ -81,7 +87,17 @@ def vectorized_monster_turns(state, monster_turn, indices, turn_keys, can_act):
             return leaf                             # tiny shared (hp,...) -> keep
         return jtu.tree_map_with_path(_compact, out)
 
-    batched = jax.vmap(_one)(indices, turn_keys, can_act)
+    # Chunked vmap (jax.lax.map with batch_size) instead of a flat vmap over all
+    # N monsters: vmap K monsters per chunk, scan across ceil(N/K) chunks.  The
+    # OUTPUT is identical [N, compact], but peak ACTIVATION memory inside the
+    # heavy monster_turn body (per-monster BFS dist-field / LoS -> [B,N,grid]
+    # under the env x monster vmaps) is bounded to K, not N.  Flat vmap-over-400
+    # OOM'd the A100 at B>=64 (job 24263295); chunking is the fix.  B=1 unaffected.
+    batched = jax.lax.map(
+        lambda a: _one(a[0], a[1], a[2]),
+        (indices, turn_keys, can_act),
+        batch_size=_VEC_CHUNK,
+    )
 
     def _merge(path, s0_leaf, b_leaf):
         if _is_per_slot(path, s0_leaf, n):
@@ -152,7 +168,9 @@ def vectorized_mattackm_strikes(state, mattackm_one, indices, mhit_keys,
         j = jnp.argmax(jnp.abs(delta)).astype(jnp.int32)    # the struck defender
         return j, delta[j]                                  # two scalars — compact
 
-    js, dmgs = jax.vmap(_one)(indices, mhit_keys)           # [N], [N] (not [N,N])
+    js, dmgs = jax.lax.map(                                  # chunked vmap (memory)
+        lambda a: _one(a[0], a[1]), (indices, mhit_keys),
+        batch_size=_VEC_CHUNK)                               # [N], [N] (not [N,N])
     total_dmg = jnp.zeros((n,), jnp.int32).at[js].add(dmgs)  # scatter-sum damage
     new_hp = (hp0 - total_dmg).astype(s0.monster_ai.hp.dtype)
     return s0.replace(monster_ai=s0.monster_ai.replace(hp=new_hp))

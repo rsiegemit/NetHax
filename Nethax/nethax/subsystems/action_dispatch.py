@@ -409,9 +409,10 @@ def _apply_fov(state):
         & (jnp.abs(cols_g - pc) <= jnp.int32(1))
     )
 
-    vf_mask = view_from(terrain_2d, state.player_pos,
-                        max_radius=0,
-                        opaque_overlay=opaque_overlay)
+    from Nethax.nethax.fov import view_from_auto as _view_from_auto
+    vf_mask = _view_from_auto(terrain_2d, state.player_pos,
+                              max_radius=0,
+                              opaque_overlay=opaque_overlay)
     # EXPERIMENT 2026-06-04: gate vf_mask with hero-room-only lit flood
     # rather than map-wide lit_dilated.  vendor vision_recalc only marks
     # cells IN_SIGHT in the hero's CURRENT lit room, not every lit room.

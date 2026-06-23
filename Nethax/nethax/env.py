@@ -626,7 +626,7 @@ class NethaxEnv:
         # Mirror that here by also seeding ``visible`` and stamping
         # ``last_seen_terrain`` for the FOV tiles — exactly as the per-step
         # ``subsystems/action_dispatch.py::_apply_fov`` does after a move.
-        from Nethax.nethax.fov import view_from
+        from Nethax.nethax.fov import view_from_auto as view_from
         terrain_l0_full = state.terrain[0, 0, :, :]
         # Vendor view_from (vendor/nle/src/vision.c:2640-2731, Algorithm C):
         # the could_see/IN_SIGHT mask is produced by a row-by-row segment
