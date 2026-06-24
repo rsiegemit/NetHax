@@ -1841,7 +1841,45 @@ def _resolve_monster(
     rc = _resolve_place(d.place, terrain_np, w, h, resolved_rooms, next_key)
     if rc is None:
         rc = (0, 0)
-    return rc, idx, state, []
+
+    # m_initgrp group spawn in default (Threefry) mode too (vendor makemon.c
+    # :1369-1378).  G_SGROUP / G_LGROUP species (jackal, sewer rat, gnome, …)
+    # spawn a same-type pack around the leader; real MiniHack Room-Monster/
+    # -Ultimate therefore has MORE, weaker monsters than a lone spawn.  Without
+    # this the default path emitted singletons (e.g. 3 monsters where real has
+    # 4), a per-spawn count/placement mismatch vs real.  Members are placed via
+    # vendor ``enexto`` around the leader using the per-episode-seeded
+    # ``vendor_rng``.  We skip the m_initweap rn2 alignment draws (only needed
+    # for byte parity, which is handled by the use_vendor_rng() block above and
+    # never reaches here).
+    members: list = []
+    if d.name == "random":
+        is_sgroup = bool(_MON_SGROUP[idx]) if 0 <= idx < _MON_SGROUP.shape[0] else False
+        is_lgroup = bool(_MON_LGROUP[idx]) if 0 <= idx < _MON_LGROUP.shape[0] else False
+        if is_sgroup or is_lgroup:
+            from Nethax.nethax import vendor_rng as _vrng_g
+            vrng = state.vendor_rng
+            grp_n = 0
+            if is_sgroup:
+                vrng, _gate = _vrng_g.rn2_jax(vrng, jnp.int32(2))
+                if int(_gate) != 0:
+                    grp_n = 3
+            else:
+                vrng, _lg = _vrng_g.rn2_jax(vrng, jnp.int32(3))
+                grp_n = 10 if int(_lg) != 0 else 3
+            if grp_n > 0:
+                vrng, _cnt_raw = _vrng_g.rn2_jax(vrng, jnp.int32(grp_n))
+                cnt = max(1, (int(_cnt_raw) + 1) // 4)  # u.ulevel==1 divisor
+                occ = set(occupied) if occupied else set()
+                occ.add(rc)
+                xi, yi = rc[1], rc[0]
+                for _m in range(cnt):
+                    mpos, vrng = _enexto(terrain_np, occ, xi, yi, w, h, vrng)
+                    if mpos is not None:
+                        members.append((mpos, idx))
+                        occ.add(mpos)
+            state = state.replace(vendor_rng=vrng)
+    return rc, idx, state, members
 
 
 def _resolve_object(
