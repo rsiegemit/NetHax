@@ -870,6 +870,20 @@ def _apply_directives(
         )
     else:
         state = EnvState.default(rng, static)
+        # Default (Threefry) mode: EnvState.default leaves ``vendor_rng`` as a
+        # constant empty ISAAC64 stream.  The Room-Random / -Monster / -Dark
+        # placement wrappers (canonical.py ``_wrap_*_room_placement``) draw the
+        # player-spawn and stair cells from ``state.vendor_rng``, so an unseeded
+        # stream makes EVERY reset produce an identical layout (player + stair
+        # fixed regardless of the episode key) — unlike real MiniHack, which
+        # randomizes placement each episode.  Seed the stream from the episode
+        # ``rng`` so default-mode layouts vary per-episode.  (Byteparity mode
+        # seeds ``vendor_rng`` via ``NethaxEnv.reset`` above and is untouched.)
+        from Nethax.nethax import vendor_rng as _vrng_seed_mod
+        _iso_seed = jax.random.randint(
+            rng, (), 0, jnp.iinfo(jnp.int32).max, dtype=jnp.int32
+        ).astype(jnp.uint64)
+        state = state.replace(vendor_rng=_vrng_seed_mod.init_jax(_iso_seed))
 
     # 2. Initialise terrain[0, 0] sub-region with the fill character.
     fill_tile = int(TERRAIN_CHAR_TO_TILE[fill])
