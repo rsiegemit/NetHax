@@ -1821,6 +1821,23 @@ def _resolve_monster(
         new_state = state.replace(vendor_rng=vrng)
         return rc, idx, new_state, members
 
+    # Default (Threefry) mode for ``MONSTER:random``: pick a level-appropriate
+    # random monster identity (vendor rndmonst) instead of the fixed ``newt``
+    # placeholder, so spawns vary by type+strength like real MiniHack.  Without
+    # this, every Room-Monster/-Ultimate monster is the same tanky entry, which
+    # a real-MiniHack-trained policy can't clear (it expects mostly weak depth-1
+    # monsters) — Room-Monster-15x15 transfer collapses to ~30%.  ``vendor_rng``
+    # is seeded per-episode in ``_apply_directives`` (default branch), so the
+    # pick varies by seed.  Byte-parity mode is handled by the
+    # ``use_vendor_rng()`` block above and never reaches here.
+    if d.name == "random" and state is not None:
+        from Nethax.nethax import vendor_rng as _vendor_rng_dm
+        from Nethax.nethax.dungeon.spawning import pick_monster_for_level
+        _vrng_dm = state.vendor_rng
+        _vrng_dm, _picked_dm = pick_monster_for_level(None, 1, vendor_rng=_vrng_dm)
+        idx = int(_picked_dm)
+        state = state.replace(vendor_rng=_vrng_dm)
+
     rc = _resolve_place(d.place, terrain_np, w, h, resolved_rooms, next_key)
     if rc is None:
         rc = (0, 0)
@@ -1925,6 +1942,19 @@ def _write_monster(
     row, col = pos_rc
     mon_idx_clipped = max(0, min(mon_idx, int(_BASE_AC.shape[0]) - 1))
 
+    # HP from the monster's level (vendor makemon.c::newmonhp), NOT a flat 8.
+    # A flat 8 made every monster equally tanky regardless of species, so a
+    # real-MiniHack-trained policy that expects mostly weak depth-1 monsters
+    # (newt/sewer-rat = 1..4 HP) couldn't clear Room-Monster levels and got
+    # drained to death — Room-Monster-15x15 transfer ~30%.  Roll per-spawn with
+    # a key folded from the episode rng + slot so it's reproducible and varies
+    # by monster.  Monster HP is not part of the NLE obs (glyphs/blstats), so
+    # byte parity is unaffected.
+    from Nethax.nethax.subsystems.monster_ai import _newmonhp_roll as _nmhp
+    _m_lev = int(MONSTERS[mon_idx_clipped].level)
+    _hp_key = jax.random.fold_in(state.rng, jnp.int32(slot * 1009 + mon_idx_clipped + 1))
+    _hp_val = int(_nmhp(_hp_key, jnp.int32(_m_lev)))
+
     new_mai = mai.replace(
         pos=mai.pos.at[slot].set(jnp.array([row, col], dtype=jnp.int16)),
         # entry_idx selects the monster glyph (GLYPH_MON_OFF + entry_idx ==
@@ -1932,8 +1962,9 @@ def _write_monster(
         # default (0 = uninitialized), which rendered as NUL on the map and
         # produced glyph-table divergence for Monster-* room variants.
         entry_idx=mai.entry_idx.at[slot].set(jnp.int16(mon_idx_clipped)),
-        hp=mai.hp.at[slot].set(jnp.int32(8)),
-        hp_max=mai.hp_max.at[slot].set(jnp.int32(8)),
+        hp=mai.hp.at[slot].set(jnp.int32(_hp_val)),
+        hp_max=mai.hp_max.at[slot].set(jnp.int32(_hp_val)),
+        m_lev=mai.m_lev.at[slot].set(jnp.int16(_m_lev)),
         alive=mai.alive.at[slot].set(jnp.bool_(True)),
         ac=mai.ac.at[slot].set(_BASE_AC[mon_idx_clipped]),
         is_large=mai.is_large.at[slot].set(_IS_LARGE[mon_idx_clipped]),
