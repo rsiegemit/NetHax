@@ -67,7 +67,10 @@ def eval_real(ag, env_cls_name, episodes):
 
 
 def eval_minihax(ag, env_name, episodes, ords):
-    import jax
+    import os as _os, jax
+    if _os.environ.get("NETHAX_EVAL_BYTEPARITY", "0") == "1":
+        from Nethax.nethax.parity_mode import set_parity_mode, ParityMode
+        set_parity_mode(ParityMode.NLE_BYTEPARITY)  # the validated faithful path
     from Nethax.minihax.minihax_env import MinihaxEnv
     from Nethax.nethax.obs.nle_obs import build_nle_observation
     env = MinihaxEnv(env_name)
