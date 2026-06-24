@@ -946,7 +946,6 @@ def _apply_directives(
     # Room-Ultimate; Trap/Random/Dark wrappers handle the prefix
     # themselves and don't have monster directives.
     has_monster_dir = any(isinstance(d, _MonsterDirective) for d in directives)
-    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng_dl
     # Room envs carve via _FillTerrainDirective (not _RoomDirective) so
     # ``resolved_rooms`` is empty.  Derive the room bbox from the FLOOR-fill
     # directive's rect (the fill is applied later in pass 2, so we can't
@@ -967,9 +966,13 @@ def _apply_directives(
                 break
 
     _mklev_stair_cell = None  # (row, col) of the vendor mkstairs down-stair
+    # NOTE: not gated on ``_use_vendor_rng_dl()``.  The Monster/Ultimate room
+    # wrappers (canonical.py ``_wrap_monster_room_placement`` etc.) consume
+    # ``state.vendor_rng`` for layout in *both* parity modes — the down-stair
+    # cell must be stamped in both too, else default (Threefry) mode produces a
+    # goal-less level and the agent can never reach stairs-down (0% transfer).
     if (
         state is not None
-        and _use_vendor_rng_dl()
         and has_monster_dir
         and len(resolved_rooms) == 1
     ):
