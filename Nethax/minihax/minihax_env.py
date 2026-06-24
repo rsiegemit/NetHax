@@ -156,6 +156,46 @@ class MinihaxEnv:
         }
         return state, info
 
+    def reset_batch(
+        self, keys: jax.Array,
+    ) -> Tuple[EnvState, Dict[str, Any]]:
+        """Build a batch of fresh envs and stack them along a leading axis.
+
+        Returns ``(batched_state, batched_info)`` where every leaf of
+        ``batched_state`` (an :class:`EnvState` pytree) and of ``batched_info``
+        has a leading batch dimension ``B = keys.shape[0]``.  The result is
+        ready to feed straight into ``jax.vmap(self.step)`` (optionally wrapped
+        in ``jax.jit``), so a whole population of differently-seeded envs steps
+        in parallel — the path for seed-parallel RL training on GPU.
+
+        Why a host-side loop rather than ``jax.vmap(self.reset)``: level
+        generation (``_apply_directives``) is irreducibly host-side — it walks
+        a Python list of des directives, uses ``set()`` / ``int()`` / numpy and
+        data-dependent control flow (the 200-iter ``somxy`` placement loops,
+        the parity-mode ``NethaxEnv.reset`` bootstrap), none of which is
+        ``jit``/``vmap`` traceable.  Reset is therefore constructed per seed on
+        the host and the *output* states are stacked; only ``step`` (vectorised
+        via ``NETHAX_VEC_MONSTERS``) runs traced under vmap.  Construction cost
+        is one-time per batch — amortised across the rollout — so the per-step
+        GPU throughput is unaffected.
+
+        Parameters
+        ----------
+        keys : jax.Array
+            A batch of PRNG keys, e.g. ``jax.random.split(key, B)``.  Iterated
+            along axis 0; each row seeds one env.
+        """
+        states = []
+        infos = []
+        for i in range(int(keys.shape[0])):
+            s, info = self.reset(keys[i])
+            states.append(s)
+            infos.append(info)
+        stack = lambda *xs: jnp.stack(xs)
+        batched_state = jax.tree_util.tree_map(stack, *states)
+        batched_info = jax.tree_util.tree_map(stack, *infos)
+        return batched_state, batched_info
+
     def step(
         self,
         state: EnvState,
