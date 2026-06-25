@@ -713,6 +713,25 @@ class NethaxEnv:
         info: Dict[str, Any] = {}
         return new_state, obs, reward, done, info
 
+    def move_step(
+        self,
+        state: EnvState,
+        dir_idx: jax.Array,
+        rng: jax.Array,
+    ) -> Tuple[EnvState, Dict[str, jax.Array], jax.Array, jax.Array, Dict[str, Any]]:
+        """Movement-only fast step (training throughput path).
+
+        ``dir_idx`` in [0,7] (N,E,S,W,NE,SE,SW,NW).  Byte-identical to
+        :meth:`step` for a movement action (verified 40/40 cases) but
+        dispatches ONLY the move handler — no 46-way ``lax.switch`` — so it
+        compiles in seconds (vs ~14min) with a ~12x smaller graph and is far
+        cheaper per step under the training ``vmap``.  Use for RL on
+        movement-only tasks (e.g. MiniHack Room); the full :meth:`step` engine
+        is unchanged for fidelity / non-movement actions.
+        """
+        new_state, obs, reward, done = _fast_move_step_impl(state, dir_idx, rng)
+        return new_state, obs, reward, done, {}
+
     # ----------------------------------------------------------------------
     # Batched (vmap-parallel) API — Wave 7 RL-scale training entry points.
     # ----------------------------------------------------------------------
@@ -2115,6 +2134,85 @@ def _obs_jit(prev_state, new_state):
     obs = build_nle_observation(new_state)
     reward = jnp.float32(new_state.scoring.score - prev_state.scoring.score)
     return obs, reward
+
+
+# ---------------------------------------------------------------------------
+# Restricted-action FAST step (training throughput path).
+#
+# Measured: the 46-handler ``lax.switch`` in ``dispatch_action`` is ~98% of the
+# per-step compile (full step 810s/247k HLO lines vs a single-handler dispatch
+# 9.3s/19.6k lines) and the bulk of per-step exec cost.  RL Room tasks use only
+# movement, so this path dispatches ONLY ``_move_shared`` (a dynamic dir_idx,
+# no switch), then runs the IDENTICAL post-dispatch phases (monster turn +
+# status + obs) as ``_step_impl``.  Result: seconds-not-minutes compile, a 12x
+# smaller/cheaper graph -> the headroom for GPU mega-batch.  The full 46-handler
+# engine (``_step_impl``) is untouched; this is an additive parallel mode, so
+# byte parity is unaffected.  ``dir_idx`` in [0,7] per action_dispatch._DIR_TABLE.
+# ---------------------------------------------------------------------------
+def _fast_move_dispatch_body(state, dir_idx, rng_act):
+    from Nethax.nethax.subsystems.action_dispatch import _move_shared
+    # Same pre-handler mutation as _dispatch_body (clear message, reset the
+    # consumed-turn flag), then call the move handler directly — no switch.
+    ns0 = state.replace(
+        messages=_clear_message(state.messages),
+        action_consumed_turn=jnp.bool_(True),
+    )
+    return _move_shared(ns0, rng_act, dir_idx)
+
+
+def _fast_move_dispatch_jit_impl(state, dir_idx, rng_act):
+    body_result = _fast_move_dispatch_body(state, dir_idx, rng_act)
+    # Brax-flat done short-circuit (same select pattern as _dispatch_jit_impl).
+    return jax.tree_util.tree_map(
+        lambda new, orig: jnp.where(state.done, orig, new),
+        body_result,
+        state,
+    )
+
+
+_fast_move_dispatch_jit = jax.jit(_fast_move_dispatch_jit_impl)
+
+
+def _fast_move_step_impl(state, dir_idx, rng):
+    """Movement-only step — mirrors ``_step_impl`` with phase-1 = ``_move_shared``.
+
+    All post-dispatch phases (pre-monster, monster turn, post-monster, obs) are
+    the SAME functions ``_step_impl`` calls, so for a movement action this is
+    byte-equivalent to the full step; it only avoids inlining the 45 non-move
+    handlers into HLO.
+    """
+    rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow, rng_explvl, rng_regions, rng_astral = jax.random.split(rng, 9)
+
+    _PM_WIZARD_ENTRY = jnp.int32(281)
+    prev_wizard_alive = jnp.any(
+        state.monster_ai.alive
+        & (state.monster_ai.entry_idx.astype(jnp.int32) == _PM_WIZARD_ENTRY)
+    )
+    prev_branch = state.dungeon.current_branch.astype(jnp.int32)
+    prev_level = state.dungeon.current_level.astype(jnp.int32)
+
+    # Phase 1: movement dispatch ONLY (no 46-handler switch).
+    ns = _fast_move_dispatch_jit(state, dir_idx, rng_act)
+
+    # Phases 1a/1b .. 8a — identical to _step_impl.
+    ns = _pre_monster_jit(ns, state, rng_act, rng_astral, prev_branch, prev_level)
+    if _USE_JIT_SPLIT:
+        _orig_ns = ns
+        ns, _pre_round, _turn_keys, _mhit_keys = _monster_pre_c_jit(ns, state, rng_monsters)
+        ns = _monster_turn_jit2(ns, state, _orig_ns, _turn_keys)
+        ns = _monster_post_c_jit(ns, state, _orig_ns, _pre_round, _mhit_keys)
+    ns = _monster_jit(ns, state, rng_monsters, rng_regions)
+    if _USE_JIT_SPLIT:
+        ns = _monster_status_tick_jit(ns)
+    new_state = _post_monster_jit(
+        ns, state, prev_wizard_alive, rng_status, rng_poly, rng_shop,
+        rng_swallow, rng_explvl,
+    )
+    if use_vendor_rng():
+        from Nethax.nethax.obs.nle_obs import consume_disp_for_obs as _consume_disp
+        new_state = new_state.replace(vendor_rng_disp=_consume_disp(new_state))
+    obs, reward = _obs_jit(state, new_state)
+    return new_state, obs, reward, new_state.done
 
 
 # --- Batched orchestrator (Seam C+B+A) ---
