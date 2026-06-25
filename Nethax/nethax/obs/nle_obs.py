@@ -820,6 +820,23 @@ def build_nle_observation(env_state) -> dict[str, jnp.ndarray]:
     }
 
 
+def build_minimal_observation(env_state) -> dict[str, jnp.ndarray]:
+    """RL-minimal observation: ONLY ``glyphs`` + ``blstats``.
+
+    The full :func:`build_nle_observation` computes 17 fields every step
+    (chars/colors/specials/message/inv_strs/tty/screen_descriptions/...), but a
+    glyph-based RL policy consumes only ``glyphs`` + ``blstats`` — and the obs
+    builder is ~77% of per-step GPU time (measured).  This skips everything else
+    for the training throughput path.  The two returned fields are byte-identical
+    to the full builder's (same ``build_glyphs`` / ``build_blstats``).  Use the
+    full builder for eval / byte-parity.
+    """
+    return {
+        "glyphs":  build_glyphs(env_state),
+        "blstats": build_blstats(env_state),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-field builders (Wave 3)
 # ---------------------------------------------------------------------------

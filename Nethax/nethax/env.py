@@ -713,8 +713,12 @@ class NethaxEnv:
         info: Dict[str, Any] = {}
         return new_state, obs, reward, done, info
 
-    def make_restricted_step(self, action_ords):
+    def make_restricted_step(self, action_ords, minimal_obs: bool = False):
         """Build a fast step over a CONFIGURABLE small action set.
+
+        ``minimal_obs=True`` returns only glyphs+blstats (the ~77%-of-step-time
+        obs builder is skipped) for the training throughput path; the two fields
+        are byte-identical to the full obs.
 
         ``action_ords`` is the list of ASCII action ords the task/policy uses
         (the agent emits index 0..len-1).  The returned ``step_fn(state, action,
@@ -727,7 +731,9 @@ class NethaxEnv:
         which need a follow-up key) are NOT modelled here — use the full
         :meth:`step` for those.
         """
-        fn = _make_restricted_step_impl(tuple(int(o) for o in action_ords))
+        fn = _make_restricted_step_impl(
+            tuple(int(o) for o in action_ords), bool(minimal_obs),
+        )
 
         def step_fn(state, action, rng):
             new_state, obs, reward, done = fn(state, action, rng)
@@ -2239,10 +2245,25 @@ def _fast_move_step_impl(state, dir_idx, rng):
 import functools as _functools
 
 
-@_functools.lru_cache(maxsize=32)
-def _make_restricted_step_impl(action_ords: tuple):
+@jax.jit
+def _obs_jit_minimal(prev_state, new_state):
+    """RL-minimal obs (glyphs + blstats only) + reward — separate cache slot.
+
+    The obs builder is ~77% of per-step GPU time; this skips the 15 unused NLE
+    fields for the training throughput path.  glyphs/blstats are byte-identical
+    to the full builder's.
+    """
+    from Nethax.nethax.obs.nle_obs import build_minimal_observation
+    obs = build_minimal_observation(new_state)
+    reward = jnp.float32(new_state.scoring.score - prev_state.scoring.score)
+    return obs, reward
+
+
+@_functools.lru_cache(maxsize=64)
+def _make_restricted_step_impl(action_ords: tuple, minimal_obs: bool = False):
     """Build a step impl that dispatches over ONLY the handlers ``action_ords``
-    touch.  Cached per action-set so the lookup tables + closure are reused.
+    touch.  Cached per (action-set, minimal_obs).  ``minimal_obs=True`` returns
+    only glyphs+blstats (training throughput path); else the full NLE obs.
     """
     import numpy as _np
     from Nethax.nethax.subsystems.action_dispatch import (
@@ -2330,7 +2351,10 @@ def _make_restricted_step_impl(action_ords: tuple):
         if use_vendor_rng():
             from Nethax.nethax.obs.nle_obs import consume_disp_for_obs as _consume_disp
             new_state = new_state.replace(vendor_rng_disp=_consume_disp(new_state))
-        obs, reward = _obs_jit(state, new_state)
+        if minimal_obs:
+            obs, reward = _obs_jit_minimal(state, new_state)
+        else:
+            obs, reward = _obs_jit(state, new_state)
         return new_state, obs, reward, new_state.done
 
     return _restricted_step_impl
