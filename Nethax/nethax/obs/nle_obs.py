@@ -832,7 +832,7 @@ def build_minimal_observation(env_state) -> dict[str, jnp.ndarray]:
     full builder for eval / byte-parity.
     """
     return {
-        "glyphs":  build_glyphs(env_state),
+        "glyphs":  build_glyphs(env_state, fast=True),
         "blstats": build_blstats(env_state),
     }
 
@@ -2310,8 +2310,16 @@ def _apply_wall_angle(display_terrain: jnp.ndarray,
     return cmap_idx
 
 
-def build_glyphs(env_state) -> jnp.ndarray:
+def build_glyphs(env_state, fast: bool = False) -> jnp.ndarray:
     """Map the current level's terrain to NLE glyph IDs.
+
+    ``fast=True`` skips the display-effect passes that are no-ops outside
+    hallucination + byte-parity mode — the monster/object hallucination
+    scramble (a full-map meshgrid+hash+gather computed every step) and the
+    ``descr_idx`` shuffle (identity in default ParityMode.NLE).  The result is
+    BYTE-IDENTICAL to the full builder whenever the player is not hallucinating
+    and ``use_vendor_rng()`` is False — i.e. the entire RL training regime.
+    The full path (``fast=False``) is unchanged for eval / byte parity.
 
     Algorithm (all JAX, JIT-compatible):
     1. Slice current level terrain from env_state.terrain[branch, level-1, :21, :79].
@@ -2434,19 +2442,23 @@ def build_glyphs(env_state) -> jnp.ndarray:
     # the monster glyph each render when Hallu.  We use a per-(timestep,row,col)
     # deterministic scramble so the same frame is consistent.
     # Cite: vendor/nethack/src/display.c::display_monster (line ~599).
-    is_hallu = env_state.status.timed_statuses[10] > 0  # TimedStatus.HALLUCINATION
-    NUMMONS = 381
-    ts_u = env_state.timestep.astype(jnp.uint32)
-    rows_u = rows.astype(jnp.uint32)
-    cols_u = cols.astype(jnp.uint32)
-    # Stable hash over (timestep, row, col) → int in [0, NUMMONS).  uint32 so
-    # the Knuth/multiplier constants don't overflow int32.
-    hash_seed = (ts_u * jnp.uint32(2654435761)
-                 + rows_u * jnp.uint32(1597334677)
-                 + cols_u * jnp.uint32(1431655781))
-    hallu_entry = jnp.mod(hash_seed, jnp.uint32(NUMMONS)).astype(jnp.int32)
-    hallu_glyphs = (jnp.int32(GLYPH_MON_OFF) + hallu_entry).astype(jnp.int16)
-    final_mon_glyphs = jnp.where(is_hallu, hallu_glyphs, mon_glyphs)
+    if fast:
+        # Not hallucinating in the training regime -> the scramble is a no-op.
+        final_mon_glyphs = mon_glyphs
+    else:
+        is_hallu = env_state.status.timed_statuses[10] > 0  # TimedStatus.HALLUCINATION
+        NUMMONS = 381
+        ts_u = env_state.timestep.astype(jnp.uint32)
+        rows_u = rows.astype(jnp.uint32)
+        cols_u = cols.astype(jnp.uint32)
+        # Stable hash over (timestep, row, col) → int in [0, NUMMONS).  uint32 so
+        # the Knuth/multiplier constants don't overflow int32.
+        hash_seed = (ts_u * jnp.uint32(2654435761)
+                     + rows_u * jnp.uint32(1597334677)
+                     + cols_u * jnp.uint32(1431655781))
+        hallu_entry = jnp.mod(hash_seed, jnp.uint32(NUMMONS)).astype(jnp.int32)
+        hallu_glyphs = (jnp.int32(GLYPH_MON_OFF) + hallu_entry).astype(jnp.int16)
+        final_mon_glyphs = jnp.where(is_hallu, hallu_glyphs, mon_glyphs)
 
     # JIT-safe scatter: for each slot, replace glyph at (row, col) only when
     # write_mask is True.  Using a vectorised .at[...] update is safe since
@@ -2500,30 +2512,31 @@ def build_glyphs(env_state) -> jnp.ndarray:
     # across frames.  Terrain glyphs (GLYPH_CMAP_OFF+) are left untouched.
     # TODO: status message scramble (status surface not yet in obs).
     # TODO: "Everything looks boring now" message on HALLUCINATION→0 transition.
-    rows_all = jnp.arange(21, dtype=jnp.uint32)
-    cols_all = jnp.arange(79, dtype=jnp.uint32)
-    rc_rows, rc_cols = jnp.meshgrid(rows_all, cols_all, indexing='ij')  # [21,79]
-    ts_grid = env_state.timestep.astype(jnp.uint32)
-    hash_grid = (ts_grid * jnp.uint32(2654435761)
-                 + rc_rows * jnp.uint32(1597334677)
-                 + rc_cols * jnp.uint32(1431655781))
-    pool_idx = jnp.mod(hash_grid, jnp.uint32(_HCOLOR_POOL_SIZE)).astype(jnp.int32)
-    scrambled_obj_idx = _HCOLOR_POOL[pool_idx]                      # int32[21,79]
-    scrambled_obj_glyphs = (jnp.int32(GLYPH_OBJ_OFF) + scrambled_obj_idx).astype(jnp.int16)
-    is_obj_glyph = (glyphs.astype(jnp.int32) >= jnp.int32(GLYPH_OBJ_OFF)) & \
-                   (glyphs.astype(jnp.int32) < jnp.int32(GLYPH_CMAP_OFF))
-    scramble_mask = is_obj_glyph & is_hallu
-    glyphs = jnp.where(scramble_mask, scrambled_obj_glyphs, glyphs)
+    if not fast:
+        rows_all = jnp.arange(21, dtype=jnp.uint32)
+        cols_all = jnp.arange(79, dtype=jnp.uint32)
+        rc_rows, rc_cols = jnp.meshgrid(rows_all, cols_all, indexing='ij')  # [21,79]
+        ts_grid = env_state.timestep.astype(jnp.uint32)
+        hash_grid = (ts_grid * jnp.uint32(2654435761)
+                     + rc_rows * jnp.uint32(1597334677)
+                     + rc_cols * jnp.uint32(1431655781))
+        pool_idx = jnp.mod(hash_grid, jnp.uint32(_HCOLOR_POOL_SIZE)).astype(jnp.int32)
+        scrambled_obj_idx = _HCOLOR_POOL[pool_idx]                      # int32[21,79]
+        scrambled_obj_glyphs = (jnp.int32(GLYPH_OBJ_OFF) + scrambled_obj_idx).astype(jnp.int16)
+        is_obj_glyph = (glyphs.astype(jnp.int32) >= jnp.int32(GLYPH_OBJ_OFF)) & \
+                       (glyphs.astype(jnp.int32) < jnp.int32(GLYPH_CMAP_OFF))
+        scramble_mask = is_obj_glyph & is_hallu
+        glyphs = jnp.where(scramble_mask, scrambled_obj_glyphs, glyphs)
 
-    # Final pass: apply the vendor description shuffle so any object
-    # glyph in the map is mapped through ``descr_idx`` to its shuffled
-    # appearance.  Identity-permutation in default ParityMode.NLE,
-    # non-trivial under NLE_BYTEPARITY.  Cite:
-    # vendor/nle/win/rl/winrl.cc::shuffled_glyph (lines 80-87) +
-    # store_glyph (line 473) — every map glyph emit passes through
-    # shuffled_glyph before the obs array is written.
-    from Nethax.nethax.obs.glyph_shuffle import shuffled_glyph as _shuffled_glyph
-    glyphs = _shuffled_glyph(glyphs, env_state.descr_idx)
+        # Final pass: apply the vendor description shuffle so any object
+        # glyph in the map is mapped through ``descr_idx`` to its shuffled
+        # appearance.  Identity-permutation in default ParityMode.NLE,
+        # non-trivial under NLE_BYTEPARITY.  Cite:
+        # vendor/nle/win/rl/winrl.cc::shuffled_glyph (lines 80-87) +
+        # store_glyph (line 473) — every map glyph emit passes through
+        # shuffled_glyph before the obs array is written.
+        from Nethax.nethax.obs.glyph_shuffle import shuffled_glyph as _shuffled_glyph
+        glyphs = _shuffled_glyph(glyphs, env_state.descr_idx)
 
     return glyphs
 
