@@ -1020,14 +1020,17 @@ def _roll_dice_sum(rng: jax.Array, n_dice: jnp.ndarray, n_sides: jnp.ndarray,
     """
     sides = jnp.maximum(n_sides.astype(jnp.int32), jnp.int32(1))
 
-    def roll_one(carry, key):
-        sub_roll = jax.random.randint(
+    # The per-die roll has NO carry dependency (it's a pure map over keys), so
+    # vmap is byte-identical to the old lax.scan — same split_n keys, same
+    # per-key randint, same masked sum — but emits flat ops instead of a
+    # while-loop, which XLA compiles far faster and parallelises under the
+    # training vmap.  Value-identical => byte parity unaffected.
+    keys = split_n(rng, max_dice)
+    rolls = jax.vmap(
+        lambda key: jax.random.randint(
             key, (), minval=1, maxval=sides + 1, dtype=jnp.int32
         )
-        return carry, sub_roll
-
-    keys = split_n(rng, max_dice)
-    _, rolls = jax.lax.scan(roll_one, jnp.int32(0), keys)
+    )(keys)
     take_mask = jnp.arange(max_dice, dtype=jnp.int32) < n_dice
     return jnp.sum(jnp.where(take_mask, rolls, jnp.int32(0))).astype(jnp.int32)
 
@@ -1862,15 +1865,15 @@ def monster_attack_player(state, rng: jax.Array, monster_idx: jnp.ndarray):
     raw_sides  = jnp.clip(mai.attack_dice_sides[idx].astype(jnp.int32), 1, 12)
     n_dice = jnp.where(mai.is_unwielded[idx], jnp.int32(1), raw_n_dice)
     sides  = jnp.where(mai.is_unwielded[idx], jnp.int32(2), raw_sides)
-    # Static unrolled dice draw using a small fixed cap (8) — JIT-safe.
-    def roll_one(carry, key):
-        sub_roll = jax.random.randint(
+    # Pure per-die map (no carry dependency) — vmap is byte-identical to the
+    # old lax.scan (same keys, randint, masked sum) but emits flat ops, not a
+    # while-loop.  Value-identical => byte parity unaffected.
+    keys = split_n(key_dmg, 8)
+    rolls = jax.vmap(
+        lambda key: jax.random.randint(
             key, (), minval=1, maxval=sides + 1, dtype=jnp.int32
         )
-        return carry, sub_roll
-
-    keys = split_n(key_dmg, 8)
-    _, rolls = jax.lax.scan(roll_one, jnp.int32(0), keys)
+    )(keys)
     take_mask = jnp.arange(8, dtype=jnp.int32) < n_dice
     raw_dmg = jnp.sum(jnp.where(take_mask, rolls, jnp.int32(0))).astype(jnp.int32)
 
