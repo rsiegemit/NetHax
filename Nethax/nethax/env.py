@@ -713,6 +713,27 @@ class NethaxEnv:
         info: Dict[str, Any] = {}
         return new_state, obs, reward, done, info
 
+    def make_restricted_step(self, action_ords):
+        """Build a fast step over a CONFIGURABLE small action set.
+
+        ``action_ords`` is the list of ASCII action ords the task/policy uses
+        (the agent emits index 0..len-1).  The returned ``step_fn(state, action,
+        rng) -> (state', obs, reward, done, {})`` dispatches via a ``lax.switch``
+        over ONLY the distinct handlers those ords touch — so compile/exec cost
+        scales with the number of *handlers* (e.g. 8 moves -> 1 handler; +search/
+        +go-down/+pickup -> a few), not the full 46.  Byte-identical to
+        :meth:`step` for single-step actions when no prompt is pending (movement,
+        search, wait, pickup, go-down).  Prompt-opening actions (kick/eat/zap,
+        which need a follow-up key) are NOT modelled here — use the full
+        :meth:`step` for those.
+        """
+        fn = _make_restricted_step_impl(tuple(int(o) for o in action_ords))
+
+        def step_fn(state, action, rng):
+            new_state, obs, reward, done = fn(state, action, rng)
+            return new_state, obs, reward, done, {}
+        return step_fn
+
     def move_step(
         self,
         state: EnvState,
@@ -2213,6 +2234,106 @@ def _fast_move_step_impl(state, dir_idx, rng):
         new_state = new_state.replace(vendor_rng_disp=_consume_disp(new_state))
     obs, reward = _obs_jit(state, new_state)
     return new_state, obs, reward, new_state.done
+
+
+import functools as _functools
+
+
+@_functools.lru_cache(maxsize=32)
+def _make_restricted_step_impl(action_ords: tuple):
+    """Build a step impl that dispatches over ONLY the handlers ``action_ords``
+    touch.  Cached per action-set so the lookup tables + closure are reused.
+    """
+    import numpy as _np
+    from Nethax.nethax.subsystems.action_dispatch import (
+        _ACTION_TO_HANDLER_IDX as _AH, _SLOT_TO_COMPACT as _SC,
+        _SLOT_TO_DIR_IDX as _SD, _COMPACT_HANDLERS,
+    )
+    from Nethax.nethax.subsystems.pending_action import (
+        action_opens_inv_letter_prompt as _opens_inv,
+        action_opens_letter_then_dir_prompt as _opens_ltd,
+    )
+    from Nethax.nethax.constants.actions import USEFUL_ACTIONS as _USEFUL
+
+    # Mirror _maybe_remap_action / _dispatch_validator_body host-side: an ord
+    # < 86 is an NLE index into USEFUL_ACTIONS; >= 86 is a raw ASCII ord.  This
+    # is exactly how the full dispatch interprets the agent's action, so the
+    # restricted handler lookup matches it byte-for-byte.
+    _useful = [int(x) for x in _USEFUL]
+    def _to_action_val(o):
+        o = int(o)
+        return _useful[o] if 0 <= o < 86 else max(0, min(255, o))
+    action_vals = [_to_action_val(o) for o in action_ords]
+
+    # GUARANTEE byte-identity by construction: the restricted step reproduces
+    # ONLY dispatch_action's normal-path switch (no pending-prompt / opens-prompt
+    # branches).  That equals the full dispatch iff no exposed action opens a
+    # follow-up prompt (and hence no prompt can ever be pending).  Refuse any
+    # action that opens an inv-letter / direction prompt (kick, eat, zap, apply,
+    # ...) — those MUST use the full step.  Movement, search, wait, pickup,
+    # go-down, etc. are prompt-free and so are byte-identical here.
+    _bad = [o for o, av in zip(action_ords, action_vals)
+            if bool(_opens_inv(jnp.int32(av))) or bool(_opens_ltd(jnp.int32(av)))]
+    if _bad:
+        raise ValueError(
+            f"make_restricted_step: action ords {_bad} open a follow-up prompt "
+            "(inv-letter / direction); the pruned dispatch would not be "
+            "byte-identical to the full step. Use env.step for those, or expose "
+            "only single-step actions (movement, search, wait, pickup, go-down)."
+        )
+
+    ah = _np.asarray(_AH); sc = _np.asarray(_SC); sd = _np.asarray(_SD)
+    per = [(int(sc[int(ah[av])]), int(sd[int(ah[av])])) for av in action_vals]
+    distinct = sorted({c for c, _ in per})
+    subset = tuple(_COMPACT_HANDLERS[c] for c in distinct)
+    loc = {c: i for i, c in enumerate(distinct)}
+    local_idx = jnp.asarray([loc[c] for c, _ in per], dtype=jnp.int32)
+    dir_tab = jnp.asarray([d for _, d in per], dtype=jnp.int32)
+    n_act = len(action_ords)
+
+    def _restricted_step_impl(state, action, rng):
+        rng_act, rng_monsters, rng_status, rng_poly, rng_shop, rng_swallow, rng_explvl, rng_regions, rng_astral = jax.random.split(rng, 9)
+        _PM_WIZARD_ENTRY = jnp.int32(281)
+        prev_wizard_alive = jnp.any(
+            state.monster_ai.alive
+            & (state.monster_ai.entry_idx.astype(jnp.int32) == _PM_WIZARD_ENTRY)
+        )
+        prev_branch = state.dungeon.current_branch.astype(jnp.int32)
+        prev_level = state.dungeon.current_level.astype(jnp.int32)
+
+        # Phase 1: restricted dispatch — switch over ONLY the touched handlers.
+        a = jnp.clip(action.astype(jnp.int32), 0, n_act - 1)
+        li = local_idx[a]; di = dir_tab[a]
+        ns0 = state.replace(
+            messages=_clear_message(state.messages),
+            action_consumed_turn=jnp.bool_(True),
+        )
+        disp = jax.lax.switch(li, subset, ns0, rng_act, di)
+        ns = jax.tree_util.tree_map(
+            lambda new, orig: jnp.where(state.done, orig, new), disp, state,
+        )
+
+        # Phases 1a..8a — identical to _step_impl / _fast_move_step_impl.
+        ns = _pre_monster_jit(ns, state, rng_act, rng_astral, prev_branch, prev_level)
+        if _USE_JIT_SPLIT:
+            _orig_ns = ns
+            ns, _pre_round, _turn_keys, _mhit_keys = _monster_pre_c_jit(ns, state, rng_monsters)
+            ns = _monster_turn_jit2(ns, state, _orig_ns, _turn_keys)
+            ns = _monster_post_c_jit(ns, state, _orig_ns, _pre_round, _mhit_keys)
+        ns = _monster_jit(ns, state, rng_monsters, rng_regions)
+        if _USE_JIT_SPLIT:
+            ns = _monster_status_tick_jit(ns)
+        new_state = _post_monster_jit(
+            ns, state, prev_wizard_alive, rng_status, rng_poly, rng_shop,
+            rng_swallow, rng_explvl,
+        )
+        if use_vendor_rng():
+            from Nethax.nethax.obs.nle_obs import consume_disp_for_obs as _consume_disp
+            new_state = new_state.replace(vendor_rng_disp=_consume_disp(new_state))
+        obs, reward = _obs_jit(state, new_state)
+        return new_state, obs, reward, new_state.done
+
+    return _restricted_step_impl
 
 
 # --- Batched orchestrator (Seam C+B+A) ---
