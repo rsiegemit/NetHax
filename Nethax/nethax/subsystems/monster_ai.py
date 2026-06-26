@@ -79,6 +79,18 @@ MAX_MONSTER_INV: int = 8
 # Bounded BFS depth (vendor monmove.c uses unbounded; we cap for JIT).
 _PATHFIND_MAX_DEPTH: int = 12
 
+# Pathfind column-window width.  The BFS floods from the player for
+# _PATHFIND_MAX_DEPTH steps, so every finite-distance cell lies within
+# Chebyshev radius _PATHFIND_MAX_DEPTH of the player; cells farther out are
+# always INF and never influence any monster's chosen step.  The map is only
+# _MAP_H=21 rows tall (< 2*depth+1) so the row axis needs no window, but the
+# column axis (80) can be cropped to a (2*depth+1)-wide band centered on the
+# player WITHOUT changing any result — this is exact, not an approximation.
+# It shrinks every [21,80] BFS intermediate to [21,25] (~3.2x less memory),
+# which is the dominant GPU exec allocation under the env x monster vmaps.
+# Setting this to _MAP_W recovers the original full-map BFS byte-for-byte.
+_PATHFIND_WINDOW_W: int = 2 * _PATHFIND_MAX_DEPTH + 1
+
 # Wave 6 Phase B: mage-class detection now reads MonsterEntry.sound (msound)
 # directly from the MONSTERS table.  An entry whose sound is MS_SPELL (42) or
 # MS_PRIEST (41) — see vendor/nethack/include/monflag.h — qualifies as a
@@ -1311,12 +1323,17 @@ def _tile_passable(terrain: jnp.ndarray, r: jnp.ndarray, c: jnp.ndarray) -> jnp.
     return in_bounds & not_blocking
 
 
-def _pathfind_step_impl(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
+def _pathfind_step_impl(state, monster_idx: jnp.ndarray,
+                        window_w: int = _PATHFIND_WINDOW_W) -> jnp.ndarray:
     """Return a one-step (dy, dx) toward the player using bounded BFS.
 
-    Implementation: bounded BFS to depth ``_PATHFIND_MAX_DEPTH``. We compute a
-    distance field on the [_MAP_H, _MAP_W] grid centered on the monster's
-    position, then pick the 8-dir neighbor of the monster with the smallest
+    Implementation: bounded BFS to depth ``_PATHFIND_MAX_DEPTH`` on a distance
+    field rooted at the player.  The field is stored on a [_MAP_H, window_w]
+    grid: rows span the full map (only 21 tall) but columns are cropped to a
+    ``window_w``-wide band centered on the player.  Because the BFS only floods
+    ``_PATHFIND_MAX_DEPTH`` steps, every finite cell lies within that band, so
+    the crop is exact (``window_w == _MAP_W`` reproduces the full-map BFS).
+    We then pick the 8-dir neighbor of the monster with the smallest
     distance-to-player. If unreachable within depth, fall back to a greedy
     8-dir step (Chebyshev gradient).
 
@@ -1339,11 +1356,30 @@ def _pathfind_step_impl(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
 
     INF = jnp.int32(_PATHFIND_MAX_DEPTH + 100)
 
+    # ----- Column window (exact) -------------------------------------------
+    # Crop the working grid to a static ``W``-wide column band centered on the
+    # player.  ``c0`` is the band's left column (global) clamped so the band
+    # stays in-bounds; since the player always sits within +-(W-1)//2 of the
+    # band edges, ``c0`` is chosen so the player is inside the band, and every
+    # cell within Chebyshev radius _PATHFIND_MAX_DEPTH of the player is too.
+    # All column-indexed reads below use window coords (global_col - c0).
+    W = int(window_w)
+    _half = jnp.int32((W - 1) // 2)
+    c0 = jnp.clip(ppos[1] - _half, 0, jnp.int32(_MAP_W - W)).astype(jnp.int32)
+
+    def _wcol(arr2d):
+        # Slice an [_MAP_H, _MAP_W] grid to [_MAP_H, W] on the column axis.
+        return jax.lax.dynamic_slice(
+            arr2d, (jnp.int32(0), c0), (_MAP_H, W))
+
+    terrain = _wcol(terrain)            # windowed terrain, used below
+    pwc = ppos[1] - c0                  # player column in window coords
+
     # Initialize distance field with INF everywhere; ROOT AT PLAYER so the
     # field's gradient guides the monster toward the player when it picks
     # its neighbor with smallest dist.
-    dist0 = jnp.full((_MAP_H, _MAP_W), INF, dtype=jnp.int32)
-    dist0 = dist0.at[ppos[0], ppos[1]].set(jnp.int32(0))
+    dist0 = jnp.full((_MAP_H, W), INF, dtype=jnp.int32)
+    dist0 = dist0.at[ppos[0], pwc].set(jnp.int32(0))
 
     # BFS frontier relaxation: at each step k, set every tile whose neighbor
     # has dist == k to k+1 (if not yet set). Repeats _PATHFIND_MAX_DEPTH times.
@@ -1361,7 +1397,7 @@ def _pathfind_step_impl(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
         if dx > 0:
             shifted = shifted.at[:, 0:dx].set(INF)
         elif dx < 0:
-            shifted = shifted.at[:, _MAP_W + dx:_MAP_W].set(INF)
+            shifted = shifted.at[:, W + dx:W].set(INF)
         return shifted
 
     # We need static offsets for `jnp.roll` to work nicely, so unroll once.
@@ -1436,8 +1472,8 @@ def _pathfind_step_impl(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
     branch  = state.dungeon.current_branch.astype(jnp.int32)
     level0  = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
     flat_lv = branch * max_lv + level0
-    trap_t  = state.traps.trap_type[flat_lv].astype(jnp.int32)   # [MAP_H, MAP_W]
-    trap_rv = state.traps.revealed[flat_lv]                       # [MAP_H, MAP_W] bool
+    trap_t  = _wcol(state.traps.trap_type[flat_lv].astype(jnp.int32))  # [MAP_H, W]
+    trap_rv = _wcol(state.traps.revealed[flat_lv])                     # [MAP_H, W] bool
 
     always_lethal = (
         (trap_t == jnp.int32(_TT_PIT))
@@ -1474,12 +1510,16 @@ def _pathfind_step_impl(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
         jnp.zeros_like(other_alive_peaceful),
         other_alive_peaceful | other_alive_tame,
     )
-    # Scatter blocker positions into a [MAP_H, MAP_W] occupancy mask.
-    occ = jnp.zeros((_MAP_H, _MAP_W), dtype=jnp.bool_)
+    # Scatter blocker positions into a [MAP_H, W] occupancy mask (window cols).
+    # Blockers outside the column band can't lie on the player-rooted finite
+    # region, so dropping them is exact.
+    occ = jnp.zeros((_MAP_H, W), dtype=jnp.bool_)
     pp = mai.pos.astype(jnp.int32)
+    pp_wc = pp[:, 1] - c0
+    in_win = (pp_wc >= 0) & (pp_wc < W)
     safe_r = jnp.clip(pp[:, 0], 0, _MAP_H - 1)
-    safe_c = jnp.clip(pp[:, 1], 0, _MAP_W - 1)
-    occ = occ.at[safe_r, safe_c].max(blocking_friendly)
+    safe_c = jnp.clip(pp_wc, 0, W - 1)
+    occ = occ.at[safe_r, safe_c].max(blocking_friendly & in_win)
 
     passable = terrain_ok & ~occ
 
@@ -1529,7 +1569,7 @@ def _pathfind_step_impl(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
                 if dx > 0:
                     orth_b = orth_b.at[:, 0:dx].set(jnp.bool_(False))
                 elif dx < 0:
-                    orth_b = orth_b.at[:, _MAP_W + dx:_MAP_W].set(jnp.bool_(False))
+                    orth_b = orth_b.at[:, W + dx:W].set(jnp.bool_(False))
                 squeeze_ok = orth_a | orth_b
                 shifted = jnp.where(squeeze_ok, shifted, INF)
             neigh_min = jnp.minimum(neigh_min, shifted)
@@ -1539,8 +1579,13 @@ def _pathfind_step_impl(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
 
     dist = jax.lax.fori_loop(0, _PATHFIND_MAX_DEPTH, bfs_body, dist0)
 
+    # Monster column in window coords.  A monster outside the band is beyond
+    # the BFS depth from the player, so its full-map dist would be INF anyway.
+    mwc = mpos[1] - c0
+    m_in = (mwc >= 0) & (mwc < W)
     # Reachable iff the BFS reached the monster's tile from the player.
-    monster_dist = dist[mpos[0], mpos[1]]
+    monster_dist = jnp.where(
+        m_in, dist[mpos[0], jnp.clip(mwc, 0, W - 1)], INF)
     reachable = monster_dist < INF
 
     # Pick the 8-neighbor of mpos with the smallest distance value.
@@ -1550,10 +1595,10 @@ def _pathfind_step_impl(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
     neighbor_offsets = []
     for dy, dx in offsets:
         nr = mpos[0] + dy
-        nc = mpos[1] + dx
-        in_b = (nr >= 0) & (nr < _MAP_H) & (nc >= 0) & (nc < _MAP_W)
+        nwc = mwc + dx              # neighbor column in window coords
+        in_b = (nr >= 0) & (nr < _MAP_H) & (nwc >= 0) & (nwc < W)
         sr = jnp.clip(nr, 0, _MAP_H - 1)
-        sc = jnp.clip(nc, 0, _MAP_W - 1)
+        sc = jnp.clip(nwc, 0, W - 1)
         nd = jnp.where(in_b, dist[sr, sc], INF)
         neighbor_dists.append(nd)
         neighbor_offsets.append((dy, dx))
