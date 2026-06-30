@@ -2265,6 +2265,29 @@ _OBJ_BOULDER_TID: int = 447   # objects.py boulder
 _CAT_ROCK: int = 14           # ItemCategory.ROCK
 
 
+def _gi_write(state, new_ground, **other):
+    """Apply a per-monster ``ground_items`` write only in byte-parity mode.
+
+    The per-monster monster turn writes the full ``[N_BRANCHES, N_LEVELS, 21,
+    80, STACK]`` ground_items array (item pickup / eat / loot).  In the
+    vec/threefry simultaneous-move path (``vectorized_monster_turns``) the merge
+    FREEZES ground_items — keeps the start-of-turn value (see
+    ``_SHARED_MERGE_MAX_ELEMS``) — so every per-monster ground_items write is
+    DISCARDED.  But computing it inside the 400-wide vmap still materialized a
+    ``[B, 400, 7, 32, 21, 80, 8]`` broadcast = the dominant full-fidelity
+    per-step cost (45.8 GB/step; .test_runs/_probe_hlo.py).  Skipping the write
+    when ``not _use_vendor_rng()`` is BEHAVIOR-NEUTRAL in vec mode (the
+    ``monster_ai`` update — including the monster's own inventory pickup — still
+    applies; only the already-discarded ground change is dropped) and lets XLA
+    DCE the dead scatter, removing the broadcast.  Byte-parity (vendor-rng) is
+    UNCHANGED: the write always applies, so the serial 48/48 path is byte-
+    identical by construction.
+    """
+    if _use_vendor_rng():
+        return state.replace(ground_items=new_ground, **other)
+    return state.replace(**other)
+
+
 def _try_scroll_earth(state, rng: jax.Array, monster_idx: jnp.ndarray):
     """Monster reads SCR_EARTH; boulders drop on 8 tiles around the hero.
 
@@ -2318,7 +2341,7 @@ def _try_scroll_earth(state, rng: jax.Array, monster_idx: jnp.ndarray):
     new_mai = mai.replace(
         inv_quantity=mai.inv_quantity.at[idx, slot].set(new_qty_scroll),
     )
-    return state.replace(ground_items=new_g, monster_ai=new_mai)
+    return _gi_write(state, new_g, monster_ai=new_mai)
 
 
 # ---------------------------------------------------------------------------
@@ -2401,7 +2424,7 @@ def _try_loot_floor_container(state, rng: jax.Array, monster_idx: jnp.ndarray):
         inv_type_id=new_inv_tid,
         inv_quantity=new_inv_qty,
     )
-    return state.replace(monster_ai=new_mai, ground_items=new_g)
+    return _gi_write(state, new_g, monster_ai=new_mai)
 _WAN_UNDEAD_TURNING: int = 6   # WandEffect.UNDEAD_TURNING
 
 
@@ -2921,7 +2944,7 @@ def mpickstuff(state, monster_idx: jnp.ndarray):
         inv_charges=new_inv_chg,
     )
     new_ground = state.ground_items.replace(category=new_ground_cat)
-    return state.replace(monster_ai=new_mai, ground_items=new_ground)
+    return _gi_write(state, new_ground, monster_ai=new_mai)
 
 
 def monster_use_item(state, rng: jax.Array, monster_idx: jnp.ndarray):
@@ -4314,7 +4337,7 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
         apport=mai.apport.at[idx].set(new_apport_e),
     )
     new_ground = state.ground_items.replace(category=new_ground_cat)
-    state = state.replace(monster_ai=mai_e, ground_items=new_ground)
+    state = _gi_write(state, new_ground, monster_ai=mai_e)
     mai = state.monster_ai
 
     # -----------------------------------------------------------------------
@@ -4372,7 +4395,7 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
         inv_charges=new_inv_chg,
     )
     new_ground2 = state.ground_items.replace(category=new_ground_cat2)
-    state = state.replace(monster_ai=mai_p, ground_items=new_ground2)
+    state = _gi_write(state, new_ground2, monster_ai=mai_p)
     mai = state.monster_ai
 
     # -----------------------------------------------------------------------
