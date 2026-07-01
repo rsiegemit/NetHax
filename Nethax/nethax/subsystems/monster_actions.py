@@ -631,15 +631,16 @@ def _floor_gold_at(state, row: jnp.ndarray, col: jnp.ndarray):
     lesser coins (steal.c:67-68).  Nethax only models gold pieces as COIN, so
     we just scan the 8-deep ground stack for category==COIN.
     """
-    g = state.ground_items
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_read_tile
     br = state.dungeon.current_branch.astype(jnp.int32)
     lv = (state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1))
     r = row.astype(jnp.int32)
     c = col.astype(jnp.int32)
 
-    cats = g.category[br, lv, r, c, :].astype(jnp.int32)        # (MAX_GROUND_STACK,)
-    tids = g.type_id[br, lv, r, c, :].astype(jnp.int32)
-    qtys = g.quantity[br, lv, r, c, :].astype(jnp.int32)
+    tile = sparse_read_tile(state.ground_items, br, lv, r, c)   # Item[S]
+    cats = tile.category.astype(jnp.int32)                      # (MAX_GROUND_STACK,)
+    tids = tile.type_id.astype(jnp.int32)
+    qtys = tile.quantity.astype(jnp.int32)
     is_gold = (cats == jnp.int32(_COIN_CATEGORY)) & (tids == jnp.int32(_GOLD_PIECE_TID))
     any_gold = jnp.any(is_gold)
     first_idx = jnp.argmax(is_gold.astype(jnp.int32))
@@ -733,15 +734,19 @@ def _leprechaun_steal_gold(state, slot: jnp.ndarray, rng: jax.Array):
         # Clear floor gold slot when taken.  safe_idx is valid only when
         # has_fgold is True.
         clear_slot = jnp.where(take_floor, fgold_slot, jnp.int32(0))
+        from Nethax.nethax.subsystems.ground_items_sparse import (
+            sparse_to_dense_level, replace_level,
+        )
         br = s.dungeon.current_branch.astype(jnp.int32)
         lv = s.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
-        g = s.ground_items
-        zero_cat = jnp.where(take_floor, jnp.int8(0), g.category[br, lv, pr, pc, clear_slot])
-        zero_qty = jnp.where(take_floor, jnp.int16(0), g.quantity[br, lv, pr, pc, clear_slot])
-        new_ground = g.replace(
-            category=g.category.at[br, lv, pr, pc, clear_slot].set(zero_cat),
-            quantity=g.quantity.at[br, lv, pr, pc, clear_slot].set(zero_qty),
+        _lvl = sparse_to_dense_level(s.ground_items, br, lv)  # Item[H,W,S]
+        zero_cat = jnp.where(take_floor, jnp.int8(0), _lvl.category[pr, pc, clear_slot])
+        zero_qty = jnp.where(take_floor, jnp.int16(0), _lvl.quantity[pr, pc, clear_slot])
+        _lvl = _lvl.replace(
+            category=_lvl.category.at[pr, pc, clear_slot].set(zero_cat),
+            quantity=_lvl.quantity.at[pr, pc, clear_slot].set(zero_qty),
         )
+        new_ground = replace_level(s.ground_items, br, lv, _lvl)
 
         # Teleport gating (vendor steal.c:94-97 floor path; :111-113 inv path):
         #   floor: `if (!ygold || !rn2(5)) rloc(); monflee();` — tele only on

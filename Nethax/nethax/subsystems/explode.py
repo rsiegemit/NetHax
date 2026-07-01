@@ -216,7 +216,13 @@ def _scatter_ground_items(state, rng: jax.Array, center_pos: jax.Array):
 
     Returns the (possibly updated) ``state``.
     """
-    gi = state.ground_items
+    # ground_items is sparse: reconstruct the full dense array, run the
+    # existing dense scatter pipeline UNCHANGED, then re-sparsify on writeback.
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_to_dense, dense_to_sparse,
+    )
+    _K = state.ground_items.K
+    gi = sparse_to_dense(state.ground_items)
     # Per-source-slot loop body needs current_branch / current_level and
     # terrain to gate walkability.
     b  = state.dungeon.current_branch.astype(jnp.int32)
@@ -394,7 +400,7 @@ def _scatter_ground_items(state, rng: jax.Array, center_pos: jax.Array):
         return new_gi, None
 
     final_gi, _ = jax.lax.scan(_per_source, gi, jnp.arange(n_total, dtype=jnp.int32))
-    return state.replace(ground_items=final_gi)
+    return state.replace(ground_items=dense_to_sparse(final_gi, _K))
 
 
 # ---------------------------------------------------------------------------

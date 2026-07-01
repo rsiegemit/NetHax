@@ -743,6 +743,9 @@ def tip_container(state, container_idx):
     the ground stack at the player's tile.
     """
     from Nethax.nethax.subsystems.inventory import MAX_GROUND_STACK
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_to_dense_level, replace_level,
+    )
 
     c_idx = jnp.int32(container_idx)
     b     = state.dungeon.current_branch.astype(jnp.int32)
@@ -751,7 +754,7 @@ def tip_container(state, container_idx):
     pc    = state.player_pos[1].astype(jnp.int32)
 
     cs     = state.containers
-    ground = state.ground_items
+    ground = sparse_to_dense_level(state.ground_items, b, lv)  # Item[H,W,S]
 
     has_container = cs.container_type[c_idx] != jnp.int8(ContainerType.NONE)
 
@@ -760,7 +763,7 @@ def tip_container(state, container_idx):
     occupied = cat_row != jnp.int8(0)              # bool[M]
 
     # Ground stack occupancy → starting fill count (== first empty slot).
-    g_cats = ground.category[b, lv, pr, pc]        # int8[MAX_GROUND_STACK]
+    g_cats = ground.category[pr, pc]               # int8[MAX_GROUND_STACK]
     g_occ  = g_cats != jnp.int8(0)                 # bool[MAX_GROUND_STACK]
     g_base = jnp.sum(g_occ.astype(jnp.int32))      # number of occupied ground slots
 
@@ -783,13 +786,13 @@ def tip_container(state, container_idx):
 
         # Ground write helper.
         def _gset(field_g, field_c, dtype):
-            old = field_g[b, lv, pr, pc, g_slot]
+            old = field_g[pr, pc, g_slot]
             new_val = jnp.where(
                 do_copy,
                 field_c[c_idx, i].astype(dtype),
                 old,
             )
-            return field_g.at[b, lv, pr, pc, g_slot].set(new_val)
+            return field_g.at[pr, pc, g_slot].set(new_val)
 
         new_ground = new_ground.replace(
             category    = _gset(new_ground.category,    cs.items_category,   jnp.int8),
@@ -818,7 +821,8 @@ def tip_container(state, container_idx):
             items_weight     = _czero(new_cs.items_weight,     jnp.int16(0)),
         )
 
-    return state.replace(containers=new_cs, ground_items=new_ground)
+    new_gi = replace_level(state.ground_items, b, lv, new_ground)
+    return state.replace(containers=new_cs, ground_items=new_gi)
 
 
 # ---------------------------------------------------------------------------

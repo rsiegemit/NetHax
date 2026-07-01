@@ -862,7 +862,13 @@ def _drop_worn_armor_per_slot(state, form_idx: jnp.ndarray):
 
     # Move displaced items to ground at player_pos (branch 0, level 0).
     # We iterate over slots using lax.fori_loop to stay JIT-pure.
-    ground = state.ground_items
+    # ground_items is sparse: reconstruct the full dense array, run the
+    # existing dense scatter pipeline UNCHANGED, then re-sparsify on writeback.
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_to_dense, dense_to_sparse,
+    )
+    _K = state.ground_items.K
+    ground = sparse_to_dense(state.ground_items)
     p_row  = state.player_pos[0].astype(jnp.int32)
     p_col  = state.player_pos[1].astype(jnp.int32)
 
@@ -898,7 +904,7 @@ def _drop_worn_armor_per_slot(state, form_idx: jnp.ndarray):
     new_ground, _ = jax.lax.fori_loop(
         0, N_ARMOR_SLOTS, _drop_slot, (ground, state.inventory.items)
     )
-    return state.replace(ground_items=new_ground)
+    return state.replace(ground_items=dense_to_sparse(new_ground, _K))
 
 
 # ---------------------------------------------------------------------------
@@ -920,7 +926,13 @@ def _retouch_equipment_silver(state, form_idx: jnp.ndarray, rng: jax.Array):
     form_hates = _FORM_HATES_SILVER[idx]
 
     worn = state.inventory.worn_armor
-    ground = state.ground_items
+    # ground_items is sparse: reconstruct the full dense array, run the
+    # existing dense scatter pipeline UNCHANGED, then re-sparsify on writeback.
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_to_dense, dense_to_sparse,
+    )
+    _K = state.ground_items.K
+    ground = sparse_to_dense(state.ground_items)
     p_row = state.player_pos[0].astype(jnp.int32)
     p_col = state.player_pos[1].astype(jnp.int32)
     n_objects = _ITEM_IS_SILVER.shape[0]
@@ -973,7 +985,8 @@ def _retouch_equipment_silver(state, form_idx: jnp.ndarray, rng: jax.Array):
     )
 
     new_inv = state.inventory.replace(worn_armor=new_worn)
-    state = state.replace(inventory=new_inv, ground_items=new_ground)
+    state = state.replace(inventory=new_inv,
+                          ground_items=dense_to_sparse(new_ground, _K))
 
     new_hp = jnp.maximum(state.player_hp - total_dmg, jnp.int32(0))
     done = new_hp <= jnp.int32(0)

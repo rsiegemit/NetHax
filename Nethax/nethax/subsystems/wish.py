@@ -906,9 +906,11 @@ def _find_first_empty_slot(items) -> int:
 
 def _find_first_empty_ground_slot(ground_items, b, lv, r, c) -> int:
     """Return first empty ground-stack slot index at (b,lv,r,c), or -1 if full."""
-    cats = ground_items.category
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_read_tile
+    tile = sparse_read_tile(ground_items, b, lv, r, c)  # Item[S]
+    cats = tile.category
     for i in range(MAX_GROUND_STACK):
-        if int(cats[b, lv, r, c, i]) == 0:
+        if int(cats[i]) == 0:
             return i
     return -1
 
@@ -952,20 +954,24 @@ def _write_ground_slot(state, b: int, lv: int, r: int, c: int, gslot: int,
     next ``pickup`` thanks to the field-by-field copy in
     ``inventory.pickup`` (added in commit 45827a5 / Wave 42d stack-merge).
     """
-    g = state.ground_items
-    new_g = g.replace(
-        category    = g.category.at[b, lv, r, c, gslot].set(jnp.int8(category)),
-        type_id     = g.type_id.at[b, lv, r, c, gslot].set(jnp.int16(type_id)),
-        buc_status  = g.buc_status.at[b, lv, r, c, gslot].set(jnp.int8(buc)),
-        enchantment = g.enchantment.at[b, lv, r, c, gslot].set(jnp.int8(enchant)),
-        charges     = g.charges.at[b, lv, r, c, gslot].set(jnp.int8(0)),
-        identified  = g.identified.at[b, lv, r, c, gslot].set(jnp.bool_(True)),
-        quantity    = g.quantity.at[b, lv, r, c, gslot].set(jnp.int16(quantity)),
-        weight      = g.weight.at[b, lv, r, c, gslot].set(jnp.int32(weight * quantity)),
-        ac_bonus    = g.ac_bonus.at[b, lv, r, c, gslot].set(jnp.int8(0)),
-        is_two_handed = g.is_two_handed.at[b, lv, r, c, gslot].set(jnp.bool_(False)),
-        artifact_idx = g.artifact_idx.at[b, lv, r, c, gslot].set(jnp.int8(artifact_idx)),
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_to_dense_level, replace_level,
     )
+    _lvl = sparse_to_dense_level(state.ground_items, b, lv)  # Item[H,W,S]
+    _lvl = _lvl.replace(
+        category    = _lvl.category.at[r, c, gslot].set(jnp.int8(category)),
+        type_id     = _lvl.type_id.at[r, c, gslot].set(jnp.int16(type_id)),
+        buc_status  = _lvl.buc_status.at[r, c, gslot].set(jnp.int8(buc)),
+        enchantment = _lvl.enchantment.at[r, c, gslot].set(jnp.int8(enchant)),
+        charges     = _lvl.charges.at[r, c, gslot].set(jnp.int8(0)),
+        identified  = _lvl.identified.at[r, c, gslot].set(jnp.bool_(True)),
+        quantity    = _lvl.quantity.at[r, c, gslot].set(jnp.int16(quantity)),
+        weight      = _lvl.weight.at[r, c, gslot].set(jnp.int32(weight * quantity)),
+        ac_bonus    = _lvl.ac_bonus.at[r, c, gslot].set(jnp.int8(0)),
+        is_two_handed = _lvl.is_two_handed.at[r, c, gslot].set(jnp.bool_(False)),
+        artifact_idx = _lvl.artifact_idx.at[r, c, gslot].set(jnp.int8(artifact_idx)),
+    )
+    new_g = replace_level(state.ground_items, b, lv, _lvl)
     return state.replace(ground_items=new_g)
 
 
