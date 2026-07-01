@@ -1283,7 +1283,7 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
         # Find first empty ground-stack index on the descent tile.
         def _find_empty(c, s):
             found, pos = c
-            cat = gi.category[_lit_br, _lit_lv, _lit_r, _lit_c, s]
+            cat = gi.category[_lit_r, _lit_c, s]
             empty = (cat == jnp.int8(0))
             pos = jnp.where(~found & empty, s, pos)
             found = found | empty
@@ -1298,8 +1298,8 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
 
         # Copy inventory slot fields into ground stack slot.
         def _w(g_arr, inv_arr):
-            cur = g_arr[_lit_br, _lit_lv, _lit_r, _lit_c, gs_safe]
-            return g_arr.at[_lit_br, _lit_lv, _lit_r, _lit_c, gs_safe].set(
+            cur = g_arr[_lit_r, _lit_c, gs_safe]
+            return g_arr.at[_lit_r, _lit_c, gs_safe].set(
                 jnp.where(write, inv_arr[slot_idx], cur)
             )
 
@@ -1341,15 +1341,16 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
     # Pass-through: the litter scan body writes dropped items into dense ground
     # cells; run it on the dense image, then re-sparsify the result.
     from Nethax.nethax.subsystems.ground_items_sparse import (
-        sparse_to_dense, dense_to_sparse,
+        sparse_to_dense_level, replace_level,
     )
     (_lit_gi, _lit_inv_items), _ = jax.lax.scan(
         _litter_body,
-        (sparse_to_dense(state_final.ground_items), state_final.inventory.items),
+        (sparse_to_dense_level(state_final.ground_items, _lit_br, _lit_lv),
+         state_final.inventory.items),
         jnp.arange(_LIT_MAX_INV, dtype=jnp.int32),
     )
     state_final = state_final.replace(
-        ground_items=dense_to_sparse(_lit_gi, state_final.ground_items.K),
+        ground_items=replace_level(state_final.ground_items, _lit_br, _lit_lv, _lit_gi),
         inventory=state_final.inventory.replace(items=_lit_inv_items),
         rng=_new_rng_lit,
     )

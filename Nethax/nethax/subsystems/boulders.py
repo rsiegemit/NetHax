@@ -81,10 +81,13 @@ _TILE_POOL:        int = 19
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _tile_has_boulder(ground_items, b, lv, row, col) -> jnp.ndarray:
-    """Return True iff ground_items[b, lv, row, col, 0] is a boulder."""
-    cat = ground_items.category[b, lv, row, col, 0].astype(jnp.int32)
-    tid = ground_items.type_id[b, lv, row, col, 0].astype(jnp.int32)
+def _tile_has_boulder(lvl, row, col) -> jnp.ndarray:
+    """Return True iff current-level ``lvl[row, col, 0]`` is a boulder.
+
+    ``lvl`` is a single-level dense ``Item[H, W, S]`` slice.
+    """
+    cat = lvl.category[row, col, 0].astype(jnp.int32)
+    tid = lvl.type_id[row, col, 0].astype(jnp.int32)
     return (cat == jnp.int32(BOULDER_CATEGORY)) & (tid == jnp.int32(BOULDER_TYPE_ID))
 
 
@@ -105,31 +108,35 @@ def _is_water_tile(t) -> jnp.ndarray:
     return (t == jnp.int32(_TILE_WATER)) | (t == jnp.int32(_TILE_POOL))
 
 
-def _place_boulder(ground_items, b, lv, row, col):
-    """Write a boulder into ground_items[b, lv, row, col, 0]."""
-    gi = ground_items
-    return gi.replace(
-        category=gi.category.at[b, lv, row, col, 0].set(
+def _place_boulder(lvl, row, col):
+    """Write a boulder into current-level ``lvl[row, col, 0]``.
+
+    ``lvl`` is a single-level dense ``Item[H, W, S]`` slice.
+    """
+    return lvl.replace(
+        category=lvl.category.at[row, col, 0].set(
             jnp.int8(BOULDER_CATEGORY)
         ),
-        type_id=gi.type_id.at[b, lv, row, col, 0].set(
+        type_id=lvl.type_id.at[row, col, 0].set(
             jnp.int16(BOULDER_TYPE_ID)
         ),
-        quantity=gi.quantity.at[b, lv, row, col, 0].set(jnp.int16(1)),
-        weight=gi.weight.at[b, lv, row, col, 0].set(jnp.int32(1000)),
-        identified=gi.identified.at[b, lv, row, col, 0].set(jnp.bool_(True)),
+        quantity=lvl.quantity.at[row, col, 0].set(jnp.int16(1)),
+        weight=lvl.weight.at[row, col, 0].set(jnp.int32(1000)),
+        identified=lvl.identified.at[row, col, 0].set(jnp.bool_(True)),
     )
 
 
-def _remove_boulder(ground_items, b, lv, row, col):
-    """Zero-out the boulder slot at ground_items[b, lv, row, col, 0]."""
-    gi = ground_items
-    return gi.replace(
-        category=gi.category.at[b, lv, row, col, 0].set(jnp.int8(0)),
-        type_id=gi.type_id.at[b, lv, row, col, 0].set(jnp.int16(0)),
-        quantity=gi.quantity.at[b, lv, row, col, 0].set(jnp.int16(0)),
-        weight=gi.weight.at[b, lv, row, col, 0].set(jnp.int32(0)),
-        identified=gi.identified.at[b, lv, row, col, 0].set(jnp.bool_(False)),
+def _remove_boulder(lvl, row, col):
+    """Zero-out the boulder slot at current-level ``lvl[row, col, 0]``.
+
+    ``lvl`` is a single-level dense ``Item[H, W, S]`` slice.
+    """
+    return lvl.replace(
+        category=lvl.category.at[row, col, 0].set(jnp.int8(0)),
+        type_id=lvl.type_id.at[row, col, 0].set(jnp.int16(0)),
+        quantity=lvl.quantity.at[row, col, 0].set(jnp.int16(0)),
+        weight=lvl.weight.at[row, col, 0].set(jnp.int32(0)),
+        identified=lvl.identified.at[row, col, 0].set(jnp.bool_(False)),
     )
 
 
@@ -228,18 +235,18 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
         | (beyond_tile == jnp.int32(_TILE_WALL))
     )
 
-    # Materialise the dense ground-item image once; the boulder place/remove
-    # helpers and the cond chain below operate on the dense form, then the
-    # result is re-sparsified before ``state.replace`` (pass-through pattern).
+    # Materialise ONLY the current level's dense ground-item slice; boulders
+    # live in ground_items on the CURRENT level, so the place/remove helpers
+    # and the cond chain below operate on this single-level ``Item[H,W,S]``
+    # form, then the result is spliced back before ``state.replace`` (avoids
+    # reconstructing the full [B,L,H,W,S] image — GPU-OOM fix).
     from Nethax.nethax.subsystems.ground_items_sparse import (
-        sparse_to_dense, dense_to_sparse,
+        sparse_to_dense_level, replace_level,
     )
-    _dense_gi = sparse_to_dense(state.ground_items)
+    _lvl = sparse_to_dense_level(state.ground_items, b, lv)
 
     # Another boulder blocks (vendor !sobj_at(BOULDER)).
-    beyond_has_boulder = _tile_has_boulder(
-        _dense_gi, b, lv, safe_br, safe_bc
-    )
+    beyond_has_boulder = _tile_has_boulder(_lvl, safe_br, safe_bc)
 
     # Closed door blocks (vendor hack.c:485-488).
     beyond_is_closed_door = beyond_tile == jnp.int32(_TILE_CLOSED_DOOR)
@@ -329,15 +336,15 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
     # Remove boulder from original tile (always when push succeeds).
     gi_after_remove = lax.cond(
         can_push,
-        lambda gi: _remove_boulder(gi, b, lv, boulder_r, boulder_c),
+        lambda gi: _remove_boulder(gi, boulder_r, boulder_c),
         lambda gi: gi,
-        _dense_gi,
+        _lvl,
     )
 
     # Place boulder at beyond tile unless consumed/relocated.
     gi_after_place = lax.cond(
         can_push & ~boulder_consumed_at_beyond,
-        lambda gi: _place_boulder(gi, b, lv, safe_br, safe_bc),
+        lambda gi: _place_boulder(gi, safe_br, safe_bc),
         lambda gi: gi,
         gi_after_remove,
     )
@@ -349,7 +356,7 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
     up_r, up_c = _find_upstair(terrain_2d)
     gi_after_relocate = lax.cond(
         relocate_target,
-        lambda gi: _place_boulder(gi, b, lv, up_r, up_c),
+        lambda gi: _place_boulder(gi, up_r, up_c),
         lambda gi: gi,
         gi_after_place,
     )
@@ -390,14 +397,14 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
     gi_with_prize = lax.cond(
         prize_due & fills_pit & in_sokoban,
         lambda gi: gi.replace(
-            category=gi.category.at[b, lv, up_r, up_c, 0].set(
+            category=gi.category.at[up_r, up_c, 0].set(
                 jnp.int8(_PRIZE_CATEGORY)
             ),
-            type_id=gi.type_id.at[b, lv, up_r, up_c, 0].set(
+            type_id=gi.type_id.at[up_r, up_c, 0].set(
                 jnp.int16(_PRIZE_TYPE_ID)
             ),
-            quantity=gi.quantity.at[b, lv, up_r, up_c, 0].set(jnp.int16(1)),
-            identified=gi.identified.at[b, lv, up_r, up_c, 0].set(
+            quantity=gi.quantity.at[up_r, up_c, 0].set(jnp.int16(1)),
+            identified=gi.identified.at[up_r, up_c, 0].set(
                 jnp.bool_(True)
             ),
         ),
@@ -406,7 +413,7 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
     )
 
     new_state = state.replace(
-        ground_items=dense_to_sparse(gi_with_prize, state.ground_items.K),
+        ground_items=replace_level(state.ground_items, b, lv, gi_with_prize),
         traps=new_traps,
         terrain=new_terrain_flat,
         sokoban_boulders_pitted=new_pitted,

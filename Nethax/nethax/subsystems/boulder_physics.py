@@ -63,19 +63,19 @@ def _boulder_dmgval(rng) -> jnp.ndarray:
     return r1 + r2
 
 
-def _place_boulder_ground(ground_items, b, lv, r, c):
-    """Write a BOULDER into ground_items[b, lv, r, c, 0].
+def _place_boulder_ground(lvl, r, c):
+    """Write a BOULDER into current-level ``lvl[r, c, 0]``.
 
-    Mirrors ``boulders._place_boulder`` but inlined here so we don't depend
-    on a private symbol of that module.
+    ``lvl`` is a single-level dense ``Item[H, W, S]`` slice.  Mirrors
+    ``boulders._place_boulder`` but inlined here so we don't depend on a
+    private symbol of that module.
     """
-    gi = ground_items
-    return gi.replace(
-        category=gi.category.at[b, lv, r, c, 0].set(jnp.int8(BOULDER_CATEGORY)),
-        type_id=gi.type_id.at[b, lv, r, c, 0].set(jnp.int16(BOULDER_TYPE_ID)),
-        quantity=gi.quantity.at[b, lv, r, c, 0].set(jnp.int16(1)),
-        weight=gi.weight.at[b, lv, r, c, 0].set(jnp.int32(1000)),
-        identified=gi.identified.at[b, lv, r, c, 0].set(jnp.bool_(True)),
+    return lvl.replace(
+        category=lvl.category.at[r, c, 0].set(jnp.int8(BOULDER_CATEGORY)),
+        type_id=lvl.type_id.at[r, c, 0].set(jnp.int16(BOULDER_TYPE_ID)),
+        quantity=lvl.quantity.at[r, c, 0].set(jnp.int16(1)),
+        weight=lvl.weight.at[r, c, 0].set(jnp.int32(1000)),
+        identified=lvl.identified.at[r, c, 0].set(jnp.bool_(True)),
     )
 
 
@@ -205,14 +205,16 @@ def roll_boulder(state, rng, start_pos, dir):
     )
     place_now = (~final_stopped) & in_bounds_final
 
-    # Pass-through: materialise dense, place the boulder via the dense helper,
-    # then re-sparsify before writing back into the state.
+    # Materialise ONLY the current level's dense slice (boulder rests on the
+    # CURRENT level), place the boulder via the level helper, then splice it
+    # back into the sparse state (avoids reconstructing the full [B,L,H,W,S]
+    # image — GPU-OOM fix).
     from Nethax.nethax.subsystems.ground_items_sparse import (
-        sparse_to_dense, dense_to_sparse,
+        sparse_to_dense_level, replace_level,
     )
-    _dense_gi = sparse_to_dense(final_state.ground_items)
-    _dense_ground = _place_boulder_ground(_dense_gi, b, lv, fr, fc)
-    new_ground = dense_to_sparse(_dense_ground, final_state.ground_items.K)
+    _lvl = sparse_to_dense_level(final_state.ground_items, b, lv)
+    _lvl_final = _place_boulder_ground(_lvl, fr, fc)
+    new_ground = replace_level(final_state.ground_items, b, lv, _lvl_final)
     out_state = lax.cond(
         place_now,
         lambda s: s.replace(ground_items=new_ground),

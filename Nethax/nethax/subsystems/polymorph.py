@@ -862,13 +862,13 @@ def _drop_worn_armor_per_slot(state, form_idx: jnp.ndarray):
 
     # Move displaced items to ground at player_pos (branch 0, level 0).
     # We iterate over slots using lax.fori_loop to stay JIT-pure.
-    # ground_items is sparse: reconstruct the full dense array, run the
-    # existing dense scatter pipeline UNCHANGED, then re-sparsify on writeback.
+    # ground_items is sparse; the drop is confined to (branch 0, level 0), so
+    # reconstruct ONLY that level's dense slice, run the drop loop on it, then
+    # splice it back in.
     from Nethax.nethax.subsystems.ground_items_sparse import (
-        sparse_to_dense, dense_to_sparse,
+        sparse_to_dense_level, replace_level,
     )
-    _K = state.ground_items.K
-    ground = sparse_to_dense(state.ground_items)
+    ground = sparse_to_dense_level(state.ground_items, 0, 0)  # [H, W, S]
     p_row  = state.player_pos[0].astype(jnp.int32)
     p_col  = state.player_pos[1].astype(jnp.int32)
 
@@ -878,7 +878,7 @@ def _drop_worn_armor_per_slot(state, form_idx: jnp.ndarray):
         should_drop = drop_mask[slot_i] & (was_worn >= jnp.int32(0))
 
         # Find first free ground stack position (category == 0).
-        ground_stack = g.category[0, 0, p_row, p_col]  # [MAX_GROUND_STACK]
+        ground_stack = g.category[p_row, p_col]  # [MAX_GROUND_STACK]
         free_idx = jnp.argmax(ground_stack == jnp.int8(0)).astype(jnp.int32)
 
         # Copy item from inventory to ground stack.
@@ -887,24 +887,26 @@ def _drop_worn_armor_per_slot(state, form_idx: jnp.ndarray):
 
         new_g_cat = jnp.where(
             should_drop,
-            g.category[0, 0, p_row, p_col].at[free_idx].set(item_cat),
-            g.category[0, 0, p_row, p_col],
+            g.category[p_row, p_col].at[free_idx].set(item_cat),
+            g.category[p_row, p_col],
         )
         new_g_tid = jnp.where(
             should_drop,
-            g.type_id[0, 0, p_row, p_col].at[free_idx].set(item_tid),
-            g.type_id[0, 0, p_row, p_col],
+            g.type_id[p_row, p_col].at[free_idx].set(item_tid),
+            g.type_id[p_row, p_col],
         )
         g = g.replace(
-            category=g.category.at[0, 0, p_row, p_col].set(new_g_cat),
-            type_id=g.type_id.at[0, 0, p_row, p_col].set(new_g_tid),
+            category=g.category.at[p_row, p_col].set(new_g_cat),
+            type_id=g.type_id.at[p_row, p_col].set(new_g_tid),
         )
         return g, inv_items
 
     new_ground, _ = jax.lax.fori_loop(
         0, N_ARMOR_SLOTS, _drop_slot, (ground, state.inventory.items)
     )
-    return state.replace(ground_items=dense_to_sparse(new_ground, _K))
+    return state.replace(
+        ground_items=replace_level(state.ground_items, 0, 0, new_ground)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -926,13 +928,13 @@ def _retouch_equipment_silver(state, form_idx: jnp.ndarray, rng: jax.Array):
     form_hates = _FORM_HATES_SILVER[idx]
 
     worn = state.inventory.worn_armor
-    # ground_items is sparse: reconstruct the full dense array, run the
-    # existing dense scatter pipeline UNCHANGED, then re-sparsify on writeback.
+    # ground_items is sparse; the drop is confined to (branch 0, level 0), so
+    # reconstruct ONLY that level's dense slice, run the drop loop on it, then
+    # splice it back in.
     from Nethax.nethax.subsystems.ground_items_sparse import (
-        sparse_to_dense, dense_to_sparse,
+        sparse_to_dense_level, replace_level,
     )
-    _K = state.ground_items.K
-    ground = sparse_to_dense(state.ground_items)
+    ground = sparse_to_dense_level(state.ground_items, 0, 0)  # [H, W, S]
     p_row = state.player_pos[0].astype(jnp.int32)
     p_col = state.player_pos[1].astype(jnp.int32)
     n_objects = _ITEM_IS_SILVER.shape[0]
@@ -949,7 +951,7 @@ def _retouch_equipment_silver(state, form_idx: jnp.ndarray, rng: jax.Array):
 
         should_drop = form_hates & is_silver
 
-        ground_stack_cat = g.category[0, 0, p_row, p_col]
+        ground_stack_cat = g.category[p_row, p_col]
         free_idx = jnp.argmax(ground_stack_cat == jnp.int8(0)).astype(jnp.int32)
 
         item_cat = state.inventory.items.category[inv_idx]
@@ -957,17 +959,17 @@ def _retouch_equipment_silver(state, form_idx: jnp.ndarray, rng: jax.Array):
 
         new_g_cat = jnp.where(
             should_drop,
-            g.category[0, 0, p_row, p_col].at[free_idx].set(item_cat),
-            g.category[0, 0, p_row, p_col],
+            g.category[p_row, p_col].at[free_idx].set(item_cat),
+            g.category[p_row, p_col],
         )
         new_g_tid = jnp.where(
             should_drop,
-            g.type_id[0, 0, p_row, p_col].at[free_idx].set(item_tid),
-            g.type_id[0, 0, p_row, p_col],
+            g.type_id[p_row, p_col].at[free_idx].set(item_tid),
+            g.type_id[p_row, p_col],
         )
         g = g.replace(
-            category=g.category.at[0, 0, p_row, p_col].set(new_g_cat),
-            type_id=g.type_id.at[0, 0, p_row, p_col].set(new_g_tid),
+            category=g.category.at[p_row, p_col].set(new_g_cat),
+            type_id=g.type_id.at[p_row, p_col].set(new_g_tid),
         )
 
         cleared = jnp.where(should_drop, jnp.int8(-1), new_worn[slot_i])
@@ -985,8 +987,10 @@ def _retouch_equipment_silver(state, form_idx: jnp.ndarray, rng: jax.Array):
     )
 
     new_inv = state.inventory.replace(worn_armor=new_worn)
-    state = state.replace(inventory=new_inv,
-                          ground_items=dense_to_sparse(new_ground, _K))
+    state = state.replace(
+        inventory=new_inv,
+        ground_items=replace_level(state.ground_items, 0, 0, new_ground),
+    )
 
     new_hp = jnp.maximum(state.player_hp - total_dmg, jnp.int32(0))
     done = new_hp <= jnp.int32(0)

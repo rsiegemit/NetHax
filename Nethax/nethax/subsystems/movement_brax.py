@@ -51,8 +51,8 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.nethax.subsystems.ground_items_sparse import (
-    sparse_to_dense,
-    dense_to_sparse,
+    sparse_to_dense_level,
+    replace_level,
 )
 from Nethax.nethax.constants import TileType
 from Nethax.nethax.subsystems.traps import trigger_trap, TrapType
@@ -435,7 +435,7 @@ def _move_branch_brax(state, dy: int, dx: int, rng: jax.Array,
 
         def _find_empty(c, s):
             found, p = c
-            cat = gi.category[_lit_br, _lit_lv, _lit_r, _lit_c, s]
+            cat = gi.category[_lit_r, _lit_c, s]
             empty = (cat == jnp.int8(0))
             p = jnp.where(~found & empty, s, p)
             found = found | empty
@@ -449,8 +449,8 @@ def _move_branch_brax(state, dy: int, dx: int, rng: jax.Array,
         gs_safe = jnp.clip(gs_pos, 0, _LIT_MAX_GS - 1)
 
         def _w(g_arr, inv_arr):
-            cur = g_arr[_lit_br, _lit_lv, _lit_r, _lit_c, gs_safe]
-            return g_arr.at[_lit_br, _lit_lv, _lit_r, _lit_c, gs_safe].set(
+            cur = g_arr[_lit_r, _lit_c, gs_safe]
+            return g_arr.at[_lit_r, _lit_c, gs_safe].set(
                 jnp.where(write, inv_arr[slot_idx], cur)
             )
 
@@ -490,10 +490,11 @@ def _move_branch_brax(state, dy: int, dx: int, rng: jax.Array,
 
     (_lit_gi_dense, _lit_inv_items), _ = jax.lax.scan(
         _litter_body,
-        (sparse_to_dense(state_final.ground_items), state_final.inventory.items),
+        (sparse_to_dense_level(state_final.ground_items, _lit_br, _lit_lv),
+         state_final.inventory.items),
         jnp.arange(_LIT_MAX_INV, dtype=jnp.int32),
     )
-    _lit_gi = dense_to_sparse(_lit_gi_dense, state_final.ground_items.K)
+    _lit_gi = replace_level(state_final.ground_items, _lit_br, _lit_lv, _lit_gi_dense)
     state_final = state_final.replace(
         ground_items=_lit_gi,
         inventory=state_final.inventory.replace(items=_lit_inv_items),

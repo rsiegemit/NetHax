@@ -216,17 +216,17 @@ def _scatter_ground_items(state, rng: jax.Array, center_pos: jax.Array):
 
     Returns the (possibly updated) ``state``.
     """
-    # ground_items is sparse: reconstruct the full dense array, run the
-    # existing dense scatter pipeline UNCHANGED, then re-sparsify on writeback.
+    # ground_items is sparse.  The scatter is confined to the CURRENT
+    # (branch, level), so reconstruct ONLY that level's dense slice, run the
+    # existing dense scatter pipeline on it, then splice it back in.
     from Nethax.nethax.subsystems.ground_items_sparse import (
-        sparse_to_dense, dense_to_sparse,
+        sparse_to_dense_level, replace_level,
     )
-    _K = state.ground_items.K
-    gi = sparse_to_dense(state.ground_items)
     # Per-source-slot loop body needs current_branch / current_level and
     # terrain to gate walkability.
     b  = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    gi = sparse_to_dense_level(state.ground_items, b, lv)  # [H, W, S]
     terrain_level = state.terrain[b, lv]  # [H, W]
     map_h = jnp.int32(terrain_level.shape[0])
     map_w = jnp.int32(terrain_level.shape[1])
@@ -278,10 +278,10 @@ def _scatter_ground_items(state, rng: jax.Array, center_pos: jax.Array):
         # Pre-scatter category at source (closed over → not affected by
         # earlier iterations that might have written into this slot from
         # a different ring tile).  Vendor reads level.objects[][] once.
-        src_cat_pre = pre_cats[b, lv, ssr, ssc, slot_i]
+        src_cat_pre = pre_cats[ssr, ssc, slot_i]
         # Current category at source — needed to honour that an earlier
         # iteration may have already moved this exact item away.
-        src_cat_now = gi.category[b, lv, ssr, ssc, slot_i]
+        src_cat_now = gi.category[ssr, ssc, slot_i]
 
         # Eligible: slot held an item BEFORE the scatter started AND that
         # item is still here (i.e. not consumed by an earlier scatter step).
@@ -310,7 +310,7 @@ def _scatter_ground_items(state, rng: jax.Array, center_pos: jax.Array):
 
         # Find first empty stack-slot at destination (use the CURRENT gi
         # because earlier iterations may have already added items there).
-        dst_stack_cats = gi.category[b, lv, sdr, sdc, :]
+        dst_stack_cats = gi.category[sdr, sdc, :]
         dst_empty_mask = dst_stack_cats == none_cat
         dst_has_room = jnp.any(dst_empty_mask)
         dst_slot = jnp.argmax(dst_empty_mask.astype(jnp.int32)).astype(jnp.int32)
@@ -328,12 +328,12 @@ def _scatter_ground_items(state, rng: jax.Array, center_pos: jax.Array):
         def _update(arr, fill, src_val):
             cleared = jnp.where(
                 breaks_here | moves,
-                arr.at[b, lv, ssr, ssc, slot_i].set(fill),
+                arr.at[ssr, ssc, slot_i].set(fill),
                 arr,
             )
             placed = jnp.where(
                 moves,
-                cleared.at[b, lv, sdr, sdc, dst_slot].set(src_val),
+                cleared.at[sdr, sdc, dst_slot].set(src_val),
                 cleared,
             )
             return placed
@@ -341,32 +341,32 @@ def _scatter_ground_items(state, rng: jax.Array, center_pos: jax.Array):
         # Read source values (using current gi, since item identity is
         # what matters here — even if the original cat snapshot drove the
         # eligibility gate, the field values come from the live array).
-        src_typ_id      = gi.type_id[b, lv, ssr, ssc, slot_i]
-        src_buc         = gi.buc_status[b, lv, ssr, ssc, slot_i]
-        src_ench        = gi.enchantment[b, lv, ssr, ssc, slot_i]
-        src_charges     = gi.charges[b, lv, ssr, ssc, slot_i]
-        src_ident       = gi.identified[b, lv, ssr, ssc, slot_i]
-        src_qty         = gi.quantity[b, lv, ssr, ssc, slot_i]
-        src_weight      = gi.weight[b, lv, ssr, ssc, slot_i]
-        src_ac          = gi.ac_bonus[b, lv, ssr, ssc, slot_i]
-        src_is_2h       = gi.is_two_handed[b, lv, ssr, ssc, slot_i]
-        src_greased     = gi.greased[b, lv, ssr, ssc, slot_i]
-        src_oerod       = gi.oeroded[b, lv, ssr, ssc, slot_i]
-        src_oerod2      = gi.oeroded2[b, lv, ssr, ssc, slot_i]
-        src_oerproof    = gi.oerodeproof[b, lv, ssr, ssc, slot_i]
-        src_bknown      = gi.bknown[b, lv, ssr, ssc, slot_i]
-        src_lamplit     = gi.lamplit[b, lv, ssr, ssc, slot_i]
-        src_olocked     = gi.olocked[b, lv, ssr, ssc, slot_i]
-        src_corpse_idx  = gi.corpse_entry_idx[b, lv, ssr, ssc, slot_i]
-        src_recharged   = gi.recharged[b, lv, ssr, ssc, slot_i]
-        src_corpse_ct   = gi.corpse_creation_turn[b, lv, ssr, ssc, slot_i]
-        src_tin_pois    = gi.tin_poisoned[b, lv, ssr, ssc, slot_i]
-        src_dknown      = gi.dknown[b, lv, ssr, ssc, slot_i]
-        src_rknown      = gi.rknown[b, lv, ssr, ssc, slot_i]
-        src_age         = gi.age[b, lv, ssr, ssc, slot_i]
-        src_artifact    = gi.artifact_idx[b, lv, ssr, ssc, slot_i]
-        src_oeaten      = gi.oeaten[b, lv, ssr, ssc, slot_i]
-        src_opoisoned   = gi.opoisoned[b, lv, ssr, ssc, slot_i]
+        src_typ_id      = gi.type_id[ssr, ssc, slot_i]
+        src_buc         = gi.buc_status[ssr, ssc, slot_i]
+        src_ench        = gi.enchantment[ssr, ssc, slot_i]
+        src_charges     = gi.charges[ssr, ssc, slot_i]
+        src_ident       = gi.identified[ssr, ssc, slot_i]
+        src_qty         = gi.quantity[ssr, ssc, slot_i]
+        src_weight      = gi.weight[ssr, ssc, slot_i]
+        src_ac          = gi.ac_bonus[ssr, ssc, slot_i]
+        src_is_2h       = gi.is_two_handed[ssr, ssc, slot_i]
+        src_greased     = gi.greased[ssr, ssc, slot_i]
+        src_oerod       = gi.oeroded[ssr, ssc, slot_i]
+        src_oerod2      = gi.oeroded2[ssr, ssc, slot_i]
+        src_oerproof    = gi.oerodeproof[ssr, ssc, slot_i]
+        src_bknown      = gi.bknown[ssr, ssc, slot_i]
+        src_lamplit     = gi.lamplit[ssr, ssc, slot_i]
+        src_olocked     = gi.olocked[ssr, ssc, slot_i]
+        src_corpse_idx  = gi.corpse_entry_idx[ssr, ssc, slot_i]
+        src_recharged   = gi.recharged[ssr, ssc, slot_i]
+        src_corpse_ct   = gi.corpse_creation_turn[ssr, ssc, slot_i]
+        src_tin_pois    = gi.tin_poisoned[ssr, ssc, slot_i]
+        src_dknown      = gi.dknown[ssr, ssc, slot_i]
+        src_rknown      = gi.rknown[ssr, ssc, slot_i]
+        src_age         = gi.age[ssr, ssc, slot_i]
+        src_artifact    = gi.artifact_idx[ssr, ssc, slot_i]
+        src_oeaten      = gi.oeaten[ssr, ssc, slot_i]
+        src_opoisoned   = gi.opoisoned[ssr, ssc, slot_i]
 
         new_gi = gi.replace(
             category             = _update(gi.category,             none_cat,                src_cat_now),
@@ -400,7 +400,9 @@ def _scatter_ground_items(state, rng: jax.Array, center_pos: jax.Array):
         return new_gi, None
 
     final_gi, _ = jax.lax.scan(_per_source, gi, jnp.arange(n_total, dtype=jnp.int32))
-    return state.replace(ground_items=dense_to_sparse(final_gi, _K))
+    return state.replace(
+        ground_items=replace_level(state.ground_items, b, lv, final_gi)
+    )
 
 
 # ---------------------------------------------------------------------------
