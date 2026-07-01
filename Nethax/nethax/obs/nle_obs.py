@@ -23,6 +23,8 @@ Canonical sources:
 Wave 2 status: build_blstats, build_glyphs, build_message, build_tty implemented.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -2398,8 +2400,23 @@ def build_glyphs(env_state, fast: bool = False) -> jnp.ndarray:
     # Nethax/nethax/subsystems/inventory.py:754-761 (pickup reads slot 0) and
     # the drop scan at lines 1067-1095 (drop fills first-empty slot).  We
     # therefore render slot 0's type_id as the visible object glyph.
-    gi_cat0 = env_state.ground_items.category[branch, level_idx, :21, 1:80, 0]   # int8[21,79]
-    gi_typ0 = env_state.ground_items.type_id[branch, level_idx, :21, 1:80, 0]    # int16[21,79]
+    # PHASE 1 sparse ground_items proof: when NETHAX_SPARSE_GROUND is set, the
+    # two slot-0 reads are sourced from a round-tripped sparse representation
+    # (dense -> sparse -> slot0 map) instead of the direct dense index.  This is
+    # a byte-identity harness for the traceable sparse primitive (dense stays
+    # the source of truth); the flag is OFF by default so behavior is unchanged.
+    if os.environ.get("NETHAX_SPARSE_GROUND"):
+        from Nethax.nethax.subsystems.ground_items_sparse import (
+            dense_to_sparse, sparse_slot0_maps,
+        )
+        _K = int(os.environ.get("NETHAX_SPARSE_K", "64"))
+        _sparse = dense_to_sparse(env_state.ground_items, _K)
+        _cat_map, _typ_map = sparse_slot0_maps(_sparse, branch, level_idx)
+        gi_cat0 = _cat_map[:21, 1:80]                                             # int8[21,79]
+        gi_typ0 = _typ_map[:21, 1:80]                                             # int16[21,79]
+    else:
+        gi_cat0 = env_state.ground_items.category[branch, level_idx, :21, 1:80, 0]   # int8[21,79]
+        gi_typ0 = env_state.ground_items.type_id[branch, level_idx, :21, 1:80, 0]    # int16[21,79]
     has_obj = (gi_cat0 != jnp.int8(0)) & visible                                 # bool[21,79]
     obj_glyphs = (gi_typ0.astype(jnp.int32) + jnp.int32(GLYPH_OBJ_OFF)).astype(jnp.int16)
     glyphs = jnp.where(has_obj, obj_glyphs, glyphs)
