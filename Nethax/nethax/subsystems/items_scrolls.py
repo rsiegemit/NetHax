@@ -821,7 +821,8 @@ def _effect_gold_detection(state, rng, buc):
     # ground_items: [n_branches, max_levels, map_h, map_w, stack]
     # state.explored: [n_branches, max_levels, map_h, map_w] bool
     # Mark explored where any stack-slot category == COIN on current level.
-    gi_cat   = state.ground_items.category[b, lv]               # [H, W, stack]
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_to_dense_level
+    gi_cat   = sparse_to_dense_level(state.ground_items, b, lv).category  # [H, W, stack]
     has_gold = jnp.any(gi_cat == jnp.int8(_IC.COIN), axis=-1)   # [H, W] bool
     old_lvl_expl = state.explored[b, lv]                        # [H, W] bool
     new_lvl_expl = jnp.where(
@@ -844,10 +845,11 @@ def _effect_food_detection(state, rng, buc):
     Cite: vendor/nethack/src/detect.c::food_detect (~line 479).
     """
     from Nethax.nethax.subsystems.inventory import ItemCategory
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_to_dense_level
     state = _detect.detect_food(state, rng)
     b = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - 1
-    level_cats = state.ground_items.category[b, lv]
+    level_cats = sparse_to_dense_level(state.ground_items, b, lv).category
     is_food = level_cats == jnp.int8(int(ItemCategory.FOOD))
     count = jnp.sum(is_food).astype(jnp.int8)
     return state.replace(last_food_count=count)
@@ -1327,9 +1329,15 @@ def _effect_earth(state, rng, buc):
     boulder_cat = jnp.int8(int(ItemCategory.ROCK))
     boulder_tid = jnp.int16(BOULDER_TYPE_ID)
 
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_to_dense_level, replace_level,
+    )
+
     mai        = state.monster_ai
     new_mai    = mai
-    new_ground = state.ground_items
+    # Reconstruct this level's dense slice once, accumulate the boulder drops,
+    # then splice the modified level back into the sparse struct.
+    _lvl = sparse_to_dense_level(state.ground_items, b, lv)
 
     for dr, dc, rng_i in [(-1, 0, rng1), (0, 1, rng2), (1, 0, rng3), (0, -1, rng4)]:
         tr = jnp.clip(pr + dr, 0, h - 1).astype(jnp.int32)
@@ -1343,12 +1351,13 @@ def _effect_earth(state, rng, buc):
         new_alive = jnp.where(on_tile & (new_hp <= jnp.int32(0)), jnp.bool_(False), new_mai.alive)
         new_mai   = new_mai.replace(hp=new_hp, alive=new_alive)
 
-        new_ground = new_ground.replace(
-            category=new_ground.category.at[b, lv, tr, tc, 0].set(boulder_cat),
-            type_id=new_ground.type_id.at[b, lv, tr, tc, 0].set(boulder_tid),
-            quantity=new_ground.quantity.at[b, lv, tr, tc, 0].set(jnp.int16(1)),
+        _lvl = _lvl.replace(
+            category=_lvl.category.at[tr, tc, 0].set(boulder_cat),
+            type_id=_lvl.type_id.at[tr, tc, 0].set(boulder_tid),
+            quantity=_lvl.quantity.at[tr, tc, 0].set(jnp.int16(1)),
         )
 
+    new_ground = replace_level(state.ground_items, b, lv, _lvl)
     return state.replace(monster_ai=new_mai, ground_items=new_ground)
 
 

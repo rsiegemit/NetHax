@@ -761,27 +761,32 @@ def artifact_invoke_dispatch(state, art_idx: jnp.ndarray, rng):
         # empty stack slot (category == NONE); if the whole stack is full
         # the arrow is silently dropped (vendor: hold_another_object falls
         # through to nothing in pathological cases).
+        from Nethax.nethax.subsystems.ground_items_sparse import (
+            sparse_read_tile, sparse_to_dense_level, replace_level,
+        )
         b = s.dungeon.current_branch.astype(jnp.int32)
         lv = s.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
         pr = s.player_pos[0].astype(jnp.int32)
         pc = s.player_pos[1].astype(jnp.int32)
         gi = s.ground_items
-        # gi.category shape: [n_branches, max_levels, map_h, map_w, MAX_GROUND_STACK]
-        stack_cats = gi.category[b, lv, pr, pc, :]
+        # Read the S-deep stack at the player tile (sparse point read).
+        stack_cats = sparse_read_tile(gi, b, lv, pr, pc).category
         stack_empty = stack_cats == jnp.int8(int(ItemCategory.NONE))
         gslot = jnp.argmax(stack_empty.astype(jnp.int32))
-        gi_new_cat = gi.category.at[b, lv, pr, pc, gslot].set(
-            jnp.int8(int(ItemCategory.WEAPON)))
-        gi_new_typ = gi.type_id.at[b, lv, pr, pc, gslot].set(
-            jnp.int16(ARROW_TYPE_ID))
-        gi_new_qty = gi.quantity.at[b, lv, pr, pc, gslot].set(
-            quan.astype(gi.quantity.dtype))
-        gi_new_buc = gi.buc_status.at[b, lv, pr, pc, gslot].set(
-            buc.astype(gi.buc_status.dtype))
-        ground_gi = gi.replace(
-            category=gi_new_cat, type_id=gi_new_typ,
-            quantity=gi_new_qty, buc_status=gi_new_buc,
+        # Reconstruct the level slice, write the arrow at the chosen slot,
+        # then splice the modified level back into the sparse struct.
+        _lvl = sparse_to_dense_level(gi, b, lv)
+        _lvl = _lvl.replace(
+            category=_lvl.category.at[pr, pc, gslot].set(
+                jnp.int8(int(ItemCategory.WEAPON))),
+            type_id=_lvl.type_id.at[pr, pc, gslot].set(
+                jnp.int16(ARROW_TYPE_ID)),
+            quantity=_lvl.quantity.at[pr, pc, gslot].set(
+                quan.astype(_lvl.quantity.dtype)),
+            buc_status=_lvl.buc_status.at[pr, pc, gslot].set(
+                buc.astype(_lvl.buc_status.dtype)),
         )
+        ground_gi = replace_level(gi, b, lv, _lvl)
 
         # Branch on has_empty.
         final_items = jax.tree_util.tree_map(

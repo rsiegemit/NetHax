@@ -644,9 +644,10 @@ def _effect_object_detection(state, rng, buc):
     every tile that contains a non-empty stack slot into state.explored.
     Cite: vendor/nethack/src/detect.c::object_detect (line 602).
     """
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_to_dense_level
     b      = state.dungeon.current_branch.astype(jnp.int32)
     lv     = state.dungeon.current_level.astype(jnp.int32) - 1
-    gi_cat = state.ground_items.category[b, lv]                # [H, W, stack]
+    gi_cat = sparse_to_dense_level(state.ground_items, b, lv).category  # [H, W, stack]
     has_item = jnp.any(gi_cat != jnp.int8(0), axis=-1)         # [H, W] bool
     old_lvl  = state.explored[b, lv]
     new_lvl  = old_lvl | has_item
