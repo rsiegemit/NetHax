@@ -1995,6 +1995,42 @@ def _post_monster_body(
     return ns
 
 
+# Training-throughput fast path (NON-parity): the DCE-safe A100 profile
+# (project_perstep_profile_2026_07_01) put post-monster at 65% of per-step cost
+# (283ms/batch @ B=512) as a chain of ~30 individually-cheap vendor ticks, most
+# of which are near-always no-ops in an RL Room-Monster episode (calendar, luck
+# drift, timer queue, occupation, ball-trap, gallop/saddle, shop, ascend, Wizard
+# intervene, digest, age_spells, ...).  This keeps ONLY the per-turn essentials
+# an RL agent actually observes — turn counters, the status/HP/PW/done tick, and
+# the polymorph timer — and skips the rest.  Gated OFF the byte-parity path by
+# construction (only reached when ``not use_vendor_rng()`` AND NETHAX_FAST_POST),
+# so the 48/48 serial gate is untouched.
+_FAST_POST = _os_split.environ.get("NETHAX_FAST_POST", "0") == "1"
+
+
+def _post_monster_body_fast(ns, state, rng_status, rng_poly):
+    """Trimmed post-monster: turn counters + status tick + polymorph only."""
+    # 3. Turn counters (allmain.c moves++ / game_moves gated on consumed turn).
+    ns = ns.replace(timestep=ns.timestep + jnp.int32(1))
+    ns = ns.replace(
+        game_moves=ns.game_moves
+        + jnp.where(ns.action_consumed_turn, jnp.int32(1), jnp.int32(0))
+    )
+    # 4. Status-effect tick (HP/PW regen, status expiry, death) — the one tick
+    #    that materially drives observable per-turn state.
+    new_status, new_hp, new_pw, new_done = _status_step(
+        ns.status, rng_status,
+        ns.player_hp, ns.player_hp_max, ns.player_pw, ns.player_pw_max,
+        ns.player_xl, ns.player_role, ns.done,
+    )
+    ns = ns.replace(
+        status=new_status, player_hp=new_hp, player_pw=new_pw, done=new_done,
+    )
+    # 5. Polymorph / lycanthropy timer.
+    ns = _polymorph_step(ns, rng_poly)
+    return ns
+
+
 def _post_monster_jit_impl(
     ns,
     state,
@@ -2015,16 +2051,19 @@ def _post_monster_jit_impl(
     Brax-flat: replace ``lax.cond`` with eager body + ``jnp.where`` select
     to avoid the both-branch HLO blowup under vmap.
     """
-    body_result = _post_monster_body(
-        ns,
-        state,
-        prev_wizard_alive,
-        rng_status,
-        rng_poly,
-        rng_shop,
-        rng_swallow,
-        rng_explvl,
-    )
+    if _FAST_POST and not use_vendor_rng():
+        body_result = _post_monster_body_fast(ns, state, rng_status, rng_poly)
+    else:
+        body_result = _post_monster_body(
+            ns,
+            state,
+            prev_wizard_alive,
+            rng_status,
+            rng_poly,
+            rng_shop,
+            rng_swallow,
+            rng_explvl,
+        )
     return jax.tree_util.tree_map(
         lambda new, orig: jnp.where(state.done, orig, new),
         body_result,
