@@ -51,6 +51,7 @@ import jax
 import jax.numpy as jnp
 import os
 
+from Nethax.nethax.subsystems.ground_items_sparse import sparse_slot0_maps
 from Nethax.nethax.subsystems import monster_ai as _ma
 from Nethax.nethax.subsystems.monster_ai import (
     MoveStrategy,
@@ -130,7 +131,8 @@ def _m_search_items_brax(state, monster_idx: jnp.ndarray) -> tuple:
 
     b = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
-    cat_map = state.ground_items.category[b, lv, :, :, 0].astype(jnp.int32)
+    _cat0_map, _ = sparse_slot0_maps(state.ground_items, b, lv)
+    cat_map = _cat0_map.astype(jnp.int32)
 
     rows = jnp.arange(_MAP_H, dtype=jnp.int32)[:, None]
     cols = jnp.arange(_MAP_W, dtype=jnp.int32)[None, :]

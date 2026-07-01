@@ -82,6 +82,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from Nethax.nethax.subsystems.ground_items_sparse import sparse_to_dense_level
 from Nethax.nethax.subsystems.monster_ai import (
     _BOULDER_TYPE_ID_VISION,
     _COVETOUS_ENTRY_IDS,
@@ -141,7 +142,7 @@ def monster_can_see_player_brax(state, monster_idx: jnp.ndarray) -> jnp.ndarray:
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
     gi = state.ground_items
     boulder_here = jnp.any(
-        gi.type_id[b, lv].astype(jnp.int32)
+        sparse_to_dense_level(gi, b, lv).type_id.astype(jnp.int32)
         == jnp.int32(_BOULDER_TYPE_ID_VISION),
         axis=-1,
     )

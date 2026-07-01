@@ -50,6 +50,11 @@ import functools
 import jax
 import jax.numpy as jnp
 
+from Nethax.nethax.subsystems.ground_items_sparse import (
+    sparse_read_tile,
+    sparse_to_dense_level,
+    replace_level,
+)
 from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng
 from Nethax.nethax.subsystems.monster_ai import (
     MAX_MONSTERS_PER_LEVEL,
@@ -170,12 +175,13 @@ def _pet_move_brax_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
     pr = jnp.clip(mpos[0], 0, _MAP_H - 1)
     pc = jnp.clip(mpos[1], 0, _MAP_W - 1)
-    food_cat = state.ground_items.category[b, lv, pr, pc, 0].astype(jnp.int32)
+    _tile_eat = sparse_read_tile(state.ground_items, b, lv, pr, pc)
+    food_cat = _tile_eat.category[0].astype(jnp.int32)
     has_food = food_cat == jnp.int32(_CAT_FOOD_LOCAL)
     is_hungry_legacy = mai.pet_hunger[idx].astype(jnp.int32) <= jnp.int32(0)
     can_eat = is_pet & is_hungry_legacy & has_food
 
-    food_tid = state.ground_items.type_id[b, lv, pr, pc, 0].astype(jnp.int32)
+    food_tid = _tile_eat.type_id[0].astype(jnp.int32)
     safe_tid = jnp.clip(food_tid, 0, _OBJ_NUTRITION_TABLE.shape[0] - 1)
     base_nutrit = _OBJ_NUTRITION_TABLE[safe_tid]
     pet_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32),
@@ -204,9 +210,7 @@ def _pet_move_brax_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
 
     new_confuse_eat = jnp.where(can_eat, jnp.int16(0), mai.confuse_timer[idx])
 
-    new_ground_cat = state.ground_items.category.at[b, lv, pr, pc, 0].set(
-        jnp.where(can_eat, jnp.int8(0), state.ground_items.category[b, lv, pr, pc, 0])
-    )
+    _eat_cat0 = jnp.where(can_eat, jnp.int8(0), _tile_eat.category[0])
     new_hunger_after_eat = jnp.where(can_eat, jnp.int16(1000), mai.pet_hunger[idx])
 
     has_drop = mai.last_drop_turn[idx] > jnp.int32(0)
@@ -237,7 +241,11 @@ def _pet_move_brax_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
         pet_hunger=mai.pet_hunger.at[idx].set(new_hunger_after_eat),
         apport=mai.apport.at[idx].set(new_apport_e),
     )
-    new_ground = state.ground_items.replace(category=new_ground_cat)
+    _lvl_eat = sparse_to_dense_level(state.ground_items, b, lv)
+    _lvl_eat = _lvl_eat.replace(
+        category=_lvl_eat.category.at[pr, pc, 0].set(_eat_cat0)
+    )
+    new_ground = replace_level(state.ground_items, b, lv, _lvl_eat)
     state = state.replace(monster_ai=mai_e, ground_items=new_ground)
     mai = state.monster_ai
 
@@ -247,8 +255,9 @@ def _pet_move_brax_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
     mpos2 = mai.pos[idx].astype(jnp.int32)
     pr2 = jnp.clip(mpos2[0], 0, _MAP_H - 1)
     pc2 = jnp.clip(mpos2[1], 0, _MAP_W - 1)
-    g_cat = state.ground_items.category[b, lv, pr2, pc2, 0].astype(jnp.int32)
-    g_buc = state.ground_items.buc_status[b, lv, pr2, pc2, 0].astype(jnp.int32)
+    _tile_pick = sparse_read_tile(state.ground_items, b, lv, pr2, pc2)
+    g_cat = _tile_pick.category[0].astype(jnp.int32)
+    g_buc = _tile_pick.buc_status[0].astype(jnp.int32)
     has_item_here = g_cat != jnp.int32(0)
     not_food = g_cat != jnp.int32(_CAT_FOOD_LOCAL)
     not_cursed = g_buc >= jnp.int32(0)
@@ -257,9 +266,9 @@ def _pet_move_brax_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
     pick_slot = jnp.argmax(empty_mask.astype(jnp.int32)).astype(jnp.int32)
     can_pickup = is_pet & has_item_here & not_food & not_cursed & has_empty
 
-    g_type = state.ground_items.type_id[b, lv, pr2, pc2, 0]
-    g_qty  = state.ground_items.quantity[b, lv, pr2, pc2, 0]
-    g_chg  = state.ground_items.charges[b, lv, pr2, pc2, 0]
+    g_type = _tile_pick.type_id[0]
+    g_qty  = _tile_pick.quantity[0]
+    g_chg  = _tile_pick.charges[0]
 
     new_inv_cat = mai.inv_category.at[idx, pick_slot].set(
         jnp.where(can_pickup, g_cat.astype(jnp.int8),
@@ -278,10 +287,7 @@ def _pet_move_brax_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
     new_inv_chg = mai.inv_charges.at[idx, pick_slot].set(
         jnp.where(can_pickup, g_chg, mai.inv_charges[idx, pick_slot])
     )
-    new_ground_cat2 = state.ground_items.category.at[b, lv, pr2, pc2, 0].set(
-        jnp.where(can_pickup, jnp.int8(0),
-                  state.ground_items.category[b, lv, pr2, pc2, 0])
-    )
+    _pick_cat0 = jnp.where(can_pickup, jnp.int8(0), _tile_pick.category[0])
     mai_p = mai.replace(
         inv_category=new_inv_cat,
         inv_type_id=new_inv_type,
@@ -289,7 +295,11 @@ def _pet_move_brax_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
         inv_buc=new_inv_buc,
         inv_charges=new_inv_chg,
     )
-    new_ground2 = state.ground_items.replace(category=new_ground_cat2)
+    _lvl_pick = sparse_to_dense_level(state.ground_items, b, lv)
+    _lvl_pick = _lvl_pick.replace(
+        category=_lvl_pick.category.at[pr2, pc2, 0].set(_pick_cat0)
+    )
+    new_ground2 = replace_level(state.ground_items, b, lv, _lvl_pick)
     state = state.replace(monster_ai=mai_p, ground_items=new_ground2)
     mai = state.monster_ai
 

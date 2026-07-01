@@ -50,6 +50,10 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from Nethax.nethax.subsystems.ground_items_sparse import (
+    sparse_to_dense,
+    dense_to_sparse,
+)
 from Nethax.nethax.constants import TileType
 from Nethax.nethax.subsystems.traps import trigger_trap, TrapType
 from Nethax.nethax.subsystems.combat import melee_attack as _combat_melee_attack
@@ -484,11 +488,12 @@ def _move_branch_brax(state, dy: int, dx: int, rng: jax.Array,
 
         return (new_gi, new_inv_items), None
 
-    (_lit_gi, _lit_inv_items), _ = jax.lax.scan(
+    (_lit_gi_dense, _lit_inv_items), _ = jax.lax.scan(
         _litter_body,
-        (state_final.ground_items, state_final.inventory.items),
+        (sparse_to_dense(state_final.ground_items), state_final.inventory.items),
         jnp.arange(_LIT_MAX_INV, dtype=jnp.int32),
     )
+    _lit_gi = dense_to_sparse(_lit_gi_dense, state_final.ground_items.K)
     state_final = state_final.replace(
         ground_items=_lit_gi,
         inventory=state_final.inventory.replace(items=_lit_inv_items),

@@ -54,6 +54,10 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.nethax.rng import rnd, split_n
+from Nethax.nethax.subsystems.ground_items_sparse import (
+    sparse_to_dense_level,
+    replace_level,
+)
 from Nethax.nethax.subsystems.combat import (
     _abon,
     _dbon,
@@ -446,11 +450,12 @@ def _single_melee_strike_brax(
     d_col = jnp.clip(death_pos[1], 0, new_state.terrain.shape[3] - 1)
     branch = new_state.dungeon.current_branch.astype(jnp.int32)
     level = new_state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
-    n_stack = gi.category.shape[-1]
+    n_stack = gi.S
+    _lvl = sparse_to_dense_level(gi, branch, level)   # Item[H,W,S]
 
     def _find_slot(carry, sidx):
         found, gs = carry
-        is_empty = gi.category[branch, level, d_row, d_col, sidx] == jnp.int8(0)
+        is_empty = _lvl.category[d_row, d_col, sidx] == jnp.int8(0)
         gs = jnp.where(~found & is_empty, sidx, gs)
         found = found | is_empty
         return (found, gs), None
@@ -467,24 +472,25 @@ def _single_melee_strike_brax(
     can_place = gfound & drops_corpse & killed
     safe_gs = jnp.clip(gslot, 0, n_stack - 1)
     corpse_entry = new_state.monster_ai.entry_idx[idx].astype(jnp.int16)
-    placed_gi = gi.replace(
-        category=gi.category.at[branch, level, d_row, d_col, safe_gs].set(
+    _lvl = _lvl.replace(
+        category=_lvl.category.at[d_row, d_col, safe_gs].set(
             jnp.where(can_place, jnp.int8(_FOOD_CATEGORY),
-                      gi.category[branch, level, d_row, d_col, safe_gs])
+                      _lvl.category[d_row, d_col, safe_gs])
         ),
-        type_id=gi.type_id.at[branch, level, d_row, d_col, safe_gs].set(
+        type_id=_lvl.type_id.at[d_row, d_col, safe_gs].set(
             jnp.where(can_place, jnp.int16(_CORPSE_TYPE_ID),
-                      gi.type_id[branch, level, d_row, d_col, safe_gs])
+                      _lvl.type_id[d_row, d_col, safe_gs])
         ),
-        quantity=gi.quantity.at[branch, level, d_row, d_col, safe_gs].set(
+        quantity=_lvl.quantity.at[d_row, d_col, safe_gs].set(
             jnp.where(can_place, jnp.int16(1),
-                      gi.quantity[branch, level, d_row, d_col, safe_gs])
+                      _lvl.quantity[d_row, d_col, safe_gs])
         ),
-        corpse_entry_idx=gi.corpse_entry_idx.at[branch, level, d_row, d_col, safe_gs].set(
+        corpse_entry_idx=_lvl.corpse_entry_idx.at[d_row, d_col, safe_gs].set(
             jnp.where(can_place, corpse_entry,
-                      gi.corpse_entry_idx[branch, level, d_row, d_col, safe_gs])
+                      _lvl.corpse_entry_idx[d_row, d_col, safe_gs])
         ),
     )
+    placed_gi = replace_level(gi, branch, level, _lvl)
     placed_state = new_state.replace(ground_items=placed_gi)
 
     # Flatten cond #6: corpse-rot / revive timer on can_place.
