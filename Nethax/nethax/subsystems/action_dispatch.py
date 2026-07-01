@@ -337,9 +337,11 @@ def _apply_fov(state):
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
     from Nethax.nethax.dungeon.branches import MAX_LEVELS_PER_BRANCH
     flat_lv = b * jnp.int32(MAX_LEVELS_PER_BRANCH) + lv
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_slot0_maps
     gi = state.ground_items
-    g_cat = gi.category[b, lv, :, :, 0].astype(jnp.int32)
-    g_tid = gi.type_id[b, lv, :, :, 0].astype(jnp.int32)
+    _g_cat_map, _g_tid_map = sparse_slot0_maps(gi, b, lv)  # [H, W] each
+    g_cat = _g_cat_map.astype(jnp.int32)
+    g_tid = _g_tid_map.astype(jnp.int32)
     boulder_plane = (g_cat == jnp.int32(14)) & (g_tid == jnp.int32(0))  # ItemCategory.ROCK + boulder
     door_val = state.features.door_state[flat_lv].astype(jnp.int32)
     door_trapped = state.features.door_trapped[flat_lv]
@@ -1336,13 +1338,18 @@ def _move_branch(state, dy: int, dx: int, rng: jax.Array,
 
         return (new_gi, new_inv_items), None
 
+    # Pass-through: the litter scan body writes dropped items into dense ground
+    # cells; run it on the dense image, then re-sparsify the result.
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_to_dense, dense_to_sparse,
+    )
     (_lit_gi, _lit_inv_items), _ = jax.lax.scan(
         _litter_body,
-        (state_final.ground_items, state_final.inventory.items),
+        (sparse_to_dense(state_final.ground_items), state_final.inventory.items),
         jnp.arange(_LIT_MAX_INV, dtype=jnp.int32),
     )
     state_final = state_final.replace(
-        ground_items=_lit_gi,
+        ground_items=dense_to_sparse(_lit_gi, state_final.ground_items.K),
         inventory=state_final.inventory.replace(items=_lit_inv_items),
         rng=_new_rng_lit,
     )
@@ -2006,8 +2013,10 @@ def _handle_zap(state, rng):
         BOULDER_CATEGORY as _BLDR_CAT,
         BOULDER_TYPE_ID  as _BLDR_TID,
     )
-    gi_cat_2d = state.ground_items.category[b, lv, :, :, 0].astype(jnp.int32)
-    gi_tid_2d = state.ground_items.type_id[b, lv, :, :, 0].astype(jnp.int32)
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_slot0_maps
+    _gi_cat_map, _gi_tid_map = sparse_slot0_maps(state.ground_items, b, lv)
+    gi_cat_2d = _gi_cat_map.astype(jnp.int32)
+    gi_tid_2d = _gi_tid_map.astype(jnp.int32)
     has_boulder_2d = (
         (gi_cat_2d == jnp.int32(_BLDR_CAT))
         & (gi_tid_2d == jnp.int32(_BLDR_TID))

@@ -541,10 +541,14 @@ def poly_pile_effect(state, rng, row, col):
     safe_row = jnp.int32(row)
     safe_col = jnp.int32(col)
 
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_read_tile, sparse_to_dense_level, replace_level,
+    )
     ground = state.ground_items
     # Stack of items at this tile across the MAX_GROUND_STACK depth.
-    cats = ground.category[b, lv, safe_row, safe_col]   # int8[MAX_GROUND_STACK]
-    tids = ground.type_id[b, lv, safe_row, safe_col]    # int16[MAX_GROUND_STACK]
+    _tile = sparse_read_tile(ground, b, lv, safe_row, safe_col)  # Item[S]
+    cats = _tile.category   # int8[MAX_GROUND_STACK]
+    tids = _tile.type_id    # int16[MAX_GROUND_STACK]
 
     # Generate a new random type_id per slot (deterministic given rng).
     keys = jax.random.split(rng, MAX_GROUND_STACK)
@@ -565,8 +569,11 @@ def poly_pile_effect(state, rng, row, col):
     )
 
     # Write the updated type_id stack back into ground_items.
-    new_type_id_arr = ground.type_id.at[b, lv, safe_row, safe_col].set(new_tids)
-    new_ground = ground.replace(type_id=new_type_id_arr)
+    _lvl = sparse_to_dense_level(ground, b, lv)
+    _lvl = _lvl.replace(
+        type_id=_lvl.type_id.at[safe_row, safe_col].set(new_tids)
+    )
+    new_ground = replace_level(ground, b, lv, _lvl)
     new_state = state.replace(ground_items=new_ground)
 
     # Conduct: POLYPILELESS violated when at least one item polymorphed.
@@ -862,21 +869,27 @@ def _trap_rolling_boulder(state, rng):
     # drop a boulder on the trap tile via ground_items.
     same_pos = (final_pos[0] == trap_pos[0]) & (final_pos[1] == trap_pos[1])
 
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_read_tile, sparse_to_dense_level, replace_level,
+    )
     _BOULDER_TYPE_ID = 447
     ground = s_after.ground_items
-    tile_cats = ground.category[b, lv, pr, pc]
+    tile_cats = sparse_read_tile(ground, b, lv, pr, pc).category
     empty_mask = tile_cats == jnp.int8(0)
     any_empty = jnp.any(empty_mask)
     slot = jnp.argmax(empty_mask.astype(jnp.int32)).astype(jnp.int32)
 
     def _do_drop(s_):
         g = s_.ground_items
-        new_cat = g.category.at[b, lv, pr, pc, slot].set(
-            jnp.int8(int(ItemCategory.ROCK))
+        _lvl = sparse_to_dense_level(g, b, lv)
+        _lvl = _lvl.replace(
+            category=_lvl.category.at[pr, pc, slot].set(
+                jnp.int8(int(ItemCategory.ROCK))
+            ),
+            type_id=_lvl.type_id.at[pr, pc, slot].set(jnp.int16(_BOULDER_TYPE_ID)),
+            quantity=_lvl.quantity.at[pr, pc, slot].set(jnp.int16(1)),
         )
-        new_tid = g.type_id.at[b, lv, pr, pc, slot].set(jnp.int16(_BOULDER_TYPE_ID))
-        new_qty = g.quantity.at[b, lv, pr, pc, slot].set(jnp.int16(1))
-        new_g = g.replace(category=new_cat, type_id=new_tid, quantity=new_qty)
+        new_g = replace_level(g, b, lv, _lvl)
         return s_.replace(ground_items=new_g)
 
     return jax.lax.cond(
@@ -1313,10 +1326,12 @@ def _trap_statue(state, rng):
     pr = state.player_pos[0].astype(jnp.int32)
     pc = state.player_pos[1].astype(jnp.int32)
 
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_read_tile
     ground = state.ground_items
     # Stack of items at this tile: shape [MAX_GROUND_STACK].
-    g_tids    = ground.type_id[b, lv, pr, pc]
-    g_corpse_entry = ground.corpse_entry_idx[b, lv, pr, pc]
+    _tile = sparse_read_tile(ground, b, lv, pr, pc)
+    g_tids    = _tile.type_id
+    g_corpse_entry = _tile.corpse_entry_idx
     # Find first STATUE in the stack.
     _STATUE_TYPE_ID = 448
     is_statue = g_tids == jnp.int16(_STATUE_TYPE_ID)

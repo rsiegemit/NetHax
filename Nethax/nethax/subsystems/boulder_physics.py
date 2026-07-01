@@ -205,9 +205,14 @@ def roll_boulder(state, rng, start_pos, dir):
     )
     place_now = (~final_stopped) & in_bounds_final
 
-    new_ground = _place_boulder_ground(
-        final_state.ground_items, b, lv, fr, fc
+    # Pass-through: materialise dense, place the boulder via the dense helper,
+    # then re-sparsify before writing back into the state.
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_to_dense, dense_to_sparse,
     )
+    _dense_gi = sparse_to_dense(final_state.ground_items)
+    _dense_ground = _place_boulder_ground(_dense_gi, b, lv, fr, fc)
+    new_ground = dense_to_sparse(_dense_ground, final_state.ground_items.K)
     out_state = lax.cond(
         place_now,
         lambda s: s.replace(ground_items=new_ground),

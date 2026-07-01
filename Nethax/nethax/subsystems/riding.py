@@ -244,7 +244,9 @@ def _landing_spot(state, rng: jax.Array):
     )                                                   # [8] bool
 
     # Boulder presence — ground_items.type_id == 447 in slot 0.
-    g_tid = state.ground_items.type_id[b, lv, safe_r, safe_c, 0].astype(jnp.int32)
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_slot0_maps
+    _, _g_typ_map = sparse_slot0_maps(state.ground_items, b, lv)  # [H, W]
+    g_tid = _g_typ_map[safe_r, safe_c].astype(jnp.int32)
     has_boulder = g_tid == jnp.int32(_BOULDER_TYPE_ID_LANDING)
 
     # Trap presence — revealed trap of any nonzero type.

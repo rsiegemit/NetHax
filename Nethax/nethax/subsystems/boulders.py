@@ -228,9 +228,17 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
         | (beyond_tile == jnp.int32(_TILE_WALL))
     )
 
+    # Materialise the dense ground-item image once; the boulder place/remove
+    # helpers and the cond chain below operate on the dense form, then the
+    # result is re-sparsified before ``state.replace`` (pass-through pattern).
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_to_dense, dense_to_sparse,
+    )
+    _dense_gi = sparse_to_dense(state.ground_items)
+
     # Another boulder blocks (vendor !sobj_at(BOULDER)).
     beyond_has_boulder = _tile_has_boulder(
-        state.ground_items, b, lv, safe_br, safe_bc
+        _dense_gi, b, lv, safe_br, safe_bc
     )
 
     # Closed door blocks (vendor hack.c:485-488).
@@ -323,7 +331,7 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
         can_push,
         lambda gi: _remove_boulder(gi, b, lv, boulder_r, boulder_c),
         lambda gi: gi,
-        state.ground_items,
+        _dense_gi,
     )
 
     # Place boulder at beyond tile unless consumed/relocated.
@@ -398,7 +406,7 @@ def try_push_boulder(state, from_pos, to_pos, dy, dx):
     )
 
     new_state = state.replace(
-        ground_items=gi_with_prize,
+        ground_items=dense_to_sparse(gi_with_prize, state.ground_items.K),
         traps=new_traps,
         terrain=new_terrain_flat,
         sokoban_boulders_pitted=new_pitted,
