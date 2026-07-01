@@ -112,13 +112,17 @@ def pickup_brax(state, rng, ground_items: Item, branch: int, level: int) -> tupl
     row = state.player_pos[0].astype(jnp.int32)
     col = state.player_pos[1].astype(jnp.int32)
 
-    ground_cat  = ground_items.category[branch, level, row, col, 0]
-    ground_tid  = ground_items.type_id[branch, level, row, col, 0]
-    ground_buc  = ground_items.buc_status[branch, level, row, col, 0]
-    ground_ench = ground_items.enchantment[branch, level, row, col, 0]
-    ground_eprf = ground_items.oerodeproof[branch, level, row, col, 0]
-    ground_wt   = ground_items.weight[branch, level, row, col, 0].astype(jnp.int32)
-    ground_qty  = ground_items.quantity[branch, level, row, col, 0].astype(jnp.int32)
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_read_tile, sparse_pickup,
+    )
+    tile0 = sparse_read_tile(ground_items, branch, level, row, col)  # Item[S]
+    ground_cat  = tile0.category[0]
+    ground_tid  = tile0.type_id[0]
+    ground_buc  = tile0.buc_status[0]
+    ground_ench = tile0.enchantment[0]
+    ground_eprf = tile0.oerodeproof[0]
+    ground_wt   = tile0.weight[0].astype(jnp.int32)
+    ground_qty  = tile0.quantity[0].astype(jnp.int32)
 
     has_item = ground_cat != 0
     is_gold = has_item & (ground_cat == jnp.int8(ItemCategory.COIN))
@@ -188,26 +192,18 @@ def pickup_brax(state, rng, ground_items: Item, branch: int, level: int) -> tupl
             jnp.where(fresh_write, ground_ench, new_items.enchantment[safe_slot])
         ),
         charges    = new_items.charges.at[safe_slot].set(
-            jnp.where(fresh_write,
-                      ground_items.charges[branch, level, row, col, 0],
-                      new_items.charges[safe_slot])
+            jnp.where(fresh_write, tile0.charges[0], new_items.charges[safe_slot])
         ),
         identified = new_items.identified.at[safe_slot].set(
-            jnp.where(fresh_write,
-                      ground_items.identified[branch, level, row, col, 0],
-                      new_items.identified[safe_slot])
+            jnp.where(fresh_write, tile0.identified[0], new_items.identified[safe_slot])
         ),
         quantity   = new_items.quantity.at[safe_slot].set(new_qty_val),
         weight     = new_items.weight.at[safe_slot].set(new_wt_val),
         ac_bonus   = new_items.ac_bonus.at[safe_slot].set(
-            jnp.where(fresh_write,
-                      ground_items.ac_bonus[branch, level, row, col, 0],
-                      new_items.ac_bonus[safe_slot])
+            jnp.where(fresh_write, tile0.ac_bonus[0], new_items.ac_bonus[safe_slot])
         ),
         is_two_handed = new_items.is_two_handed.at[safe_slot].set(
-            jnp.where(fresh_write,
-                      ground_items.is_two_handed[branch, level, row, col, 0],
-                      new_items.is_two_handed[safe_slot])
+            jnp.where(fresh_write, tile0.is_two_handed[0], new_items.is_two_handed[safe_slot])
         ),
         dknown = new_items.dknown.at[safe_slot].set(
             jnp.where(write_slot, jnp.bool_(True), new_items.dknown[safe_slot])
@@ -215,7 +211,7 @@ def pickup_brax(state, rng, ground_items: Item, branch: int, level: int) -> tupl
         artifact_idx = new_items.artifact_idx.at[safe_slot].set(
             jnp.where(
                 fresh_write,
-                ground_items.artifact_idx[branch, level, row, col, 0],
+                tile0.artifact_idx[0],
                 new_items.artifact_idx[safe_slot],
             )
         ),
@@ -265,11 +261,11 @@ def pickup_brax(state, rng, ground_items: Item, branch: int, level: int) -> tupl
         jnp.where(fresh_write, chosen_letter, state.inventory.letters[safe_slot])
     )
 
-    new_ground_items = ground_items.replace(
-        category=ground_items.category.at[branch, level, row, col, 0].set(
-            jnp.where(can_pickup, jnp.int8(0),
-                      ground_items.category[branch, level, row, col, 0])
-        )
+    new_ground_items = jax.lax.cond(
+        can_pickup,
+        lambda g: sparse_pickup(g, branch, level, row, col),
+        lambda g: g,
+        ground_items,
     )
 
     new_inv = state.inventory.replace(
@@ -353,20 +349,23 @@ def drop_brax(state, rng, ground_items: Item, branch: int, level: int,
     in_buc  = state.inventory.items.buc_status[slot_idx]
     in_ench = state.inventory.items.enchantment[slot_idx]
     in_eprf = state.inventory.items.oerodeproof[slot_idx]
-    in_qty  = state.inventory.items.quantity[slot_idx].astype(jnp.int32)
-    in_wt   = state.inventory.items.weight[slot_idx].astype(jnp.int32)
+
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        sparse_read_tile, sparse_drop,
+    )
+    tile = sparse_read_tile(ground_items, branch, level, row, col)  # Item[S]
 
     def _scan(carry, stack_idx):
         empty_found, empty_pos, merge_found, merge_pos = carry
-        cat_here = ground_items.category[branch, level, row, col, stack_idx]
+        cat_here = tile.category[stack_idx]
         is_empty = cat_here == jnp.int8(0)
         is_match = (
             (~is_empty)
             & (cat_here == in_cat)
-            & (ground_items.type_id[branch, level, row, col, stack_idx]    == in_tid)
-            & (ground_items.buc_status[branch, level, row, col, stack_idx] == in_buc)
-            & (ground_items.enchantment[branch, level, row, col, stack_idx] == in_ench)
-            & (ground_items.oerodeproof[branch, level, row, col, stack_idx] == in_eprf)
+            & (tile.type_id[stack_idx]    == in_tid)
+            & (tile.buc_status[stack_idx] == in_buc)
+            & (tile.enchantment[stack_idx] == in_ench)
+            & (tile.oerodeproof[stack_idx] == in_eprf)
         )
         empty_pos = jnp.where(~empty_found & is_empty, stack_idx, empty_pos)
         empty_found = empty_found | is_empty
@@ -380,10 +379,8 @@ def drop_brax(state, rng, ground_items: Item, branch: int, level: int,
         jnp.arange(MAX_GROUND_STACK, dtype=jnp.int32),
     )
 
-    g_target = jnp.where(g_merge_found, g_merge_pos, g_empty_pos)
     g_slot_ok = g_merge_found | g_empty_found
     can_drop = has_item & g_slot_ok
-    safe_gs  = jnp.clip(g_target, 0, MAX_GROUND_STACK - 1)
 
     # Altar BUC mutation — flatten ``lax.cond(on_altar, drop_at_altar, id)``.
     here_tile = state.terrain[branch, level, row, col].astype(jnp.int32)
@@ -392,43 +389,15 @@ def drop_brax(state, rng, ground_items: Item, branch: int, level: int,
     state_altared = _select_tree(on_altar, altared_full, state)
     inv = state_altared.inventory.items
 
-    merge_write = can_drop & g_merge_found
-    fresh_write = can_drop & ~g_merge_found
-
-    def _set_ground(field_ground, field_inv):
-        return field_ground.at[branch, level, row, col, safe_gs].set(
-            jnp.where(fresh_write, field_inv[slot_idx],
-                      field_ground[branch, level, row, col, safe_gs])
-        )
-
-    g_existing_qty = ground_items.quantity[branch, level, row, col, safe_gs].astype(jnp.int32)
-    g_existing_wt  = ground_items.weight[branch, level, row, col, safe_gs].astype(jnp.int32)
-    merged_qty = (g_existing_qty + in_qty).astype(jnp.int16)
-    merged_wt  = (g_existing_wt + in_wt).astype(jnp.int32)
-
-    new_qty_at_pos = jnp.where(
-        merge_write, merged_qty,
-        jnp.where(fresh_write, inv.quantity[slot_idx],
-                  ground_items.quantity[branch, level, row, col, safe_gs])
-    )
-    new_wt_at_pos = jnp.where(
-        merge_write, merged_wt,
-        jnp.where(fresh_write, inv.weight[slot_idx],
-                  ground_items.weight[branch, level, row, col, safe_gs])
-    )
-
-    new_ground = ground_items.replace(
-        category    = _set_ground(ground_items.category,    inv.category),
-        type_id     = _set_ground(ground_items.type_id,     inv.type_id),
-        buc_status  = _set_ground(ground_items.buc_status,  inv.buc_status),
-        enchantment = _set_ground(ground_items.enchantment, inv.enchantment),
-        charges     = _set_ground(ground_items.charges,     inv.charges),
-        identified  = _set_ground(ground_items.identified,  inv.identified),
-        quantity    = ground_items.quantity.at[branch, level, row, col, safe_gs].set(new_qty_at_pos),
-        weight      = ground_items.weight.at[branch, level, row, col, safe_gs].set(new_wt_at_pos),
-        ac_bonus    = _set_ground(ground_items.ac_bonus,    inv.ac_bonus),
-        is_two_handed = _set_ground(ground_items.is_two_handed, inv.is_two_handed),
-        artifact_idx = _set_ground(ground_items.artifact_idx, inv.artifact_idx),
+    # Ground write via the P2-validated sparse primitive (merge/first-empty scan
+    # + merge-sum, no-op when full).  Compute-both + ``_select_tree`` keeps the
+    # Brax no-``cond`` style; gate on ``can_drop``.  Dropped item = post-altar
+    # inventory record at ``slot_idx``.
+    dropped_item = Item(**{f: getattr(inv, f)[slot_idx] for f in inv.__dict__})
+    new_ground = _select_tree(
+        can_drop,
+        sparse_drop(ground_items, branch, level, row, col, dropped_item),
+        ground_items,
     )
 
     new_items = inv.replace(
@@ -721,7 +690,10 @@ def handle_pickup_brax(state, rng, ground_items: Item, branch: int, level: int) 
     )
     row = state.player_pos[0].astype(jnp.int32)
     col = state.player_pos[1].astype(jnp.int32)
-    picked_type_id = ground_items.type_id[branch, level, row, col, 0].astype(jnp.int16)
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_read_tile
+    picked_type_id = sparse_read_tile(
+        ground_items, branch, level, row, col
+    ).type_id[0].astype(jnp.int16)
     role_idx = jnp.clip(state.player_role.astype(jnp.int32),
                        0, _ARTIFACT_IDX_BY_ROLE.shape[0] - 1)
     quest_art_id = _ARTIFACT_IDX_BY_ROLE[role_idx].astype(jnp.int16)

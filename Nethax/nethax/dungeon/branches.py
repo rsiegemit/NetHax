@@ -2105,9 +2105,16 @@ def generate_main_branch_l1_with_features(
         _br = int(flat_lv) // MAX_LEVELS_PER_BRANCH
         _lv = int(flat_lv) %  MAX_LEVELS_PER_BRANCH
         if state is not None:
-            _gcat = state.ground_items.category
-            _gtyp = state.ground_items.type_id
-            _gqty = state.ground_items.quantity
+            # ``state.ground_items`` is the sparse representation; mineralize
+            # works on dense slabs.  Reconstruct the dense image, run mineralize
+            # on it, then convert back to sparse at commit (gen is not hot).
+            from Nethax.nethax.subsystems.ground_items_sparse import (
+                sparse_to_dense, dense_to_sparse,
+            )
+            _dense_gi = sparse_to_dense(state.ground_items)
+            _gcat = _dense_gi.category
+            _gtyp = _dense_gi.type_id
+            _gqty = _dense_gi.quantity
             (
                 _mineralize_grid, vendor_rng, _gcat, _gtyp, _gqty,
             ) = _mineralize(
@@ -2119,8 +2126,11 @@ def generate_main_branch_l1_with_features(
                 level_idx=_lv,
             )
             state = state.replace(
-                ground_items=state.ground_items.replace(
-                    category=_gcat, type_id=_gtyp, quantity=_gqty,
+                ground_items=dense_to_sparse(
+                    _dense_gi.replace(
+                        category=_gcat, type_id=_gtyp, quantity=_gqty,
+                    ),
+                    state.ground_items.K,
                 ),
             )
         else:

@@ -1892,9 +1892,14 @@ def fill_ordinary_rooms(
     branch_idx = jnp.int32(int(flat_lv) // MAX_LEVELS_PER_BRANCH)
     level_idx  = jnp.int32(int(flat_lv) %  MAX_LEVELS_PER_BRANCH)
     if state is not None:
-        _init_gcat = state.ground_items.category
-        _init_gtyp = state.ground_items.type_id
-        _init_gqty = state.ground_items.quantity
+        # ``state.ground_items`` is the sparse representation; the mkobj scan
+        # threads DENSE [B,L,H,W,STACK] slabs.  Reconstruct the dense image to
+        # seed the slabs (converted back to sparse at commit; gen is not hot).
+        from Nethax.nethax.subsystems.ground_items_sparse import sparse_to_dense
+        _dense_gi_seed = sparse_to_dense(state.ground_items)
+        _init_gcat = _dense_gi_seed.category
+        _init_gtyp = _dense_gi_seed.type_id
+        _init_gqty = _dense_gi_seed.quantity
     else:
         # Zero placeholders shaped to match the empty Item slabs.  Caller
         # path doesn't read them back.  Use a tiny [1,1,H,W,STACK] proxy
@@ -3421,10 +3426,14 @@ def fill_ordinary_rooms(
                 init_carry,
                 jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
             )
-            new_ground_items = state.ground_items.replace(
-                category=gcat_out,
-                type_id=gtyp_out,
-                quantity=gqty_out,
+            from Nethax.nethax.subsystems.ground_items_sparse import dense_to_sparse
+            new_ground_items = dense_to_sparse(
+                _dense_gi_seed.replace(
+                    category=gcat_out,
+                    type_id=gtyp_out,
+                    quantity=gqty_out,
+                ),
+                state.ground_items.K,
             )
             state_out = state.replace(
                 monster_ai=monster_ai_out,
@@ -3456,10 +3465,14 @@ def fill_ordinary_rooms(
                 jnp.arange(MAX_ROOMS_PER_LEVEL, dtype=jnp.int32),
             )
             if state is not None:
-                new_ground_items = state.ground_items.replace(
-                    category=gcat_out,
-                    type_id=gtyp_out,
-                    quantity=gqty_out,
+                from Nethax.nethax.subsystems.ground_items_sparse import dense_to_sparse
+                new_ground_items = dense_to_sparse(
+                    _dense_gi_seed.replace(
+                        category=gcat_out,
+                        type_id=gtyp_out,
+                        quantity=gqty_out,
+                    ),
+                    state.ground_items.K,
                 )
                 state_out = state.replace(ground_items=new_ground_items)
             else:
