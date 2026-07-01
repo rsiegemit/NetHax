@@ -876,8 +876,10 @@ def build_colors(env_state) -> jnp.ndarray:
     # vendor/nle/src/mapglyph.c GLYPH_OBJ_OFF branch sets
     # ``color = objects[obj_descr_idx].oc_color``.
     visible_all = env_state.visible[:21, 1:80]                     # bool[21,79]
-    gi_cat0 = env_state.ground_items.category[branch, level_idx, :21, 1:80, 0]
-    gi_typ0 = env_state.ground_items.type_id[branch, level_idx, :21, 1:80, 0]
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_slot0_maps
+    _cat_map_c, _typ_map_c = sparse_slot0_maps(env_state.ground_items, branch, level_idx)
+    gi_cat0 = _cat_map_c[:21, 1:80]
+    gi_typ0 = _typ_map_c[:21, 1:80]
     has_obj = (gi_cat0 != jnp.int8(0)) & visible_all
     obj_glyph_idx = jnp.clip(
         gi_typ0.astype(jnp.int32) + jnp.int32(GLYPH_OBJ_OFF),
@@ -965,8 +967,10 @@ def build_specials(env_state) -> jnp.ndarray:
     # Ground items: category[branch, level, row, col, stack] (int8)
     # stack dim is MAX_GROUND_STACK = 8; non-zero means item present.
     # Drop internal column 0 (obs col c = internal col c+1), matching NLE.
-    gi_cat = env_state.ground_items.category[branch, level_idx, :21, 1:80, :]
-    gi_typ = env_state.ground_items.type_id[branch, level_idx, :21, 1:80, :]
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_to_dense_level
+    _lvl = sparse_to_dense_level(env_state.ground_items, branch, level_idx)  # Item[H,W,S]
+    gi_cat = _lvl.category[:21, 1:80, :]
+    gi_typ = _lvl.type_id[:21, 1:80, :]
 
     occupied = gi_cat != 0
     stack_count = jnp.sum(occupied.astype(jnp.int32), axis=-1)
@@ -1149,8 +1153,10 @@ def build_screen_descriptions(env_state) -> jnp.ndarray:
     # by construction in _build_glyph_lookups.
     branch_p = jnp.int32(env_state.dungeon.current_branch)
     level_idx_p = jnp.int32(env_state.dungeon.current_level) - 1
-    gi_cat_p = env_state.ground_items.category[branch_p, level_idx_p, :21, 1:80, :]
-    gi_qty_p = env_state.ground_items.quantity[branch_p, level_idx_p, :21, 1:80, :]
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_to_dense_level
+    _lvl_p = sparse_to_dense_level(env_state.ground_items, branch_p, level_idx_p)  # Item[H,W,S]
+    gi_cat_p = _lvl_p.category[:21, 1:80, :]
+    gi_qty_p = _lvl_p.quantity[:21, 1:80, :]
     # First-occupied slot per cell (matches the placement order written by
     # ``fill_ordinary_rooms``'s argmax-on-empty slot allocator).
     occupied_p = gi_cat_p != 0
@@ -2400,23 +2406,13 @@ def build_glyphs(env_state, fast: bool = False) -> jnp.ndarray:
     # Nethax/nethax/subsystems/inventory.py:754-761 (pickup reads slot 0) and
     # the drop scan at lines 1067-1095 (drop fills first-empty slot).  We
     # therefore render slot 0's type_id as the visible object glyph.
-    # PHASE 1 sparse ground_items proof: when NETHAX_SPARSE_GROUND is set, the
-    # two slot-0 reads are sourced from a round-tripped sparse representation
-    # (dense -> sparse -> slot0 map) instead of the direct dense index.  This is
-    # a byte-identity harness for the traceable sparse primitive (dense stays
-    # the source of truth); the flag is OFF by default so behavior is unchanged.
-    if os.environ.get("NETHAX_SPARSE_GROUND"):
-        from Nethax.nethax.subsystems.ground_items_sparse import (
-            dense_to_sparse, sparse_slot0_maps,
-        )
-        _K = int(os.environ.get("NETHAX_SPARSE_K", "64"))
-        _sparse = dense_to_sparse(env_state.ground_items, _K)
-        _cat_map, _typ_map = sparse_slot0_maps(_sparse, branch, level_idx)
-        gi_cat0 = _cat_map[:21, 1:80]                                             # int8[21,79]
-        gi_typ0 = _typ_map[:21, 1:80]                                             # int16[21,79]
-    else:
-        gi_cat0 = env_state.ground_items.category[branch, level_idx, :21, 1:80, 0]   # int8[21,79]
-        gi_typ0 = env_state.ground_items.type_id[branch, level_idx, :21, 1:80, 0]    # int16[21,79]
+    # PHASE 3: ``env_state.ground_items`` IS the sparse representation, so the
+    # two slot-0 reads come straight from ``sparse_slot0_maps`` (top-of-stack
+    # category + type_id maps for this level) — no dense round-trip.
+    from Nethax.nethax.subsystems.ground_items_sparse import sparse_slot0_maps
+    _cat_map, _typ_map = sparse_slot0_maps(env_state.ground_items, branch, level_idx)
+    gi_cat0 = _cat_map[:21, 1:80]                                             # int8[21,79]
+    gi_typ0 = _typ_map[:21, 1:80]                                             # int16[21,79]
     has_obj = (gi_cat0 != jnp.int8(0)) & visible                                 # bool[21,79]
     obj_glyphs = (gi_typ0.astype(jnp.int32) + jnp.int32(GLYPH_OBJ_OFF)).astype(jnp.int16)
     glyphs = jnp.where(has_obj, obj_glyphs, glyphs)

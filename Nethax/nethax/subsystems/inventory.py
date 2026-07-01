@@ -391,8 +391,14 @@ def _empty_items_array() -> Item:
     )
 
 
-def _empty_ground_items_array(n_branches: int, max_levels: int, map_h: int, map_w: int) -> Item:
-    """Return a ground_items array of shape [n_branches, max_levels, map_h, map_w, MAX_GROUND_STACK]."""
+def _empty_dense_ground_items(n_branches: int, max_levels: int, map_h: int, map_w: int) -> Item:
+    """Return a DENSE ground_items array of shape [n_branches, max_levels, map_h, map_w, MAX_GROUND_STACK].
+
+    This is the legacy dense representation, retained for level-generation
+    working buffers (build dense, then ``dense_to_sparse`` at gen end) and for
+    the sparse module's field-metadata harvesting.  ``EnvState`` no longer
+    stores this — see :func:`_empty_ground_items_array` for the sparse storage.
+    """
     shape = (n_branches, max_levels, map_h, map_w, MAX_GROUND_STACK)
     return Item(
         category=jnp.zeros(shape, dtype=jnp.int8),
@@ -423,6 +429,30 @@ def _empty_ground_items_array(n_branches: int, max_levels: int, map_h: int, map_
         oeaten=jnp.zeros(shape, dtype=jnp.int8),
         opoisoned=jnp.zeros(shape, dtype=jnp.bool_),
     )
+
+
+def _empty_ground_items_array(n_branches: int, max_levels: int, map_h: int, map_w: int):
+    """Return an EMPTY ``SparseGroundItems`` for ``EnvState`` storage.
+
+    Phase 3: ``EnvState.ground_items`` now holds the sparse representation.
+    Every field is ``category == 0`` (canonical empty-fill), so this is
+    byte-equivalent to the legacy all-empty dense grid on every occupied
+    (``category != 0``) cell — there are none.  ``K`` from ``NETHAX_SPARSE_K``
+    (default 64).  Lazy-imports ``SparseGroundItems`` to avoid the
+    inventory <-> ground_items_sparse import cycle.
+    """
+    import os
+    from Nethax.nethax.subsystems.ground_items_sparse import SparseGroundItems
+    K = int(os.environ.get("NETHAX_SPARSE_K", "64"))
+    B, L, S = n_branches, max_levels, MAX_GROUND_STACK
+    cell = _empty_dense_ground_items(1, 1, 1, 1)  # [1,1,1,1,S] per field
+    field_vals = {}
+    for name in cell.__dict__.keys():
+        fill = jnp.asarray(getattr(cell, name)).reshape(-1)[0]
+        field_vals[name] = jnp.full((B, L, K), fill, dtype=fill.dtype)
+    items = Item(**field_vals)
+    pos = jnp.zeros((B, L, K, 3), dtype=jnp.int16)
+    return SparseGroundItems(items=items, pos=pos, H=map_h, W=map_w, S=S, K=K)
 
 
 # ---------------------------------------------------------------------------

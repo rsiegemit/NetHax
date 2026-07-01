@@ -924,8 +924,15 @@ def _apply_directives(
     # the flat index is 0.
     trap_lvl_idx = 0
 
-    # Ground-items array (Item pytree).
-    ground = state.ground_items
+    # Ground-items DENSE working buffer (Item pytree).  ``EnvState.ground_items``
+    # is now the sparse representation; level-gen builds items into a dense
+    # [B,L,H,W,S] scratch grid and converts to sparse once at commit (gen is not
+    # hot, so dense-build-then-convert is simplest — see Phase 3 migration).
+    from Nethax.nethax.subsystems.inventory import _empty_dense_ground_items
+    ground = _empty_dense_ground_items(
+        static.n_branches, static.max_levels_per_branch,
+        static.map_h, static.map_w,
+    )
 
     # Pass 0: stamp literal MAP blocks before anything else so subsequent
     # directives (stairs, objects) write on top of the authoritative grid.
@@ -1142,12 +1149,15 @@ def _apply_directives(
                 jnp.int8(int(TileType.STAIRCASE_DOWN))
             )
 
-    # 4. Commit accumulated terrain/traps/grounds.
+    # 4. Commit accumulated terrain/traps/grounds.  Convert the dense scratch
+    # ground buffer to the sparse representation EnvState stores (K from the
+    # existing empty sparse struct so the pytree structure stays consistent).
+    from Nethax.nethax.subsystems.ground_items_sparse import dense_to_sparse
     new_traps = state.traps.replace(trap_type=trap_type_arr)
     state = state.replace(
         terrain=terrain_np,
         traps=new_traps,
-        ground_items=ground,
+        ground_items=dense_to_sparse(ground, state.ground_items.K),
     )
 
     # 4b. Commit door open/closed/locked status into the features overlay.

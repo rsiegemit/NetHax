@@ -32,14 +32,14 @@ import jax
 import jax.numpy as jnp
 from flax import struct
 
-from Nethax.nethax.subsystems.inventory import Item, _empty_ground_items_array
+from Nethax.nethax.subsystems.inventory import Item, _empty_dense_ground_items
 
 # ---------------------------------------------------------------------------
 # Field metadata harvested from a real empty Item (no hardcoded field list).
 # FILLS[f] = the canonical empty-cell value for field f; DTYPES[f] its dtype.
 # ---------------------------------------------------------------------------
 _FIELDS = tuple(f.name for f in dataclasses.fields(Item))
-_EMPTY_CELL = _empty_ground_items_array(1, 1, 1, 1)  # shape [1,1,1,1,S] per field
+_EMPTY_CELL = _empty_dense_ground_items(1, 1, 1, 1)  # shape [1,1,1,1,S] per field
 _FILLS = {
     f: jnp.asarray(getattr(_EMPTY_CELL, f)).reshape(-1)[0] for f in _FIELDS
 }
@@ -158,6 +158,68 @@ def sparse_slot0_maps(sparse: SparseGroundItems, b, lv):
     cat_map = jnp.zeros((H * W + 1,), _DTYPES["category"]).at[flat].set(cat)
     typ_map = jnp.zeros((H * W + 1,), _DTYPES["type_id"]).at[flat].set(typ)
     return cat_map[:H * W].reshape(H, W), typ_map[:H * W].reshape(H, W)
+
+
+# ---------------------------------------------------------------------------
+# PHASE 3 — bridge helpers for peripheral reconstruct-modify-writeback sites.
+#
+# ``sparse_to_dense_level`` rebuilds ONE level's dense ``Item[H,W,S]`` slice;
+# ``replace_level`` splices a modified dense ``Item[H,W,S]`` slice back into the
+# sparse struct at ``(b, lv)`` via ``dense_to_sparse`` on that single level.
+# Round-trip identity on ``category != 0`` cells:
+#   ``replace_level(s, b, lv, sparse_to_dense_level(s, b, lv)) == s``.
+# Both are JITTABLE and vmap-safe (fixed K / static H,W,S; ``b``/``lv`` traced).
+# ---------------------------------------------------------------------------
+
+
+def sparse_to_dense_level(sparse: SparseGroundItems, b, lv) -> Item:
+    """Reconstruct ONE level's dense ``Item[H,W,S]`` slice (JITTABLE scatter).
+
+    Per-level dual of :func:`sparse_to_dense`: scatters the (b, lv) K-entries
+    back to their ``(row, col, slot)`` cells; invalid/pad entries scatter to a
+    trash cell that is dropped.  ``b`` / ``lv`` may be traced.
+    """
+    items, pos = sparse.items, sparse.pos
+    H, W, S = sparse.H, sparse.W, sparse.S
+    HWS = H * W * S
+
+    cat_k = items.category[b, lv]                        # [K]
+    valid = cat_k != 0                                   # [K]
+    rp = pos[b, lv].astype(jnp.int32)                    # [K,3]
+    flat = rp[:, 0] * (W * S) + rp[:, 1] * S + rp[:, 2]  # [K]
+    flat = jnp.where(valid, flat, jnp.int32(HWS))        # invalid -> trash
+
+    out = {}
+    for f in _FIELDS:
+        fill = _FILLS[f].astype(_DTYPES[f])
+        base = jnp.full((HWS + 1,), fill, dtype=_DTYPES[f])
+        base = base.at[flat].set(getattr(items, f)[b, lv])
+        out[f] = base[:HWS].reshape(H, W, S)
+    return Item(**out)
+
+
+def replace_level(sparse: SparseGroundItems, b, lv,
+                  dense_level: Item) -> SparseGroundItems:
+    """Write a modified dense ``Item[H,W,S]`` level slice back into ``sparse``.
+
+    ``dense_to_sparse`` the single level ``(b, lv)`` and splice its K captured
+    entries into ``sparse.items[b, lv]`` / ``sparse.pos[b, lv]``.  ``b`` / ``lv``
+    may be traced.  Byte-exact on ``category != 0`` cells; overflow (> K
+    occupied) follows the module policy (keep lowest flat indices).
+    """
+    H, W, S, K = sparse.H, sparse.W, sparse.S, sparse.K
+    single = Item(**{f: getattr(dense_level, f).reshape(1, 1, H, W, S)
+                     for f in _FIELDS})
+    sub = dense_to_sparse(single, K)                     # items [1,1,K], pos [1,1,K,3]
+
+    new_items = sparse.items
+    for f in _FIELDS:
+        arr = getattr(new_items, f)                      # [B,L,K]
+        new_items = new_items.replace(
+            **{f: arr.at[b, lv].set(getattr(sub.items, f)[0, 0])}
+        )
+    new_pos = sparse.pos.at[b, lv].set(sub.pos[0, 0])
+    return sparse.replace(items=new_items, pos=new_pos)
 
 
 # ===========================================================================
