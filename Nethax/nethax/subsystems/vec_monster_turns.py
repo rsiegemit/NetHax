@@ -80,16 +80,22 @@ def vectorized_monster_turns(state, monster_turn, indices, turn_keys, can_act):
     s0 = state
 
     def _one(idx, key, may):
-        out = jax.lax.cond(
-            may, lambda: monster_turn(s0, key, idx), lambda: s0)
-
+        # Compact each branch to per-slot + tiny-shared leaves BEFORE selecting.
+        # Under vmap, lax.cond/where lowers to a SELECT over BOTH branch outputs;
+        # selecting over the full state would broadcast every big shared leaf
+        # (terrain/explored/ground_items) to [N, ...].  Those leaves are frozen +
+        # discarded by the merge anyway, so we zero them in each branch first,
+        # then select over the compact pytree only.  Behavior-identical: cond ==
+        # where under vmap, and the big leaves are zeroed either way.
         def _compact(path, leaf):
             if _is_per_slot(path, leaf, n):
                 return leaf[idx]                    # this monster's own slot
             if leaf.size > _SHARED_MERGE_MAX_ELEMS:
                 return jnp.zeros((), leaf.dtype)    # frozen shared -> placeholder
             return leaf                             # tiny shared (hp,...) -> keep
-        return jtu.tree_map_with_path(_compact, out)
+        turned = jtu.tree_map_with_path(_compact, monster_turn(s0, key, idx))
+        frozen = jtu.tree_map_with_path(_compact, s0)
+        return jtu.tree_map(lambda a, b: jnp.where(may, a, b), turned, frozen)
 
     # Chunked vmap (jax.lax.map with batch_size) instead of a flat vmap over all
     # N monsters: vmap K monsters per chunk, scan across ceil(N/K) chunks.  The
