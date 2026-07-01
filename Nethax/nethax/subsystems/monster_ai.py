@@ -45,6 +45,10 @@ from flax import struct
 
 from Nethax.nethax import vendor_rng as _vendor_rng_mod
 from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng
+from Nethax.nethax.subsystems.ground_items_sparse import (
+    sparse_to_dense_level,
+    replace_level,
+)
 
 # Monster-JIT split gate (mirrors env._USE_JIT_SPLIT).  When set, the
 # byte-parity branch of ``monsters_step_all`` delegates to the 3-step
@@ -2306,7 +2310,7 @@ def _gi_cur(state):
         return _VEC_GI_CUR
     b = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
-    return jax.tree_util.tree_map(lambda a: a[b, lv], state.ground_items)
+    return sparse_to_dense_level(state.ground_items, b, lv)
 
 
 def _try_scroll_earth(state, rng: jax.Array, monster_idx: jnp.ndarray):
@@ -2330,8 +2334,9 @@ def _try_scroll_earth(state, rng: jax.Array, monster_idx: jnp.ndarray):
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
     pr = state.player_pos[0].astype(jnp.int32)
     pc = state.player_pos[1].astype(jnp.int32)
-    map_h = g.category.shape[2]
-    map_w = g.category.shape[3]
+    map_h = g.H
+    map_w = g.W
+    _lvl = sparse_to_dense_level(g, br, lv)   # Item[H, W, STACK]
 
     offsets = jnp.array(
         [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]],
@@ -2343,19 +2348,20 @@ def _try_scroll_earth(state, rng: jax.Array, monster_idx: jnp.ndarray):
         r = pr + off[0]; c = pc + off[1]
         in_bounds = (r >= 0) & (r < map_h) & (c >= 0) & (c < map_w)
         rs = jnp.clip(r, 0, map_h - 1); cs = jnp.clip(c, 0, map_w - 1)
-        slot0_empty = gg.category[br, lv, rs, cs, 0] == jnp.int8(0)
+        slot0_empty = gg.category[rs, cs, 0] == jnp.int8(0)
         do_place = can_read & in_bounds & slot0_empty
-        new_cat = jnp.where(do_place, jnp.int8(_CAT_ROCK), gg.category[br, lv, rs, cs, 0])
-        new_tid = jnp.where(do_place, jnp.int16(_OBJ_BOULDER_TID), gg.type_id[br, lv, rs, cs, 0])
-        new_qty = jnp.where(do_place, jnp.int16(1), gg.quantity[br, lv, rs, cs, 0])
+        new_cat = jnp.where(do_place, jnp.int8(_CAT_ROCK), gg.category[rs, cs, 0])
+        new_tid = jnp.where(do_place, jnp.int16(_OBJ_BOULDER_TID), gg.type_id[rs, cs, 0])
+        new_qty = jnp.where(do_place, jnp.int16(1), gg.quantity[rs, cs, 0])
         new_gg = gg.replace(
-            category=gg.category.at[br, lv, rs, cs, 0].set(new_cat),
-            type_id=gg.type_id.at[br, lv, rs, cs, 0].set(new_tid),
-            quantity=gg.quantity.at[br, lv, rs, cs, 0].set(new_qty),
+            category=gg.category.at[rs, cs, 0].set(new_cat),
+            type_id=gg.type_id.at[rs, cs, 0].set(new_tid),
+            quantity=gg.quantity.at[rs, cs, 0].set(new_qty),
         )
         return new_gg, None
 
-    new_g, _ = jax.lax.scan(_place, g, offsets)
+    new_lvl, _ = jax.lax.scan(_place, _lvl, offsets)
+    new_g = replace_level(g, br, lv, new_lvl)
 
     # Consume one scroll.
     new_qty_scroll = jnp.where(can_read, qty - jnp.int32(1), qty).astype(jnp.int16)
@@ -2400,15 +2406,16 @@ def _try_loot_floor_container(state, rng: jax.Array, monster_idx: jnp.ndarray):
     g = state.ground_items
     br = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
+    _lvl = sparse_to_dense_level(g, br, lv)   # Item[H, W, STACK]
 
     # Vendor MUSE_BAG fires when the monster has an empty bag of holding
     # (a tool slot containing TID 220).  Check inv for BoH presence.
     found_bag, _bag_slot = _find_inv_slot(mai, idx, _CAT_TOOL, _BAG_OF_HOLDING_TID)
 
     # Pick the top of the ground stack at the monster's tile.
-    cat_here = g.category[br, lv, mr, mc, 0].astype(jnp.int32)
-    tid_here = g.type_id[br, lv, mr, mc, 0]
-    qty_here = g.quantity[br, lv, mr, mc, 0]
+    cat_here = _lvl.category[mr, mc, 0].astype(jnp.int32)
+    tid_here = _lvl.type_id[mr, mc, 0]
+    qty_here = _lvl.quantity[mr, mc, 0]
     has_floor_item = cat_here != jnp.int32(0)
 
     # Find first empty monster inv slot (other than slot 0 which holds the
@@ -2433,13 +2440,14 @@ def _try_loot_floor_container(state, rng: jax.Array, monster_idx: jnp.ndarray):
     )
 
     # Clear the floor stack slot.
-    new_g_cat = g.category.at[br, lv, mr, mc, 0].set(
-        jnp.where(do_loot, jnp.int8(0), g.category[br, lv, mr, mc, 0])
+    new_l_cat = _lvl.category.at[mr, mc, 0].set(
+        jnp.where(do_loot, jnp.int8(0), _lvl.category[mr, mc, 0])
     )
-    new_g_qty = g.quantity.at[br, lv, mr, mc, 0].set(
-        jnp.where(do_loot, jnp.int16(0), g.quantity[br, lv, mr, mc, 0])
+    new_l_qty = _lvl.quantity.at[mr, mc, 0].set(
+        jnp.where(do_loot, jnp.int16(0), _lvl.quantity[mr, mc, 0])
     )
-    new_g = g.replace(category=new_g_cat, quantity=new_g_qty)
+    new_lvl = _lvl.replace(category=new_l_cat, quantity=new_l_qty)
+    new_g = replace_level(g, br, lv, new_lvl)
     new_mai = mai.replace(
         inv_category=new_inv_cat,
         inv_type_id=new_inv_tid,
@@ -2917,7 +2925,8 @@ def mpickstuff(state, monster_idx: jnp.ndarray):
     pc = jnp.clip(pos[1], 0, _MAP_W - 1)
 
     # First ground stack at this tile.
-    ground_cat = _gi_cur(state).category[pr, pc, 0].astype(jnp.int32)
+    _cur = _gi_cur(state)   # dense current-level Item[H, W, STACK]
+    ground_cat = _cur.category[pr, pc, 0].astype(jnp.int32)
     has_item = ground_cat != jnp.int32(0)
     alive = mai.alive[idx]
     not_pet = ~mai.tame[idx]
@@ -2929,10 +2938,10 @@ def mpickstuff(state, monster_idx: jnp.ndarray):
     slot = jnp.argmax(empty_mask.astype(jnp.int32)).astype(jnp.int32)
     should = can_pick & has_empty
 
-    type_id  = _gi_cur(state).type_id[pr, pc, 0]
-    quantity = _gi_cur(state).quantity[pr, pc, 0]
-    buc      = _gi_cur(state).buc[pr, pc, 0]
-    charges  = _gi_cur(state).charges[pr, pc, 0]
+    type_id  = _cur.type_id[pr, pc, 0]
+    quantity = _cur.quantity[pr, pc, 0]
+    buc      = _cur.buc[pr, pc, 0]
+    charges  = _cur.charges[pr, pc, 0]
 
     new_inv_cat = mai.inv_category.at[idx, slot].set(
         jnp.where(should, ground_cat.astype(jnp.int8),
@@ -2952,9 +2961,9 @@ def mpickstuff(state, monster_idx: jnp.ndarray):
     )
 
     # Clear ground tile when picked up.
-    new_ground_cat = state.ground_items.category.at[b, lv, pr, pc, 0].set(
+    new_cat_row = _cur.category.at[pr, pc, 0].set(
         jnp.where(should, jnp.int8(0),
-                  _gi_cur(state).category[pr, pc, 0])
+                  _cur.category[pr, pc, 0])
     )
 
     new_mai = mai.replace(
@@ -2964,7 +2973,8 @@ def mpickstuff(state, monster_idx: jnp.ndarray):
         inv_buc=new_inv_buc,
         inv_charges=new_inv_chg,
     )
-    new_ground = state.ground_items.replace(category=new_ground_cat)
+    new_lvl = _cur.replace(category=new_cat_row)
+    new_ground = replace_level(state.ground_items, b, lv, new_lvl)
     return _gi_write(state, new_ground, monster_ai=new_mai)
 
 
@@ -4266,7 +4276,8 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
     pr = jnp.clip(mpos[0], 0, _MAP_H - 1)
     pc = jnp.clip(mpos[1], 0, _MAP_W - 1)
-    food_cat = _gi_cur(state).category[pr, pc, 0].astype(jnp.int32)
+    _cur_e = _gi_cur(state)   # dense current-level Item[H, W, STACK]
+    food_cat = _cur_e.category[pr, pc, 0].astype(jnp.int32)
     has_food = food_cat == jnp.int32(_CAT_FOOD_LOCAL)
     is_hungry_legacy = mai.pet_hunger[idx].astype(jnp.int32) <= jnp.int32(0)
     # Either hungry (cited dogmove.c:437 "edible <= CADAVER ... ACCFOOD" gate
@@ -4279,7 +4290,7 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
     #   switch (msize) { TINY*=8, SMALL*=6, MEDIUM*=5, LARGE*=4,
     #                    HUGE*=3, GIGANTIC*=2 }
     # Cite: vendor/nethack/src/dogmove.c::dog_nutrition lines 164-192.
-    food_tid = _gi_cur(state).type_id[pr, pc, 0].astype(jnp.int32)
+    food_tid = _cur_e.type_id[pr, pc, 0].astype(jnp.int32)
     safe_tid = jnp.clip(food_tid, 0, _OBJ_NUTRITION_TABLE.shape[0] - 1)
     base_nutrit = _OBJ_NUTRITION_TABLE[safe_tid]
     pet_entry = jnp.clip(mai.entry_idx[idx].astype(jnp.int32),
@@ -4312,8 +4323,8 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
     # mconf=0 (dogmove.c:241).
     new_confuse_eat = jnp.where(can_eat, jnp.int16(0), mai.confuse_timer[idx])
 
-    new_ground_cat = state.ground_items.category.at[b, lv, pr, pc, 0].set(
-        jnp.where(can_eat, jnp.int8(0), _gi_cur(state).category[pr, pc, 0])
+    new_cat_e = _cur_e.category.at[pr, pc, 0].set(
+        jnp.where(can_eat, jnp.int8(0), _cur_e.category[pr, pc, 0])
     )
     # Reset legacy pet_hunger to 1000 on eat (back-compat).
     new_hunger_after_eat = jnp.where(can_eat, jnp.int16(1000), mai.pet_hunger[idx])
@@ -4357,7 +4368,8 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
         pet_hunger=mai.pet_hunger.at[idx].set(new_hunger_after_eat),
         apport=mai.apport.at[idx].set(new_apport_e),
     )
-    new_ground = state.ground_items.replace(category=new_ground_cat)
+    new_lvl_e = _cur_e.replace(category=new_cat_e)
+    new_ground = replace_level(state.ground_items, b, lv, new_lvl_e)
     state = _gi_write(state, new_ground, monster_ai=mai_e)
     mai = state.monster_ai
 
@@ -4373,8 +4385,9 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
     mpos2 = mai.pos[idx].astype(jnp.int32)
     pr2 = jnp.clip(mpos2[0], 0, _MAP_H - 1)
     pc2 = jnp.clip(mpos2[1], 0, _MAP_W - 1)
-    g_cat = _gi_cur(state).category[pr2, pc2, 0].astype(jnp.int32)
-    g_buc = _gi_cur(state).buc_status[pr2, pc2, 0].astype(jnp.int32)
+    _cur_p = _gi_cur(state)   # dense current-level Item[H, W, STACK]
+    g_cat = _cur_p.category[pr2, pc2, 0].astype(jnp.int32)
+    g_buc = _cur_p.buc_status[pr2, pc2, 0].astype(jnp.int32)
     has_item_here = g_cat != jnp.int32(0)
     not_food = g_cat != jnp.int32(_CAT_FOOD_LOCAL)
     not_cursed = g_buc >= jnp.int32(0)  # buc_status: -1=cursed, 0=uncursed, +1=blessed
@@ -4383,9 +4396,9 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
     pick_slot = jnp.argmax(empty_mask.astype(jnp.int32)).astype(jnp.int32)
     can_pickup = is_pet & has_item_here & not_food & not_cursed & has_empty
 
-    g_type = _gi_cur(state).type_id[pr2, pc2, 0]
-    g_qty  = _gi_cur(state).quantity[pr2, pc2, 0]
-    g_chg  = _gi_cur(state).charges[pr2, pc2, 0]
+    g_type = _cur_p.type_id[pr2, pc2, 0]
+    g_qty  = _cur_p.quantity[pr2, pc2, 0]
+    g_chg  = _cur_p.charges[pr2, pc2, 0]
 
     new_inv_cat = mai.inv_category.at[idx, pick_slot].set(
         jnp.where(can_pickup, g_cat.astype(jnp.int8),
@@ -4404,9 +4417,9 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
     new_inv_chg = mai.inv_charges.at[idx, pick_slot].set(
         jnp.where(can_pickup, g_chg, mai.inv_charges[idx, pick_slot])
     )
-    new_ground_cat2 = state.ground_items.category.at[b, lv, pr2, pc2, 0].set(
+    new_cat_p = _cur_p.category.at[pr2, pc2, 0].set(
         jnp.where(can_pickup, jnp.int8(0),
-                  _gi_cur(state).category[pr2, pc2, 0])
+                  _cur_p.category[pr2, pc2, 0])
     )
     mai_p = mai.replace(
         inv_category=new_inv_cat,
@@ -4415,7 +4428,8 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
         inv_buc=new_inv_buc,
         inv_charges=new_inv_chg,
     )
-    new_ground2 = state.ground_items.replace(category=new_ground_cat2)
+    new_lvl_p = _cur_p.replace(category=new_cat_p)
+    new_ground2 = replace_level(state.ground_items, b, lv, new_lvl_p)
     state = _gi_write(state, new_ground2, monster_ai=mai_p)
     mai = state.monster_ai
 
@@ -5820,8 +5834,9 @@ def _find_ground_quest_artifact(state) -> tuple:
     """
     b = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
-    cat = state.ground_items.category[b, lv]        # [H, W, STACK]
-    tid = state.ground_items.type_id[b, lv]         # [H, W, STACK]
+    _lvl = sparse_to_dense_level(state.ground_items, b, lv)   # Item[H, W, STACK]
+    cat = _lvl.category        # [H, W, STACK]
+    tid = _lvl.type_id         # [H, W, STACK]
     occupied = cat != jnp.int8(0)
 
     is_qa = jnp.zeros_like(occupied)
@@ -7295,8 +7310,7 @@ def monsters_step_all(state, rng: jax.Array) -> object:
             global _VEC_GI_CUR
             _b = state.dungeon.current_branch.astype(jnp.int32)
             _lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
-            _VEC_GI_CUR = jax.tree_util.tree_map(
-                lambda a: a[_b, _lv], state.ground_items)
+            _VEC_GI_CUR = sparse_to_dense_level(state.ground_items, _b, _lv)
             try:
                 final_state = vectorized_monster_turns(
                     state, monster_turn, indices, turn_keys, can_act,

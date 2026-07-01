@@ -93,6 +93,7 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.nethax.vendor_rng import Isaac64State, rn2_jax
+from Nethax.nethax.subsystems.ground_items_sparse import sparse_to_dense_level
 
 # ---------------------------------------------------------------------------
 # Local constants -- kept here instead of importing from monster_ai.py so
@@ -271,7 +272,7 @@ def _emit_dog_goal_fobj_scan(state, vendor_rng, pet_r, pet_c):
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
 
     # category[branch, level, :, :, :] -> [H, W, MAX_GROUND_STACK]; 0 = empty.
-    cat_slab = state.ground_items.category[b, lv].astype(jnp.int32)
+    cat_slab = sparse_to_dense_level(state.ground_items, b, lv).category.astype(jnp.int32)
 
     side = 2 * _SQSRCHRADIUS + 1   # 11
     box_cells = side * side        # 121
