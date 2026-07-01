@@ -32,6 +32,11 @@ import jax
 import jax.numpy as jnp
 from flax import struct
 
+from Nethax.nethax.subsystems.ground_items_sparse import (
+    sparse_to_dense_level,
+    replace_level,
+)
+
 
 # ---------------------------------------------------------------------------
 # Fountain effects (vendor/nethack/src/fountain.c :: drinkfountain, fate 1-30)
@@ -652,29 +657,34 @@ def scatter_iron_chain_debris(state, pos: jnp.ndarray, rng: jax.Array):
         [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]],
         dtype=jnp.int32,
     )
-    map_h = g.category.shape[2]
-    map_w = g.category.shape[3]
+    map_h = g.H
+    map_w = g.W
+
+    # Reconstruct the dense level slice once; the scan mutates the DENSE
+    # Item[H,W,S] carry, and we splice it back into the sparse rep after.
+    lvl0 = sparse_to_dense_level(g, b, lv)
 
     def _place(carry, args):
-        gg, i = carry
+        lvl, i = carry
         off = args
         will_place = i < count
         r = row + off[0]; c = col + off[1]
         in_bounds = (r >= 0) & (r < map_h) & (c >= 0) & (c < map_w)
         rs = jnp.clip(r, 0, map_h - 1); cs = jnp.clip(c, 0, map_w - 1)
-        slot0_empty = gg.category[b, lv, rs, cs, 0] == jnp.int8(0)
+        slot0_empty = lvl.category[rs, cs, 0] == jnp.int8(0)
         do_place = will_place & in_bounds & slot0_empty
-        new_cat = jnp.where(do_place, jnp.int8(_CAT_CHAIN), gg.category[b, lv, rs, cs, 0])
-        new_tid = jnp.where(do_place, jnp.int16(_OBJ_IRON_CHAIN_TID), gg.type_id[b, lv, rs, cs, 0])
-        new_qty = jnp.where(do_place, jnp.int16(1), gg.quantity[b, lv, rs, cs, 0])
-        new_gg = gg.replace(
-            category=gg.category.at[b, lv, rs, cs, 0].set(new_cat),
-            type_id=gg.type_id.at[b, lv, rs, cs, 0].set(new_tid),
-            quantity=gg.quantity.at[b, lv, rs, cs, 0].set(new_qty),
+        new_cat = jnp.where(do_place, jnp.int8(_CAT_CHAIN), lvl.category[rs, cs, 0])
+        new_tid = jnp.where(do_place, jnp.int16(_OBJ_IRON_CHAIN_TID), lvl.type_id[rs, cs, 0])
+        new_qty = jnp.where(do_place, jnp.int16(1), lvl.quantity[rs, cs, 0])
+        new_lvl = lvl.replace(
+            category=lvl.category.at[rs, cs, 0].set(new_cat),
+            type_id=lvl.type_id.at[rs, cs, 0].set(new_tid),
+            quantity=lvl.quantity.at[rs, cs, 0].set(new_qty),
         )
-        return (new_gg, i + jnp.int32(1)), None
+        return (new_lvl, i + jnp.int32(1)), None
 
-    (new_g, _), _ = jax.lax.scan(_place, (g, jnp.int32(0)), offsets)
+    (new_lvl, _), _ = jax.lax.scan(_place, (lvl0, jnp.int32(0)), offsets)
+    new_g = replace_level(g, b, lv, new_lvl)
     return state.replace(ground_items=new_g)
 
 

@@ -65,6 +65,12 @@ from Nethax.nethax.dungeon.branches import (
     MAP_W as _MAP_W,
     MAX_LEVELS_PER_BRANCH as _MAX_LEVELS,
 )
+from Nethax.nethax.subsystems.ground_items_sparse import (
+    sparse_clear_slot,
+    sparse_read_tile,
+    sparse_to_dense_level,
+    replace_level,
+)
 
 
 MAX_TIMERS: int = 64
@@ -306,8 +312,8 @@ def _clear_ground_slot(state, branch, level, row, col, stack_slot):
     ``category != 0`` first.
     """
     gi = state.ground_items
-    new_cat = gi.category.at[branch, level, row, col, stack_slot].set(jnp.int8(0))
-    return state.replace(ground_items=gi.replace(category=new_cat))
+    gi = sparse_clear_slot(gi, branch, level, row, col, stack_slot)
+    return state.replace(ground_items=gi)
 
 
 # ---------------------------------------------------------------------------
@@ -340,24 +346,27 @@ def _callback_hatch_egg(state, target_id):
     gi = state.ground_items
 
     # Index-safety clips so out-of-range ids degrade to a no-op.
-    safe_b = jnp.clip(b, 0, gi.category.shape[0] - 1)
-    safe_l = jnp.clip(l, 0, gi.category.shape[1] - 1)
-    safe_r = jnp.clip(r, 0, gi.category.shape[2] - 1)
-    safe_c = jnp.clip(c, 0, gi.category.shape[3] - 1)
-    safe_s = jnp.clip(s, 0, gi.category.shape[4] - 1)
+    safe_b = jnp.clip(b, 0, gi.items.category.shape[0] - 1)
+    safe_l = jnp.clip(l, 0, gi.items.category.shape[1] - 1)
+    safe_r = jnp.clip(r, 0, gi.H - 1)
+    safe_c = jnp.clip(c, 0, gi.W - 1)
+    safe_s = jnp.clip(s, 0, gi.S - 1)
 
-    cat   = gi.category[safe_b, safe_l, safe_r, safe_c, safe_s]
-    tid   = gi.type_id[safe_b, safe_l, safe_r, safe_c, safe_s]
-    cnm   = gi.corpse_entry_idx[safe_b, safe_l, safe_r, safe_c, safe_s].astype(jnp.int32)
+    tile  = sparse_read_tile(gi, safe_b, safe_l, safe_r, safe_c)
+    cat   = tile.category[safe_s]
+    tid   = tile.type_id[safe_s]
+    cnm   = tile.corpse_entry_idx[safe_s].astype(jnp.int32)
 
     # vendor 1029: sterilised egg (corpsenm == NON_PM) just returns.
     is_egg = (cat == jnp.int8(_FOOD_CATEGORY)) & (tid == jnp.int16(_OTYP_EGG))
     valid = is_egg & (cnm >= jnp.int32(0))
 
-    new_cat = gi.category.at[safe_b, safe_l, safe_r, safe_c, safe_s].set(
+    _lvl = sparse_to_dense_level(gi, safe_b, safe_l)
+    _lvl = _lvl.replace(category=_lvl.category.at[safe_r, safe_c, safe_s].set(
         jnp.where(valid, jnp.int8(0), cat)
-    )
-    return state.replace(ground_items=gi.replace(category=new_cat))
+    ))
+    gi = replace_level(gi, safe_b, safe_l, _lvl)
+    return state.replace(ground_items=gi)
 
 
 def _callback_fig_transform(state, target_id):
@@ -398,20 +407,23 @@ def _callback_rot_corpse(state, target_id):
     """
     b, l, r, c, s = decode_ground_slot(target_id)
     gi = state.ground_items
-    safe_b = jnp.clip(b, 0, gi.category.shape[0] - 1)
-    safe_l = jnp.clip(l, 0, gi.category.shape[1] - 1)
-    safe_r = jnp.clip(r, 0, gi.category.shape[2] - 1)
-    safe_c = jnp.clip(c, 0, gi.category.shape[3] - 1)
-    safe_s = jnp.clip(s, 0, gi.category.shape[4] - 1)
+    safe_b = jnp.clip(b, 0, gi.items.category.shape[0] - 1)
+    safe_l = jnp.clip(l, 0, gi.items.category.shape[1] - 1)
+    safe_r = jnp.clip(r, 0, gi.H - 1)
+    safe_c = jnp.clip(c, 0, gi.W - 1)
+    safe_s = jnp.clip(s, 0, gi.S - 1)
 
-    cat = gi.category[safe_b, safe_l, safe_r, safe_c, safe_s]
-    tid = gi.type_id[safe_b, safe_l, safe_r, safe_c, safe_s]
+    tile = sparse_read_tile(gi, safe_b, safe_l, safe_r, safe_c)
+    cat = tile.category[safe_s]
+    tid = tile.type_id[safe_s]
     is_corpse = (cat == jnp.int8(_FOOD_CATEGORY)) & (tid == jnp.int16(_OTYP_CORPSE))
 
-    new_cat = gi.category.at[safe_b, safe_l, safe_r, safe_c, safe_s].set(
+    _lvl = sparse_to_dense_level(gi, safe_b, safe_l)
+    _lvl = _lvl.replace(category=_lvl.category.at[safe_r, safe_c, safe_s].set(
         jnp.where(is_corpse, jnp.int8(0), cat)
-    )
-    return state.replace(ground_items=gi.replace(category=new_cat))
+    ))
+    gi = replace_level(gi, safe_b, safe_l, _lvl)
+    return state.replace(ground_items=gi)
 
 
 def _callback_revive_mon(state, target_id):
@@ -433,20 +445,23 @@ def _callback_revive_mon(state, target_id):
     """
     b, l, r, c, s = decode_ground_slot(target_id)
     gi = state.ground_items
-    safe_b = jnp.clip(b, 0, gi.category.shape[0] - 1)
-    safe_l = jnp.clip(l, 0, gi.category.shape[1] - 1)
-    safe_r = jnp.clip(r, 0, gi.category.shape[2] - 1)
-    safe_c = jnp.clip(c, 0, gi.category.shape[3] - 1)
-    safe_s = jnp.clip(s, 0, gi.category.shape[4] - 1)
+    safe_b = jnp.clip(b, 0, gi.items.category.shape[0] - 1)
+    safe_l = jnp.clip(l, 0, gi.items.category.shape[1] - 1)
+    safe_r = jnp.clip(r, 0, gi.H - 1)
+    safe_c = jnp.clip(c, 0, gi.W - 1)
+    safe_s = jnp.clip(s, 0, gi.S - 1)
 
-    cat = gi.category[safe_b, safe_l, safe_r, safe_c, safe_s]
-    tid = gi.type_id[safe_b, safe_l, safe_r, safe_c, safe_s]
+    tile = sparse_read_tile(gi, safe_b, safe_l, safe_r, safe_c)
+    cat = tile.category[safe_s]
+    tid = tile.type_id[safe_s]
     is_corpse = (cat == jnp.int8(_FOOD_CATEGORY)) & (tid == jnp.int16(_OTYP_CORPSE))
 
-    new_cat = gi.category.at[safe_b, safe_l, safe_r, safe_c, safe_s].set(
+    _lvl = sparse_to_dense_level(gi, safe_b, safe_l)
+    _lvl = _lvl.replace(category=_lvl.category.at[safe_r, safe_c, safe_s].set(
         jnp.where(is_corpse, jnp.int8(0), cat)
-    )
-    return state.replace(ground_items=gi.replace(category=new_cat))
+    ))
+    gi = replace_level(gi, safe_b, safe_l, _lvl)
+    return state.replace(ground_items=gi)
 
 
 def _callback_zombify_mon(state, target_id):
@@ -473,15 +488,16 @@ def _callback_zombify_mon(state, target_id):
     """
     b, l, r, c, s = decode_ground_slot(target_id)
     gi = state.ground_items
-    safe_b = jnp.clip(b, 0, gi.category.shape[0] - 1)
-    safe_l = jnp.clip(l, 0, gi.category.shape[1] - 1)
-    safe_r = jnp.clip(r, 0, gi.category.shape[2] - 1)
-    safe_c = jnp.clip(c, 0, gi.category.shape[3] - 1)
-    safe_s = jnp.clip(s, 0, gi.category.shape[4] - 1)
+    safe_b = jnp.clip(b, 0, gi.items.category.shape[0] - 1)
+    safe_l = jnp.clip(l, 0, gi.items.category.shape[1] - 1)
+    safe_r = jnp.clip(r, 0, gi.H - 1)
+    safe_c = jnp.clip(c, 0, gi.W - 1)
+    safe_s = jnp.clip(s, 0, gi.S - 1)
 
-    cat = gi.category[safe_b, safe_l, safe_r, safe_c, safe_s]
-    tid = gi.type_id[safe_b, safe_l, safe_r, safe_c, safe_s]
-    cnm = gi.corpse_entry_idx[safe_b, safe_l, safe_r, safe_c, safe_s].astype(jnp.int32)
+    tile = sparse_read_tile(gi, safe_b, safe_l, safe_r, safe_c)
+    cat = tile.category[safe_s]
+    tid = tile.type_id[safe_s]
+    cnm = tile.corpse_entry_idx[safe_s].astype(jnp.int32)
     safe_cnm = jnp.clip(cnm, 0, _IS_ZOMBIE_FORM.shape[0] - 1)
 
     is_corpse = (cat == jnp.int8(_FOOD_CATEGORY)) & (tid == jnp.int16(_OTYP_CORPSE))
@@ -489,10 +505,12 @@ def _callback_zombify_mon(state, target_id):
     # effect is identical (consume corpse) regardless.
     _has_zombify = _IS_ZOMBIE_FORM[safe_cnm] & (cnm >= jnp.int32(0))
 
-    new_cat = gi.category.at[safe_b, safe_l, safe_r, safe_c, safe_s].set(
+    _lvl = sparse_to_dense_level(gi, safe_b, safe_l)
+    _lvl = _lvl.replace(category=_lvl.category.at[safe_r, safe_c, safe_s].set(
         jnp.where(is_corpse, jnp.int8(0), cat)
-    )
-    return state.replace(ground_items=gi.replace(category=new_cat))
+    ))
+    gi = replace_level(gi, safe_b, safe_l, _lvl)
+    return state.replace(ground_items=gi)
 
 
 def _callback_melt_ice(state, target_id):

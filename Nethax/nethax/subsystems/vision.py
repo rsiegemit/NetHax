@@ -44,6 +44,7 @@ import jax
 import jax.numpy as jnp
 
 from Nethax.nethax.constants.tiles import TileType
+from Nethax.nethax.subsystems.ground_items_sparse import sparse_read_tile
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +159,9 @@ def _cell_blocks_los_full(state, tile: jnp.ndarray,
     # row, col, 0]`` (the only slot used for boulders per
     # subsystems/boulders.py::_tile_has_boulder).
     gi = state.ground_items
-    g_cat = gi.category[b, lv_local, row, col, 0].astype(jnp.int32)
-    g_tid = gi.type_id[b, lv_local, row, col, 0].astype(jnp.int32)
+    _gtile = sparse_read_tile(gi, b, lv_local, row, col)
+    g_cat = _gtile.category[0].astype(jnp.int32)
+    g_tid = _gtile.type_id[0].astype(jnp.int32)
     blocks_boulder = (
         (g_cat == jnp.int32(_BOULDER_CATEGORY))
         & (g_tid == jnp.int32(_BOULDER_TYPE_ID))

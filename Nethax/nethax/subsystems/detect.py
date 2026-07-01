@@ -25,6 +25,7 @@ import jax.numpy as jnp
 
 from Nethax.nethax.constants.tiles import TileType, VendorTileType
 from Nethax.nethax.subsystems.inventory import ItemCategory
+from Nethax.nethax.subsystems.ground_items_sparse import sparse_to_dense_level
 # Re-export the LoS primitives so that callers preferring the historical
 # detect.cansee / detect.couldsee names see them surfaced from this module.
 from Nethax.nethax.subsystems.vision import (  # noqa: F401  (public re-export)
@@ -174,7 +175,7 @@ def detect_treasure(state, rng):
     b  = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
 
-    level_cats = state.ground_items.category[b, lv]  # [H, W, MAX_STACK]
+    level_cats = sparse_to_dense_level(state.ground_items, b, lv).category  # [H, W, MAX_STACK]
     has_gold = jnp.any(
         level_cats == jnp.int8(int(ItemCategory.COIN)), axis=-1
     )  # [H, W]
@@ -210,7 +211,7 @@ def detect_objects(state, rng):
     b  = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
 
-    level_cats = state.ground_items.category[b, lv]  # [H, W, MAX_STACK]
+    level_cats = sparse_to_dense_level(state.ground_items, b, lv).category  # [H, W, MAX_STACK]
     has_item = jnp.any(level_cats != jnp.int8(0), axis=-1)  # [H, W]
 
     new_explored = state.explored.at[b, lv].set(
@@ -276,7 +277,7 @@ def detect_magic(state, rng):
 
     b  = state.dungeon.current_branch.astype(jnp.int32)
     lv = state.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
-    level_cats = state.ground_items.category[b, lv]  # [H, W, MAX_STACK]
+    level_cats = sparse_to_dense_level(state.ground_items, b, lv).category  # [H, W, MAX_STACK]
 
     # Build a mask: is this category a magic class?
     magic_vals = jnp.array(sorted(_MAGIC_CATEGORIES), dtype=jnp.int8)
