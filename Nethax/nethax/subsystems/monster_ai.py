@@ -57,6 +57,23 @@ from Nethax.nethax.subsystems.ground_items_sparse import (
 # here, byte-identical to the pre-split implementation at ``7c70135``.
 _USE_JIT_SPLIT = _os.environ.get("NETHAX_JIT_SPLIT", "0") == "1"
 
+# DIAGNOSTIC (training path only): replace the bounded-BFS pathfind flood with a
+# trivial greedy Chebyshev step (sign of player-monster delta).  Isolates the
+# BFS flood's share of the monster-turn cost.  Gated off the byte-parity path.
+_SKIP_PATHFIND = _os.environ.get("NETHAX_SKIP_PATHFIND", "0") == "1"
+
+# BFS-HOIST shared distance field (training path only).  The bounded-BFS pathfind
+# floods a distance field rooted at the PLAYER; it is identical across all monsters
+# on a level except for per-monster passability (swim/fly/door/bars/trap flags).
+# ``vectorized_monster_turns`` computes it ONCE per env (using the first monster's
+# passability as representative) and stashes ``(dist, c0)`` here; ``_pathfind_step_impl``
+# then reads it instead of re-flooding per monster inside the 400-way vmap — cutting
+# both the redundant compute and the [400, grid] intermediate that caps the batch.
+# Set/cleared within a single trace (try/finally); read only when NOT use_vendor_rng.
+# The in-monster call sites use the NON-jitted ``_pathfind_step_impl`` so this global
+# is read fresh on every outer-step trace (no stale inner-jit cache).
+_VEC_SHARED_FLOOD = None
+
 # Map dims — kept local so we don't have to import dungeon.branches in JIT-time.
 # These must match Nethax.nethax.dungeon.branches.MAP_H/MAP_W.
 _MAP_H: int = 21
@@ -1326,8 +1343,44 @@ def _tile_passable(terrain: jnp.ndarray, r: jnp.ndarray, c: jnp.ndarray) -> jnp.
     return in_bounds & not_blocking
 
 
+def _pathfind_pick(dist, c0, mpos, ppos, window_w) -> jnp.ndarray:
+    """Pick the one-step (dy,dx) toward the player from a precomputed player-rooted
+    distance field ``dist`` (window left-col ``c0``).  Byte-identical to the pick
+    tail of ``_pathfind_step_impl`` — factored so the field can be shared/hoisted."""
+    W = int(window_w)
+    INF = jnp.int32(_PATHFIND_MAX_DEPTH + 100)
+    offsets = [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),          (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+    ]
+    mwc = mpos[1] - c0
+    m_in = (mwc >= 0) & (mwc < W)
+    monster_dist = jnp.where(
+        m_in, dist[mpos[0], jnp.clip(mwc, 0, W - 1)], INF)
+    reachable = monster_dist < INF
+    neighbor_dists = []
+    neighbor_offsets = []
+    for dy, dx in offsets:
+        nr = mpos[0] + dy
+        nwc = mwc + dx
+        in_b = (nr >= 0) & (nr < _MAP_H) & (nwc >= 0) & (nwc < W)
+        sr = jnp.clip(nr, 0, _MAP_H - 1)
+        sc = jnp.clip(nwc, 0, W - 1)
+        nd = jnp.where(in_b, dist[sr, sc], INF)
+        neighbor_dists.append(nd)
+        neighbor_offsets.append((dy, dx))
+    stacked = jnp.stack(neighbor_dists)  # [8]
+    best_idx = jnp.argmin(stacked).astype(jnp.int32)
+    offsets_arr = jnp.array(neighbor_offsets, dtype=jnp.int32)  # [8, 2]
+    bfs_step = offsets_arr[best_idx]  # [2]
+    greedy_delta = jnp.clip(ppos - mpos, -1, 1).astype(jnp.int32)
+    return jnp.where(reachable, bfs_step, greedy_delta)
+
+
 def _pathfind_step_impl(state, monster_idx: jnp.ndarray,
-                        window_w: int = _PATHFIND_WINDOW_W) -> jnp.ndarray:
+                        window_w: int = _PATHFIND_WINDOW_W,
+                        _return_field: bool = False) -> jnp.ndarray:
     """Return a one-step (dy, dx) toward the player using bounded BFS.
 
     Implementation: bounded BFS to depth ``_PATHFIND_MAX_DEPTH`` on a distance
@@ -1355,6 +1408,19 @@ def _pathfind_step_impl(state, monster_idx: jnp.ndarray,
     mai = state.monster_ai
     mpos = mai.pos[idx].astype(jnp.int32)
     ppos = state.player_pos.astype(jnp.int32)
+
+    # DIAGNOSTIC: skip the BFS flood, greedy Chebyshev step toward player.
+    if _SKIP_PATHFIND and not _use_vendor_rng() and not _return_field:
+        return jnp.clip(ppos - mpos, -1, 1).astype(jnp.int32)
+
+    # BFS-HOIST: reuse the shared player-rooted distance field (computed once per
+    # env in vectorized_monster_turns) instead of re-flooding per monster.  Only
+    # in the vec/training path; never when returning the field itself.
+    if (not _return_field) and (_VEC_SHARED_FLOOD is not None) \
+            and not _use_vendor_rng():
+        _sd, _sc0 = _VEC_SHARED_FLOOD
+        return _pathfind_pick(_sd, _sc0, mpos, ppos, window_w)
+
     terrain = _current_level_terrain(state)
 
     INF = jnp.int32(_PATHFIND_MAX_DEPTH + 100)
@@ -1582,39 +1648,13 @@ def _pathfind_step_impl(state, monster_idx: jnp.ndarray,
 
     dist = jax.lax.fori_loop(0, _PATHFIND_MAX_DEPTH, bfs_body, dist0)
 
-    # Monster column in window coords.  A monster outside the band is beyond
-    # the BFS depth from the player, so its full-map dist would be INF anyway.
-    mwc = mpos[1] - c0
-    m_in = (mwc >= 0) & (mwc < W)
-    # Reachable iff the BFS reached the monster's tile from the player.
-    monster_dist = jnp.where(
-        m_in, dist[mpos[0], jnp.clip(mwc, 0, W - 1)], INF)
-    reachable = monster_dist < INF
+    # BFS-HOIST: hand the raw player-rooted field back so the caller can share it
+    # across all monsters (vectorized_monster_turns computes this once per env).
+    if _return_field:
+        return dist, c0
 
-    # Pick the 8-neighbor of mpos with the smallest distance value.
-    # We want the neighbor whose dist == player_dist - 1 (closest to player
-    # from the monster's side). Easiest: read each of 8 neighbors' dist, pick min.
-    neighbor_dists = []
-    neighbor_offsets = []
-    for dy, dx in offsets:
-        nr = mpos[0] + dy
-        nwc = mwc + dx              # neighbor column in window coords
-        in_b = (nr >= 0) & (nr < _MAP_H) & (nwc >= 0) & (nwc < W)
-        sr = jnp.clip(nr, 0, _MAP_H - 1)
-        sc = jnp.clip(nwc, 0, W - 1)
-        nd = jnp.where(in_b, dist[sr, sc], INF)
-        neighbor_dists.append(nd)
-        neighbor_offsets.append((dy, dx))
-
-    stacked = jnp.stack(neighbor_dists)  # [8]
-    best_idx = jnp.argmin(stacked).astype(jnp.int32)
-    offsets_arr = jnp.array(neighbor_offsets, dtype=jnp.int32)  # [8, 2]
-    bfs_step = offsets_arr[best_idx]  # [2]
-
-    # Greedy fallback (8-dir Chebyshev gradient).
-    greedy_delta = jnp.clip(ppos - mpos, -1, 1).astype(jnp.int32)
-
-    return jnp.where(reachable, bfs_step, greedy_delta)
+    # Pick the monster's one-step toward the player from the flooded field.
+    return _pathfind_pick(dist, c0, mpos, ppos, window_w)
 
 
 # Module-level @jax.jit alias so ``pathfind_step`` can be called from a
@@ -4553,7 +4593,7 @@ def _pet_move_body(state, rng: jax.Array, monster_idx: jnp.ndarray,
             new_s, new_vrng = vendor_pet_dog_move(s, s.vendor_rng, idx)
             return new_s.replace(vendor_rng=new_vrng)
         _mai = s.monster_ai
-        step_delta = pathfind_step(s, idx)
+        step_delta = _pathfind_step_impl(s, idx)
         _rng_conf_pet = jax.random.fold_in(rng, jnp.int32(0x636F6E66))  # "conf"
         is_confused_pet = _mai.confuse_timer[idx] > jnp.int16(0)
         step_delta = apply_confusion_to_step(
@@ -5158,7 +5198,7 @@ def monster_turn(state, rng: jax.Array, monster_idx: jnp.ndarray) -> object:
             # 7b: movement decision; zero out step when scared.
             retreat_step = maybe_retreat(st, idx)
             wants_retreat = jnp.any(retreat_step != 0)
-            path_step = pathfind_step(st, idx)
+            path_step = _pathfind_step_impl(st, idx)
             # 7b': m_search_items — vendor monmove.c:1330-1452.  When a wanted
             # ground item lies within SQSRCHRADIUS Chebyshev squares of the
             # monster, vendor reorients the goal toward the item tile so the
@@ -6638,7 +6678,7 @@ def _monster_turn_one_bp_orchestrate(state, k_idx, key):
 
     state = _bp_pet_or_skip_jit(state, key, safe_slot, may_act)
     state, was_asleep = _monster_turn_a_jit(state, key, safe_slot, may_act)
-    path_step = pathfind_step(state, safe_slot)
+    path_step = _pathfind_step_impl(state, safe_slot)
 
     # Phase 5 — monster_turn_b.  ``NETHAX_BRAX_MT_B=1`` selects the
     # Brax-style version (always-compute + jnp.where) instead of the

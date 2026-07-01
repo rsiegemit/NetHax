@@ -79,6 +79,17 @@ def vectorized_monster_turns(state, monster_turn, indices, turn_keys, can_act):
     n = indices.shape[0]
     s0 = state
 
+    # BFS-HOIST: flood the player-rooted BFS distance field ONCE (using the first
+    # monster's passability as representative) and share it across all monsters via
+    # the module global that _pathfind_step_impl reads — instead of re-flooding it
+    # per monster inside the N-way vmap.  Cuts the redundant 400x BFS AND its
+    # [400, grid] intermediate (which caps the batch).  Training path only (this fn
+    # is reached only when not use_vendor_rng); restored in the finally below.
+    from Nethax.nethax.subsystems import monster_ai as _mai
+    _prev_shared = _mai._VEC_SHARED_FLOOD
+    _mai._VEC_SHARED_FLOOD = _mai._pathfind_step_impl(
+        s0, indices[0], _mai._PATHFIND_WINDOW_W, _return_field=True)
+
     def _one(idx, key, may):
         # Compact each branch to per-slot + tiny-shared leaves BEFORE selecting.
         # Under vmap, lax.cond/where lowers to a SELECT over BOTH branch outputs;
@@ -103,12 +114,15 @@ def vectorized_monster_turns(state, monster_turn, indices, turn_keys, can_act):
     # heavy monster_turn body (per-monster BFS dist-field / LoS -> [B,N,grid]
     # under the env x monster vmaps) is bounded to K, not N.  Flat vmap-over-400
     # OOM'd the A100 at B>=64 (job 24263295); chunking is the fix.  B=1 unaffected.
-    if _VEC_CHUNK > 0:
-        batched = jax.lax.map(
-            lambda a: _one(a[0], a[1], a[2]),
-            (indices, turn_keys, can_act), batch_size=_VEC_CHUNK)
-    else:
-        batched = jax.vmap(_one)(indices, turn_keys, can_act)
+    try:
+        if _VEC_CHUNK > 0:
+            batched = jax.lax.map(
+                lambda a: _one(a[0], a[1], a[2]),
+                (indices, turn_keys, can_act), batch_size=_VEC_CHUNK)
+        else:
+            batched = jax.vmap(_one)(indices, turn_keys, can_act)
+    finally:
+        _mai._VEC_SHARED_FLOOD = _prev_shared
 
     def _merge(path, s0_leaf, b_leaf):
         if _is_per_slot(path, s0_leaf, n):
