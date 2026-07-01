@@ -31,6 +31,10 @@ from Nethax.nethax.subsystems.inventory import (
     ItemCategory,
     compute_ac as _inv_compute_ac,
 )
+from Nethax.nethax.subsystems.ground_items_sparse import (
+    sparse_to_dense_level,
+    replace_level,
+)
 from Nethax.nethax.subsystems.items_potions import apply_potion_to_monster
 from Nethax.nethax.subsystems.scoring import (
     record_kill as _scoring_record_kill,
@@ -1157,7 +1161,7 @@ def relobj_drop_monster_inventory(state, monster_idx: jnp.ndarray, do_drop: jnp.
     inv_bucs = mai.inv_buc[m_safe]
     n_minv = inv_cats.shape[0]
 
-    n_stack = state.ground_items.category.shape[-1]
+    n_stack = state.ground_items.S
 
     def _step(carry, minv_slot):
         gi = carry
@@ -1167,10 +1171,13 @@ def relobj_drop_monster_inventory(state, monster_idx: jnp.ndarray, do_drop: jnp.
         item_buc = inv_bucs[minv_slot]
         has_item = item_cat != jnp.int8(0)
 
+        # Reconstruct the dense [H,W,S] slice for this level to find + write.
+        _lvl = sparse_to_dense_level(gi, branch, level)
+
         # Find the first empty ground stack slot at the death tile.
         def _find_slot(c2, sidx):
             found, gs = c2
-            is_empty = gi.category[branch, level, d_row, d_col, sidx] == jnp.int8(0)
+            is_empty = _lvl.category[d_row, d_col, sidx] == jnp.int8(0)
             gs = jnp.where(~found & is_empty, sidx, gs)
             found = found | is_empty
             return (found, gs), None
@@ -1183,24 +1190,25 @@ def relobj_drop_monster_inventory(state, monster_idx: jnp.ndarray, do_drop: jnp.
         can_place = gfound & has_item & do_drop
         safe_gs = jnp.clip(gslot, 0, n_stack - 1)
 
-        new_gi = gi.replace(
-            category=gi.category.at[branch, level, d_row, d_col, safe_gs].set(
+        _lvl = _lvl.replace(
+            category=_lvl.category.at[d_row, d_col, safe_gs].set(
                 jnp.where(can_place, item_cat,
-                          gi.category[branch, level, d_row, d_col, safe_gs])
+                          _lvl.category[d_row, d_col, safe_gs])
             ),
-            type_id=gi.type_id.at[branch, level, d_row, d_col, safe_gs].set(
+            type_id=_lvl.type_id.at[d_row, d_col, safe_gs].set(
                 jnp.where(can_place, item_tid,
-                          gi.type_id[branch, level, d_row, d_col, safe_gs])
+                          _lvl.type_id[d_row, d_col, safe_gs])
             ),
-            quantity=gi.quantity.at[branch, level, d_row, d_col, safe_gs].set(
+            quantity=_lvl.quantity.at[d_row, d_col, safe_gs].set(
                 jnp.where(can_place, item_qty,
-                          gi.quantity[branch, level, d_row, d_col, safe_gs])
+                          _lvl.quantity[d_row, d_col, safe_gs])
             ),
-            buc_status=gi.buc_status.at[branch, level, d_row, d_col, safe_gs].set(
+            buc_status=_lvl.buc_status.at[d_row, d_col, safe_gs].set(
                 jnp.where(can_place, item_buc,
-                          gi.buc_status[branch, level, d_row, d_col, safe_gs])
+                          _lvl.buc_status[d_row, d_col, safe_gs])
             ),
         )
+        new_gi = replace_level(gi, branch, level, _lvl)
         return new_gi, None
 
     new_gi, _ = jax.lax.scan(
@@ -1607,11 +1615,14 @@ def _single_melee_strike(
         d_col = jnp.clip(death_pos[1], 0, s.terrain.shape[3] - 1)
         branch = s.dungeon.current_branch.astype(jnp.int32)
         level = s.dungeon.current_level.astype(jnp.int32) - jnp.int32(1)
-        n_stack = gi.category.shape[-1]
+        n_stack = gi.S
+
+        # Reconstruct the dense [H,W,S] slice for this level to find + write.
+        _lvl = sparse_to_dense_level(gi, branch, level)
 
         def _find_slot(carry, sidx):
             found, gs = carry
-            is_empty = gi.category[branch, level, d_row, d_col, sidx] == jnp.int8(0)
+            is_empty = _lvl.category[d_row, d_col, sidx] == jnp.int8(0)
             gs = jnp.where(~found & is_empty, sidx, gs)
             found = found | is_empty
             return (found, gs), None
@@ -1624,24 +1635,25 @@ def _single_melee_strike(
         can_place = gfound & drops_corpse
         safe_gs = jnp.clip(gslot, 0, n_stack - 1)
         corpse_entry = s.monster_ai.entry_idx[idx].astype(jnp.int16)
-        new_gi = gi.replace(
-            category=gi.category.at[branch, level, d_row, d_col, safe_gs].set(
+        _lvl = _lvl.replace(
+            category=_lvl.category.at[d_row, d_col, safe_gs].set(
                 jnp.where(can_place, jnp.int8(_FOOD_CATEGORY),
-                          gi.category[branch, level, d_row, d_col, safe_gs])
+                          _lvl.category[d_row, d_col, safe_gs])
             ),
-            type_id=gi.type_id.at[branch, level, d_row, d_col, safe_gs].set(
+            type_id=_lvl.type_id.at[d_row, d_col, safe_gs].set(
                 jnp.where(can_place, jnp.int16(_CORPSE_TYPE_ID),
-                          gi.type_id[branch, level, d_row, d_col, safe_gs])
+                          _lvl.type_id[d_row, d_col, safe_gs])
             ),
-            quantity=gi.quantity.at[branch, level, d_row, d_col, safe_gs].set(
+            quantity=_lvl.quantity.at[d_row, d_col, safe_gs].set(
                 jnp.where(can_place, jnp.int16(1),
-                          gi.quantity[branch, level, d_row, d_col, safe_gs])
+                          _lvl.quantity[d_row, d_col, safe_gs])
             ),
-            corpse_entry_idx=gi.corpse_entry_idx.at[branch, level, d_row, d_col, safe_gs].set(
+            corpse_entry_idx=_lvl.corpse_entry_idx.at[d_row, d_col, safe_gs].set(
                 jnp.where(can_place, corpse_entry,
-                          gi.corpse_entry_idx[branch, level, d_row, d_col, safe_gs])
+                          _lvl.corpse_entry_idx[d_row, d_col, safe_gs])
             ),
         )
+        new_gi = replace_level(gi, branch, level, _lvl)
         s2 = s.replace(ground_items=new_gi)
 
         # Arm a ROT_CORPSE / REVIVE_MON timer for the just-placed corpse.
@@ -2432,12 +2444,14 @@ def thrown_attack(
     should_drop = should_drop & ~any_return
 
     gi = state.ground_items
+    # Reconstruct the dense [H,W,S] slice for this level to find + write.
+    _lvl = sparse_to_dense_level(gi, branch, level)
     # Find first empty slot in the ground stack at the terminal tile.
-    n_stack = gi.category.shape[-1]
+    n_stack = gi.S
 
     def _find_gslot(carry, sidx):
         found, gs = carry
-        is_empty = gi.category[branch, level, drop_row, drop_col, sidx] == 0
+        is_empty = _lvl.category[drop_row, drop_col, sidx] == 0
         gs = jnp.where(~found & is_empty, sidx, gs)
         found = found | is_empty
         return (found, gs), None
@@ -2483,7 +2497,7 @@ def thrown_attack(
     drop_qty_base = jnp.where(
         can_drop,
         jnp.int16(1),
-        gi.quantity[branch, level, drop_row, drop_col, safe_gs],
+        _lvl.quantity[drop_row, drop_col, safe_gs],
     )
     drop_qty = jnp.where(does_break, jnp.int16(0), drop_qty_base)
     # Also zero out inventory slot when item shatters.
@@ -2495,22 +2509,23 @@ def thrown_attack(
     )
 
     def _set_field_ground(field_g, field_inv):
-        return field_g.at[branch, level, drop_row, drop_col, safe_gs].set(
-            jnp.where(can_drop, field_inv[slot], field_g[branch, level, drop_row, drop_col, safe_gs])
+        return field_g.at[drop_row, drop_col, safe_gs].set(
+            jnp.where(can_drop, field_inv[slot], field_g[drop_row, drop_col, safe_gs])
         )
 
-    new_ground = gi.replace(
-        category=_set_field_ground(gi.category, items.category),
-        type_id=_set_field_ground(gi.type_id, items.type_id),
-        buc_status=_set_field_ground(gi.buc_status, items.buc_status),
-        enchantment=_set_field_ground(gi.enchantment, items.enchantment),
-        charges=_set_field_ground(gi.charges, items.charges),
-        identified=_set_field_ground(gi.identified, items.identified),
-        quantity=gi.quantity.at[branch, level, drop_row, drop_col, safe_gs].set(drop_qty),
-        weight=_set_field_ground(gi.weight, items.weight),
-        ac_bonus=_set_field_ground(gi.ac_bonus, items.ac_bonus),
-        is_two_handed=_set_field_ground(gi.is_two_handed, items.is_two_handed),
+    _lvl = _lvl.replace(
+        category=_set_field_ground(_lvl.category, items.category),
+        type_id=_set_field_ground(_lvl.type_id, items.type_id),
+        buc_status=_set_field_ground(_lvl.buc_status, items.buc_status),
+        enchantment=_set_field_ground(_lvl.enchantment, items.enchantment),
+        charges=_set_field_ground(_lvl.charges, items.charges),
+        identified=_set_field_ground(_lvl.identified, items.identified),
+        quantity=_lvl.quantity.at[drop_row, drop_col, safe_gs].set(drop_qty),
+        weight=_set_field_ground(_lvl.weight, items.weight),
+        ac_bonus=_set_field_ground(_lvl.ac_bonus, items.ac_bonus),
+        is_two_handed=_set_field_ground(_lvl.is_two_handed, items.is_two_handed),
     )
+    new_ground = replace_level(gi, branch, level, _lvl)
 
     new_inv = state.inventory.replace(items=new_items)
 
