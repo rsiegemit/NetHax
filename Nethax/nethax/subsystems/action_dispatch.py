@@ -71,6 +71,11 @@ from Nethax.nethax.constants import TileType
 from Nethax.nethax.constants.objects import ObjectClass
 from Nethax.nethax.fov import compute_fov, update_explored, view_from, BLIND_SIGHT_RADIUS, DEFAULT_SIGHT_RADIUS, DARK_ROOM_SIGHT_RADIUS
 from Nethax.nethax.subsystems.lighting import _player_in_lit_area
+import os as _os_fov
+from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng_fov
+# DIAGNOSTIC (training path only): skip the per-move FOV/vision recompute
+# (Bresenham raycast + view_from) to isolate its share of the per-step cost.
+_SKIP_FOV = _os_fov.environ.get("NETHAX_SKIP_FOV", "0") == "1"
 from Nethax.nethax.subsystems.features import (
     DoorState,
     open_door,
@@ -296,6 +301,9 @@ def _apply_fov(state):
          DEFAULT_SIGHT_RADIUS even in a dark corridor.
          Vendor: light.c::do_light_sources line 169.
     """
+    # DIAGNOSTIC: skip the per-move vision recompute (training path only).
+    if _SKIP_FOV and not _use_vendor_rng_fov():
+        return state
     from Nethax.nethax.subsystems.status_effects import TimedStatus
     terrain_2d = _current_level_terrain(state)
 
