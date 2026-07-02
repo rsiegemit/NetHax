@@ -86,25 +86,22 @@ O(1 ms) or less. The benchmark measures only post-compile throughput.
 
 ## Comparison: NLE vs Nethax
 
-| Environment | Single-env (CPU) | Batch-512 (CPU) | Batch-4096 (CPU) |
-|-------------|-----------------|-----------------|-----------------|
-| NLE (C ext) | ~10 000–20 000  | N/A (fork-per-env) | N/A           |
-| Nethax (JAX)| *(measured)*    | *(measured)*    | *(measured)*   |
+> **See ["Honest comparison to the C baselines (MEASURED)"](#honest-comparison-to-the-c-baselines-measured-2026-07-02)
+> below for the real, measured numbers.** The optimized-C NLE/MiniHack engines win on
+> raw throughput at every scale; Nethax/Minihax do **not** beat them on steps/s. The
+> paragraphs below described an *expected* vmap advantage that measurement did not bear
+> out for these envs — kept only for context.
 
-**NLE** achieves ~10 000–20 000 sps per environment on a modern x86 CPU but
-is fundamentally **not batchable** — each environment is a separate forked
-process with a C extension. There is no efficient vmap or lax.scan path.
+**NLE** achieves ~16 000–46 000 sps per environment on a CPU core (measured:
+`NetHack-v0` 16,261; `NetHackChallenge-v0` 45,970) and, though each env is a separate
+forked process, **scales ~linearly across CPU cores** — a 112-core node reaches
+millions of sps.
 
-**Nethax** pays a ~30–60 s JIT compile cost but then amortises it across
-arbitrarily many rollouts. The key advantage is:
-
-- `jax.vmap` over N environments is a single fused kernel, not N forked
-  processes. At batch=512 or 4096 the aggregate sps typically exceeds NLE
-  by 10–100×.
-- `jax.lax.scan` eliminates Python-loop overhead for long rollouts; the
-  entire 1 000-step trajectory is a single compiled XLA computation.
-- On GPU, vmap batching can push aggregate throughput to millions of sps
-  (environment-dependent — not yet measured on this machine).
+**Nethax/Minihax** pay a JIT compile cost, then run N rollouts as one fused
+`jax.vmap` kernel — but throughput **plateaus** (the step graph is compute-bound), so a
+single GPU roughly matches *one* CPU core, not a whole node. The real advantages are
+byte-exact parity, differentiability, and running the env natively on GPU/TPU — not
+sample throughput.
 
 The single-env no-vmap figure is expected to be **lower** than NLE (~1 000–
 5 000 sps) because the JAX interpreter overhead dominates at batch=1. This
@@ -166,17 +163,43 @@ serialization is more than repaid by the larger batch). B=4096 still OOMs (needs
 more headroom → a state shrink such as bit-packing the bool feature planes). Recommended
 full-fidelity training recipe on 80 GB: `NETHAX_VEC_CHUNK=64` + donated state at B=2048.
 
-### Honest comparison to NLE at full fidelity
+### Honest comparison to the C baselines (MEASURED 2026-07-02)
 
-A single NLE core does **~10,778 steps/s**. Full-fidelity Nethax on a *whole*
-A100 tops out at **~3436 steps/s @ B=1024 — roughly 3× below one NLE core**, and
-batching does **not** close this: throughput plateaus (574 → 929 → 1043 → 3436
-after the optimizations) because the full-fidelity step graph is **compute-bound**
-(monster AI + the per-move FOV/vision raycast), so the GPU saturates rather than
-scaling linearly with B. The `jax.vmap` "beats NLE by 10–100×" advantage is real
-for *reduced* configs (single level, few monsters) but does **not** hold for full
-fidelity, where per-step cost dominates. Beating NLE at full fidelity remains open
-and would require cutting the FOV raycast and monster-body cost further.
+All baselines are **measured**, not cited — the optimized-C NLE/MiniHack envs win
+decisively on raw throughput, at every scale. Two matched comparisons:
+
+**① NetHack vs Nethax (full game).** Baseline: NLE running full NetHack, single-env
+on one CPU core (Harvard, 112-core node).
+
+| | throughput | at node scale |
+|---|-----------|---------------|
+| NetHack — `NetHackChallenge-v0` (NLE C) | **45,970 sps / core** | ~5.1M sps (×112 cores, fork-per-env) |
+| NetHack — `NetHack-v0` (NLE C) | **16,261 sps / core** | ~1.8M sps (×112) |
+| **Nethax (JAX, full fidelity, 1×A100)** | **3,844 sps @ B=2048** | one GPU |
+
+Nethax on a *whole* A100 is **~4–12× below one NLE core** and ~500–1300× below a full
+node. Batching does not close it: throughput plateaus (929 → 3436 → 3844 across the
+optimizations) because the full-fidelity step is **compute-bound** (monster AI + the
+per-move FOV/vision raycast), so the GPU saturates rather than scaling with B.
+
+**② MiniHack vs Minihax (small RL scope).** Baseline: vendor MiniHack (NLE C) single-env.
+
+| | throughput | at node scale |
+|---|-----------|---------------|
+| MiniHack — `Room-Monster-5x5` (NLE C, 1 core) | **~14,967 sps / core** | ~240k (16-core) … ~1.7M (112-core) sps, fork-per-env |
+| **Minihax (JAX, matched reduced scope, 1×A100)** | **15,148 sps @ B=16,384** | one GPU |
+
+At matched scope, Minihax on a full GPU ≈ **one** MiniHack CPU core, and loses to a
+multi-core node (MiniHack forks scale ~linearly with cores; Minihax plateaus,
+compute-bound). (Corrects an earlier draft that cited NLE ≈ 10,778 sps and claimed a
+10–100× vmap advantage — both wrong.)
+
+**Takeaway:** the value of the JAX reimplementation is **not** steps/s — the C engines
+are faster. It is (a) **byte-exact vendor parity** (48/48 multi-seed), (b)
+**differentiability** — gradients flow through `env.step`, impossible in the C envs,
+(c) **GPU/TPU-native** single-kernel batching for research that must run the env on the
+accelerator (no per-env host processes). For pure sample throughput on CPU, NLE/MiniHack
+remain the better tool.
 
 ---
 

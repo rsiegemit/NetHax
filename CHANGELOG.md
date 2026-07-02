@@ -20,11 +20,13 @@ green (12/12 across seeds 0/1/2/5). Measured on A100-80GB, `MiniHack-Room-Monste
 - **BFS hoist** — the player-rooted pathfind distance field is computed once per env
   and shared across all monsters instead of re-flooded inside the 400-way vmap.
   **1.43×** (→ 2678 sps @ 512; 3436 sps @ 1024).
-- **Net: 929 → 3436 env-steps/s @ batch 1024 = 3.7×.** Batch ceiling B=1024 on 80 GB
-  (fused-broadcast transient in the monster vmap). See [`docs/benchmark.md`](docs/benchmark.md)
-  for the honest NLE comparison — full-fidelity Nethax is still ~3× below one NLE
-  core because the step graph is compute-bound; the vmap advantage holds for reduced
-  configs, not full fidelity.
+- **Net: 929 → 3436 env-steps/s @ batch 1024 = 3.7×** (3844 @ B=2048 with byte-neutral
+  donation + `NETHAX_VEC_CHUNK=64`). See [`docs/benchmark.md`](docs/benchmark.md) for the
+  honest MEASURED comparison to the C engines: full NetHack under NLE runs 16k–46k sps
+  **per core** (and scales ~linearly across a node), so full-fidelity Nethax on a whole
+  A100 is ~4–12× *below one* NLE core; at matched small scope Minihax ≈ one MiniHack core
+  (~15k sps). The optimized-C envs win on throughput — the JAX port's value is byte
+  parity, differentiability, and GPU/TPU-native batching, not steps/s.
 
 ---
 
