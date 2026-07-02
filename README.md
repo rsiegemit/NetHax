@@ -26,7 +26,7 @@ The implementation is breadth-first to full vendor parity. Every formula carries
 
 - **Vendor-bit-equal.** Glyph table, action enum, blstats layout, observation dict, monster table (381 entries), object table (453 entries), spell list (43 formulas), and trap damage tables all match `vendor/nethack/` and `vendor/nle/` byte-for-byte. Deliberate simplifications (shopkeepers, bones) are listed in [`docs/vendor_parity.md`](docs/vendor_parity.md).
 - **JIT-compiled hot path.** `env.step` is a single compiled XLA program — ~30–60 s one-time compile, ~1 ms per call after warmup, scales linearly under `jax.vmap`.
-- **Batched at training scale.** `jax.vmap(env.step)` runs N independent rollouts as one fused kernel. `jax.lax.scan` removes Python-loop overhead for long trajectories. See [`docs/benchmark.md`](docs/benchmark.md).
+- **Batched at training scale.** `jax.vmap(env.step)` runs N independent rollouts as one fused kernel. `jax.lax.scan` removes Python-loop overhead for long trajectories. Opt-in training-throughput flags `NETHAX_VEC_MONSTERS=1` (vectorized monster turn, default on) and `NETHAX_FAST_POST=1` (trimmed per-turn ticks) give a measured **3.7× full-fidelity speedup on A100** (929 → 3436 env-steps/s @ batch 1024) — both gated off the byte-parity path. See [`docs/benchmark.md`](docs/benchmark.md).
 - **NLE drop-in.** `Nethax.nethax.compat.nle_shim.NLECompat` matches the Gymnasium `(obs, info)` / `(obs, reward, terminated, truncated, info)` contract; existing NLE training scripts work with a one-line import swap.
 - **Deeply tested.** 1691 unit + integration + property tests, 36 NLE-compat byte-equality checks, an opt-in 12-property deep Hypothesis sweep including a 500-step `RuleBasedStateMachine`.
 

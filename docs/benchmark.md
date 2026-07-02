@@ -113,6 +113,56 @@ single-env interaction.
 
 ---
 
+## Full-fidelity GPU measurements (2026-07, A100-80GB)
+
+Measured on `MiniHack-Room-Monster-5x5-v0` via `MinihaxEnv` at **full fidelity**
+(`MAX_MONSTERS=400`, all dungeon levels, no `SINGLE_LEVEL`), sparse `ground_items`
+(8.04 MB/env vs 124.8 MB dense), movement-only restricted step. These are the
+honest, load-bearing numbers — they supersede the optimistic "10–100× over NLE"
+estimate above, which only holds for reduced/generic configs.
+
+### Training-throughput flags
+
+The RL/training path has two opt-in speedups, **both gated off the vendor /
+byte-parity path** (they only fire when `use_vendor_rng()` is False), so the
+48/48 multi-seed byte-parity gate is unaffected by construction:
+
+| Flag | Effect |
+|------|--------|
+| `NETHAX_VEC_MONSTERS=1` (default on) | simultaneous-move vectorized monster turn (vmap over slots) instead of the serial 400-iteration scan |
+| `NETHAX_FAST_POST=1` | trims the ~30 per-turn vendor status/timer ticks to the RL essentials (turn counters + status/HP/PW + polymorph) |
+
+The vectorized monster turn additionally **hoists the player-rooted BFS distance
+field** out of the per-monster vmap (computed once per env, shared) — a large
+compute + memory win. All three are byte-parity-safe (serial vendor path
+untouched; verified 48/48 12/12 across seeds 0/1/2/5).
+
+### Measured curve (A100-80GB, `NETHAX_VEC_MONSTERS=1 NETHAX_FAST_POST=1`)
+
+| Optimization stage | B=512 | B=1024 |
+|--------------------|-------|--------|
+| baseline (vec monsters only) | 929 sps | — |
+| + fast post-monster (2.02×)  | 1878 sps | — |
+| + BFS hoist (1.43×)          | 2678 sps | **3436 sps** |
+
+**Cumulative: 929 → 3436 env-steps/s @ B=1024 = 3.7×.** Batch ceiling is **B=1024**
+on 80 GB (B=2048 OOMs); the wall is a fused multi-broadcast transient in the
+monster vmap, not the sparse state size.
+
+### Honest comparison to NLE at full fidelity
+
+A single NLE core does **~10,778 steps/s**. Full-fidelity Nethax on a *whole*
+A100 tops out at **~3436 steps/s @ B=1024 — roughly 3× below one NLE core**, and
+batching does **not** close this: throughput plateaus (574 → 929 → 1043 → 3436
+after the optimizations) because the full-fidelity step graph is **compute-bound**
+(monster AI + the per-move FOV/vision raycast), so the GPU saturates rather than
+scaling linearly with B. The `jax.vmap` "beats NLE by 10–100×" advantage is real
+for *reduced* configs (single level, few monsters) but does **not** hold for full
+fidelity, where per-step cost dominates. Beating NLE at full fidelity remains open
+and would require cutting the FOV raycast and monster-body cost further.
+
+---
+
 ## Methodology
 
 - Timing: `time.perf_counter_ns` (sub-millisecond resolution).

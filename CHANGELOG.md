@@ -6,6 +6,28 @@ Test counts are taken from each wave's `README.md` headline.
 
 ---
 
+## Training throughput (2026-07)
+
+Full-fidelity GPU throughput work (`MAX_MONSTERS=400`, all levels). All wins are
+**gated off the vendor / byte-parity path** — 48/48 multi-seed byte-parity stays
+green (12/12 across seeds 0/1/2/5). Measured on A100-80GB, `MiniHack-Room-Monster-5x5`.
+
+- **Sparse `ground_items`** — dense `[7,32,21,80,S]` grid → `SparseGroundItems`
+  (list + positions); per-env state 124.8 → 8.04 MB (15.5×), byte-identical.
+- **`NETHAX_FAST_POST=1`** — trims the ~30 per-turn vendor status/timer ticks to the
+  RL essentials (turn counters + status/HP/PW + polymorph). **2.02×** (929 → 1878 sps
+  @ batch 512).
+- **BFS hoist** — the player-rooted pathfind distance field is computed once per env
+  and shared across all monsters instead of re-flooded inside the 400-way vmap.
+  **1.43×** (→ 2678 sps @ 512; 3436 sps @ 1024).
+- **Net: 929 → 3436 env-steps/s @ batch 1024 = 3.7×.** Batch ceiling B=1024 on 80 GB
+  (fused-broadcast transient in the monster vmap). See [`docs/benchmark.md`](docs/benchmark.md)
+  for the honest NLE comparison — full-fidelity Nethax is still ~3× below one NLE
+  core because the step graph is compute-bound; the vmap advantage holds for reduced
+  configs, not full fidelity.
+
+---
+
 ## Wave 6 — Maximum Vendor Parity + Polish
 
 **Status: complete. 1691 tests collected (`pytest --co -q`), all passing on CPU.**
