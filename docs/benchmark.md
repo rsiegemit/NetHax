@@ -145,9 +145,26 @@ untouched; verified 48/48 12/12 across seeds 0/1/2/5).
 | + fast post-monster (2.02×)  | 1878 sps | — |
 | + BFS hoist (1.43×)          | 2678 sps | **3436 sps** |
 
-**Cumulative: 929 → 3436 env-steps/s @ B=1024 = 3.7×.** Batch ceiling is **B=1024**
-on 80 GB (B=2048 OOMs); the wall is a fused multi-broadcast transient in the
-monster vmap, not the sparse state size.
+**Cumulative: 929 → 3436 env-steps/s @ B=1024 = 3.7×.**
+
+### Byte-neutral batch ceiling (donation + monster-vmap chunking)
+
+The default batch ceiling is **B=1024** on 80 GB — the wall is a fused multi-broadcast
+transient in the monster vmap (not the sparse state size). Two **byte-neutral** levers
+(exact same outputs) raise it to **B=2048**:
+
+- **Input→output donation** — `jax.jit(step, donate_argnums=(state,))` so XLA aliases
+  the input state buffer into the output. Free for a scan-based training rollout (the
+  caller must not reuse the donated state). *Alone* only saves ~2.7 GiB — the binding
+  alloc is the monster transient, not a redundant state copy.
+- **`NETHAX_VEC_CHUNK=64`** — processes the 400-monster vmap in chunks of 64
+  (`jax.lax.map`), bounding the per-monster activation to `[64, …]` instead of
+  `[400, …]`. Output is identical; the 51.66 GiB transient drops to ~14 GiB.
+
+Together: **B=2048 fits at 3844 env-steps/s** (vs 3436 @ B=1024, **+12%** — the chunk
+serialization is more than repaid by the larger batch). B=4096 still OOMs (needs ~33 GiB
+more headroom → a state shrink such as bit-packing the bool feature planes). Recommended
+full-fidelity training recipe on 80 GB: `NETHAX_VEC_CHUNK=64` + donated state at B=2048.
 
 ### Honest comparison to NLE at full fidelity
 
