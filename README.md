@@ -30,6 +30,23 @@ The implementation is breadth-first to full vendor parity. Every formula carries
 - **NLE drop-in.** `Nethax.nethax.compat.nle_shim.NLECompat` matches the Gymnasium `(obs, info)` / `(obs, reward, terminated, truncated, info)` contract; existing NLE training scripts work with a one-line import swap.
 - **Deeply tested.** 1691 unit + integration + property tests, 36 NLE-compat byte-equality checks, an opt-in 12-property deep Hypothesis sweep including a 500-step `RuleBasedStateMachine`.
 
+## Why not just use NLE?
+
+For raw sample throughput on CPU, **use NLE** — its optimized C engine is faster per
+step and scales ~linearly across cores (measured numbers in [`docs/benchmark.md`](docs/benchmark.md)).
+Nethax's value is **not** steps/s; it is the things NLE's opaque running C process
+*cannot* do, because here the entire game state is an immutable JAX pytree:
+
+- **Snapshot / fork / rewind for free** — clone a state, branch it into N futures, run
+  counterfactuals, rewind. This is the MCTS / model-based / model-predictive inner loop
+  on the *real* game. NLE can't clone or rewind a live game without re-simulating from
+  scratch. See [`examples/`](examples/): a parallel state-fork and a working
+  lookahead planner that reaches the goal by searching 8³ futures per turn.
+- **GPU/TPU-native** — env + policy + learner as one XLA program on the accelerator, no
+  per-step host round-trip (relevant when CPU cores are scarce relative to GPUs).
+- **Byte-exact vendor parity** (48/48 multi-seed) and hardware-independent determinism.
+- **Differentiable** `env.step` (architecturally; limited utility for discrete NetHack).
+
 ## Quickstart
 
 ```python
