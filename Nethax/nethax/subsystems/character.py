@@ -1447,91 +1447,131 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
     vendor/nle/src/mkobj.c:309           — mkbox_cnts rn2(n+1)
     .test_runs/ini_inv_item_trace_seed0.txt — confirmed per-item modulus
     """
-    from Nethax.nethax.vendor_rng import rn2_jax, rn1_jax
+    from Nethax.nethax.vendor_rng import rn2_jax, rn1_jax, rne_jax
 
-    # BULLWHIP — WEAPON_CLASS via ini_inv (artif=FALSE).  Vendor
-    # mkobj.c:803-818 + blessorcurse:1370-1383.  Per-seed empirical draws
-    # (vendor C-trace at .test_runs/_probe_vendor_stage_offsets.py):
-    #   seed=0 → 4 draws; seeds 1, 2, 5 → 3 draws.
-    # All test seeds take the ELSE (blessorcurse) branch
-    # (rn2(11)!=0 AND rn2(10)!=0); within that, the rn2(2) bonus only
-    # fires when blessorcurse's rn2(10) == 0.  Use the conditional-advance
-    # pattern (jnp.where on the vrng pytree) so the rn2(2) draw is only
-    # committed when bc1 == 0.  Preserves seed=0's 4-draw consumption AND
-    # corrects seeds 1/2/5 to vendor's 3-draw consumption.
-    # NOTE: paths A (rn2(11)==0) and B (rn2(11)!=0, rn2(10)==0) are NOT
-    # modeled; they consume rne(3) draws and don't apply for our test
-    # seeds.  Forward-compat seeds would need them.
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(11))   # rn2(11) (else-path discriminator)
-    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(10))   # rn2(10) (else-if discriminator)
-    vendor_rng, _bw_bc1 = rn2_jax(vendor_rng, jnp.int32(10))  # blessorcurse rn2(10)
-    _vrng_bonus, _ = rn2_jax(vendor_rng, jnp.int32(2))   # conditional rn2(2)
-    vendor_rng = jax.tree_util.tree_map(
-        lambda new, old: jnp.where(_bw_bc1 == jnp.int32(0), new, old),
-        _vrng_bonus, vendor_rng,
+    def _cadv(rng_orig, rng_advanced, take):
+        """Adopt ``rng_advanced`` iff ``take`` (vmap-safe short-circuit)."""
+        return jax.tree_util.tree_map(
+            lambda a, o: jnp.where(take, a, o), rng_advanced, rng_orig,
+        )
+
+    # BULLWHIP — WEAPON_CLASS via ini_inv (artif=FALSE).  Faithful port of
+    # vendor mkobj.c:803-818 (BULLWHIP is not multigen → no quan draw, and
+    # not is_poisonable → no rn2(100) draw; confirmed by NLE C-traces for
+    # seeds 0/4/7/8/9)::
+    #
+    #     if (!rn2(11)) {              // Path A
+    #         otmp->spe = rne(3);       //   rne(3) loop
+    #         otmp->blessed = rn2(2);   //   rn2(2)
+    #     } else if (!rn2(10)) {       // Path B (rn2(10) drawn only if X1!=0)
+    #         otmp->spe = -rne(3);      //   rne(3) loop
+    #     } else                        // Path C
+    #         blessorcurse(otmp, 10);   //   rn2(10) [+ rn2(2) if 0]
+    #
+    # Uses the conditional-advance pattern so each branch consumes exactly
+    # the vendor draw count.  ``rne_jax`` faithfully replays the rne loop
+    # (up to 4 rn2(3) draws at ulevel 0).  Previously only Path C was
+    # modeled, which mis-aligned every seed hitting X1==0 or X2==0.
+    vendor_rng, _bw_x1 = rn2_jax(vendor_rng, jnp.int32(11))   # X1 = rn2(11)
+    _bw_path_a = (_bw_x1 == jnp.int32(0))
+    _bw_not_a = jnp.logical_not(_bw_path_a)
+
+    # Path A: rne(3) loop + rn2(2), committed only when X1 == 0.
+    # ``otmp->blessed = rn2(2)`` — blessed iff the rn2(2) result is non-zero.
+    _vr_a, _ = rne_jax(vendor_rng, jnp.int32(3))
+    _vr_a, _bw_a_bless = rn2_jax(_vr_a, jnp.int32(2))
+    _vr_a_only = _cadv(vendor_rng, _vr_a, _bw_path_a)
+
+    # Path B/C: X2 = rn2(10), drawn only when X1 != 0.
+    _vr_x2, _bw_x2 = rn2_jax(vendor_rng, jnp.int32(10))
+    _vr_x2 = _cadv(vendor_rng, _vr_x2, _bw_not_a)
+    _bw_x2 = jnp.where(_bw_not_a, _bw_x2, jnp.int32(1))  # placeholder if skipped
+    _bw_path_b = jnp.logical_and(_bw_not_a, _bw_x2 == jnp.int32(0))
+    _bw_path_c = jnp.logical_and(_bw_not_a, _bw_x2 != jnp.int32(0))
+
+    # Path B: rne(3) loop (spe = -rne(3), curse → wiped to uncursed by ini_inv).
+    # Path C: blessorcurse(10) — bless iff rn2(10)==0 AND rn2(2)!=0.
+    _vr_b, _ = rne_jax(_vr_x2, jnp.int32(3))
+    _vr_bc, _bw_bc1 = rn2_jax(_vr_x2, jnp.int32(10))       # blessorcurse rn2(10)
+    _vr_bc2, _bw_bc2 = rn2_jax(_vr_bc, jnp.int32(2))       # conditional rn2(2)
+    _vr_bc = _cadv(_vr_bc, _vr_bc2, _bw_bc1 == jnp.int32(0))
+    _bw_c_bless = jnp.logical_and(_bw_bc1 == jnp.int32(0), _bw_bc2 != jnp.int32(0))
+    # Merge B and C onto the X2-advanced state.
+    _vr_bc_or_b = _cadv(_vr_x2, _vr_b, _bw_path_b)
+    _vr_bc_or_b = _cadv(_vr_bc_or_b, _vr_bc, _bw_path_c)
+    # Merge Path A (rewinds/uses the pre-X2 state) vs Paths B/C.
+    vendor_rng = _cadv(_vr_bc_or_b, _vr_a_only, _bw_path_a)
+    # BULLWHIP blessed bit: Path A → rn2(2)!=0; Path C → blessorcurse bless.
+    # (Path B curses, wiped to uncursed by ini_inv u_init.c:1094.)
+    _bw_blessed = jnp.logical_or(
+        jnp.logical_and(_bw_path_a, _bw_a_bless != jnp.int32(0)),
+        jnp.logical_and(_bw_path_c, _bw_c_bless),
     )
 
     # LEATHER_JACKET + FEDORA — ARMOR_CLASS via ini_inv (artif=FALSE).
-    # Vendor mkobj.c:992-1006.  3 distinct paths with variable rn2 draws:
-    #   Path A (curse):   X1 != 0 AND X2 == 0 → X1, X2, rne(3)
-    #   Path B (blessed): (X1 == 0 OR (X1 != 0 AND X2 != 0)) AND X3 == 0
-    #                     → X1, [X2 if X1!=0], X3, rn2(2), rne(3)
-    #   Path C (else):    everything else → X1, [X2 if X1!=0], X3,
-    #                     blessorcurse(rn2(10), maybe rn2(2))
-    # where X1=rn2(10), X2=rn2(11), X3=rn2(10).  Non-special items only
-    # (LJ/FEDORA aren't FUMBLE_BOOTS/etc.).  ulevel=0 → rne(3) draws
-    # rn2(3) at least once; model 1 draw (works for all test seeds 0/1/2/5).
+    # Faithful port of vendor mkobj.c:992-1006 (LJ/FEDORA aren't
+    # FUMBLE_BOOTS/LEVITATION_BOOTS/OPPOSITE_ALIGNMENT/GAUNTLETS_OF_FUMBLING,
+    # so the special-item disjunct is inert)::
+    #
+    #     if (rn2(10) && !rn2(11)) {      // Path A: X1!=0 AND X2==0
+    #         curse; otmp->spe = -rne(3);  //   rne(3) loop
+    #     } else if (!rn2(10)) {          // Path B: X3==0
+    #         otmp->blessed = rn2(2);      //   rn2(2)
+    #         otmp->spe = rne(3);          //   then rne(3) loop
+    #     } else                           // Path C
+    #         blessorcurse(otmp, 10);      //   rn2(10) [+ rn2(2) if 0]
+    #
+    # Short-circuit: X1=rn2(10) always; X2=rn2(11) drawn only if X1!=0.
+    # ``rne_jax`` faithfully replays the rne loop (up to 4 rn2(3) draws at
+    # ulevel 0) — the previous single-rn2(3) model mis-aligned any seed that
+    # hit Path A/B with a zero-run in the rne loop (e.g. seed 7 LEATHER_JACKET
+    # drew four rn2(3) draws).
     def _consume_armor_class(vrng):
         # X1 = rn2(10), always drawn
         vrng, X1 = rn2_jax(vrng, jnp.int32(10))
         X1_nz = (X1 != jnp.int32(0))
         # X2 = rn2(11), conditional on X1 != 0
         vrng_x2, X2_raw = rn2_jax(vrng, jnp.int32(11))
-        vrng = jax.tree_util.tree_map(
-            lambda new, old: jnp.where(X1_nz, new, old), vrng_x2, vrng
-        )
+        vrng = _cadv(vrng, vrng_x2, X1_nz)
         X2 = jnp.where(X1_nz, X2_raw, jnp.int32(1))  # 1 = non-zero placeholder
         path_a = X1_nz & (X2 == jnp.int32(0))
-        # X3 = rn2(10), conditional on NOT path A
         not_a = ~path_a
+
+        # Path A: rne(3) loop (spe = -rne(3)); committed only when path_a.
+        vrng_a, _ = rne_jax(vrng, jnp.int32(3))
+        vrng_a = _cadv(vrng, vrng_a, path_a)
+
+        # NOT Path A: X3 = rn2(10)
         vrng_x3, X3_raw = rn2_jax(vrng, jnp.int32(10))
-        vrng = jax.tree_util.tree_map(
-            lambda new, old: jnp.where(not_a, new, old), vrng_x3, vrng
-        )
+        vrng_x3 = _cadv(vrng, vrng_x3, not_a)
         X3 = jnp.where(not_a, X3_raw, jnp.int32(1))
         path_b = not_a & (X3 == jnp.int32(0))
         path_c = not_a & ~path_b
-        # Paths A and B both call rne(3) (curse rne or blessed rne); model 1 draw.
-        rne_path = path_a | path_b
-        vrng_rne, _ = rn2_jax(vrng, jnp.int32(3))
-        vrng = jax.tree_util.tree_map(
-            lambda new, old: jnp.where(rne_path, new, old), vrng_rne, vrng
-        )
-        # Path B: rn2(2) for blessed flag — drawn BEFORE rne(3) in vendor
-        # (otmp->blessed = rn2(2); otmp->spe = rne(3)).  Order within
-        # ISAAC64 stream: rn2(2) at offset Nb, rn2(3) at Nb+1.  Our model
-        # consumes rne(3) first then rn2(2); they're both 1-draw advances
-        # under our flat advancement, so the stream offset is invariant
-        # to ordering as long as both draws happen exactly when path_b.
-        vrng_b2, _ = rn2_jax(vrng, jnp.int32(2))
-        vrng = jax.tree_util.tree_map(
-            lambda new, old: jnp.where(path_b, new, old), vrng_b2, vrng
-        )
-        # Path C: blessorcurse rn2(10), then conditional rn2(2)
-        vrng_bc, bc1 = rn2_jax(vrng, jnp.int32(10))
-        vrng = jax.tree_util.tree_map(
-            lambda new, old: jnp.where(path_c, new, old), vrng_bc, vrng
-        )
-        bc1 = jnp.where(path_c, bc1, jnp.int32(1))
-        vrng_bonus, _ = rn2_jax(vrng, jnp.int32(2))
-        bc_bonus = path_c & (bc1 == jnp.int32(0))
-        vrng = jax.tree_util.tree_map(
-            lambda new, old: jnp.where(bc_bonus, new, old), vrng_bonus, vrng
-        )
-        return vrng
 
-    vendor_rng = _consume_armor_class(vendor_rng)  # LEATHER_JACKET
-    vendor_rng = _consume_armor_class(vendor_rng)  # FEDORA
+        # Path B: rn2(2) blessed flag, then rne(3) loop.
+        vrng_b, b_bless = rn2_jax(vrng_x3, jnp.int32(2))
+        vrng_b, _ = rne_jax(vrng_b, jnp.int32(3))
+        # Path C: blessorcurse rn2(10), then conditional rn2(2).
+        vrng_c, bc1 = rn2_jax(vrng_x3, jnp.int32(10))
+        vrng_c2, bc2 = rn2_jax(vrng_c, jnp.int32(2))
+        vrng_c = _cadv(vrng_c, vrng_c2, bc1 == jnp.int32(0))
+        # Merge B/C onto the X3-advanced state.
+        vrng_bc = _cadv(vrng_x3, vrng_b, path_b)
+        vrng_bc = _cadv(vrng_bc, vrng_c, path_c)
+        # Merge Path A vs NOT-A.
+        vrng = _cadv(vrng_bc, vrng_a, path_a)
+        # Blessed bit (Path A curses → wiped to uncursed by ini_inv):
+        #   Path B → rn2(2)!=0; Path C → blessorcurse bless (bc1==0 & bc2!=0).
+        blessed = jnp.logical_or(
+            jnp.logical_and(path_b, b_bless != jnp.int32(0)),
+            jnp.logical_and(path_c,
+                            jnp.logical_and(bc1 == jnp.int32(0),
+                                            bc2 != jnp.int32(0))),
+        )
+        return vrng, blessed
+
+    vendor_rng, _lj_blessed = _consume_armor_class(vendor_rng)     # LEATHER_JACKET
+    vendor_rng, _fedora_blessed = _consume_armor_class(vendor_rng)  # FEDORA
 
     # FOOD_RATION ×3 — FOOD_CLASS, qty loop, 1 rn2(6) per ration.
     # Vendor mkobj.c:879-882: each mksobj call for FOOD_RATION draws rn2(6)
@@ -1583,10 +1623,22 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
     # hardcodes qty=4 (matches seed=0 by coincidence); the actual qty is
     # 3 + count(rn2(6) == 0) summed over the 3 mksobj calls.
     fr_qty = _food_qty.astype(items.quantity.dtype)
+    # Apply the rolled blessed bits to the base items whose mksobj draws can
+    # bless them: slot 0 = BULLWHIP, slot 1 = LEATHER_JACKET, slot 2 = FEDORA.
+    # ini_inv (u_init.c:1094) wipes ``cursed`` so only the blessed bit varies;
+    # buc_status 3 = BLESSED, 2 = UNCURSED (the static-table default).  The
+    # gated seeds (0/1/2/5) all roll uncursed, so this is a no-op for them.
+    _BLESSED = jnp.asarray(3, dtype=items.buc_status.dtype)
+    _UNCURSED = jnp.asarray(2, dtype=items.buc_status.dtype)
+    buc = items.buc_status
+    buc = buc.at[0].set(jnp.where(_bw_blessed, _BLESSED, _UNCURSED))
+    buc = buc.at[1].set(jnp.where(_lj_blessed, _BLESSED, _UNCURSED))
+    buc = buc.at[2].set(jnp.where(_fedora_blessed, _BLESSED, _UNCURSED))
     new_items = items.replace(
         charges=items.charges.at[5].set(tk_spe_charges),
         enchantment=items.enchantment.at[5].set(tk_spe_enchant),
         quantity=items.quantity.at[3].set(fr_qty),
+        buc_status=buc,
     )
     inventory = inventory.replace(items=new_items)
 
@@ -1892,9 +1944,10 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         # picked nothing; rn2(10) again only if neither prior fired.  Use the
         # conditional-advance pattern to match vendor's draw count exactly.
         # Then for whichever bonus item was picked, replay the item's mksobj
-        # draws (rn2(500), rn2(5) for OIL_LAMP per vendor trace).  TIN_OPENER
-        # and MAGIC_MARKER mksobj draws are NOT modelled yet — forward-compat
-        # seeds picking those bonuses would still misalign.
+        # draws: TIN_OPENER = 0 draws (no matching TOOL_CLASS case);
+        # OIL_LAMP = rn1(500,1000)→rn2(500) + blessorcurse(5)→rn2(5)[+rn2(2)];
+        # MAGIC_MARKER = rn1(70,30)→rn2(70) (spe, kept since NLE trspe is
+        # UNDEF_SPE).  Cite: vendor/nle/src/mkobj.c:897-935; u_init.c:668-679.
         vendor_rng, _arc_r10a = _rn2_jax_arc(vendor_rng, jnp.int32(10))
         _arc_pick_tin = jnp.equal(_arc_r10a, jnp.int32(0))
         _not_tin = jnp.logical_not(_arc_pick_tin)
@@ -1912,18 +1965,42 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
             _vrng_r10b, vendor_rng,
         )
         _arc_r10b = jnp.where(_not_oil_path, _arc_r10b_raw, jnp.int32(1))
-        # OIL_LAMP mksobj: rn2(500), rn2(5) per vendor trace at seed=0.
-        # Cite: vendor/nle/src/mkobj.c TOOL_CLASS (artif=FALSE).
+        _arc_pick_mm_draw = jnp.logical_and(
+            _not_oil_path, jnp.equal(_arc_r10b, jnp.int32(0)),
+        )
+        # OIL_LAMP mksobj (vendor mkobj.c:909-914): otmp->age = rn1(500,1000)
+        # → rn2(500); then blessorcurse(otmp, 5) → rn2(5) [+ rn2(2) if 0].
+        # Committed only when OIL_LAMP is the picked bonus item.
         _vrng_oil1, _ = _rn2_jax_arc(vendor_rng, jnp.int32(500))
         vendor_rng = jax.tree_util.tree_map(
             lambda new, old: jnp.where(_arc_pick_oil, new, old),
             _vrng_oil1, vendor_rng,
         )
-        _vrng_oil2, _ = _rn2_jax_arc(vendor_rng, jnp.int32(5))
+        _vrng_oil2, _arc_oil_bc = _rn2_jax_arc(vendor_rng, jnp.int32(5))
         vendor_rng = jax.tree_util.tree_map(
             lambda new, old: jnp.where(_arc_pick_oil, new, old),
             _vrng_oil2, vendor_rng,
         )
+        # blessorcurse bonus rn2(2): only when OIL_LAMP picked AND rn2(5)==0.
+        _vrng_oil3, _ = _rn2_jax_arc(vendor_rng, jnp.int32(2))
+        _arc_oil_bonus = jnp.logical_and(
+            _arc_pick_oil, jnp.equal(_arc_oil_bc, jnp.int32(0)),
+        )
+        vendor_rng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(_arc_oil_bonus, new, old),
+            _vrng_oil3, vendor_rng,
+        )
+        # MAGIC_MARKER mksobj (vendor mkobj.c:932-934): otmp->spe = rn1(70,30)
+        # → rn2(70)+30.  NLE Magicmarker trspe == UNDEF_SPE (u_init.c:179), so
+        # ini_inv does NOT overwrite spe (u_init.c:1104) — the rolled value is
+        # kept and rendered as the "(0:spe)" charge suffix (objnam.c).  No
+        # blessorcurse for MAGIC_MARKER.  Committed only when MM is picked.
+        _vrng_mm, _arc_mm_spe_raw = _rn2_jax_arc(vendor_rng, jnp.int32(70))
+        vendor_rng = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(_arc_pick_mm_draw, new, old),
+            _vrng_mm, vendor_rng,
+        )
+        _arc_mm_spe = _arc_mm_spe_raw + jnp.int32(30)   # rn1(70, 30)
         _arc_tin_opener = _make_item_arc(
             category=int(_ItemCategory_arc.TOOL), type_id=214, quantity=1,
             weight=30, buc_status=2, identified=True,  # 2 = UNCURSED
@@ -1964,6 +2041,24 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         )
         _arc_new_items = jax.tree_util.tree_map(
             lambda arr, val: arr.at[8].set(val), inv_state.items, _arc_picked,
+        )
+        # MAGIC_MARKER "(0:spe)" charge suffix (objnam.c): write the rolled
+        # rn1(70,30) spe into slot-8 ``charges`` (and mirror to ``enchantment``
+        # for view consistency, as done for TINNING_KIT) only when the marker
+        # was the picked bonus item; otherwise leave the item's defaults.
+        _arc_slot8_charges = jnp.where(
+            _arc_pick_mm,
+            _arc_mm_spe.astype(_arc_new_items.charges.dtype),
+            _arc_new_items.charges[8],
+        )
+        _arc_slot8_enchant = jnp.where(
+            _arc_pick_mm,
+            _arc_mm_spe.astype(_arc_new_items.enchantment.dtype),
+            _arc_new_items.enchantment[8],
+        )
+        _arc_new_items = _arc_new_items.replace(
+            charges=_arc_new_items.charges.at[8].set(_arc_slot8_charges),
+            enchantment=_arc_new_items.enchantment.at[8].set(_arc_slot8_enchant),
         )
         _arc_new_letter = jnp.where(
             _arc_any_pick, jnp.int8(ord('a') + 8), jnp.int8(0),

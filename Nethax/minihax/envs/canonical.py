@@ -1649,6 +1649,255 @@ def _register_boxoban_envs(register_fn) -> None:
 # ---------------------------------------------------------------------------
 # Skill suite — single-action envs (Group A)
 # ---------------------------------------------------------------------------
+#
+# Byte-parity note (skills_simple family: Eat/Wield/Wear/PutOn/Zap/Read/
+# Pray/Sink).  Vendor builds these as a lit 5x5 room via
+#   LevelGenerator(w=5, h=5, lit=True); lvl_gen.add_object(item, sym)   (or
+#   add_altar / add_sink)                         (skills_simple.py:10-19,...)
+# with NO explicit start_pos and NO stair.  The header carries
+# ``GEOMETRY:center,center`` so NLE centers the 5x5 MAP on the 80x21 dungeon
+# exactly like the Room envs -> internal rect cols 37..41, rows 9..13
+# (``_vendor_geometry_center(5)``).  Both the object cell AND the player spawn
+# are RNG-driven by mklev.  Previously the Minihax builder stamped a tiny 5x5
+# LG at terrain[0:5,0:5] (top-left corner) with an @-at-origin, producing a
+# degenerate empty level: glyph 327 at obs (0,0) vs vendor stone 2359.
+#
+# We fix it the same way ``_register_room_envs`` fixed Room-Random: build a
+# full 80x21 VOID grid, carve the centered 5x5 FLOOR room, then a wrapper
+# (`_wrap_skill_placement`) consumes vendor's exact mklev ISAAC64 draw stream:
+#   1. rn2(3), rn2(2)                      -- level setup prefix
+#   2. rn2(5), rn2(5)                      -- object somexy() room-relative
+#      (x_off, y_off): object cell = (x1+x_off, y1+y_off)
+#   3. mksobj_init draws for the object's class (see _consume_mksobj_draws)
+#   4. faithful place_lregion (mkmaze.c:275-319): 200-try (rn2(79)+1, rn2(21))
+#      accept first in-room FLOOR cell that is not the object cell -> player.
+# Ground truth: .test_runs/skill_rnd_stream_*_seed0.txt (NETHAX_RND/RN2 trace
+# of vendor MiniHack-{Eat,Wield,Zap,Pray,...}).
+# ---------------------------------------------------------------------------
+def _skill_room_builder(size: int, lit: bool) -> Callable[[LevelGenerator], None]:
+    """Carve a ``size``x``size`` FLOOR room at the vendor-centered location on
+    the full 80x21 VOID grid (mirrors ``_room_builder(size, random=True)`` but
+    without any stair/object/start — those are stamped by the wrapper)."""
+    x0, y0 = _vendor_geometry_center(size)
+    x1, y1 = x0 + size - 1, y0 + size - 1
+
+    def build(lg: LevelGenerator) -> None:
+        lg.fill_terrain(".", x0, y0, x1, y1)
+    return build
+
+
+def _consume_mksobj_draws(vrng, obj_class: int):
+    """Replay the vendor ``mksobj_init`` ISAAC64 draw sequence for a des-placed
+    named object (``artif=TRUE``), returning the advanced ``vrng``.
+
+    Faithful port of vendor/nethack/src/mkobj.c::mksobj_init for the object
+    classes used by skills_simple (WEAPON/ARMOR/WAND/AMULET/SCROLL/FOOD-apple).
+    Only draw *consumption* is modelled (the resulting item is stamped
+    separately from the des directive) — this keeps ``state.vendor_rng``
+    byte-aligned so the subsequent player place_lregion draws land on vendor's
+    offsets.  Runs host-side (eager) like the Room wrappers; every draw goes
+    through ``rn2_jax`` so the JIT trace records the right modulus.
+
+    Cite: mkobj.c:876-1097 (class switch), :bless­orcurse (rn2(chance)[,rn2(2)]),
+    rnd.c::rne (while tmp<5 && !rn2(x)), rn1(x,base)=rn2(x)+base.
+    """
+    from Nethax.nethax import vendor_rng as _vr
+    from Nethax.nethax.constants.objects import ObjectClass as _OC
+
+    def rn2(v, n):
+        v, r = _vr.rn2_jax(v, jnp.int32(n))
+        return v, int(r)
+
+    def rne(v, x):
+        # utmp=5 for ulevel<15; tmp starts 1, increments while tmp<5 && !rn2(x).
+        tmp = 1
+        while tmp < 5:
+            v, r = rn2(v, x)
+            if r != 0:
+                break
+            tmp += 1
+        return v
+
+    def blessorcurse(v, chance):
+        v, r = rn2(v, chance)
+        if r == 0:
+            v, _ = rn2(v, 2)   # curse vs bless
+        return v
+
+    c = int(obj_class)
+    if c == int(_OC.WEAPON_CLASS):
+        # dagger: is_multigen=False (no quan draw), is_poisonable=False in this
+        # build (no rn2(100)).  mkobj.c:876-893.
+        v, r = rn2(vrng, 11)
+        if r == 0:
+            v = rne(v, 3)          # spe = rne(3)
+            v, _ = rn2(v, 2)       # blessed = rn2(2)
+        else:
+            v, r = rn2(v, 10)
+            if r == 0:
+                v = rne(v, 3)      # curse; spe = -rne(3)
+            else:
+                v = blessorcurse(v, 10)
+        v, _ = rn2(v, 20)          # artif && !rn2(20 + 10*nartifact_exist()=0)
+        return v
+    if c == int(_OC.ARMOR_CLASS):
+        # robe: not fumble/levitation boots etc -> first operand rn2(10) plus
+        # the ``|| !rn2(11)`` short-circuit.  mkobj.c:1085-1097.
+        v, r = rn2(vrng, 10)
+        take_curse = False
+        if r != 0:
+            v, r2 = rn2(v, 11)     # (... || !rn2(11))
+            take_curse = (r2 == 0)
+        if take_curse:
+            v = rne(v, 3)          # curse; spe = -rne(3)
+        else:
+            v, r = rn2(v, 10)
+            if r == 0:
+                v, _ = rn2(v, 2)   # blessed = rn2(2)
+                v = rne(v, 3)      # spe = rne(3)
+            else:
+                v = blessorcurse(v, 10)
+        v, _ = rn2(v, 40)          # artif && !rn2(40 + 0)
+        return v
+    if c == int(_OC.WAND_CLASS):
+        # enlightenment (NODIR): spe = rn1(5, 11) -> rn2(5); then blessorcurse(17).
+        v, _ = rn2(vrng, 5)
+        v = blessorcurse(v, 17)
+        return v
+    if c == int(_OC.AMULET_CLASS):
+        # amulet of life saving: first `&&` operand rn2(10) always drawn, then
+        # blessorcurse(10).  mkobj.c:1060-1069.
+        v, _ = rn2(vrng, 10)
+        v = blessorcurse(v, 10)
+        return v
+    if c == int(_OC.SCROLL_CLASS):
+        # blank paper: blessorcurse(4).  mkobj.c:1075-1080.
+        return blessorcurse(vrng, 4)
+    if c == int(_OC.FOOD_CLASS):
+        # apple (not corpse/egg/tin/mold/kelp/candy): trailing `!rn2(6)`
+        # quan=2 check.  mkobj.c:969-974.
+        v, _ = rn2(vrng, 6)
+        return v
+    # Unknown class: consume nothing (best-effort; item glyph still correct).
+    return vrng
+
+
+def _wrap_skill_placement(
+    factory: Callable[[jax.Array], "EnvState"],
+    size: int,
+    *,
+    item_name: Optional[str],
+    feature: Optional[str],
+    lit: bool = True,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Wrap a ``_skill_room_builder`` factory so it stamps the vendor object /
+    altar / sink and the RNG-placed player, consuming vendor's exact mklev
+    draws (see the family byte-parity note above).
+
+    ``item_name``: OBJECTS-table name for a ground object (Eat/Wield/Wear/
+    PutOn/Zap/Read), or ``None`` for a terrain feature.
+    ``feature``: ``"altar"`` (Pray) or ``"sink"`` (Sink) -> stamp a terrain
+    tile instead of a ground item; ``None`` otherwise.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TT
+    from Nethax.nethax.constants.objects import OBJECTS as _OBJECTS
+    from Nethax.minihax.level_generator import (
+        seed_hero_fov as _seed_hero_fov,
+        _OBJECT_NAME_TO_IDX as _NAME2IDX,
+        _write_ground_item as _write_gi,
+    )
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        dense_to_sparse as _dense_to_sparse,
+        sparse_to_dense as _sparse_to_dense,
+    )
+
+    obj_idx = None
+    obj_class = None
+    if item_name is not None:
+        obj_idx = _NAME2IDX[item_name]
+        obj_class = int(_OBJECTS[obj_idx].class_)
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        x1, y1 = _vendor_geometry_center(size)  # internal top-left of room rect
+
+        # (1) level-setup prefix: rn2(3), rn2(2).
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+
+        # (2) object/feature somexy(): room-relative (x_off, y_off) via rn2(size).
+        vrng, ox = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, oy = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        obj_col = int(x1) + int(ox)
+        obj_row = int(y1) + int(oy)
+
+        _FLOOR = int(_TT.FLOOR)
+        new_terrain = state.terrain
+
+        if feature is None:
+            # (3) object mksobj_init draws (class-dependent).
+            vrng = _consume_mksobj_draws(vrng, obj_class)
+            # Stamp the ground item at the somexy cell.  Round-trip through the
+            # dense buffer so we reuse the level_generator writer.
+            dense = _sparse_to_dense(state.ground_items)
+            dense, _ = _write_gi(dense, {}, (obj_row, obj_col), int(obj_idx))
+            state = state.replace(
+                ground_items=_dense_to_sparse(dense, state.ground_items.K)
+            )
+        elif feature == "altar":
+            new_terrain = new_terrain.at[0, 0, obj_row, obj_col].set(
+                jnp.int8(int(_TT.ALTAR))
+            )
+        elif feature == "sink":
+            # No dedicated SINK tile: FOUNTAIN analogue (matches LG _SinkOverride).
+            new_terrain = new_terrain.at[0, 0, obj_row, obj_col].set(
+                jnp.int8(int(_TT.FOUNTAIN))
+            )
+
+        # (4) player place_lregion: 200-try (rn2(79)+1, rn2(21)); accept first
+        #     in-room FLOOR cell that is not the object cell.  mkmaze.c:275-319.
+        import numpy as _np
+        terr_np = _np.asarray(new_terrain[0, 0])
+        _H, _W = terr_np.shape
+        ok = (terr_np == _FLOOR)
+        ok[obj_row, obj_col] = False  # object cell is occupied
+        acc_x = int((x1 + x1 + size - 1) // 2)
+        acc_y = int((y1 + y1 + size - 1) // 2)
+        accepted = False
+        for _ in range(200):
+            vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+            vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+            cx = int(raw_x) + 1
+            cy = int(cand_y)
+            if 0 <= cy < _H and 0 <= cx < _W and bool(ok[cy, cx]):
+                acc_x, acc_y = cx, cy
+                accepted = True
+                break
+        if not accepted:
+            for sx in range(1, _W):
+                for sy in range(0, _H):
+                    if bool(ok[sy, sx]):
+                        acc_x, acc_y = sx, sy
+                        accepted = True
+                        break
+                if accepted:
+                    break
+
+        state = state.replace(
+            vendor_rng=vrng,
+            terrain=new_terrain,
+            player_pos=jnp.stack(
+                [jnp.int32(acc_y).astype(jnp.int16),
+                 jnp.int32(acc_x).astype(jnp.int16)]
+            ),
+        )
+        return _seed_hero_fov(state, lit)
+
+    return wrapped
+
+
 def _skill_eat_builder(distr: bool, fixed: bool) -> Callable[[LevelGenerator], None]:
     def build(lg: LevelGenerator) -> None:
         place = (0, 0) if fixed else None
@@ -1764,6 +2013,17 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("Zap",   "enlightenment",         "/", _skill_zap_rm),
         ("Read",  "blank paper",           "?", _skill_read_rm),
     ]
+    # Base (non-Fixed, non-Distr) variants build the full-fidelity vendor
+    # 5x5 room + RNG-placed object/player (byte-parity).  The -Fixed / -Distr
+    # variants keep the legacy compact builder (out of the byte-parity scope
+    # today: -Fixed pins start_pos, -Distr adds extra objects/monsters).
+    def _base_skill_factory(item_name, feature):
+        builder = _skill_room_builder(5, lit=True)
+        factory = _make_factory(builder, w=80, h=21, fill=" ", lit=True)
+        return _wrap_skill_placement(
+            factory, 5, item_name=item_name, feature=feature, lit=True,
+        )
+
     for base, item, symbol, rm_factory in item_specs:
         for suffix, distr, fixed in [
             ("",       False, False),
@@ -1771,8 +2031,11 @@ def _register_skill_simple_envs(register_fn) -> None:
             ("-Distr", True,  False),
         ]:
             env_id = f"MiniHack-{base}{suffix}-v0"
-            builder = _skill_simple_builder(item, symbol, distr, fixed)
-            factory = _make_factory(builder, w=5, h=5)
+            if suffix == "":
+                factory = _base_skill_factory(item, None)
+            else:
+                builder = _skill_simple_builder(item, symbol, distr, fixed)
+                factory = _make_factory(builder, w=5, h=5)
             register_fn(env_id, factory, rm_factory(),
                         max_steps=50, category="Skill")
 
@@ -1783,8 +2046,11 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("-Distr", True,  False),
     ]:
         env_id = f"MiniHack-Eat{suffix}-v0"
-        builder = _skill_eat_builder(distr, fixed)
-        factory = _make_factory(builder, w=5, h=5)
+        if suffix == "":
+            factory = _base_skill_factory("apple", None)
+        else:
+            builder = _skill_eat_builder(distr, fixed)
+            factory = _make_factory(builder, w=5, h=5)
         register_fn(env_id, factory, _skill_eat_rm(),
                     max_steps=50, category="Skill")
 
@@ -1795,8 +2061,11 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("-Distr", True,  False),
     ]:
         env_id = f"MiniHack-Pray{suffix}-v0"
-        builder = _skill_pray_builder(distr, fixed)
-        factory = _make_factory(builder, w=5, h=5)
+        if suffix == "":
+            factory = _base_skill_factory(None, "altar")
+        else:
+            builder = _skill_pray_builder(distr, fixed)
+            factory = _make_factory(builder, w=5, h=5)
         register_fn(env_id, factory, _skill_pray_rm(),
                     max_steps=50, category="Skill")
 
@@ -1807,8 +2076,11 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("-Distr", True,  False),
     ]:
         env_id = f"MiniHack-Sink{suffix}-v0"
-        builder = _skill_sink_builder(distr, fixed)
-        factory = _make_factory(builder, w=5, h=5)
+        if suffix == "":
+            factory = _base_skill_factory(None, "sink")
+        else:
+            builder = _skill_sink_builder(distr, fixed)
+            factory = _make_factory(builder, w=5, h=5)
         register_fn(env_id, factory, _skill_sink_rm(),
                     max_steps=50, category="Skill")
 

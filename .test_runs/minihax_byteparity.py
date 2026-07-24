@@ -105,8 +105,17 @@ def _env_id_to_vendor_cls(env_id: str):
     environment.  Only Room-* envs are wired today (Phase 1 scope).
     """
     from minihack.envs import room as _room_mod
+    from minihack.envs import skills_simple as _skills_mod
 
     table = {
+        "MiniHack-Eat-v0":                 _skills_mod.MiniHackEat,
+        "MiniHack-Pray-v0":                _skills_mod.MiniHackPray,
+        "MiniHack-Wield-v0":               _skills_mod.MiniHackWield,
+        "MiniHack-Zap-v0":                 _skills_mod.MiniHackZap,
+        "MiniHack-Read-v0":                _skills_mod.MiniHackRead,
+        "MiniHack-Wear-v0":                _skills_mod.MiniHackWear,
+        "MiniHack-PutOn-v0":               _skills_mod.MiniHackPutOn,
+        "MiniHack-Sink-v0":                _skills_mod.MiniHackSink,
         "MiniHack-Room-5x5-v0":            _room_mod.MiniHackRoom5x5,
         "MiniHack-Room-Random-5x5-v0":     _room_mod.MiniHackRoom5x5Random,
         "MiniHack-Room-Dark-5x5-v0":       _room_mod.MiniHackRoom5x5Dark,
