@@ -111,8 +111,33 @@ def _env_id_to_vendor_cls(env_id: str):
     from minihack.envs import mazewalk as _mw_mod
     from minihack.envs import corridor as _corr_mod
     from minihack.envs import sokoban as _soko_mod
+    from minihack.envs import skills_lava as _lava_mod
 
     table = {
+        "MiniHack-LavaCross-Levitate-Potion-Pickup-Full-v0":
+            _lava_mod.MiniHackLCLevitatePotionPickup,
+        "MiniHack-LavaCross-Levitate-Potion-Pickup-Restricted-v0":
+            _lava_mod.MiniHackLCLevitatePotionPickupRestrictedActions,
+        "MiniHack-LavaCross-Levitate-Potion-Inv-Full-v0":
+            _lava_mod.MiniHackLCLevitatePotionInv,
+        "MiniHack-LavaCross-Levitate-Potion-Inv-Restricted-v0":
+            _lava_mod.MiniHackLCLevitatePotionInvRestrictedActions,
+        "MiniHack-LavaCross-Levitate-Ring-Pickup-Full-v0":
+            _lava_mod.MiniHackLCLevitateRingPickup,
+        "MiniHack-LavaCross-Levitate-Ring-Pickup-Restricted-v0":
+            _lava_mod.MiniHackLCLevitateRingPickupRestrictedActions,
+        "MiniHack-LavaCross-Levitate-Ring-Inv-Full-v0":
+            _lava_mod.MiniHackLCLevitateRingInv,
+        "MiniHack-LavaCross-Levitate-Ring-Inv-Restricted-v0":
+            _lava_mod.MiniHackLCLevitateRingInvRestrictedActions,
+        "MiniHack-LavaCross-Levitate-Full-v0":
+            _lava_mod.MiniHackLCLevitate,
+        "MiniHack-LavaCross-Levitate-Restricted-v0":
+            _lava_mod.MiniHackLCLevitateRestrictedActions,
+        "MiniHack-LavaCross-Full-v0":
+            _lava_mod.MiniHackLC,
+        "MiniHack-LavaCross-Restricted-v0":
+            _lava_mod.MiniHackLCRestrictedActions,
         "MiniHack-Corridor-R2-v0":         _corr_mod.MiniHackCorridor2,
         "MiniHack-Corridor-R3-v0":         _corr_mod.MiniHackCorridor3,
         "MiniHack-Corridor-R5-v0":         _corr_mod.MiniHackCorridor5,
