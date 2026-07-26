@@ -113,8 +113,14 @@ def _env_id_to_vendor_cls(env_id: str):
     from minihack.envs import sokoban as _soko_mod
     from minihack.envs import skills_lava as _lava_mod
     from minihack.envs import river as _river_mod
+    from minihack.envs import keyroom as _kr_mod
 
     table = {
+        "MiniHack-KeyRoom-Fixed-S5-v0":    _kr_mod.MiniHackKeyRoom5x5Fixed,
+        "MiniHack-KeyRoom-S5-v0":          _kr_mod.MiniHackKeyRoom5x5,
+        "MiniHack-KeyRoom-Dark-S5-v0":     _kr_mod.MiniHackKeyRoom5x5Dark,
+        "MiniHack-KeyRoom-S15-v0":         _kr_mod.MiniHackKeyRoom15x15,
+        "MiniHack-KeyRoom-Dark-S15-v0":    _kr_mod.MiniHackKeyRoom15x15Dark,
         "MiniHack-LavaCross-Levitate-Potion-Pickup-Full-v0":
             _lava_mod.MiniHackLCLevitatePotionPickup,
         "MiniHack-LavaCross-Levitate-Potion-Pickup-Restricted-v0":

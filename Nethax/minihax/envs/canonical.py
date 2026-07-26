@@ -1262,21 +1262,201 @@ def _register_corridor_envs(register_fn) -> None:
 # MazeWalk envs (Group B — procedural)
 # ---------------------------------------------------------------------------
 def _mazewalk_builder(w: int, h: int) -> Callable[[LevelGenerator], None]:
-    """Build a ``w × h`` perfect maze with stairs in the far corner.
+    """Build a bare (all-VOID) ``w × h`` level for the MazeWalk envs.
 
-    Wave17i: replaces the legacy "open room" substitute with a real
-    recursive-backtracker maze carve via ``LevelGenerator.add_mazewalk``
-    (cite vendor MAZEWALK des-file directive → mklev.c::walkfrom).
-    The agent starts at the top-left and the goal stair is at the
-    bottom-right corner.
+    Vendor MiniHack ``MiniHackMazeWalk`` emits an all-stone MAP under
+    ``GEOMETRY:center,center`` plus a ``MAZEWALK`` directive and a
+    ``STAIR:random,down`` (vendor/minihack/minihack/envs/mazewalk.py).  The
+    actual maze carve, stair placement and hero start are all
+    ISAAC64-driven and reproduced faithfully in
+    :func:`_wrap_mazewalk_placement` (which consumes ``state.vendor_rng``
+    in vendor's exact des-interpreter draw order).  The builder therefore
+    leaves the level empty — every non-maze cell stays VOID (glyph 2359,
+    S_stone) exactly like vendor's unrevealed stone.
     """
+    del w, h  # geometry handled entirely by the placement wrapper
+
     def build(lg: LevelGenerator) -> None:
-        # Carve a perfect maze covering the active (h, w) area.
-        lg.add_mazewalk(coord=(1, 1), dir="east")
-        lg.set_start_pos(1, 1)
-        lg.add_stair_down(x=w - 2 if w > 2 else w - 1,
-                          y=h - 2 if h > 2 else h - 1)
+        # Intentionally empty: no fill, no mazewalk, no stair, no start.
+        # The whole level remains VOID (LG default), matching vendor's
+        # concrete-stone MAP before walkfrom carves it.
+        del lg
     return build
+
+
+# ---------------------------------------------------------------------------
+# Faithful vendor MAZEWALK carve + placement (ISAAC64-driven).
+#
+# The vendor des interpreter runs, in order (see the MiniHack-emitted des
+# file MAZE/FLAGS/INIT_MAP/GEOMETRY/MAP/REGION/MAZEWALK/STAIR):
+#
+#   1. REGION setup ................... rn2(3), rn2(2)          (2 draws)
+#   2. MAZEWALK: spo_mazewalk+walkfrom . rn2(q) per carve step  (variable)
+#   3. STAIR:random,down ............. rn2(MAP), rn2(MAP) loop  (accept dry)
+#   4. hero start placement .......... rn2(79), rn2(21) loop    (accept floor)
+#
+# Ground-truthed against the vendor NETHAX_RN2 trace + the ``MazeWalk-Mapped``
+# premapped reveal for MazeWalk-9x9 seeds 0/1/2 (draws 339..370 for seed 0;
+# walkfrom start=(40,9), okay-bounds x[35,43] y[6,14], stair base (34,5)).
+#
+# Cite: vendor/nle/src/sp_lev.c::spo_mazewalk (4725), mkmaze.c::walkfrom
+# (1167) + okay (231) + mz_move (34); vendor/minihack level_generator.py
+# (GEOMETRY:center,center header; add_mazewalk default coord = MAP//2).
+# ---------------------------------------------------------------------------
+def _mazewalk_geometry(w: int, h: int):
+    """Return internal-coordinate maze parameters as a tuple
+    ``(xstart, ystart, sx, sy, minx, maxx, miny, maxy, stair_bx, stair_by,
+    mapw, maph)``.
+
+    ``w``/``h`` are the vendor env's nominal maze extents (9, 15, 45/19).
+    The vendor MAP is ``(w+2) × (h+2)`` and is centered on the 79×21 level
+    via the ``GEOMETRY:center,center`` CENTER formula (spo_map).
+    """
+    mapw, maph = w + 2, h + 2
+    xstart, ystart = _vendor_geometry_center_wh(mapw, maph)
+    # spo_mazewalk default coord = (MAP//2, MAP//2) MAP-relative, dir=east.
+    # Internal cell = (xstart + MAP//2, ystart + MAP//2); the y coordinate is
+    # forced odd (walkfrom parity).  Ground-truthed (9x9 seed 0): the walk
+    # begins at (xstart+MAP//2, ystart+MAP//2 - even_adjust) = (40, 9).
+    cx = xstart + (mapw // 2)
+    cy = ystart + (maph // 2)
+    if cy % 2 == 0:
+        cy -= 1
+    sx, sy = cx, cy
+    # walkfrom okay-bounds = the maze interior (w × h) of the stone MAP.
+    minx, maxx = xstart, xstart + w - 1
+    miny, maxy = ystart + 1, ystart + h
+    # STAIR:random region base = MAP top-left minus the 1-col west margin.
+    stair_bx, stair_by = xstart - 1, ystart
+    return (xstart, ystart, sx, sy, minx, maxx, miny, maxy,
+            stair_bx, stair_by, mapw, maph)
+
+
+def _wrap_mazewalk_placement(
+    factory: Callable[[jax.Array], "EnvState"], w: int, h: int,
+    lit: bool = True,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Reproduce vendor's MAZEWALK level-gen from ``state.vendor_rng``.
+
+    Consumes ISAAC64 draws in vendor's des-interpreter order, carves the
+    recursive-backtracker maze (faithful ``walkfrom`` port), stamps the
+    random down-stair, and pins the hero start to the vendor-accepted cell.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TileType
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    import numpy as _np
+
+    (_xstart, _ystart, sx, sy, minx, maxx, miny, maxy,
+     stair_bx, stair_by, mapw, maph) = _mazewalk_geometry(w, h)
+    _FLOOR = int(_TileType.FLOOR)
+    _STAIR = int(_TileType.STAIRCASE_DOWN)
+
+    def _mz_move(x, y, d):
+        # vendor mz_move: 0=N,1=E,2=S,3=W (mkmaze.c:34).
+        if d == 0:
+            return x, y - 1
+        if d == 1:
+            return x + 1, y
+        if d == 2:
+            return x, y + 1
+        return x - 1, y
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = [state.vendor_rng]   # list holder so nested fns can rebind
+
+        def rn2(n):
+            vrng[0], r = _vendor_rng.rn2_jax(vrng[0], jnp.int32(n))
+            return int(r)
+
+        # --- (1) REGION setup: rn2(3), rn2(2) ---------------------------
+        rn2(3)
+        rn2(2)
+
+        # --- (2) walkfrom recursive-backtracker carve -------------------
+        # levl model: VOID (0) == vendor STONE; carved cells become FLOOR.
+        _H, _W = int(state.terrain.shape[2]), int(state.terrain.shape[3])
+        carved = _np.zeros((_H, _W), dtype=bool)
+
+        def okay(x, y, d):
+            x, y = _mz_move(x, y, d)
+            x, y = _mz_move(x, y, d)
+            if x < minx or y < miny or x > maxx or y > maxy:
+                return False
+            return not carved[y, x]
+
+        # Iterative walkfrom (recursion depth can exceed CPython's limit for
+        # the 45×19 maze).  Mirrors mkmaze.c::walkfrom (non-MICRO) exactly:
+        # at each cell collect the valid dirs, pick rn2(q), carve the bridge
+        # + neighbour, recurse; pop when no dir is valid.
+        stack = [(sx, sy)]
+        carved[sy, sx] = True
+        while stack:
+            x, y = stack[-1]
+            dirs = [d for d in range(4) if okay(x, y, d)]
+            if not dirs:
+                stack.pop()
+                continue
+            d = dirs[rn2(len(dirs))]
+            bx, by = _mz_move(x, y, d)
+            carved[by, bx] = True          # bridge cell
+            nx, ny = _mz_move(bx, by, d)
+            carved[ny, nx] = True          # neighbour cell
+            stack.append((nx, ny))
+
+        # The maze is carved in the vendor DISPLAY frame (matching the trace
+        # + premapped reveal).  NLE's internal terrain column is display + 1
+        # (the same +1 the Room wrappers apply: internal x = rn2(...)+1), so
+        # stamp every carved cell at column ``cx + X_OFF``.
+        X_OFF = 1
+        terrain = state.terrain
+        for (cy, cx) in _np.argwhere(carved):
+            terrain = terrain.at[0, 0, int(cy), int(cx) + X_OFF].set(
+                jnp.int8(_FLOOR)
+            )
+
+        # --- (3) STAIR:random,down --------------------------------------
+        # get_location(DRY): loop rn2(MAP)/rn2(MAP) over the MAP region,
+        # accept the first carved-floor cell (display frame), stamp at +1.
+        stair_x, stair_y = None, None
+        for _ in range(200):
+            rx = rn2(mapw)
+            ry = rn2(maph)
+            cx_ = stair_bx + rx
+            cy_ = stair_by + ry
+            if 0 <= cy_ < _H and 0 <= cx_ < _W and carved[cy_, cx_]:
+                stair_x, stair_y = cx_, cy_
+                break
+        if stair_x is not None:
+            terrain = terrain.at[0, 0, stair_y, stair_x + X_OFF].set(
+                jnp.int8(_STAIR)
+            )
+
+        # --- (4) hero start placement -----------------------------------
+        # place_lregion(LR_UPSTAIR): loop rn2(79)/rn2(21), accept the first
+        # floor cell.  Internal hero column = rn2(79) + 1 (same +1 as the
+        # Room placement wrappers); the down-stair cell is non-floor so it
+        # is skipped.
+        _terr_np = _np.asarray(terrain[0, 0])
+        _floor_mask = (_terr_np == _FLOOR)
+        acc_x = int(sx) + X_OFF           # fallback: maze start (always floor)
+        acc_y = int(sy)
+        for _ in range(200):
+            rx = rn2(79) + X_OFF
+            ry = rn2(21)
+            if 0 <= ry < _H and 0 <= rx < _W and bool(_floor_mask[ry, rx]):
+                acc_x, acc_y = rx, ry
+                break
+
+        state = state.replace(
+            vendor_rng=vrng[0],
+            terrain=terrain,
+            player_pos=jnp.array([acc_y, acc_x], dtype=jnp.int16),
+        )
+        return _seed_hero_fov(state, lit)
+
+    return wrapped
 
 
 def _register_mazewalk_envs(register_fn) -> None:
@@ -1291,7 +1471,8 @@ def _register_mazewalk_envs(register_fn) -> None:
         ("MiniHack-MazeWalk-Mapped-45x19-v0", 45, 19, 1000),
     ]
     for env_id, w, h, ms in variants:
-        factory = _make_factory(_mazewalk_builder(w, h), w=w, h=h)
+        base = _make_factory(_mazewalk_builder(w, h), w=w, h=h, fill=" ")
+        factory = _wrap_mazewalk_placement(base, w=w, h=h)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=ms, category="MazeWalk")
 
@@ -1344,43 +1525,86 @@ def _register_hidenseek_envs(register_fn) -> None:
 # ---------------------------------------------------------------------------
 # KeyRoom envs (Group A)
 # ---------------------------------------------------------------------------
+def _keyroom_center(room_size: int) -> tuple[int, int]:
+    """Return the (x1, y1) ABSOLUTE internal interior top-left of the vendor
+    KeyRoom outer ROOM.
+
+    Vendor ``key_and_door_tmp.des`` emits ``ROOM: ..., (3,3), (center,center),
+    (RS,RS)`` which routes through ``create_room`` (vendor/nle/src/sp_lev.c:
+    1219-1267 CENTER-align branch).  The C formula is::
+
+        xabs = (((3-1)*COLNO)/5)+1 + ((COLNO/5)-RS)/2
+        yabs = (((3-1)*ROWNO)/5)+1 + ((ROWNO/5)-RS)/2   [+1 empirical]
+
+    with COLNO=80, ROWNO=21.  Ground-truthed against the vendor glyph map
+    (``.test_runs/kr_rnd_stream_*`` capture): for RS=5 the outer room
+    interior is internal cols 38..42, rows 9..13 (walls 37/43, 8/14).  The
+    +1 row correction matches the observed anchor across all seeds.
+    """
+    COLNO, ROWNO = 80, 21
+    xabs = (((3 - 1) * COLNO) // 5) + 1 + ((COLNO // 5) - room_size) // 2
+    yabs = (((3 - 1) * ROWNO) // 5) + 1 + ((ROWNO // 5) - room_size) // 2 + 1
+    if xabs + room_size - 1 > COLNO - 2:
+        xabs = COLNO - room_size - 3
+    xabs = max(2, xabs)
+    if yabs + room_size - 1 > ROWNO - 2:
+        yabs = ROWNO - room_size - 3
+    yabs = max(2, yabs)
+    return xabs, yabs
+
+
 def _keyroom_builder(room_size: int, subroom_size: int,
                      lit: bool) -> Callable[[LevelGenerator], None]:
-    """Hand-coded KeyRoom that matches vendor ``key_and_door.des``.
+    """Hand-coded KeyRoom that mirrors vendor ``key_and_door_tmp.des``.
 
-    Vendor layout (vendor/minihack/minihack/dat/key_and_door.des and
-    key_and_door_tmp.des):
-      * an outer ``ROOM`` holding the blessed skeleton key,
-      * a ``SUBROOM`` nested in a corner holding the down ``STAIR``,
-      * a **locked** ``DOOR`` / ``ROOMDOOR`` on the wall separating the two.
+    Structure (vendor/minihack/minihack/dat/key_and_door_tmp.des):
+      * an outer ``ROOM`` (RS×RS) holding the blessed skeleton key,
+      * a ``SUBROOM`` (SS×SS) nested in a corner holding the down ``STAIR``,
+      * a **locked** ``ROOMDOOR`` on the subroom wall separating the two.
 
-    The prior Minihax builder carved the sub-room walls but never placed
-    the door, sealing the stairs off and — critically — letting an agent
-    that learned the key-use policy receive no benefit (the door was simply
-    absent).  We now nest the sub-room with a 1-cell gap inside the outer
-    room and stamp a ``locked`` door on the shared wall, mirroring vendor.
+    The outer room is now stamped at the vendor ``GEOMETRY:center,center``
+    absolute location (:func:`_keyroom_center`) instead of the top-left
+    corner, so its walls/floor align with vendor.  The subroom / door / key
+    / stair are placed deterministically in the top-left corner of the
+    outer interior (matching the vendor ``key_and_door.des`` Fixed layout:
+    SUBROOM (0,0), DOOR (2,1)).
+
+    NOTE (byte-parity ceiling): the sized S5/S15 variants place the
+    subroom/door/key/stair/player via ISAAC64 draws in vendor.  Minihax
+    cannot reproduce those draws because the vendor KeyRoom character is
+    **Rogue** (``rog-hum-cha-mal``; vendor/minihack/.../keyroom.py:34 +
+    navigation.py:38) while the minihax bootstrap is hard-wired to
+    **Archeologist** (level_generator.py ``role=_Role.ARCHEOLOGIST``).  The
+    role divergence shifts the pre-mklev ISAAC64 stream (role_init + u_init
+    inventory), so ``state.vendor_rng`` at KeyRoom mklev holds Archeologist
+    values, not vendor's Rogue values.  A trace-driven RNG model was derived
+    and validated (subroom/stair/door/key match on seeds 0/1/2 when fed the
+    *vendor* Rogue stream — see ``.test_runs/_kr_sim.py``) but is inert on
+    the minihax Archeologist stream.  Byte parity requires routing the
+    bootstrap through role=ROGUE (level_generator.py; out of scope here).
     """
+    x1, y1 = _keyroom_center(room_size)          # outer interior top-left
+    x2, y2 = x1 + room_size - 1, y1 + room_size - 1
+
     def build(lg: LevelGenerator) -> None:
-        # Outer room: interior cols/rows 1..room_size.
-        outer = lg.add_room(x=1, y=1, w=room_size, h=room_size, lit=lit)
-        # Nest the sub-room in the top-right corner of the outer interior,
-        # leaving a 1-cell wall gap so its left + bottom walls border outer
-        # floor (matching vendor SUBROOM placement inside the parent ROOM).
-        outer_x2 = room_size            # outer interior right col
-        outer_y1 = 1                    # outer interior top row
-        sub_x = outer_x2 - subroom_size + 1   # sub interior left col
-        sub_y = outer_y1 + 1                  # sub interior top row (gap @ row 1)
+        outer = lg.add_room(x=x1, y=y1, w=room_size, h=room_size, lit=lit)
+        # Sub-room in the top-left corner of the outer interior (vendor
+        # Fixed-layout SUBROOM (0,0)); its right + bottom walls border outer
+        # floor so a door can connect them.
+        sub_x = x1
+        sub_y = y1
         lg.add_room(x=sub_x, y=sub_y, w=subroom_size, h=subroom_size, lit=lit)
-        # Locked door on the sub-room's left wall, connecting sub-room interior
-        # to outer-room interior.  Vendor: ``DOOR:locked,(2,1)`` (relative to
-        # parent room) — a single locked door is the task's whole point.
-        door_x = sub_x - 1                    # shared wall column
-        door_y = sub_y                        # first sub-room interior row
+        # Locked door on the sub-room's right wall (vendor Fixed DOOR (2,1) is
+        # on the wall at subroom-relative col SS, row 1), connecting the
+        # sub-room interior to the outer-room interior.
+        door_x = sub_x + subroom_size            # shared wall column (east)
+        door_y = sub_y                           # first sub-room interior row
         lg.add_door(door_x, door_y, state="locked")
-        # Key in the outer room; goal stair inside the (sealed) sub-room.
+        # Key in the outer room; goal stair inside the (locked) sub-room.
         lg.add_object("skeleton key", "(", place=outer)
-        lg.add_stair_down(x=sub_x, y=sub_y + subroom_size - 1)
-        lg.set_start_pos(1, 1)
+        lg.add_stair_down(x=sub_x + subroom_size - 1,
+                          y=sub_y + subroom_size - 1)
+        lg.set_start_pos(x2, y2)
     return build
 
 
@@ -1409,9 +1633,12 @@ def _register_keyroom_envs(register_fn) -> None:
         ("MiniHack-KeyRoom-Dark-S15-v0", 15, 5, False, 400),
     ]
     for env_id, rs, ss, lit, ms in variants:
+        # Full 80x21 dungeon so the vendor GEOMETRY:center outer room
+        # (``_keyroom_center``) can be stamped at its absolute location
+        # instead of being clamped to a 20-wide LG.
         factory = _make_factory(
             _keyroom_builder(rs, ss, lit),
-            w=max(20, rs + 2), h=max(20, rs + 2), lit=lit,
+            w=80, h=21, fill=" ", lit=lit,
         )
         register_fn(env_id, factory, _keyroom_rm(),
                     max_steps=ms, category="KeyRoom")
