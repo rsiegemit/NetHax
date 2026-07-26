@@ -1332,6 +1332,32 @@ def _apply_directives(
     return state
 
 
+_BOULDER_OBJ_IDX: int = _OBJECT_NAME_TO_IDX["boulder"]
+
+
+def _boulder_opaque_overlay(state: EnvState, shape: Tuple[int, int]) -> jnp.ndarray:
+    """Build a ``bool[H, W]`` mask of cells holding a boulder on level (0, 0).
+
+    Vendor ``does_block`` (vision.c:156-184) treats a boulder as opaque, so
+    the hero's line-of-sight FOV must shadow-cast behind boulders.  We scan
+    the sparse ``ground_items`` for entries whose ``type_id`` is the vendor
+    "boulder" object index (any stack slot occludes) and scatter their
+    (row, col) into a mask that augments ``view_from``'s terrain opacity.
+    Levels with no boulders (e.g. Room) yield an all-False mask -> no-op.
+    """
+    h, w = shape
+    gi = state.ground_items
+    type_id = gi.items.type_id[0, 0]                      # [K]
+    category = gi.items.category[0, 0]                    # [K]
+    pos = gi.pos[0, 0].astype(jnp.int32)                  # [K, 3]
+    is_boulder = (type_id == jnp.int16(_BOULDER_OBJ_IDX)) & (category != 0)
+    row = jnp.clip(pos[:, 0], 0, h - 1)
+    col = jnp.clip(pos[:, 1], 0, w - 1)
+    flat = jnp.where(is_boulder, row * w + col, jnp.int32(h * w))
+    mask = jnp.zeros((h * w + 1,), dtype=jnp.bool_).at[flat].set(True)
+    return mask[:h * w].reshape(h, w)
+
+
 def seed_hero_fov(
     state: EnvState,
     default_lit: bool,
@@ -1357,10 +1383,12 @@ def seed_hero_fov(
     """
     from Nethax.nethax.fov import view_from as _view_from
     terrain_l0 = state.terrain[0, 0]
+    boulder_overlay = _boulder_opaque_overlay(state, terrain_l0.shape)
     couldsee = _view_from(
         terrain_l0,
         state.player_pos.astype(jnp.int32),
         max_radius=0,
+        opaque_overlay=boulder_overlay,
     )
     if lit_regions:
         # Per-region lighting (vendor ``REGION:...,lit`` on an unlit level):
