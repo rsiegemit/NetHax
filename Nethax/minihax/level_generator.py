@@ -1711,6 +1711,22 @@ def _resolve_monster(
         idx = _MONSTER_NAME_TO_IDX[lookup]
 
     from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng
+    # Explicitly-placed named monster (vendor des ``MONSTER:"name",(x,y)``):
+    # vendor's create_monster uses the literal coordinate via
+    # get_location_coord() and does NOT run the mkroom somxy() retry loop, so
+    # there is no per-monster placement RNG to consume.  Honour the fixed cell
+    # directly.  This only fires for name!="random" AND an explicit place tuple
+    # (e.g. CorridorBattle's six giant rats); random room monsters (place=None)
+    # still fall through to the vendor-rng somxy path below.
+    if (
+        d.name != "random"
+        and d.place is not None
+        and isinstance(d.place, tuple)
+        and len(d.place) == 2
+    ):
+        px, py = int(d.place[0]), int(d.place[1])
+        if 0 <= py < h and 0 <= px < w:
+            return (py, px), idx, state, []
     if state is not None and _use_vendor_rng():
         from Nethax.nethax import vendor_rng as _vendor_rng
         vrng = state.vendor_rng

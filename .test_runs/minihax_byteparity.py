@@ -106,6 +106,9 @@ def _env_id_to_vendor_cls(env_id: str):
     """
     from minihack.envs import room as _room_mod
     from minihack.envs import skills_simple as _skills_mod
+    from minihack.envs import hidenseek as _hns_mod
+    from minihack.envs import fightcorridor as _fc_mod
+    from minihack.envs import mazewalk as _mw_mod
 
     table = {
         "MiniHack-Eat-v0":                 _skills_mod.MiniHackEat,
@@ -116,6 +119,15 @@ def _env_id_to_vendor_cls(env_id: str):
         "MiniHack-Wear-v0":                _skills_mod.MiniHackWear,
         "MiniHack-PutOn-v0":               _skills_mod.MiniHackPutOn,
         "MiniHack-Sink-v0":                _skills_mod.MiniHackSink,
+        "MiniHack-CorridorBattle-v0":      _fc_mod.MiniHackFightCorridor,
+        "MiniHack-CorridorBattle-Dark-v0": _fc_mod.MiniHackFightCorridorDark,
+        "MiniHack-HideNSeek-v0":           _hns_mod.MiniHackHideAndSeek,
+        "MiniHack-HideNSeek-Mapped-v0":    _hns_mod.MiniHackHideAndSeekMapped,
+        "MiniHack-HideNSeek-Lava-v0":      _hns_mod.MiniHackHideAndSeekLava,
+        "MiniHack-HideNSeek-Big-v0":       _hns_mod.MiniHackHideAndSeekBig,
+        "MiniHack-MazeWalk-9x9-v0":        _mw_mod.MiniHackMazeWalk9x9,
+        "MiniHack-MazeWalk-15x15-v0":      _mw_mod.MiniHackMazeWalk15x15,
+        "MiniHack-MazeWalk-45x19-v0":      _mw_mod.MiniHackMazeWalk45x19,
         "MiniHack-Room-5x5-v0":            _room_mod.MiniHackRoom5x5,
         "MiniHack-Room-Random-5x5-v0":     _room_mod.MiniHackRoom5x5Random,
         "MiniHack-Room-Dark-5x5-v0":       _room_mod.MiniHackRoom5x5Dark,

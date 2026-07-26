@@ -440,6 +440,26 @@ def _vendor_geometry_center(size: int) -> tuple[int, int]:
     return xstart, ystart
 
 
+def _vendor_geometry_center_wh(w: int, h: int) -> tuple[int, int]:
+    """Return (xstart, ystart) for a ``w``×``h`` (non-square) MAP block under
+    ``GEOMETRY:center,center``.
+
+    Same sp_lev.c CENTER formula as :func:`_vendor_geometry_center`, but with
+    independent width/height so rectangular vendor maps (e.g. CorridorBattle's
+    34×5 MAP) land at the same terrain origin vendor computes.
+    Cite vendor/nle/src/sp_lev.c:4944-4967.
+    """
+    x_maze_max = 78  # COLNO - 1
+    y_maze_max = 20  # ROWNO - 1
+    xstart = 2 + ((x_maze_max - 2 - w) // 2)
+    ystart = 2 + ((y_maze_max - 2 - h) // 2)
+    if (xstart % 2) == 0:
+        xstart += 1
+    if (ystart % 2) == 0:
+        ystart += 1
+    return xstart, ystart
+
+
 def _room_builder(size: int, *, random: bool, lit: bool,
                   n_monster: int, n_trap: int) -> Callable[[LevelGenerator], None]:
     x0, y0 = _vendor_geometry_center(size)
@@ -980,23 +1000,68 @@ def _register_corridor_envs(register_fn) -> None:
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=1000, category="Corridor")
 
-    # CorridorBattle envs: two rooms + a fight corridor.
-    def battle_builder(lit: bool):
+    # CorridorBattle envs: fixed vendor MAP (two rooms + fight corridor)
+    # placed center,center on the 80x21 grid.  Reproduces the exact des
+    # emitted by vendor/minihack/minihack/envs/fightcorridor.py via its
+    # LevelGenerator(map=...).  Vendor applies GEOMETRY:center,center which
+    # the des-parser MAP stamper does NOT (it stamps at terrain[0,0]); the
+    # old procedural add_room()/add_corridor() builder could not match the
+    # placement either.  We therefore build the level directly via the LG
+    # API at the vendor-centered absolute coordinates (same approach as
+    # _room_builder / _vendor_geometry_center).
+    #
+    # The vendor MAP is 34 wide x 5 tall.  sp_lev.c center formula (see
+    # _vendor_geometry_center) with (W=34, H=5) yields terrain origin
+    # (col=23, row=9).  Every MAP cell / MONSTER / STAIR / start coord is
+    # offset by (dx=23, dy=9) so the level lands where vendor renders it.
+    _CB_MAP = (
+        "-----       ----------------------",
+        "|...|       |....................|",
+        "|....#######.....................|",
+        "|...|       |....................|",
+        "-----       ----------------------",
+    )
+    _CB_W = max(len(r) for r in _CB_MAP)   # 34
+    _CB_H = len(_CB_MAP)                    # 5
+    _cb_dx, _cb_dy = _vendor_geometry_center_wh(_CB_W, _CB_H)
+
+    # Build a full 80x21 grid with the MAP content stamped at the centered
+    # origin, then hand it to set_map().  Using set_map (the _SetMapDirective
+    # path) instead of per-cell fill_terrain avoids synthesising a spurious
+    # single-cell "__carved_fill__" room, which would otherwise trigger the
+    # mklev auto down-stair (a second stray S_dnstair at the room corner).
+    _CB_GRID: list[str] = []
+    for _gy in range(21):
+        _row = [" "] * 80
+        _my = _gy - _cb_dy
+        if 0 <= _my < _CB_H:
+            for _cx, _ch in enumerate(_CB_MAP[_my]):
+                _ax = _cx + _cb_dx
+                if 0 <= _ax < 80:
+                    _row[_ax] = _ch
+        _CB_GRID.append("".join(_row))
+
+    def corridorbattle_builder(lit: bool):
         def build(lg: LevelGenerator) -> None:
-            lg.add_room(x=2, y=8, w=4, h=4)
-            lg.add_room(x=70, y=8, w=4, h=4)
-            lg.add_corridor((6, 10), (70, 10))
-            lg.set_start_pos(3, 10)
-            lg.add_stair_down(x=72, y=10)
-            for _ in range(3):
-                lg.add_monster()
+            lg.set_map(_CB_GRID)
+            # Vendor start_rect (1,1)-(3,3) + BRANCH -> hero at map (3,2)
+            # (the accepted branch cell, verified from vendor render).
+            lg.set_start_pos(3 + _cb_dx, 2 + _cb_dy)
+            # Six giant rats at fixed map cells (30..31, 1..3).
+            for mx in (30, 31):
+                for my in (1, 2, 3):
+                    lg.add_monster(name="giant rat",
+                                   place=(mx + _cb_dx, my + _cb_dy))
+            # Down stair (goal) at map (32, 2).
+            lg.add_stair_down(x=32 + _cb_dx, y=2 + _cb_dy)
         return build
 
     for env_id, lit in [
         ("MiniHack-CorridorBattle-v0", True),
         ("MiniHack-CorridorBattle-Dark-v0", False),
     ]:
-        factory = _make_factory(battle_builder(lit), w=76, h=21, lit=lit)
+        factory = _make_factory(corridorbattle_builder(lit),
+                                w=80, h=21, fill=" ", lit=lit)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=1000, category="Corridor")
 
