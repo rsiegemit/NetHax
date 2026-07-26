@@ -61,6 +61,14 @@ TERRAIN_CHAR_TO_TILE: dict = {
     "W": TileType.WATER,
     "L": TileType.LAVA,
     "{": TileType.FOUNTAIN,
+    # 'F' is the vendor MAP mapchar for IRONBARS ("Fe = iron"; cite
+    # vendor/nethack/src/nhlua.c:374 char2typ table), rendered as S_bars ('#').
+    # nethax has no IRONBARS TileType and nle_obs has no S_bars entry, so map to
+    # CORRIDOR: it shares the '#' display char (chars-array byte-match) and is
+    # the nearest existing tile.  The exact S_bars glyph needs a new TileType +
+    # nle_obs cmap entry (owned elsewhere) — one residual glyph cell remains.
+    # (The MONSTER 'F' lichen glyph is a separate directive, not a MAP char.)
+    "F": TileType.CORRIDOR,
     "\\": TileType.THRONE,
     "<": TileType.STAIRCASE_UP,
     ">": TileType.STAIRCASE_DOWN,
@@ -325,8 +333,28 @@ class _SetMapDirective:
     ``VOID`` per ``TERRAIN_CHAR_TO_TILE``) — is written, so the MAP block
     is authoritative and the level is correctly bounded by stone/void rather
     than leaking open FLOOR into the rest of the 80x21 grid.
+
+    ``xstart``/``ystart`` are the internal terrain origin computed from the
+    vendor ``GEOMETRY`` header (des_parser._compute_map_geometry).  The grid
+    is stamped starting there rather than at ``terrain[0, 0]``.
     """
     rows: Tuple[str, ...]
+    xstart: int = 0
+    ystart: int = 0
+
+
+@dataclasses.dataclass
+class _LitRegionDirective:
+    """A ``REGION:...,lit`` sub-rect that lights only its own cells.
+
+    Source: vendor des ``REGION:(x1,y1,x2,y2),lit,"..."`` on a globally-unlit
+    level (e.g. memento_short.des).  Coordinates are internal terrain
+    (row, col) — the GEOMETRY offset has already been applied by the parser.
+    """
+    row: int
+    col: int
+    height: int
+    width: int
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +699,7 @@ class LevelGenerator:
             x=x, y=y, direction=str(dir),
         ))
 
-    def set_map(self, rows) -> None:
+    def set_map(self, rows, xstart: int = 0, ystart: int = 0) -> None:
         """Ingest a literal vendor ``MAP`` block.
 
         Source: vendor des-file ``MAP ... ENDMAP`` grid (e.g.
@@ -681,9 +709,31 @@ class LevelGenerator:
         time: every glyph — including spaces, which resolve to ``VOID`` —
         is written into the terrain so the level is bounded by stone rather
         than the LG's default open-FLOOR fill.
+
+        ``xstart``/``ystart`` place the grid's top-left at the internal
+        terrain origin computed from the vendor ``GEOMETRY`` header
+        (des_parser._compute_map_geometry).  Default ``(0, 0)`` preserves the
+        legacy terrain[0,0] stamp for callers that pre-offset their coords
+        (e.g. the Room builders in canonical.py that use ``fill_terrain``).
         """
         clean = tuple(str(r) for r in rows)
-        self._directives.append(_SetMapDirective(rows=clean))
+        self._directives.append(
+            _SetMapDirective(rows=clean, xstart=int(xstart), ystart=int(ystart))
+        )
+
+    def add_lit_region(
+        self, row: int, col: int, height: int = 1, width: int = 1,
+    ) -> None:
+        """Mark a rectangular region as lit (vendor ``REGION:...,lit``).
+
+        On a globally-unlit level only these cells (plus the hero's own
+        torchlight) are lit; every other cell renders dark.  Coordinates are
+        internal terrain (row, col) — the GEOMETRY offset is pre-applied by
+        the des parser.
+        """
+        self._directives.append(_LitRegionDirective(
+            row=int(row), col=int(col), height=int(height), width=int(width),
+        ))
 
     def add_random_corridors(self) -> None:
         """Vendor ``RANDOM_CORRIDORS`` directive (no-op stand-in).
@@ -946,7 +996,9 @@ def _apply_directives(
         terrain_np = terrain_np.at[0, 0, :h, :w].set(void_block)
         for d in directives:
             if isinstance(d, _SetMapDirective):
-                terrain_np = _stamp_map_block(terrain_np, d.rows, w, h)
+                terrain_np = _stamp_map_block(
+                    terrain_np, d.rows, w, h, d.xstart, d.ystart,
+                )
 
     # Pass 1: resolve rooms (room placements are needed before other directives
     # that reference them by id).
@@ -1130,6 +1182,9 @@ def _apply_directives(
             terrain_np = _carve_maze(
                 terrain_np, d.x, d.y, w, h, _next_key,
             )
+        elif isinstance(d, _LitRegionDirective):
+            # Collected below (after the loop) into ``lit_regions`` for FoV.
+            pass
         elif isinstance(d, _StartingInventoryDirective):
             # Buffer; committed after the walk so all items are assigned
             # contiguous letters via InventoryState.from_items.
@@ -1257,12 +1312,27 @@ def _apply_directives(
     # :func:`seed_hero_fov` themselves after pinning ``player_pos`` to the
     # vendor-accepted cell.
     if explicit_start_pos:
-        state = seed_hero_fov(state, lg.default_lit)
+        # Collect any per-region lit rects (vendor ``REGION:...,lit`` on a
+        # globally-unlit level).  When present, the level is globally dark
+        # except for these rects plus the hero's torchlight — pass them to
+        # seed_hero_fov and force default_lit off so the rest stays stone.
+        lit_regions = [
+            (d.row, d.col, d.height, d.width)
+            for d in directives if isinstance(d, _LitRegionDirective)
+        ]
+        if lit_regions:
+            state = seed_hero_fov(state, False, lit_regions=lit_regions)
+        else:
+            state = seed_hero_fov(state, lg.default_lit)
 
     return state
 
 
-def seed_hero_fov(state: EnvState, default_lit: bool) -> EnvState:
+def seed_hero_fov(
+    state: EnvState,
+    default_lit: bool,
+    lit_regions: Optional[List[Tuple[int, int, int, int]]] = None,
+) -> EnvState:
     """Seed ``visible`` / ``explored`` / ``last_seen_terrain`` for the
     hero's current cell on level (branch=0, level=0).
 
@@ -1288,7 +1358,32 @@ def seed_hero_fov(state: EnvState, default_lit: bool) -> EnvState:
         state.player_pos.astype(jnp.int32),
         max_radius=0,
     )
-    if default_lit:
+    if lit_regions:
+        # Per-region lighting (vendor ``REGION:...,lit`` on an unlit level):
+        # light only the union of the given internal-coord rects; every other
+        # cell stays dark and renders as stone unless within hero torchlight.
+        _h_r, _w_r = terrain_l0.shape
+        _rows_r = jnp.arange(_h_r, dtype=jnp.int32)[:, None]
+        _cols_r = jnp.arange(_w_r, dtype=jnp.int32)[None, :]
+        lit_mask = jnp.zeros_like(terrain_l0, dtype=jnp.bool_)
+        for (rr, cc, hh, ww) in lit_regions:
+            # Vendor light_region (sp_lev.c:2848-2854) grows a lit rect by one
+            # cell in every direction so the bounding walls are lit too (x
+            # clamped to >=1, y to >=0).
+            _lo_r = max(rr - 1, 0)
+            _hi_r = rr + hh - 1 + 1
+            _lo_c = max(cc - 1, 1)
+            _hi_c = cc + ww - 1 + 1
+            in_rect = (
+                (_rows_r >= jnp.int32(_lo_r))
+                & (_rows_r <= jnp.int32(_hi_r))
+                & (_cols_r >= jnp.int32(_lo_c))
+                & (_cols_r <= jnp.int32(_hi_c))
+            )
+            lit_mask = lit_mask | in_rect
+        # Only actual (non-VOID) tiles can be lit.
+        lit_mask = lit_mask & (terrain_l0 != jnp.int8(int(TileType.VOID)))
+    elif default_lit:
         lit_mask = terrain_l0 != jnp.int8(int(TileType.VOID))
     else:
         lit_mask = jnp.zeros_like(terrain_l0, dtype=jnp.bool_)
@@ -1329,6 +1424,7 @@ def _set_tile(
 
 def _stamp_map_block(
     terrain_np: jax.Array, rows: Tuple[str, ...], w: int, h: int,
+    xstart: int = 0, ystart: int = 0,
 ) -> jax.Array:
     """Write a literal vendor MAP grid into ``terrain[0, 0]``.
 
@@ -1338,14 +1434,20 @@ def _stamp_map_block(
     so the tile is walkable.  Spaces resolve to ``VOID`` (vendor
     ``INIT_MAP:solidfill,' '`` stone), giving the level a hard boundary
     instead of the LG's default open-FLOOR fill.
+
+    ``xstart``/``ystart`` offset the grid to the internal terrain origin
+    computed from the GEOMETRY header (matching vendor spo_map), so the
+    stamped level lands where NLE renders it.
     """
     floor = int(TileType.FLOOR)
     for y, line in enumerate(rows):
-        if y >= h:
-            break
+        ty = y + ystart
+        if ty >= h or ty < 0:
+            continue
         for x, ch in enumerate(line):
-            if x >= w:
-                break
+            tx = x + xstart
+            if tx >= w or tx < 0:
+                continue
             tile = TERRAIN_CHAR_TO_TILE.get(ch)
             if tile is None:
                 # Glyph is an object/monster placement char (e.g. '!', '/');
@@ -1353,7 +1455,7 @@ def _stamp_map_block(
                 tile = floor
             else:
                 tile = int(tile)
-            terrain_np = terrain_np.at[0, 0, y, x].set(jnp.int8(tile))
+            terrain_np = terrain_np.at[0, 0, ty, tx].set(jnp.int8(tile))
     return terrain_np
 
 
@@ -1515,6 +1617,16 @@ def _place_stair(
         if rc is None:
             return terrain_np, (0, 0)
         row, col = rc
+    # Vendor stairs need a "dry" cell (get_location DRY -> SPACE_POS: floor /
+    # corridor / doorway).  A des ``STAIR`` whose coord lands on a WALL/VOID
+    # MAP cell (e.g. memento_short.des ``STAIR:(1,5),up`` on the level's wall
+    # border, which marks the branch-entry rather than a navigable stair) is
+    # not materialised there — vendor renders the underlying map terrain.  Skip
+    # the stamp so we don't punch a stair through a wall.
+    if 0 <= row < h and 0 <= col < w:
+        _existing = int(terrain_np[0, 0, row, col])
+        if _existing in (int(TileType.WALL), int(TileType.VOID)):
+            return terrain_np, (col, row)
     terrain_np = _set_tile(terrain_np, row, col, tile, w, h)
     return terrain_np, (col, row)
 

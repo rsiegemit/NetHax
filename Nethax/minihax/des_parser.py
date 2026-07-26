@@ -1457,14 +1457,23 @@ def _resolve_pos(pos: Any, env: dict, rng_key: Any) -> Optional[Tuple[int, int]]
     None if the position can't be resolved at emit time (e.g. random,
     rndcoord without bounds).  The LevelGenerator is expected to accept
     these and pick at generation time.
+
+    des positions in a MAP-block level are MAP-relative; ``env`` carries the
+    ``_map_xstart``/``_map_ystart`` internal origin (from the GEOMETRY header)
+    so concrete coords are translated to internal terrain coords, matching
+    vendor ``get_location_coord`` (sp_lev.c:4785-4786).
     """
+    xoff = int(env.get("_map_xstart", 0))
+    yoff = int(env.get("_map_ystart", 0))
     if isinstance(pos, Coord):
-        return _xy_to_rc(pos.x, pos.y)
+        r, c = _xy_to_rc(pos.x, pos.y)
+        return (r + yoff, c + xoff)
     if isinstance(pos, Rect):
         # Use centre as best-effort fallback.
         cx = (pos.x1 + pos.x2) // 2
         cy = (pos.y1 + pos.y2) // 2
-        return _xy_to_rc(cx, cy)
+        r, c = _xy_to_rc(cx, cy)
+        return (r + yoff, c + xoff)
     if isinstance(pos, VarRef):
         val = env.get(pos.name)
         if isinstance(val, ListExpr):
@@ -1504,12 +1513,24 @@ def _emit_stmt(lg: Any, stmt: Any, env: dict, rng_state: dict) -> None:
     rnd = rng_state["rand"]
 
     if isinstance(stmt, Region):
+        xoff = int(env.get("_map_xstart", 0))
+        yoff = int(env.get("_map_ystart", 0))
         if _has(lg, "add_region"):
             lg.add_region(
-                row=stmt.rect.y1, col=stmt.rect.x1,
+                row=stmt.rect.y1 + yoff, col=stmt.rect.x1 + xoff,
                 height=stmt.rect.y2 - stmt.rect.y1 + 1,
                 width=stmt.rect.x2 - stmt.rect.x1 + 1,
                 lit=stmt.lit, name=stmt.name,
+            )
+        # A REGION with the ``lit`` flag lights only its own sub-rect; the
+        # rest of the level stays dark (vendor per-region lighting).  Record
+        # the lit rect (in internal terrain coords) so the LG seeds FoV with a
+        # per-region lit_mask instead of a single global default_lit.
+        if stmt.lit and _has(lg, "add_lit_region"):
+            lg.add_lit_region(
+                row=stmt.rect.y1 + yoff, col=stmt.rect.x1 + xoff,
+                height=stmt.rect.y2 - stmt.rect.y1 + 1,
+                width=stmt.rect.x2 - stmt.rect.x1 + 1,
             )
         env.setdefault("_regions", {})[stmt.name] = stmt.rect
         return
@@ -1591,6 +1612,20 @@ def _emit_stmt(lg: Any, stmt: Any, env: dict, rng_state: dict) -> None:
             lg.set_branch(
                 src_rect=stmt.src, dst_rect=stmt.dst,
             )
+        # The hero enters the level on the branch's source cell (vendor
+        # ``place_branch`` + ``u_on_upstairs``): the up-branch back to the
+        # parent level is where the player spawns.  Place the player at the
+        # ``src`` rect origin (MAP-relative) translated to internal coords, so
+        # a des without an explicit STAIR-up player start still spawns the hero
+        # at the correct cell.  Only set if no explicit start_pos was emitted.
+        src = stmt.src
+        if isinstance(src, Rect) and _has(lg, "set_start_pos"):
+            xoff = int(env.get("_map_xstart", 0))
+            yoff = int(env.get("_map_ystart", 0))
+            if not env.get("_start_pos_set"):
+                # set_start_pos takes internal (col, row).
+                lg.set_start_pos(src.x1 + xoff, src.y1 + yoff)
+                env["_start_pos_set"] = True
         return
 
     if isinstance(stmt, Terrain):
@@ -1719,20 +1754,86 @@ def _has(obj: Any, attr: str) -> bool:
     return hasattr(obj, attr) and callable(getattr(obj, attr))
 
 
-def _emit_map_block(lg: Any, mb: MapBlock) -> None:
-    """Emit a MAP block: tile-by-tile fill_terrain calls."""
+def _compute_map_geometry(
+    geometry: Optional[Tuple[Any, ...]],
+    init_map_present: bool,
+    map_w: int,
+    map_h: int,
+) -> Tuple[int, int]:
+    """Compute the internal ``(xstart, ystart)`` origin where a vendor MAP
+    block is stamped, mirroring ``vendor/nethack/src/sp_lev.c::lspo_map``.
+
+    ``geometry`` is the ``GEOMETRY`` header's ``(halign, valign)`` pair
+    (e.g. ``("left", "top")`` / ``("center", "center")``).  ``init_map_present``
+    is ``True`` when an ``INIT_MAP`` header preceded the MAP (vendor
+    ``splev_init_present``), which changes the ``left`` xstart from 3 to 1.
+
+    Returns internal terrain coords ``(xstart_col, ystart_row)``.  The obs
+    column is one less than the internal col due to NLE's column-0 crop
+    (see ``Nethax/nethax/obs/nle_obs.py``); callers store internal coords.
+
+    Matches the ``x_maze_max=78`` / ``y_maze_max=20`` constants already used by
+    ``Nethax/minihax/envs/canonical.py::_vendor_geometry_center`` so the des
+    path and the Room builders agree on the CENTER origin.
+    """
+    x_maze_max = 78  # COLNO - 1 (matches canonical._vendor_geometry_center)
+    y_maze_max = 20  # ROWNO - 1
+    halign = str(geometry[0]).lower() if geometry and len(geometry) >= 1 else "center"
+    valign = str(geometry[1]).lower() if geometry and len(geometry) >= 2 else "center"
+
+    if halign == "left":
+        xstart = 1 if init_map_present else 3
+    elif halign in ("half-left", "halfleft"):
+        xstart = 2 + ((x_maze_max - 2 - map_w) // 4)
+    elif halign == "center":
+        xstart = 2 + ((x_maze_max - 2 - map_w) // 2)
+    elif halign in ("half-right", "halfright"):
+        xstart = 2 + ((x_maze_max - 2 - map_w) * 3 // 4)
+    elif halign == "right":
+        xstart = x_maze_max - map_w - 1
+    else:
+        xstart = 2 + ((x_maze_max - 2 - map_w) // 2)
+
+    if valign == "top":
+        ystart = 3
+    elif valign == "center":
+        ystart = 2 + ((y_maze_max - 2 - map_h) // 2)
+    elif valign == "bottom":
+        ystart = y_maze_max - map_h - 1
+    else:
+        ystart = 2 + ((y_maze_max - 2 - map_h) // 2)
+
+    # Vendor forces odd xstart/ystart (sp_lev.c:6221-6224).
+    if xstart % 2 == 0:
+        xstart += 1
+    if ystart % 2 == 0:
+        ystart += 1
+    return int(xstart), int(ystart)
+
+
+def _emit_map_block(
+    lg: Any, mb: MapBlock, xstart: int = 0, ystart: int = 0,
+) -> None:
+    """Emit a MAP block: tile-by-tile fill_terrain calls.
+
+    ``xstart``/``ystart`` are the internal terrain origin computed from the
+    ``GEOMETRY`` header (see :func:`_compute_map_geometry`); the grid is
+    stamped starting there.
+    """
     if mb is None or not _has(lg, "set_map") and not _has(lg, "fill_terrain"):
         return
     rows = mb.grid.split("\n")
     # MiniHack pads rows with spaces; some files have trailing blanks.
     if _has(lg, "set_map"):
-        lg.set_map(rows)
+        lg.set_map(rows, xstart=xstart, ystart=ystart)
         return
     for y, line in enumerate(rows):
         for x, ch in enumerate(line):
             if ch == " ":
                 continue
-            lg.fill_terrain(row=y, col=x, height=1, width=1, glyph=ch)
+            lg.fill_terrain(
+                row=y + ystart, col=x + xstart, height=1, width=1, glyph=ch,
+            )
 
 
 def compile_des(ast: DesAST) -> Callable[..., None]:
@@ -1784,13 +1885,19 @@ def compile_des(ast: DesAST) -> Callable[..., None]:
         rng_state = {"rand": _random.Random(seed)}
         env: dict = {}
         # Apply headers first.
+        geometry: Optional[Tuple[Any, ...]] = None
+        init_map_present = False
         for hdr in ast.headers:
             if hdr.kind == "FLAGS" and _has(lg, "set_flags"):
                 lg.set_flags(hdr.args)
-            elif hdr.kind == "GEOMETRY" and _has(lg, "set_geometry"):
-                lg.set_geometry(hdr.args)
-            elif hdr.kind == "INIT_MAP" and _has(lg, "init_map"):
-                lg.init_map(hdr.args)
+            elif hdr.kind == "GEOMETRY":
+                geometry = hdr.args
+                if _has(lg, "set_geometry"):
+                    lg.set_geometry(hdr.args)
+            elif hdr.kind == "INIT_MAP":
+                init_map_present = True
+                if _has(lg, "init_map"):
+                    lg.init_map(hdr.args)
             elif hdr.kind == "MESSAGE" and _has(lg, "set_message"):
                 lg.set_message(hdr.args[0] if hdr.args else "")
             elif hdr.kind == "MAZE" and _has(lg, "set_maze_name"):
@@ -1798,8 +1905,25 @@ def compile_des(ast: DesAST) -> Callable[..., None]:
             elif hdr.kind == "LEVEL" and _has(lg, "set_level_name"):
                 lg.set_level_name(hdr.args[0] if hdr.args else "")
 
+        # Compute the internal MAP origin from GEOMETRY + INIT_MAP presence,
+        # matching vendor spo_map.  A GEOMETRY header only takes effect when a
+        # MAP block is present; when neither is set the offset stays (0, 0) so
+        # legacy MAP-less des files (and callers with no GEOMETRY) are
+        # unchanged.
+        xstart = ystart = 0
+        if ast.map_block is not None and geometry is not None:
+            _rows = ast.map_block.grid.split("\n")
+            _map_h = len(_rows)
+            _map_w = max((len(r) for r in _rows), default=0)
+            xstart, ystart = _compute_map_geometry(
+                geometry, init_map_present, _map_w, _map_h,
+            )
+        # Stash for BRANCH/REGION resolution (des MAP-relative -> internal).
+        env["_map_xstart"] = xstart
+        env["_map_ystart"] = ystart
+
         if ast.map_block is not None:
-            _emit_map_block(lg, ast.map_block)
+            _emit_map_block(lg, ast.map_block, xstart, ystart)
 
         for stmt in ast.statements:
             _emit_stmt(lg, stmt, env, rng_state)
@@ -1888,9 +2012,15 @@ class _MockLevelGenerator:
     def _rec(self, name: str, args: tuple, kwargs: dict) -> Any:
         self.calls.append((name, args, kwargs))
 
-    def set_map(self, rows: List[str]) -> None:
+    def set_map(self, rows: List[str], xstart: int = 0, ystart: int = 0) -> None:
         self.map_rows = list(rows)
-        self._rec("set_map", (rows,), {})
+        self._rec("set_map", (rows,), {"xstart": xstart, "ystart": ystart})
+
+    def add_lit_region(self, **kwargs: Any) -> None:
+        self._rec("add_lit_region", (), kwargs)
+
+    def set_start_pos(self, x: int, y: int) -> None:
+        self._rec("set_start_pos", (x, y), {})
 
     def fill_terrain(self, **kwargs: Any) -> None:
         self._rec("fill_terrain", (), kwargs)
@@ -2001,17 +2131,25 @@ class _RealLGAdapter:
             return None, None
         return int(col), int(row)
 
-    def set_map(self, rows: List[str]) -> None:
+    def set_map(self, rows: List[str], xstart: int = 0, ystart: int = 0) -> None:
         # Prefer the real LG's authoritative MAP ingestion (added so the des
         # path stamps a correctly-bounded level instead of leaking open
         # FLOOR).  Source: vendor des ``MAP ... ENDMAP`` blocks.  Fall back to
         # per-cell fill_terrain only if the inner LG predates set_map.
-        self._rec("set_map", (rows,), {})
+        # ``xstart``/``ystart`` are the internal terrain origin from GEOMETRY.
+        self._rec("set_map", (rows,), {"xstart": xstart, "ystart": ystart})
         inner = self._inner
         if _has(inner, "set_map"):
             try:
-                inner.set_map(rows)
+                inner.set_map(rows, xstart=xstart, ystart=ystart)
                 return
+            except TypeError:
+                # Inner LG predates the xstart/ystart kwargs.
+                try:
+                    inner.set_map(rows)
+                    return
+                except Exception:
+                    pass
             except Exception:
                 pass
         if not _has(inner, "fill_terrain"):
@@ -2022,9 +2160,39 @@ class _RealLGAdapter:
                 if ch == " ":
                     continue
                 try:
-                    inner.fill_terrain(ch, x, y, x, y)
+                    inner.fill_terrain(
+                        ch, x + xstart, y + ystart, x + xstart, y + ystart,
+                    )
                 except Exception:
                     pass  # unknown glyph — leave default fill
+
+    def add_lit_region(self, **kwargs: Any) -> None:
+        self._rec("add_lit_region", (), kwargs)
+        inner = self._inner
+        if not _has(inner, "add_lit_region"):
+            return
+        row = kwargs.get("row")
+        col = kwargs.get("col")
+        height = kwargs.get("height", 1)
+        width = kwargs.get("width", 1)
+        if row is None or col is None:
+            return
+        try:
+            inner.add_lit_region(
+                row=int(row), col=int(col),
+                height=int(height), width=int(width),
+            )
+        except Exception:
+            pass
+
+    def set_start_pos(self, x: int, y: int) -> None:
+        self._rec("set_start_pos", (x, y), {})
+        inner = self._inner
+        if _has(inner, "set_start_pos"):
+            try:
+                inner.set_start_pos(int(x), int(y))
+            except Exception:
+                pass
 
     def fill_terrain(self, **kwargs: Any) -> None:
         self._rec("fill_terrain", (), kwargs)
