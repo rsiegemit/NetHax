@@ -2239,11 +2239,19 @@ def _build_wall_angle_table():
     tbl[S | W]          = S_trcorn                   # top-right of room
     tbl[N | E]          = S_blcorn                   # bottom-left of room
     tbl[N | W]          = S_brcorn                   # bottom-right of room
-    # Three-neighbour T-junctions: name reflects the OPEN direction.
-    tbl[N | S | E]      = S_tlwall                   # only W is open
-    tbl[N | S | W]      = S_trwall                   # only E is open
-    tbl[N | E | W]      = S_tdwall                   # only S is open (T points down)
-    tbl[S | E | W]      = S_tuwall                   # only N is open (T points up)
+    # Three-neighbour T-junctions.  Vendor mkmaze.c::fix_wall_spines
+    # spine_array (bits = N<<3 | S<<2 | E<<1 | W) is authoritative: the T-wall
+    # name is the vendor typ, NOT the "open" direction.  Mapping:
+    #   walls N+S+E (W open) -> TRWALL   (spine_array[N|S|E]=TRWALL)
+    #   walls N+S+W (E open) -> TLWALL   (spine_array[N|S|W]=TLWALL)
+    #   walls N+E+W (S open) -> TUWALL   (spine_array[N|E|W]=TUWALL)
+    #   walls S+E+W (N open) -> TDWALL   (spine_array[S|E|W]=TDWALL)
+    # The previous entries had all four swapped (TL<->TR, TU<->TD), which
+    # mispicked at multi-room / maze junctions (e.g. Sokoban).
+    tbl[N | S | E]      = S_trwall                   # W open  -> TRWALL
+    tbl[N | S | W]      = S_tlwall                   # E open  -> TLWALL
+    tbl[N | E | W]      = S_tuwall                   # S open  -> TUWALL
+    tbl[S | E | W]      = S_tdwall                   # N open  -> TDWALL
     # Four-neighbour cross
     tbl[N | S | E | W]  = S_crwall
     return jnp.array(tbl, dtype=jnp.int16)
