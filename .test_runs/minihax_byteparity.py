@@ -109,8 +109,12 @@ def _env_id_to_vendor_cls(env_id: str):
     from minihack.envs import hidenseek as _hns_mod
     from minihack.envs import fightcorridor as _fc_mod
     from minihack.envs import mazewalk as _mw_mod
+    from minihack.envs import corridor as _corr_mod
 
     table = {
+        "MiniHack-Corridor-R2-v0":         _corr_mod.MiniHackCorridor2,
+        "MiniHack-Corridor-R3-v0":         _corr_mod.MiniHackCorridor3,
+        "MiniHack-Corridor-R5-v0":         _corr_mod.MiniHackCorridor5,
         "MiniHack-Eat-v0":                 _skills_mod.MiniHackEat,
         "MiniHack-Pray-v0":                _skills_mod.MiniHackPray,
         "MiniHack-Wield-v0":               _skills_mod.MiniHackWield,

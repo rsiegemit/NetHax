@@ -2383,6 +2383,46 @@ def build_glyphs(env_state, fast: bool = False) -> jnp.ndarray:
     # body at lines 3512-3700) and set_wall_state / xy_set_wall_state.
     cmap_idx = _apply_wall_angle(display_terrain, cmap_idx)
 
+    # Lit-corridor pass — vendor renders a CORR tile as S_litcorr instead of
+    # S_corr when the cell is lit-and-seen, i.e. ``waslit``.  Cite:
+    # vendor/nethack/src/display.c::back_to_glyph line 2302
+    #   ``case CORR: idx = (ptr->waslit || flags.lit_corridor) ? S_litcorr
+    #                                                          : S_corr;``
+    # (``flags.lit_corridor`` defaults Off — vendor/nethack/include/optlist.h
+    # :417 ``Term_False`` — so the effective gate is ``waslit``, and
+    # ``lev->waslit = (lev->lit != 0)`` whenever the hero sees the cell,
+    # vendor/nethack/src/display.c:967).  ``_TILE_TO_CMAP`` maps CORRIDOR to
+    # the dark ``S_corr`` unconditionally (mirroring back_to_glyph's default),
+    # so we upgrade lit corridors here.
+    #
+    # Lit signal, ORed:
+    #   1. ``features.lit`` — the persisted per-tile ``lev->lit`` grid stamped
+    #      at generation time in the full dungeon path (rooms.py) — the exact
+    #      analog of vendor ``lev->lit``.
+    #   2. Visible-outside-torchlight — a corridor cell that is currently
+    #      ``visible`` but lies OUTSIDE the hero's own 3x3 torchlight ring
+    #      (Chebyshev > 1) can only be seen because its region is lit (vendor
+    #      vision_recalc only marks unlit cells IN_SIGHT within the hero's
+    #      light radius, vendor/nethack/src/vision.c:320-335).  A dark corridor
+    #      at/adjacent to the hero (within the 3x3) is seen by torchlight with
+    #      ``lev->lit == 0`` → still ``S_corr``, so the Chebyshev>1 gate
+    #      excludes it.  This recovers the region-lit signal for level-gen
+    #      paths that light a des-region without stamping ``features.lit``
+    #      (e.g. MiniHack ``REGION:...,lit,...``).
+    from Nethax.nethax.dungeon.branches import MAX_LEVELS_PER_BRANCH
+    _flat_lv = branch * jnp.int32(MAX_LEVELS_PER_BRANCH) + level_idx
+    _cell_lit = env_state.features.lit[_flat_lv][:21, 1:80]               # bool[21,79]
+    _pr = jnp.int32(env_state.player_pos[0])
+    _pc = jnp.int32(env_state.player_pos[1]) - jnp.int32(1)               # obs-col space
+    _rows_g = jnp.arange(21, dtype=jnp.int32)[:, None]
+    _cols_g = jnp.arange(79, dtype=jnp.int32)[None, :]
+    _within_torch = (jnp.abs(_rows_g - _pr) <= jnp.int32(1)) & \
+                    (jnp.abs(_cols_g - _pc) <= jnp.int32(1))
+    _corr_lit = _cell_lit | (visible & (~_within_torch))
+    _is_corr_cell = (cmap_idx == jnp.int16(_S_corr))
+    cmap_idx = jnp.where(_is_corr_cell & _corr_lit,
+                         jnp.int16(_S_litcorr), cmap_idx)
+
     # Terrain glyph IDs
     terrain_glyphs = (cmap_idx + jnp.int16(GLYPH_CMAP_OFF)).astype(jnp.int16)
 
