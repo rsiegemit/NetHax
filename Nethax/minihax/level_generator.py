@@ -62,13 +62,12 @@ TERRAIN_CHAR_TO_TILE: dict = {
     "L": TileType.LAVA,
     "{": TileType.FOUNTAIN,
     # 'F' is the vendor MAP mapchar for IRONBARS ("Fe = iron"; cite
-    # vendor/nethack/src/nhlua.c:374 char2typ table), rendered as S_bars ('#').
-    # nethax has no IRONBARS TileType and nle_obs has no S_bars entry, so map to
-    # CORRIDOR: it shares the '#' display char (chars-array byte-match) and is
-    # the nearest existing tile.  The exact S_bars glyph needs a new TileType +
-    # nle_obs cmap entry (owned elsewhere) — one residual glyph cell remains.
+    # vendor/nethack/src/nhlua.c:374 char2typ table), rendered as S_bars ('#',
+    # glyph 2376).  TileType.IRONBARS + the nle_obs _TILE_TO_CMAP entry now
+    # produce that exact S_bars glyph (previously mapped to CORRIDOR, which
+    # shares the '#' char but renders S_corr / glyph 2380).
     # (The MONSTER 'F' lichen glyph is a separate directive, not a MAP char.)
-    "F": TileType.CORRIDOR,
+    "F": TileType.IRONBARS,
     "\\": TileType.THRONE,
     "<": TileType.STAIRCASE_UP,
     ">": TileType.STAIRCASE_DOWN,

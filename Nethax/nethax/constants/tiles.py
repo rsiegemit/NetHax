@@ -66,6 +66,17 @@ class TileType(IntEnum):
                        #            (D_NODOOR / D_BROKEN); vendor/nethack/src/
                        #            display.c::back_to_glyph (D_NODOOR ->
                        #            S_ndoor).
+    IRONBARS = 24      # Iron bars ('F' in des MAP files, "Fe = iron").  A
+                       # non-diggable metal grid: blocks movement but is
+                       # transparent.  Vendor renders it as S_bars (cmap 17,
+                       # char '#', glyph 2376), distinct from a corridor
+                       # (S_corr, char '#', glyph 2380) which merely shares the
+                       # display char.  Appended at the end of the enum so the
+                       # existing 0..23 terrain->cmap indices are untouched.
+                       # Citation: vendor/nethack/include/rm.h::IRONBARS;
+                       #            vendor/nethack/src/display.c::back_to_glyph
+                       #            (IRONBARS -> S_bars); vendor/nethack/src/
+                       #            nhlua.c char2typ 'F' -> IRONBARS.
 
 
 NUM_TILE_TYPES: int = len(TileType)

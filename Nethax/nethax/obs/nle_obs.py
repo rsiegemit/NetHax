@@ -214,6 +214,7 @@ _S_vodoor   = _cmap.S_vodoor
 _S_hcdoor   = _cmap.S_hcdoor
 _S_hodoor   = _cmap.S_hodoor
 _S_ndoor    = _cmap.S_ndoor
+_S_bars     = _cmap.S_bars     # iron bars (cmap 17, char '#', glyph 2376)
 
 # Indexed by TileType integer value; must cover indices 0..NUM_TILE_TYPES-1
 _TILE_TO_CMAP: jnp.ndarray = jnp.array([
@@ -248,6 +249,11 @@ _TILE_TO_CMAP: jnp.ndarray = jnp.array([
     _S_room,     # 21 HOLE           (prior implicit clamp value)
     _S_room,     # 22 SINK           (prior implicit clamp value)
     _S_ndoor,    # 23 DOORWAY        S_ndoor (doorless gap, char '.')
+    # Iron bars: appended at the tail so indices 0..23 above are unchanged
+    # (no existing terrain->cmap mapping shifts).  S_bars gives glyph 2376,
+    # char '#' — distinct from CORRIDOR's S_corr (glyph 2380) which merely
+    # shares the '#' display char.
+    _S_bars,     # 24 IRONBARS       S_bars (iron bars, char '#', glyph 2376)
 ], dtype=jnp.int16)
 
 # ---------------------------------------------------------------------------
