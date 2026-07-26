@@ -112,6 +112,7 @@ def _env_id_to_vendor_cls(env_id: str):
     from minihack.envs import corridor as _corr_mod
     from minihack.envs import sokoban as _soko_mod
     from minihack.envs import skills_lava as _lava_mod
+    from minihack.envs import river as _river_mod
 
     table = {
         "MiniHack-LavaCross-Levitate-Potion-Pickup-Full-v0":
@@ -138,6 +139,11 @@ def _env_id_to_vendor_cls(env_id: str):
             _lava_mod.MiniHackLC,
         "MiniHack-LavaCross-Restricted-v0":
             _lava_mod.MiniHackLCRestrictedActions,
+        "MiniHack-River-v0":               _river_mod.MiniHackRiver,
+        "MiniHack-River-Monster-v0":       _river_mod.MiniHackRiverMonster,
+        "MiniHack-River-Lava-v0":          _river_mod.MiniHackRiverLava,
+        "MiniHack-River-MonsterLava-v0":   _river_mod.MiniHackRiverMonsterLava,
+        "MiniHack-River-Narrow-v0":        _river_mod.MiniHackRiverNarrow,
         "MiniHack-Corridor-R2-v0":         _corr_mod.MiniHackCorridor2,
         "MiniHack-Corridor-R3-v0":         _corr_mod.MiniHackCorridor3,
         "MiniHack-Corridor-R5-v0":         _corr_mod.MiniHackCorridor5,

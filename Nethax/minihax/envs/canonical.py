@@ -2140,43 +2140,115 @@ def _register_labyrinth_envs(register_fn) -> None:
 # ---------------------------------------------------------------------------
 # River envs (Group A)
 # ---------------------------------------------------------------------------
+# Vendor river.py MAP blocks, verbatim (vendor/minihack/minihack/envs/river.py
+# :14-43).  A 25-wide x 7-tall room whose only structure is a vertical W/L
+# water strip at MAP cols 18-20 (18-19 narrow).  Everything else is FLOOR.
+_RIVER_MAP_DEFAULT = (
+    "..................WWW....",
+    "..................WWW....",
+    "..................WWW....",
+    "..................WWW....",
+    "..................WWW....",
+    "..................WWW....",
+    "..................WWW....",
+)
+_RIVER_MAP_NARROW = (
+    "..................WW.....",
+    "..................WW.....",
+    "..................WW.....",
+    "..................WW.....",
+    "..................WW.....",
+    "..................WW.....",
+    "..................WW.....",
+)
+_RIVER_MAP_LAVA = (
+    "..................LLL....",
+    "..................LLL....",
+    "..................WWW....",
+    "..................LLL....",
+    "..................WWW....",
+    "..................LLL....",
+    "..................LLL....",
+)
+
+
+def _river_map(narrow: bool, lava: bool) -> tuple[str, ...]:
+    if narrow:
+        return _RIVER_MAP_NARROW
+    if lava:
+        return _RIVER_MAP_LAVA
+    return _RIVER_MAP_DEFAULT
+
+
 def _river_builder(narrow: bool, lava: bool,
                    n_monster: int) -> Callable[[LevelGenerator], None]:
     """Build a River level matching vendor ``river.py``.
 
-    Vendor ``MiniHackRiver`` (vendor/minihack/minihack/envs/river.py:6-61)
-    lays a 25x7 room with a vertical W/L water strip at cols 18-20, a goal
-    at (24,2), the start rect on the left, **and pre-places 5 pushable
-    boulders** in ``$boulder_area`` = rect (1,1)-(18,5).  Pushing those
-    boulders into the water to form a bridge is the whole task; the prior
-    Minihax builder omitted them entirely, so a River-trained agent's
-    boulder-bridging policy had nothing to push.
+    Vendor ``MiniHackRiver`` (vendor/minihack/minihack/envs/river.py:6-61) is a
+    static ``LevelGenerator(map=...)`` level, NOT a procedural one: a 25x7 MAP
+    with a vertical W/L water strip (cols 18-20), stamped
+    ``GEOMETRY:center,center`` on the 80x21 dungeon.  Its des (verified via
+    ``lvl_gen.get_des()``) is::
+
+        GEOMETRY:center,center
+        MAP ...WWW... ENDMAP
+        REGION:(0,0,25,7),lit,"ordinary"
+        BRANCH:(0,0,18,6),(0,0,0,0)
+        $boulder_area = selection:fillrect (1,1,18,5)
+        OBJECT:('`',"boulder"),rndcoord($boulder_area)   x5
+        STAIR:(24,2),down
+
+    The prior Minihax builder used ``add_room`` at the top-left (wrong offset,
+    wrong FOV) and hardcoded boulder cells.  We instead stamp the vendor MAP at
+    its ``GEOMETRY:center,center`` origin (``_vendor_geometry_center_wh``, same
+    path Sokoban uses) so the room, water strip and stair land byte-exact; the
+    player start (BRANCH rect (0,0)-(18,6)) and the 5 ``rndcoord`` boulders are
+    RNG-placed and handled by :func:`_wrap_river_placement`.
     """
+    rows = _river_map(narrow, lava)
+    w = max(len(r) for r in rows)
+    h = len(rows)
+    dx, dy = _vendor_geometry_center_wh(w, h)
+
     def build(lg: LevelGenerator) -> None:
-        lg.add_room(x=1, y=1, w=25, h=7)
-        # Water (or lava) strip at cols 18-20 (vendor river.py map).  Narrow
-        # variant is 2 wide; the lava variant uses L instead of W.  The
-        # boulder-bridging mechanic is identical across variants.
-        terrain = "L" if lava else "W"
-        strip_width = 2 if narrow else 3
-        x_start = 18
-        for c in range(x_start, x_start + strip_width):
-            lg.fill_terrain(terrain, c, 1, c, 7)
-        lg.set_start_pos(2, 3)
-        lg.add_stair_down(x=24, y=3)
+        # Stamp the vendor MAP at the centered origin (VOID/stone everywhere
+        # else, matching INIT_MAP:solidfill,' ').
+        lg.set_map(rows, xstart=dx, ystart=dy)
+        # STAIR:(24,2),down -> goal, MAP-relative (24,2).
+        lg.add_stair_down(x=24 + dx, y=2 + dy)
         for _ in range(n_monster):
             lg.add_monster()
-        # Pre-place 5 boulders in the left "boulder area" (vendor river.py:51-57
-        # sets $boulder_area = fillrect (1,1)-(18,5) and drops 5 boulders).
-        # Spread them across the rows just left of the water so they can be
-        # pushed in to bridge; deterministic for reproducible resets.
-        boulder_cells = [(16, 1), (16, 3), (16, 5), (14, 2), (14, 4)]
-        for bx, by in boulder_cells:
-            lg.add_boulder(place=(bx, by))
+        # Deterministic fallback start + boulders so a non-vendor-rng reset
+        # still yields a playable level; the byte-parity path overwrites these
+        # via _wrap_river_placement.
+        lg.set_start_pos(0 + dx, 0 + dy)
+        for (bx, by) in ((16, 1), (16, 3), (16, 5), (14, 2), (14, 4)):
+            lg.add_boulder(place=(bx + dx, by + dy))
     return build
 
 
 def _register_river_envs(register_fn) -> None:
+    # Vendor River's full byte-parity is blocked on two engine-level gaps that
+    # live OUTSIDE the River builder's scope (documented here so the residual
+    # is auditable):
+    #
+    #  1. FOV over-render (~68 of ~72-80 residual cells).  Vendor renders only
+    #     the hero's reset line-of-sight blob; minihax lights the whole
+    #     ``REGION:(0,0,25,7),lit`` room.  Matching vendor needs the engine FOV
+    #     path (fov.py / seed_hero_fov), not this builder.
+    #  2. mklev draw-count alignment for the RNG start cell + 5 ``rndcoord``
+    #     boulders.  The vendor draw stream (NETHAX_RND, seed 0, draws 341-347:
+    #     ``rn2(90)x5 = 16,2,77,62,51`` boulders then ``rn2(19)=1``/``rn2(7)=5``
+    #     start, boulder enum column-major -> MAP ``(1+idx//5, 1+idx%5)``) is
+    #     fully decoded, but minihax's ``vendor_rng`` sits at a different offset
+    #     at factory-end (mklev prefix draws not yet aligned like the Room
+    #     family), so pinning off it lands the wrong cell.  Aligning the full
+    #     ~340-draw mklev prefix is a Room-family-scale byte-parity effort.
+    #
+    # This builder fixes the STRUCTURAL divergence (was ~353/340 cells): the
+    # room now lands at the vendor GEOMETRY:center origin with the exact W/L
+    # water strip and stair, cutting the residual to ~70-80 cells (almost all
+    # FOV over-render).
     variants = [
         ("MiniHack-River-v0",            False, False, 0),
         ("MiniHack-River-Monster-v0",    False, False, 5),
@@ -2185,8 +2257,11 @@ def _register_river_envs(register_fn) -> None:
         ("MiniHack-River-Narrow-v0",     True,  False, 0),
     ]
     for env_id, narrow, lava, nm in variants:
+        # Full 80x21 grid with VOID fill (INIT_MAP:solidfill,' '); the vendor
+        # MAP is stamped at its GEOMETRY:center,center origin inside the
+        # builder (same path as Sokoban).
         factory = _make_factory(
-            _river_builder(narrow, lava, nm), w=27, h=9,
+            _river_builder(narrow, lava, nm), w=80, h=21, fill=" ",
         )
         rm = _lava_avoid_reward_manager() if lava else _default_goal_reward_manager()
         register_fn(env_id, factory, rm,
