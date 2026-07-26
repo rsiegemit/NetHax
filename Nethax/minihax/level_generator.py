@@ -1101,11 +1101,16 @@ def _apply_directives(
         elif isinstance(d, _StartPosDirective):
             lg.last_player_pos = (d.x, d.y)
         elif isinstance(d, _MonsterDirective):
-            # Build the occupancy set (earlier monsters + the down-stair) so
-            # enexto places m_initgrp members on free cells like vendor.
+            # Build the occupancy set (earlier monsters only) so enexto places
+            # m_initgrp members on free cells like vendor.  Vendor goodpos()
+            # (teleport.c:25-105) rejects cells that hold an existing monster
+            # or the player, but a staircase is still `accessible()` — so the
+            # down-stair cell IS a valid enexto candidate.  Including it here
+            # wrongly dropped one candidate, shifting enexto's rn2(num_good)
+            # modulus/index and mis-placing the group member (Room-Monster
+            # seed 6: member landed at the leader's up-left diagonal instead
+            # of directly above).  Do NOT add the stair to `_occ`.
             _occ = set()
-            if _mklev_stair_cell is not None:
-                _occ.add(_mklev_stair_cell)
             import numpy as _np_occ
             _al = _np_occ.asarray(state.monster_ai.alive)
             _mp = _np_occ.asarray(state.monster_ai.pos)
