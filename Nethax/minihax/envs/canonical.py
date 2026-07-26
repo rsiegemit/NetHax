@@ -1114,6 +1114,19 @@ def _wrap_corridor_room_placement(
                     continue
                 terrain = terrain.at[0, 0, y, x].set(jnp.int8(tt))
 
+        # Render the down-staircase if it falls inside the carved hero room
+        # (nroom==2 has no reject filter so the hero CAN start in the down-stair
+        # room; nroom>2 rejects it, so the cell is off-screen there).  MiniHack
+        # keeps the down-stair visible (unlike the branch up-stair, which is
+        # never created on Dlvl-1).
+        dn = lev.dnstairs_cell
+        if dn is not None:
+            dxc, dyc = int(dn[0]), int(dn[1])
+            if lx - 1 <= dxc <= hx + 1 and ly - 1 <= dyc <= hy + 1:
+                terrain = terrain.at[0, 0, dyc, dxc].set(
+                    jnp.int8(int(_TileType.STAIRCASE_DOWN))
+                )
+
         px, py = int(hero[0]), int(hero[1])  # internal (x, y)
         state = state.replace(
             vendor_rng=sim_rng.s,
@@ -1147,7 +1160,8 @@ def _register_corridor_envs(register_fn) -> None:
             # first ROOM directive in corridor{2,3,5}.des and consumes the same
             # draws at the same offsets regardless of n_rooms, so a single
             # wrapper serves all three variants.
-            base = _make_factory(_corridor_empty_builder(), w=80, h=21)
+            base = _make_factory(_corridor_empty_builder(), w=80, h=21,
+                                  fill=" ")
             factory = _wrap_corridor_room_placement(base, n_rooms)
         else:
             fallback = _make_factory(_corridor_builder(n_rooms), w=76, h=21)

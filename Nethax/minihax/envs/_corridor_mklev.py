@@ -56,6 +56,7 @@ class Level:
         self.doors = []
         self.upstairs_room = None
         self.dnstairs_room = None
+        self.dnstairs_cell = None
 
 
 # ---------------- rect pool (faithful rect.c) ----------------
@@ -252,6 +253,7 @@ def spo_stair(lev, croom, up, rng):
         return
     else:
         lev.dnstairs_room = croom
+        lev.dnstairs_cell = (x, y)
         # place down stair (mark a non-room typ so it doesn't affect corridors much)
         # keep typ ROOM for simplicity; stair is stripped by minihack anyway.
 
