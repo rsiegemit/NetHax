@@ -2439,6 +2439,28 @@ def build_glyphs(env_state, fast: bool = False) -> jnp.ndarray:
     stone_glyph_val = jnp.int16(GLYPH_CMAP_OFF + _S_stone)               # 2359
     glyphs = jnp.where(explored, terrain_glyphs, stone_glyph_val)
 
+    # Trap overlay (vendor order: terrain → TRAP → object → monster → player;
+    # vendor/nethack/src/display.c::map_location / newsym).  Vendor renders a
+    # trap glyph via ``trap_to_glyph(trap) = cmap_to_glyph(trap_to_defsym(ttyp))``
+    # (vendor/nethack/include/display.h:631) where
+    # ``trap_to_defsym(t) = S_arrow_trap + t - 1`` (vendor/nethack/include/rm.h:497).
+    # So a trap of TrapType ``t`` (1..25) renders at cmap ``S_arrow_trap + t - 1``
+    # and glyph ``GLYPH_CMAP_OFF + S_arrow_trap + t - 1`` — e.g. PIT(11) → cmap 52
+    # (S_pit) → glyph 2411.  Vendor only shows the trap once the hero knows it
+    # (``trap->tseen``); hidden/undiscovered traps render as the terrain below.
+    # Gate: trap present (trap_type != 0) AND revealed (traps.revealed, the
+    # per-cell tseen flag set on discovery) AND the cell is currently visible.
+    # This keeps hidden-trap cells (e.g. Room-Trap, revealed=False) untouched.
+    max_lv = jnp.int32(env_state.terrain.shape[1])
+    flat_lv = branch * max_lv + level_idx
+    trap_type_lv = env_state.traps.trap_type[flat_lv, :21, 1:80]          # int8[21,79]
+    trap_revealed_lv = env_state.traps.revealed[flat_lv, :21, 1:80]       # bool[21,79]
+    trap_present = (trap_type_lv != jnp.int8(0)) & trap_revealed_lv & visible
+    trap_cmap = (trap_type_lv.astype(jnp.int32)
+                 + jnp.int32(_cmap.S_arrow_trap) - jnp.int32(1))          # int32[21,79]
+    trap_glyphs = (trap_cmap + jnp.int32(GLYPH_CMAP_OFF)).astype(jnp.int16)
+    glyphs = jnp.where(trap_present, trap_glyphs, glyphs)
+
     # Overlay ground objects on visible cells (vendor order: terrain → trap →
     # object → monster → player; vendor/nethack/src/display.c::map_location
     # lines 350-430).  Nethax's ground_items stack has slot 0 = TOP of pile
