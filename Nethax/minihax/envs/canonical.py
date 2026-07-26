@@ -1003,6 +1003,7 @@ def _corridor_empty_builder() -> Callable[[LevelGenerator], None]:
 
 def _wrap_corridor_room_placement(
     factory: Callable[[jax.Array], "EnvState"],
+    n_rooms: int,
 ) -> Callable[[jax.Array], "EnvState"]:
     """Carve the agent's starting room for a MiniHack-Corridor level by
     replaying vendor NetHack's ``create_room`` (fully-random branch) off
@@ -1041,123 +1042,98 @@ def _wrap_corridor_room_placement(
     body) advance ``state.vendor_rng`` off-screen; we do NOT need to model the
     far rooms/corridor cells because they are never in the reset observation.
     """
-    from Nethax.nethax import vendor_rng as _vendor_rng
     from Nethax.nethax.constants.tiles import TileType as _TileType
+    from Nethax.nethax.subsystems.features import DoorState as _DoorState
     from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    from Nethax.minihax.envs._corridor_mklev import simulate as _corr_simulate
 
-    COLNO = 80
-    ROWNO = 21
-    XLIM = 4
-    YLIM = 3
+    # Sentinel typ codes used by the mklev engine (rm.typ analogues).
+    _ROOM_T, _CORR_T, _DOOR_T, _SCORR_T, _SDOOR_T = 100, 101, 102, 103, 104
+    _VWALL, _HWALL = 1, 2
+    _CORNERS = (110, 111, 112, 113)
 
     def wrapped(rng: jax.Array):
         state = factory(rng)
-        vrng = state.vendor_rng
+        # Replay the FULL vendor N-room mklev off state.vendor_rng: rect pool +
+        # create_room x nroom + STAIRs + makecorridors + find_branch_room.  The
+        # hero lands in the find_branch_room-selected room (NOT always ROOM 1;
+        # for nroom>2 the down-stair room is rejected).  MiniHack strips stairs
+        # and shows only the hero's lit room via FOV, so we carve the hero
+        # room's rect (floor + wall ring + its doors) from the engine's grid.
+        lev, hero_room, hero, sim_rng = _corr_simulate(state.vendor_rng,
+                                                       int(n_rooms))
 
-        # --- mklev prologue: two setup draws before the des ROOM directives
-        # (RND trace offsets 339-340: rn2(3), rn2(2)).  Values unused here;
-        # we only need to advance the stream so create_room lands on-offset.
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-
-        # --- ROOM 1: create_room fully-random branch (sp_lev.c:1486) --------
-        # build_room chance roll (rn2(100) < chance=100 always true).
-        vrng, _chance = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
-        # rnd_rect(): on a fresh level the whole map is one free rectangle
-        # (lx=0, ly=0, hx=COLNO-1=79, hy=ROWNO-1=20).  rnd_rect draws
-        # rn2(rect_cnt); rect_cnt==1 at this point so the draw is rn2(1)=0.
-        vrng, _r1 = _vendor_rng.rn2_jax(vrng, jnp.int32(1))
-        lx, ly, hx, hy = 0, 0, COLNO - 1, ROWNO - 1
-        # dx = 2 + rn2((hx-lx>28)?12:8); dy = 2 + rn2(4); clamp dx*dy<=50.
-        dx_mod = 12 if (hx - lx > 28) else 8
-        vrng, _dxr = _vendor_rng.rn2_jax(vrng, jnp.int32(dx_mod))
-        dx = 2 + int(_dxr)
-        vrng, _dyr = _vendor_rng.rn2_jax(vrng, jnp.int32(4))
-        dy = 2 + int(_dyr)
-        if dx * dy > 50:
-            dy = 50 // dx
-        # xborder / yborder: lx==0 so (lx>0 && hx<COLNO-1) is False → xlim+1;
-        # ly==0 so yborder = ylim+1.
-        xborder = 2 * XLIM if (lx > 0 and hx < COLNO - 1) else XLIM + 1
-        yborder = 2 * YLIM if (ly > 0 and hy < ROWNO - 1) else YLIM + 1
-        # xabs = lx + (lx>0?xlim:3) + rn2(hx-(lx>0?lx:3)-dx-xborder+1)
-        x_span = hx - (lx if lx > 0 else 3) - dx - xborder + 1
-        vrng, _xr = _vendor_rng.rn2_jax(vrng, jnp.int32(x_span))
-        xabs = lx + (XLIM if lx > 0 else 3) + int(_xr)
-        # yabs = ly + (ly>0?ylim:2) + rn2(hy-(ly>0?ly:2)-dy-yborder+1)
-        y_span = hy - (ly if ly > 0 else 2) - dy - yborder + 1
-        vrng, _yr = _vendor_rng.rn2_jax(vrng, jnp.int32(y_span))
-        yabs = ly + (YLIM if ly > 0 else 2) + int(_yr)
-        # ly==0 top-band special (create_room:1563): svn.nroom==0 for ROOM 1.
-        if ly == 0 and hy >= ROWNO - 1 and (yabs + dy > ROWNO // 2):
-            vrng, _yr2 = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
-            yabs = int(_yr2) + 2  # rn1(3,2)
-            if dy > 1:            # svn.nroom < 4
-                dy -= 1
-        # add_room(xabs, yabs, xabs+dx, yabs+dy): interior inclusive rect.
-        # wtmp=dx+1, htmp=dy+1 → interior hi = xabs+dx, yabs+dy.
-        r_x1, r_y1 = xabs, yabs
-        r_x2, r_y2 = xabs + dx, yabs + dy
-
-        # --- STAIR:random up in ROOM 1: somex/somey off the rect -----------
-        # somex = rn1(hx-lx+1, lx) ; somey = rn1(hy-ly+1, ly).  These land the
-        # up-stair inside the room; MiniHack strips it from the obs so we only
-        # advance the stream (no terrain write).
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(r_x2 - r_x1 + 1))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(r_y2 - r_y1 + 1))
-
-        # NLE glyph column shift: internal terrain col C renders at obs col
-        # C-1.  Carve floor + walls at internal coords so the room appears one
-        # column left in the observation (matches _vendor_geometry_center).
         _FLOOR = int(_TileType.FLOOR)
         _WALL = int(_TileType.WALL)
         _CLOSED = int(_TileType.CLOSED_DOOR)
+        _OPEN = int(_TileType.OPEN_DOOR)
+        _DOORWAY = int(_TileType.DOORWAY)
+
         terrain = state.terrain
-        # Floor interior.
-        fh = r_y2 - r_y1 + 1
-        fw = r_x2 - r_x1 + 1
-        terrain = terrain.at[0, 0, r_y1:r_y2 + 1, r_x1:r_x2 + 1].set(
-            jnp.full((fh, fw), jnp.int8(_FLOOR))
-        )
-        # Wall surround (1-cell ring).
-        wy1, wy2 = r_y1 - 1, r_y2 + 1
-        wx1, wx2 = r_x1 - 1, r_x2 + 1
-        terrain = terrain.at[0, 0, wy1, wx1:wx2 + 1].set(jnp.int8(_WALL))
-        terrain = terrain.at[0, 0, wy2, wx1:wx2 + 1].set(jnp.int8(_WALL))
-        terrain = terrain.at[0, 0, wy1:wy2 + 1, wx1].set(jnp.int8(_WALL))
-        terrain = terrain.at[0, 0, wy1:wy2 + 1, wx2].set(jnp.int8(_WALL))
+        ds = state.features.door_state
+        typ = lev.typ
+        dm = lev.doormask
+        lx, ly = int(hero_room["lx"]), int(hero_room["ly"])
+        hx, hy = int(hero_room["hx"]), int(hero_room["hy"])
 
-        # --- RANDOM_CORRIDORS: join(0,1) exit door on ROOM 1 --------------
-        # finddpos(cc, room 0) picks the door cell on ROOM 1's exit wall.  For
-        # R2 the corridor runs left/down toward ROOM 2 so the door sits on the
-        # WEST wall: finddpos draws rn1(hx-lx+1==1 span, lx) → x = wall col,
-        # rn1(hy-ly+1, ly) → y in [r_y1..r_y2].  We consume both draws and
-        # place a CLOSED door at (west_wall_col, door_y); dodoor's rn2(8) door
-        # kind + closed/locked cascade advance the stream too.
-        west_col = r_x1 - 1
-        vrng, _ddx = _vendor_rng.rn2_jax(vrng, jnp.int32(1))
-        vrng, _ddy = _vendor_rng.rn2_jax(vrng, jnp.int32(r_y2 - r_y1 + 1))
-        door_y = r_y1 + int(_ddy)
-        terrain = terrain.at[0, 0, door_y, west_col].set(jnp.int8(_CLOSED))
+        # Carve the hero room bounding box (interior + 1-cell wall ring) by
+        # mapping the engine's sentinel typ codes onto Nethax TileTypes.  NLE
+        # glyph column shift (obs col = internal col - 1) is applied downstream
+        # by build_glyphs, so we write at internal [y, x].
+        for x in range(lx - 1, hx + 2):
+            if not (0 <= x < 80):
+                continue
+            for y in range(ly - 1, hy + 2):
+                if not (0 <= y < 21):
+                    continue
+                t = int(typ[x][y])
+                if t == 0 or t == _SCORR_T:
+                    continue
+                if t == _ROOM_T or t == _CORR_T:
+                    tt = _FLOOR
+                elif t == _VWALL or t == _HWALL or t in _CORNERS or t == _SDOOR_T:
+                    tt = _WALL
+                elif t == _DOOR_T:
+                    # Engine doormask sentinels: 0=NODOOR, 1=ISOPEN, 2=CLOSED,
+                    # 4=LOCKED (dosdoor, _corridor_mklev).
+                    mask = int(dm[x][y])
+                    if mask == 0:            # D_NODOOR: doorless doorway
+                        tt = _DOORWAY
+                        dstate = int(_DoorState.GONE)
+                    elif mask == 1:          # ISOPEN
+                        tt = _OPEN
+                        dstate = int(_DoorState.OPEN)
+                    elif mask == 4:          # LOCKED
+                        tt = _CLOSED
+                        dstate = int(_DoorState.LOCKED)
+                    else:                    # CLOSED
+                        tt = _CLOSED
+                        dstate = int(_DoorState.CLOSED)
+                    ds = ds.at[0, y, x].set(jnp.int32(dstate))
+                else:
+                    continue
+                terrain = terrain.at[0, 0, y, x].set(jnp.int8(tt))
 
-        # --- player placement: vendor puts the hero in ROOM 1.  The observed
-        # start cell (obs agent_yx) is the west interior column, bottom row of
-        # the room rect: internal (r_x1, r_y2).  Pin player_pos there.
-        acc_x = jnp.int32(r_x1)
-        acc_y = jnp.int32(r_y2)
+        # Render the down-staircase if it falls inside the carved hero room
+        # (nroom==2 has no reject filter so the hero CAN start in the down-stair
+        # room; nroom>2 rejects it, so the cell is off-screen there).  MiniHack
+        # keeps the down-stair visible (unlike the branch up-stair, which is
+        # never created on Dlvl-1).
+        dn = lev.dnstairs_cell
+        if dn is not None:
+            dxc, dyc = int(dn[0]), int(dn[1])
+            if lx - 1 <= dxc <= hx + 1 and ly - 1 <= dyc <= hy + 1:
+                terrain = terrain.at[0, 0, dyc, dxc].set(
+                    jnp.int8(int(_TileType.STAIRCASE_DOWN))
+                )
 
-        # Persist door open/closed status (CLOSED) into features.door_state.
-        from Nethax.nethax.subsystems.features import DoorState as _DoorState
-        ds = state.features.door_state.at[0, door_y, west_col].set(
-            jnp.int32(int(_DoorState.CLOSED))
-        )
-
+        px, py = int(hero[0]), int(hero[1])  # internal (x, y)
         state = state.replace(
-            vendor_rng=vrng,
+            vendor_rng=sim_rng.s,
             terrain=terrain,
             features=state.features.replace(door_state=ds),
             player_pos=jnp.stack(
-                [acc_y.astype(jnp.int16), acc_x.astype(jnp.int16)]
+                [jnp.int16(py), jnp.int16(px)]
             ),
         )
         return _seed_hero_fov(state, True)
@@ -1184,8 +1160,9 @@ def _register_corridor_envs(register_fn) -> None:
             # first ROOM directive in corridor{2,3,5}.des and consumes the same
             # draws at the same offsets regardless of n_rooms, so a single
             # wrapper serves all three variants.
-            base = _make_factory(_corridor_empty_builder(), w=80, h=21)
-            factory = _wrap_corridor_room_placement(base)
+            base = _make_factory(_corridor_empty_builder(), w=80, h=21,
+                                  fill=" ")
+            factory = _wrap_corridor_room_placement(base, n_rooms)
         else:
             fallback = _make_factory(_corridor_builder(n_rooms), w=76, h=21)
             factory = _des_factory(des_name, fallback=fallback)
