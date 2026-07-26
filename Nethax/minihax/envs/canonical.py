@@ -1558,39 +1558,143 @@ def _register_simplecrossing_envs(register_fn) -> None:
 # ---------------------------------------------------------------------------
 # Sokoban envs (Group A)
 # ---------------------------------------------------------------------------
-def _sokoban_builder(level: int, variant: str) -> Callable[[LevelGenerator], None]:
-    """Build a small Sokoban-style level with boulders + fountains.
+import re as _re
 
-    Wave 4 simplification: hand-coded compact layouts, ``level``/``variant``
-    parametrise the placement.
+
+def _parse_sokoban_des(src: str) -> dict:
+    """Parse a minihack ``soko*.des`` into MAP + placement directives.
+
+    Every vendor MiniHack ``soko<N><a|b>.des`` is a *static* single-``MAZE``
+    level: a literal ``MAP ... ENDMAP`` block placed ``GEOMETRY:center,center``
+    on the 80×21 dungeon plus fixed ``OBJECT`` (boulders), ``TRAP`` (pit/hole),
+    ``DOOR`` and ``BRANCH``/``STAIR`` directives.  Coordinates in the des are
+    MAP-relative ``(col, row)``.  We return them verbatim; the builder applies
+    the ``GEOMETRY:center,center`` offset (see ``_vendor_geometry_center_wh``).
+
+    ``soko4a``/``soko4b`` additionally carry ``$place = {..}`` / ``SHUFFLE`` and
+    a ``STAIR:$place[0],down`` whose cell is one of three shuffled candidates;
+    the shuffle order is RNG-driven, so those are handled by the caller.
     """
+    map_rows: list[str] = []
+    boulders: list[tuple[int, int]] = []
+    traps: list[tuple[str, int, int]] = []
+    doors: list[tuple[str, int, int]] = []
+    branch: tuple[int, int] | None = None
+    stair_down: tuple[int, int] | None = None
+    stair_is_shuffle = False
+    shuffle_place: list[tuple[int, int]] = []
+
+    in_map = False
+    for line in src.splitlines():
+        if line.startswith("MAP"):
+            in_map = True
+            continue
+        if line.startswith("ENDMAP"):
+            in_map = False
+            continue
+        if in_map:
+            map_rows.append(line)
+            continue
+
+        s = line.strip()
+        if s.startswith("$place"):
+            for mx, my in _re.findall(r"\((\d+),(\d+)\)", s):
+                shuffle_place.append((int(mx), int(my)))
+        elif s.startswith("OBJECT:") and '"boulder"' in s:
+            m = _re.search(r"\((\d+),(\d+)\)\s*$", s)
+            if m:
+                boulders.append((int(m.group(1)), int(m.group(2))))
+        elif s.startswith("TRAP:"):
+            m = _re.search(r'TRAP:"(\w+)",\((\d+),(\d+)\)', s)
+            if m:
+                traps.append((m.group(1), int(m.group(2)), int(m.group(3))))
+        elif s.startswith("DOOR:"):
+            m = _re.search(r"DOOR:(\w+),\((\d+),(\d+)\)", s)
+            if m:
+                doors.append((m.group(1), int(m.group(2)), int(m.group(3))))
+        elif s.startswith("BRANCH:"):
+            m = _re.search(r"BRANCH:\((\d+),(\d+),", s)
+            if m:
+                branch = (int(m.group(1)), int(m.group(2)))
+        elif s.startswith("STAIR:"):
+            if "$place[0]" in s:
+                stair_is_shuffle = True
+            else:
+                m = _re.search(r"STAIR:\((\d+),(\d+)\),down", s)
+                if m:
+                    stair_down = (int(m.group(1)), int(m.group(2)))
+
+    return {
+        "map_rows": map_rows,
+        "boulders": boulders,
+        "traps": traps,
+        "doors": doors,
+        "branch": branch,
+        "stair_down": stair_down,
+        "stair_is_shuffle": stair_is_shuffle,
+        "shuffle_place": shuffle_place,
+    }
+
+
+def _sokoban_builder(des_name: str) -> Callable[[LevelGenerator], None]:
+    """Stamp a static vendor Sokoban level at its ``GEOMETRY:center,center``
+    origin on the full 80×21 grid.
+
+    The des-parser MAP stamper writes the block at terrain[0,0]; vendor NLE
+    centers it (sp_lev.c CENTER, see ``_vendor_geometry_center_wh``).  Like
+    ``corridorbattle_builder`` we therefore build the 80×21 grid ourselves,
+    stamp the MAP at the centered origin via ``set_map`` (avoids the spurious
+    auto-downstair a synthesised carve room would add), then place every
+    boulder / trap / door / stair / start at ``(map_coord + offset)``.
+    """
+    parsed = _parse_sokoban_des(_read_vendor_des(des_name))
+    map_rows = parsed["map_rows"]
+    w = max(len(r) for r in map_rows)
+    h = len(map_rows)
+    dx, dy = _vendor_geometry_center_wh(w, h)
+
+    grid: list[str] = []
+    for gy in range(21):
+        row = [" "] * 80
+        my = gy - dy
+        if 0 <= my < h:
+            for cx, ch in enumerate(map_rows[my]):
+                ax = cx + dx
+                if 0 <= ax < 80:
+                    row[ax] = ch
+        grid.append("".join(row))
+
     def build(lg: LevelGenerator) -> None:
-        lg.add_room(x=1, y=1, w=10, h=8)
-        lg.set_start_pos(2, 2)
-        lg.add_stair_down(x=9, y=7)
-        n_boulders = max(1, level)
-        for i in range(n_boulders):
-            x = 3 + (i * 2) % 6
-            y = 3 + (i // 3)
-            try:
-                lg.add_object("boulder", "`", place=(x, y))
-            except KeyError:
-                lg.add_object("random", place=(x, y))
-        # Fountains as drop targets.
-        for i in range(n_boulders):
-            fx = 5 + (i * 2) % 4
-            fy = 5
-            lg.fill_terrain("{", fx, fy, fx, fy)
+        lg.set_map(grid)
+        # Player spawns on the BRANCH cell (vendor mklev branch stair entry).
+        branch = parsed["branch"]
+        if branch is not None:
+            lg.set_start_pos(branch[0] + dx, branch[1] + dy)
+        # Down stair (goal).  For the shuffled 4a/4b variants the vendor cell
+        # is the first shuffled candidate; use candidate[0] as a stand-in.
+        if parsed["stair_down"] is not None:
+            sx, sy = parsed["stair_down"]
+            lg.add_stair_down(x=sx + dx, y=sy + dy)
+        elif parsed["stair_is_shuffle"] and parsed["shuffle_place"]:
+            sx, sy = parsed["shuffle_place"][0]
+            lg.add_stair_down(x=sx + dx, y=sy + dy)
+        for (bx, by) in parsed["boulders"]:
+            lg.add_boulder(place=(bx + dx, by + dy))
+        for (tname, tx, ty) in parsed["traps"]:
+            lg.add_trap(name=tname, place=(tx + dx, ty + dy))
+        for (state, dxi, dyi) in parsed["doors"]:
+            lg.add_door(state, place=(dxi + dx, dyi + dy))
     return build
 
 
 def _register_sokoban_envs(register_fn) -> None:
     # Every vendor MiniHack-Sokoban<N><a|b>-v0 has a matching static
     # ``soko<N><a|b>.des`` under vendor/minihack/minihack/dat/, fed via
-    #   vendor/minihack/minihack/envs/sokoban.py: des_file="soko1a.des"
-    # so we route each id through the des_parser, keeping the hand-coded
-    # LG builder as a fallback in case a directive (e.g. BRANCH) trips
-    # the compiler.
+    #   vendor/minihack/minihack/envs/sokoban.py: des_file="soko1a.des".
+    # These are FIXED des-file layouts (deterministic MAP + boulders/pits),
+    # so we stamp them directly at the GEOMETRY:center,center origin rather
+    # than routing through the des_parser (which stamps at terrain[0,0] and
+    # drops the centering, boulders, and traps).
     for env_id, level, variant in [
         ("MiniHack-Sokoban1a-v0", 1, "a"),
         ("MiniHack-Sokoban1b-v0", 1, "b"),
@@ -1601,13 +1705,57 @@ def _register_sokoban_envs(register_fn) -> None:
         ("MiniHack-Sokoban4a-v0", 4, "a"),
         ("MiniHack-Sokoban4b-v0", 4, "b"),
     ]:
-        fallback = _make_factory(
-            _sokoban_builder(level, variant), w=12, h=10,
-        )
         des_name = f"soko{level}{variant}.des"
-        factory = _des_factory(des_name, fallback=fallback)
+        base = _make_factory(
+            _sokoban_builder(des_name), w=80, h=21, fill=" ",
+        )
+        factory = _premapped_factory(base)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=400, category="Sokoban")
+
+
+def _premapped_factory(base: Callable[[jax.Array], EnvState],
+                       ) -> Callable[[jax.Array], EnvState]:
+    """Wrap a factory so the whole starting level is remembered (premapped).
+
+    Vendor Sokoban des files carry ``FLAGS:...,premapped`` (see
+    ``vendor/minihack/minihack/dat/soko1a.des``): NetHack maps the entire
+    level's terrain on entry, so the obs shows every wall / boulder / trap
+    regardless of the hero's line-of-sight.  ``seed_hero_fov`` only lights the
+    hero's LOS, so multi-room Sokoban mazes render truncated.  We mark every
+    non-VOID cell of level (branch=0, level=0) as explored + visible and copy
+    ``terrain`` into ``last_seen_terrain`` so ``build_glyphs`` renders the
+    whole map (see ``Nethax/nethax/obs/nle_obs.py::build_glyphs`` three-way
+    visibility split).
+    """
+    from Nethax.nethax.constants.tiles import TileType as _TT
+
+    def factory(rng: jax.Array) -> EnvState:
+        state = base(rng)
+        terr = state.terrain[0, 0]
+        mapped = terr != jnp.int8(int(_TT.VOID))
+        new_explored = state.explored.at[0, 0].set(
+            state.explored[0, 0] | mapped
+        )
+        new_lst = state.last_seen_terrain.at[0, 0].set(
+            jnp.where(mapped, terr.astype(jnp.int8),
+                      state.last_seen_terrain[0, 0])
+        )
+        new_visible = state.visible | mapped
+        return state.replace(
+            explored=new_explored,
+            last_seen_terrain=new_lst,
+            visible=new_visible,
+        )
+
+    return factory
+
+
+def _read_vendor_des(filename: str) -> str:
+    """Read a vendor ``.des`` under ``vendor/minihack/minihack/dat/``."""
+    with open(_vendor_des_path(filename), "r",
+              encoding="utf-8", errors="replace") as fh:
+        return fh.read()
 
 
 # ---------------------------------------------------------------------------

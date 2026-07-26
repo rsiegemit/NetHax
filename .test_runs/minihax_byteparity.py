@@ -110,11 +110,20 @@ def _env_id_to_vendor_cls(env_id: str):
     from minihack.envs import fightcorridor as _fc_mod
     from minihack.envs import mazewalk as _mw_mod
     from minihack.envs import corridor as _corr_mod
+    from minihack.envs import sokoban as _soko_mod
 
     table = {
         "MiniHack-Corridor-R2-v0":         _corr_mod.MiniHackCorridor2,
         "MiniHack-Corridor-R3-v0":         _corr_mod.MiniHackCorridor3,
         "MiniHack-Corridor-R5-v0":         _corr_mod.MiniHackCorridor5,
+        "MiniHack-Sokoban1a-v0":           _soko_mod.MiniHackSokoban1a,
+        "MiniHack-Sokoban1b-v0":           _soko_mod.MiniHackSokoban1b,
+        "MiniHack-Sokoban2a-v0":           _soko_mod.MiniHackSokoban2a,
+        "MiniHack-Sokoban2b-v0":           _soko_mod.MiniHackSokoban2b,
+        "MiniHack-Sokoban3a-v0":           _soko_mod.MiniHackSokoban3a,
+        "MiniHack-Sokoban3b-v0":           _soko_mod.MiniHackSokoban3b,
+        "MiniHack-Sokoban4a-v0":           _soko_mod.MiniHackSokoban4a,
+        "MiniHack-Sokoban4b-v0":           _soko_mod.MiniHackSokoban4b,
         "MiniHack-Eat-v0":                 _skills_mod.MiniHackEat,
         "MiniHack-Pray-v0":                _skills_mod.MiniHackPray,
         "MiniHack-Wield-v0":               _skills_mod.MiniHackWield,
