@@ -4908,46 +4908,174 @@ def _wrap_locked_door(
     return wrapped
 
 
-def _closed_door_builder(lg: LevelGenerator) -> None:
-    """Structural ClosedDoor level (closed_door.des).
+def _closeddoor_builder(room_size: int, lit: bool) -> Callable[[LevelGenerator], None]:
+    """Hand-coded ClosedDoor outer ROOM (vendor ``closed_door.des``).
 
-    NOT byte-exact.  closed_door.des is a fully *random* level built by
-    NetHack's create_room engine:
+    Structure (vendor/minihack/minihack/dat/closed_door.des) — the SAME
+    ``create_room`` machinery as KeyRoom (``key_and_door_tmp.des``), differing
+    only in that there is no ``OBJECT`` (no skeleton key) and the ROOMDOOR is
+    ``closed`` (unlocked) instead of ``locked``::
 
         ROOM: "ordinary", lit, (3,3), (center,center), (8,8) {
             SUBROOM:"ordinary", lit, random, (4,4) {
                 STAIR: random, down
                 ROOMDOOR: false, closed, random, random
+                }
             }
-        }
 
-    i.e. an 8×8 outer room (deterministically centered), a 4×4 SUBROOM placed
-    at a *random* cell inside it, a *random* down-stair inside the subroom, a
-    closed ROOMDOOR on a *random* subroom wall, plus the hero placed at a
-    *random* outer-room floor cell.  Byte-parity would require a faithful port
-    of create_room + subroom placement + roomdoor + the player somexy draws
-    (the create_room ISAAC64 stream — a separate, larger effort, cf. KeyRoom).
-
-    Here we only fix the gross un-centering symptom: the outer 8×8 room is
-    stamped at its centered origin (``_vendor_geometry_center(8)`` == internal
-    (37,7), matching vendor MiniHack-ClosedDoor observations) with a closed
-    door + subroom + stair as a playable stand-in.
+    This builder carves ONLY the outer 8×8 ROOM at its vendor
+    ``GEOMETRY:center,center`` location (:func:`_keyroom_center`, which returns
+    internal (37,7) for RS=8).  The sub-room / closed door / stair / hero-start
+    are all ISAAC64-driven in vendor mklev, so they are placed by
+    :func:`_wrap_closeddoor_placement` which consumes ``state.vendor_rng`` in
+    the exact vendor draw order.  Like :func:`_keyroom_builder` we deliberately
+    do NOT ``set_start_pos`` here (the wrapper pins the hero cell + seeds FoV).
     """
-    x0, y0 = _vendor_geometry_center(8)          # (37, 7) internal top-left
-    x1, y1 = x0 + 7, y0 + 7                       # (44, 14)
-    lg.fill_terrain(".", x0, y0, x1, y1)          # 8×8 outer room (VOID walls)
-    # 4×4 subroom in the right half: carve its walls, leave a closed door.
-    sx0, sy0 = x1 - 3, y0 + 1                     # subroom interior top-left
-    lg.fill_terrain("|", sx0 - 1, sy0 - 1, sx0 - 1, sy0 + 2)  # west wall
-    lg.add_door("closed", place=(sx0 - 1, sy0 + 1))          # closed door
-    lg.add_stair_down(x=sx0 + 1, y=sy0 + 1)      # stair inside subroom
-    lg.set_start_pos(x0, y0)                      # hero in outer room
+    x1, y1 = _keyroom_center(room_size)
+
+    def build(lg: LevelGenerator) -> None:
+        lg.add_room(x=x1, y=y1, w=room_size, h=room_size, lit=lit)
+    return build
+
+
+def _wrap_closeddoor_placement(
+    factory: Callable[[jax.Array], "EnvState"],
+    room_size: int, subroom_size: int, lit: bool,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Consume the vendor ClosedDoor mklev ISAAC64 draws off ``state.vendor_rng``
+    and stamp the sub-room, closed door, down-stair and hero start at the
+    vendor-exact cells.
+
+    This is the KeyRoom create_room replay (:func:`_wrap_keyroom_placement`,
+    validated byte-exact) with the sized-layout draw order, minus the OBJECT
+    skeleton-key ``somexy`` step (``closed_door.des`` has no OBJECT) and with a
+    CLOSED (not LOCKED) door.  Draw order (vendor sp_lev/mklev/mkroom.c):
+
+      1. ``rn2(3), rn2(2)``          mklev preamble (consumed, unused)
+      2. ``rn2(100), rn2(100)``      ``build_room`` rtype rolls (outer + sub)
+      3. ``create_subroom`` random position: ``rnd(RS-SS-1)-1`` for x then y
+         (SS fixed -> no size draw), with the vendor 1->0 / edge nudges
+      4. STAIR ``somexy`` in the sub-room: ``rn1(SS,slx), rn1(SS,sly)``
+      5. ROOMDOOR ``create_door`` do-while (:func:`_keyroom_create_door`)
+      6. hero start: ``rn2(1)`` then ``somexy`` in the outer room (rejecting the
+         sub-room bbox) -> ``player_pos``
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TT
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    import numpy as _np
+
+    x1, y1 = _keyroom_center(room_size)          # outer interior top-left (internal)
+    RS, SS = room_size, subroom_size
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+
+        def rn2(n):
+            nonlocal vrng
+            vrng, v = _vendor_rng.rn2_jax(vrng, jnp.int32(n))
+            return int(v)
+
+        # (1) preamble + (2) build_room rtype rolls (values unused).
+        rn2(3); rn2(2)
+        rn2(100); rn2(100)
+
+        # (3) sub-room position (sized): create_subroom random x/y =
+        # rnd(RS-SS-1)-1 with the vendor 1->0 / edge nudges.
+        span = RS - SS - 1
+        sub_dx = (rn2(span) + 1) - 1 if span > 0 else 0   # rnd(span)-1
+        sub_dy = (rn2(span) + 1) - 1 if span > 0 else 0
+        if sub_dx == 1:
+            sub_dx = 0
+        if sub_dy == 1:
+            sub_dy = 0
+        if sub_dx + SS + 1 == RS:
+            sub_dx += 1
+        if sub_dy + SS + 1 == RS:
+            sub_dy += 1
+        sx1 = x1 + sub_dx
+        sy1 = y1 + sub_dy
+        sx2 = sx1 + SS - 1
+        sy2 = sy1 + SS - 1
+
+        # ---- carve the sub-room walls/floor into a working terrain copy so
+        # create_door's IS_ROCK / okdoor checks see the real map -------------
+        terrain = _np.asarray(state.terrain).copy()
+        _WALL = int(_TT.WALL)
+        _FLOOR = int(_TT.FLOOR)
+        _VOID = int(_TT.VOID)
+        _CLOSED = int(_TT.CLOSED_DOOR)
+        _Hn, _Wn = terrain.shape[2], terrain.shape[3]
+        for r in range(sy1 - 1, sy2 + 2):
+            for c in range(sx1 - 1, sx2 + 2):
+                if 0 <= r < _Hn and 0 <= c < _Wn:
+                    if r < sy1 or r > sy2 or c < sx1 or c > sx2:
+                        terrain[0, 0, r, c] = _WALL
+        for r in range(sy1, sy2 + 1):
+            for c in range(sx1, sx2 + 1):
+                terrain[0, 0, r, c] = _FLOOR
+
+        # (4) STAIR somexy inside the sub-room (SS x SS).
+        stair_x = rn2(SS) + sx1
+        stair_y = rn2(SS) + sy1
+
+        # (5) ROOMDOOR create_door (random wall/pos) — CLOSED door.
+        door_x, door_y = _keyroom_create_door(
+            rn2, terrain, sx1, sy1, sx2, sy2, _WALL, _VOID,
+        )
+
+        # helper: vendor somexy rejection in the outer room — reject cells
+        # inside the sub-room bounding box (floor + its wall ring).
+        def _reject(cx, cy):
+            return (sx1 - 1 <= cx <= sx2 + 1) and (sy1 - 1 <= cy <= sy2 + 1)
+
+        # (6) hero start: rn2(1) room-pick + somexy in the outer room.
+        rn2(1)
+        px, py = x1, y1
+        for _ in range(100):
+            cx = rn2(RS) + x1
+            cy = rn2(RS) + y1
+            if not _reject(cx, cy):
+                px, py = cx, cy
+                break
+
+        # ---- stamp stair + closed door -----------------------------------
+        terrain[0, 0, stair_y, stair_x] = int(_TT.STAIRCASE_DOWN)
+        if door_x is not None:
+            terrain[0, 0, door_y, door_x] = _CLOSED
+
+        state = state.replace(
+            vendor_rng=vrng,
+            terrain=jnp.asarray(terrain, dtype=state.terrain.dtype),
+            player_pos=jnp.array([py, px], dtype=jnp.int16),
+        )
+        # Record the closed-door feature state (does not affect the reset glyph
+        # — a closed door renders '+' regardless — but keeps the open task's
+        # door gameplay intact).
+        if door_x is not None:
+            from Nethax.nethax.subsystems.features import DoorState as _DoorState
+            ds_arr = jnp.asarray(state.features.door_state)
+            ds_arr = ds_arr.at[0, door_y, door_x].set(
+                jnp.int8(int(_DoorState.CLOSED)))
+            state = state.replace(
+                features=state.features.replace(door_state=ds_arr),
+            )
+        del stair_x, stair_y
+        return _seed_hero_fov(state, lit)
+
+    return wrapped
 
 
 def _register_skill_door_envs(register_fn) -> None:
     """ClosedDoor / LockedDoor envs (vendor skills_simple.py)."""
-    closed = _make_factory(_closed_door_builder, w=80, h=21, fill=" ")
-    register_fn("MiniHack-ClosedDoor-v0", closed,
+    # ClosedDoor: random create_room (8×8 outer, 4×4 sub-room, closed ROOMDOOR)
+    # replayed off the ISAAC64 stream — same machinery as KeyRoom.
+    closed_base = _make_factory(
+        _closeddoor_builder(8, True), w=80, h=21, fill=" ", lit=True,
+    )
+    register_fn("MiniHack-ClosedDoor-v0",
+                _wrap_closeddoor_placement(closed_base, 8, 4, True),
                 _skill_door_rm(),
                 max_steps=50, category="Skill")
 
