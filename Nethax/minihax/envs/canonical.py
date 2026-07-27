@@ -4953,27 +4953,230 @@ def _exploremaze_builder(hard: bool) -> Callable[[LevelGenerator], None]:
     return build
 
 
+# ---------------------------------------------------------------------------
+# Faithful vendor ExploreMaze level-gen (ISAAC64-driven, DOUBLE MAZEWALK).
+#
+# The vendor .des (exploremazeeasy.des / exploremazehard.des) stamps a fixed
+# MAP (border walls + three vertical floor corridors) under GEOMETRY:left,top,
+# then carves TWO independent recursive-backtracker mazes into the stone
+# between the corridors and RNG-places the apples / down-stair / hero start.
+# The _des_factory path mis-stamps this (xstart=3 not 1, skips the MAZEWALKs,
+# and puts the hero at the wrong cell), so ExploreMaze gets a dedicated builder.
+#
+# Draw order (ground-truthed against the vendor NETHAX_RN2 trace for
+# Easy/Hard seeds 0/1/2; the whole 46/86-draw stream matches byte-for-byte):
+#   1. mklev prefix ................. rn2(3), rn2(2)
+#   2. $maze_start_left/right ....... rndcoord(line) = rn2(#cells) each
+#   3. MAZEWALK x2 .................. spo_mazewalk + walkfrom (variable rn2(q))
+#   4. LOOP[4] apples ............... rn2(#bottom), rn2(6)  (off-FOV; RNG only)
+#   5. STAIR:random,down ........... rn2(width), rn2(height)  (region all floor)
+#   6. BRANCH (hero start) ......... rn2(width), rn2(height)  (region all floor)
+#
+# Cite: vendor/nle/src/sp_lev.c::spo_mazewalk (4725) + get_location (868)
+# + selection_rndcoord (3793); mkmaze.c::walkfrom (1167) + okay (231)
+# + mz_move (34).  Map placement LEFT->xstart=1 (splev_init_present),
+# TOP->ystart=3 (sp_lev.c:4938,4955); x_maze_max=78, y_maze_max=20.
+# ---------------------------------------------------------------------------
+_EM_XSTART, _EM_YSTART = 1, 3
+
+
+def _extract_des_map(des_name: str) -> list[str]:
+    """Return the verbatim MAP rows from a vendor ``.des`` file."""
+    with open(_vendor_des_path(des_name), "r",
+              encoding="utf-8", errors="replace") as fh:
+        rows, in_map = [], False
+        for line in fh.read().splitlines():
+            s = line.strip()
+            if s == "MAP":
+                in_map = True
+                continue
+            if s == "ENDMAP":
+                break
+            if in_map:
+                rows.append(line)
+    return rows
+
+
+def _exploremaze_directives(hard: bool) -> dict:
+    """des-MAP-relative coords for the rndcoord lines and stair/branch/apple
+    rects (verified against the vendor trace, Easy/Hard seeds 0/1/2)."""
+    if hard:
+        return dict(left=(2, 1, 2, 13), right=(14, 1, 14, 13),
+                    stair=(14, 1, 14, 9), branch=(1, 1, 1, 13),
+                    bottom=(27, 1, 27, 13))
+    return dict(left=(2, 1, 2, 8), right=(10, 1, 10, 8),
+                stair=(9, 1, 9, 9), branch=(1, 1, 1, 9),
+                bottom=(19, 1, 19, 9))
+
+
+def _wrap_exploremaze_placement(
+    base_factory: Callable[[jax.Array], "EnvState"],
+    map_rows: list[str], hard: bool, lit: bool = True,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Reproduce vendor ExploreMaze level-gen from ``state.vendor_rng``."""
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TileType
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    import numpy as _np
+
+    _FLOOR = int(_TileType.FLOOR)
+    _WALL = int(_TileType.WALL)
+    _STAIR = int(_TileType.STAIRCASE_DOWN)
+    _VOID = 0
+    D = _exploremaze_directives(hard)
+    XS, YS = _EM_XSTART, _EM_YSTART
+
+    def _mz_move(x, y, d):
+        # vendor mz_move (mkmaze.c:34): 0=N,1=E,2=S,3=W; (x=col, y=row).
+        if d == 0:
+            return x, y - 1
+        if d == 1:
+            return x + 1, y
+        if d == 2:
+            return x, y + 1
+        return x - 1, y
+
+    def wrapped(rng: jax.Array):
+        state = base_factory(rng)
+        vrng = [state.vendor_rng]
+
+        def rn2(n):
+            vrng[0], r = _vendor_rng.rn2_jax(vrng[0], jnp.int32(n))
+            return int(r)
+
+        _H = int(state.terrain.shape[2])
+        _W = int(state.terrain.shape[3])
+        # Base terrain: VOID (0) == vendor STONE; stamp the fixed MAP at the
+        # left/top internal origin.  '.' -> FLOOR, '-'/'|' -> WALL.
+        terr = _np.zeros((_H, _W), dtype=_np.int8)
+        for dy, row in enumerate(map_rows):
+            iy = YS + dy
+            if iy >= _H:
+                break
+            for dx, ch in enumerate(row):
+                ix = XS + dx
+                if ix >= _W:
+                    break
+                if ch in "-|":
+                    terr[iy, ix] = _WALL
+                elif ch == ".":
+                    terr[iy, ix] = _FLOOR
+
+        def okay(x, y, d):
+            # vendor mkmaze.c::okay (231): 2-step, global clip + STONE only.
+            x, y = _mz_move(x, y, d)
+            x, y = _mz_move(x, y, d)
+            if x < 3 or y < 3 or x > 78 or y > 20:
+                return False
+            return terr[y, x] == _VOID
+
+        def carve(x, y):
+            terr[y, x] = _FLOOR
+
+        def rndcoord_line(line):
+            # selection_rndcoord scan order: col outer, row inner (sp_lev.c:3802).
+            x1, y1, x2, y2 = line
+            cells = [(cx, cy) for cx in range(x1, x2 + 1)
+                     for cy in range(y1, y2 + 1)]
+            cx, cy = cells[rn2(len(cells))]
+            return cx, cy      # map-relative
+
+        def walkfrom(x, y):
+            # iterative port of mkmaze.c::walkfrom (1167); (x=col, y=row).
+            carve(x, y)
+            stack = [(x, y)]
+            while stack:
+                x, y = stack[-1]
+                dirs = [d for d in range(4) if okay(x, y, d)]
+                if not dirs:
+                    stack.pop()
+                    continue
+                d = dirs[rn2(len(dirs))]
+                bx, by = _mz_move(x, y, d)
+                carve(bx, by)            # bridge cell
+                nx, ny = _mz_move(bx, by, d)
+                carve(nx, ny)            # neighbour cell
+                stack.append((nx, ny))
+
+        def spo_mazewalk(mcx, mcy):
+            # sp_lev.c::spo_mazewalk (4725), dir=EAST; map-rel -> internal.
+            x, y = XS + mcx, YS + mcy
+            x += 1
+            carve(x, y)
+            if x % 2 == 0:               # force odd x (EAST bias)
+                x += 1
+                carve(x, y)
+            if y % 2 == 0:               # force odd y (not SOUTH -> y--)
+                y -= 1
+            walkfrom(x, y)
+
+        def rect_random(rect):
+            # get_location random-in-rect: rn2(width) then rn2(height).
+            # The stair / branch regions are single-column floor corridors,
+            # so the vendor DRY accept-loop always takes the first cell.
+            x1, y1, x2, y2 = rect
+            rx = rn2(x2 - x1 + 1)
+            ry = rn2(y2 - y1 + 1)
+            return XS + x1 + rx, YS + y1 + ry      # internal (col, row)
+
+        # --- (1) mklev prefix ---
+        rn2(3)
+        rn2(2)
+        # --- (2) rndcoord maze seeds ---
+        ml = rndcoord_line(D["left"])
+        mr = rndcoord_line(D["right"])
+        # --- (3) DOUBLE MAZEWALK walkfrom carve ---
+        spo_mazewalk(*ml)
+        spo_mazewalk(*mr)
+        # --- (4) LOOP[4] apples: consume RNG (placed off-FOV; not stamped) ---
+        bx1, by1, bx2, by2 = D["bottom"]
+        n_bottom = (bx2 - bx1 + 1) * (by2 - by1 + 1)
+        for _ in range(4):
+            rn2(n_bottom)
+            rn2(6)
+        # --- (5) STAIR:random,down ---
+        stair_col, stair_row = rect_random(D["stair"])
+        # --- (6) BRANCH: hero start ---
+        hero_col, hero_row = rect_random(D["branch"])
+
+        if 0 <= stair_row < _H and 0 <= stair_col < _W:
+            terr[stair_row, stair_col] = _STAIR
+
+        terrain = state.terrain.at[0, 0].set(
+            jnp.asarray(terr, dtype=jnp.int8)
+        )
+        state = state.replace(
+            vendor_rng=vrng[0],
+            terrain=terrain,
+            player_pos=jnp.array([hero_row, hero_col], dtype=jnp.int16),
+        )
+        return _seed_hero_fov(state, lit)
+
+    return wrapped
+
+
 def _register_exploremaze_envs(register_fn) -> None:
-    # Every ExploreMaze variant ships with a static vendor .des
-    # (vendor/minihack/minihack/envs/exploremaze.py:52-70):
-    #   Easy           -> exploremazeeasy.des
-    #   Easy-Mapped    -> exploremazeeasy_premapped.des
-    #   Hard           -> exploremazehard.des
-    #   Hard-Mapped    -> exploremazehard_premapped.des
-    # All four parse and build via the des_parser; the LG builder remains
-    # as a safety fallback if the probe-build raises (see _des_factory).
-    variants = [
-        ("MiniHack-ExploreMaze-Easy-v0",        False, "exploremazeeasy.des"),
+    # Easy / Hard use the dedicated DOUBLE-MAZEWALK builder above (byte-exact).
+    # The premapped variants still route through the des_parser.
+    procedural = [
+        ("MiniHack-ExploreMaze-Easy-v0", False, "exploremazeeasy.des"),
+        ("MiniHack-ExploreMaze-Hard-v0", True,  "exploremazehard.des"),
+    ]
+    for env_id, hard, des_name in procedural:
+        map_rows = _extract_des_map(des_name)
+        base = _make_factory(lambda lg: None,
+                             w=len(map_rows[0]), h=len(map_rows), fill=" ")
+        factory = _wrap_exploremaze_placement(base, map_rows, hard)
+        register_fn(env_id, factory, _exploremaze_rm(),
+                    max_steps=500, category="ExploreMaze")
+
+    mapped = [
         ("MiniHack-ExploreMaze-Easy-Mapped-v0", False, "exploremazeeasy_premapped.des"),
-        ("MiniHack-ExploreMaze-Hard-v0",        True,  "exploremazehard.des"),
         ("MiniHack-ExploreMaze-Hard-Mapped-v0", True,  "exploremazehard_premapped.des"),
     ]
-    for env_id, hard, des_name in variants:
+    for env_id, hard, des_name in mapped:
         fallback = _make_factory(_exploremaze_builder(hard), w=22, h=14)
-        if des_name is not None:
-            factory = _des_factory(des_name, fallback=fallback)
-        else:
-            factory = fallback
+        factory = _des_factory(des_name, fallback=fallback)
         register_fn(env_id, factory, _exploremaze_rm(),
                     max_steps=500, category="ExploreMaze")
 
