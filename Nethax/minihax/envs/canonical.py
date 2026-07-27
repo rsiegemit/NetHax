@@ -3175,10 +3175,177 @@ def _river_builder(narrow: bool, lava: bool,
     return build
 
 
+def _river_place_monsters(
+    state: "EnvState",
+    n_monster: int,
+    rows: tuple,
+    dx: int,
+    dy: int,
+) -> "EnvState":
+    """Replay vendor ``create_monster`` for the ``n_monster`` River
+    ``MONSTER:random,random`` directives off ``state.vendor_rng`` and write the
+    resulting monsters into ``state.monster_ai``.
+
+    Vendor des order (``lvl_gen.get_des()``) places the ``BRANCH`` (deferred),
+    then the 5 ``MONSTER`` directives, then the 5 boulder ``OBJECT`` directives,
+    then ``STAIR`` — so the makemon draws fall between the ``mklev`` flip
+    prologue and the boulder ``rndcoord`` draws.  Ground-truthed bit-exact
+    against the NETHAX_RND River-Monster traces (seeds 0/1/2): after this
+    consumes the monster stream, the 5× ``rn2(90)`` boulders and the
+    ``place_lregion`` hero draws land byte-identical to River-v0.
+
+    Per-monster draw template (vendor ``sp_lev.c:create_monster`` ->
+    ``get_location`` somexy + ``makemon(NULL)``), matching
+    :func:`level_generator._resolve_monster` PLUS the leader ``enexto``
+    relocation that ``create_monster`` (sp_lev.c:1640) runs when the somexy
+    cell already holds a monster (``MON_AT``) — the piece ``_resolve_monster``
+    omits, needed for River where 5 monsters share one 25×7 region:
+
+      * ``rn2(3)``                 mkclass mlet pick (discarded)
+      * ``rn2(25)``, ``rn2(7)``    somexy(croom) — REGION (0,0,25,7); retry
+                                   (is_ok_location DRY) until a FLOOR cell
+      * ``rn2(num_good)``          enexto, ONLY if the somexy cell is occupied
+      * ``rnd(21)``                rndmonst pick (``pick_monster_for_level``)
+      * newmonhp                   ``rn2(4)`` (adj_lev 0) or ``d(adj_lev,8)``
+      * ``rn2(2)``                 gender
+      * m_initgrp                  G_SGROUP/G_LGROUP group spawn (enexto +
+                                   per-member makemon draws)
+      * m_initweap                 is_armed-guarded weapon grants
+      * ``rn2(50)``, ``rn2(100)``, ``rn2(100)``   m_initinv + saddle
+
+    ``resolved_rooms`` geometry is the River REGION mapped to grid coordinates
+    (origin ``(dx, dy)``), so the somexy moduli are the vendor ``rn2(25)`` /
+    ``rn2(7)`` (NOT the full-map fallback ``_resolve_monster`` would use with an
+    empty ``resolved_rooms``).  All draws come from ``state.vendor_rng``; the
+    advanced rng is returned on ``state``.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.dungeon.spawning import pick_monster_for_level
+    from Nethax.nethax.constants.monsters import MONSTERS as _MONSTERS
+    from Nethax.nethax.constants.tiles import TileType as _TileType
+    from Nethax.minihax.level_generator import (
+        _enexto,
+        _m_initweap_draws,
+        _adj_lev_depth1,
+        _MON_SGROUP,
+        _MON_LGROUP,
+        _MON_ARMED,
+        _write_monster,
+    )
+    import numpy as _np
+
+    if n_monster <= 0:
+        return state
+
+    w = max(len(r) for r in rows)
+    h = len(rows)
+    floor = int(_TileType.FLOOR)
+    rx1, ry1 = dx, dy
+    room_w, room_h = w, h  # 25 × 7 (default / narrow-24 / lava)
+
+    def _map_is_floor(mx: int, my: int) -> bool:
+        # is_ok_location(DRY): a MAP '.' cell is ROOM floor; the water/lava strip
+        # ('W'/'L') is rejected.  The STAIR:(24,2) cell is still '.' in the MAP
+        # string here (STAIR is stamped AFTER the monster pass in vendor), so it
+        # is a valid somexy target — matching vendor's not-yet-placed stair.
+        return 0 <= my < h and 0 <= mx < len(rows[my]) and rows[my][mx] == "."
+
+    # Terrain view for enexto ``goodpos`` (FLOOR test): reset the already-stamped
+    # down-stair cell back to FLOOR so enexto treats it as vendor does at monster
+    # time (stair not yet placed).  Water is DEEPWATER (retagged) so it is not
+    # FLOOR and is correctly rejected.
+    _terr = _np.asarray(state.terrain).copy()
+    if 0 <= dy + 2 < _terr.shape[2] and 0 <= dx + 24 < _terr.shape[3]:
+        _terr[0, 0, dy + 2, dx + 24] = floor
+    terr_j = jnp.asarray(_terr)
+
+    vrng = state.vendor_rng
+    occupied: set = set()   # grid (row, col) of every placed monster
+    placed: list = []       # ((row, col), idx, [(mpos, idx), ...])
+    for _mi in range(n_monster):
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))   # mkclass (discarded)
+        # somexy(croom) loop — accept the first FLOOR MAP cell (is_ok_location).
+        mx = my = 0
+        for _cpt in range(100):
+            vrng, _mxd = _vendor_rng.rn2_jax(vrng, jnp.int32(room_w))
+            vrng, _myd = _vendor_rng.rn2_jax(vrng, jnp.int32(room_h))
+            mx, my = int(_mxd), int(_myd)
+            if _map_is_floor(mx, my):
+                break
+        xi, yi = rx1 + mx, ry1 + my
+        # MON_AT(x,y) -> enexto: relocate off an occupied somexy cell.
+        if (yi, xi) in occupied:
+            _mpos, vrng = _enexto(terr_j, occupied, xi, yi, w=80, h=21, vrng=vrng)
+            if _mpos is not None:
+                yi, xi = _mpos
+        # makemon(NULL): rndmonst identity pick.
+        vrng, _picked = pick_monster_for_level(None, 1, vendor_rng=vrng)
+        idx = int(_picked)
+        # newmonhp (makemon.c:983): draw-count varies by adj_lev at depth 1.
+        _mlev = int(_MONSTERS[idx].level) if 0 <= idx < len(_MONSTERS) else 0
+        _alev = _adj_lev_depth1(_mlev)
+        _n_hp = _alev if _alev >= 1 else 1
+        for _ in range(_n_hp):
+            vrng, _ = _vendor_rng.rn2_jax(
+                vrng, jnp.int32(8 if _alev >= 1 else 4),
+            )
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))   # gender
+        # m_initgrp group spawn (makemon.c:1369-1378).
+        is_sg = bool(_MON_SGROUP[idx]) if 0 <= idx < _MON_SGROUP.shape[0] else False
+        is_lg = bool(_MON_LGROUP[idx]) if 0 <= idx < _MON_LGROUP.shape[0] else False
+        grp_n = 0
+        if is_sg:
+            vrng, _g = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+            if int(_g) != 0:
+                grp_n = 3
+        elif is_lg:
+            vrng, _lg = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+            grp_n = 10 if int(_lg) != 0 else 3
+        members: list = []
+        occupied.add((yi, xi))   # leader occupies its own cell
+        if grp_n > 0:
+            vrng, _cnt_raw = _vendor_rng.rn2_jax(vrng, jnp.int32(grp_n))
+            cnt = max(1, (int(_cnt_raw) + 1) // 4)   # u.ulevel==1 divisor
+            for _m in range(cnt):
+                _mpos, vrng = _enexto(
+                    terr_j, occupied, xi, yi, w=80, h=21, vrng=vrng,
+                )
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))    # newmonhp
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))    # gender
+                if _MON_ARMED[idx]:
+                    vrng = _m_initweap_draws(vrng, idx)
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+                vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+                if _mpos is not None:
+                    members.append((_mpos, idx))
+                    occupied.add(_mpos)
+            if _MON_ARMED[idx]:
+                vrng = _m_initweap_draws(vrng, idx)
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        else:
+            if _MON_ARMED[idx]:
+                vrng = _m_initweap_draws(vrng, idx)
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        placed.append(((yi, xi), idx, members))
+
+    state = state.replace(vendor_rng=vrng)
+    for _rc, _idx, _members in placed:
+        state = _write_monster(state, _rc, _idx)
+        for _mp, _midx in _members:
+            state = _write_monster(state, _mp, _midx)
+    return state
+
+
 def _wrap_river_placement(
     factory: Callable[[jax.Array], "EnvState"],
     narrow: bool,
     lava: bool,
+    n_monster: int = 0,
 ) -> Callable[[jax.Array], "EnvState"]:
     """Place the 5 ``rndcoord`` boulders and the random hero start for a
     MiniHack-River level by replaying vendor NetHack's ``mklev`` object /
@@ -3250,6 +3417,13 @@ def _wrap_river_placement(
         # mklev flip prologue (reseed=False -> no flip; discard the two draws).
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+        # Monster variants (River-Monster / River-MonsterLava) place n_monster
+        # MONSTER:random,random directives BEFORE the boulders (vendor des
+        # order: BRANCH, MONSTER×n, OBJECT×5, STAIR).  Replay the makemon draws
+        # off vendor_rng so the boulder/hero draws below stay byte-aligned.
+        state = state.replace(vendor_rng=vrng)
+        state = _river_place_monsters(state, n_monster, rows, dx, dy)
+        vrng = state.vendor_rng
         # 5× rndcoord($boulder_area) — column-major idx -> MAP (1+idx//5, 1+idx%5).
         # A boulder landing on the river (MAP col 18) sinks (see ``_is_pool``);
         # those cells are recorded so the relocation loop drops them.
@@ -3407,10 +3581,13 @@ def _register_river_envs(register_fn) -> None:
     # boulder+WATER-occluded reset FOV byte-exact off ``state.vendor_rng`` (was
     # ~353 -> now 0 residual cells across all three no-monster variants).
     #
-    # Monster variants (River-Monster / River-MonsterLava) still insert per-
-    # monster ``makemon`` draws between the flip prologue and the boulders,
-    # which is not yet modelled, so they keep the deterministic fallback
-    # builder.
+    # Monster variants (River-Monster / River-MonsterLava): the per-monster
+    # ``makemon`` draws between the flip prologue and the boulders are now
+    # modelled in ``_river_place_monsters`` (invoked from
+    # ``_wrap_river_placement``), so they take the byte-parity path too.  In
+    # vendor-rng mode the builder is handed ``nm=0`` (the wrapper places the
+    # monsters off vendor_rng); default (Threefry) mode keeps the builder's
+    # ``add_monster`` spawns for playability.
     variants = [
         ("MiniHack-River-v0",            False, False, 0),
         ("MiniHack-River-Monster-v0",    False, False, 5),
@@ -3420,25 +3597,28 @@ def _register_river_envs(register_fn) -> None:
     ]
     from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng_dl
     for env_id, narrow, lava, nm in variants:
+        # In vendor-rng (byte-parity) mode the wrapper places the monsters off
+        # vendor_rng, so hand the builder ``nm=0`` to avoid a double placement /
+        # mis-aligned makemon draws.  Default mode keeps the builder's spawns.
+        _bnm = 0 if _use_vendor_rng_dl() else nm
         # Full 80x21 grid with VOID fill (INIT_MAP:solidfill,' '); the vendor
         # MAP is stamped at its GEOMETRY:center,center origin inside the
         # builder (same path as Sokoban).
         factory = _make_factory(
-            _river_builder(narrow, lava, nm), w=80, h=21, fill=" ",
+            _river_builder(narrow, lava, _bnm), w=80, h=21, fill=" ",
         )
         # Retag the river strip's cells (stamped as TileType.WATER via the 'W'
         # mapchar) to TileType.DEEPWATER so they render S_water (glyph 2400)
         # like vendor, not S_pool (2391).  Scoped to River (its only water is
         # the strip); applied to every variant, monster and no-monster alike.
         factory = _wrap_river_deepwater(factory)
-        # Byte-parity path: for the no-monster variants (River / River-Lava /
-        # River-Narrow) replay vendor's mklev boulder + branch-hero draws off
-        # ``state.vendor_rng`` so the 5 boulders and the random hero start land
-        # byte-exact.  The Monster variants insert per-monster ``makemon`` draws
-        # between the flip prologue and the boulders (not yet modelled), so they
-        # keep the deterministic fallback builder to avoid mis-aligning.
-        if _use_vendor_rng_dl() and nm == 0:
-            factory = _wrap_river_placement(factory, narrow, lava)
+        # Byte-parity path: replay vendor's mklev draws off ``state.vendor_rng``
+        # so the ``nm`` monsters (Monster variants), the 5 boulders and the
+        # random hero start all land byte-exact.  ``_river_place_monsters``
+        # consumes the makemon stream between the flip prologue and the boulder
+        # ``rndcoord`` draws (vendor des order: MONSTER×n, OBJECT×5, STAIR).
+        if _use_vendor_rng_dl():
+            factory = _wrap_river_placement(factory, narrow, lava, nm)
         rm = _lava_avoid_reward_manager() if lava else _default_goal_reward_manager()
         register_fn(env_id, factory, rm,
                     max_steps=350, category="River")
