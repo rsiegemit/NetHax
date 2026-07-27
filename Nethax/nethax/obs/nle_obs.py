@@ -2287,19 +2287,35 @@ _WALL_ANGLE_TABLE: jnp.ndarray = _build_wall_angle_table()
 
 
 def _apply_wall_angle(display_terrain: jnp.ndarray,
-                      cmap_idx: jnp.ndarray) -> jnp.ndarray:
+                      cmap_idx: jnp.ndarray,
+                      full_terrain: jnp.ndarray = None) -> jnp.ndarray:
     """Replace generic S_vwall on WALL tiles with the correct corner variant.
 
     Args:
-        display_terrain: int8/int16[21, 79] terrain TileType per cell.
+        display_terrain: int8/int16[21, 79] FOV-limited terrain TileType per
+            cell (visible truth, else stale memory, else stone).  Gates WHICH
+            cells are shown (only a cell shown as WALL/door gets rewritten).
         cmap_idx:        int16[21, 79] current cmap indices from _TILE_TO_CMAP.
+        full_terrain:    int8/int16[21, 79] the FULL, FOV-INDEPENDENT level
+            terrain.  The wall variant (corner / T / cross) is a property of the
+            map layout, baked by vendor at level-gen (mkmaze.c::fix_wall_spines
+            operating on ``levl[x][y].typ``), so the neighbour bitmask MUST be
+            derived from the true wall layout — NOT from what the hero currently
+            sees.  When a corner's perpendicular wall neighbour is out of view,
+            the FOV-limited map would degrade the corner to a straight wall.
+            Defaults to ``display_terrain`` for callers (e.g. the junction test)
+            that pass a single already-full terrain.
 
     Returns:
         int16[21, 79] cmap indices with wall variants resolved.
     """
     from Nethax.nethax.constants.tiles import TileType
 
+    if full_terrain is None:
+        full_terrain = display_terrain
+
     t = display_terrain.astype(jnp.int16)
+    tf = full_terrain.astype(jnp.int16)
     WALL = jnp.int16(int(TileType.WALL))
     CLOSED = jnp.int16(int(TileType.CLOSED_DOOR))
     OPEN = jnp.int16(int(TileType.OPEN_DOOR))
@@ -2309,7 +2325,10 @@ def _apply_wall_angle(display_terrain: jnp.ndarray,
     # (closed, open, or a doorless DOORWAY).  Vendor check_pos() treats walls +
     # doors as connected segments, so a doorless doorway carved into a wall run
     # still lets the adjacent room corner resolve to the correct corner variant.
-    is_wallish = (t == WALL) | (t == CLOSED) | (t == OPEN) | (t == DOORWAY)
+    # Derived from the FULL terrain (fix_wall_spines is FOV-independent), so a
+    # revealed corner shows the correct variant even when its perpendicular wall
+    # neighbour is currently unseen.
+    is_wallish = (tf == WALL) | (tf == CLOSED) | (tf == OPEN) | (tf == DOORWAY)
 
     H, W = is_wallish.shape
 
@@ -2415,7 +2434,7 @@ def build_glyphs(env_state, fast: bool = False) -> jnp.ndarray:
     # from the 4 cardinal neighbours' wall pattern.  Vendor reference:
     # vendor/nethack/src/display.c::wall_angle (lines 143-151 forward decl,
     # body at lines 3512-3700) and set_wall_state / xy_set_wall_state.
-    cmap_idx = _apply_wall_angle(display_terrain, cmap_idx)
+    cmap_idx = _apply_wall_angle(display_terrain, cmap_idx, level_terrain)
 
     # Lit-corridor pass — vendor renders a CORR tile as S_litcorr instead of
     # S_corr when the cell is lit-and-seen, i.e. ``waslit``.  Cite:
