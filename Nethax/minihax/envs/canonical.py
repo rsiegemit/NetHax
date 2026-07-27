@@ -2659,28 +2659,182 @@ def _river_builder(narrow: bool, lava: bool,
     return build
 
 
+def _wrap_river_placement(
+    factory: Callable[[jax.Array], "EnvState"],
+    narrow: bool,
+    lava: bool,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Place the 5 ``rndcoord`` boulders and the random hero start for a
+    MiniHack-River level by replaying vendor NetHack's ``mklev`` object /
+    branch-hero draws off ``state.vendor_rng``.
+
+    Vendor ``MiniHackRiver`` (vendor/minihack/minihack/envs/river.py) is a
+    static 25×7 ``LevelGenerator(map=...)`` level with a vertical water strip
+    plus ``set_start_rect((0,0),(18,6))`` and ``$boulder_area = fillrect
+    (1,1,18,5)`` seeding 5 ``add_object(boulder)`` (``rndcoord``) draws.  The
+    ``_river_builder`` already stamps the MAP, water/lava strip and down-stair
+    byte-exact (``GEOMETRY:center,center`` origin); this wrapper supplies the
+    two RNG-driven pieces.
+
+    The draw sequence — verified bit-exact against the NETHAX_RND traces
+    (.test_runs/full_rnd_stream_MiniHack_River_v0_seed{0,1,2}.txt, MKLEV
+    section) — is, consumed from ``state.vendor_rng`` at MKLEV_BEGIN:
+
+      * ``rn2(3)``, ``rn2(2)``     mklev flip prologue (values discarded;
+                                   ``reseed=False`` so no coordinate flip)
+      * ``rn2(90)`` × 5            each ``rndcoord($boulder_area)`` — the idx
+                                   enumerates ``fillrect(1,1,18,5)`` column-major
+                                   so the boulder lands at MAP ``(1+idx//5,
+                                   1+idx%5)``
+      * ``rn2(19)``, ``rn2(7)``    ``place_lregion(LR_BRANCH)`` loop (mkmaze.c
+                                   :300-308): ``rn1((hx-lx)+1, lx)`` over the
+                                   start rect ``(0,0)-(18,6)``.  ``bad_location``
+                                   (mkmaze.c:261-273) rejects the exclusion cell
+                                   MAP ``(0,0)`` and any non-``ROOM`` typ (the
+                                   water / lava strip), retrying up to 200×.
+
+    We reuse the 5 boulder ``ground_items`` entries the builder already placed
+    (relocating their ``pos`` to the vendor cells so they render ``` ` ``` and
+    shadow-cast via ``_boulder_opaque_overlay``), pin ``player_pos`` to the
+    accepted branch cell, and re-seed the hero's FOV — clearing the fallback
+    ``set_start_pos`` FOV seed first so no stale explored cells leak in.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.fov import view_from as _view_from
+    from Nethax.nethax.constants.tiles import TileType as _TileType
+    from Nethax.minihax.level_generator import (
+        _boulder_opaque_overlay,
+        _BOULDER_OBJ_IDX,
+    )
+
+    rows = _river_map(narrow, lava)
+    w = max(len(r) for r in rows)
+    h = len(rows)
+    dx, dy = _vendor_geometry_center_wh(w, h)
+
+    def _is_floor(mx: int, my: int) -> bool:
+        return (
+            0 <= my < h and 0 <= mx < len(rows[my]) and rows[my][mx] == "."
+        )
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        # mklev flip prologue (reseed=False -> no flip; discard the two draws).
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+        # 5× rndcoord($boulder_area) — column-major idx -> MAP (1+idx//5, 1+idx%5).
+        boulder_cells = []
+        for _ in range(5):
+            vrng, idx = _vendor_rng.rn2_jax(vrng, jnp.int32(90))
+            i = int(idx)
+            boulder_cells.append((dy + 1 + i % 5, dx + 1 + i // 5))  # (row, col)
+        # place_lregion(LR_BRANCH): first accepted (rn2(19), rn2(7)) cell that
+        # is FLOOR and not the exclusion cell MAP (0,0).
+        hero_rc = None
+        for _ in range(200):
+            vrng, hx = _vendor_rng.rn2_jax(vrng, jnp.int32(19))
+            vrng, hy = _vendor_rng.rn2_jax(vrng, jnp.int32(7))
+            mx, my = int(hx), int(hy)
+            if (mx, my) != (0, 0) and _is_floor(mx, my):
+                hero_rc = (dy + my, dx + mx)
+                break
+        if hero_rc is None:
+            # Deterministic fallback (mkmaze.c:311-315): first valid cell.
+            for my in range(h):
+                for mx in range(w):
+                    if (mx, my) != (0, 0) and _is_floor(mx, my):
+                        hero_rc = (dy + my, dx + mx)
+                        break
+                if hero_rc is not None:
+                    break
+
+        # Relocate the builder's 5 boulder ground_items entries to the vendor
+        # cells (positions only; the entries/type_id are already correct).
+        gi = state.ground_items
+        tid = gi.items.type_id[0, 0]
+        cat = gi.items.category[0, 0]
+        pos = gi.pos
+        b = 0
+        for k in range(int(tid.shape[0])):
+            if b >= len(boulder_cells):
+                break
+            if int(tid[k]) == int(_BOULDER_OBJ_IDX) and int(cat[k]) != 0:
+                br, bc = boulder_cells[b]
+                pos = pos.at[0, 0, k, 0].set(jnp.int16(br))
+                pos = pos.at[0, 0, k, 1].set(jnp.int16(bc))
+                b += 1
+
+        state = state.replace(
+            vendor_rng=vrng,
+            ground_items=gi.replace(pos=pos),
+            player_pos=jnp.stack(
+                [jnp.int16(hero_rc[0]), jnp.int16(hero_rc[1])]
+            ),
+        )
+
+        # Re-seed the hero's reset FOV.  This mirrors
+        # ``level_generator.seed_hero_fov(state, default_lit=True)`` but adds
+        # the WATER strip to the line-of-sight occluder set: vendor
+        # ``does_block`` (vision.c:167-168) treats ``typ == WATER`` as opaque
+        # (like boulders and walls), so the hero cannot see past the river.
+        # ``seed_hero_fov`` occludes only boulders, which over-reveals the far
+        # bank; building the couldsee mask here with a boulder + WATER overlay
+        # matches vendor's shadow-cast.  (LAVA does NOT block — excluded.)
+        terrain_l0 = state.terrain[0, 0]
+        occ = _boulder_opaque_overlay(state, terrain_l0.shape) | (
+            terrain_l0 == jnp.int8(int(_TileType.WATER))
+        )
+        couldsee = _view_from(
+            terrain_l0,
+            state.player_pos.astype(jnp.int32),
+            max_radius=0,
+            opaque_overlay=occ,
+        )
+        lit_mask = terrain_l0 != jnp.int8(int(_TileType.VOID))
+        _h_g, _w_g = terrain_l0.shape
+        _pr = state.player_pos[0].astype(jnp.int32)
+        _pc = state.player_pos[1].astype(jnp.int32)
+        _rows_g = jnp.arange(_h_g, dtype=jnp.int32)[:, None]
+        _cols_g = jnp.arange(_w_g, dtype=jnp.int32)[None, :]
+        within_light = (jnp.abs(_rows_g - _pr) <= jnp.int32(1)) & (
+            jnp.abs(_cols_g - _pc) <= jnp.int32(1)
+        )
+        vis = couldsee & (lit_mask | within_light)
+        # Clear any fallback set_start_pos FOV seed, then write the fresh mask.
+        return state.replace(
+            visible=vis,
+            explored=state.explored.at[0, 0].set(vis),
+            last_seen_terrain=state.last_seen_terrain.at[0, 0].set(
+                jnp.where(vis, terrain_l0.astype(jnp.int8), jnp.int8(-1))
+            ),
+        )
+
+    return wrapped
+
+
 def _register_river_envs(register_fn) -> None:
-    # Vendor River's full byte-parity is blocked on two engine-level gaps that
-    # live OUTSIDE the River builder's scope (documented here so the residual
-    # is auditable):
+    # Byte-parity status (no-monster variants River / River-Lava / River-Narrow,
+    # seeds 0/1/2): the map / water-strip / stair land byte-exact via the
+    # centered ``_river_builder``, and ``_wrap_river_placement`` now pins the 5
+    # ``rndcoord`` boulders, the ``place_lregion`` random hero start, and the
+    # boulder+WATER-occluded reset FOV byte-exact off ``state.vendor_rng`` (was
+    # ~353 -> ~41 with the earlier structural/boulder-FOV work -> 3-6 residual
+    # cells now).
     #
-    #  1. FOV over-render (~68 of ~72-80 residual cells).  Vendor renders only
-    #     the hero's reset line-of-sight blob; minihax lights the whole
-    #     ``REGION:(0,0,25,7),lit`` room.  Matching vendor needs the engine FOV
-    #     path (fov.py / seed_hero_fov), not this builder.
-    #  2. mklev draw-count alignment for the RNG start cell + 5 ``rndcoord``
-    #     boulders.  The vendor draw stream (NETHAX_RND, seed 0, draws 341-347:
-    #     ``rn2(90)x5 = 16,2,77,62,51`` boulders then ``rn2(19)=1``/``rn2(7)=5``
-    #     start, boulder enum column-major -> MAP ``(1+idx//5, 1+idx%5)``) is
-    #     fully decoded, but minihax's ``vendor_rng`` sits at a different offset
-    #     at factory-end (mklev prefix draws not yet aligned like the Room
-    #     family), so pinning off it lands the wrong cell.  Aligning the full
-    #     ~340-draw mklev prefix is a Room-family-scale byte-parity effort.
+    # The remaining 3-6 cells are ALL the same rendering-table gap, OUTSIDE this
+    # builder's editable scope: ``nle_obs._TILE_TO_CMAP[TileType.WATER]`` maps
+    # deep water to ``S_pool`` (cmap 32, glyph 2391) but vendor renders the
+    # river's ``WATER`` typ as ``S_water`` (cmap 41, glyph 2400).  Both display
+    # as ``}`` so the ``chars`` obs already matches; only the ``glyphs`` obs
+    # differs, at the hero-visible near water column.  Fixing it means changing
+    # the WATER->cmap entry in nle_obs.py (shared across every water env), not
+    # the River builder.
     #
-    # This builder fixes the STRUCTURAL divergence (was ~353/340 cells): the
-    # room now lands at the vendor GEOMETRY:center origin with the exact W/L
-    # water strip and stair, cutting the residual to ~70-80 cells (almost all
-    # FOV over-render).
+    # Monster variants (River-Monster / River-MonsterLava) still insert per-
+    # monster ``makemon`` draws between the flip prologue and the boulders,
+    # which is not yet modelled, so they keep the deterministic fallback
+    # builder.
     variants = [
         ("MiniHack-River-v0",            False, False, 0),
         ("MiniHack-River-Monster-v0",    False, False, 5),
@@ -2688,6 +2842,7 @@ def _register_river_envs(register_fn) -> None:
         ("MiniHack-River-MonsterLava-v0",False, True,  5),
         ("MiniHack-River-Narrow-v0",     True,  False, 0),
     ]
+    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng_dl
     for env_id, narrow, lava, nm in variants:
         # Full 80x21 grid with VOID fill (INIT_MAP:solidfill,' '); the vendor
         # MAP is stamped at its GEOMETRY:center,center origin inside the
@@ -2695,6 +2850,14 @@ def _register_river_envs(register_fn) -> None:
         factory = _make_factory(
             _river_builder(narrow, lava, nm), w=80, h=21, fill=" ",
         )
+        # Byte-parity path: for the no-monster variants (River / River-Lava /
+        # River-Narrow) replay vendor's mklev boulder + branch-hero draws off
+        # ``state.vendor_rng`` so the 5 boulders and the random hero start land
+        # byte-exact.  The Monster variants insert per-monster ``makemon`` draws
+        # between the flip prologue and the boulders (not yet modelled), so they
+        # keep the deterministic fallback builder to avoid mis-aligning.
+        if _use_vendor_rng_dl() and nm == 0:
+            factory = _wrap_river_placement(factory, narrow, lava)
         rm = _lava_avoid_reward_manager() if lava else _default_goal_reward_manager()
         register_fn(env_id, factory, rm,
                     max_steps=350, category="River")
