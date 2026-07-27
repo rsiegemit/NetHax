@@ -2322,29 +2322,85 @@ def _apply_wall_angle(display_terrain: jnp.ndarray,
     DOORWAY = jnp.int16(int(TileType.DOORWAY))
 
     # A neighbour counts as a wall-continuation when it is WALL or any door
-    # (closed, open, or a doorless DOORWAY).  Vendor check_pos() treats walls +
-    # doors as connected segments, so a doorless doorway carved into a wall run
-    # still lets the adjacent room corner resolve to the correct corner variant.
-    # Derived from the FULL terrain (fix_wall_spines is FOV-independent), so a
-    # revealed corner shows the correct variant even when its perpendicular wall
-    # neighbour is currently unseen.
-    is_wallish = (tf == WALL) | (tf == CLOSED) | (tf == OPEN) | (tf == DOORWAY)
-
-    H, W = is_wallish.shape
-
-    # Pad with False (out-of-bounds = open) so edge cells behave like rooms.
+    # (closed, open, or a doorless DOORWAY).  Vendor iswall() (mkmaze.c:44-55)
+    # treats walls + doors as connected segments, so a doorless doorway carved
+    # into a wall run still lets the adjacent room corner resolve to the correct
+    # corner variant.
+    VOID = jnp.int16(0)
+    H, W = t.shape
     zero_row = jnp.zeros((1, W), dtype=jnp.bool_)
     zero_col = jnp.zeros((H, 1), dtype=jnp.bool_)
 
-    n = jnp.concatenate([zero_row, is_wallish[:-1, :]], axis=0)   # north neighbour
-    s = jnp.concatenate([is_wallish[1:, :], zero_row], axis=0)    # south neighbour
-    w = jnp.concatenate([zero_col, is_wallish[:, :-1]], axis=1)   # west neighbour
-    e = jnp.concatenate([is_wallish[:, 1:], zero_col], axis=1)    # east neighbour
+    def _spine_bits(terr):
+        """Vendor fix_wall_spines / extend_spine spine bitmask for one terrain
+        view (mkmaze.c:165-287).
 
-    pattern = (n.astype(jnp.int16)
-               | (s.astype(jnp.int16) << jnp.int16(1))
-               | (e.astype(jnp.int16) << jnp.int16(2))
-               | (w.astype(jnp.int16) << jnp.int16(3)))           # int16[21,79], 0..15
+        A spine toward orthogonal neighbour D is set iff D is a wall-continuation
+        AND extend_spine does not suppress it: suppression happens when the wall
+        is buried in a "corridor of walls" — the two cells perpendicular to D
+        (adjacent to the centre) AND the two far-diagonal cells (perpendicular to
+        D, adjacent to the D-neighbour) are ALL solid, where "solid" == rock
+        (STONE/VOID) or wall/door or out-of-bounds (iswall_or_stone,
+        mkmaze.c:58-65; OOB == solid).  Wall-continuation OOB == not-a-wall
+        (iswall, mkmaze.c:49-50).  Returns (spine_n, spine_s, spine_e, spine_w)
+        plus the raw orthogonal wall-continuation planes (e, w) for door
+        orientation.
+        """
+        wallish = (terr == WALL) | (terr == CLOSED) | (terr == OPEN) | (terr == DOORWAY)
+        solid = (terr == VOID) | wallish
+        n = jnp.concatenate([zero_row, wallish[:-1, :]], axis=0)   # north
+        s = jnp.concatenate([wallish[1:, :], zero_row], axis=0)    # south
+        w = jnp.concatenate([zero_col, wallish[:, :-1]], axis=1)   # west
+        e = jnp.concatenate([wallish[:, 1:], zero_col], axis=1)    # east
+        # Solid 3x3 neighbourhood, OOB padded True.
+        sp = jnp.pad(solid, ((1, 1), (1, 1)), constant_values=True)
+        sN  = sp[0:H,     1:W + 1]
+        sS  = sp[2:H + 2, 1:W + 1]
+        sW  = sp[1:H + 1, 0:W]
+        sE  = sp[1:H + 1, 2:W + 2]
+        sNW = sp[0:H,     0:W]
+        sNE = sp[0:H,     2:W + 2]
+        sSW = sp[2:H + 2, 0:W]
+        sSE = sp[2:H + 2, 2:W + 2]
+        spine_n = n & ~(sW & sE & sNW & sNE)
+        spine_s = s & ~(sW & sE & sSW & sSE)
+        spine_e = e & ~(sN & sS & sNE & sSE)
+        spine_w = w & ~(sN & sS & sNW & sSW)
+        return spine_n, spine_s, spine_e, spine_w, e, w
+
+    # The gen-time wall TYP family (corner / T / cross) is FOV-independent and
+    # comes from fix_wall_spines on the FULL terrain — a corner whose
+    # perpendicular wall neighbour is currently out of view must still resolve
+    # to a corner (7636245: Corridor-R3 / KeyRoom-Dark).
+    fn, fs, fe, fw, e_full, w_full = _spine_bits(tf)
+
+    # But the DISPLAYED glyph also depends on the seen-vector: vendor
+    # wall_angle() (display.c:3512+) reduces a T-junction / crosswall to a
+    # corner (or straight) when the hero has only seen part of it — e.g. a
+    # dividing-wall T whose far arm is in an unseen adjacent room renders as the
+    # corner of the seen room, not a T (LockedDoor (7,38): gen-time TDWALL,
+    # displayed S_trcorn).  We approximate seenv by the DISPLAY terrain (visible
+    # else remembered else stone): an arm that is not yet seen/remembered is
+    # dropped.  This reduction only applies to genuine junctions (>= 3 spines) —
+    # a plain 2-spine corner is stable under set_corner() and must keep its full
+    # -terrain spines (never degrade a corner to a straight because one arm is
+    # unseen).
+    dn, ds, de, dw, _, _ = _spine_bits(t)
+    full_count = (fn.astype(jnp.int16) + fs.astype(jnp.int16)
+                  + fe.astype(jnp.int16) + fw.astype(jnp.int16))
+    reduce = full_count >= jnp.int16(3)
+    spine_n = jnp.where(reduce, dn, fn)
+    spine_s = jnp.where(reduce, ds, fs)
+    spine_e = jnp.where(reduce, de, fe)
+    spine_w = jnp.where(reduce, dw, fw)
+
+    # Keep the raw full-terrain E/W wall planes for door orientation below.
+    e, w = e_full, w_full
+
+    pattern = (spine_n.astype(jnp.int16)
+               | (spine_s.astype(jnp.int16) << jnp.int16(1))
+               | (spine_e.astype(jnp.int16) << jnp.int16(2))
+               | (spine_w.astype(jnp.int16) << jnp.int16(3)))     # int16[21,79], 0..15
 
     wall_variant = _WALL_ANGLE_TABLE[pattern]                     # int16[21,79]
 
