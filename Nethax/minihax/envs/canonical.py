@@ -1756,25 +1756,36 @@ def _register_hidenseek_envs(register_fn) -> None:
 # ---------------------------------------------------------------------------
 # KeyRoom envs (Group A)
 # ---------------------------------------------------------------------------
+def _c_trunc_div(a: int, b: int) -> int:
+    """C integer division: truncate toward zero (differs from Python ``//``
+    for negative operands)."""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b >= 0) else -q
+
+
 def _keyroom_center(room_size: int) -> tuple[int, int]:
-    """Return the (x1, y1) ABSOLUTE internal interior top-left of the vendor
+    """Return the (x1, y1) **NLE-internal** interior top-left of the vendor
     KeyRoom outer ROOM.
 
     Vendor ``key_and_door_tmp.des`` emits ``ROOM: ..., (3,3), (center,center),
     (RS,RS)`` which routes through ``create_room`` (vendor/nle/src/sp_lev.c:
-    1219-1267 CENTER-align branch).  The C formula is::
+    1219-1267 CENTER-align branch).  The C formula (COLNO=80, ROWNO=21,
+    integer division truncating toward zero) is::
 
         xabs = (((3-1)*COLNO)/5)+1 + ((COLNO/5)-RS)/2
-        yabs = (((3-1)*ROWNO)/5)+1 + ((ROWNO/5)-RS)/2   [+1 empirical]
+        yabs = (((3-1)*ROWNO)/5)+1 + ((ROWNO/5)-RS)/2
 
-    with COLNO=80, ROWNO=21.  Ground-truthed against the vendor glyph map
-    (``.test_runs/kr_rnd_stream_*`` capture): for RS=5 the outer room
-    interior is internal cols 38..42, rows 9..13 (walls 37/43, 8/14).  The
-    +1 row correction matches the observed anchor across all seeds.
+    giving the internal interior top-left.  Minihax stores terrain in these
+    internal (col 0..79) coordinates; ``build_glyphs`` takes ``terrain[.., 1:80]``
+    so the *observation* column is ``internal - 1`` (rows unshifted).  Ground-
+    truthed against the vendor glyph map: RS=5 -> internal (38,9), obs interior
+    cols 37..41 rows 9..13; RS=15 -> internal (33,4), obs interior cols 32..46
+    rows 4..18.
     """
     COLNO, ROWNO = 80, 21
-    xabs = (((3 - 1) * COLNO) // 5) + 1 + ((COLNO // 5) - room_size) // 2
-    yabs = (((3 - 1) * ROWNO) // 5) + 1 + ((ROWNO // 5) - room_size) // 2 + 1
+    xabs = (((3 - 1) * COLNO) // 5) + 1 + _c_trunc_div((COLNO // 5) - room_size, 2)
+    yabs = (((3 - 1) * ROWNO) // 5) + 1 + _c_trunc_div((ROWNO // 5) - room_size, 2)
+    # create_room clamps (internal coords).
     if xabs + room_size - 1 > COLNO - 2:
         xabs = COLNO - room_size - 3
     xabs = max(2, xabs)
@@ -1786,91 +1797,303 @@ def _keyroom_center(room_size: int) -> tuple[int, int]:
 
 def _keyroom_builder(room_size: int, subroom_size: int,
                      lit: bool) -> Callable[[LevelGenerator], None]:
-    """Hand-coded KeyRoom that mirrors vendor ``key_and_door_tmp.des``.
+    """Hand-coded KeyRoom outer ROOM (vendor ``key_and_door*.des``).
 
     Structure (vendor/minihack/minihack/dat/key_and_door_tmp.des):
       * an outer ``ROOM`` (RS×RS) holding the blessed skeleton key,
       * a ``SUBROOM`` (SS×SS) nested in a corner holding the down ``STAIR``,
       * a **locked** ``ROOMDOOR`` on the subroom wall separating the two.
 
-    The outer room is now stamped at the vendor ``GEOMETRY:center,center``
-    absolute location (:func:`_keyroom_center`) instead of the top-left
-    corner, so its walls/floor align with vendor.  The subroom / door / key
-    / stair are placed deterministically in the top-left corner of the
-    outer interior (matching the vendor ``key_and_door.des`` Fixed layout:
-    SUBROOM (0,0), DOOR (2,1)).
-
-    NOTE (byte-parity ceiling): the sized S5/S15 variants place the
-    subroom/door/key/stair/player via ISAAC64 draws in vendor.  Minihax
-    cannot reproduce those draws because the vendor KeyRoom character is
-    **Rogue** (``rog-hum-cha-mal``; vendor/minihack/.../keyroom.py:34 +
-    navigation.py:38) while the minihax bootstrap is hard-wired to
-    **Archeologist** (level_generator.py ``role=_Role.ARCHEOLOGIST``).  The
-    role divergence shifts the pre-mklev ISAAC64 stream (role_init + u_init
-    inventory), so ``state.vendor_rng`` at KeyRoom mklev holds Archeologist
-    values, not vendor's Rogue values.  A trace-driven RNG model was derived
-    and validated (subroom/stair/door/key match on seeds 0/1/2 when fed the
-    *vendor* Rogue stream — see ``.test_runs/_kr_sim.py``) but is inert on
-    the minihax Archeologist stream.  Byte parity requires routing the
-    bootstrap through role=ROGUE (level_generator.py; out of scope here).
+    This builder carves ONLY the outer ROOM at its vendor
+    ``GEOMETRY:center,center`` observation-space location
+    (:func:`_keyroom_center`).  The sub-room / locked door / key / stair /
+    hero-start are all ISAAC64-driven in vendor mklev, so they are placed by
+    :func:`_wrap_keyroom_placement` which consumes ``state.vendor_rng`` in
+    the exact vendor draw order (now that the Rogue role bootstrap aligns the
+    stream at MKLEV_BEGIN).  We deliberately do NOT call ``set_start_pos``
+    here so the base factory skips FoV seeding (the wrapper pins the hero
+    cell and seeds FoV itself).
     """
     x1, y1 = _keyroom_center(room_size)          # outer interior top-left
-    x2, y2 = x1 + room_size - 1, y1 + room_size - 1
 
     def build(lg: LevelGenerator) -> None:
         outer = lg.add_room(x=x1, y=y1, w=room_size, h=room_size, lit=lit)
-        # Sub-room in the top-left corner of the outer interior (vendor
-        # Fixed-layout SUBROOM (0,0)); its right + bottom walls border outer
-        # floor so a door can connect them.
-        sub_x = x1
-        sub_y = y1
-        lg.add_room(x=sub_x, y=sub_y, w=subroom_size, h=subroom_size, lit=lit)
-        # Locked door on the sub-room's right wall (vendor Fixed DOOR (2,1) is
-        # on the wall at subroom-relative col SS, row 1), connecting the
-        # sub-room interior to the outer-room interior.
-        door_x = sub_x + subroom_size            # shared wall column (east)
-        door_y = sub_y                           # first sub-room interior row
-        lg.add_door(door_x, door_y, state="locked")
-        # Key in the outer room; goal stair inside the (locked) sub-room.
+        # Materialise the blessed skeleton key ground item (its cell here is a
+        # Threefry placeholder; ``_wrap_keyroom_placement`` repositions it to
+        # the vendor somexy cell).  Uses ``_next_key`` (not vendor_rng) so the
+        # ISAAC64 stream stays aligned.
         lg.add_object("skeleton key", "(", place=outer)
-        lg.add_stair_down(x=sub_x + subroom_size - 1,
-                          y=sub_y + subroom_size - 1)
-        lg.set_start_pos(x2, y2)
     return build
+
+
+def _wrap_keyroom_placement(
+    factory: Callable[[jax.Array], "EnvState"],
+    room_size: int, subroom_size: int, lit: bool, fixed: bool,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Consume the vendor KeyRoom mklev ISAAC64 draws off ``state.vendor_rng``
+    and stamp the sub-room, locked door, down-stair, skeleton key and hero
+    start at the vendor-exact cells.
+
+    Draw order (validated byte-exact against the NETHAX_RND ground-truth
+    stream for KeyRoom-Fixed-S5 seeds 0/1/2 — see
+    vendor/nle/src/{sp_lev,mklev,mkroom}.c):
+
+      1. ``rn2(3), rn2(2)``          generic mklev preamble (consumed, unused)
+      2. ``rn2(100), rn2(100)``      ``build_room`` rtype-chance rolls for the
+                                     outer room then the sub-room
+      3. (sized only) ``create_subroom`` random sub-room position:
+         ``rnd(RS-SS-1)-1`` for x then y (size SS fixed -> no size draw)
+      4. STAIR ``somexy`` in the sub-room: ``rn1(SS,slx), rn1(SS,sly)``
+      5. (sized only) ROOMDOOR ``create_door`` do-while loop
+      6. OBJECT skeleton key ``somexy`` in the outer room (rejects the
+         sub-room bbox): repeat ``rn1(RS,olx), rn1(RS,oly)`` until accepted
+      7. hero start: ``rn2(1)`` then ``somexy`` in the outer room (same
+         rejection) -> ``player_pos``
+
+    ``somex = rn1(w, lx) = rn2(w) + lx`` / ``somey = rn1(h, ly)`` (vendor
+    mkroom.c:640-651).  We work in NLE-internal coordinates (same frame as
+    ``state.terrain``): the rn2 value is identical, we add the internal room
+    origin.  ``build_glyphs`` applies the internal->obs column shift at render
+    time.  The sub-room/door are stamped into ``state.terrain``; the down-stair
+    sits in the locked sub-room (never in hero LoS at reset) and the key lands
+    in the outer room.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TT
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    import numpy as _np
+
+    x1, y1 = _keyroom_center(room_size)          # outer interior top-left (internal)
+    RS, SS = room_size, subroom_size
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+
+        def rn2(n):
+            nonlocal vrng
+            vrng, v = _vendor_rng.rn2_jax(vrng, jnp.int32(n))
+            return int(v)
+
+        # (1) preamble + (2) build_room rtype rolls (values unused).
+        rn2(3); rn2(2)
+        rn2(100); rn2(100)
+
+        # (3) sub-room position.  Fixed layout: (0,0).  Sized: create_subroom
+        # random x/y = rnd(RS-SS-1)-1 with the vendor 1->0 / edge nudges.
+        if fixed:
+            sub_dx, sub_dy = 0, 0
+        else:
+            span = RS - SS - 1
+            sub_dx = (rn2(span) + 1) - 1 if span > 0 else 0   # rnd(span)-1
+            sub_dy = (rn2(span) + 1) - 1 if span > 0 else 0
+            if sub_dx == 1:
+                sub_dx = 0
+            if sub_dy == 1:
+                sub_dy = 0
+            if sub_dx + SS + 1 == RS:
+                sub_dx += 1
+            if sub_dy + SS + 1 == RS:
+                sub_dy += 1
+        sx1 = x1 + sub_dx
+        sy1 = y1 + sub_dy
+        sx2 = sx1 + SS - 1
+        sy2 = sy1 + SS - 1
+
+        # ---- carve the sub-room walls/floor into a working terrain copy so
+        # create_door's IS_ROCK / okdoor checks see the real map -------------
+        terrain = _np.asarray(state.terrain).copy()
+        _WALL = int(_TT.WALL)
+        _FLOOR = int(_TT.FLOOR)
+        _VOID = int(_TT.VOID)
+        _CLOSED = int(_TT.CLOSED_DOOR)
+        _Hn, _Wn = terrain.shape[2], terrain.shape[3]
+        # sub-room wall ring then floor (matches _resolve_and_carve_room).
+        for r in range(sy1 - 1, sy2 + 2):
+            for c in range(sx1 - 1, sx2 + 2):
+                if 0 <= r < _Hn and 0 <= c < _Wn:
+                    if r < sy1 or r > sy2 or c < sx1 or c > sx2:
+                        terrain[0, 0, r, c] = _WALL
+        for r in range(sy1, sy2 + 1):
+            for c in range(sx1, sx2 + 1):
+                terrain[0, 0, r, c] = _FLOOR
+
+        # (4) STAIR somexy inside the sub-room (SS x SS).
+        stair_x = rn2(SS) + sx1
+        stair_y = rn2(SS) + sy1
+
+        # (5) ROOMDOOR.  Fixed layout: deterministic DOOR (2,1) on the sub-room
+        # east wall, row +1.  Sized: vendor create_door (random wall/pos).
+        if fixed:
+            door_x = sx2 + 1
+            door_y = sy1 + 1
+        else:
+            door_x, door_y = _keyroom_create_door(
+                rn2, terrain, sx1, sy1, sx2, sy2, _WALL, _VOID,
+            )
+
+        # helper: vendor somexy rejection in the outer room (mkroom.c:663) —
+        # reject cells inside the sub-room bounding box (inside_room: floor +
+        # its wall ring, lx-1..hx+1 / ly-1..hy+1).
+        def _reject(cx, cy):
+            return (sx1 - 1 <= cx <= sx2 + 1) and (sy1 - 1 <= cy <= sy2 + 1)
+
+        # (6) OBJECT skeleton key somexy in the outer room.
+        key_x = key_y = None
+        for _ in range(100):
+            cx = rn2(RS) + x1
+            cy = rn2(RS) + y1
+            if not _reject(cx, cy):
+                key_x, key_y = cx, cy
+                break
+
+        # (7) hero start: rn2(1) room-pick + somexy in the outer room.
+        rn2(1)
+        px, py = x1, y1
+        for _ in range(100):
+            cx = rn2(RS) + x1
+            cy = rn2(RS) + y1
+            if not _reject(cx, cy):
+                px, py = cx, cy
+                break
+
+        # ---- stamp stair + locked door -----------------------------------
+        terrain[0, 0, stair_y, stair_x] = int(_TT.STAIRCASE_DOWN)
+        if door_x is not None:
+            terrain[0, 0, door_y, door_x] = _CLOSED
+
+        state = state.replace(
+            vendor_rng=vrng,
+            terrain=jnp.asarray(terrain, dtype=state.terrain.dtype),
+            player_pos=jnp.array([py, px], dtype=jnp.int16),
+        )
+        # Record the locked-door feature so the engine treats it as locked
+        # (features.door_state[level=0, row, col]); this does not affect the
+        # reset glyph (a closed door renders '+' regardless) but keeps the
+        # task's locked-door gameplay intact.
+        if door_x is not None:
+            from Nethax.nethax.subsystems.features import DoorState as _DoorState
+            ds_arr = jnp.asarray(state.features.door_state)
+            ds_arr = ds_arr.at[0, door_y, door_x].set(
+                jnp.int8(int(_DoorState.LOCKED)))
+            state = state.replace(
+                features=state.features.replace(door_state=ds_arr),
+            )
+        # Reposition the builder-placed skeleton key ground item to the vendor
+        # somexy cell (key_x, key_y).  The builder created exactly one ground
+        # item (the key); dense_to_sparse stored it at K-index 0.  We only move
+        # its (row, col) — the item payload and stack slot are unchanged.
+        if key_x is not None:
+            gi = state.ground_items
+            _pos = jnp.asarray(gi.pos)
+            _pos = _pos.at[0, 0, 0, 0].set(jnp.int16(key_y))
+            _pos = _pos.at[0, 0, 0, 1].set(jnp.int16(key_x))
+            state = state.replace(ground_items=gi.replace(pos=_pos))
+        del stair_x, stair_y
+        return _seed_hero_fov(state, lit)
+
+    return wrapped
+
+
+def _keyroom_create_door(rn2, terrain, sx1, sy1, sx2, sy2, wall_tile, void_tile):
+    """Faithful port of vendor ``create_door`` (sp_lev.c:1345-1446) for the
+    sized KeyRoom ROOMDOOR (``false, locked, random, random``): random wall,
+    random position; mask + secret are fixed so they draw nothing.
+
+    Per do-while iteration (vendor order):
+      * ``dwall = 1 << rn2(4)``   — the wall the door "wants" (random)
+      * ``wtry = rn2(4)``         — the wall direction actually tried
+      * if ``wtry`` selects a direction whose bit is set in ``dwall``:
+          ``dpos = rn2(1 + span)`` — position along that wall
+          then reject (redo, NO further draw) if the cell *beyond* the wall
+          IS_ROCK (so only walls facing the outer-room interior qualify)
+      * accept (break) when ``okdoor`` holds: the cell is a plain wall and is
+        not adjacent to an existing door (always true here — one door total).
+
+    ``terrain`` is the numpy working map (already carrying the outer room +
+    carved sub-room).  ``IS_ROCK`` (rm.h) is true for stone/VOID and walls;
+    room floor / doors / stairs are not rock.  Returns ``(door_x, door_y)`` or
+    ``(None, None)`` if 100 tries fail.
+    """
+    W_NORTH, W_SOUTH, W_EAST, W_WEST = 1, 2, 4, 8  # sp_lev.h wall bits
+    H, W = terrain.shape[2], terrain.shape[3]
+
+    def is_rock(cx, cy):
+        if not (0 <= cy < H and 0 <= cx < W):
+            return True
+        t = int(terrain[0, 0, cy, cx])
+        return t == void_tile or t == wall_tile
+
+    def okdoor(cx, cy):
+        # vendor okdoor: cell is HWALL/VWALL and not adjacent to a door.
+        # Only one door is ever placed here, so bydoor() is always False.
+        return 0 <= cy < H and 0 <= cx < W and int(terrain[0, 0, cy, cx]) == wall_tile
+
+    for _ in range(100):
+        dwall = 1 << rn2(4)
+        wtry = rn2(4)
+        x = y = -1
+        if wtry == 0:      # north wall
+            if not (dwall & W_NORTH):
+                continue
+            y = sy1 - 1
+            x = sx1 + rn2(1 + (sx2 - sx1))
+            if is_rock(x, y - 1):
+                continue
+        elif wtry == 1:    # south wall
+            if not (dwall & W_SOUTH):
+                continue
+            y = sy2 + 1
+            x = sx1 + rn2(1 + (sx2 - sx1))
+            if is_rock(x, y + 1):
+                continue
+        elif wtry == 2:    # west wall
+            if not (dwall & W_WEST):
+                continue
+            x = sx1 - 1
+            y = sy1 + rn2(1 + (sy2 - sy1))
+            if is_rock(x - 1, y):
+                continue
+        else:              # east wall
+            if not (dwall & W_EAST):
+                continue
+            x = sx2 + 1
+            y = sy1 + rn2(1 + (sy2 - sy1))
+            if is_rock(x + 1, y):
+                continue
+        if okdoor(x, y):
+            return x, y
+    return None, None
 
 
 def _register_keyroom_envs(register_fn) -> None:
     """Register all KeyRoom envs.
 
-    Vendor Fixed-S5 ships ``key_and_door.des`` (envs/keyroom.py:82); the
-    sized variants are materialised by ``KeyRoomGenerator`` from
-    ``key_and_door_tmp.des`` with RS/SS/lit substitutions (keyroom.py:13-27).
-    Both vendor layouts place a **locked DOOR/ROOMDOOR** between the outer
-    room (holding the skeleton key) and the sub-room (holding the down
-    stair) — that locked door is the entire point of the task.
-
-    The des_parser path produced a degenerate map for these templates
-    (only the sub-room rendered: no outer room, no door, no key, no stair),
-    so we route every KeyRoom variant through the hand-coded
-    ``_keyroom_builder``, which mirrors the vendor structure and now stamps
-    the locked door into ``features.door_state`` (see level_generator.py).
+    Vendor Fixed-S5 ships ``key_and_door.des`` (envs/keyroom.py:82) with a
+    deterministic SUBROOM (0,0) / DOOR (2,1); the sized variants are
+    materialised by ``KeyRoomGenerator`` from ``key_and_door_tmp.des`` with a
+    RANDOM sub-room + random ROOMDOOR.  Both place a **locked** door between
+    the outer room (holding the skeleton key) and the sub-room (holding the
+    down stair).  Every variant now routes through the hand-coded outer-room
+    builder plus :func:`_wrap_keyroom_placement`, which reproduces vendor's
+    ISAAC64 mklev draws (the Rogue role bootstrap aligns the stream).
     """
     variants = [
-        # (env_id, room_size, subroom_size, lit, max_steps)
-        ("MiniHack-KeyRoom-Fixed-S5-v0", 5,  2, True,  200),
-        ("MiniHack-KeyRoom-S5-v0",       5,  2, True,  200),
-        ("MiniHack-KeyRoom-Dark-S5-v0",  5,  2, False, 200),
-        ("MiniHack-KeyRoom-S15-v0",      15, 5, True,  400),
-        ("MiniHack-KeyRoom-Dark-S15-v0", 15, 5, False, 400),
+        # (env_id, room_size, subroom_size, lit, fixed, max_steps)
+        ("MiniHack-KeyRoom-Fixed-S5-v0", 5,  2, True,  True,  200),
+        ("MiniHack-KeyRoom-S5-v0",       5,  2, True,  False, 200),
+        ("MiniHack-KeyRoom-Dark-S5-v0",  5,  2, False, False, 200),
+        ("MiniHack-KeyRoom-S15-v0",      15, 5, True,  False, 400),
+        ("MiniHack-KeyRoom-Dark-S15-v0", 15, 5, False, False, 400),
     ]
-    for env_id, rs, ss, lit, ms in variants:
+    for env_id, rs, ss, lit, fixed, ms in variants:
         # Full 80x21 dungeon so the vendor GEOMETRY:center outer room
-        # (``_keyroom_center``) can be stamped at its absolute location
-        # instead of being clamped to a 20-wide LG.
-        factory = _make_factory(
+        # (``_keyroom_center``) can be stamped at its absolute location.
+        base = _make_factory(
             _keyroom_builder(rs, ss, lit),
             w=80, h=21, fill=" ", lit=lit,
         )
+        factory = _wrap_keyroom_placement(base, rs, ss, lit, fixed)
         register_fn(env_id, factory, _keyroom_rm(),
                     max_steps=ms, category="KeyRoom")
 
