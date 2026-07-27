@@ -286,6 +286,20 @@ _OBJECT_IS_WEPTOOL: jnp.ndarray = jnp.array(
     dtype=jnp.bool_,
 )  # bool[NUM_OBJECTS]
 
+# Ammo / missile weapons: WEAPON_CLASS with oc_skill < 0.  Vendor objclass.h
+# encodes launcher skills as positive P_BOW..P_CROSSBOW and their ammo /
+# thrown missiles as the NEGATED skill (is_ammo / is_missile macros test the
+# negative range).  ini_inv (u_init.c:1143) routes these to the quiver
+# (setuqwep) rather than uwep/uswapwep, so they must be excluded when deriving
+# the alternate weapon.  Cite: vendor/nle/include/objclass.h is_ammo/is_missile.
+_OBJECT_IS_AMMO_MISSILE: jnp.ndarray = jnp.array(
+    [
+        obj.class_ == ObjectClass.WEAPON_CLASS and int(obj.oc_skill) < 0
+        for obj in OBJECTS
+    ],
+    dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS]
+
 # Monster name byte table — for corpse/tin rendering.
 # vendor/nethack/src/objnam.c:1824 (corpse_xname), eat.c:1456 (tin monster meat).
 _MAX_MONSTER_NAME_LEN = 32
@@ -874,7 +888,7 @@ def _equip_status_idx(inv_state, slot_idx: jax.Array,
 
 def _render_slot(inv_state, id_state, slot_idx: jax.Array,
                   two_weapon: jax.Array, alt_slot: jax.Array,
-                  swap_weapon: jax.Array) -> jax.Array:
+                  swap_weapon: jax.Array, descr_idx: jax.Array) -> jax.Array:
     """Render one inventory slot as an 80-byte uint8 string.
 
     Empty slots (category == 0) return all-zero buffers.
@@ -943,6 +957,15 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     # (long-u, 'one', single-letter, x-consonant).
     # Vendor: objnam.c::just_an() lines 2108-2142.
     safe_type = jnp.clip(type_id, 0, _MAX_OBJ - 1).astype(jnp.int32)
+    # Shuffled appearance index (vendor objects[otyp].oc_descr_idx after
+    # init_objects()).  For an unidentified item the displayed appearance
+    # word is the description stored at descr_idx[otyp], NOT the canonical
+    # type's own description — mirrors glyph_shuffle.shuffled_glyph and how
+    # build_inv_glyphs applies the shuffle.  In default (non-byte-parity)
+    # mode descr_idx is identity, so app_type == safe_type.  The shuffle
+    # permutes only within an object class, so the class noun is invariant.
+    # Cite: vendor/nle/win/rl/winrl.cc::shuffled_glyph; objnam.c::xname.
+    app_type  = jnp.clip(descr_idx[safe_type], 0, _MAX_OBJ - 1).astype(jnp.int32)
     has_app   = _HAS_APPEARANCE[safe_type]
     # bknown: player knows the BUC status of this item (vendor objnam.c:1318).
     # When False, suppress the "blessed"/"cursed"/"uncursed" prefix.
@@ -955,7 +978,7 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     #   - Otherwise, the noun/appearance is first.
     # Vendor: doname_base objnam.c:1686-1692 calls just_an() on the first
     # non-article word in the prefix buffer (BUC word when present, else name).
-    noun_use_an = jnp.where(show_app, _APP_USE_AN[safe_type], _OBJECT_USE_AN[safe_type])
+    noun_use_an = jnp.where(show_app, _APP_USE_AN[app_type], _OBJECT_USE_AN[safe_type])
     buc_use_an  = _BUC_USE_AN[buc_row]
     # Implicit-uncursed suppression (vendor objnam.c:1328-1348): omit the
     # "uncursed" word for an identified oc_charged item that is NOT armor/ring
@@ -1152,7 +1175,7 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         # Identified OR no appearance    -> class prefix (if any) + canonical name
         b, c = lax.cond(
             show_app,
-            lambda bc: _write_appearance(bc[0], bc[1], safe_type, quantity),
+            lambda bc: _write_appearance(bc[0], bc[1], app_type, quantity),
             lambda bc: _write_true_name(bc[0], bc[1], safe_type, obj_class,
                                         quantity, category, type_id,
                                         buc_status, identified, enchantment,
@@ -1583,6 +1606,48 @@ def _write_charges(buf, cursor, recharged, charges):
 
 
 # ---------------------------------------------------------------------------
+# Alternate-weapon (uswapwep) derivation
+# ---------------------------------------------------------------------------
+
+def _derive_uswapwep(items) -> jax.Array:
+    """Return the inventory slot index of ``uswapwep`` (-1 if none).
+
+    Ports the weapon-assignment pass of vendor ``ini_inv``
+    (vendor/nle/src/u_init.c:1141-1150): iterating the starting inventory in
+    slot order, each WEAPON_CLASS / is_weptool item that is *not* ammo/missile
+    (those go to the quiver) is assigned to ``uwep`` if unset, else to
+    ``uswapwep`` if unset.  Thus the SECOND such eligible item — in slot
+    order — is the alternate weapon.  The Knight (long sword + lance) is the
+    canonical case: long sword -> uwep, lance -> uswapwep.
+
+    ``character.py`` sets ``inventory.swap_weapon`` explicitly for the roles it
+    special-cases (Rogue, Archeologist); this derivation is used only as a
+    fallback for roles it does not (Knight), so those explicit values are never
+    overridden.  JIT-safe (fixed-trip ``lax.fori_loop`` over the 52 real slots).
+    Cite: vendor/nle/src/u_init.c:1141-1150.
+    """
+    cat = items.category.astype(jnp.int32)                       # int32[52]
+    tid = jnp.clip(items.type_id, 0, _MAX_OBJ - 1).astype(jnp.int32)
+    is_weaponish = (cat == jnp.int32(_WEAPON_CLASS_VAL)) | _OBJECT_IS_WEPTOOL[tid]
+    is_ammo_miss = _OBJECT_IS_AMMO_MISSILE[tid]
+    eligible = is_weaponish & ~is_ammo_miss & (cat != jnp.int32(0))
+
+    def body(i, carry):
+        seen, uswap = carry
+        e = eligible[i]
+        # The second eligible item (seen == 1 when we reach it) is uswapwep.
+        is_second = e & (seen == jnp.int32(1)) & (uswap < jnp.int32(0))
+        uswap = jnp.where(is_second, i, uswap)
+        seen = jnp.where(e, seen + jnp.int32(1), seen)
+        return seen, uswap
+
+    _, uswap = lax.fori_loop(
+        0, MAX_INVENTORY_SLOTS, body, (jnp.int32(0), jnp.int32(-1))
+    )
+    return uswap
+
+
+# ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
@@ -1618,13 +1683,30 @@ def build_inv_strs(state) -> jnp.ndarray:
     alt_slot_i32 = jnp.asarray(alt_slot).astype(jnp.int32)
     swap_weapon = getattr(inv_state, "swap_weapon", jnp.int8(-1))
     swap_weapon_i32 = jnp.asarray(swap_weapon).astype(jnp.int32)
+    # Fallback: when the state does not carry an explicit uswapwep slot
+    # (character.py sets it only for Rogue/Archeologist), derive it from the
+    # starting-inventory weapon layout so Knight's lance renders the vendor
+    # " (alternate weapon; not wielded)" suffix.  Explicit values win.
+    _derived_swap = _derive_uswapwep(inv_state.items)
+    swap_weapon_i32 = jnp.where(
+        swap_weapon_i32 >= jnp.int32(0), swap_weapon_i32, _derived_swap
+    )
+
+    # descr_idx[otyp] — shuffled appearance index (identity in default mode).
+    # Drives the unidentified-item appearance word so inv_strs matches the
+    # shuffled inv_glyphs (vendor init_objects() shuffle).  Graceful identity
+    # default for minimal-state test callers without a descr_idx field.
+    descr_idx = getattr(state, "descr_idx", None)
+    if descr_idx is None:
+        descr_idx = jnp.arange(_MAX_OBJ, dtype=jnp.int32)
+    descr_idx_i32 = jnp.asarray(descr_idx).astype(jnp.int32)
 
     # vmap over slot indices [0..54]
     slot_indices = jnp.arange(NLE_INV_SLOTS, dtype=jnp.int32)
 
     def render_one(slot_idx):
         return _render_slot(inv_state, id_state, slot_idx, two_weapon,
-                            alt_slot_i32, swap_weapon_i32)
+                            alt_slot_i32, swap_weapon_i32, descr_idx_i32)
 
     # lax.map applies render_one SEQUENTIALLY (55-deep scan, ~230k serial op-
     # executions) for low memory.  Under NETHAX_VEC_MONSTERS (training-speed mode)
