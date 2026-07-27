@@ -97,11 +97,12 @@ class TileType(IntEnum):
                        # (envs/river.py) draws its river with 'W', so its cells
                        # must render S_water, not S_pool.  Appended at the tail
                        # so the existing 0..25 terrain->cmap indices are
-                       # unchanged (gate-neutral).  Walkable + non-opaque in the
-                       # default tables exactly like TileType.WATER; River's
-                       # reset FOV occludes it explicitly (canonical.py
-                       # _wrap_river_placement), matching vendor does_block which
-                       # treats typ == WATER as opaque (vision.c:167-168).
+                       # unchanged (gate-neutral).  Walkable like TileType.WATER
+                       # but OPAQUE (listed in OPAQUE_TILES below): vendor
+                       # does_block treats typ == WATER as blocking LOS
+                       # (vision.c:167-168), so the hero cannot see past the
+                       # river.  River's reset FOV also occludes it explicitly
+                       # (canonical.py _wrap_river_placement).
 
 
 NUM_TILE_TYPES: int = len(TileType)
@@ -183,8 +184,13 @@ SOLID_TILES = jnp.array(
 # IS_TREE and CLOUD as opaque).  They were previously stored as VOID (which is
 # already opaque) in the HideNSeek terrain overlay; now that they carry their
 # own TileType so they can render as S_tree/S_cloud, they must remain opaque.
+# DEEPWATER (the MiniHack-River 'W' terrain, vendor typ WATER) is opaque too:
+# vendor does_block (vision.c:167-168) treats typ == WATER as blocking LOS, so
+# the hero cannot see past the river.  DEEPWATER appears only in River levels,
+# so this entry is River-scoped in practice; pool/moat TileType.WATER stays
+# non-opaque.  (River-Lava's LAVA does NOT block and is deliberately absent.)
 OPAQUE_TILES = jnp.array(
     [TileType.VOID, TileType.WALL, TileType.CLOSED_DOOR,
-     TileType.TREE, TileType.CLOUD],
+     TileType.TREE, TileType.CLOUD, TileType.DEEPWATER],
     dtype=jnp.int32,
 )

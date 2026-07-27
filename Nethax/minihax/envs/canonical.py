@@ -2775,15 +2775,18 @@ def _wrap_river_placement(
 
         # Re-seed the hero's reset FOV.  This mirrors
         # ``level_generator.seed_hero_fov(state, default_lit=True)`` but adds
-        # the WATER strip to the line-of-sight occluder set: vendor
+        # the river strip to the line-of-sight occluder set: vendor
         # ``does_block`` (vision.c:167-168) treats ``typ == WATER`` as opaque
         # (like boulders and walls), so the hero cannot see past the river.
-        # ``seed_hero_fov`` occludes only boulders, which over-reveals the far
-        # bank; building the couldsee mask here with a boulder + WATER overlay
-        # matches vendor's shadow-cast.  (LAVA does NOT block — excluded.)
+        # The River builder now retags its river cells as ``DEEPWATER`` (so
+        # they render ``S_water`` instead of ``S_pool``), so occlude on
+        # ``DEEPWATER`` here.  ``seed_hero_fov`` occludes only boulders, which
+        # over-reveals the far bank; building the couldsee mask here with a
+        # boulder + DEEPWATER overlay matches vendor's shadow-cast.  (LAVA does
+        # NOT block — excluded.)
         terrain_l0 = state.terrain[0, 0]
         occ = _boulder_opaque_overlay(state, terrain_l0.shape) | (
-            terrain_l0 == jnp.int8(int(_TileType.WATER))
+            terrain_l0 == jnp.int8(int(_TileType.DEEPWATER))
         )
         couldsee = _view_from(
             terrain_l0,
@@ -2809,6 +2812,42 @@ def _wrap_river_placement(
                 jnp.where(vis, terrain_l0.astype(jnp.int8), jnp.int8(-1))
             ),
         )
+
+    return wrapped
+
+
+def _wrap_river_deepwater(
+    factory: Callable[[jax.Array], "EnvState"],
+) -> Callable[[jax.Array], "EnvState"]:
+    """Retag the River's river cells from ``TileType.WATER`` to
+    ``TileType.DEEPWATER``.
+
+    The vendor ``river.py`` MAP draws its river strip with the ``'W'`` mapchar,
+    which ``TERRAIN_CHAR_TO_TILE`` stamps as ``TileType.WATER`` — rendered by
+    ``nle_obs`` as ``S_pool`` (cmap 32, glyph 2391).  Vendor NetHack, however,
+    maps the ``'W'`` MAP char to terrain typ ``WATER`` (rm.h:57) which renders
+    ``S_water`` (cmap 41, glyph 2400).  ``nle_obs._TILE_TO_CMAP[DEEPWATER]``
+    already maps to ``S_water``, so retagging the strip's cells makes the
+    ``glyphs`` obs byte-exact.
+
+    Scoped to River: this wrapper is applied only to the River factories, whose
+    only water is the river strip (River levels have no pool/moat).  A blanket
+    ``WATER -> DEEPWATER`` retag over the River terrain therefore touches
+    nothing but the river, and leaves the global ``TERRAIN_CHAR_TO_TILE`` /
+    pool/moat ``TileType.WATER`` rendering (still ``S_pool``) untouched.  LAVA
+    cells (River-Lava) are a different tile and are unaffected.
+    """
+    from Nethax.nethax.constants.tiles import TileType as _TileType
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        terr = state.terrain
+        retagged = jnp.where(
+            terr == jnp.int8(int(_TileType.WATER)),
+            jnp.int8(int(_TileType.DEEPWATER)),
+            terr,
+        )
+        return state.replace(terrain=retagged)
 
     return wrapped
 
@@ -2850,6 +2889,11 @@ def _register_river_envs(register_fn) -> None:
         factory = _make_factory(
             _river_builder(narrow, lava, nm), w=80, h=21, fill=" ",
         )
+        # Retag the river strip's cells (stamped as TileType.WATER via the 'W'
+        # mapchar) to TileType.DEEPWATER so they render S_water (glyph 2400)
+        # like vendor, not S_pool (2391).  Scoped to River (its only water is
+        # the strip); applied to every variant, monster and no-monster alike.
+        factory = _wrap_river_deepwater(factory)
         # Byte-parity path: for the no-monster variants (River / River-Lava /
         # River-Narrow) replay vendor's mklev boulder + branch-hero draws off
         # ``state.vendor_rng`` so the 5 boulders and the random hero start land
