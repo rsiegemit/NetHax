@@ -1938,9 +1938,28 @@ def _consume_lava_item_draws(vrng, with_potion: bool, with_ring: bool):
         if r != 0:
             vrng, _ = rn2(vrng, 9)
         return vrng
-    # levitation boots (ARMOR_CLASS): reuse the skills_simple armor path.
-    from Nethax.nethax.constants.objects import ObjectClass as _OC
-    return _consume_mksobj_draws(vrng, int(_OC.ARMOR_CLASS))
+    # levitation boots (ARMOR_CLASS): LEVITATION_BOOTS is one of the
+    # special "always cursed on !rn2(10)" armors (mkobj.c:992-1006), so it
+    # does NOT follow the generic robe path in _consume_mksobj_draws (which
+    # draws rn2(11)).  Faithful sequence:
+    #   rn2(10); if !=0 -> spe=-rne(3)  [OR-list short-circuits !rn2(11)]
+    #            else   -> rn2(10); if ==0 -> rn2(2), rne(3)
+    #                                else  -> blessorcurse(10)
+    #   then artif -> rn2(40).
+    # Ground-truthed LavaCross-Full seed1: rn2(10)=6 -> rne(3)=[0,0,0,2] ->
+    # rn2(40)=0  (draws (10,6)(3,0)(3,0)(3,0)(3,2)(40,0)).
+    v, r = rn2(vrng, 10)
+    if r != 0:
+        v = rne(v, 3)
+    else:
+        v, r2 = rn2(v, 10)
+        if r2 == 0:
+            v, _ = rn2(v, 2)
+            v = rne(v, 3)
+        else:
+            v = blessorcurse(v, 10)
+    v, _ = rn2(v, 40)
+    return v
 
 
 def _wrap_lavacross_placement(
@@ -2049,6 +2068,53 @@ def _wrap_lavacross_placement(
     return wrapped
 
 
+def _carry_starting_inventory_item(state, obj_idx: int, buc_status: int):
+    """Append a des ``INV:``-style carried item to the hero's inventory.
+
+    Used by the LavaCross ``-Inv-`` variants: the des places the levitation
+    item on the floor at the hero's start cell with ``autopickup=True``, so
+    vendor auto-picks it up during level entry — at reset it is in inventory
+    (unidentified, appearance-only) and NOT on the floor.
+
+    Writes into the first empty slot of the (already role-``ini_inv``-populated)
+    ``state.inventory``, preserving slots 0..N-1 (and their worn/wielded
+    annotations) untouched — a surgical slot write, not a from_items rebuild.
+
+    Item fields mirror a freshly auto-picked-up object the hero has *seen* but
+    not identified: ``dknown=True`` (random appearance shown, e.g. "a dark
+    potion"), ``bknown=False`` (BUC not revealed -> no "blessed" prefix),
+    ``identified=False`` (type unknown).  ``type_id`` uses the OBJECTS-table
+    index convention (matching ``_write_ground_item``) so the inv_glyphs
+    shuffle (GLYPH_OBJ_OFF + type_id) lands on vendor's per-run glyph.
+    """
+    import numpy as _np
+    from Nethax.nethax.subsystems.inventory import make_item as _make_item
+    from Nethax.nethax.constants.objects import OBJECTS as _OBJ
+
+    entry = _OBJ[obj_idx] if 0 <= obj_idx < len(_OBJ) else None
+    category = int(entry.class_) if entry is not None else 0
+    weight = int(entry.weight) if entry is not None else 0
+
+    inv = state.inventory
+    cat = _np.asarray(inv.items.category)
+    empties = _np.where(cat == 0)[0]
+    if empties.size == 0:
+        return state
+    slot = int(empties[0])
+
+    item = _make_item(
+        category=category, type_id=int(obj_idx), quantity=1, weight=weight,
+        buc_status=int(buc_status), identified=False,
+        bknown=False, dknown=True, rknown=False,
+    )
+    new_items = jax.tree_util.tree_map(
+        lambda arr, val: arr.at[slot].set(val), inv.items, item
+    )
+    new_letters = inv.letters.at[slot].set(jnp.int8(ord("a") + slot))
+    return state.replace(inventory=inv.replace(items=new_items,
+                                               letters=new_letters))
+
+
 def _wrap_lavacross_inv(
     factory: Callable[[jax.Array], "EnvState"],
     *,
@@ -2075,11 +2141,6 @@ def _wrap_lavacross_inv(
     from Nethax.minihax.level_generator import (
         seed_hero_fov as _seed_hero_fov,
         _OBJECT_NAME_TO_IDX as _NAME2IDX,
-        _write_ground_item as _write_gi,
-    )
-    from Nethax.nethax.subsystems.ground_items_sparse import (
-        dense_to_sparse as _dense_to_sparse,
-        sparse_to_dense as _sparse_to_dense,
     )
 
     xstart, ystart = _vendor_geometry_center_wh(13, 7)
@@ -2116,13 +2177,6 @@ def _wrap_lavacross_inv(
             0, 0, stair_row, stair_col
         ].set(jnp.int8(int(_TT.STAIRCASE_DOWN)))
 
-        if obj_idx is not None:
-            dense = _sparse_to_dense(state.ground_items)
-            dense, _ = _write_gi(dense, {}, (fixed_row, fixed_col), int(obj_idx))
-            state = state.replace(
-                ground_items=_dense_to_sparse(dense, state.ground_items.K)
-            )
-
         state = state.replace(
             vendor_rng=vrng,
             terrain=new_terrain,
@@ -2131,6 +2185,14 @@ def _wrap_lavacross_inv(
                  jnp.int32(fixed_col).astype(jnp.int16)]
             ),
         )
+
+        # ``autopickup=True`` + hero placed on the OBJECT cell -> vendor
+        # auto-picks the (blessed) levitation item into inventory at level
+        # entry; it is carried (unidentified appearance), not on the floor.
+        if obj_idx is not None:
+            state = _carry_starting_inventory_item(state, int(obj_idx),
+                                                   buc_status=3)
+
         return _seed_hero_fov(state, True)
 
     return wrapped
@@ -2240,6 +2302,144 @@ def _wrap_lavacross_levitate_any(
     return wrapped
 
 
+def _wrap_lavacross_full(
+    factory: Callable[[jax.Array], "EnvState"],
+) -> Callable[[jax.Array], "EnvState"]:
+    """MiniHack-LavaCross-{Full,Restricted}: the shipped ``lava_crossing.des``.
+
+    Same 13x7 lava MAP as the Levitate skill grid, but the object is chosen
+    from an OUTER ``IF [50%]`` (levitate vs freeze), each sub-branch drawing an
+    ``rn2(100)`` (mkobj.c) exactly like ``_wrap_lavacross_levitate_any`` plus:
+        IF [50%] levitate {           # rn2(100) < 50
+            IF [33%] potion  ELSE IF [50%] ring ELSE boots
+        } ELSE freeze {               # rn2(100) >= 50
+            IF [50%] wand of cold ELSE frost horn
+        }
+    Draw order (ground-truthed .test_runs/_lc/_cap.py, seeds 0/1/2):
+        rn2(3), rn2(2)                 -- level-setup prefix
+        rn2(100) [levitate?]           -- outer branch
+        rn2(100)[, rn2(100)]           -- item-type sub-branch
+        rn2(25)                        -- OBJECT rndcoord($left_bank)
+        <item mksobj draws>            -- class-specific (see below)
+        rn2(25)                        -- STAIR rndcoord($right_bank)
+        rn2(5), rn2(5)                 -- BRANCH player in left_bank
+    Item mksobj draws:
+        potion  -> blessorcurse(4)                    (_consume_lava_item_draws)
+        ring    -> rn2(10)[, rn2(9)]                  (_consume_lava_item_draws)
+        boots   -> LEVITATION_BOOTS armor path        (_consume_lava_item_draws)
+        wand    -> rn2(5), blessorcurse(17)           (WAND_CLASS)
+        horn    -> rn2(5)                              (FROST_HORN rn1(5,4))
+    Coordinate decode mirrors the Levitate wrappers (LG-internal coords; the
+    NLE glyphs array is shifted -1 in x, so obj LG col 36 renders at glyph 35).
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TT
+    from Nethax.nethax.constants.objects import ObjectClass as _OC
+    from Nethax.minihax.level_generator import (
+        seed_hero_fov as _seed_hero_fov,
+        _write_ground_item as _write_gi,
+    )
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        dense_to_sparse as _dense_to_sparse,
+        sparse_to_dense as _sparse_to_dense,
+    )
+
+    xstart, ystart = _vendor_geometry_center_wh(13, 7)
+    ix0 = xstart + 1
+    iy0 = ystart + 1
+    left_x0 = ix0
+    right_x0 = ix0 + 6
+    row0 = iy0
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+
+        # Outer IF[50%]: levitate vs freeze.
+        vrng, r0 = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        levitate = int(r0) < 50
+
+        with_boots = False
+        with_wand = False
+        if levitate:
+            vrng, r1 = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+            with_potion = int(r1) < 33
+            with_ring = False
+            if not with_potion:
+                vrng, r2 = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+                with_ring = int(r2) < 50
+                with_boots = not with_ring
+            if with_potion:
+                obj_idx = _resolve_skill_obj_idx("potion of levitation", "!")
+            elif with_ring:
+                obj_idx = _resolve_skill_obj_idx("ring of levitation", "=")
+            else:
+                obj_idx = _resolve_skill_obj_idx("levitation boots", "[")
+        else:
+            with_potion = False
+            with_ring = False
+            vrng, rf = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+            with_wand = int(rf) < 50
+            if with_wand:
+                obj_idx = _resolve_skill_obj_idx("cold", "/")
+            else:
+                obj_idx = _resolve_skill_obj_idx("frost horn", "(")
+
+        # OBJECT rndcoord($left_bank).
+        vrng, oi = _vendor_rng.rn2_jax(vrng, jnp.int32(25))
+        oi = int(oi)
+        obj_col = left_x0 + (oi // 5)
+        obj_row = row0 + (oi % 5)
+
+        # Item mksobj draws (class-specific).
+        if levitate:
+            # potion / ring / boots all handled by _consume_lava_item_draws.
+            vrng = _consume_lava_item_draws(vrng, with_potion, with_ring)
+        elif with_wand:
+            vrng = _consume_mksobj_draws(vrng, int(_OC.WAND_CLASS))
+        else:
+            # frost horn: spe = rn1(5,4) -> single rn2(5).
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+
+        # STAIR rndcoord($right_bank).
+        vrng, si = _vendor_rng.rn2_jax(vrng, jnp.int32(25))
+        si = int(si)
+        stair_col = right_x0 + (si // 5)
+        stair_row = row0 + (si % 5)
+
+        # BRANCH player: rn2(5), rn2(5) in left_bank.
+        vrng, px = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, py = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        start_col = left_x0 + int(px)
+        start_row = row0 + int(py)
+
+        new_terrain = state.terrain.at[
+            0, 0, stair_row, stair_col
+        ].set(jnp.int8(int(_TT.STAIRCASE_DOWN)))
+
+        if obj_idx is not None:
+            dense = _sparse_to_dense(state.ground_items)
+            dense, _ = _write_gi(dense, {}, (obj_row, obj_col), int(obj_idx))
+            state = state.replace(
+                ground_items=_dense_to_sparse(dense, state.ground_items.K)
+            )
+
+        state = state.replace(
+            vendor_rng=vrng,
+            terrain=new_terrain,
+            player_pos=jnp.stack(
+                [jnp.int32(start_row).astype(jnp.int16),
+                 jnp.int32(start_col).astype(jnp.int16)]
+            ),
+        )
+        return _seed_hero_fov(state, True)
+
+    return wrapped
+
+
 def _register_lavacross_envs(register_fn) -> None:
     # 15 LavaCross variants per vendor counts.
     skill_variants = [
@@ -2272,14 +2472,15 @@ def _register_lavacross_envs(register_fn) -> None:
         # Full 80x21 VOID grid so GEOMETRY:center,center lands the 13x7 MAP
         # at vendor's internal origin (mirrors the Room / skill_simple path).
         base = _make_factory(_lavacross_builder(**kw), w=80, h=21, fill=".")
-        # MiniHack-LavaCross-Full and -Restricted are the only LavaCross
-        # variants that use the shipped lava_crossing.des
-        # (vendor/minihack/minihack/envs/skills_lava.py:339-358) — a larger,
-        # different map, not the 13x7 Levitate skill grid.  Keep those on the
-        # .des path (fall back to the LG map builder if parsing breaks).
+        # MiniHack-LavaCross-Full and -Restricted use the shipped
+        # lava_crossing.des (skills_lava.py:339-358).  It shares the 13x7 lava
+        # MAP with the Levitate skill grid but adds an OUTER IF[50%]
+        # (levitate vs freeze) item selection.  The des parser lays the
+        # terrain but does not replay the rndcoord/BRANCH/STAIR ISAAC64 draws,
+        # so drive it through the placement wrapper like the Levitate variants.
         if env_id in ("MiniHack-LavaCross-Full-v0",
                       "MiniHack-LavaCross-Restricted-v0"):
-            factory = _des_factory("lava_crossing.des", fallback=base)
+            factory = _wrap_lavacross_full(base)
         elif env_id in ("MiniHack-LavaCross-Levitate-Full-v0",
                         "MiniHack-LavaCross-Levitate-Restricted-v0"):
             # Item TYPE is RNG-chosen (IF[33%]/ELSE-IF[50%]).
