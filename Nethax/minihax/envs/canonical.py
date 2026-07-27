@@ -3204,12 +3204,54 @@ def _consume_mksobj_draws(vrng, obj_class: int):
     return vrng
 
 
+# NetHack object-class symbols (``def_oc_syms``, vendor/nethack/src/drawing.c).
+# A des ``OBJECT`` directive carries the class symbol, which disambiguates the
+# name when the same bare name lives in multiple classes.  Notably
+# "enlightenment" exists as BOTH the potion (otyp 285) and the wand (otyp 385);
+# ``skills_simple.MiniHackZap`` uses ``add_object("enlightenment", "/")`` so the
+# '/' symbol pins it to the WAND.  Without the symbol, the bare-name lookup
+# (setdefault, class-order) returns the potion -> wrong floor glyph.
+_SKILL_SYM_TO_OBJCLASS: dict = {
+    ")": "WEAPON_CLASS",
+    "[": "ARMOR_CLASS",
+    "=": "RING_CLASS",
+    '"': "AMULET_CLASS",
+    "(": "TOOL_CLASS",
+    "%": "FOOD_CLASS",
+    "!": "POTION_CLASS",
+    "?": "SCROLL_CLASS",
+    "+": "SPBOOK_CLASS",
+    "/": "WAND_CLASS",
+    "*": "GEM_CLASS",
+}
+
+
+def _resolve_skill_obj_idx(item_name: str, symbol: Optional[str]) -> int:
+    """Resolve an OBJECTS index for a des ``OBJECT`` name, constrained to the
+    class implied by ``symbol`` when the name is class-ambiguous.
+
+    Falls back to the plain bare-name lookup (``_OBJECT_NAME_TO_IDX``) when the
+    symbol is unknown or no name+class match exists — preserving behaviour for
+    the unambiguous skill objects (apple/dagger/robe/…).
+    """
+    from Nethax.nethax.constants.objects import OBJECTS as _OBJ, ObjectClass
+    from Nethax.minihax.level_generator import _OBJECT_NAME_TO_IDX as _N2I
+    if symbol is not None and symbol in _SKILL_SYM_TO_OBJCLASS:
+        want = int(getattr(ObjectClass, _SKILL_SYM_TO_OBJCLASS[symbol]))
+        for i, e in enumerate(_OBJ):
+            if e.name == item_name and int(e.class_) == want:
+                return i
+    return _N2I[item_name]
+
+
 def _wrap_skill_placement(
     factory: Callable[[jax.Array], "EnvState"],
     size: int,
     *,
     item_name: Optional[str],
     feature: Optional[str],
+    symbol: Optional[str] = None,
+    fixed: bool = False,
     lit: bool = True,
 ) -> Callable[[jax.Array], "EnvState"]:
     """Wrap a ``_skill_room_builder`` factory so it stamps the vendor object /
@@ -3220,13 +3262,18 @@ def _wrap_skill_placement(
     PutOn/Zap/Read), or ``None`` for a terrain feature.
     ``feature``: ``"altar"`` (Pray) or ``"sink"`` (Sink) -> stamp a terrain
     tile instead of a ground item; ``None`` otherwise.
+    ``symbol``: des class symbol (e.g. ``"/"``) used to disambiguate a
+    class-ambiguous ``item_name`` (see ``_resolve_skill_obj_idx``).
+    ``fixed``: the ``-Fixed`` variant — object/feature pinned at room-relative
+    ``(0, 0)`` and the hero at ``(2, 2)`` (vendor ``add_object(place=(0,0))``
+    + ``set_start_pos((2,2))``); both are deterministic so NO mklev ISAAC64
+    draws are consumed.
     """
     from Nethax.nethax import vendor_rng as _vendor_rng
     from Nethax.nethax.constants.tiles import TileType as _TT
     from Nethax.nethax.constants.objects import OBJECTS as _OBJECTS
     from Nethax.minihax.level_generator import (
         seed_hero_fov as _seed_hero_fov,
-        _OBJECT_NAME_TO_IDX as _NAME2IDX,
         _write_ground_item as _write_gi,
     )
     from Nethax.nethax.subsystems.ground_items_sparse import (
@@ -3237,7 +3284,7 @@ def _wrap_skill_placement(
     obj_idx = None
     obj_class = None
     if item_name is not None:
-        obj_idx = _NAME2IDX[item_name]
+        obj_idx = _resolve_skill_obj_idx(item_name, symbol)
         obj_class = int(_OBJECTS[obj_idx].class_)
 
     def wrapped(rng: jax.Array):
@@ -3245,23 +3292,30 @@ def _wrap_skill_placement(
         vrng = state.vendor_rng
         x1, y1 = _vendor_geometry_center(size)  # internal top-left of room rect
 
-        # (1) level-setup prefix: rn2(3), rn2(2).
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-
-        # (2) object/feature somexy(): room-relative (x_off, y_off) via rn2(size).
-        vrng, ox = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
-        vrng, oy = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
-        obj_col = int(x1) + int(ox)
-        obj_row = int(y1) + int(oy)
-
         _FLOOR = int(_TT.FLOOR)
         new_terrain = state.terrain
 
+        if fixed:
+            # -Fixed: object/feature pinned at room-relative (0, 0); no somexy
+            # or mksobj draws (des ``place=(0,0)`` is deterministic).
+            obj_col = int(x1)
+            obj_row = int(y1)
+        else:
+            # (1) level-setup prefix: rn2(3), rn2(2).
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+
+            # (2) object/feature somexy(): room-relative (x_off, y_off).
+            vrng, ox = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+            vrng, oy = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+            obj_col = int(x1) + int(ox)
+            obj_row = int(y1) + int(oy)
+
         if feature is None:
-            # (3) object mksobj_init draws (class-dependent).
-            vrng = _consume_mksobj_draws(vrng, obj_class)
-            # Stamp the ground item at the somexy cell.  Round-trip through the
+            if not fixed:
+                # (3) object mksobj_init draws (class-dependent).
+                vrng = _consume_mksobj_draws(vrng, obj_class)
+            # Stamp the ground item at the object cell.  Round-trip through the
             # dense buffer so we reuse the level_generator writer.
             dense = _sparse_to_dense(state.ground_items)
             dense, _ = _write_gi(dense, {}, (obj_row, obj_col), int(obj_idx))
@@ -3278,34 +3332,41 @@ def _wrap_skill_placement(
                 jnp.int8(int(_TT.FOUNTAIN))
             )
 
-        # (4) player place_lregion: 200-try (rn2(79)+1, rn2(21)); accept first
-        #     in-room FLOOR cell that is not the object cell.  mkmaze.c:275-319.
-        import numpy as _np
-        terr_np = _np.asarray(new_terrain[0, 0])
-        _H, _W = terr_np.shape
-        ok = (terr_np == _FLOOR)
-        ok[obj_row, obj_col] = False  # object cell is occupied
-        acc_x = int((x1 + x1 + size - 1) // 2)
-        acc_y = int((y1 + y1 + size - 1) // 2)
-        accepted = False
-        for _ in range(200):
-            vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
-            vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
-            cx = int(raw_x) + 1
-            cy = int(cand_y)
-            if 0 <= cy < _H and 0 <= cx < _W and bool(ok[cy, cx]):
-                acc_x, acc_y = cx, cy
-                accepted = True
-                break
-        if not accepted:
-            for sx in range(1, _W):
-                for sy in range(0, _H):
-                    if bool(ok[sy, sx]):
-                        acc_x, acc_y = sx, sy
-                        accepted = True
-                        break
-                if accepted:
+        if fixed:
+            # -Fixed: hero pinned at room-relative (2, 2) (set_start_pos((2,2)));
+            # no place_lregion draws.
+            acc_x = int(x1) + 2
+            acc_y = int(y1) + 2
+        else:
+            # (4) player place_lregion: 200-try (rn2(79)+1, rn2(21)); accept
+            #     first in-room FLOOR cell that is not the object cell.
+            #     mkmaze.c:275-319.
+            import numpy as _np
+            terr_np = _np.asarray(new_terrain[0, 0])
+            _H, _W = terr_np.shape
+            ok = (terr_np == _FLOOR)
+            ok[obj_row, obj_col] = False  # object cell is occupied
+            acc_x = int((x1 + x1 + size - 1) // 2)
+            acc_y = int((y1 + y1 + size - 1) // 2)
+            accepted = False
+            for _ in range(200):
+                vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+                vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+                cx = int(raw_x) + 1
+                cy = int(cand_y)
+                if 0 <= cy < _H and 0 <= cx < _W and bool(ok[cy, cx]):
+                    acc_x, acc_y = cx, cy
+                    accepted = True
                     break
+            if not accepted:
+                for sx in range(1, _W):
+                    for sy in range(0, _H):
+                        if bool(ok[sy, sx]):
+                            acc_x, acc_y = sx, sy
+                            accepted = True
+                            break
+                    if accepted:
+                        break
 
         state = state.replace(
             vendor_rng=vrng,
@@ -3714,15 +3775,18 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("Zap",   "enlightenment",         "/", _skill_zap_rm),
         ("Read",  "blank paper",           "?", _skill_read_rm),
     ]
-    # Base (non-Fixed, non-Distr) variants build the full-fidelity vendor
-    # 5x5 room + RNG-placed object/player (byte-parity).  The -Fixed / -Distr
-    # variants keep the legacy compact builder (out of the byte-parity scope
-    # today: -Fixed pins start_pos, -Distr adds extra objects/monsters).
-    def _base_skill_factory(item_name, feature):
+    # Base and -Fixed variants build the full-fidelity vendor 5x5 room
+    # (byte-parity): base RNG-places the object/hero, -Fixed pins the object at
+    # room-relative (0,0) and the hero at (2,2) (deterministic, no draws).  The
+    # -Distr variant keeps the legacy compact builder (out of byte-parity scope:
+    # its extra ``add_monster()`` + random ``add_object()`` need faithful random
+    # monster/object generation the LG object path does not yet reproduce).
+    def _base_skill_factory(item_name, feature, symbol=None, fixed=False):
         builder = _skill_room_builder(5, lit=True)
         factory = _make_factory(builder, w=80, h=21, fill=" ", lit=True)
         return _wrap_skill_placement(
-            factory, 5, item_name=item_name, feature=feature, lit=True,
+            factory, 5, item_name=item_name, feature=feature,
+            symbol=symbol, fixed=fixed, lit=True,
         )
 
     for base, item, symbol, rm_factory in item_specs:
@@ -3732,8 +3796,9 @@ def _register_skill_simple_envs(register_fn) -> None:
             ("-Distr", True,  False),
         ]:
             env_id = f"MiniHack-{base}{suffix}-v0"
-            if suffix == "":
-                factory = _base_skill_factory(item, None)
+            if not distr:
+                factory = _base_skill_factory(item, None, symbol=symbol,
+                                              fixed=fixed)
             else:
                 builder = _skill_simple_builder(item, symbol, distr, fixed)
                 factory = _make_factory(builder, w=5, h=5)
@@ -3747,8 +3812,9 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("-Distr", True,  False),
     ]:
         env_id = f"MiniHack-Eat{suffix}-v0"
-        if suffix == "":
-            factory = _base_skill_factory("apple", None)
+        if not distr:
+            factory = _base_skill_factory("apple", None, symbol="%",
+                                          fixed=fixed)
         else:
             builder = _skill_eat_builder(distr, fixed)
             factory = _make_factory(builder, w=5, h=5)
@@ -3762,8 +3828,8 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("-Distr", True,  False),
     ]:
         env_id = f"MiniHack-Pray{suffix}-v0"
-        if suffix == "":
-            factory = _base_skill_factory(None, "altar")
+        if not distr:
+            factory = _base_skill_factory(None, "altar", fixed=fixed)
         else:
             builder = _skill_pray_builder(distr, fixed)
             factory = _make_factory(builder, w=5, h=5)
@@ -3777,8 +3843,12 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("-Distr", True,  False),
     ]:
         env_id = f"MiniHack-Sink{suffix}-v0"
-        if suffix == "":
-            factory = _base_skill_factory(None, "sink")
+        if not distr:
+            # NOTE: the sink cell still renders as FOUNTAIN (glyph 2390) vs
+            # vendor's real sink (2389); emitting 2389 needs a shared-infra
+            # _TILE_TO_CMAP[SINK] change in nle_obs.py (out of scope here).  The
+            # room geometry / hero placement are byte-exact regardless.
+            factory = _base_skill_factory(None, "sink", fixed=fixed)
         else:
             builder = _skill_sink_builder(distr, fixed)
             factory = _make_factory(builder, w=5, h=5)
