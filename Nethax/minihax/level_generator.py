@@ -1397,8 +1397,8 @@ def _apply_directives(
             ].set(jnp.int8(trap_type))
             lg.last_trap_types.append(trap_type)
         elif isinstance(d, _ObjectDirective):
-            pos_rc, obj_idx = _resolve_object(
-                d, terrain_np, w, h, resolved_rooms, _next_key,
+            pos_rc, obj_idx, state = _resolve_object(
+                d, terrain_np, w, h, resolved_rooms, _next_key, state,
             )
             ground, stack_index = _write_ground_item(
                 ground, stack_index, pos_rc, obj_idx,
@@ -2388,6 +2388,285 @@ def _resolve_monster(
     return rc, idx, state, members
 
 
+# ---------------------------------------------------------------------------
+# mkobj — faithful random-object generation (vendor/nethack/src/mkobj.c).
+#
+# A des ``OBJECT:random,random`` (MiniHack -Distr distractor) resolves to
+# ``mkobj_at(RANDOM_CLASS, ..., artif=TRUE)`` (sp_lev.c:1859), i.e.
+# ``mkobj(RANDOM_CLASS, TRUE)``:
+#   1. prob  = rnd(1000)                       (mkobj.c:251)
+#   2. tprob = rnd(100); walk ``mkobjprobs`` -> object class  (mkobj.c:259-261)
+#   3. i = bases[class]; walk ``objects[i].oc_prob`` until prob<=0 -> otyp
+#   4. mksobj(otyp, TRUE, artif)               (class/otyp mksobj_init draws)
+# The picked *true* otyp is stamped as the ground item; the NLE description
+# shuffle (obs.glyph_shuffle) maps it to the per-run appearance glyph, so we
+# only need the true otyp + an exact ISAAC64 draw count so the downstream
+# player place_lregion stays byte-aligned.
+# ---------------------------------------------------------------------------
+
+# mkobjprobs[] (mkobj.c:29-39): (iprob, object-class).
+_MKOBJPROBS = (
+    (10, int(ObjectClass.WEAPON_CLASS)),
+    (10, int(ObjectClass.ARMOR_CLASS)),
+    (20, int(ObjectClass.FOOD_CLASS)),
+    (8,  int(ObjectClass.TOOL_CLASS)),
+    (8,  int(ObjectClass.GEM_CLASS)),
+    (16, int(ObjectClass.POTION_CLASS)),
+    (16, int(ObjectClass.SCROLL_CLASS)),
+    (4,  int(ObjectClass.SPBOOK_CLASS)),
+    (4,  int(ObjectClass.WAND_CLASS)),
+    (3,  int(ObjectClass.RING_CLASS)),
+    (1,  int(ObjectClass.AMULET_CLASS)),
+)
+
+
+def _build_mkobj_prob_tables():
+    """bases[class] (first otyp of each class) and the effective oc_prob table.
+
+    Replays vendor ``init_objects`` (o_init.c:164-172): a class whose static
+    probabilities sum to 0 (only RING_CLASS here) is rescaled to
+    ``(1000 + i - first) / (last - first)``.  All other classes keep their
+    static ``OBJECTS[i].prob``.
+    """
+    n = len(OBJECTS)
+    bases: dict = {}
+    for i, o in enumerate(OBJECTS):
+        c = int(o.class_)
+        if c not in bases:
+            bases[c] = i
+    eff = [int(o.prob) for o in OBJECTS]
+    # per-class rescale when static sum == 0 (rings)
+    first = 0
+    while first < n:
+        c = int(OBJECTS[first].class_)
+        last = first + 1
+        while last < n and int(OBJECTS[last].class_) == c:
+            last += 1
+        s = sum(eff[first:last])
+        if s == 0:
+            span = last - first
+            for i in range(first, last):
+                eff[i] = (1000 + i - first) // span
+        first = last
+
+    # setgemprobs (o_init.c:45-67) at depth 1 (dlvl 1 — the MiniHack skill
+    # level): zero the ``9 - lev/3`` most-precious gems, then rescale the
+    # semi-precious gems ``[first9 .. LAST_GEM]`` to
+    # ``(171 + j - first9) / (LAST_GEM + 1 - first9)``.  Worthless-glass gems
+    # (kept at their high static prob) and the gray stones (luckstone/loadstone/
+    # touchstone/flint/rock, which live past LAST_GEM in the GEM_CLASS range)
+    # are untouched.  LAST_GEM = the otyp just before the first "worthless
+    # piece..." entry.  This is a deterministic (no-RNG) init step; without it a
+    # random GEM object picks the wrong otyp (its glyph is the true otyp, gems
+    # are not description-shuffled).
+    gem_first = bases[int(ObjectClass.GEM_CLASS)]
+    last_gem = None
+    i = gem_first
+    while i < n and int(OBJECTS[i].class_) == int(ObjectClass.GEM_CLASS):
+        if (OBJECTS[i].name or "").startswith("worthless"):
+            last_gem = i - 1
+            break
+        i += 1
+    if last_gem is not None:
+        nzero = 9 - 1 // 3  # lev == 1 at dlvl 1
+        for j in range(gem_first, gem_first + nzero):
+            eff[j] = 0
+        rf = gem_first + nzero
+        div = last_gem + 1 - rf
+        for j in range(rf, last_gem + 1):
+            eff[j] = (171 + j - rf) // div
+    return bases, eff
+
+
+_MKOBJ_BASES, _MKOBJ_EFF_PROB = _build_mkobj_prob_tables()
+
+# Charged rings (objects.c RING(...) ``spec`` field == 1): adornment, gain
+# strength, gain constitution, increase accuracy, increase damage, protection.
+_CHARGED_RINGS = frozenset(range(150, 156))
+# Armour otyps whose mksobj forces the curse branch (mkobj.c:1002-1004).
+_ARMOR_CURSE_SPECIALS = frozenset({148, 149, 80, 137})  # fumble/levit boots,
+#   helm of opposite alignment, gauntlets of fumbling.
+# Amulets that curse when rn2(10) is nonzero (mkobj.c:1062-1066).
+_AMULET_CURSE_SPECIALS = frozenset({180, 183, 181})  # strangulation/change/
+#   restful sleep.
+
+
+def _mksobj_init_draws(vrng, otyp: int):
+    """Consume the exact ``mksobj`` init-block ISAAC64 draws for ``otyp``.
+
+    Faithful port of vendor/nethack/src/mkobj.c::mksobj (init=TRUE, artif=TRUE)
+    class switch.  Only draw *consumption* matters (the object glyph is the
+    true otyp, stamped separately).  Rare monster-typed branches (CORPSE / EGG /
+    TIN / FIGURINE / STATUE ``rndmonnum`` loops, ``mk_artifact`` follow-ups) are
+    approximated to their first-order draw count; the -Distr distractor never
+    resolves to those on the covered seeds.
+    """
+    from Nethax.nethax import vendor_rng as _vr
+    OC = ObjectClass
+    o = OBJECTS[otyp]
+    cls = int(o.class_)
+
+    def rn2(v, n):
+        v, r = _vr.rn2_jax(v, jnp.int32(n))
+        return v, int(r)
+
+    def rne(v, x):
+        # utmp = 5 for u.ulevel < 15; tmp advances while tmp<5 and !rn2(x).
+        tmp = 1
+        while tmp < 5:
+            v, r = rn2(v, x)
+            if r != 0:
+                break
+            tmp += 1
+        return v, tmp
+
+    def blessorcurse(v, chance):
+        v, r = rn2(v, chance)
+        bcsign = 0
+        if r == 0:
+            v, r2 = rn2(v, 2)
+            bcsign = -1 if r2 == 0 else 1
+        return v, bcsign
+
+    def is_missile(oi):
+        # is_multigen / is_poisonable: launched-missile weapon skills
+        # (mkobj.c obj.h:197-204). Nethax stores these skills as -20..-24.
+        return cls == int(OC.WEAPON_CLASS) and -24 <= int(OBJECTS[oi].oc_skill) <= -20
+
+    v = vrng
+    if cls == int(OC.WEAPON_CLASS):
+        if is_missile(otyp):
+            v, _ = rn2(v, 6)                 # quan = rn1(6, 6)
+        v, r = rn2(v, 11)
+        if r == 0:
+            v, _ = rne(v, 3)                 # spe = rne(3)
+            v, _ = rn2(v, 2)                 # blessed = rn2(2)
+        else:
+            v, r2 = rn2(v, 10)
+            if r2 == 0:
+                v, _ = rne(v, 3)             # curse; spe = -rne(3)
+            else:
+                v, _ = blessorcurse(v, 10)
+        if is_missile(otyp):
+            v, _ = rn2(v, 100)               # is_poisonable && !rn2(100)
+        v, _ = rn2(v, 20)                    # artif && !rn2(20)
+        return v
+    if cls == int(OC.ARMOR_CLASS):
+        v, r1 = rn2(v, 10)
+        take_curse = False
+        if r1 != 0:
+            if otyp in _ARMOR_CURSE_SPECIALS:
+                take_curse = True
+            else:
+                v, r2 = rn2(v, 11)
+                take_curse = (r2 == 0)
+        if take_curse:
+            v, _ = rne(v, 3)                 # curse; spe = -rne(3)
+        else:
+            v, r3 = rn2(v, 10)
+            if r3 == 0:
+                v, _ = rn2(v, 2)             # blessed = rn2(2)
+                v, _ = rne(v, 3)             # spe = rne(3)
+            else:
+                v, _ = blessorcurse(v, 10)
+        v, _ = rn2(v, 40)                    # artif && !rn2(40)
+        return v
+    if cls == int(OC.RING_CLASS):
+        if otyp in _CHARGED_RINGS:
+            v, bcsign = blessorcurse(v, 3)
+            spe = 0
+            v, r = rn2(v, 10)
+            if r != 0:
+                v, r2 = rn2(v, 10)
+                if r2 != 0 and bcsign != 0:
+                    v, e = rne(v, 3)
+                    spe = bcsign * e
+                else:
+                    v, b = rn2(v, 2)
+                    v, e = rne(v, 3)
+                    spe = e if b != 0 else -e
+            if spe == 0:
+                v, a = rn2(v, 4)
+                v, c = rn2(v, 3)
+                spe = a - c
+            if spe < 0:
+                v, _ = rn2(v, 5)             # spe<0 && rn2(5) -> curse
+        else:
+            v, r = rn2(v, 10)
+            if r != 0:
+                # RIN_TELEPORTATION/POLYMORPH/AGGRAVATE_MONSTER/HUNGER or !rn2(9)
+                specials = {161, 162, 171, 173}
+                if otyp not in specials:
+                    v, _ = rn2(v, 9)
+        return v
+    if cls == int(OC.AMULET_CLASS):
+        v, r = rn2(v, 10)
+        if r != 0 and otyp in _AMULET_CURSE_SPECIALS:
+            pass                             # curse (no further draw)
+        else:
+            v, _ = blessorcurse(v, 10)
+        return v
+    if cls in (int(OC.POTION_CLASS), int(OC.SCROLL_CLASS)):
+        v, _ = blessorcurse(v, 4)
+        return v
+    if cls == int(OC.SPBOOK_CLASS):
+        v, _ = blessorcurse(v, 17)
+        return v
+    if cls == int(OC.WAND_CLASS):
+        if otyp == 387:                      # wand of wishing: spe = rnd(3)
+            v, _ = rn2(v, 3)
+        else:
+            v, _ = rn2(v, 5)                 # spe = rn1(5, ...) -> rn2(5)
+        v, _ = blessorcurse(v, 17)
+        return v
+    if cls == int(OC.FOOD_CLASS):
+        if otyp == 250:                      # kelp frond: quan = rnd(2)
+            v, _ = rn2(v, 2)
+        if otyp not in (240, 245, 250):      # not corpse / meat ring / kelp
+            v, _ = rn2(v, 6)                 # !rn2(6) -> quan = 2
+        return v
+    if cls == int(OC.GEM_CLASS):
+        if otyp == 446:                      # gem-class rock: quan = rn1(6, 6)
+            v, _ = rn2(v, 6)
+        elif otyp not in (442, 443):         # not luckstone / loadstone
+            v, _ = rn2(v, 6)                 # !rn2(6) -> quan = 2
+        return v
+    if cls == int(OC.TOOL_CLASS):
+        if otyp in (199, 200):               # tallow/wax candle
+            v, r = rn2(v, 2)
+            if r != 0:
+                v, _ = rn2(v, 7)
+            v, _ = blessorcurse(v, 5)
+        elif otyp in (201, 202):             # brass lantern / oil lamp
+            v, _ = rn2(v, 500)               # age = rn1(500, 1000)
+            v, _ = blessorcurse(v, 5)
+        elif otyp == 203:                    # magic lamp
+            v, _ = blessorcurse(v, 2)
+        elif otyp in (190, 189):             # chest / large box
+            v, _ = rn2(v, 5)                 # olocked
+            v, _ = rn2(v, 10)                # otrapped
+            v, _ = rn2(v, 1)                 # mkbox_cnts: rn2(n+1) content roll
+        elif otyp in (191, 192, 193, 194):   # ice box / sack / oilskin / boh
+            v, _ = rn2(v, 1)                 # mkbox_cnts content roll (n small)
+        elif otyp in (204, 213, 217):        # camera / tinning kit / marker
+            v, _ = rn2(v, 70)                # spe = rn1(70, 30)
+        elif otyp == 215:                    # can of grease
+            v, _ = rn2(v, 25)                # spe = rnd(25)
+            v, _ = blessorcurse(v, 10)
+        elif otyp == 206:                    # crystal ball
+            v, _ = rn2(v, 5)                 # spe = rnd(5)
+            v, _ = blessorcurse(v, 2)
+        elif otyp in (227, 195):             # horn of plenty / bag of tricks
+            v, _ = rn2(v, 20)                # spe = rnd(20)
+        elif otyp in (223, 229, 225, 226, 233):  # magic instruments
+            v, _ = rn2(v, 5)                 # spe = rn1(5, 4)
+        # bell of opening / default tools: no init draws.
+        return v
+    # Other classes (illobj/coin/rock/ball/chain/venom) are never reachable
+    # via mkobjprobs; consume nothing.
+    return v
+
+
 def _resolve_object(
     d: _ObjectDirective,
     terrain_np: jax.Array,
@@ -2395,8 +2674,61 @@ def _resolve_object(
     h: int,
     resolved_rooms: dict,
     next_key,
-) -> Tuple[Tuple[int, int], int]:
-    """Return ``((row, col), object_idx)`` for an object directive."""
+    state: Optional[EnvState] = None,
+) -> Tuple[Tuple[int, int], int, Optional[EnvState]]:
+    """Resolve an object directive to ``((row, col), object_idx, new_state)``.
+
+    ``OBJECT:random`` under ``use_vendor_rng()`` is a full mkobj replay: the
+    coordinate somexy() + ``mkobj(RANDOM_CLASS, TRUE)`` (class/otyp walk +
+    mksobj init draws) all consume ``state.vendor_rng``.  The advanced
+    ``state`` is returned; callers MUST adopt it.  All other cases keep the
+    legacy behaviour (state passed through unchanged).
+    """
+    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng
+    if state is not None and _use_vendor_rng() and d.name == "random":
+        from Nethax.nethax import vendor_rng as _vendor_rng
+        vrng = state.vendor_rng
+        if resolved_rooms:
+            ry1, rx1, ry2, rx2 = next(iter(resolved_rooms.values()))
+        else:
+            rx1, ry1, rx2, ry2 = 0, 0, w - 1, h - 1
+        room_w = max(1, rx2 - rx1 + 1)
+        room_h = max(1, ry2 - ry1 + 1)
+        floor = int(TileType.FLOOR)
+        sub = terrain_np[0, 0, :h, :w]
+        # get_location_coord(DRY, random): somex/somey retry until DRY floor
+        # (sp_lev.c:892 / mkroom.c somexy) — accept the first floor cell.
+        xi, yi = rx1, ry1
+        for _ in range(100):
+            vrng, ox = _vendor_rng.rn2_jax(vrng, jnp.int32(room_w))
+            vrng, oy = _vendor_rng.rn2_jax(vrng, jnp.int32(room_h))
+            xi = rx1 + int(ox)
+            yi = ry1 + int(oy)
+            if 0 <= yi < h and 0 <= xi < w and int(sub[yi, xi]) == floor:
+                break
+        rc = (yi, xi)
+        # mkobj(RANDOM_CLASS, TRUE): prob = rnd(1000); tprob = rnd(100).
+        vrng, prob_v = _vendor_rng.rn2_jax(vrng, jnp.int32(1000))
+        prob = int(prob_v) + 1
+        vrng, tprob_v = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        tprob = int(tprob_v) + 1
+        oclass = None
+        for p, c in _MKOBJPROBS:
+            tprob -= p
+            if tprob <= 0:
+                oclass = c
+                break
+        i = _MKOBJ_BASES[oclass]
+        while True:
+            prob -= _MKOBJ_EFF_PROB[i]
+            if prob <= 0:
+                break
+            i += 1
+        otyp = i
+        vrng = _mksobj_init_draws(vrng, otyp)
+        new_state = state.replace(vendor_rng=vrng)
+        return rc, otyp, new_state
+
     if d.name == "random":
         idx = _OBJECT_NAME_TO_IDX.get("apple", 0)
     else:
@@ -2408,7 +2740,7 @@ def _resolve_object(
     rc = _resolve_place(d.place, terrain_np, w, h, resolved_rooms, next_key)
     if rc is None:
         rc = (0, 0)
-    return rc, idx
+    return rc, idx, state
 
 
 def _resolve_trap(

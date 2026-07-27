@@ -3867,6 +3867,7 @@ def _wrap_skill_placement(
     symbol: Optional[str] = None,
     fixed: bool = False,
     lit: bool = True,
+    distr: bool = False,
 ) -> Callable[[jax.Array], "EnvState"]:
     """Wrap a ``_skill_room_builder`` factory so it stamps the vendor object /
     altar / sink and the RNG-placed player, consuming vendor's exact mklev
@@ -3889,6 +3890,11 @@ def _wrap_skill_placement(
     from Nethax.minihax.level_generator import (
         seed_hero_fov as _seed_hero_fov,
         _write_ground_item as _write_gi,
+        _resolve_monster as _resolve_monster,
+        _resolve_object as _resolve_object,
+        _write_monster as _write_monster,
+        _MonsterDirective as _MonsterDirective,
+        _ObjectDirective as _ObjectDirective,
     )
     from Nethax.nethax.subsystems.ground_items_sparse import (
         dense_to_sparse as _dense_to_sparse,
@@ -3946,6 +3952,43 @@ def _wrap_skill_placement(
             new_terrain = new_terrain.at[0, 0, obj_row, obj_col].set(
                 jnp.int8(int(_TT.SINK))
             )
+
+        if distr:
+            # -Distr distractors (vendor skills_simple ``add_monster()`` +
+            # ``add_object()``): a random MONSTER then a random OBJECT, placed
+            # AFTER the named object/feature and BEFORE the player (des order).
+            # Both consume ``state.vendor_rng`` via the shared level_generator
+            # resolvers (makemon template + mkobj); adopt their advanced state
+            # so the player place_lregion below lands on vendor's offsets.
+            state = state.replace(vendor_rng=vrng, terrain=new_terrain)
+            _H = int(new_terrain.shape[2])
+            _W = int(new_terrain.shape[3])
+            _rooms = {
+                "__skill__": (int(y1), int(x1),
+                              int(y1) + size - 1, int(x1) + size - 1),
+            }
+            _mdir = _MonsterDirective(
+                name="random", symbol=None, place=None, args=(),
+            )
+            (_mrow, _mcol), _midx, state, _members = _resolve_monster(
+                _mdir, new_terrain, _W, _H, _rooms, None, state,
+                occupied=set(), stair_cell=None,
+            )
+            state = _write_monster(state, (_mrow, _mcol), _midx)
+            for _mp, _mi in _members:
+                state = _write_monster(state, _mp, _mi)
+            _odir = _ObjectDirective(
+                name="random", symbol=None, place=None, cursestate="random",
+            )
+            (_orow, _ocol), _oidx, state = _resolve_object(
+                _odir, new_terrain, _W, _H, _rooms, None, state,
+            )
+            _dense = _sparse_to_dense(state.ground_items)
+            _dense, _ = _write_gi(_dense, {}, (_orow, _ocol), int(_oidx))
+            state = state.replace(
+                ground_items=_dense_to_sparse(_dense, state.ground_items.K)
+            )
+            vrng = state.vendor_rng
 
         if fixed:
             # -Fixed: hero pinned at room-relative (2, 2) (set_start_pos((2,2)));
@@ -4597,18 +4640,20 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("Zap",   "enlightenment",         "/", _skill_zap_rm),
         ("Read",  "blank paper",           "?", _skill_read_rm),
     ]
-    # Base and -Fixed variants build the full-fidelity vendor 5x5 room
-    # (byte-parity): base RNG-places the object/hero, -Fixed pins the object at
-    # room-relative (0,0) and the hero at (2,2) (deterministic, no draws).  The
-    # -Distr variant keeps the legacy compact builder (out of byte-parity scope:
-    # its extra ``add_monster()`` + random ``add_object()`` need faithful random
-    # monster/object generation the LG object path does not yet reproduce).
-    def _base_skill_factory(item_name, feature, symbol=None, fixed=False):
+    # Base, -Fixed AND -Distr variants all build the full-fidelity vendor 5x5
+    # room (byte-parity): base RNG-places the object/hero, -Fixed pins the
+    # object at room-relative (0,0) and hero at (2,2) (deterministic).  The
+    # -Distr variant adds vendor's ``add_monster()`` + random ``add_object()``
+    # distractors — placed AFTER the named object, BEFORE the player — via the
+    # shared makemon template (_resolve_monster) + mkobj port (_resolve_object)
+    # threaded through ``state.vendor_rng`` (see _wrap_skill_placement).
+    def _base_skill_factory(item_name, feature, symbol=None, fixed=False,
+                            distr=False):
         builder = _skill_room_builder(5, lit=True)
         factory = _make_factory(builder, w=80, h=21, fill=" ", lit=True)
         return _wrap_skill_placement(
             factory, 5, item_name=item_name, feature=feature,
-            symbol=symbol, fixed=fixed, lit=True,
+            symbol=symbol, fixed=fixed, lit=True, distr=distr,
         )
 
     for base, item, symbol, rm_factory in item_specs:
@@ -4618,12 +4663,8 @@ def _register_skill_simple_envs(register_fn) -> None:
             ("-Distr", True,  False),
         ]:
             env_id = f"MiniHack-{base}{suffix}-v0"
-            if not distr:
-                factory = _base_skill_factory(item, None, symbol=symbol,
-                                              fixed=fixed)
-            else:
-                builder = _skill_simple_builder(item, symbol, distr, fixed)
-                factory = _make_factory(builder, w=5, h=5)
+            factory = _base_skill_factory(item, None, symbol=symbol,
+                                          fixed=fixed, distr=distr)
             register_fn(env_id, factory, rm_factory(),
                         max_steps=50, category="Skill")
 
@@ -4634,12 +4675,8 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("-Distr", True,  False),
     ]:
         env_id = f"MiniHack-Eat{suffix}-v0"
-        if not distr:
-            factory = _base_skill_factory("apple", None, symbol="%",
-                                          fixed=fixed)
-        else:
-            builder = _skill_eat_builder(distr, fixed)
-            factory = _make_factory(builder, w=5, h=5)
+        factory = _base_skill_factory("apple", None, symbol="%",
+                                      fixed=fixed, distr=distr)
         register_fn(env_id, factory, _skill_eat_rm(),
                     max_steps=50, category="Skill")
 
@@ -4650,11 +4687,7 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("-Distr", True,  False),
     ]:
         env_id = f"MiniHack-Pray{suffix}-v0"
-        if not distr:
-            factory = _base_skill_factory(None, "altar", fixed=fixed)
-        else:
-            builder = _skill_pray_builder(distr, fixed)
-            factory = _make_factory(builder, w=5, h=5)
+        factory = _base_skill_factory(None, "altar", fixed=fixed, distr=distr)
         register_fn(env_id, factory, _skill_pray_rm(),
                     max_steps=50, category="Skill")
 
@@ -4665,15 +4698,11 @@ def _register_skill_simple_envs(register_fn) -> None:
         ("-Distr", True,  False),
     ]:
         env_id = f"MiniHack-Sink{suffix}-v0"
-        if not distr:
-            # NOTE: the sink cell still renders as FOUNTAIN (glyph 2390) vs
-            # vendor's real sink (2389); emitting 2389 needs a shared-infra
-            # _TILE_TO_CMAP[SINK] change in nle_obs.py (out of scope here).  The
-            # room geometry / hero placement are byte-exact regardless.
-            factory = _base_skill_factory(None, "sink", fixed=fixed)
-        else:
-            builder = _skill_sink_builder(distr, fixed)
-            factory = _make_factory(builder, w=5, h=5)
+        # NOTE: the sink cell still renders as FOUNTAIN (glyph 2390) vs
+        # vendor's real sink (2389); emitting 2389 needs a shared-infra
+        # _TILE_TO_CMAP[SINK] change in nle_obs.py (out of scope here).  The
+        # room geometry / hero placement are byte-exact regardless.
+        factory = _base_skill_factory(None, "sink", fixed=fixed, distr=distr)
         register_fn(env_id, factory, _skill_sink_rm(),
                     max_steps=50, category="Skill")
 
