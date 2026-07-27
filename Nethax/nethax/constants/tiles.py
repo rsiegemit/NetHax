@@ -86,6 +86,22 @@ class TileType(IntEnum):
                        #            vendor/nethack/src/display.c::back_to_glyph
                        #            (CLOUD -> S_cloud); vendor/nethack/src/
                        #            vision.c::does_block (CLOUD is opaque).
+    DEEPWATER = 26     # Deep water — vendor terrain typ WATER (rm.h line 57,
+                       # WATER = 18), the 'W' MAP mapchar (util/lev_main.c:1319
+                       # 'W' -> WATER).  DISTINCT from the pool/moat water that
+                       # our TileType.WATER (index 8) already models: vendor
+                       # renders POOL(16)/MOAT(17) as S_pool (cmap 32, glyph
+                       # 2391) but WATER(18) as S_water (cmap 41, glyph 2400)
+                       # (display.c::back_to_glyph POOL/MOAT->S_pool line 1749-
+                       # 1751 vs WATER->S_water line 1786-1787).  MiniHack-River
+                       # (envs/river.py) draws its river with 'W', so its cells
+                       # must render S_water, not S_pool.  Appended at the tail
+                       # so the existing 0..25 terrain->cmap indices are
+                       # unchanged (gate-neutral).  Walkable + non-opaque in the
+                       # default tables exactly like TileType.WATER; River's
+                       # reset FOV occludes it explicitly (canonical.py
+                       # _wrap_river_placement), matching vendor does_block which
+                       # treats typ == WATER as opaque (vision.c:167-168).
 
 
 NUM_TILE_TYPES: int = len(TileType)

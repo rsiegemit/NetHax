@@ -207,6 +207,8 @@ _S_grave    = _cmap.S_grave
 _S_throne   = _cmap.S_throne
 _S_fountain = _cmap.S_fountain
 _S_pool     = _cmap.S_pool
+_S_water    = _cmap.S_water    # deep water (cmap 41, char '}', glyph 2400)
+_S_sink     = _cmap.S_sink     # sink (cmap 30, char '{', glyph 2389)
 _S_lava     = _cmap.S_lava
 _S_trap     = _cmap.S_arrow_trap   # generic trap base
 _S_vcdoor   = _cmap.S_vcdoor
@@ -249,7 +251,10 @@ _TILE_TO_CMAP: jnp.ndarray = jnp.array([
     _S_room,     # 19 POOL           (prior implicit clamp value)
     _S_tree,     # 20 TREE           S_tree (cmap 18, glyph 2377)
     _S_room,     # 21 HOLE           (prior implicit clamp value)
-    _S_room,     # 22 SINK           (prior implicit clamp value)
+    _S_sink,     # 22 SINK           S_sink (cmap 30, char '{', glyph 2389).
+                 #    Vendor back_to_glyph maps typ SINK -> S_sink
+                 #    (display.c:1762-1763); the prior _S_room clamp rendered
+                 #    the sink cell as floor (glyph 2378).
     _S_ndoor,    # 23 DOORWAY        S_ndoor (doorless gap, char '.')
     # Iron bars: appended at the tail so indices 0..23 above are unchanged
     # (no existing terrain->cmap mapping shifts).  S_bars gives glyph 2376,
@@ -261,6 +266,14 @@ _TILE_TO_CMAP: jnp.ndarray = jnp.array([
     # glyph 2399, char '#'.  Trees/clouds in the HideNSeek terrain overlay now
     # render as their vendor glyph instead of clamping to S_room.
     _S_cloud,    # 25 CLOUD          S_cloud (cmap 40, glyph 2399)
+    # Deep water: appended at the tail so indices 0..25 above are unchanged (no
+    # existing terrain->cmap mapping shifts — gate-neutral).  S_water gives
+    # glyph 2400, char '}' — distinct from TileType.WATER's S_pool (glyph 2391)
+    # which shares the '}' display char.  Vendor renders POOL/MOAT as S_pool but
+    # the WATER typ (MiniHack-River's 'W' strip) as S_water; this entry supplies
+    # that S_water so River's river column renders 2400 while pool/moat water
+    # (TileType.WATER, index 8) stays 2391.
+    _S_water,    # 26 DEEPWATER      S_water (cmap 41, char '}', glyph 2400)
 ], dtype=jnp.int16)
 
 # ---------------------------------------------------------------------------

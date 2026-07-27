@@ -261,7 +261,7 @@ _CHAR_FOR: dict[str, str] = {
     "S_altar":      "_",
     "S_grave":      "|",
     "S_throne":     "\\",
-    "S_sink":       "{",
+    "S_sink":       "#",
     "S_fountain":   "{",
     "S_pool":       "}",
     "S_ice":        ".",

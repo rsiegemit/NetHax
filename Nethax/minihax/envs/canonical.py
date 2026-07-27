@@ -3327,9 +3327,10 @@ def _wrap_skill_placement(
                 jnp.int8(int(_TT.ALTAR))
             )
         elif feature == "sink":
-            # No dedicated SINK tile: FOUNTAIN analogue (matches LG _SinkOverride).
+            # TileType.SINK renders S_sink (glyph 2389) now that nle_obs maps it
+            # (was a FOUNTAIN proxy -> S_fountain glyph 2390).
             new_terrain = new_terrain.at[0, 0, obj_row, obj_col].set(
-                jnp.int8(int(_TT.FOUNTAIN))
+                jnp.int8(int(_TT.SINK))
             )
 
         if fixed:
