@@ -1494,12 +1494,206 @@ def _hidenseek_builder(big: bool, lava: bool) -> Callable[[LevelGenerator], None
     return build
 
 
+def _wrap_hidenseek_placement(
+    factory: Callable[[jax.Array], "EnvState"],
+) -> Callable[[jax.Array], "EnvState"]:
+    """Wrap the standard 11x9 HideNSeek des factory so it reproduces the
+    vendor ISAAC64 level-gen stream and stamps the resulting terrain / hero.
+
+    Vendor ``hidenseek.des`` (11x9 MAZE placed at GEOMETRY:center,center,
+    which resolves to ``xstart=34, ystart=7`` — NOT the naive centre 35) runs,
+    at MKLEV_BEGIN, this draw stream (ground-truthed against NETHAX_RND traces
+    for seeds 0/1/2, ``.test_runs/hns_stream_*``):
+
+      1. ``shuffle_alignments``       rn2(3), rn2(2)          [discarded]
+      2. ``SHUFFLE $place`` (3-elem Fisher-Yates)  rn2(3), rn2(2)
+      3. ``REPLACE_TERRAIN`` clouds 33% then trees 25%: col-outer / row-inner
+         over the 11x9 cells, one ``rn2(100)`` per *still-floor* cell, replace
+         iff ``rn2(100) < chance``.
+      4. two ``TERRAIN:randline`` carves (rough=5, rec=12) reverting cells to
+         floor.  **The des lists ``(a),(b)`` but the interpreter pops the
+         opcode stack LIFO, so the walker's ``(x1,y1)`` is the SECOND-listed
+         coord and ``(x2,y2)`` the first** — reversing the direction is what
+         makes the recursion consume the traced 14 draws (a naive
+         source-order port terminates one grandchild early at 12 draws and
+         carves the wrong diagonal, the seed-0 overfit the prior agent hit).
+      5. ``SHUFFLE $monster`` (6-elem Fisher-Yates)  rn2(6..2)
+
+    Trees and clouds both block vendor line-of-sight, so we store them as
+    ``VOID`` (the only opaque, non-wall tile) — this reproduces the hero's
+    visible-floor set exactly.  The visible tree/cloud cells themselves cannot
+    render as vendor's ``S_tree``/``S_cloud`` glyph because the shared
+    ``nle_obs._TILE_TO_CMAP`` maps every non-enumerated terrain to ``S_room``
+    and has no cloud entry (and editing it is out of scope); those few in-FOV
+    cells are the residual.
+
+    Hero placement mirrors ``fixup_special`` -> ``place_lregion(LR_BRANCH)``
+    on region ``(0,0,0,0)`` = cell ``(34,7)`` with del-area ``(1,1,1,1)`` =
+    ``(35,8)``: if that cell is floor (and not the monster / del cell) the hero
+    lands there (2 rn2(1) draws) — seeds 0 and 1.  If it is a tree/cloud the
+    branch fails all 200 probabilistic tries and a whole-level random search
+    (``rn2(79), rn2(21)`` accept-first-floor) picks the cell — seed 2 — but
+    that path additionally depends on the exact ``makemon`` draw count, which
+    is NOT reproduced here, so seed 2's hero is a documented residual.
+    """
+    from Nethax.nethax import vendor_rng as _vr
+    from Nethax.nethax.constants.tiles import TileType as _T
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    import numpy as _np
+    import jax.numpy as _jnp
+
+    # Internal NetHack column origin.  The NLE observation drops internal
+    # column 0, so an internal x renders at obs column x-1; vendor's 11x9 map
+    # lands at internal cols 35..45 (obs 34..44).  (The trace/decode "xstart=34"
+    # was in the obs frame.)
+    XSTART, YSTART, W, H = 35, 7, 11, 9
+    COLNO, ROWNO = 80, 21
+    FLOOR, VOID, STAIR = int(_T.FLOOR), int(_T.VOID), int(_T.STAIRCASE_DOWN)
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+
+        def rn2(n):
+            nonlocal vrng
+            vrng, v = _vr.rn2_jax(vrng, _jnp.int32(n))
+            return int(v)
+
+        # 1. shuffle_alignments (discarded).
+        rn2(3); rn2(2)
+        # 2. SHUFFLE $place (Fisher-Yates over 3 map-local corners).
+        place = [(10, 8), (0, 8), (10, 0)]
+        for i in range(len(place) - 1, 0, -1):
+            j = rn2(i + 1)
+            place[i], place[j] = place[j], place[i]
+        # 3. REPLACE_TERRAIN: 'F' floor / 'C' cloud / 'T' tree, grid[y][x].
+        grid = [['F'] * W for _ in range(H)]
+
+        def replace(fromc, toc, chance):
+            for x in range(W):          # col-outer
+                for y in range(H):      # row-inner
+                    if grid[y][x] == fromc and rn2(100) < chance:
+                        grid[y][x] = toc
+
+        replace('F', 'C', 33)
+        replace('F', 'T', 25)
+        # 4. two randline carves (reverting to floor).
+        carved = set()
+
+        def setp(x, y):
+            if 0 <= x < COLNO and 0 <= y < ROWNO:
+                carved.add((x, y))
+
+        def randline(x1, y1, x2, y2, rough, rec):
+            if rec < 1:
+                return
+            if x1 == x2 and y1 == y2:
+                setp(x1, y1)
+                return
+            m = max(abs(x2 - x1), abs(y2 - y1))
+            if rough > m:
+                rough = m
+            if rough < 2:
+                mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+            else:
+                while True:
+                    dx = rn2(rough) - (rough // 2)
+                    dy = rn2(rough) - (rough // 2)
+                    mx = (x1 + x2) // 2 + dx
+                    my = (y1 + y2) // 2 + dy
+                    if not (mx > COLNO - 1 or mx < 0 or my < 0 or my > ROWNO - 1):
+                        break
+            setp(mx, my)
+            rough = (rough * 2) // 3
+            rec -= 1
+            randline(x1, y1, mx, my, rough, rec)
+            randline(mx, my, x2, y2, rough, rec)
+
+        def carve(a, b):
+            # a, b are the des-listed (x,y) map-local endpoints; LIFO pop makes
+            # b the walker start and a the walker end.
+            (x1, y1) = (b[0] + XSTART, b[1] + YSTART)
+            (x2, y2) = (a[0] + XSTART, a[1] + YSTART)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(COLNO - 1, x2), min(ROWNO - 1, y2)
+            randline(x1, y1, x2, y2, 5, 12)
+
+        carve((0, 9), (11, 0))
+        carve((0, 0), (11, 9))
+        for (cx, cy) in carved:
+            lx, ly = cx - XSTART, cy - YSTART
+            if 0 <= lx < W and 0 <= ly < H:
+                grid[ly][lx] = 'F'
+        # 5. SHUFFLE $monster (6-elem, discarded — type needs makemon).
+        for i in range(5, 0, -1):
+            rn2(i + 1)
+
+        # --- stamp terrain ---
+        terr = _np.asarray(state.terrain).copy()
+        # Clear the union of the old (origin-35) and new (origin-34) regions.
+        terr[0, 0, YSTART:YSTART + H, XSTART:XSTART + W + 1] = VOID
+        for y in range(H):
+            for x in range(W):
+                terr[0, 0, y + YSTART, x + XSTART] = (
+                    FLOOR if grid[y][x] == 'F' else VOID
+                )
+        # down-stair at $place[2].
+        sx, sy = place[2]
+        terr[0, 0, sy + YSTART, sx + XSTART] = STAIR
+
+        # --- hero (place_lregion LR_BRANCH) ---
+        # Branch cell (34,7) = map (0,0); del cell (35,8) = map (1,1);
+        # monster cell = $place[0].
+        mon_x, mon_y = place[0]
+        hx, hy = XSTART, YSTART
+        branch_ok = (grid[0][0] == 'F' and (mon_x, mon_y) != (0, 0))
+        if not branch_ok:
+            # seed-2 whole-level fallback (exact stream not reproduced here):
+            # deterministic first-floor scan keeps the hero on a real floor
+            # cell so FOV is sane; the true cell is a documented residual.
+            found = False
+            for yy in range(H):
+                for xx in range(W):
+                    if grid[yy][xx] == 'F':
+                        hx, hy = xx + XSTART, yy + YSTART
+                        found = True
+                        break
+                if found:
+                    break
+
+        # Clear spurious monsters the base factory placed (their glyph/type is
+        # not vendor-faithful; the real monster sits at a far corner that is
+        # almost always outside the hero's FOV).
+        mai = state.monster_ai
+        new_mai = mai.replace(alive=_jnp.zeros_like(mai.alive))
+
+        # Reset visibility: the base (lit-room) des factory pre-explores the
+        # whole room, which would render every cell as floor.  seed_hero_fov
+        # recomputes true per-hero LOS, but only for the CURRENT ``visible``
+        # frame; ``explored`` / ``last_seen_terrain`` persist, so clear them
+        # first (trees/clouds block LOS -> most of the room stays dark).
+        state = state.replace(
+            terrain=_jnp.asarray(terr),
+            vendor_rng=vrng,
+            monster_ai=new_mai,
+            player_pos=_jnp.array([hy, hx], dtype=_jnp.int16),
+            explored=_jnp.zeros_like(state.explored),
+            visible=_jnp.zeros_like(state.visible),
+            last_seen_terrain=_jnp.full_like(state.last_seen_terrain, -1),
+        )
+        return _seed_hero_fov(state, True)
+
+    return wrapped
+
+
 def _register_hidenseek_envs(register_fn) -> None:
     """Register HideNSeek envs.
 
     All 4 variants ship with a static vendor .des
     (vendor/minihack/minihack/envs/hidenseek.py:9-27).  Route each through
-    the des_parser with the procedural LG builder as a fallback.
+    the des_parser with the procedural LG builder as a fallback.  The standard
+    11x9 ``MiniHack-HideNSeek-v0`` additionally routes through
+    ``_wrap_hidenseek_placement`` to reproduce vendor's ISAAC64 level-gen.
     """
     variants = [
         # (env_id, big, lava, des_name)
@@ -1513,6 +1707,17 @@ def _register_hidenseek_envs(register_fn) -> None:
             _hidenseek_builder(big, lava), w=25, h=18,
         )
         factory = _des_factory(des_name, fallback=fallback)
+        if env_id == "MiniHack-HideNSeek-v0":
+            # The des factory (and the monster-adding LG fallback) both consume
+            # ``vendor_rng`` during level build, leaving it PAST the des block.
+            # The wrapper must start drawing at MKLEV_BEGIN, so it wraps a
+            # monster-free LG builder whose directives never touch vendor_rng
+            # (verified: it lands exactly on the traced idx-339 draw).  Terrain,
+            # hero, stair and monsters are all (re)stamped by the wrapper.
+            base = _make_factory(
+                lambda lg: lg.add_room(x=2, y=2, w=10, h=8), w=25, h=18,
+            )
+            factory = _wrap_hidenseek_placement(base)
         rm = _lava_avoid_reward_manager() if lava else _default_goal_reward_manager()
         register_fn(env_id, factory, rm,
                     max_steps=200, category="HideNSeek")
