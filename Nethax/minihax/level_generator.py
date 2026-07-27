@@ -1167,7 +1167,7 @@ def _apply_directives(
                 _occ.add((int(_mp[_si, 0]), int(_mp[_si, 1])))
             pos_rc, mon_idx, state, members = _resolve_monster(
                 d, terrain_np, w, h, resolved_rooms, _next_key, state,
-                occupied=_occ,
+                occupied=_occ, stair_cell=_mklev_stair_cell,
             )
             state = _write_monster(state, pos_rc, mon_idx)
             lg.last_monster_entry_ids.append(mon_idx)
@@ -1851,6 +1851,34 @@ def _enexto(terrain_np, occupied: set, xx: int, yy: int, w: int, h: int,
     return good[int(i)], vrng
 
 
+def _adj_lev_depth1(mlevel: int) -> int:
+    """Vendor ``adj_lev(ptr)`` (makemon.c:1757) evaluated at the first dungeon
+    level: ``level_difficulty()==1`` and ``u.ulevel==1``.
+
+    Returns the adjusted monster level that ``newmonhp`` uses to size the HP
+    roll (and hence the ISAAC64 draw-count: adj_lev==0 -> one rnd(4);
+    adj_lev>=1 -> ``adj_lev`` d(_,8) rolls).  No shape-changer / demon
+    special-cases fire at depth 1 for the common ``rndmonst`` picks.
+    """
+    tmp = mlevel
+    if tmp > 49:
+        return 50
+    tmp2 = 1 - tmp                 # level_difficulty() - mlevel, diff == 1
+    if tmp2 < 0:
+        tmp -= 1
+    else:
+        tmp += tmp2 // 5
+    tmp2 = 1 - mlevel             # u.ulevel - mlevel, ulevel == 1
+    if tmp2 > 0:
+        tmp += tmp2 // 4
+    cap = (3 * mlevel) // 2       # crude upper limit
+    if cap > 49:
+        cap = 49
+    if tmp > cap:
+        return cap
+    return tmp if tmp > 0 else 0
+
+
 def _resolve_monster(
     d: _MonsterDirective,
     terrain_np: jax.Array,
@@ -1860,6 +1888,7 @@ def _resolve_monster(
     next_key,
     state: Optional[EnvState] = None,
     occupied: Optional[set] = None,
+    stair_cell: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Tuple[int, int], int, Optional[EnvState], list]:
     """Resolve a monster directive to ``((row, col), monster_idx, new_state, members)``.
 
@@ -1962,8 +1991,37 @@ def _resolve_monster(
         # of modulus (vendor RND = isaac64_next_uint64 % x, no rejection),
         # so the untraced fillers' moduli only matter for faithfulness.
         vrng, mkclass_val = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
-        vrng, mx_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_w))
-        vrng, my_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_h))
+        # Leader coordinate: vendor create_monster -> get_location_coord ->
+        # get_location's random path (sp_lev.c:892) draws somex/somey and
+        # rejects via is_ok_location(DRY) until an acceptable cell (up to 100
+        # tries).  is_ok_location(DRY) accepts ROOM/CORR floor but REJECTS the
+        # down-staircase cell (typ==STAIRS) that mkstairs placed earlier in
+        # mklev.  The port stamps the down-stair AFTER this directive pass, so
+        # terrain_np still shows FLOOR there — reject ``stair_cell`` explicitly
+        # so the retry draw-count matches vendor.  Without this the leader lands
+        # on the stair with NO retry, the whole ISAAC64 stream shifts, and the
+        # player @ (placed later) + monster cells land wrong.  E.g.
+        # Room-Monster-5x5 seed 8: the leader's first somexy == the stair cell
+        # -> vendor draws an extra somex/somey retry pair the port used to miss.
+        floor = int(TileType.FLOOR)
+        sub = terrain_np[0, 0, :h, :w]
+        _stair = tuple(stair_cell) if stair_cell is not None else None
+        xi = rx1
+        yi = ry1
+        _cpt = 0
+        while True:
+            vrng, mx_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_w))
+            vrng, my_off = _vendor_rng.rn2_jax(vrng, jnp.int32(room_h))
+            xi = rx1 + int(mx_off)
+            yi = ry1 + int(my_off)
+            _ok = (
+                0 <= yi < h and 0 <= xi < w
+                and int(sub[yi, xi]) == floor
+                and (_stair is None or (yi, xi) != _stair)
+            )
+            _cpt += 1
+            if _ok or _cpt >= 100:
+                break
         # The untraced rnd(21) IS vendor's rndmonst monster pick:
         # MONSTER:random -> create_monster(class=0) -> makemon(NULL) ->
         # rndmonst() draws rnd(choice_count) (choice_count==21 at depth 1,
@@ -1973,13 +2031,20 @@ def _resolve_monster(
         vrng, _picked_idx = pick_monster_for_level(None, 1, vendor_rng=vrng)
         if d.name == "random":
             idx = int(_picked_idx)
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))   # untraced rnd(4)
-        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
-        # Leader cell (vendor mkroom.c somexy: room-relative offsets).
-        xi = rx1 + int(mx_off)
-        yi = ry1 + int(my_off)
-        floor = int(TileType.FLOOR)
-        sub = terrain_np[0, 0, :h, :w]
+        # newmonhp (makemon.c:983): HP-roll draw-count varies BY MONSTER TYPE.
+        # adj_lev(mlevel) at level_difficulty()==1, u.ulevel==1: adj_lev==0 ->
+        # rnd(4) (1 draw); adj_lev>=1 -> d(adj_lev, 8) == adj_lev draws.  The
+        # port previously assumed a fixed 1-draw rnd(4), which under-counts for
+        # base-level>=3 monsters and shifts the downstream stream.
+        _mlev = int(MONSTERS[idx].level) if 0 <= idx < len(MONSTERS) else 0
+        _alev = _adj_lev_depth1(_mlev)
+        _n_hp = _alev if _alev >= 1 else 1
+        for _ in range(_n_hp):
+            vrng, _ = _vendor_rng.rn2_jax(
+                vrng, jnp.int32(8 if _alev >= 1 else 4),
+            )
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))   # gender rn2(2)
+        # Leader cell resolved by the retry loop above (room-relative somexy).
         if 0 <= yi < h and 0 <= xi < w and int(sub[yi, xi]) == floor:
             rc = (yi, xi)
         else:
