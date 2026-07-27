@@ -3190,18 +3190,297 @@ def _skill_simple_builder(item: str, symbol: str,
     return build
 
 
-def _skill_levitate_builder(item: str, symbol: str,
-                            fixed: bool) -> Callable[[LevelGenerator], None]:
-    def build(lg: LevelGenerator) -> None:
-        place = (0, 0) if fixed else None
-        try:
-            lg.add_object(item, symbol, place=place)
-        except KeyError:
-            lg.add_object("random", place=place)
-        if fixed:
-            lg.set_start_pos(2, 2)
-        lg.add_stair_down(x=4, y=4)
-    return build
+# ---------------------------------------------------------------------------
+# Levitate skill family byte-parity.
+#
+# Vendor (skills_levitate.py) builds each Levitate env as a lit 5x5 room via
+#   LevelGenerator(w=5, h=5, lit=True); lvl_gen.add_object(<lev item>, sym,
+#                                                           cursestate="blessed")
+# with GEOMETRY:center,center and NO stair (the RM fires on the levitation
+# message, not stairs_down).  This mirrors the skills_simple base family
+# (_skill_room_builder + _wrap_skill_placement) exactly EXCEPT for the item
+# mksobj_init draws, which are class/otyp-specific for the levitation items.
+#
+# Full / Restricted variants (Restricted shares Full's des, only restricting
+# the action set) place BOTH object and player at RNG cells:
+#   1. rn2(3), rn2(2)              -- level-setup prefix
+#   2. rn2(5), rn2(5)             -- object somexy (x_off, y_off)
+#   3. item mksobj_init draws     (_consume_levitate_item_draws)
+#   4. player place_lregion        -- 200-try (rn2(79)+1, rn2(21))
+# Fixed variant fixes object at des (0,0) and player at (2,2):
+#   1. rn2(3), rn2(2)             -- prefix (NO object somexy: fixed cell)
+#   2. item mksobj_init draws
+#   3. rn2(1), rn2(1)            -- single-cell player place_lregion (trivial)
+# Random-Full picks the item TYPE via IF[33%]/ELSE-IF[50%] (rn2(100)[,rn2(100)])
+# before the object somexy, otherwise identical to the Full path.
+# Ground-truthed from NETHAX_RN2_TRACE of the vendor envs, seeds 0/1/2
+# (item draws verified against mkobj.c::mksobj_init below).
+# ---------------------------------------------------------------------------
+def _consume_levitate_item_draws(vrng, item_key: str):
+    """Replay the vendor ``mksobj_init`` ISAAC64 draws for a levitation item.
+
+    Faithful to vendor/nethack/src/mkobj.c::mksobj_init:
+      * potion of levitation (POTION_CLASS, :1074-1080): blessorcurse(4);
+        POT_WATER post-init draws nothing.
+      * ring of levitation (RING_CLASS, uncharged branch :1143-1148):
+        rn2(10); only when nonzero is ``!rn2(9)`` evaluated -> rn2(9).
+      * levitation boots (ARMOR_CLASS, :1085-1098): rn2(10); when nonzero the
+        ``&&`` short-circuits on ``otyp == LEVITATION_BOOTS`` (NO rn2(11)) ->
+        curse; spe = -rne(3).  When zero -> ``else if (!rn2(10))`` -> rn2(10);
+        if zero: blessed = rn2(2), spe = rne(3); else blessorcurse(10).
+        Then artif: rn2(40).
+    """
+    from Nethax.nethax import vendor_rng as _vr
+
+    def rn2(v, n):
+        v, r = _vr.rn2_jax(v, jnp.int32(n))
+        return v, int(r)
+
+    def rne(v, x):
+        tmp = 1
+        while tmp < 5:
+            v, r = rn2(v, x)
+            if r != 0:
+                break
+            tmp += 1
+        return v
+
+    def blessorcurse(v, chance):
+        v, r = rn2(v, chance)
+        if r == 0:
+            v, _ = rn2(v, 2)
+        return v
+
+    if item_key == "potion":
+        return blessorcurse(vrng, 4)
+    if item_key == "ring":
+        vrng, r = rn2(vrng, 10)
+        if r != 0:
+            vrng, _ = rn2(vrng, 9)
+        return vrng
+    # levitation boots (ARMOR_CLASS with the LEVITATION_BOOTS otyp short-circuit)
+    vrng, r = rn2(vrng, 10)
+    if r != 0:
+        vrng = rne(vrng, 3)            # curse; spe = -rne(3)
+    else:
+        vrng, r2 = rn2(vrng, 10)       # else if (!rn2(10))
+        if r2 == 0:
+            vrng, _ = rn2(vrng, 2)     # blessed = rn2(2)
+            vrng = rne(vrng, 3)        # spe = rne(3)
+        else:
+            vrng = blessorcurse(vrng, 10)
+    vrng, _ = rn2(vrng, 40)            # artif && !rn2(40 + 0)
+    return vrng
+
+
+def _levitate_place_player(vrng, terr_np, blocked, x1, y1, size):
+    """Faithful place_lregion for the room player start (mkmaze.c:275-319).
+
+    ``blocked`` is a set of (row, col) cells excluded from acceptance (the
+    object cell).  Returns (advanced vrng, acc_x, acc_y).
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TT
+
+    _FLOOR = int(_TT.FLOOR)
+    _H, _W = terr_np.shape
+    ok = (terr_np == _FLOOR)
+    for (r, c) in blocked:
+        ok[r, c] = False
+    acc_x = int((x1 + x1 + size - 1) // 2)
+    acc_y = int((y1 + y1 + size - 1) // 2)
+    accepted = False
+    for _ in range(200):
+        vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+        vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+        cx = int(raw_x) + 1
+        cy = int(cand_y)
+        if 0 <= cy < _H and 0 <= cx < _W and bool(ok[cy, cx]):
+            acc_x, acc_y = cx, cy
+            accepted = True
+            break
+    if not accepted:
+        for sx in range(1, _W):
+            for sy in range(0, _H):
+                if bool(ok[sy, sx]):
+                    acc_x, acc_y = sx, sy
+                    accepted = True
+                    break
+            if accepted:
+                break
+    return vrng, acc_x, acc_y
+
+
+def _stamp_levitate_item(state, item_name, obj_row, obj_col):
+    """Write ``item_name`` as a ground item at (obj_row, obj_col)."""
+    from Nethax.minihax.level_generator import (
+        _OBJECT_NAME_TO_IDX as _NAME2IDX,
+        _write_ground_item as _write_gi,
+    )
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        dense_to_sparse as _dense_to_sparse,
+        sparse_to_dense as _sparse_to_dense,
+    )
+    obj_idx = _NAME2IDX.get(item_name)
+    if obj_idx is None:
+        return state
+    dense = _sparse_to_dense(state.ground_items)
+    dense, _ = _write_gi(dense, {}, (obj_row, obj_col), int(obj_idx))
+    return state.replace(
+        ground_items=_dense_to_sparse(dense, state.ground_items.K)
+    )
+
+
+def _wrap_skill_levitate_placement(
+    factory: Callable[[jax.Array], "EnvState"],
+    item_name: str,
+    item_key: str,
+    *,
+    lit: bool = True,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Levitate-{Boots,Ring,Potion}-{Full,Restricted}: random object + player."""
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    import numpy as _np
+
+    size = 5
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        x1, y1 = _vendor_geometry_center(size)
+
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+
+        vrng, ox = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, oy = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        obj_col = int(x1) + int(ox)
+        obj_row = int(y1) + int(oy)
+
+        vrng = _consume_levitate_item_draws(vrng, item_key)
+        state = _stamp_levitate_item(state, item_name, obj_row, obj_col)
+
+        terr_np = _np.asarray(state.terrain[0, 0])
+        vrng, acc_x, acc_y = _levitate_place_player(
+            vrng, terr_np, {(obj_row, obj_col)}, x1, y1, size
+        )
+
+        state = state.replace(
+            vendor_rng=vrng,
+            player_pos=jnp.stack(
+                [jnp.int32(acc_y).astype(jnp.int16),
+                 jnp.int32(acc_x).astype(jnp.int16)]
+            ),
+        )
+        return _seed_hero_fov(state, lit)
+
+    return wrapped
+
+
+def _wrap_skill_levitate_fixed(
+    factory: Callable[[jax.Array], "EnvState"],
+    item_name: str,
+    item_key: str,
+    *,
+    lit: bool = True,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Levitate-{Boots,Ring,Potion}-Fixed: object at des (0,0), player at (2,2)."""
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+
+    size = 5
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        x1, y1 = _vendor_geometry_center(size)
+
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+
+        # Fixed object cell (des (0,0)) -> no somexy draw.
+        obj_col = int(x1) + 0
+        obj_row = int(y1) + 0
+        vrng = _consume_levitate_item_draws(vrng, item_key)
+        state = _stamp_levitate_item(state, item_name, obj_row, obj_col)
+
+        # Single-cell player place_lregion (des set_start_pos (2,2)): rn2(1)x2.
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(1))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(1))
+        start_col = int(x1) + 2
+        start_row = int(y1) + 2
+
+        state = state.replace(
+            vendor_rng=vrng,
+            player_pos=jnp.stack(
+                [jnp.int32(start_row).astype(jnp.int16),
+                 jnp.int32(start_col).astype(jnp.int16)]
+            ),
+        )
+        return _seed_hero_fov(state, lit)
+
+    return wrapped
+
+
+def _wrap_skill_levitate_random(
+    factory: Callable[[jax.Array], "EnvState"],
+    *,
+    lit: bool = True,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Levitate-Random-Full: item TYPE RNG-chosen, then Full-style placement.
+
+    Vendor des IF[33%]{potion} ELSE IF[50%]{ring} ELSE {boots}, each IF drawing
+    rn2(100).  Ground-truthed seeds 0/1/2 (66>=33->2<50=ring, 6<33=potion,
+    87>=33->15<50=ring).
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    import numpy as _np
+
+    size = 5
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        x1, y1 = _vendor_geometry_center(size)
+
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+
+        vrng, r1 = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        if int(r1) < 33:
+            item_name, item_key = "potion of levitation", "potion"
+        else:
+            vrng, r2 = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+            if int(r2) < 50:
+                item_name, item_key = "ring of levitation", "ring"
+            else:
+                item_name, item_key = "levitation boots", "boots"
+
+        vrng, ox = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, oy = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        obj_col = int(x1) + int(ox)
+        obj_row = int(y1) + int(oy)
+
+        vrng = _consume_levitate_item_draws(vrng, item_key)
+        state = _stamp_levitate_item(state, item_name, obj_row, obj_col)
+
+        terr_np = _np.asarray(state.terrain[0, 0])
+        vrng, acc_x, acc_y = _levitate_place_player(
+            vrng, terr_np, {(obj_row, obj_col)}, x1, y1, size
+        )
+
+        state = state.replace(
+            vendor_rng=vrng,
+            player_pos=jnp.stack(
+                [jnp.int32(acc_y).astype(jnp.int16),
+                 jnp.int32(acc_x).astype(jnp.int16)]
+            ),
+        )
+        return _seed_hero_fov(state, lit)
+
+    return wrapped
 
 
 def _skill_pray_builder(distr: bool, fixed: bool) -> Callable[[LevelGenerator], None]:
@@ -3352,21 +3631,34 @@ def _register_skill_levitate_envs(register_fn) -> None:
     starts floating.
     """
     item_specs = [
-        ("Boots",   "levitation boots",      "["),
-        ("Ring",    "ring of levitation",    "="),
-        ("Potion",  "potion of levitation",  "!"),
+        ("Boots",   "levitation boots",      "boots"),
+        ("Ring",    "ring of levitation",    "ring"),
+        ("Potion",  "potion of levitation",  "potion"),
     ]
-    for base, item, symbol in item_specs:
+    for base, item_name, item_key in item_specs:
         for suffix in ("-Full", "-Restricted", "-Fixed"):
             env_id = f"MiniHack-Levitate-{base}{suffix}-v0"
-            builder = _skill_levitate_builder(item, symbol,
-                                              fixed=(suffix == "-Fixed"))
-            factory = _make_factory(builder, w=5, h=5)
+            # Full 80x21 VOID grid so GEOMETRY:center,center lands the lit 5x5
+            # MAP at vendor's internal origin (mirrors the skills_simple base
+            # path); the wrapper stamps the item + RNG-placed player.
+            base_factory = _make_factory(
+                _skill_room_builder(5, lit=True), w=80, h=21, fill=" ", lit=True
+            )
+            if suffix == "-Fixed":
+                factory = _wrap_skill_levitate_fixed(
+                    base_factory, item_name, item_key
+                )
+            else:
+                factory = _wrap_skill_levitate_placement(
+                    base_factory, item_name, item_key
+                )
             register_fn(env_id, factory, _skill_levitate_rm(),
                         max_steps=50, category="Skill")
-    # Levitate-Random
-    builder = _skill_levitate_builder("random", "/", fixed=False)
-    factory = _make_factory(builder, w=5, h=5)
+    # Levitate-Random-Full: item TYPE is RNG-chosen.
+    base_factory = _make_factory(
+        _skill_room_builder(5, lit=True), w=80, h=21, fill=" ", lit=True
+    )
+    factory = _wrap_skill_levitate_random(base_factory)
     register_fn("MiniHack-Levitate-Random-Full-v0", factory,
                 _skill_levitate_rm(),
                 max_steps=50, category="Skill")

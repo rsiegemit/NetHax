@@ -112,10 +112,24 @@ def _env_id_to_vendor_cls(env_id: str):
     from minihack.envs import corridor as _corr_mod
     from minihack.envs import sokoban as _soko_mod
     from minihack.envs import skills_lava as _lava_mod
+    from minihack.envs import skills_levitate as _levit_mod
     from minihack.envs import river as _river_mod
     from minihack.envs import keyroom as _kr_mod
 
     table = {
+        "MiniHack-Levitate-Boots-Full-v0":       _levit_mod.MiniHackLevitateBoots,
+        "MiniHack-Levitate-Boots-Restricted-v0":
+            _levit_mod.MiniHackLevitateBootsRestrictedActions,
+        "MiniHack-Levitate-Boots-Fixed-v0":      _levit_mod.MiniHackLevitateBootsFixed,
+        "MiniHack-Levitate-Ring-Full-v0":        _levit_mod.MiniHackLevitateRing,
+        "MiniHack-Levitate-Ring-Restricted-v0":
+            _levit_mod.MiniHackLevitateRingRestrictedActions,
+        "MiniHack-Levitate-Ring-Fixed-v0":       _levit_mod.MiniHackLevitateRingFixed,
+        "MiniHack-Levitate-Potion-Full-v0":      _levit_mod.MiniHackLevitatePotion,
+        "MiniHack-Levitate-Potion-Restricted-v0":
+            _levit_mod.MiniHackLevitatePotionRestrictedActions,
+        "MiniHack-Levitate-Potion-Fixed-v0":     _levit_mod.MiniHackLevitatePotionFixed,
+        "MiniHack-Levitate-Random-Full-v0":      _levit_mod.MiniHackLevitateRandom,
         "MiniHack-KeyRoom-Fixed-S5-v0":    _kr_mod.MiniHackKeyRoom5x5Fixed,
         "MiniHack-KeyRoom-S5-v0":          _kr_mod.MiniHackKeyRoom5x5,
         "MiniHack-KeyRoom-Dark-S5-v0":     _kr_mod.MiniHackKeyRoom5x5Dark,
