@@ -77,6 +77,15 @@ class TileType(IntEnum):
                        #            vendor/nethack/src/display.c::back_to_glyph
                        #            (IRONBARS -> S_bars); vendor/nethack/src/
                        #            nhlua.c char2typ 'F' -> IRONBARS.
+    CLOUD = 25         # Cloud ('#'/S_cloud in air/planes and HideNSeek terrain
+                       # overlays).  Blocks line-of-sight (does_block) and is
+                       # opaque like TREE.  Vendor renders it as S_cloud (cmap
+                       # 40, glyph 2399).  Appended at the tail so the existing
+                       # 0..24 terrain->cmap indices are untouched (gate-neutral).
+                       # Citation: vendor/nethack/include/rm.h::CLOUD (=36);
+                       #            vendor/nethack/src/display.c::back_to_glyph
+                       #            (CLOUD -> S_cloud); vendor/nethack/src/
+                       #            vision.c::does_block (CLOUD is opaque).
 
 
 NUM_TILE_TYPES: int = len(TileType)
@@ -154,7 +163,12 @@ SOLID_TILES = jnp.array(
 # VendorTileType (rm.h-exact) below. Secret doors that aren't yet discovered
 # are represented at the internal-tile layer as WALL (vendor's display
 # behavior), so the existing WALL entry already blocks LOS for them.
+# TREE and CLOUD both block vendor line-of-sight (vision.c does_block treats
+# IS_TREE and CLOUD as opaque).  They were previously stored as VOID (which is
+# already opaque) in the HideNSeek terrain overlay; now that they carry their
+# own TileType so they can render as S_tree/S_cloud, they must remain opaque.
 OPAQUE_TILES = jnp.array(
-    [TileType.VOID, TileType.WALL, TileType.CLOSED_DOOR],
+    [TileType.VOID, TileType.WALL, TileType.CLOSED_DOOR,
+     TileType.TREE, TileType.CLOUD],
     dtype=jnp.int32,
 )

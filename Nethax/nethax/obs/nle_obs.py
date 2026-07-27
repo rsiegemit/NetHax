@@ -215,6 +215,8 @@ _S_hcdoor   = _cmap.S_hcdoor
 _S_hodoor   = _cmap.S_hodoor
 _S_ndoor    = _cmap.S_ndoor
 _S_bars     = _cmap.S_bars     # iron bars (cmap 17, char '#', glyph 2376)
+_S_tree     = _cmap.S_tree     # tree (cmap 18, char '#', glyph 2377)
+_S_cloud    = _cmap.S_cloud    # cloud (cmap 40, char '#', glyph 2399)
 
 # Indexed by TileType integer value; must cover indices 0..NUM_TILE_TYPES-1
 _TILE_TO_CMAP: jnp.ndarray = jnp.array([
@@ -245,7 +247,7 @@ _TILE_TO_CMAP: jnp.ndarray = jnp.array([
     _S_room,     # 17 DRAWBRIDGE_UP  (prior implicit clamp value)
     _S_room,     # 18 ICE_FLOOR      (prior implicit clamp value)
     _S_room,     # 19 POOL           (prior implicit clamp value)
-    _S_room,     # 20 TREE           (prior implicit clamp value)
+    _S_tree,     # 20 TREE           S_tree (cmap 18, glyph 2377)
     _S_room,     # 21 HOLE           (prior implicit clamp value)
     _S_room,     # 22 SINK           (prior implicit clamp value)
     _S_ndoor,    # 23 DOORWAY        S_ndoor (doorless gap, char '.')
@@ -254,6 +256,11 @@ _TILE_TO_CMAP: jnp.ndarray = jnp.array([
     # char '#' — distinct from CORRIDOR's S_corr (glyph 2380) which merely
     # shares the '#' display char.
     _S_bars,     # 24 IRONBARS       S_bars (iron bars, char '#', glyph 2376)
+    # Cloud: appended at the tail so indices 0..24 above are unchanged (no
+    # existing terrain->cmap mapping shifts — gate-neutral).  S_cloud gives
+    # glyph 2399, char '#'.  Trees/clouds in the HideNSeek terrain overlay now
+    # render as their vendor glyph instead of clamping to S_room.
+    _S_cloud,    # 25 CLOUD          S_cloud (cmap 40, glyph 2399)
 ], dtype=jnp.int16)
 
 # ---------------------------------------------------------------------------

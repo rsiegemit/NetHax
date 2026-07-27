@@ -1519,13 +1519,11 @@ def _wrap_hidenseek_placement(
          carves the wrong diagonal, the seed-0 overfit the prior agent hit).
       5. ``SHUFFLE $monster`` (6-elem Fisher-Yates)  rn2(6..2)
 
-    Trees and clouds both block vendor line-of-sight, so we store them as
-    ``VOID`` (the only opaque, non-wall tile) — this reproduces the hero's
-    visible-floor set exactly.  The visible tree/cloud cells themselves cannot
-    render as vendor's ``S_tree``/``S_cloud`` glyph because the shared
-    ``nle_obs._TILE_TO_CMAP`` maps every non-enumerated terrain to ``S_room``
-    and has no cloud entry (and editing it is out of scope); those few in-FOV
-    cells are the residual.
+    Trees and clouds both block vendor line-of-sight, so we store them as the
+    opaque ``TREE`` / ``CLOUD`` tile types (both in ``OPAQUE_TILES``) — this
+    reproduces the hero's visible-floor set exactly AND renders the in-FOV
+    tree/cloud cells as vendor's ``S_tree`` (cmap 18) / ``S_cloud`` (cmap 40)
+    glyphs via ``nle_obs._TILE_TO_CMAP``.
 
     Hero placement mirrors ``fixup_special`` -> ``place_lregion(LR_BRANCH)``
     on region ``(0,0,0,0)`` = cell ``(34,7)`` with del-area ``(1,1,1,1)`` =
@@ -1549,6 +1547,7 @@ def _wrap_hidenseek_placement(
     XSTART, YSTART, W, H = 35, 7, 11, 9
     COLNO, ROWNO = 80, 21
     FLOOR, VOID, STAIR = int(_T.FLOOR), int(_T.VOID), int(_T.STAIRCASE_DOWN)
+    TREE, CLOUD = int(_T.TREE), int(_T.CLOUD)
 
     def wrapped(rng: jax.Array):
         state = factory(rng)
@@ -1632,10 +1631,15 @@ def _wrap_hidenseek_placement(
         terr = _np.asarray(state.terrain).copy()
         # Clear the union of the old (origin-35) and new (origin-34) regions.
         terr[0, 0, YSTART:YSTART + H, XSTART:XSTART + W + 1] = VOID
+        # 'F' -> FLOOR; 'C' -> CLOUD (S_cloud); 'T' -> TREE (S_tree).  Trees and
+        # clouds are opaque (OPAQUE_TILES) so they still block the hero's FOV
+        # exactly like the prior VOID storage, but now render as their vendor
+        # glyph instead of stone.
+        _CELL_TO_TILE = {'F': FLOOR, 'C': CLOUD, 'T': TREE}
         for y in range(H):
             for x in range(W):
-                terr[0, 0, y + YSTART, x + XSTART] = (
-                    FLOOR if grid[y][x] == 'F' else VOID
+                terr[0, 0, y + YSTART, x + XSTART] = _CELL_TO_TILE.get(
+                    grid[y][x], VOID
                 )
         # down-stair at $place[2].
         sx, sy = place[2]
