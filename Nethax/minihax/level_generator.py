@@ -22,6 +22,7 @@ without modifying ``EnvState`` schema.  Goal positions are recorded as
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from typing import Any, Callable, List, Optional, Tuple, Union
 
@@ -41,6 +42,45 @@ from Nethax.nethax.dungeon.spawning import (
 from Nethax.nethax.state import EnvState, StaticParams
 from Nethax.nethax.subsystems.inventory import MAX_GROUND_STACK
 from Nethax.nethax.subsystems.traps import TrapType
+
+
+# ---------------------------------------------------------------------------
+# Per-env player-role bootstrap override
+# ---------------------------------------------------------------------------
+# The NLE_BYTEPARITY reset bootstrap in ``_apply_directives`` routes through
+# ``NethaxEnv.reset`` to advance the ISAAC64 stream (init_objects -> role_init
+# -> u_init).  The canonical MiniHack character is Archeologist-Human-Lawful
+# ("arc-hum-law-mal") and that is the default.  A handful of MiniHack envs
+# hardcode a *different* player role in their vendor class (e.g. Quest-Medium
+# and CorridorBattle use "kni-hum-law-fem"; the KeyRoom family uses
+# "rog-hum-cha-mal").  For those envs both the vendor build (byte-parity
+# harness) and the minihax bootstrap must use the env's true role, otherwise
+# the hero @-glyph, inventory, and role_init RNG diverge.
+#
+# ``(role, race, alignment)`` — role/race are ``Role``/``Race`` enum values,
+# alignment is 0=lawful / 1=neutral / 2=chaotic.  ``None`` means "use the
+# Archeologist default", so Room / skills / Levitate envs are unaffected.
+# The registry (canonical.register_all) wraps the factories of the named
+# envs in ``bootstrap_character(...)`` so the override is active only while
+# that env's factory runs.
+_BOOTSTRAP_CHARACTER: Optional[Tuple[Any, Any, int]] = None
+
+
+@contextlib.contextmanager
+def bootstrap_character(role: Any, race: Any, alignment: int):
+    """Temporarily override the NLE_BYTEPARITY reset bootstrap character.
+
+    ``role``/``race`` are ``Role``/``Race`` enum values; ``alignment`` is
+    0=lawful, 1=neutral, 2=chaotic.  Restores the previous value on exit so
+    the default (Archeologist) applies to every other env.
+    """
+    global _BOOTSTRAP_CHARACTER
+    prev = _BOOTSTRAP_CHARACTER
+    _BOOTSTRAP_CHARACTER = (role, race, int(alignment))
+    try:
+        yield
+    finally:
+        _BOOTSTRAP_CHARACTER = prev
 
 
 # ---------------------------------------------------------------------------
@@ -873,18 +913,27 @@ def _apply_directives(
             _raw_key = rng
         _engine = _NethaxEnv(static=static)
         # Archeologist-Human-Lawful is the canonical MiniHack character
-        # ("arc-hum-law-mal" — .test_runs/minihax_byteparity.py:149).
+        # ("arc-hum-law-mal" — .test_runs/minihax_byteparity.py:149).  Envs
+        # that hardcode a different vendor role override it via
+        # ``bootstrap_character`` (see _BOOTSTRAP_CHARACTER above); the default
+        # (None) keeps Archeologist so Room / skills / Levitate are unchanged.
         # ``fast_reset=True``: skip mklev dungeon-gen / pet spawn / view_from
         # since LG directives below stamp the terrain authoritatively and the
         # ``default_lit`` block at the tail of this factory seeds FoV.
         # The ISAAC64 stream is still advanced through init_objects ->
         # role_init -> init_dungeons -> u_init so descr_idx + inventory
         # remain byte-aligned with vendor MiniHack.
+        if _BOOTSTRAP_CHARACTER is not None:
+            _boot_role, _boot_race, _boot_align = _BOOTSTRAP_CHARACTER
+        else:
+            _boot_role, _boot_race, _boot_align = (
+                _Role.ARCHEOLOGIST, _Race.HUMAN, 0,
+            )
         state, _ = _engine.reset(
             _raw_key,
-            role=_Role.ARCHEOLOGIST,
-            race=_Race.HUMAN,
-            alignment=0,
+            role=_boot_role,
+            race=_boot_race,
+            alignment=_boot_align,
             fast_reset=True,
         )
         # NethaxEnv.reset populated the state with a full vendor dungeon

@@ -4411,9 +4411,42 @@ def _register_exploremaze_envs(register_fn) -> None:
 # ---------------------------------------------------------------------------
 # Top-level registration entry-point
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Per-env player-role overrides
+# ---------------------------------------------------------------------------
+# A handful of MiniHack envs hardcode a non-Archeologist player role in their
+# vendor class.  The minihax bootstrap must spawn the matching role so the
+# hero @-glyph, starting inventory, and role_init RNG stay byte-identical.
+# ``(role, race, alignment)`` — alignment is 0=lawful / 1=neutral / 2=chaotic.
+# Envs NOT listed here keep the Archeologist-Human-Lawful default, so Room /
+# skills / Levitate / etc. are unaffected.  Cite the vendor characters:
+#   * Quest-Medium / CorridorBattle -> "kni-hum-law-fem"
+#     (vendor/minihack/minihack/envs/skills_quest.py:16, fightcorridor.py:8)
+#   * KeyRoom family -> "rog-hum-cha-mal"
+#     (vendor/minihack/minihack/envs/keyroom.py:34)
+def _env_role_overrides():
+    from Nethax.nethax.constants.roles import Role
+    from Nethax.nethax.constants.races import Race
+    knight = (Role.KNIGHT, Race.HUMAN, 0)   # kni-hum-law
+    rogue = (Role.ROGUE, Race.HUMAN, 2)     # rog-hum-cha
+    return {
+        "MiniHack-Quest-Medium-v0": knight,
+        "MiniHack-CorridorBattle-v0": knight,
+        "MiniHack-CorridorBattle-Dark-v0": knight,
+        "MiniHack-KeyRoom-Fixed-S5-v0": rogue,
+        "MiniHack-KeyRoom-S5-v0": rogue,
+        "MiniHack-KeyRoom-Dark-S5-v0": rogue,
+        "MiniHack-KeyRoom-S15-v0": rogue,
+        "MiniHack-KeyRoom-Dark-S15-v0": rogue,
+    }
+
+
 def register_all() -> None:
     """Populate the global ``MINIHACK_ENV_REGISTRY``."""
     from Nethax.minihax.registry import EnvSpec, register
+    from Nethax.minihax.level_generator import bootstrap_character
+
+    role_overrides = _env_role_overrides()
 
     def reg(env_id: str,
             factory: Callable[[jax.Array], EnvState],
@@ -4421,6 +4454,17 @@ def register_all() -> None:
             *,
             max_steps: int,
             category: str) -> None:
+        # Wrap the factory so the env's true player role is active while the
+        # (host-side) level factory runs its NLE_BYTEPARITY reset bootstrap.
+        override = role_overrides.get(env_id)
+        if override is not None:
+            _inner = factory
+            _role, _race, _align = override
+
+            def factory(rng, _inner=_inner, _r=_role, _rc=_race, _a=_align):
+                with bootstrap_character(_r, _rc, _a):
+                    return _inner(rng)
+
         spec = EnvSpec(
             env_id=env_id,
             level_factory=factory,

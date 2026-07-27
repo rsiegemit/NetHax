@@ -97,6 +97,26 @@ _OBS_KEYS = (
     "glyphs", "chars", "blstats", "inv_glyphs", "inv_letters", "inv_strs",
 )
 
+# Per-env vendor player character.  Default is the canonical MiniHack
+# "arc-hum-law-mal" (Archeologist).  A few envs hardcode a different role in
+# their vendor class, so the vendor build MUST use the same character the
+# vendor env forces — otherwise the hero @-glyph / inventory / role_init RNG
+# diverge from the minihax bootstrap (which spawns the matching role via
+# canonical._env_role_overrides).  Cite:
+#   * skills_quest.py:16 / fightcorridor.py:8 -> "kni-hum-law-fem"
+#   * keyroom.py:34                          -> "rog-hum-cha-mal"
+_DEFAULT_CHARACTER = "arc-hum-law-mal"
+_ENV_CHARACTER = {
+    "MiniHack-Quest-Medium-v0": "kni-hum-law-fem",
+    "MiniHack-CorridorBattle-v0": "kni-hum-law-fem",
+    "MiniHack-CorridorBattle-Dark-v0": "kni-hum-law-fem",
+    "MiniHack-KeyRoom-Fixed-S5-v0": "rog-hum-cha-mal",
+    "MiniHack-KeyRoom-S5-v0": "rog-hum-cha-mal",
+    "MiniHack-KeyRoom-Dark-S5-v0": "rog-hum-cha-mal",
+    "MiniHack-KeyRoom-S15-v0": "rog-hum-cha-mal",
+    "MiniHack-KeyRoom-Dark-S15-v0": "rog-hum-cha-mal",
+}
+
 
 def _env_id_to_vendor_cls(env_id: str):
     """Map a canonical MiniHack env_id to its vendor class.
@@ -116,8 +136,10 @@ def _env_id_to_vendor_cls(env_id: str):
     from minihack.envs import skills_freeze as _freeze_mod
     from minihack.envs import river as _river_mod
     from minihack.envs import keyroom as _kr_mod
+    from minihack.envs import skills_quest as _quest_mod
 
     table = {
+        "MiniHack-Quest-Medium-v0":        _quest_mod.MiniHackQuestMedium,
         "MiniHack-Levitate-Boots-Full-v0":       _levit_mod.MiniHackLevitateBoots,
         "MiniHack-Levitate-Boots-Restricted-v0":
             _levit_mod.MiniHackLevitateBootsRestrictedActions,
@@ -263,7 +285,8 @@ def vendor_dump(env_id: str, seed: int) -> dict:
     # reset default, the MinihaxEnv path keeps the EnvState zero-init,
     # producing @ glyph 327 (Archeologist PM).  Vendor character format
     # is "role-race-align-gender" (vendor/minihack/minihack/navigation.py:38).
-    env = cls(observation_keys=_OBS_KEYS, character="arc-hum-law-mal")
+    character = _ENV_CHARACTER.get(env_id, _DEFAULT_CHARACTER)
+    env = cls(observation_keys=_OBS_KEYS, character=character)
     assert env._level_seeds is None, (
         "vendor env should have _level_seeds=None to avoid silent draw"
     )
