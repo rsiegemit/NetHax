@@ -216,6 +216,219 @@ def _build_monster_group_flags():
 _MON_SGROUP, _MON_LGROUP = _build_monster_group_flags()
 
 
+def _build_monster_armed():
+    """Per-monster ``is_armed`` boolean (vendor mondata: has an AT_WEAP attack).
+
+    Vendor makemon.c:1442 only calls ``m_initweap()`` when ``is_armed(ptr)``.
+    ``is_armed`` == the monster has any attack of type AT_WEAP.  Mirrored on
+    ``MonsterEntry.attacks``.
+    """
+    import numpy as _np
+    from Nethax.nethax.constants.monsters import MONSTERS, AttackType
+    n = len(MONSTERS)
+    arr = _np.zeros(n, dtype=bool)
+    for i, m in enumerate(MONSTERS):
+        arr[i] = any(a[0] == AttackType.AT_WEAP for a in m.attacks)
+    return arr
+
+
+_MON_ARMED = _build_monster_armed()
+
+# Object / monster type indices used by the m_initweap mlet switch, resolved
+# from the OBJECTS / MONSTERS tables by name at import (never hardcoded map
+# positions).  ``.get`` so a missing entry yields None rather than KeyError.
+_OBJ_BY_NAME = {ob.name: i for i, ob in enumerate(OBJECTS)}
+_MON_BY_NAME = {m.name: i for i, m in enumerate(MONSTERS)}
+_PM_GOBLIN = _MON_BY_NAME.get("goblin")
+_PM_ORC_SHAMAN = _MON_BY_NAME.get("orc shaman")
+_PM_ORC_CAPTAIN = _MON_BY_NAME.get("orc-captain")
+# Armor types whose mksobj() cursed-branch short-circuits the rn2(11) draw
+# (vendor mkobj.c:1087-1090); none are granted by depth-1 monsters but the set
+# keeps _mksobj_armor_draws faithful for the general case.
+_SPECIAL_CURSE_ARMOR = frozenset(
+    i for i in (
+        _OBJ_BY_NAME.get("fumble boots"),
+        _OBJ_BY_NAME.get("levitation boots"),
+        _OBJ_BY_NAME.get("helm of opposite alignment"),
+        _OBJ_BY_NAME.get("gauntlets of fumbling"),
+    ) if i is not None
+)
+
+
+def _rn2(vrng, x):
+    """One vendor ``rn2(x)`` draw off the ISAAC64 stream -> (vrng, int result)."""
+    from Nethax.nethax import vendor_rng as _vr
+    vrng, v = _vr.rn2_jax(vrng, jnp.int32(x))
+    return vrng, int(v)
+
+
+def _rne_draws(vrng, x=3):
+    """Vendor ``rne(x)`` (rnd.c:208) at u.ulevel==1 (utmp==5): draw rn2(x)
+    up to 4 times, stopping early on the first non-zero result."""
+    utmp = 5  # u.ulevel == 1 at mklev  ->  (ulevel<15) ? 5 : ...
+    tmp = 1
+    while tmp < utmp:
+        vrng, r = _rn2(vrng, x)
+        if r != 0:
+            break
+        tmp += 1
+    return vrng
+
+
+def _blessorcurse_draws(vrng, chance):
+    """Vendor ``blessorcurse(otmp, chance)`` (mkobj.c): draw rn2(chance); when
+    it is 0, draw an extra rn2(2) to choose curse vs bless."""
+    vrng, r = _rn2(vrng, chance)
+    if r == 0:
+        vrng, _ = _rn2(vrng, 2)
+    return vrng
+
+
+def _is_multigen(otyp):
+    """Vendor ``is_multigen`` (obj.h): WEAPON_CLASS ammo (oc_skill in
+    [-P_SHURIKEN, -P_BOW] == [-24, -20]) -> stacks via rn1(6,6)."""
+    ob = OBJECTS[otyp]
+    return int(ob.class_) == int(ObjectClass.WEAPON_CLASS) and -24 <= int(ob.oc_skill) <= -20
+
+
+def _is_poisonable(otyp):
+    """Vendor ``is_poisonable`` (obj.h): same launcher-ammo range as multigen
+    (permapoisoned specials are ignored — none are granted at depth 1)."""
+    return _is_multigen(otyp)
+
+
+def _mksobj_draws(vrng, otyp):
+    """Vendor ``mksobj(otyp, TRUE, FALSE)`` -> ``mksobj_init`` object-creation
+    RNG for the WEAPON/ARMOR classes a monster can be granted (mkobj.c:876,
+    1085).  ``artif`` is FALSE (mongets/m_initthrow), so the artifact rn2 is
+    never drawn.  Only the draw-count/moduli matter for stream alignment."""
+    cls = int(OBJECTS[otyp].class_)
+    if cls == int(ObjectClass.WEAPON_CLASS):
+        if _is_multigen(otyp):
+            vrng, _ = _rn2(vrng, 6)          # quan = rn1(6, 6)
+        vrng, r11 = _rn2(vrng, 11)
+        if r11 == 0:
+            vrng = _rne_draws(vrng, 3)       # spe = rne(3)
+            vrng, _ = _rn2(vrng, 2)          # blessed = rn2(2)
+        else:
+            vrng, r10 = _rn2(vrng, 10)
+            if r10 == 0:
+                vrng = _rne_draws(vrng, 3)   # spe = -rne(3)
+            else:
+                vrng = _blessorcurse_draws(vrng, 10)
+        if _is_poisonable(otyp):
+            vrng, _ = _rn2(vrng, 100)        # opoisoned = !rn2(100)
+        return vrng
+    if cls == int(ObjectClass.ARMOR_CLASS):
+        vrng, a = _rn2(vrng, 10)
+        cond_curse = False
+        if a != 0:
+            if otyp in _SPECIAL_CURSE_ARMOR:
+                cond_curse = True            # || short-circuits the rn2(11)
+            else:
+                vrng, b = _rn2(vrng, 11)
+                cond_curse = (b == 0)
+        if cond_curse:
+            vrng = _rne_draws(vrng, 3)       # spe = -rne(3)
+        else:
+            vrng, c = _rn2(vrng, 10)
+            if c == 0:
+                vrng, _ = _rn2(vrng, 2)      # blessed = rn2(2)
+                vrng = _rne_draws(vrng, 3)   # spe = rne(3)
+            else:
+                vrng = _blessorcurse_draws(vrng, 10)
+        return vrng
+    # Other object classes are not granted by the depth-1 mlet cases handled
+    # below; leave the stream untouched.
+    return vrng
+
+
+def _m_initthrow_draws(vrng, otyp, oquan):
+    """Vendor ``m_initthrow(otyp, oquan)`` (makemon.c:148): mksobj(otyp) then
+    ``quan = rn1(oquan, 3)`` (one rn2(oquan) draw)."""
+    if otyp is None:
+        return vrng
+    vrng = _mksobj_draws(vrng, otyp)
+    vrng, _ = _rn2(vrng, oquan)
+    return vrng
+
+
+def _m_initweap_default_draws(vrng, idx):
+    """Vendor ``m_initweap`` default case (makemon.c:526-567): a bias-weighted
+    ``rnd(14 - 2*bias)`` roll selecting one weapon grant."""
+    m = MONSTERS[idx]
+    f2 = int(m.flags2)
+    from Nethax.nethax.constants.monsters import (
+        M2_LORD, M2_PRINCE, M2_NASTY, M2_STRONG,
+    )
+    bias = (1 if f2 & M2_LORD else 0) + (2 if f2 & M2_PRINCE else 0) \
+        + (1 if f2 & M2_NASTY else 0)
+    strong = bool(f2 & M2_STRONG)
+    vrng, w = _rn2(vrng, 14 - 2 * bias)      # rnd(14 - 2*bias)
+    case = w + 1
+    O = _OBJ_BY_NAME.get
+    if case == 1:
+        vrng = _mksobj_draws(vrng, O("battle-axe")) if strong \
+            else _m_initthrow_draws(vrng, O("dart"), 12)
+    elif case == 2:
+        if strong:
+            vrng = _mksobj_draws(vrng, O("two-handed sword"))
+        else:
+            vrng = _mksobj_draws(vrng, O("crossbow"))
+            vrng = _m_initthrow_draws(vrng, O("crossbow bolt"), 12)
+    elif case == 3:
+        vrng = _mksobj_draws(vrng, O("bow"))
+        vrng = _m_initthrow_draws(vrng, O("arrow"), 12)
+    elif case == 4:
+        vrng = _mksobj_draws(vrng, O("long sword")) if strong \
+            else _m_initthrow_draws(vrng, O("dagger"), 3)
+    elif case == 5:
+        vrng = _mksobj_draws(vrng, O("lucern hammer")) if strong \
+            else _mksobj_draws(vrng, O("aklys"))
+    return vrng
+
+
+def _m_initweap_draws(vrng, idx):
+    """Vendor ``m_initweap(mtmp)`` (makemon.c:161): mlet-keyed weapon/armor
+    grants (each consuming ``mksobj`` RNG) + the final ``rnd_offensive_item``
+    gate.  Only called for ``is_armed`` monsters.  Fully faithful for the
+    mlets reachable at dungeon depth 1 (S_ORC goblin, S_KOBOLD kobold); other
+    mlets fall through to the generic default case."""
+    m = MONSTERS[idx]
+    sym = int(m.symbol)
+    S_KOBOLD, S_ORC = 11, 15
+    O = _OBJ_BY_NAME.get
+    if sym == S_KOBOLD:
+        vrng, r = _rn2(vrng, 4)
+        if r == 0:
+            vrng = _m_initthrow_draws(vrng, O("dart"), 12)
+    elif sym == S_ORC:
+        vrng, r = _rn2(vrng, 2)                       # ORCISH_HELM gate
+        if r != 0:
+            vrng = _mksobj_draws(vrng, O("orcish helm"))
+        # switch selector draws rn2(2) only for ORC_CAPTAIN (not depth-1);
+        # every other orc uses its own mndx -> the default sub-case.
+        if idx == _PM_ORC_CAPTAIN:
+            vrng, _sel = _rn2(vrng, 2)
+        if idx != _PM_ORC_SHAMAN:
+            vrng, g = _rn2(vrng, 2)
+            if g != 0:
+                if idx == _PM_GOBLIN:
+                    otyp = O("orcish dagger")        # || short-circuits rn2(2)
+                else:
+                    vrng, d2 = _rn2(vrng, 2)
+                    otyp = O("orcish dagger") if d2 == 0 else O("scimitar")
+                vrng = _mksobj_draws(vrng, otyp)
+    else:
+        vrng = _m_initweap_default_draws(vrng, idx)
+    # if ((int) mtmp->m_lev > rn2(75)) mongets(rnd_offensive_item(mtmp));
+    vrng, r75 = _rn2(vrng, 75)
+    # At depth 1 the picked monsters have m_lev 0..1 so this gate is virtually
+    # always false; rnd_offensive_item's internal draws are not ported (would
+    # only fire for higher-level armed monsters, absent from these envs).
+    return vrng
+
+
 # ---------------------------------------------------------------------------
 # Directive dataclasses
 # ---------------------------------------------------------------------------
@@ -2083,22 +2296,31 @@ def _resolve_monster(
             occ.add(rc)  # leader occupies its own cell
             for _m in range(cnt):
                 mpos, vrng = _enexto(terrain_np, occ, xi, yi, w, h, vrng)
-                # member makemon draws (newmonhp/init + m_initweap):
-                # rn2(4), rn2(2), rn2(50), rn2(100), rn2(100).
+                # member makemon draws: newmonhp rn2(4), gender rn2(2),
+                # [m_initweap if armed], m_initinv rn2(50)+rn2(100), saddle
+                # rn2(100).  Members are the same species as the leader.
                 vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))
                 vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+                if _MON_ARMED[idx]:
+                    vrng = _m_initweap_draws(vrng, idx)
                 vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
                 vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
                 vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
                 if mpos is not None:
                     members.append((mpos, idx))
                     occ.add(mpos)
-            # Leader's own m_initweap (after the group is built).
+            # Leader: m_initweap (if armed) precedes m_initinv + saddle.
+            if _MON_ARMED[idx]:
+                vrng = _m_initweap_draws(vrng, idx)
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
         else:
-            # Non-group (or gate==0): just the leader's m_initweap.
+            # Non-group leader: m_initweap (if armed) then m_initinv + saddle.
+            # m_initweap (makemon.c:1442) is is_armed-GUARDED so unarmed gate
+            # monsters (newt/gridbug/jackal) consume ZERO extra draws here.
+            if _MON_ARMED[idx]:
+                vrng = _m_initweap_draws(vrng, idx)
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(50))
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
             vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
