@@ -1289,20 +1289,39 @@ def _mazewalk_geometry(w: int, h: int):
     The vendor MAP is ``(w+2) × (h+2)`` and is centered on the 79×21 level
     via the ``GEOMETRY:center,center`` CENTER formula (spo_map).
     """
+    ROWNO = 21
     mapw, maph = w + 2, h + 2
     xstart, ystart = _vendor_geometry_center_wh(mapw, maph)
-    # spo_mazewalk default coord = (MAP//2, MAP//2) MAP-relative, dir=east.
-    # Internal cell = (xstart + MAP//2, ystart + MAP//2); the y coordinate is
-    # forced odd (walkfrom parity).  Ground-truthed (9x9 seed 0): the walk
-    # begins at (xstart+MAP//2, ystart+MAP//2 - even_adjust) = (40, 9).
-    cx = xstart + (mapw // 2)
-    cy = ystart + (maph // 2)
-    if cy % 2 == 0:
-        cy -= 1
-    sx, sy = cx, cy
-    # walkfrom okay-bounds = the maze interior (w × h) of the stone MAP.
-    minx, maxx = xstart, xstart + w - 1
-    miny, maxy = ystart + 1, ystart + h
+    # spo_map CENTER overflow clamp (sp_lev.c:4983-4991): a centered MAP whose
+    # bottom edge would pass ROWNO is nudged back up two rows, and a
+    # full-height MAP (ysize == ROWNO, e.g. 45x19's maph=21) is snapped to
+    # ystart=0.  _vendor_geometry_center_wh does not model this clamp.
+    if ystart < 0 or ystart + maph > ROWNO:
+        ystart += -2 if ystart > 0 else 2
+        if maph == ROWNO:
+            ystart = 0
+    # spo_mazewalk default coord = (MAP//2, MAP//2) MAP-relative, dir=east
+    # (sp_lev.c:4761-4800).  get_location_coord maps it to internal
+    # (xstart+MAP//2, ystart+MAP//2); then dir=east does x++ and the parity
+    # force makes BOTH coords odd (x++ again if still even, y-- if even).  In
+    # the minihax DISPLAY frame (internal x - 1, internal y) that means the
+    # start col rounds UP to even and the start row rounds DOWN to odd.  9x9's
+    # base col is already even so only y mattered there; 15x15/45x19 need the
+    # x round-up too (base col odd -> +1), else the walk starts one cell west
+    # and the whole rn2 carve stream diverges.
+    base_x = xstart + (mapw // 2)
+    base_y = ystart + (maph // 2)
+    sx = base_x if (base_x % 2 == 0) else base_x + 1
+    sy = base_y if (base_y % 2 == 1) else base_y - 1
+    # walkfrom okay-bounds = the stone MAP interior (w × h) INTERSECTED with
+    # vendor okay()'s hard global clip (mkmaze.c:238 `x<3 || y<3 ||
+    # x>x_maze_max || y>y_maze_max`).  With x_maze_max=(COLNO-1)&~1=78,
+    # y_maze_max=(ROWNO-1)&~1=20 (decl.c:31).  In the display frame this is
+    # x∈[2,77], y∈[3,20].  The y≥3 clip only bites for 45x19 (ystart clamped
+    # to 0 -> stone rows 1..2 are unreachable), keeping its maze top at row 3.
+    x_maze_max, y_maze_max = 78, 20
+    minx, maxx = max(xstart, 2), min(xstart + w - 1, x_maze_max - 1)
+    miny, maxy = max(ystart + 1, 3), min(ystart + h, y_maze_max)
     # STAIR:random region base = MAP top-left minus the 1-col west margin.
     stair_bx, stair_by = xstart - 1, ystart
     return (xstart, ystart, sx, sy, minx, maxx, miny, maxy,
