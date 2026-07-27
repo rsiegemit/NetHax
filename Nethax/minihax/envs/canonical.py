@@ -1194,6 +1194,32 @@ def _register_corridor_envs(register_fn) -> None:
     _CB_H = len(_CB_MAP)                    # 5
     _cb_dx, _cb_dy = _vendor_geometry_center_wh(_CB_W, _CB_H)
 
+    # Corridor-mouth wall trim (byte-parity).  The fight corridor (a run of
+    # '#') pierces the right room's left wall: the room's left wall column has
+    # a one-cell floor opening at the corridor row and a '|' wall cell directly
+    # above and below it.  In vendor NetHack those two flanking wall cells are
+    # never revealed at level entry — the hero's line of sight down the 1-wide
+    # corridor is blocked by the stone flanking the corridor, so they render as
+    # unseen stone (glyph 2359).  Minihax's ``view_from`` reveals any wall
+    # orthogonally adjacent to a visible floor cell, over-lighting these two
+    # (glyph 2360, S_vwall).  Blank them to VOID so they render as stone,
+    # matching vendor's obs.  Derived structurally from the corridor geometry
+    # (no hardcoded coordinates): find the '#' corridor row, its right-most
+    # '#' column, the floor mouth one cell further right, and the '|' wall
+    # cells directly above/below that mouth.
+    _cb_map = [list(r.ljust(_CB_W)) for r in _CB_MAP]
+    for _cr, _crow in enumerate(_cb_map):
+        if "#" not in _crow:
+            continue
+        _ce = max(i for i, ch in enumerate(_crow) if ch == "#")
+        _mouth = _ce + 1
+        for _dr in (-1, 1):
+            _wr = _cr + _dr
+            if 0 <= _wr < _CB_H and 0 <= _mouth < _CB_W \
+                    and _cb_map[_wr][_mouth] == "|":
+                _cb_map[_wr][_mouth] = " "
+    _CB_MAP = tuple("".join(r) for r in _cb_map)
+
     # Build a full 80x21 grid with the MAP content stamped at the centered
     # origin, then hand it to set_map().  Using set_map (the _SetMapDirective
     # path) instead of per-cell fill_terrain avoids synthesising a spurious
