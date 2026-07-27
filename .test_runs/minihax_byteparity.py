@@ -113,6 +113,7 @@ def _env_id_to_vendor_cls(env_id: str):
     from minihack.envs import sokoban as _soko_mod
     from minihack.envs import skills_lava as _lava_mod
     from minihack.envs import skills_levitate as _levit_mod
+    from minihack.envs import skills_freeze as _freeze_mod
     from minihack.envs import river as _river_mod
     from minihack.envs import keyroom as _kr_mod
 
@@ -130,6 +131,18 @@ def _env_id_to_vendor_cls(env_id: str):
             _levit_mod.MiniHackLevitatePotionRestrictedActions,
         "MiniHack-Levitate-Potion-Fixed-v0":     _levit_mod.MiniHackLevitatePotionFixed,
         "MiniHack-Levitate-Random-Full-v0":      _levit_mod.MiniHackLevitateRandom,
+        "MiniHack-Freeze-Wand-Full-v0":          _freeze_mod.MiniHackFreezeWand,
+        "MiniHack-Freeze-Wand-Restricted-v0":
+            _freeze_mod.MiniHackFreezeWandRestrictedActions,
+        "MiniHack-Freeze-Horn-Full-v0":          _freeze_mod.MiniHackFreezeHorn,
+        "MiniHack-Freeze-Horn-Restricted-v0":
+            _freeze_mod.MiniHackFreezeHornRestrictedActions,
+        "MiniHack-Freeze-Random-Full-v0":        _freeze_mod.MiniHackFreezeRandom,
+        "MiniHack-Freeze-Random-Restricted-v0":
+            _freeze_mod.MiniHackFreezeRandomRestrictedActions,
+        "MiniHack-Freeze-Lava-Full-v0":          _freeze_mod.MiniHackFreezeLava,
+        "MiniHack-Freeze-Lava-Restricted-v0":
+            _freeze_mod.MiniHackFreezeLavaRestrictedActions,
         "MiniHack-KeyRoom-Fixed-S5-v0":    _kr_mod.MiniHackKeyRoom5x5Fixed,
         "MiniHack-KeyRoom-S5-v0":          _kr_mod.MiniHackKeyRoom5x5,
         "MiniHack-KeyRoom-Dark-S5-v0":     _kr_mod.MiniHackKeyRoom5x5Dark,

@@ -3731,26 +3731,233 @@ def _skill_sink_builder(distr: bool, fixed: bool) -> Callable[[LevelGenerator], 
     return build
 
 
-def _skill_freeze_builder(source: str) -> Callable[[LevelGenerator], None]:
-    def build(lg: LevelGenerator) -> None:
-        # Place freeze source (wand/horn/random) and a monster.
-        if source == "wand":
-            try:
-                lg.add_object("wand of cold", "/", place=(1, 1))
-            except KeyError:
-                lg.add_object("random", place=(1, 1))
-        elif source == "horn":
-            try:
-                lg.add_object("frost horn", "(", place=(1, 1))
-            except KeyError:
-                lg.add_object("random", place=(1, 1))
+# ---------------------------------------------------------------------------
+# Freeze skill family byte-parity.
+#
+# Vendor (skills_freeze.py) builds Wand/Horn as a lit 8x8 room via
+#   LevelGenerator(w=8, h=8, lit=True); add_object(<item>, sym, blessed)
+# with GEOMETRY:center,center and NO stair (RM fires on the cold-bounce
+# message).  Random-{Full,Restricted} use an inline 8x8 MAP des that picks the
+# item TYPE via IF[50%] before the OBJECT directive.  Lava-{Full,Restricted}
+# reuse the LavaCross 13x7 lava MAP (IF[50%] item pick, on-bank OBJECT
+# rndcoord, right-bank STAIR, BRANCH player) with the default sparse RM.
+#
+# Item mksobj_init draws (vendor/nethack/src/mkobj.c):
+#   wand of cold (WAND_CLASS, oc_dir != NODIR): spe = rn1(5, 4) -> rn2(5),
+#       then blessorcurse(otmp, 17)          (mkobj.c:1115-1125)
+#   frost horn  (TOOL_CLASS):  spe = rn1(5, 4) -> rn2(5), no blessorcurse
+#       (mkobj.c:1051-1057)
+# Placement draw order mirrors the Levitate (5x5 room) / LavaCross (13x7)
+# families, which are already byte-exact.
+# ---------------------------------------------------------------------------
+def _consume_freeze_item_draws(vrng, item_key: str):
+    """Replay the vendor ``mksobj_init`` ISAAC64 draws for a freeze item.
+
+    ``"wand"`` (wand of cold, WAND_CLASS DIR): ``rn2(5)`` then
+    ``blessorcurse(17)``.  ``"horn"`` (frost horn, TOOL_CLASS): ``rn2(5)`` only.
+    """
+    from Nethax.nethax import vendor_rng as _vr
+
+    def rn2(v, n):
+        v, r = _vr.rn2_jax(v, jnp.int32(n))
+        return v, int(r)
+
+    def blessorcurse(v, chance):
+        v, r = rn2(v, chance)
+        if r == 0:
+            v, _ = rn2(v, 2)
+        return v
+
+    vrng, _ = rn2(vrng, 5)          # spe = rn1(5, 4)
+    if item_key == "wand":
+        vrng = blessorcurse(vrng, 17)
+    return vrng
+
+
+def _wrap_freeze_placement(
+    factory: Callable[[jax.Array], "EnvState"],
+    item_name: str,
+    item_key: str,
+    *,
+    size: int = 8,
+    lit: bool = True,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Freeze-{Wand,Horn}-{Full,Restricted}: RNG object + RNG player in an 8x8
+    lit room (mirrors ``_wrap_skill_levitate_placement``)."""
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    import numpy as _np
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        x1, y1 = _vendor_geometry_center(size)
+
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+
+        vrng, ox = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, oy = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        obj_col = int(x1) + int(ox)
+        obj_row = int(y1) + int(oy)
+
+        vrng = _consume_freeze_item_draws(vrng, item_key)
+        state = _stamp_levitate_item(state, item_name, obj_row, obj_col)
+
+        terr_np = _np.asarray(state.terrain[0, 0])
+        vrng, acc_x, acc_y = _levitate_place_player(
+            vrng, terr_np, {(obj_row, obj_col)}, x1, y1, size
+        )
+        state = state.replace(
+            vendor_rng=vrng,
+            player_pos=jnp.stack(
+                [jnp.int32(acc_y).astype(jnp.int16),
+                 jnp.int32(acc_x).astype(jnp.int16)]
+            ),
+        )
+        return _seed_hero_fov(state, lit)
+
+    return wrapped
+
+
+def _wrap_freeze_random(
+    factory: Callable[[jax.Array], "EnvState"],
+    *,
+    size: int = 8,
+    lit: bool = True,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Freeze-Random-{Full,Restricted}: item TYPE RNG-chosen (``IF[50%]``:
+    ``rn2(100) < 50`` -> wand of cold, else frost horn), then Full-style
+    8x8 room placement."""
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+    import numpy as _np
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        x1, y1 = _vendor_geometry_center(size)
+
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+
+        vrng, r = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        if int(r) < 50:
+            item_name, item_key = "cold", "wand"
         else:
-            lg.add_object("random", place=(1, 1))
-        lg.add_monster()
-        lg.add_stair_down(x=4, y=4)
-        if source == "lava":
-            lg.fill_terrain("L", 3, 3, 3, 3)
-    return build
+            item_name, item_key = "frost horn", "horn"
+
+        vrng, ox = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, oy = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        obj_col = int(x1) + int(ox)
+        obj_row = int(y1) + int(oy)
+
+        vrng = _consume_freeze_item_draws(vrng, item_key)
+        state = _stamp_levitate_item(state, item_name, obj_row, obj_col)
+
+        terr_np = _np.asarray(state.terrain[0, 0])
+        vrng, acc_x, acc_y = _levitate_place_player(
+            vrng, terr_np, {(obj_row, obj_col)}, x1, y1, size
+        )
+        state = state.replace(
+            vendor_rng=vrng,
+            player_pos=jnp.stack(
+                [jnp.int32(acc_y).astype(jnp.int16),
+                 jnp.int32(acc_x).astype(jnp.int16)]
+            ),
+        )
+        return _seed_hero_fov(state, lit)
+
+    return wrapped
+
+
+def _wrap_freeze_lava(
+    factory: Callable[[jax.Array], "EnvState"],
+) -> Callable[[jax.Array], "EnvState"]:
+    """Freeze-Lava-{Full,Restricted}: LavaCross 13x7 lava MAP.
+
+    Vendor des directive order OBJECT/BRANCH/STAIR, but the BRANCH player
+    ``place_lregion`` is deferred to level end, so the ISAAC64 draw order is
+    (matching ``_wrap_lavacross_placement``):
+      1. rn2(3), rn2(2)          -- level-setup prefix
+      2. rn2(100)                -- IF[50%]: <50 wand of cold, else frost horn
+      3. rn2(25)                 -- OBJECT rndcoord($left_bank)  (v//5, v%5)
+      4. freeze item mksobj draws
+      5. rn2(25)                 -- STAIR rndcoord($right_bank)
+      6. rn2(5), rn2(5)          -- BRANCH player (xrel, yrel) in left_bank
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TT
+    from Nethax.minihax.level_generator import (
+        seed_hero_fov as _seed_hero_fov,
+        _OBJECT_NAME_TO_IDX as _NAME2IDX,
+        _write_ground_item as _write_gi,
+    )
+    from Nethax.nethax.subsystems.ground_items_sparse import (
+        dense_to_sparse as _dense_to_sparse,
+        sparse_to_dense as _sparse_to_dense,
+    )
+
+    xstart, ystart = _vendor_geometry_center_wh(13, 7)
+    ix0 = xstart + 1
+    iy0 = ystart + 1
+    left_x0 = ix0
+    right_x0 = ix0 + 6
+    row0 = iy0
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+
+        vrng, r = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+        if int(r) < 50:
+            item_name, item_key = "cold", "wand"
+        else:
+            item_name, item_key = "frost horn", "horn"
+
+        vrng, oi = _vendor_rng.rn2_jax(vrng, jnp.int32(25))
+        oi = int(oi)
+        obj_col = left_x0 + (oi // 5)
+        obj_row = row0 + (oi % 5)
+
+        vrng = _consume_freeze_item_draws(vrng, item_key)
+
+        vrng, si = _vendor_rng.rn2_jax(vrng, jnp.int32(25))
+        si = int(si)
+        stair_col = right_x0 + (si // 5)
+        stair_row = row0 + (si % 5)
+
+        vrng, px = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, py = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        start_col = left_x0 + int(px)
+        start_row = row0 + int(py)
+
+        new_terrain = state.terrain.at[
+            0, 0, stair_row, stair_col
+        ].set(jnp.int8(int(_TT.STAIRCASE_DOWN)))
+
+        obj_idx = _NAME2IDX.get(item_name)
+        if obj_idx is not None:
+            dense = _sparse_to_dense(state.ground_items)
+            dense, _ = _write_gi(dense, {}, (obj_row, obj_col), int(obj_idx))
+            state = state.replace(
+                ground_items=_dense_to_sparse(dense, state.ground_items.K)
+            )
+
+        state = state.replace(
+            vendor_rng=vrng,
+            terrain=new_terrain,
+            player_pos=jnp.stack(
+                [jnp.int32(start_row).astype(jnp.int16),
+                 jnp.int32(start_col).astype(jnp.int16)]
+            ),
+        )
+        return _seed_hero_fov(state, True)
+
+    return wrapped
 
 
 def _register_skill_simple_envs(register_fn) -> None:
@@ -3898,22 +4105,51 @@ def _register_skill_levitate_envs(register_fn) -> None:
 
 
 def _register_skill_freeze_envs(register_fn) -> None:
-    """8 Freeze envs.
+    """8 Freeze envs (byte-parity).
 
-    Vendor (``skills_freeze.py:11-18``): RM is ``add_message_event(freeze_msgs)``
-    for Wand/Horn/Random.  ``Freeze-Lava-*`` constructs ``MiniHackSkill``
-    without a RM (vendor default = sparse stairs_down), so keep the default
-    here for the Lava variants only.
+    Vendor (``skills_freeze.py``): RM is ``add_message_event(freeze_msgs)`` for
+    Wand/Horn/Random.  ``Freeze-Lava-*`` constructs ``MiniHackSkill`` without a
+    RM (vendor default = sparse stairs_down), so keep the default there.
+
+    Wand/Horn build a lit 8x8 room (``LevelGenerator(w=8, h=8)``) with an
+    RNG-placed blessed freeze item + RNG hero; Random picks the item TYPE via
+    ``IF[50%]``; Lava reuses the LavaCross 13x7 lava MAP.  All placement is
+    stamped by the vendor-draw-replay wrappers above (void-grid + centered MAP).
     """
-    for source in ("Wand", "Horn", "Random", "Lava"):
+    # Wand / Horn (Full + Restricted): 8x8 room, fixed item type.
+    for source, item_name, item_key in (
+        ("Wand", "cold", "wand"),
+        ("Horn", "frost horn", "horn"),
+    ):
         for suffix in ("-Full", "-Restricted"):
             env_id = f"MiniHack-Freeze-{source}{suffix}-v0"
-            builder = _skill_freeze_builder(source.lower())
-            factory = _make_factory(builder, w=5, h=5)
-            rm = (_default_goal_reward_manager()
-                  if source == "Lava" else _skill_freeze_rm())
-            register_fn(env_id, factory, rm,
+            base_factory = _make_factory(
+                _skill_room_builder(8, lit=True), w=80, h=21, fill=" ", lit=True
+            )
+            factory = _wrap_freeze_placement(base_factory, item_name, item_key)
+            register_fn(env_id, factory, _skill_freeze_rm(),
                         max_steps=50, category="Skill")
+
+    # Random (Full + Restricted): item TYPE RNG-chosen in an 8x8 room.
+    for suffix in ("-Full", "-Restricted"):
+        env_id = f"MiniHack-Freeze-Random{suffix}-v0"
+        base_factory = _make_factory(
+            _skill_room_builder(8, lit=True), w=80, h=21, fill=" ", lit=True
+        )
+        factory = _wrap_freeze_random(base_factory)
+        register_fn(env_id, factory, _skill_freeze_rm(),
+                    max_steps=50, category="Skill")
+
+    # Lava (Full + Restricted): LavaCross 13x7 lava MAP; default sparse RM.
+    for suffix in ("-Full", "-Restricted"):
+        env_id = f"MiniHack-Freeze-Lava{suffix}-v0"
+        base_factory = _make_factory(
+            _lavacross_builder(with_potion=False, with_ring=False, inv=False),
+            w=80, h=21, fill=".",
+        )
+        factory = _wrap_freeze_lava(base_factory)
+        register_fn(env_id, factory, _default_goal_reward_manager(),
+                    max_steps=50, category="Skill")
 
 
 # ---------------------------------------------------------------------------
