@@ -2741,20 +2741,88 @@ def _read_vendor_des(filename: str) -> str:
 # ---------------------------------------------------------------------------
 # Labyrinth envs (Group A)
 # ---------------------------------------------------------------------------
+# Vendor Labyrinth MAP blocks, verbatim (vendor/minihack/minihack/envs/lab.py
+# :8-29 Big, :47-58 Small).  Static ``LevelGenerator(map=..., lit=True)`` maze
+# levels stamped ``GEOMETRY:center,center`` on the 80x21 dungeon.
+_LABYRINTH_BIG_MAP = (
+    "-------------------------------------",
+    "|.................|.|...............|",
+    "|.|-------------|.|.|.------------|.|",
+    "|.|.............|.|.|.............|.|",
+    "|.|.|----------.|.|.|------------.|.|",
+    "|.|.|...........|.|.............|.|.|",
+    "|.|.|.|----------.|-----------|.|.|.|",
+    "|.|.|.|...........|.......|...|.|.|.|",
+    "|.|.|.|.|----------------.|.|.|.|.|.|",
+    "|.|.|.|.|.................|.|.|.|.|.|",
+    "|.|.|.|.|.-----------------.|.|.|.|.|",
+    "|.|.|.|.|...................|.|.|.|.|",
+    "|.|.|.|.|--------------------.|.|.|.|",
+    "|.|.|.|.......................|.|.|.|",
+    "|.|.|.|-----------------------|.|.|.|",
+    "|.|.|...........................|.|.|",
+    "|.|.|---------------------------|.|.|",
+    "|.|...............................|.|",
+    "|.|-------------------------------|.|",
+    "|...................................|",
+    "-------------------------------------",
+)
+_LABYRINTH_SMALL_MAP = (
+    "--------------------",
+    "|.......|.|........|",
+    "|.-----.|.|.-----|.|",
+    "|.|...|.|.|......|.|",
+    "|.|.|.|.|.|-----.|.|",
+    "|.|.|...|....|.|.|.|",
+    "|.|.--------.|.|.|.|",
+    "|.|..........|...|.|",
+    "|.|--------------|.|",
+    "|..................|",
+    "--------------------",
+)
+
+
+def _static_center_geometry(w: int, h: int) -> tuple[int, int]:
+    """Return the internal ``(xstart, ystart)`` origin for a ``w×h``
+    ``GEOMETRY:center,center`` MAP block, including the sp_lev.c full-height
+    clamp (a MAP whose bottom edge passes ROWNO is nudged up two rows, and a
+    full-height MAP is snapped to ystart=0).  Same clamp as
+    :func:`_mazewalk_geometry`; verified against the vendor Labyrinth reset
+    (hero at internal (col=40,row=1) for the 37x21 map -> xstart=21,ystart=0).
+    """
+    xstart, ystart = _vendor_geometry_center_wh(w, h)
+    ROWNO = 21
+    if ystart < 0 or ystart + h > ROWNO:
+        ystart += -2 if ystart > 0 else 2
+        if h == ROWNO:
+            ystart = 0
+    return xstart, ystart
+
+
 def _labyrinth_builder(big: bool) -> Callable[[LevelGenerator], None]:
+    """Stamp the vendor Labyrinth static MAP at its centered origin.
+
+    Vendor ``MiniHackLabyrinth`` / ``MiniHackLabyrinthSmall`` (lab.py) are
+    static ``LevelGenerator(map=..., lit=True)`` levels with a fixed
+    ``set_start_pos`` (BRANCH hero) and ``add_goal_pos`` (down-stair) — no RNG
+    placement, so the whole level is deterministic.  We stamp the MAP, pin the
+    hero, and drop the goal stair at the vendor MAP-relative coords + centered
+    offset; ``seed_hero_fov`` (default_lit=True) reproduces the lit-maze LOS.
+    """
+    if big:
+        rows = _LABYRINTH_BIG_MAP
+        start_xy, goal_xy = (19, 1), (19, 7)
+    else:
+        rows = _LABYRINTH_SMALL_MAP
+        start_xy, goal_xy = (9, 1), (14, 5)
+    w = max(len(r) for r in rows)
+    h = len(rows)
+    dx, dy = _static_center_geometry(w, h)
+
     def build(lg: LevelGenerator) -> None:
-        if big:
-            lg.add_room(x=1, y=1, w=30, h=18)
-            lg.set_start_pos(2, 2)
-            lg.add_stair_down(x=29, y=17)
-            # A few interior wall pillars to make the path non-trivial.
-            for cx in (8, 16, 24):
-                lg.fill_terrain("|", cx, 4, cx, 14)
-        else:
-            lg.add_room(x=1, y=1, w=15, h=10)
-            lg.set_start_pos(2, 2)
-            lg.add_stair_down(x=14, y=9)
-            lg.fill_terrain("|", 7, 3, 7, 7)
+        lg.set_map(rows, xstart=dx, ystart=dy)
+        lg.set_start_pos(start_xy[0] + dx, start_xy[1] + dy)
+        lg.add_stair_down(x=goal_xy[0] + dx, y=goal_xy[1] + dy)
     return build
 
 
@@ -2763,9 +2831,7 @@ def _register_labyrinth_envs(register_fn) -> None:
         ("MiniHack-Labyrinth-Big-v0", True),
         ("MiniHack-Labyrinth-Small-v0", False),
     ]:
-        w = 32 if big else 17
-        h = 20 if big else 12
-        factory = _make_factory(_labyrinth_builder(big), w=w, h=h)
+        factory = _make_factory(_labyrinth_builder(big), w=80, h=21, fill=" ")
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=400 if big else 200, category="Labyrinth")
 
@@ -3261,6 +3327,36 @@ def _wod_builder(difficulty: str) -> Callable[[LevelGenerator], None]:
     return build
 
 
+def _wod_pro_builder() -> Callable[[LevelGenerator], None]:
+    """Stamp the vendor WoD-Pro static MAP at its centered origin.
+
+    Vendor ``MiniHackWoDPro`` (skills_wod.py:184-221) reuses the exact
+    Labyrinth-Big 37x21 maze via ``LevelGenerator(map=..., lit=True)`` with a
+    fixed ``set_start_pos((19,1))`` / ``add_goal_pos((19,7))``, a fixed
+    ``add_monster("minotaur", place=(19,9))`` and a random blessed
+    ``add_object("death","/")`` wand.  On reset the minotaur and the wand both
+    lie well outside the hero's start-corridor LOS, so neither renders; the
+    reset obs is therefore the Labyrinth-Big maze view.  We stamp the MAP,
+    hero, goal stair and (out-of-FOV) fixed minotaur; the random wand is left
+    unplaced — it never appears in the reset obs and a minihax-RNG cell would
+    risk landing in-view.
+    """
+    rows = _LABYRINTH_BIG_MAP
+    w = max(len(r) for r in rows)
+    h = len(rows)
+    dx, dy = _static_center_geometry(w, h)
+
+    def build(lg: LevelGenerator) -> None:
+        lg.set_map(rows, xstart=dx, ystart=dy)
+        lg.set_start_pos(19 + dx, 1 + dy)
+        lg.add_stair_down(x=19 + dx, y=7 + dy)
+        try:
+            lg.add_monster("minotaur", place=(19 + dx, 9 + dy))
+        except (KeyError, TypeError):
+            pass
+    return build
+
+
 def _register_wod_envs(register_fn) -> None:
     # Only the Easy variants carry a kill-event RewardManager in vendor
     # (skills_wod.py:29-34, :59-60); Medium/Hard/Pro use add_goal_pos with
@@ -3275,7 +3371,10 @@ def _register_wod_envs(register_fn) -> None:
         ("MiniHack-WoD-Pro-Full-v0",        "pro"),
         ("MiniHack-WoD-Pro-Restricted-v0",  "pro"),
     ]:
-        factory = _make_factory(_wod_builder(diff), w=17, h=10)
+        if diff == "pro":
+            factory = _make_factory(_wod_pro_builder(), w=80, h=21, fill=" ")
+        else:
+            factory = _make_factory(_wod_builder(diff), w=17, h=10)
         rm = (_skill_wod_kill_rm() if diff == "easy"
               else _default_goal_reward_manager())
         register_fn(env_id, factory, rm,

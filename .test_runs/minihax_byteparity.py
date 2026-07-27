@@ -137,8 +137,21 @@ def _env_id_to_vendor_cls(env_id: str):
     from minihack.envs import river as _river_mod
     from minihack.envs import keyroom as _kr_mod
     from minihack.envs import skills_quest as _quest_mod
+    from minihack.envs import exploremaze as _em_mod
+    from minihack.envs import lab as _lab_mod
+    from minihack.envs import skills_wod as _wod_mod
 
     table = {
+        "MiniHack-ExploreMaze-Easy-v0":        _em_mod.MiniHackExploreMazeEasy,
+        "MiniHack-ExploreMaze-Easy-Mapped-v0": _em_mod.MiniHackExploreMazeEasyMapped,
+        "MiniHack-ExploreMaze-Hard-v0":        _em_mod.MiniHackExploreMazeHard,
+        "MiniHack-ExploreMaze-Hard-Mapped-v0": _em_mod.MiniHackExploreMazeHardMapped,
+        "MiniHack-Labyrinth-Big-v0":           _lab_mod.MiniHackLabyrinth,
+        "MiniHack-Labyrinth-Small-v0":         _lab_mod.MiniHackLabyrinthSmall,
+        "MiniHack-WoD-Easy-Full-v0":           _wod_mod.MiniHackWoDEasy,
+        "MiniHack-WoD-Medium-Full-v0":         _wod_mod.MiniHackWoDMedium,
+        "MiniHack-WoD-Hard-Full-v0":           _wod_mod.MiniHackWoDHard,
+        "MiniHack-WoD-Pro-Full-v0":            _wod_mod.MiniHackWoDPro,
         "MiniHack-Quest-Medium-v0":        _quest_mod.MiniHackQuestMedium,
         "MiniHack-Levitate-Boots-Full-v0":       _levit_mod.MiniHackLevitateBoots,
         "MiniHack-Levitate-Boots-Restricted-v0":
