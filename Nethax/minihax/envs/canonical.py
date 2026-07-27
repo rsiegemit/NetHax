@@ -3233,6 +3233,17 @@ def _wrap_river_placement(
             0 <= my < h and 0 <= mx < len(rows[my]) and rows[my][mx] == "."
         )
 
+    def _is_pool(mx: int, my: int) -> bool:
+        # Vendor flooreffects (trap.c ``flooreffects`` -> ``boulder_hits_pool``):
+        # a boulder dropped on water/moat/lava is consumed (``delobj``) and the
+        # pool is left as-is.  ``$boulder_area = fillrect(1,1,18,5)`` overlaps the
+        # river's near column (MAP col 18 = ``'W'``/``'L'``), so a ``rndcoord``
+        # boulder can land on it; when it does, vendor sinks the boulder and the
+        # cell stays water/lava (glyph 2400 ``S_water``), not a boulder (2353).
+        return (
+            0 <= my < h and 0 <= mx < len(rows[my]) and rows[my][mx] in ("W", "L")
+        )
+
     def wrapped(rng: jax.Array):
         state = factory(rng)
         vrng = state.vendor_rng
@@ -3240,11 +3251,16 @@ def _wrap_river_placement(
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
         vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
         # 5× rndcoord($boulder_area) — column-major idx -> MAP (1+idx//5, 1+idx%5).
+        # A boulder landing on the river (MAP col 18) sinks (see ``_is_pool``);
+        # those cells are recorded so the relocation loop drops them.
         boulder_cells = []
+        boulder_sink = []
         for _ in range(5):
             vrng, idx = _vendor_rng.rn2_jax(vrng, jnp.int32(90))
             i = int(idx)
-            boulder_cells.append((dy + 1 + i % 5, dx + 1 + i // 5))  # (row, col)
+            mrow, mcol = 1 + i % 5, 1 + i // 5  # MAP (row, col) in $boulder_area
+            boulder_cells.append((dy + mrow, dx + mcol))  # (grid row, grid col)
+            boulder_sink.append(_is_pool(mcol, mrow))
         # place_lregion(LR_BRANCH): first accepted (rn2(19), rn2(7)) cell that
         # is FLOOR and not the exclusion cell MAP (0,0).
         hero_rc = None
@@ -3266,24 +3282,37 @@ def _wrap_river_placement(
                     break
 
         # Relocate the builder's 5 boulder ground_items entries to the vendor
-        # cells (positions only; the entries/type_id are already correct).
+        # cells (positions only; the entries/type_id are already correct).  A
+        # boulder whose cell sinks (river water/lava) is instead DROPPED —
+        # ``category`` cleared to 0 — so it is neither an item nor an FOV
+        # occluder (``_boulder_opaque_overlay`` gates on ``category != 0``),
+        # leaving the pool cell to render as water/lava like vendor.
         gi = state.ground_items
         tid = gi.items.type_id[0, 0]
-        cat = gi.items.category[0, 0]
+        cat_full = gi.items.category
+        cat = cat_full[0, 0]
         pos = gi.pos
         b = 0
         for k in range(int(tid.shape[0])):
             if b >= len(boulder_cells):
                 break
             if int(tid[k]) == int(_BOULDER_OBJ_IDX) and int(cat[k]) != 0:
-                br, bc = boulder_cells[b]
-                pos = pos.at[0, 0, k, 0].set(jnp.int16(br))
-                pos = pos.at[0, 0, k, 1].set(jnp.int16(bc))
+                if boulder_sink[b]:
+                    cat_full = cat_full.at[0, 0, k].set(
+                        jnp.asarray(0, dtype=cat_full.dtype)
+                    )
+                else:
+                    br, bc = boulder_cells[b]
+                    pos = pos.at[0, 0, k, 0].set(jnp.int16(br))
+                    pos = pos.at[0, 0, k, 1].set(jnp.int16(bc))
                 b += 1
 
         state = state.replace(
             vendor_rng=vrng,
-            ground_items=gi.replace(pos=pos),
+            ground_items=gi.replace(
+                pos=pos,
+                items=gi.items.replace(category=cat_full),
+            ),
             player_pos=jnp.stack(
                 [jnp.int16(hero_rc[0]), jnp.int16(hero_rc[1])]
             ),
@@ -3370,21 +3399,13 @@ def _wrap_river_deepwater(
 
 def _register_river_envs(register_fn) -> None:
     # Byte-parity status (no-monster variants River / River-Lava / River-Narrow,
-    # seeds 0/1/2): the map / water-strip / stair land byte-exact via the
-    # centered ``_river_builder``, and ``_wrap_river_placement`` now pins the 5
-    # ``rndcoord`` boulders, the ``place_lregion`` random hero start, and the
+    # seeds 0/1/2): ALL byte-exact.  The map / water-strip / stair land byte-exact
+    # via the centered ``_river_builder``; ``_wrap_river_deepwater`` retags the
+    # strip to ``S_water``; and ``_wrap_river_placement`` pins the 5 ``rndcoord``
+    # boulders, sinks any boulder that lands on the river (vendor flooreffects),
+    # pins the ``place_lregion`` random hero start, and rebuilds the
     # boulder+WATER-occluded reset FOV byte-exact off ``state.vendor_rng`` (was
-    # ~353 -> ~41 with the earlier structural/boulder-FOV work -> 3-6 residual
-    # cells now).
-    #
-    # The remaining 3-6 cells are ALL the same rendering-table gap, OUTSIDE this
-    # builder's editable scope: ``nle_obs._TILE_TO_CMAP[TileType.WATER]`` maps
-    # deep water to ``S_pool`` (cmap 32, glyph 2391) but vendor renders the
-    # river's ``WATER`` typ as ``S_water`` (cmap 41, glyph 2400).  Both display
-    # as ``}`` so the ``chars`` obs already matches; only the ``glyphs`` obs
-    # differs, at the hero-visible near water column.  Fixing it means changing
-    # the WATER->cmap entry in nle_obs.py (shared across every water env), not
-    # the River builder.
+    # ~353 -> now 0 residual cells across all three no-monster variants).
     #
     # Monster variants (River-Monster / River-MonsterLava) still insert per-
     # monster ``makemon`` draws between the flip prologue and the boulders,
