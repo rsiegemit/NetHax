@@ -3916,32 +3916,168 @@ def _register_skill_freeze_envs(register_fn) -> None:
                         max_steps=50, category="Skill")
 
 
+# ---------------------------------------------------------------------------
+# ClosedDoor / LockedDoor skill envs
+# ---------------------------------------------------------------------------
+# Unlike the earlier stub (a tiny add_room at terrain[0,0]), the vendor skill
+# door levels are two 5×5 rooms separated by a wall with a single door, stamped
+# ``GEOMETRY:center,center`` on the 80×21 dungeon — the same void-grid +
+# ``_vendor_geometry_center_wh`` pattern Sokoban / River / CorridorBattle use.
+#
+#   vendor/minihack/minihack/dat/locked_door_fixed.des
+#     MAZE "mylevel",' ' + INIT_MAP:solidfill,' ' + GEOMETRY:center,center
+#     MAP  (13×7: | left room | wall+door | right room |)
+#     REGION:(0,0,12,6),lit,"ordinary"
+#     BRANCH:(3,3,3,3),(0,0,0,0)   -> player fixed at MAP (3,3)
+#     DOOR:locked,(6,3)            -> locked door in the shared wall
+#     STAIR:(8,3),down             -> down-stair in the right room
+#
+#   locked_door.des is identical except the player start is RNG-placed in the
+#   left room (BRANCH region (1,1)-(5,5)) and the stair is ``rndcoord`` in the
+#   right room; both consume ``state.vendor_rng`` (see _wrap_locked_door).
+#
+# The hero can only see the left room (the closed/locked door blocks LOS), so
+# only the left room + door appear in the observation — the RNG-placed stair in
+# the (unseen) right room never affects glyph/char byte-parity.
+_LOCKED_DOOR_MAP = (
+    "-------------",
+    "|.....|.....|",
+    "|.....|.....|",
+    "|.....+.....|",
+    "|.....|.....|",
+    "|.....|.....|",
+    "-------------",
+)
+_LD_W = 13
+_LD_H = 7
+
+
+def _locked_door_builder(fixed: bool) -> Callable[[LevelGenerator], None]:
+    """Stamp the locked-door two-room MAP at its GEOMETRY:center,center origin.
+
+    ``fixed`` mirrors locked_door_fixed.des (player / stair at fixed cells);
+    the non-fixed locked_door.des RNG-places the player (BRANCH region) and the
+    stair (rndcoord right room) — those are stamped by :func:`_wrap_locked_door`
+    on top of the deterministic fallback placed here.
+    """
+    dx, dy = _vendor_geometry_center_wh(_LD_W, _LD_H)
+
+    def build(lg: LevelGenerator) -> None:
+        lg.set_map(_LOCKED_DOOR_MAP, xstart=dx, ystart=dy)
+        # DOOR:locked,(6,3) — MAP-relative (col,row); the map's '+' already
+        # stamps a CLOSED_DOOR tile, add_door records the locked door_state.
+        lg.add_door("locked", place=(6 + dx, 3 + dy))
+        # STAIR down in the right room (unseen behind the locked door).  Fixed
+        # variant: MAP (8,3); non-fixed fallback also (8,3) — the RNG stair is
+        # never visible so its exact cell can't affect byte-parity.
+        lg.add_stair_down(x=8 + dx, y=3 + dy)
+        # Player start in the left room.  Fixed: BRANCH (3,3).  Non-fixed:
+        # fallback (3,3); overwritten by _wrap_locked_door after the RNG draw.
+        lg.set_start_pos(3 + dx, 3 + dy)
+    return build
+
+
+def _wrap_locked_door(
+    factory: Callable[[jax.Array], "EnvState"],
+) -> Callable[[jax.Array], "EnvState"]:
+    """RNG-place the player for locked_door.des (non-fixed).
+
+    Vendor mklev draw stream after the shared reset (verified by matching the
+    player cell of vendor MiniHack-LockedDoor-v0 seeds 0-4):
+
+      1. rn2(3), rn2(2)                        -- level-setup prefix
+      2. rn2(25)                               -- STAIR:rndcoord($right_room)
+         (right room = fillrect(7,1,11,5) = 25 selection cells;
+         selection_rndcoord draws a single rn2(idx), sp_lev.c:3808)
+      3. place_lregion BRANCH:(1,1,5,5):        player cell (first try always
+         succeeds — the whole region is left-room FLOOR), mkmaze.c:301-308
+             x_internal = rn2(5) + (dx + 1)
+             y_internal = rn2(5) + (dy + 1)
+
+    The right-room stair is behind the locked door (never in FOV) so its RNG
+    cell can't change the observation; only the draw *consumption* matters and
+    is replayed here to keep ``vendor_rng`` byte-aligned with the player draw.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.minihax.level_generator import seed_hero_fov as _seed_hero_fov
+
+    dx, dy = _vendor_geometry_center_wh(_LD_W, _LD_H)
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+        # (1) level-setup prefix.
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(3))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(2))
+        # (2) STAIR:rndcoord($right_room) — one rn2(25) draw.
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(25))
+        # (3) BRANCH place_lregion — player cell (accepted first try).
+        vrng, ox = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        vrng, oy = _vendor_rng.rn2_jax(vrng, jnp.int32(5))
+        px = dx + 1 + int(ox)
+        py = dy + 1 + int(oy)
+        state = state.replace(
+            vendor_rng=vrng,
+            player_pos=jnp.stack(
+                [jnp.int32(py).astype(jnp.int16),
+                 jnp.int32(px).astype(jnp.int16)]
+            ),
+        )
+        return _seed_hero_fov(state, True)
+
+    return wrapped
+
+
+def _closed_door_builder(lg: LevelGenerator) -> None:
+    """Structural ClosedDoor level (closed_door.des).
+
+    NOT byte-exact.  closed_door.des is a fully *random* level built by
+    NetHack's create_room engine:
+
+        ROOM: "ordinary", lit, (3,3), (center,center), (8,8) {
+            SUBROOM:"ordinary", lit, random, (4,4) {
+                STAIR: random, down
+                ROOMDOOR: false, closed, random, random
+            }
+        }
+
+    i.e. an 8×8 outer room (deterministically centered), a 4×4 SUBROOM placed
+    at a *random* cell inside it, a *random* down-stair inside the subroom, a
+    closed ROOMDOOR on a *random* subroom wall, plus the hero placed at a
+    *random* outer-room floor cell.  Byte-parity would require a faithful port
+    of create_room + subroom placement + roomdoor + the player somexy draws
+    (the create_room ISAAC64 stream — a separate, larger effort, cf. KeyRoom).
+
+    Here we only fix the gross un-centering symptom: the outer 8×8 room is
+    stamped at its centered origin (``_vendor_geometry_center(8)`` == internal
+    (37,7), matching vendor MiniHack-ClosedDoor observations) with a closed
+    door + subroom + stair as a playable stand-in.
+    """
+    x0, y0 = _vendor_geometry_center(8)          # (37, 7) internal top-left
+    x1, y1 = x0 + 7, y0 + 7                       # (44, 14)
+    lg.fill_terrain(".", x0, y0, x1, y1)          # 8×8 outer room (VOID walls)
+    # 4×4 subroom in the right half: carve its walls, leave a closed door.
+    sx0, sy0 = x1 - 3, y0 + 1                     # subroom interior top-left
+    lg.fill_terrain("|", sx0 - 1, sy0 - 1, sx0 - 1, sy0 + 2)  # west wall
+    lg.add_door("closed", place=(sx0 - 1, sy0 + 1))          # closed door
+    lg.add_stair_down(x=sx0 + 1, y=sy0 + 1)      # stair inside subroom
+    lg.set_start_pos(x0, y0)                      # hero in outer room
+
+
 def _register_skill_door_envs(register_fn) -> None:
-    """ClosedDoor / LockedDoor envs."""
-    def closed_builder(lg: LevelGenerator) -> None:
-        lg.add_room(x=1, y=1, w=4, h=3)
-        lg.add_door(2, 1, state="closed")
-        lg.set_start_pos(0, 1)
-        lg.add_stair_down(x=4, y=2)
-
-    def locked_builder(lg: LevelGenerator) -> None:
-        lg.add_room(x=1, y=1, w=4, h=3)
-        lg.add_door(2, 1, state="locked")
-        lg.set_start_pos(0, 1)
-        lg.add_stair_down(x=4, y=2)
-
-    factory = _make_factory(closed_builder, w=6, h=5)
-    register_fn("MiniHack-ClosedDoor-v0", factory,
+    """ClosedDoor / LockedDoor envs (vendor skills_simple.py)."""
+    closed = _make_factory(_closed_door_builder, w=80, h=21, fill=" ")
+    register_fn("MiniHack-ClosedDoor-v0", closed,
                 _skill_door_rm(),
                 max_steps=50, category="Skill")
 
-    factory = _make_factory(locked_builder, w=6, h=5)
-    register_fn("MiniHack-LockedDoor-v0", factory,
+    fixed = _make_factory(_locked_door_builder(True), w=80, h=21, fill=" ")
+    register_fn("MiniHack-LockedDoor-Fixed-v0", fixed,
                 _skill_door_rm(),
                 max_steps=50, category="Skill")
 
-    factory = _make_factory(locked_builder, w=6, h=5)
-    register_fn("MiniHack-LockedDoor-Fixed-v0", factory,
+    base = _make_factory(_locked_door_builder(False), w=80, h=21, fill=" ")
+    register_fn("MiniHack-LockedDoor-v0", _wrap_locked_door(base),
                 _skill_door_rm(),
                 max_steps=50, category="Skill")
 
