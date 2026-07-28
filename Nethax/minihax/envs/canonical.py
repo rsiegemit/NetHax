@@ -4626,6 +4626,7 @@ def _wrap_skill_placement(
         _resolve_monster as _resolve_monster,
         _resolve_object as _resolve_object,
         _write_monster as _write_monster,
+        _bump_hero_collision_monster as _bump_hero_collision_monster,
         _MonsterDirective as _MonsterDirective,
         _ObjectDirective as _ObjectDirective,
     )
@@ -4720,6 +4721,18 @@ def _wrap_skill_placement(
             _dense, _ = _write_gi(_dense, {}, (_orow, _ocol), int(_oidx))
             state = state.replace(
                 ground_items=_dense_to_sparse(_dense, state.ground_items.K)
+            )
+            # Vendor hero/monster collision bump (allmain.c::newgame): the hero
+            # place_lregion scan below does NOT skip a monster-occupied cell, so
+            # when the distractor monster's somexy cell equals the hero cell the
+            # follow-up ``mnexto`` relocates that squatting monster to an
+            # adjacent ``enexto`` cell.  The mnexto ``rn2(num_good)`` draw lands
+            # AFTER the hero placement (observation-irrelevant), so this runs on
+            # a clone of ``state.vendor_rng`` and leaves the stream the hero
+            # place_lregion below consumes untouched.  n_trap=0 (skill rooms
+            # have no traps).
+            state = _bump_hero_collision_monster(
+                state, new_terrain, _rooms, _W, _H, 0,
             )
             vrng = state.vendor_rng
 
