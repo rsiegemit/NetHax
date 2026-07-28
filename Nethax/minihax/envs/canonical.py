@@ -1520,26 +1520,16 @@ def _register_mazewalk_envs(register_fn) -> None:
 # ---------------------------------------------------------------------------
 # HideNSeek envs (Group A)
 # ---------------------------------------------------------------------------
-def _hidenseek_builder(big: bool, lava: bool) -> Callable[[LevelGenerator], None]:
-    def build(lg: LevelGenerator) -> None:
-        if big:
-            lg.add_room(x=2, y=2, w=18, h=12)
-            lg.set_start_pos(3, 3)
-            lg.add_stair_down(x=19, y=13)
-        else:
-            lg.add_room(x=2, y=2, w=10, h=8)
-            lg.set_start_pos(3, 3)
-            lg.add_stair_down(x=11, y=9)
-        if lava:
-            # A small lava strip to dodge.
-            lg.fill_terrain("L", 6, 4, 8, 4)
-        for _ in range(2):
-            lg.add_monster()
-    return build
-
-
 def _wrap_hidenseek_placement(
     factory: Callable[[jax.Array], "EnvState"],
+    *,
+    map_w: int = 11,
+    map_h: int = 9,
+    xstart: int = 35,
+    ystart: int = 7,
+    randlines: tuple = (((0, 9), (11, 0)), ((0, 0), (11, 9))),
+    lava: bool = False,
+    premapped: bool = False,
 ) -> Callable[[jax.Array], "EnvState"]:
     """Wrap the standard 11x9 HideNSeek des factory so it reproduces the
     vendor ISAAC64 level-gen stream and stamps the resulting terrain / hero.
@@ -1588,10 +1578,10 @@ def _wrap_hidenseek_placement(
     # column 0, so an internal x renders at obs column x-1; vendor's 11x9 map
     # lands at internal cols 35..45 (obs 34..44).  (The trace/decode "xstart=34"
     # was in the obs frame.)
-    XSTART, YSTART, W, H = 35, 7, 11, 9
+    XSTART, YSTART, W, H = xstart, ystart, map_w, map_h
     COLNO, ROWNO = 80, 21
     FLOOR, VOID, STAIR = int(_T.FLOOR), int(_T.VOID), int(_T.STAIRCASE_DOWN)
-    TREE, CLOUD = int(_T.TREE), int(_T.CLOUD)
+    TREE, CLOUD, LAVA = int(_T.TREE), int(_T.CLOUD), int(_T.LAVA)
 
     def wrapped(rng: jax.Array):
         state = factory(rng)
@@ -1605,11 +1595,14 @@ def _wrap_hidenseek_placement(
         # 1. shuffle_alignments (discarded).
         rn2(3); rn2(2)
         # 2. SHUFFLE $place (Fisher-Yates over 3 map-local corners).
-        place = [(10, 8), (0, 8), (10, 0)]
+        #    Vendor $place corners are the 3 non-top-left map corners:
+        #    (W-1,H-1), (0,H-1), (W-1,0).
+        place = [(W - 1, H - 1), (0, H - 1), (W - 1, 0)]
         for i in range(len(place) - 1, 0, -1):
             j = rn2(i + 1)
             place[i], place[j] = place[j], place[i]
-        # 3. REPLACE_TERRAIN: 'F' floor / 'C' cloud / 'T' tree, grid[y][x].
+        # 3. REPLACE_TERRAIN: 'F' floor / 'C' cloud / 'T' tree / 'L' lava,
+        #    grid[y][x].
         grid = [['F'] * W for _ in range(H)]
 
         def replace(fromc, toc, chance):
@@ -1620,6 +1613,10 @@ def _wrap_hidenseek_placement(
 
         replace('F', 'C', 33)
         replace('F', 'T', 25)
+        if lava:
+            # hidenseek_lava.des adds a third REPLACE_TERRAIN 'L' 5% pass
+            # AFTER the trees pass (over the still-floor cells).
+            replace('F', 'L', 5)
         # 4. two randline carves (reverting to floor).
         carved = set()
 
@@ -1661,8 +1658,8 @@ def _wrap_hidenseek_placement(
             x2, y2 = min(COLNO - 1, x2), min(ROWNO - 1, y2)
             randline(x1, y1, x2, y2, 5, 12)
 
-        carve((0, 9), (11, 0))
-        carve((0, 0), (11, 9))
+        for (a, b) in randlines:
+            carve(a, b)
         for (cx, cy) in carved:
             lx, ly = cx - XSTART, cy - YSTART
             if 0 <= lx < W and 0 <= ly < H:
@@ -1673,13 +1670,18 @@ def _wrap_hidenseek_placement(
 
         # --- stamp terrain ---
         terr = _np.asarray(state.terrain).copy()
-        # Clear the union of the old (origin-35) and new (origin-34) regions.
-        terr[0, 0, YSTART:YSTART + H, XSTART:XSTART + W + 1] = VOID
+        # Clear the ENTIRE level to VOID before stamping.  The base carrier
+        # factory stamps a spurious placeholder room; the only real terrain is
+        # the 11x9/15x15 HideNSeek map + stair.  For the standard variants
+        # those spurious cells are never lit (dark stone either way), but the
+        # premapped (Mapped) variant reveals every non-VOID cell, so they must
+        # not exist.  Clearing the whole board is byte-neutral for the others.
+        terr[0, 0, :, :] = VOID
         # 'F' -> FLOOR; 'C' -> CLOUD (S_cloud); 'T' -> TREE (S_tree).  Trees and
         # clouds are opaque (OPAQUE_TILES) so they still block the hero's FOV
         # exactly like the prior VOID storage, but now render as their vendor
         # glyph instead of stone.
-        _CELL_TO_TILE = {'F': FLOOR, 'C': CLOUD, 'T': TREE}
+        _CELL_TO_TILE = {'F': FLOOR, 'C': CLOUD, 'T': TREE, 'L': LAVA}
         for y in range(H):
             for x in range(W):
                 terr[0, 0, y + YSTART, x + XSTART] = _CELL_TO_TILE.get(
@@ -1729,7 +1731,25 @@ def _wrap_hidenseek_placement(
             visible=_jnp.zeros_like(state.visible),
             last_seen_terrain=_jnp.full_like(state.last_seen_terrain, -1),
         )
-        return _seed_hero_fov(state, True)
+        state = _seed_hero_fov(state, True)
+        if premapped:
+            # hidenseek_mapped.des carries FLAGS:...,premapped: NetHack maps
+            # the whole level's terrain on entry.  Reveal every non-VOID cell
+            # (explored + last_seen_terrain) exactly like _premapped_factory,
+            # while seed_hero_fov's LOS-limited ``visible`` frame is preserved.
+            terr2 = state.terrain[0, 0]
+            mapped = terr2 != _jnp.int8(VOID)
+            state = state.replace(
+                explored=state.explored.at[0, 0].set(
+                    state.explored[0, 0] | mapped
+                ),
+                last_seen_terrain=state.last_seen_terrain.at[0, 0].set(
+                    _jnp.where(mapped, terr2.astype(_jnp.int8),
+                               state.last_seen_terrain[0, 0])
+                ),
+                visible=state.visible | mapped,
+            )
+        return state
 
     return wrapped
 
@@ -1738,37 +1758,49 @@ def _register_hidenseek_envs(register_fn) -> None:
     """Register HideNSeek envs.
 
     All 4 variants ship with a static vendor .des
-    (vendor/minihack/minihack/envs/hidenseek.py:9-27).  Route each through
-    the des_parser with the procedural LG builder as a fallback.  The standard
-    11x9 ``MiniHack-HideNSeek-v0`` additionally routes through
-    ``_wrap_hidenseek_placement`` to reproduce vendor's ISAAC64 level-gen.
+    (vendor/minihack/minihack/envs/hidenseek.py:9-27) that share ONE
+    structurally-identical MKLEV_BEGIN draw stream (shuffle_alignments ->
+    SHUFFLE $place -> REPLACE_TERRAIN cloud/tree[/lava] -> two randline carves
+    -> SHUFFLE $monster -> place_lregion hero).  All 4 therefore route through
+    ``_wrap_hidenseek_placement`` — parameterised by map dims, the internal
+    GEOMETRY:center,center origin (des_parser._compute_map_geometry), the two
+    des-listed randline endpoint pairs, the lava REPLACE_TERRAIN pass and the
+    premapped full-reveal flag:
+
+      * base  (11x9): origin (35,7), randlines (0,9)-(11,0) / (0,0)-(11,9)
+      * Mapped(11x9): identical stream to base + premapped full-reveal
+      * Lava  (11x9): base + a third REPLACE_TERRAIN 'L' 5% pass
+      * Big   (15x15): origin (33,3), randlines (0,14)-(14,0) / (0,0)-(14,14)
     """
     variants = [
-        # (env_id, big, lava, des_name)
-        ("MiniHack-HideNSeek-v0",        False, False, "hidenseek.des"),
-        ("MiniHack-HideNSeek-Mapped-v0", False, False, "hidenseek_mapped.des"),
-        ("MiniHack-HideNSeek-Lava-v0",   False, True,  "hidenseek_lava.des"),
-        ("MiniHack-HideNSeek-Big-v0",    True,  False, "hidenseek_big.des"),
+        # (env_id, map_w, map_h, xstart, ystart, randlines, lava, premapped)
+        ("MiniHack-HideNSeek-v0",        11, 9, 35, 7,
+         (((0, 9), (11, 0)), ((0, 0), (11, 9))),   False, False),
+        ("MiniHack-HideNSeek-Mapped-v0", 11, 9, 35, 7,
+         (((0, 9), (11, 0)), ((0, 0), (11, 9))),   False, True),
+        ("MiniHack-HideNSeek-Lava-v0",   11, 9, 35, 7,
+         (((0, 9), (11, 0)), ((0, 0), (11, 9))),   True,  False),
+        ("MiniHack-HideNSeek-Big-v0",    15, 15, 33, 3,
+         (((0, 14), (14, 0)), ((0, 0), (14, 14))), False, False),
     ]
-    for env_id, big, lava, des_name in variants:
-        fallback = _make_factory(
-            _hidenseek_builder(big, lava), w=25, h=18,
+    for (env_id, map_w, map_h, xstart, ystart,
+         randlines, lava, premapped) in variants:
+        # The wrapper must start drawing at MKLEV_BEGIN, so it wraps a
+        # monster-free LG builder whose directives never touch vendor_rng
+        # (verified: it lands exactly on the traced idx-339 draw).  Terrain,
+        # hero, stair and monsters are all (re)stamped by the wrapper, so the
+        # base room dims are cosmetic (a placeholder EnvState carrier).
+        base = _make_factory(
+            lambda lg: lg.add_room(x=2, y=2, w=10, h=8), w=25, h=18,
         )
-        factory = _des_factory(des_name, fallback=fallback)
-        if env_id == "MiniHack-HideNSeek-v0":
-            # The des factory (and the monster-adding LG fallback) both consume
-            # ``vendor_rng`` during level build, leaving it PAST the des block.
-            # The wrapper must start drawing at MKLEV_BEGIN, so it wraps a
-            # monster-free LG builder whose directives never touch vendor_rng
-            # (verified: it lands exactly on the traced idx-339 draw).  Terrain,
-            # hero, stair and monsters are all (re)stamped by the wrapper.
-            base = _make_factory(
-                lambda lg: lg.add_room(x=2, y=2, w=10, h=8), w=25, h=18,
-            )
-            factory = _wrap_hidenseek_placement(base)
+        factory = _wrap_hidenseek_placement(
+            base, map_w=map_w, map_h=map_h, xstart=xstart, ystart=ystart,
+            randlines=randlines, lava=lava, premapped=premapped,
+        )
+        max_steps = 400 if map_w == 15 else 200
         rm = _lava_avoid_reward_manager() if lava else _default_goal_reward_manager()
         register_fn(env_id, factory, rm,
-                    max_steps=200, category="HideNSeek")
+                    max_steps=max_steps, category="HideNSeek")
 
 
 # ---------------------------------------------------------------------------
