@@ -1373,6 +1373,7 @@ def _wrap_mazewalk_placement(
      stair_bx, stair_by, mapw, maph) = _mazewalk_geometry(w, h)
     _FLOOR = int(_TileType.FLOOR)
     _STAIR = int(_TileType.STAIRCASE_DOWN)
+    _WALL = int(_TileType.WALL)
 
     def _mz_move(x, y, d):
         # vendor mz_move: 0=N,1=E,2=S,3=W (mkmaze.c:34).
@@ -1436,6 +1437,23 @@ def _wrap_mazewalk_placement(
         for (cy, cx) in _np.argwhere(carved):
             terrain = terrain.at[0, 0, int(cy), int(cx) + X_OFF].set(
                 jnp.int8(_FLOOR)
+            )
+
+        # Bottom-edge boundary wall.  vendor's des MAP is bordered by a "-"
+        # wall rect, but wallification reverts every border cell to stone
+        # EXCEPT where the MAP edge coincides with the map's hard boundary
+        # (y_maze_max = ROWNO-1 = 20).  Only the 45x19 maze is full height
+        # (ystart clamped to 0), so its bottom carve row (maxy=19) sits one
+        # cell above row 20 and that hard edge survives as HWALL — the hero's
+        # FOV reveals it when standing on the row-19 corridor.  9x9/15x15 are
+        # centered with margin (maxy<19), never touch row 20, and have no
+        # wall terrain at all (verified against the -Mapped premapped reveal).
+        # Cols span the maze region [minx, maxx] in the internal frame (the
+        # MAP border is one col west of the +X_OFF-shifted floor).
+        _Y_MAZE_MAX = 20
+        if maxy + 1 == _Y_MAZE_MAX:
+            terrain = terrain.at[0, 0, _Y_MAZE_MAX, minx:maxx + 1].set(
+                jnp.int8(_WALL)
             )
 
         # --- (3) STAIR:random,down --------------------------------------
