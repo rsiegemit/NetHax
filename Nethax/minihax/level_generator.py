@@ -1392,9 +1392,20 @@ def _apply_directives(
             pos_rc, trap_type, state = _resolve_trap(
                 d, terrain_np, w, h, resolved_rooms, _next_key, state,
             )
-            trap_type_arr = trap_type_arr.at[
-                trap_lvl_idx, pos_rc[0], pos_rc[1]
-            ].set(jnp.int8(trap_type))
+            # The Room-Trap wrapper (canonical.py ``_wrap_trap_room_placement``)
+            # reads this placeholder trap out of ``state.traps`` to exclude it
+            # from the hero place_lregion scan, so keep stamping it there.  But
+            # the Room-Ultimate wrapper stamps the REAL vendor trap cells itself
+            # and also reads ``state.traps`` for the same exclusion — so the
+            # placeholder (first-floor cell) would be a SECOND, spurious trap
+            # that can sit on the true hero cell and shove the hero one cell
+            # over (Room-Ultimate-5x5 seed 9: placeholder lands on (9,37), the
+            # vendor hero cell).  Skip the placeholder when monsters are present
+            # (i.e. the Ultimate wrapper owns trap stamping).
+            if not has_monster_dir:
+                trap_type_arr = trap_type_arr.at[
+                    trap_lvl_idx, pos_rc[0], pos_rc[1]
+                ].set(jnp.int8(trap_type))
             lg.last_trap_types.append(trap_type)
         elif isinstance(d, _ObjectDirective):
             pos_rc, obj_idx, state = _resolve_object(
@@ -1469,6 +1480,24 @@ def _apply_directives(
             terrain_np = terrain_np.at[0, 0, _scy, _scx].set(
                 jnp.int8(int(TileType.STAIRCASE_DOWN))
             )
+
+    # 3b. Vendor hero/monster collision bump (allmain.c::newgame):
+    #     mklev();  u_on_upstairs();  if (MON_AT(u.ux,u.uy)) mnexto(...);
+    # ``u_on_upstairs`` places the hero via place_lregion (mkmaze.c) at the
+    # first FLOOR cell of its rn2(79)/rn2(21) scan — that scan does NOT skip a
+    # monster-occupied cell, so the hero can land on a des monster; the
+    # follow-up ``mnexto`` then relocates that squatting monster to an adjacent
+    # ``enexto`` cell.  The canonical.py room wrappers instead reject
+    # monster-occupied FLOOR cells when picking the hero cell, so whenever a
+    # des monster's somexy cell equals the place_lregion cell the wrapper
+    # over-draws and the hero lands one cell late (Room-Monster-15x15 seed 7,
+    # Room-Ultimate-5x5 seed 9).  Pre-relocate that monster here so the
+    # wrapper's FLOOR-minus-monster scan accepts the true hero cell unchanged.
+    if state is not None and has_monster_dir and len(resolved_rooms) == 1:
+        _n_trap_dir = sum(1 for _d in directives if isinstance(_d, _TrapDirective))
+        state = _bump_hero_collision_monster(
+            state, terrain_np, resolved_rooms, w, h, _n_trap_dir,
+        )
 
     # 4. Commit accumulated terrain/traps/grounds.  Convert the dense scratch
     # ground buffer to the sparse representation EnvState stores (K from the
@@ -2062,6 +2091,118 @@ def _enexto(terrain_np, occupied: set, xx: int, yy: int, w: int, h: int,
         return None, vrng
     vrng, i = _vendor_rng.rn2_jax(vrng, jnp.int32(len(good)))
     return good[int(i)], vrng
+
+
+def _bump_hero_collision_monster(
+    state: EnvState, terrain_np, resolved_rooms: dict, w: int, h: int,
+    n_trap: int,
+) -> EnvState:
+    """Reproduce vendor ``allmain.c::newgame`` hero/monster collision.
+
+    Vendor order is ``mklev()`` (places the des monsters) then
+    ``u_on_upstairs()`` which drops the hero on the first FLOOR cell of a
+    ``place_lregion`` ``rn2(79)/rn2(21)`` scan (mkmaze.c).  That scan does NOT
+    skip a monster-occupied cell, so the hero can land on a des monster; the
+    immediately-following ``if (MON_AT(u.ux,u.uy)) mnexto(...)`` then relocates
+    the squatting monster to an adjacent ``enexto`` cell.
+
+    The canonical.py room wrappers instead build the hero cell by rejecting
+    monster-occupied FLOOR cells, so when a monster's somexy cell equals the
+    place_lregion cell they over-scan and the hero lands one cell late.  Here
+    we mirror vendor by relocating that one monster off the true hero cell, so
+    the wrapper's later FLOOR-minus-monster scan accepts the same cell vendor's
+    hero occupies.
+
+    The mnexto ``rn2(num_good)`` draw vendor makes lands AFTER the hero
+    placement (i.e. after the observation-relevant part of the ISAAC64 stream),
+    so we run this on a CLONE of ``state.vendor_rng`` and leave the real stream
+    — which the wrapper consumes for the hero placement — untouched.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    import numpy as _np
+
+    ry1, rx1, ry2, rx2 = next(iter(resolved_rooms.values()))
+    size = rx2 - rx1 + 1
+
+    floor = int(TileType.FLOOR)
+    terr = _np.asarray(terrain_np[0, 0])
+
+    # Clone of the pre-hero stream.  ``place_lregion`` (and, for Ultimate
+    # variants, the wrapper's per-trap draws that precede it) advance this
+    # clone; the real ``state.vendor_rng`` stays put for the wrapper.
+    vrng = state.vendor_rng
+
+    # Ultimate wrappers draw n_trap per-trap blocks (rn2(size), rn2(size),
+    # rn2(4)) before the hero place_lregion — replicate them so the clone is at
+    # the place_lregion offset, and mark the resulting trap cells (place_lregion
+    # rejects them, matching bad_location).  Monster wrappers have n_trap == 0.
+    trap_cells = set()
+    for _ in range(n_trap):
+        vrng, tx_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, ty_off = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+        vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))
+        tx = rx1 + int(tx_off)
+        ty = ry1 + int(ty_off)
+        if 0 <= ty < h and 0 <= tx < w and int(terr[ty, tx]) == floor:
+            trap_cells.add((ty, tx))
+
+    # place_lregion (mkmaze.c): first FLOOR (non-trap) cell of the rn2(79)+1 /
+    # rn2(21) scan wins.  Unlike the wrapper we do NOT exclude monster cells —
+    # vendor's hero lands on the monster.  200 random tries then a column-major
+    # deterministic scan.
+    def _ok(cy, cx):
+        return (
+            0 <= cy < h and 0 <= cx < w
+            and int(terr[cy, cx]) == floor
+            and (cy, cx) not in trap_cells
+        )
+
+    hero = None
+    for _ in range(200):
+        vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
+        vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
+        cx = int(raw_x) + 1
+        cy = int(cand_y)
+        if _ok(cy, cx):
+            hero = (cy, cx)
+            break
+    if hero is None:
+        for sx in range(1, w):
+            for sy in range(0, h):
+                if _ok(sy, sx):
+                    hero = (sy, sx)
+                    break
+            if hero is not None:
+                break
+    if hero is None:
+        return state
+
+    # Is a monster sitting on the hero cell?  If not, the wrapper already picks
+    # the right cell and no bump is needed.
+    mai = state.monster_ai
+    alive = _np.asarray(mai.alive)
+    pos = _np.asarray(mai.pos)
+    hit_slot = -1
+    occupied = set()
+    for si in _np.where(alive)[0]:
+        cell = (int(pos[si, 0]), int(pos[si, 1]))
+        occupied.add(cell)
+        if cell == hero:
+            hit_slot = int(si)
+    if hit_slot < 0:
+        return state
+
+    # mnexto: relocate the squatting monster to an adjacent enexto cell.  The
+    # rn2(num_good) draw here is vendor's post-hero mnexto draw (clone offset).
+    dest, vrng = _enexto(terrain_np, occupied, hero[1], hero[0], w, h, vrng)
+    if dest is None:
+        return state
+    new_pos = pos.copy()
+    new_pos[hit_slot, 0] = dest[0]
+    new_pos[hit_slot, 1] = dest[1]
+    return state.replace(
+        monster_ai=mai.replace(pos=jnp.asarray(new_pos, dtype=mai.pos.dtype)),
+    )
 
 
 def _adj_lev_depth1(mlevel: int) -> int:
