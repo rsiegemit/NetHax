@@ -300,6 +300,35 @@ _OBJECT_IS_AMMO_MISSILE: jnp.ndarray = jnp.array(
     dtype=jnp.bool_,
 )  # bool[NUM_OBJECTS]
 
+# Quiver suffix kind for a WEAPON_CLASS item worn in the quiver (W_QUIVER).
+# Vendor objnam.c:1213-1230 switch on obj->oclass == WEAPON_CLASS:
+#   is_ammo(obj) && oc_skill == -P_BOW  -> " (in quiver)"        (idx 5)
+#   is_ammo(obj) && oc_skill != -P_BOW  -> " (in quiver pouch)"  (idx 8)
+#   !is_ammo(obj)                       -> " (at the ready)"     (idx 9)
+# is_ammo = WEAPON_CLASS && -P_CROSSBOW <= oc_skill <= -P_BOW  (obj.h:178).
+# The OBJECTS table encodes launcher skills as small positive ints and ammo
+# as their negation; derive -P_BOW / -P_CROSSBOW from the bow/crossbow rows
+# (bow oc_skill=20, crossbow=22 in this build).  Ranger arrows (oc_skill
+# == -P_BOW) render "(in quiver)"; gnome crossbow bolts (oc_skill
+# == -P_CROSSBOW) render "(in quiver pouch)".  Non-weapon quiver classes are
+# handled by the pouch-class branch in _equip_status_idx.
+_P_BOW_SKILL: int = int(OBJECTS[_find_type_id("bow", ObjectClass.WEAPON_CLASS)].oc_skill)
+_P_XBOW_SKILL: int = int(OBJECTS[_find_type_id("crossbow", ObjectClass.WEAPON_CLASS)].oc_skill)
+
+def _quiver_weapon_idx(obj) -> int:
+    if obj.class_ != ObjectClass.WEAPON_CLASS:
+        return 9
+    sk = int(obj.oc_skill)
+    if sk == -_P_BOW_SKILL:                         # bow ammo -> "(in quiver)"
+        return 5
+    if -_P_XBOW_SKILL <= sk <= -_P_BOW_SKILL:       # ammo, not bow -> pouch
+        return 8
+    return 9                                        # weapon-class, not ammo
+
+_QUIVER_WEAPON_IDX: jnp.ndarray = jnp.array(
+    [_quiver_weapon_idx(obj) for obj in OBJECTS], dtype=jnp.int32,
+)  # int32[NUM_OBJECTS]
+
 # Monster name byte table — for corpse/tin rendering.
 # vendor/nethack/src/objnam.c:1824 (corpse_xname), eat.c:1456 (tin monster meat).
 _MAX_MONSTER_NAME_LEN = 32
@@ -827,7 +856,8 @@ def _write_uint(buf: jax.Array, cursor: jax.Array,
 # ---------------------------------------------------------------------------
 
 def _equip_status_idx(inv_state, slot_idx: jax.Array,
-                      item_class: jax.Array) -> jax.Array:
+                      item_class: jax.Array,
+                      type_id: jax.Array) -> jax.Array:
     """Return the equip-status table index (int32) for the given inventory slot.
 
     0 = no status, 1 = weapon in hand, 2 = being worn (body/helm/gloves/boots/
@@ -869,8 +899,14 @@ def _equip_status_idx(inv_state, slot_idx: jax.Array,
         (cls == jnp.int32(int(ObjectClass.GEM_CLASS)))
     )
     is_weapon_class = cls == jnp.int32(_WEAPON_CLASS_VAL)
+    # WEAPON in quiver: distinguish bow-ammo "(in quiver)" from crossbow/sling
+    # ammo "(in quiver pouch)" and non-ammo weapons "(at the ready)" per the
+    # per-otyp _QUIVER_WEAPON_IDX table (vendor objnam.c:1213-1230).
+    _safe_tid = jnp.clip(type_id.astype(jnp.int32), 0, _MAX_OBJ - 1)
+    _weapon_quiver_idx = _QUIVER_WEAPON_IDX[_safe_tid]
     quiver_idx = jnp.where(is_pouch_class, jnp.int32(8),
-                           jnp.where(is_weapon_class, jnp.int32(5), jnp.int32(9)))
+                           jnp.where(is_weapon_class, _weapon_quiver_idx,
+                                     jnp.int32(9)))
 
     result = jnp.int32(0)
     result = jnp.where(is_quiver,     quiver_idx, result)
@@ -994,7 +1030,23 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     show_uncursed_word = (~identified) | (~is_oc_charged) | is_armor_cls | is_ring_cls
     suppress_uncursed = is_uncursed & ~show_uncursed_word
     buc_shown = buc_known & ~suppress_uncursed
-    article_use_an = jnp.where(buc_shown, buc_use_an, noun_use_an)
+    # When BUC is suppressed but an enchantment "+N" prefix WILL be shown
+    # (identified weapon/armor/charged-ring/weptool), the first prefix word is
+    # the "+N" token, so just_an() keys off '+'/digit -> always "a" (never
+    # "an").  This fixes vowel-initial enchanted weapon names, e.g.
+    # "a +1 elven dagger" (not "an ...").  Cite: vendor objnam.c doname_base +
+    # just_an (the number prefix precedes the noun).
+    _art_oc = _OBJECT_CLASS[safe_type]
+    enchant_shown = identified & (
+        (_art_oc == jnp.uint8(_WEAPON_CLASS_VAL)) |
+        (_art_oc == jnp.uint8(_ARMOR_CLASS_VAL))  |
+        ((_art_oc == jnp.uint8(_RING_CLASS_VAL)) & _OBJECT_IS_CHARGED[safe_type]) |
+        _OBJECT_IS_WEPTOOL[safe_type]
+    )
+    article_use_an = jnp.where(
+        buc_shown, buc_use_an,
+        jnp.where(enchant_shown, jnp.bool_(False), noun_use_an),
+    )
 
     def render_nonempty(args):
         b, c = args
@@ -1195,7 +1247,7 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         )
 
         # 6. Equip status -- pass item_class so quiver can pick pouch vs bow-ammo.
-        eq_idx = _equip_status_idx(inv_state, slot_idx, obj_class)
+        eq_idx = _equip_status_idx(inv_state, slot_idx, obj_class, type_id)
         b, c = lax.cond(
             eq_idx > jnp.int32(0),
             lambda bc: _write_equip(bc[0], bc[1], eq_idx),

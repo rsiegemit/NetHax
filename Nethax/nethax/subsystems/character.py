@@ -285,6 +285,8 @@ class ObjType:
 
     # Food (FOOD_CLASS = 7) — vendor otyp values
     # Canonical source: constants/objects.py indices 252-268
+    TRIPE_RATION      = 239   # orc CRAM_RATION/LEMBAS_WAFER substitute
+    SLIME_MOLD        = 260   # random FOOD_CLASS pick (orc Xtra_food)
     APPLE             = 252   # objects.py:5224
     ORANGE            = 253   # objects.py:5244
     CARROT            = 257   # objects.py:5324
@@ -804,7 +806,7 @@ _WORN_ARMOR_BY_ROLE: dict = {
                         ArmorSlot.SHIELD: 4, ArmorSlot.GLOVES: 5},
     Role.MONK:         {ArmorSlot.GLOVES: 0, ArmorSlot.BODY: 1},
     Role.PRIEST:       {ArmorSlot.BODY: 1, ArmorSlot.SHIELD: 2},
-    Role.RANGER:       {ArmorSlot.CLOAK: 3},
+    Role.RANGER:       {ArmorSlot.CLOAK: 4},
     Role.ROGUE:        {ArmorSlot.BODY: 2},
     Role.SAMURAI:      {ArmorSlot.BODY: 4},
     Role.TOURIST:      {ArmorSlot.BODY: 3},
@@ -1664,6 +1666,358 @@ def _consume_ini_inv_archeologist_draws(vendor_rng, inventory):
 
 
 # ---------------------------------------------------------------------------
+# Per-role ini_inv mkobj-draw helpers + registry entries (Knight, Ranger)
+#
+# Vendor ``ini_inv(trop)`` (u_init.c:972-1168) calls ``mksobj(otyp, TRUE,
+# FALSE)`` per item, then re-runs it ``trquan`` times for stacked non-
+# WEAPON/TOOL items (the ``if (--trop->trquan) continue`` loop, u_init.c:1155).
+# Each mksobj emits the class-specific ISAAC64 draws below; those set the
+# item's spe/quantity/BUC AND advance the shared stream.  The three helpers
+# faithfully replay vendor mkobj.c:801-1006 using the same conditional-advance
+# (``_cadv``) / jnp.where style as _consume_ini_inv_archeologist_draws.
+# ---------------------------------------------------------------------------
+
+def _cadv_rng(rng_orig, rng_advanced, take):
+    """Adopt ``rng_advanced`` iff ``take`` (vmap-safe short-circuit)."""
+    return jax.tree_util.tree_map(
+        lambda a, o: jnp.where(take, a, o), rng_advanced, rng_orig,
+    )
+
+
+def _mksobj_weapon_draws(vrng, multigen: bool, poisonable: bool):
+    """Replay vendor mkobj.c:803-818 WEAPON_CLASS init; return (vrng, blessed).
+
+    ``multigen`` (oc_skill in [-P_SHURIKEN,-P_BOW], obj.h:197) draws the
+    ``rn1(6,6)`` stack-quantity first (discarded — ini_inv overwrites quan
+    with trquan for WEAPON_CLASS).  ``poisonable`` (identical predicate,
+    obj.h:201) draws a trailing ``rn2(100)`` opoison check.  Both flags are
+    True for ARROW, False for DAGGER/BOW/LONG_SWORD/LANCE.
+
+    Cascade (u_init.c weapons are never artif via ini_inv)::
+
+        if (!rn2(11)) { spe = rne(3); blessed = rn2(2); }
+        else if (!rn2(10)) { curse; spe = -rne(3); }      // wiped uncursed
+        else blessorcurse(10);                            // rn2(10)[+rn2(2)]
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax, rne_jax
+    if multigen:
+        vrng, _ = rn2_jax(vrng, jnp.int32(6))                # rn1(6,6) quan
+    vrng, x1 = rn2_jax(vrng, jnp.int32(11))
+    path_a = x1 == jnp.int32(0)
+    not_a = jnp.logical_not(path_a)
+    # Path A: spe = rne(3); blessed = rn2(2).
+    vr_a, _ = rne_jax(vrng, jnp.int32(3))
+    vr_a, a_bless = rn2_jax(vr_a, jnp.int32(2))
+    vr_a = _cadv_rng(vrng, vr_a, path_a)
+    # Path B/C: X2 = rn2(10), drawn only when X1 != 0.
+    vr_x2, x2 = rn2_jax(vrng, jnp.int32(10))
+    vr_x2 = _cadv_rng(vrng, vr_x2, not_a)
+    x2 = jnp.where(not_a, x2, jnp.int32(1))
+    path_b = jnp.logical_and(not_a, x2 == jnp.int32(0))
+    path_c = jnp.logical_and(not_a, x2 != jnp.int32(0))
+    # Path B: spe = -rne(3) (cursed -> wiped uncursed by ini_inv).
+    vr_b, _ = rne_jax(vr_x2, jnp.int32(3))
+    # Path C: blessorcurse(10) -> rn2(10) [+ rn2(2) if 0].
+    vr_bc, bc1 = rn2_jax(vr_x2, jnp.int32(10))
+    vr_bc2, bc2 = rn2_jax(vr_bc, jnp.int32(2))
+    vr_bc = _cadv_rng(vr_bc, vr_bc2, bc1 == jnp.int32(0))
+    c_bless = jnp.logical_and(bc1 == jnp.int32(0), bc2 != jnp.int32(0))
+    vr = _cadv_rng(vr_x2, vr_b, path_b)
+    vr = _cadv_rng(vr, vr_bc, path_c)
+    vrng = _cadv_rng(vr, vr_a, path_a)
+    blessed = jnp.logical_or(
+        jnp.logical_and(path_a, a_bless != jnp.int32(0)),
+        jnp.logical_and(path_c, c_bless),
+    )
+    if poisonable:
+        vrng, _ = rn2_jax(vrng, jnp.int32(100))              # opoisoned check
+    return vrng, blessed
+
+
+def _mksobj_armor_draws(vrng):
+    """Replay vendor mkobj.c:992-1006 ARMOR_CLASS init; return (vrng, blessed).
+
+    Faithful port for non-special armor (not FUMBLE_BOOTS/LEVITATION_BOOTS/
+    HELM_OF_OPPOSITE_ALIGNMENT/GAUNTLETS_OF_FUMBLING), so the special
+    disjunct is inert::
+
+        if (rn2(10) && !rn2(11)) { curse; spe = -rne(3); }   // Path A
+        else if (!rn2(10)) { blessed = rn2(2); spe = rne(3); } // Path B
+        else blessorcurse(10);                                // Path C
+
+    Mirrors ``_consume_ini_inv_archeologist_draws._consume_armor_class``.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax, rne_jax
+    vrng, X1 = rn2_jax(vrng, jnp.int32(10))
+    X1_nz = (X1 != jnp.int32(0))
+    vrng_x2, X2_raw = rn2_jax(vrng, jnp.int32(11))
+    vrng = _cadv_rng(vrng, vrng_x2, X1_nz)
+    X2 = jnp.where(X1_nz, X2_raw, jnp.int32(1))
+    path_a = X1_nz & (X2 == jnp.int32(0))
+    not_a = ~path_a
+    vrng_a, _ = rne_jax(vrng, jnp.int32(3))
+    vrng_a = _cadv_rng(vrng, vrng_a, path_a)
+    vrng_x3, X3_raw = rn2_jax(vrng, jnp.int32(10))
+    vrng_x3 = _cadv_rng(vrng, vrng_x3, not_a)
+    X3 = jnp.where(not_a, X3_raw, jnp.int32(1))
+    path_b = not_a & (X3 == jnp.int32(0))
+    path_c = not_a & ~path_b
+    vrng_b, b_bless = rn2_jax(vrng_x3, jnp.int32(2))
+    vrng_b, _ = rne_jax(vrng_b, jnp.int32(3))
+    vrng_c, bc1 = rn2_jax(vrng_x3, jnp.int32(10))
+    vrng_c2, bc2 = rn2_jax(vrng_c, jnp.int32(2))
+    vrng_c = _cadv_rng(vrng_c, vrng_c2, bc1 == jnp.int32(0))
+    vrng_bc = _cadv_rng(vrng_x3, vrng_b, path_b)
+    vrng_bc = _cadv_rng(vrng_bc, vrng_c, path_c)
+    vrng = _cadv_rng(vrng_bc, vrng_a, path_a)
+    blessed = jnp.logical_or(
+        jnp.logical_and(path_b, b_bless != jnp.int32(0)),
+        jnp.logical_and(path_c,
+                        jnp.logical_and(bc1 == jnp.int32(0),
+                                        bc2 != jnp.int32(0))),
+    )
+    return vrng, blessed
+
+
+def _mksobj_food_stack_qty(vrng, n: int):
+    """Replay ``n`` stacked FOOD mksobj calls; return (vrng, total_qty).
+
+    Vendor u_init.c:1155 re-runs mksobj ``trquan`` times for FOOD (quan not
+    reset).  Each mksobj FOOD tail (mkobj.c:879-882) draws ``rn2(6)`` and sets
+    that object's quan to 2 iff ``!rn2(6)``; addinv merges them, so the stack
+    total = ``n + count(rn2(6) == 0)``.  Cite: vendor/nle/src/mkobj.c:879-882.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax
+    qty = jnp.int32(n)
+    for _ in range(n):
+        vrng, r = rn2_jax(vrng, jnp.int32(6))
+        qty = qty + (r == jnp.int32(0)).astype(jnp.int32)
+    return vrng, qty
+
+
+def _blessorcurse_eager(vrng, chance: int):
+    """Eager vendor blessorcurse(chance): rn2(chance); if 0, rn2(2)."""
+    from Nethax.nethax.vendor_rng import rn2_jax
+    vrng, hit = rn2_jax(vrng, jnp.int32(chance))
+    if int(hit) == 0:
+        vrng, _ = rn2_jax(vrng, jnp.int32(2))
+    return vrng
+
+
+def _mkobj_food_isaac(vrng):
+    """Eager port of vendor ``mkobj(FOOD_CLASS, FALSE)`` (mkobj.c:247-269 +
+    the FOOD_CLASS mksobj block).  Returns ``(vrng, otyp, quan)``.
+
+    ``prob = rnd(1000)`` (rn2(1000)+1) is always drawn first, then the
+    FOOD_CLASS oc_prob walk selects the otyp; mksobj then emits the food's
+    init draws.  Only paths reachable for orc Xtra_food seeds are modelled in
+    full (simple foods, kelp, generic egg); the corpse otyp has oc_prob 0 so
+    is never selected.  Eager (Python-int) — byte-parity char init runs
+    single-seed under NETHAX_EAGER, matching level_generator._resolve_object.
+    Cite: vendor/nle/src/mkobj.c:247-269, 819-885.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax
+    from Nethax.minihax.level_generator import _MKOBJ_BASES, _MKOBJ_EFF_PROB
+    from Nethax.nethax.constants.objects import ObjectClass
+    vrng, prob_v = rn2_jax(vrng, jnp.int32(1000))
+    prob = int(prob_v) + 1
+    i = _MKOBJ_BASES[int(ObjectClass.FOOD_CLASS)]
+    while True:
+        prob -= int(_MKOBJ_EFF_PROB[i])
+        if prob <= 0:
+            break
+        i += 1
+    otyp = i
+    quan = 1
+    if otyp == 241:                       # EGG
+        vrng, e = rn2_jax(vrng, jnp.int32(3))
+        # int(e)==0 -> typed-egg rndmonnum loop (not modelled; unreached for
+        # seeds 0-2 which roll generic eggs).
+        vrng, r = rn2_jax(vrng, jnp.int32(6))
+        quan = 2 if int(r) == 0 else 1
+    elif otyp == 271:                     # TIN (spinach path only)
+        vrng, _t = rn2_jax(vrng, jnp.int32(6))
+        vrng = _blessorcurse_eager(vrng, 10)
+        vrng, r = rn2_jax(vrng, jnp.int32(6))
+        quan = 2 if int(r) == 0 else 1
+    elif otyp == 250:                     # KELP_FROND: quan = rnd(2)
+        vrng, k = rn2_jax(vrng, jnp.int32(2))
+        quan = int(k) + 1
+    elif otyp in (240, 245):              # CORPSE / MEAT_RING: no tail draw
+        quan = 1
+    else:                                 # simple foods: tail rn2(6)
+        vrng, r = rn2_jax(vrng, jnp.int32(6))
+        quan = 2 if int(r) == 0 else 1
+    return vrng, otyp, quan
+
+
+def _orc_add_food(inv_state, otyp: int, quan: int):
+    """addinv one FOOD object (eager): merge into an existing same-otyp FOOD
+    stack, else place at the first empty slot with the positional letter.
+    Cite: vendor/nle/src/invent.c::addinv (mergable by otyp for plain food)."""
+    from Nethax.nethax.subsystems.inventory import MAX_INVENTORY_SLOTS
+    _FOOD_CAT = int(ItemCategory.FOOD)
+    items = inv_state.items
+    merge_slot = None
+    empty_slot = None
+    for j in range(MAX_INVENTORY_SLOTS):
+        cat = int(items.category[j])
+        if cat == 0:
+            if empty_slot is None:
+                empty_slot = j
+            continue
+        if cat == _FOOD_CAT and int(items.type_id[j]) == otyp:
+            merge_slot = j
+            break
+    if merge_slot is not None:
+        add_q = jnp.asarray(quan, dtype=items.quantity.dtype)
+        q = items.quantity.at[merge_slot].set(items.quantity[merge_slot] + add_q)
+        return inv_state.replace(items=items.replace(quantity=q))
+    slot = empty_slot
+    new_item = _food(otyp, quan)
+    new_items = jax.tree_util.tree_map(
+        lambda arr, val: arr.at[slot].set(val), items, new_item,
+    )
+    letters = inv_state.letters.at[slot].set(jnp.int8(ord('a') + slot))
+    return inv_state.replace(items=new_items, letters=letters)
+
+
+def _orc_xtra_food(vrng, inv_state):
+    """Vendor u_init.c:853 ``ini_inv(Xtra_food)`` for non-wizard orcs:
+    ``{ UNDEF_TYP, UNDEF_SPE, FOOD_CLASS, 2, 0 }`` -> two ``mkobj(FOOD)``
+    objects (trquan=2 stacking loop), each racially substituted (cram/lembas
+    -> tripe) and addinv-merged.  Cite: u_init.c:853, 1057-1073, 1155."""
+    for _ in range(2):
+        vrng, otyp, quan = _mkobj_food_isaac(vrng)
+        if otyp in (267, 266):            # CRAM_RATION / LEMBAS_WAFER
+            otyp = 239                    # -> TRIPE_RATION (orc inv_sub)
+        inv_state = _orc_add_food(inv_state, otyp, quan)
+    return vrng, inv_state
+
+
+# Ranger racial equipment substitutions (u_init.c inv_subs[], applied in
+# ini_inv after mksobj).  Keyed by slot in STARTING_INVENTORY[Role.RANGER]:
+#   0 DAGGER, 1 BOW, 2/3 ARROW, 4 CLOAK_OF_DISPLACEMENT, 5 CRAM_RATION.
+# mksobj draws are always ARROW/BOW/DAGGER-based (substitution changes only
+# the resulting otyp/appearance), so draw counts are race-independent.
+_RANGER_RACE_SUBS_ELF = {
+    0: ObjType.ELVEN_DAGGER, 1: ObjType.ELVEN_BOW,
+    2: ObjType.ELVEN_ARROW, 3: ObjType.ELVEN_ARROW,
+    4: ObjType.ELVEN_CLOAK, 5: ObjType.LEMBAS_WAFER,
+}
+_RANGER_RACE_SUBS_ORC = {
+    0: ObjType.ORCISH_DAGGER, 1: ObjType.ORCISH_BOW,
+    2: ObjType.ORCISH_ARROW, 3: ObjType.ORCISH_ARROW,
+    5: ObjType.TRIPE_RATION,
+}
+_RANGER_RACE_SUBS_GNOME = {
+    1: ObjType.CROSSBOW, 2: ObjType.CROSSBOW_BOLT, 3: ObjType.CROSSBOW_BOLT,
+}
+
+
+def _ini_inv_knight(vendor_rng, inv_state, items_list, race):
+    """ini_inv(Knight) mksobj draws (u_init.c:73-83, 706).  Knight is human-
+    only (no racial subs, no Xtra_food).  Items in trobj order: LONG_SWORD,
+    LANCE (weapons), RING_MAIL, HELMET, SMALL_SHIELD, LEATHER_GLOVES (armor),
+    APPLE x10, CARROT x10 (food).  All trbless=UNDEF_BLESS so mksobj's rolled
+    blessed bit is kept; apple/carrot trbless=0 -> forced uncursed."""
+    vendor_rng, b_ls = _mksobj_weapon_draws(vendor_rng, False, False)
+    vendor_rng, b_lance = _mksobj_weapon_draws(vendor_rng, False, False)
+    vendor_rng, b_rm = _mksobj_armor_draws(vendor_rng)
+    vendor_rng, b_helm = _mksobj_armor_draws(vendor_rng)
+    vendor_rng, b_ss = _mksobj_armor_draws(vendor_rng)
+    vendor_rng, b_lg = _mksobj_armor_draws(vendor_rng)
+    vendor_rng, apple_qty = _mksobj_food_stack_qty(vendor_rng, 10)
+    vendor_rng, carrot_qty = _mksobj_food_stack_qty(vendor_rng, 10)
+
+    items = inv_state.items
+    _BLESSED = jnp.asarray(3, dtype=items.buc_status.dtype)
+    _UNCURSED = jnp.asarray(2, dtype=items.buc_status.dtype)
+    def _bset(b):
+        return jnp.where(b, _BLESSED, _UNCURSED)
+    buc = items.buc_status
+    buc = buc.at[0].set(_bset(b_ls))
+    buc = buc.at[1].set(_bset(b_lance))
+    buc = buc.at[2].set(_bset(b_rm))
+    buc = buc.at[3].set(_bset(b_helm))
+    buc = buc.at[4].set(_bset(b_ss))
+    buc = buc.at[5].set(_bset(b_lg))
+    q = items.quantity
+    q = q.at[6].set(apple_qty.astype(q.dtype))
+    q = q.at[7].set(carrot_qty.astype(q.dtype))
+    inv_state = inv_state.replace(items=items.replace(buc_status=buc, quantity=q))
+    return vendor_rng, inv_state
+
+
+def _ini_inv_ranger(vendor_rng, inv_state, items_list, race):
+    """PM_RANGER (u_init.c:743-749) + orc Xtra_food (u_init.c:853).
+
+    Pre-ini_inv role_init draws set the arrow-stack quantities:
+        Ranger[2].trquan = rn1(10, 50);   // 50..59  (+2 arrows)
+        Ranger[3].trquan = rn1(10, 30);   // 30..39  (+0 arrows)
+    Then ini_inv(Ranger): DAGGER, BOW (weapons), ARROW x2 stacks
+    (multigen+poisonable -> rn1(6,6) quan + rn2(100)), CLOAK_OF_DISPLACEMENT
+    (armor), CRAM_RATION x4 (food).  First ammo stack -> uquiver (setuqwep).
+    Racial equipment substitution + orc extra food applied last.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax
+    from Nethax.nethax.constants.races import Race
+
+    vendor_rng, a1 = rn2_jax(vendor_rng, jnp.int32(10))     # rn1(10,50)
+    arrow1_qty = a1 + jnp.int32(50)
+    vendor_rng, a2 = rn2_jax(vendor_rng, jnp.int32(10))     # rn1(10,30)
+    arrow2_qty = a2 + jnp.int32(30)
+
+    vendor_rng, b_dag = _mksobj_weapon_draws(vendor_rng, False, False)  # DAGGER
+    vendor_rng, b_bow = _mksobj_weapon_draws(vendor_rng, False, False)  # BOW
+    vendor_rng, b_ar1 = _mksobj_weapon_draws(vendor_rng, True, True)    # ARROW
+    vendor_rng, b_ar2 = _mksobj_weapon_draws(vendor_rng, True, True)    # ARROW
+    vendor_rng, b_cloak = _mksobj_armor_draws(vendor_rng)              # CLOAK
+    vendor_rng, cram_qty = _mksobj_food_stack_qty(vendor_rng, 4)       # CRAM x4
+
+    items = inv_state.items
+    _BLESSED = jnp.asarray(3, dtype=items.buc_status.dtype)
+    _UNCURSED = jnp.asarray(2, dtype=items.buc_status.dtype)
+    def _bset(b):
+        return jnp.where(b, _BLESSED, _UNCURSED)
+    buc = items.buc_status
+    buc = buc.at[0].set(_bset(b_dag))
+    buc = buc.at[1].set(_bset(b_bow))
+    buc = buc.at[2].set(_bset(b_ar1))
+    buc = buc.at[3].set(_bset(b_ar2))
+    buc = buc.at[4].set(_bset(b_cloak))
+    q = items.quantity
+    q = q.at[2].set(arrow1_qty.astype(q.dtype))
+    q = q.at[3].set(arrow2_qty.astype(q.dtype))
+    q = q.at[5].set(cram_qty.astype(q.dtype))
+    items = items.replace(buc_status=buc, quantity=q)
+
+    # Racial equipment substitution (static race -> otyp swap on fixed slots).
+    subs = None
+    if race == Race.ELF:
+        subs = _RANGER_RACE_SUBS_ELF
+    elif race == Race.ORC:
+        subs = _RANGER_RACE_SUBS_ORC
+    elif race == Race.GNOME:
+        subs = _RANGER_RACE_SUBS_GNOME
+    if subs is not None:
+        tid = items.type_id
+        for slot, new_otyp in subs.items():
+            tid = tid.at[slot].set(jnp.asarray(int(new_otyp), dtype=tid.dtype))
+        items = items.replace(type_id=tid)
+
+    inv_state = inv_state.replace(items=items, quiver=jnp.int8(2))
+
+    if race == Race.ORC:
+        vendor_rng, inv_state = _orc_xtra_food(vendor_rng, inv_state)
+    return vendor_rng, inv_state
+
+
+_INI_INV_ROLE_DRAWS[Role.KNIGHT] = _ini_inv_knight
+_INI_INV_ROLE_DRAWS[Role.RANGER] = _ini_inv_ranger
+
+
+# ---------------------------------------------------------------------------
 # _consume_attr_variation_draws  — vendor u_init.c:887-894 post-init_attr loop
 # ---------------------------------------------------------------------------
 
@@ -2096,7 +2450,7 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         _ini_inv_fn = _INI_INV_ROLE_DRAWS.get(role)
         if _ini_inv_fn is not None:
             vendor_rng, inv_state = _ini_inv_fn(
-                vendor_rng, inv_state, items_list,
+                vendor_rng, inv_state, items_list, race,
             )
 
     # --- Stat rolls (vendor init_attr(75) parity) ---
