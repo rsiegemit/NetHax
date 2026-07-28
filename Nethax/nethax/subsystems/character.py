@@ -547,6 +547,26 @@ def _coin(qty: int = 0) -> "Item":
                      bknown=True, dknown=True, rknown=True)
 
 
+# GOLD_PIECE object type id (constants/objects.py otyp 410, COIN_CLASS).
+_GOLD_PIECE_OTYP = 410
+
+
+def _gold(quantity: int = 1001) -> "Item":
+    """Build the COIN_CLASS gold-piece inventory object (letter ``$``).
+
+    Vendor ``ini_inv(Money)`` (u_init.c:878-879) sets ``obj->quan = u.umoney0``
+    with no BUC/enchant; coins are excluded from the bknown BUC branch
+    (objnam.c:1318) so they render as "<qty> gold pieces".  The ``quantity``
+    here is a placeholder for default (Threefry) mode; NLE_BYTEPARITY replaces
+    it with the vendor ``rn1(1000, 1001)`` roll (u_init.c:698).
+    Cite: vendor/nle/src/u_init.c:698,878-879; objnam.c:1318.
+    """
+    from Nethax.nethax.subsystems.inventory import make_item
+    return make_item(category=ItemCategory.COIN, type_id=_GOLD_PIECE_OTYP,
+                     quantity=quantity, weight=0, buc_status=0,
+                     identified=True, bknown=True, dknown=True, rknown=True)
+
+
 # ---------------------------------------------------------------------------
 # STARTING_INVENTORY
 # Each entry is a list of Item objects (pre-built, not names).
@@ -597,12 +617,21 @@ STARTING_INVENTORY: dict = {
         _gem(ObjType.ROCK, 18),
         _armor(ObjType.LEATHER_ARMOR),
     ],
-    # Hea: scalpel+0, leather gloves+1, stethoscope, 4 healing + 4 extra healing,
-    #      wand of sleep, spellbooks (3 of them BLESSED per u_init.c), 5 apples.
-    # u_init.c Healer[] (76-89): SCALPEL 0, LEATHER_GLOVES 1, spellbooks
-    # trbless=1, APPLE qty=5.
-    # Audit L #17: added the missing APPLE×5.
+    # Hea: gold ($), scalpel+0, leather gloves+1, stethoscope, 4 healing + 4
+    #      extra healing, wand of sleep, spellbooks (3 BLESSED per u_init.c),
+    #      5 apples.  u_init.c PM_HEALER (697-704): u.umoney0 = rn1(1000,1001)
+    #      then ini_inv(Healer).  Healer[] (59-72): SCALPEL 0, LEATHER_GLOVES 1,
+    #      STETHOSCOPE, POT_HEALING×4, POT_EXTRA_HEALING×4, WAN_SLEEP,
+    #      SPE_* trbless=1, APPLE qty=5.
+    # Gold occupies inv slot 0 (letter '$'); the shift of scalpel→1 / gloves→2
+    # is absorbed by the create_character wield/worn category derivation below.
+    # In NLE_BYTEPARITY the potion stacks SPLIT by BUC (addinv merges same-BUC),
+    # the WAN_SLEEP charges = rn1(5,4), the gold qty = rn1(1000,1001), and the
+    # whole kit is rebuilt densely by _consume_ini_inv_healer_draws — so the
+    # POT_HEALING/POT_EXTRA_HEALING ×4 entries here are the single-stack default
+    # (Threefry) layout and byte-parity placeholders for the split slots.
     Role.HEALER: [
+        _gold(),
         _weapon(ObjType.SCALPEL),
         _armor(ObjType.LEATHER_GLOVES, enchant=1),
         _tool(ObjType.STETHOSCOPE),
@@ -887,7 +916,7 @@ _WORN_ARMOR_BY_ROLE: dict = {
     Role.ARCHEOLOGIST: {ArmorSlot.BODY: 1, ArmorSlot.HELM: 2},
     Role.BARBARIAN:    {ArmorSlot.BODY: 2},
     Role.CAVEMAN:      {ArmorSlot.BODY: 4},
-    Role.HEALER:       {ArmorSlot.GLOVES: 1},
+    Role.HEALER:       {ArmorSlot.GLOVES: 2},  # gold@0 shifts gloves 1->2
     Role.KNIGHT:       {ArmorSlot.BODY: 2, ArmorSlot.HELM: 3,
                         ArmorSlot.SHIELD: 4, ArmorSlot.GLOVES: 5},
     Role.MONK:         {ArmorSlot.GLOVES: 0, ArmorSlot.BODY: 1},
@@ -2662,6 +2691,147 @@ def _consume_ini_inv_priest_draws(vendor_rng, inv_state, items_list, race=None):
 
 
 _INI_INV_ROLE_DRAWS[Role.PRIEST] = _consume_ini_inv_priest_draws
+
+
+# ---------------------------------------------------------------------------
+# _consume_ini_inv_healer_draws  — vendor ISAAC64 ini_inv replay for Healer
+# ---------------------------------------------------------------------------
+
+def _consume_ini_inv_healer_draws(vendor_rng, inv_state, items_list, race=None):
+    """Replay the ISAAC64 draws vendor emits for the Healer starting kit and
+    return a densely-rebuilt ``inv_state`` (gold + BUC-split potion stacks +
+    rolled wand charges + apple qty + optional lamp).
+
+    Vendor order (u_init.c:697-704 → PM_HEALER):
+
+      0. ``u.umoney0 = rn1(1000, 1001)``  gold amount            (u_init.c:698)
+      1. ini_inv(Healer)  (Healer[] u_init.c:59-72):
+         a. SCALPEL          (WEAPON) — mkobj weapon cascade.  SCALPEL is a
+            P_KNIFE melee weapon (positive oc_skill) so it is neither multigen
+            nor poisonable — plain _mksobj_weapon_cascade, no rn1/rn2(100).
+         b. LEATHER_GLOVES   (ARMOR)  — mkobj armor cascade (trspe pins +1).
+         c. STETHOSCOPE      (TOOL)   — no mksobj draw.
+         d. POT_HEALING ×4   (POTION) — 4× blessorcurse(4).  ini_inv loops
+            trquan (u_init.c:1156) creating four separate objects; addinv
+            merges same-BUC → the stack SPLITS into ≤2 letters (blessed /
+            uncursed) ordered by first-appearance of each BUC value.
+         e. POT_EXTRA_HEALING ×4 (POTION) — same 4× blessorcurse(4) split.
+         f. WAN_SLEEP        (WAND)   — spe = rn1(5, 4) (oc_dir != NODIR → 4),
+            then blessorcurse(17).  ini_inv sets known=1 (oc_uses_known) →
+            discover_object → renders "wand of sleep (0:spe)".
+         g. SPE_HEALING / SPE_EXTRA_HEALING / SPE_STONE_TO_FLESH (SPBOOK) —
+            blessorcurse(17) each; trbless=1 forces BLESSED.
+         h. APPLE ×5         (FOOD)   — per-unit rn2(6) stack doubling.
+      2. bonus: ``if (!rn2(25)) ini_inv(Lamp)`` — OIL_LAMP mksobj =
+         rn1(500, 1000) age + blessorcurse(5) (u_init.c:700-701).
+
+    Gold is rendered at inv slot 0 with letter ``$`` (vendor addinv keeps coins
+    first); the remaining items take consecutive letters a, b, c, … from the
+    first non-gold slot.  ``knows_object(POT_FULL_HEALING)`` / ``skill_init``
+    (u_init.c:702-703) draw no ISAAC64 RNG.  Byte-parity char init runs
+    single-seed under NETHAX_EAGER, so concrete Python values drive the
+    (variable-length) dense rebuild — matching _blessorcurse_eager /
+    _mkobj_food_isaac.
+
+    Returns ``(vendor_rng, inv_state)``.
+
+    Citations
+    ---------
+    vendor/nle/src/u_init.c:59-72, 697-704, 878-879, 1083-1167
+    vendor/nle/src/mkobj.c:803-1027 (weapon/armor/potion/spbook/wand cascades)
+    vendor/nle/include/obj.h:197-204 (is_multigen / is_poisonable)
+    """
+    from Nethax.nethax.vendor_rng import rn1_jax, rn2_jax
+    from Nethax.nethax.subsystems.inventory import (
+        make_item, InventoryState, MAX_INVENTORY_SLOTS,
+    )
+
+    # ---- Vendor ISAAC64 draws (exact order) ----
+    # 0. Gold amount — drawn BEFORE ini_inv (u_init.c:698).
+    vendor_rng, umoney0 = rn1_jax(vendor_rng, jnp.int32(1000), jnp.int32(1001))
+    # 1a. SCALPEL weapon cascade.
+    vendor_rng, scalpel_blessed = _mksobj_weapon_cascade(vendor_rng)
+    # 1b. LEATHER_GLOVES armor cascade.
+    vendor_rng, gloves_blessed = _mksobj_armor_cascade(vendor_rng)
+    # 1c. STETHOSCOPE — no draw.
+    # 1d/e. POT_HEALING ×4, POT_EXTRA_HEALING ×4 — per-potion blessorcurse(4).
+    heal_blessed = []
+    for _ in range(4):
+        vendor_rng, b = _mksobj_blessorcurse(vendor_rng, 4)
+        heal_blessed.append(bool(int(b)))
+    exheal_blessed = []
+    for _ in range(4):
+        vendor_rng, b = _mksobj_blessorcurse(vendor_rng, 4)
+        exheal_blessed.append(bool(int(b)))
+    # 1f. WAN_SLEEP — spe = rn1(5, 4) then blessorcurse(17).
+    vendor_rng, wand_spe = rn1_jax(vendor_rng, jnp.int32(5), jnp.int32(4))
+    vendor_rng, wand_blessed = _mksobj_blessorcurse(vendor_rng, 17)
+    # 1g. 3 spellbooks — blessorcurse(17) each; trbless=1 → BLESSED.
+    for _ in range(3):
+        vendor_rng, _ = _mksobj_blessorcurse(vendor_rng, 17)
+    # 1h. APPLE ×5 — food stack doubling.
+    vendor_rng, apple_qty = _mksobj_food_stack_qty(vendor_rng, 5)
+    # 2. Lamp bonus gate — rn2(25); if 0, OIL_LAMP mksobj draws.
+    vendor_rng, lamp_gate = rn2_jax(vendor_rng, jnp.int32(25))
+    lamp_present = int(lamp_gate) == 0
+    lamp_blessed = False
+    if lamp_present:
+        vendor_rng, _ = rn1_jax(vendor_rng, jnp.int32(500), jnp.int32(1000))
+        vendor_rng, _lb = _mksobj_blessorcurse(vendor_rng, 5)
+        lamp_blessed = bool(int(_lb))
+
+    # ---- Dense rebuild (addinv order + BUC-split) ----
+    def _buc(blessed):
+        return _BUC_BLESSED if blessed else _BUC_UNCURSED
+
+    def _split_stacks(flags):
+        """BUC stacks in first-appearance order: [(blessed_bool, count), ...]."""
+        order, counts = [], {}
+        for f in flags:
+            if f not in counts:
+                counts[f] = 0
+                order.append(f)
+            counts[f] += 1
+        return [(k, counts[k]) for k in order]
+
+    dense = [
+        _gold(int(umoney0)),                                          # slot 0: $
+        _weapon(ObjType.SCALPEL, buc=_buc(bool(int(scalpel_blessed)))),
+        _armor(ObjType.LEATHER_GLOVES, enchant=1,
+                buc=_buc(bool(int(gloves_blessed)))),
+        _tool(ObjType.STETHOSCOPE),
+    ]
+    for blessed, cnt in _split_stacks(heal_blessed):
+        dense.append(_potion(ObjType.POT_HEALING, cnt, buc=_buc(blessed)))
+    for blessed, cnt in _split_stacks(exheal_blessed):
+        dense.append(_potion(ObjType.POT_EXTRA_HEALING, cnt, buc=_buc(blessed)))
+    _wand_item = _wand(ObjType.WAN_SLEEP, buc=_buc(bool(int(wand_blessed))))
+    _wand_item = _wand_item.replace(charges=jnp.int8(int(wand_spe)))
+    dense.append(_wand_item)
+    dense.append(_spellbook(ObjType.SPE_HEALING, buc=_BUC_BLESSED))
+    dense.append(_spellbook(ObjType.SPE_EXTRA_HEALING, buc=_BUC_BLESSED))
+    dense.append(_spellbook(ObjType.SPE_STONE_TO_FLESH, buc=_BUC_BLESSED))
+    dense.append(_food(ObjType.APPLE, int(apple_qty)))
+    if lamp_present:
+        # OIL_LAMP (otyp 202) — spe=1, lamplit off.  Untested for the gated
+        # seeds (rn2(25)!=0 there); modelled for stream correctness.
+        _lamp = make_item(category=int(ItemCategory.TOOL), type_id=202,
+                          quantity=1, weight=20, buc_status=_buc(lamp_blessed),
+                          identified=True, bknown=True, dknown=True, rknown=True)
+        _lamp = _lamp.replace(enchantment=jnp.int8(1))
+        dense.append(_lamp)
+
+    inv_state = InventoryState.from_items(dense)
+    # Letters: gold keeps '$' (coins are not assigned a lettered slot); items
+    # take consecutive a, b, c, … from the first non-gold slot (assigninvlet).
+    n = len(dense)
+    letters = [ord('$')] + [ord('a') + i for i in range(n - 1)]
+    letters += [0] * (MAX_INVENTORY_SLOTS - len(letters))
+    inv_state = inv_state.replace(letters=jnp.asarray(letters, dtype=jnp.int8))
+    return vendor_rng, inv_state
+
+
+_INI_INV_ROLE_DRAWS[Role.HEALER] = _consume_ini_inv_healer_draws
 
 
 # ---------------------------------------------------------------------------
@@ -4459,10 +4629,22 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     # --- Wield primary weapon ---
     wielded = jnp.int8(-1)
     if role not in _NO_WEAPON_ROLES and len(items_list) > 0:
-        # Wield slot 0 (primary weapon is always first in the list)
-        first_cat = int(items_list[0].category)
-        if first_cat == int(ItemCategory.WEAPON):
-            wielded = jnp.int8(0)
+        if role == Role.HEALER:
+            # Healer's gold ($) occupies slot 0, so the primary weapon is not
+            # at index 0.  Derive the wield slot from item CATEGORY (first
+            # WEAPON = scalpel) rather than the fixed index; role-gated so every
+            # other role (weapon at slot 0) keeps its byte-identical wield.
+            # Cite: vendor/nle/src/u_init.c:1146 (setuwep on first !uwep weapon).
+            wielded = jnp.int8(next(
+                (i for i, it in enumerate(items_list)
+                 if int(it.category) == int(ItemCategory.WEAPON)),
+                -1,
+            ))
+        else:
+            # Wield slot 0 (primary weapon is always first in the list)
+            first_cat = int(items_list[0].category)
+            if first_cat == int(ItemCategory.WEAPON):
+                wielded = jnp.int8(0)
     inv_state = inv_state.replace(wielded=wielded)
 
     # --- Set swap weapon (uswapwep) for Rogue ---
@@ -4560,6 +4742,18 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         pw.astype(jnp.int16)
     )
 
+    # --- Starting gold (u.umoney0) ---
+    # Vendor sets u.umoney0 per role (Healer rn1(1000,1001), Tourist rnd(1000),
+    # 0 otherwise) then ``ini_inv(Money)`` adds a COIN_CLASS gold object with
+    # quan == u.umoney0 (u_init.c:878-879).  Derive blstats gold from that
+    # starting COIN item's quantity so blstats[$] tracks the inventory; roles
+    # without gold have no COIN item → 0 (byte-identical to the prior default).
+    _coin_mask = inv_state.items.category == jnp.int8(int(ItemCategory.COIN))
+    player_gold = jnp.sum(
+        jnp.where(_coin_mask, inv_state.items.quantity.astype(jnp.int64),
+                  jnp.int64(0))
+    )
+
     return dict(
         player_role=jnp.int8(int(role)),
         player_race=jnp.int8(int(race)),
@@ -4578,6 +4772,7 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         player_uhpinc=player_uhpinc,
         player_ueninc=player_ueninc,
         player_ac=player_ac,
+        player_gold=player_gold,
         # Vendor default: luck starts at 0 (you.h::u.uluck), no birth opt.
         player_luck=jnp.int8(0),
         inventory=inv_state,

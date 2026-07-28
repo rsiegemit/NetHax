@@ -306,7 +306,11 @@ class NethaxEnv:
         # = (100, 49) lands between ROLE_INIT_BEGIN and INIT_DUNGEONS_BEGIN
         # markers — for Archeologist (Lord Carnarvon).  This was previously
         # misattributed to init_dungeons.
-        if use_vendor_rng() and role is not None and int(role) == int(Role.ARCHEOLOGIST):
+        # role.c:2071 fires this rn2(100) for every role whose quest-leader
+        # entry lacks a fixed gender bit (M2_MALE/M2_FEMALE/M2_NEUTER).
+        # Archeologist (Lord Carnarvon) and Healer (Hippocrates) both do.
+        if (use_vendor_rng() and role is not None
+                and int(role) in (int(Role.ARCHEOLOGIST), int(Role.HEALER))):
             v_state = state.vendor_rng
             v_state, _ = _vendor_rng.rn2_jax(v_state, jnp.int32(100))
             state = state.replace(vendor_rng=v_state)
