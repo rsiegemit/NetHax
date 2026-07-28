@@ -389,6 +389,7 @@ _CLASS_PREFIX_STRS[_SCROLL_CLASS_VAL] = "scroll of "
 _CLASS_PREFIX_STRS[_SPBOOK_CLASS_VAL] = "spellbook of "
 _CLASS_PREFIX_STRS[_RING_CLASS_VAL]   = "ring of "
 _CLASS_PREFIX_STRS[_AMULET_CLASS_VAL] = "amulet of "
+_CLASS_PREFIX_STRS[_WAND_CLASS_VAL]   = "wand of "
 
 _MAX_PREFIX_LEN = 14  # "spellbook of \0"
 _CLASS_PREFIX_BYTES: jnp.ndarray = jnp.array(
@@ -406,6 +407,7 @@ _CLASS_PREFIX_PLURAL_STRS[_SCROLL_CLASS_VAL] = "scrolls of "
 _CLASS_PREFIX_PLURAL_STRS[_SPBOOK_CLASS_VAL] = "spellbooks of "
 _CLASS_PREFIX_PLURAL_STRS[_RING_CLASS_VAL]   = "rings of "
 _CLASS_PREFIX_PLURAL_STRS[_AMULET_CLASS_VAL] = "amulets of "
+_CLASS_PREFIX_PLURAL_STRS[_WAND_CLASS_VAL]   = "wands of "
 
 _MAX_PREFIX_PLURAL_LEN = 16  # "spellbooks of \0" = 15 bytes
 _CLASS_PREFIX_PLURAL_BYTES: jnp.ndarray = jnp.array(

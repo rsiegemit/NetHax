@@ -756,22 +756,30 @@ STARTING_INVENTORY: dict = {
         _food(ObjType.FOOD_RATION, 1),
     ],
     # Wiz: quarterstaff+1 (BLESSED — trbless=1), cloak of magic resistance+0,
-    #      wand, force-bolt spellbook (BLESSED), random potions/scrolls,
-    #      magic marker (spe = 18 + d4 ≈ 20).
-    # u_init.c Wizard[] (167-178): QUARTERSTAFF spe=1 trbless=1, SPE_FORCE_BOLT
-    # trbless=1, MAGIC_MARKER spe=18+d4.  Random RING ×2, POTION ×3, SCROLL ×3,
-    # SPBOOK ×1, WAND each pulled from UNDEF_TYP — we keep the existing
-    # POT_HEALING/SCR_IDENTIFY/WAN_SLEEP representatives until random-init is
-    # wired (Audit L #26 remaining).
+    #      random WAND ×1, RING ×2, POTION ×3, SCROLL ×3, force-bolt spellbook
+    #      (BLESSED), random SPBOOK ×1, plus optional MAGIC_MARKER / BLINDFOLD
+    #      bonus and (elf) a musical instrument.
+    # u_init.c Wizard[] (159-171) + PM_WIZARD case (790-796).  All slots except
+    # slots 0-1 are PLACEHOLDERS — _consume_ini_inv_wizard_draws replays the
+    # mksobj reject-loop draws and REBUILDS inv_state.items + letters entirely
+    # (dynamic addinv merge of same-type potions/scrolls -> variable slot count
+    # 11-13).  Only slot 0 (QUARTERSTAFF, wielded) and slot 1 (CLOAK, worn) are
+    # read downstream (wield + _WORN_ARMOR_BY_ROLE[WIZARD]); the rest exist so
+    # from_items() sizes the base inventory before the rebuild.
     Role.WIZARD: [
         _weapon(ObjType.QUARTERSTAFF, enchant=1, buc=_BUC_BLESSED),
         _armor(ObjType.CLOAK_OF_MAGIC_RESISTANCE),
-        _wand(ObjType.WAN_SLEEP),          # representative random wand
-        _spellbook(ObjType.SPE_FORCE_BOLT, buc=_BUC_BLESSED),
-        _potion(ObjType.POT_HEALING, 3),   # representative random potions
-        _scroll(ObjType.SCR_IDENTIFY, 3),  # representative random scrolls
-        # MAGIC_MARKER spe = 18 + d4 (median = 20).  Vendor u_init.c:177.
-        _tool(ObjType.MAGIC_MARKER),
+        _wand(ObjType.WAN_SLEEP),                          # placeholder WAND
+        _spellbook(ObjType.SPE_FORCE_BOLT, buc=_BUC_BLESSED),  # placeholder
+        _potion(ObjType.POT_HEALING, 1),                   # placeholder RING
+        _potion(ObjType.POT_HEALING, 1),                   # placeholder RING
+        _potion(ObjType.POT_HEALING, 1),                   # placeholder POTION
+        _potion(ObjType.POT_HEALING, 1),                   # placeholder POTION
+        _potion(ObjType.POT_HEALING, 1),                   # placeholder POTION
+        _scroll(ObjType.SCR_IDENTIFY, 1),                  # placeholder SCROLL
+        _scroll(ObjType.SCR_IDENTIFY, 1),                  # placeholder SCROLL
+        _scroll(ObjType.SCR_IDENTIFY, 1),                  # placeholder SCROLL
+        _spellbook(ObjType.SPE_FORCE_BOLT),                # placeholder SPBOOK
     ],
 }
 
@@ -1888,6 +1896,492 @@ def _consume_ini_inv_monk_draws(vendor_rng, inv_state, items_list, race=None):
 
 
 _INI_INV_ROLE_DRAWS[Role.MONK] = _consume_ini_inv_monk_draws
+
+
+# ===========================================================================
+# _consume_ini_inv_wizard_draws  — vendor ISAAC64 ini_inv replay for Wizard
+# ===========================================================================
+#
+# Vendor Wizard[] trobj (u_init.c:159-171) + PM_WIZARD case (790-796):
+#   0 QUARTERSTAFF spe=1 trbless=1      (WEAPON) — mksobj weapon cascade
+#   1 CLOAK_OF_MAGIC_RESISTANCE spe=0   (ARMOR)  — mksobj armor cascade
+#   2 random WAND x1                    (UNDEF)  — mkobj reject loop
+#   3 random RING x2                    (UNDEF)  — mkobj reject loop x2
+#   4 random POTION x3                  (UNDEF)  — mkobj reject loop x3
+#   5 random SCROLL x3                  (UNDEF)  — mkobj reject loop x3
+#   6 SPE_FORCE_BOLT spe=0 trbless=1    (SPBOOK) — mksobj blessorcurse(17)
+#   7 random SPBOOK x1                  (UNDEF)  — mkobj reject loop
+# then bonus:  if (!rn2(5)) Magicmarker;  if (!rn2(5)) Blindfold;   (790-795)
+# then race switch (after role switch): elf Wizard gets a non-magic
+# instrument (rn2(6) trotyp pick + mksobj = no draws); orc Wizard gets NO
+# Xtra_food (u_init.c:852 excludes wizard) but its ring reject-set adds
+# RIN_POISON_RESISTANCE (u_init.c:1015).
+#
+# Each UNDEF item = mkobj(class): rnd(1000) type pick (mkobj.c:251) + the
+# per-class mksobj cascade, wrapped in the reject loop (u_init.c:1000-1029).
+# ``nocreate``/``nocreate4`` no-dup + polymorph chain threaded per item.
+# Charged rings get an extra rne(3) (u_init.c:1032) when spe<=0.
+#
+# Cite: vendor/nle/src/u_init.c:159-171, 790-819, 971-1054; mkobj.c:244-272,
+#       803-1048.
+# ---------------------------------------------------------------------------
+
+
+def _wiz_build_tables():
+    """Build the module-level otyp lookup tables from the canonical OBJECTS
+    table (no hardcoded otyp integers)."""
+    from Nethax.nethax.constants.objects import OBJECTS, ObjectClass as _OC
+
+    n = len(OBJECTS)
+
+    def _otyp(cls, name):
+        for i, e in enumerate(OBJECTS):
+            if e.class_ == cls and e.name == name:
+                return i
+        raise KeyError(f"{cls}:{name}")
+
+    # Named otyps used by the polymorph nocreate chain + special ring set.
+    ids = {
+        "WAN_WISHING":  _otyp(_OC.WAND_CLASS, "wishing"),
+        "WAN_NOTHING":  _otyp(_OC.WAND_CLASS, "nothing"),
+        "WAN_POLYMORPH": _otyp(_OC.WAND_CLASS, "polymorph"),
+        "RIN_LEVITATION": _otyp(_OC.RING_CLASS, "levitation"),
+        "RIN_AGGRAVATE": _otyp(_OC.RING_CLASS, "aggravate monster"),
+        "RIN_HUNGER":   _otyp(_OC.RING_CLASS, "hunger"),
+        "RIN_POISON_RES": _otyp(_OC.RING_CLASS, "poison resistance"),
+        "RIN_TELEPORT": _otyp(_OC.RING_CLASS, "teleportation"),
+        "RIN_POLYMORPH": _otyp(_OC.RING_CLASS, "polymorph"),
+        "RIN_POLYCTRL": _otyp(_OC.RING_CLASS, "polymorph control"),
+        "POT_HALLUC":   _otyp(_OC.POTION_CLASS, "hallucination"),
+        "POT_ACID":     _otyp(_OC.POTION_CLASS, "acid"),
+        "POT_POLYMORPH": _otyp(_OC.POTION_CLASS, "polymorph"),
+        "SCR_AMNESIA":  _otyp(_OC.SCROLL_CLASS, "amnesia"),
+        "SCR_FIRE":     _otyp(_OC.SCROLL_CLASS, "fire"),
+        "SCR_BLANK":    _otyp(_OC.SCROLL_CLASS, "blank paper"),
+        "SPE_BLANK":    _otyp(_OC.SPBOOK_CLASS, "blank paper"),
+        "SPE_FORCE_BOLT": _otyp(_OC.SPBOOK_CLASS, "force bolt"),
+        "SPE_POLYMORPH": _otyp(_OC.SPBOOK_CLASS, "polymorph"),
+    }
+
+    # Always-rejected otyps (class-independent union, u_init.c:1000-1013).
+    base_reject = [
+        ids["WAN_WISHING"], ids["WAN_NOTHING"], ids["RIN_LEVITATION"],
+        ids["RIN_AGGRAVATE"], ids["RIN_HUNGER"], ids["POT_HALLUC"],
+        ids["POT_ACID"], ids["SCR_AMNESIA"], ids["SCR_FIRE"],
+        ids["SCR_BLANK"], ids["SPE_BLANK"], ids["SPE_FORCE_BOLT"],
+    ]
+    base = [False] * n
+    for i in base_reject:
+        base[i] = True
+
+    # oc_charged rings (spec=1 rings, objects.c:542-547) — start at "adornment".
+    charged = [False] * n
+    for nm in ("adornment", "gain strength", "gain constitution",
+               "increase accuracy", "increase damage", "protection"):
+        charged[_otyp(_OC.RING_CLASS, nm)] = True
+
+    # Wand charge offset per otyp: rn1(5, off) where off = oc_charge - 4
+    # (NODIR wands oc_charge=15 -> off 11; ray/imm oc_charge=8 -> off 4).
+    woff = [0] * n
+    for i, e in enumerate(OBJECTS):
+        if e.class_ == _OC.WAND_CLASS and e.oc_charge > 0:
+            woff[i] = int(e.oc_charge) - 4
+
+    # Spellbook spell level (oc2); >3 rejected (u_init.c:1024).
+    slevel = [0] * n
+    for i, e in enumerate(OBJECTS):
+        if e.class_ == _OC.SPBOOK_CLASS:
+            slevel[i] = int(e.oc2)
+
+    tables = {
+        "ids": ids,
+        "base_reject": jnp.asarray(base, dtype=jnp.bool_),
+        "poison_res": ids["RIN_POISON_RES"],
+        "charged": jnp.asarray(charged, dtype=jnp.bool_),
+        "wand_off": jnp.asarray(woff, dtype=jnp.int32),
+        "sp_level": jnp.asarray(slevel, dtype=jnp.int32),
+        "ring_special": jnp.asarray(
+            [ids["RIN_TELEPORT"], ids["RIN_POLYMORPH"], ids["RIN_AGGRAVATE"],
+             ids["RIN_HUNGER"]], dtype=jnp.int32),
+        # Non-magic elf instruments — u_init.c:816-817 trotyp[rn2(6)].
+        "instruments": jnp.asarray(
+            [_otyp(_OC.TOOL_CLASS, nm) for nm in
+             ("wooden flute", "tooled horn", "wooden harp", "bell", "bugle",
+              "leather drum")], dtype=jnp.int32),
+        "MAGIC_MARKER": _otyp(_OC.TOOL_CLASS, "magic marker"),
+        "BLINDFOLD": _otyp(_OC.TOOL_CLASS, "blindfold"),
+        "class_ring": int(_OC.RING_CLASS),
+        "class_wand": int(_OC.WAND_CLASS),
+        "class_potion": int(_OC.POTION_CLASS),
+        "class_scroll": int(_OC.SCROLL_CLASS),
+        "class_spbook": int(_OC.SPBOOK_CLASS),
+    }
+    return tables
+
+
+_WIZ = _wiz_build_tables()
+_WIZ_MAX_ATTEMPTS = 24
+
+
+def _wiz_ring_charged_cascade(rng):
+    """Vendor mkobj.c:1029-1042 charged-ring cascade (conditional-advance,
+    vmap-safe).  Returns ``(rng, spe, blessed)``."""
+    from Nethax.nethax.vendor_rng import rn2_jax, rne_jax
+
+    # blessorcurse(3) -> sign / blessed  (mkobj.c:1030)
+    rng, hit = rn2_jax(rng, jnp.int32(3))
+    outer0 = hit == jnp.int32(0)
+    rng_i, inner = rn2_jax(rng, jnp.int32(2))
+    rng = _mksobj_cadv(rng, rng_i, outer0)
+    sign = jnp.where(outer0,
+                     jnp.where(inner != jnp.int32(0), jnp.int32(1), jnp.int32(-1)),
+                     jnp.int32(0))
+    blessed = jnp.logical_and(outer0, inner != jnp.int32(0))
+
+    # if (rn2(10)) { ... }   (mkobj.c:1031)
+    rng, x1 = rn2_jax(rng, jnp.int32(10))
+    x1nz = x1 != jnp.int32(0)
+    # X2 = rn2(10) only when x1nz  (mkobj.c:1032)
+    r_x2, x2 = rn2_jax(rng, jnp.int32(10))
+    rng = _mksobj_cadv(rng, r_x2, x1nz)
+    x2 = jnp.where(x1nz, x2, jnp.int32(0))
+    inner_a = x1nz & (x2 != jnp.int32(0)) & (sign != jnp.int32(0))
+    inner_b = x1nz & jnp.logical_not((x2 != jnp.int32(0)) & (sign != jnp.int32(0)))
+    # branch A: spe = sign * rne(3)  (mkobj.c:1033)
+    r_a, v_a = rne_jax(rng, jnp.int32(3))
+    spe_a = sign * v_a
+    # branch B: rn2(2) ? rne(3) : -rne(3)  (mkobj.c:1035)
+    r_b, bb = rn2_jax(rng, jnp.int32(2))
+    r_b, v_b = rne_jax(r_b, jnp.int32(3))
+    spe_b = jnp.where(bb != jnp.int32(0), v_b, -v_b)
+    rng = _mksobj_cadv(rng, r_a, inner_a)
+    rng = _mksobj_cadv(rng, r_b, inner_b)
+    spe = jnp.where(inner_a, spe_a, jnp.where(inner_b, spe_b, jnp.int32(0)))
+
+    # if (spe == 0) spe = rn2(4) - rn2(3);  (mkobj.c:1038-1039)
+    r0, a4 = rn2_jax(rng, jnp.int32(4))
+    r0, b3 = rn2_jax(r0, jnp.int32(3))
+    is0 = spe == jnp.int32(0)
+    rng = _mksobj_cadv(rng, r0, is0)
+    spe = jnp.where(is0, a4 - b3, spe)
+
+    # if (spe < 0 && rn2(5)) curse;   (mkobj.c:1041)
+    r5, _ = rn2_jax(rng, jnp.int32(5))
+    isneg = spe < jnp.int32(0)
+    rng = _mksobj_cadv(rng, r5, isneg)
+    return rng, spe, blessed
+
+
+def _wiz_ring_uncharged_cascade(rng, otyp):
+    """Vendor mkobj.c:1043-1048 uncharged-ring cascade.  Returns
+    ``(rng, blessed)``.
+
+    Uncharged rings get NO blessorcurse in mksobj — only::
+
+        else if (rn2(10) && (otyp==RIN_TELEPORTATION || RIN_POLYMORPH
+                             || RIN_AGGRAVATE_MONSTER || RIN_HUNGER
+                             || !rn2(9)))
+            curse(otmp);
+
+    So an uncharged ring is never blessed at generation (blessed=False), and
+    the draw cost is rn2(10) always + rn2(9) only when the outer rn2(10) is
+    non-zero AND the otyp is not one of the 4 short-circuit specials.  The
+    curse that may follow is wiped by ini_inv (u_init.c:1094)."""
+    from Nethax.nethax.vendor_rng import rn2_jax
+    rng, x10 = rn2_jax(rng, jnp.int32(10))                   # mkobj.c:1043
+    is_special = jnp.any(otyp == _WIZ["ring_special"])
+    r9, _ = rn2_jax(rng, jnp.int32(9))                       # mkobj.c:1046 !rn2(9)
+    draw9 = jnp.logical_and(x10 != jnp.int32(0),
+                            jnp.logical_not(is_special))
+    rng = _mksobj_cadv(rng, r9, draw9)
+    return rng, jnp.bool_(False)
+
+
+def _wiz_ring_cascade(rng_roll, otyp):
+    """mksobj RING dispatch — charged vs uncharged by ``otyp``.  Returns
+    ``(rng, spe, blessed)`` where ``spe`` is meaningful only for charged rings."""
+    is_ch = _WIZ["charged"][jnp.clip(otyp, 0, _WIZ["charged"].shape[0] - 1)]
+    rng_c, spe_c, bl_c = _wiz_ring_charged_cascade(rng_roll)
+    rng_u, bl_u = _wiz_ring_uncharged_cascade(rng_roll, otyp)
+    rng = _mksobj_cadv(rng_u, rng_c, is_ch)
+    spe = jnp.where(is_ch, spe_c, jnp.int32(0))
+    blessed = jnp.where(is_ch, bl_c, bl_u)
+    return rng, spe, blessed
+
+
+def _wiz_pick_item(vendor_rng, class_id, nc, nc2, nc3, nc4, orc, is_spbook,
+                   cascade):
+    """Run the vendor mkobj reject loop for ONE UNDEF item of ``class_id``.
+
+    ``cascade(rng_roll, otyp) -> (rng_after, spe, blessed)`` replays the
+    per-class mksobj draws.  Returns ``(vendor_rng, otyp, spe, blessed)``.
+    Rejection set = static union ∪ {orc poison-res} ∪ nocreate chain ∪
+    {spbook oc_level>3}.  Conditional-advance keeps the ISAAC64 stream exact.
+    """
+    from Nethax.nethax.vendor_rng import rnd_jax
+    from Nethax.nethax.subsystems.random_objects import decode_picked_otyp
+
+    base_reject = _WIZ["base_reject"]
+    nobj = base_reject.shape[0]
+    pr = _WIZ["poison_res"]
+    sp_level = _WIZ["sp_level"]
+
+    import os as _os
+    _dbg = _os.environ.get("WIZDBG")
+    accepted = jnp.bool_(False)
+    otyp_out = jnp.int32(0)
+    spe_out = jnp.int32(0)
+    bless_out = jnp.bool_(False)
+    for _att in range(_WIZ_MAX_ATTEMPTS):
+        active = jnp.logical_not(accepted)
+        rng_roll, roll = rnd_jax(vendor_rng, jnp.int32(1000))
+        if _dbg and _att < 3:
+            print(f"DBG cls={class_id} att={_att} roll={int(roll)}")
+        otyp = decode_picked_otyp(jnp.int32(class_id), roll).astype(jnp.int32)
+        rng_after, spe, blessed = cascade(rng_roll, otyp)
+        vendor_rng = _mksobj_cadv(vendor_rng, rng_after, active)
+
+        safe = jnp.clip(otyp, 0, nobj - 1)
+        rejected = base_reject[safe]
+        rejected = rejected | jnp.logical_and(orc, otyp == jnp.int32(pr))
+        rejected = rejected | (otyp == nc) | (otyp == nc2) | (otyp == nc3) | (otyp == nc4)
+        if is_spbook:
+            rejected = rejected | (sp_level[safe] > jnp.int32(3))
+
+        newly = jnp.logical_and(active, jnp.logical_not(rejected))
+        otyp_out = jnp.where(newly, otyp, otyp_out)
+        spe_out = jnp.where(newly, spe, spe_out)
+        bless_out = jnp.where(newly, blessed, bless_out)
+        accepted = jnp.logical_or(accepted, newly)
+    return vendor_rng, otyp_out, spe_out, bless_out
+
+
+def _wiz_update_nocreate(otyp, nc, nc2, nc3, nc4, is_ring_or_spbook):
+    """Vendor u_init.c:1042-1054 polymorph nocreate chain + ring/spbook no-dup."""
+    i = _WIZ["ids"]
+    poly_trigger = (
+        (otyp == jnp.int32(i["WAN_POLYMORPH"]))
+        | (otyp == jnp.int32(i["RIN_POLYMORPH"]))
+        | (otyp == jnp.int32(i["POT_POLYMORPH"]))
+    )
+    is_polyctrl = otyp == jnp.int32(i["RIN_POLYCTRL"])
+    nc = jnp.where(poly_trigger, jnp.int32(i["RIN_POLYCTRL"]), nc)
+    nc = jnp.where(is_polyctrl, jnp.int32(i["RIN_POLYMORPH"]), nc)
+    nc2 = jnp.where(is_polyctrl, jnp.int32(i["SPE_POLYMORPH"]), nc2)
+    nc3 = jnp.where(is_polyctrl, jnp.int32(i["POT_POLYMORPH"]), nc3)
+    nc4 = jnp.where(is_ring_or_spbook, otyp, nc4)
+    return nc, nc2, nc3, nc4
+
+
+def _consume_ini_inv_wizard_draws(vendor_rng, inv_state, items_list, race=None):
+    """Replay the ISAAC64 draws vendor emits for the Wizard starting kit and
+    rebuild ``inv_state`` (items + letters) with the rolled random items.
+
+    Returns ``(vendor_rng, inv_state)``.  See the block header above for the
+    vendor item order + draw structure.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax, rn1_jax, rne_jax
+    from Nethax.nethax.constants.races import Race as _Race
+
+    _BLESSED = jnp.asarray(_BUC_BLESSED, dtype=jnp.int8)
+    _UNCURSED = jnp.asarray(_BUC_UNCURSED, dtype=jnp.int8)
+    is_orc = jnp.bool_(race == _Race.ORC)
+    is_elf = (race == _Race.ELF)
+
+    from Nethax.nethax.vendor_rng import rn2_jax as _rn2
+    # Pre-ini_inv preamble: two ISAAC64 words fire between the level_generator's
+    # entry state and the first Wizard[] item (QUARTERSTAFF).  Verified via
+    # NETHAX_RND_TRACE — after consuming them, the QUARTERSTAFF weapon cascade
+    # and CLOAK armor cascade draws match vendor exactly ([7,0,0,2] / [7,5,7,1]).
+    # (Vendor RND idx 282-283: the trailing INIT_DUNGEONS_TUNE rn2(7) note plus
+    # the u_init rn2(3) that the role-agnostic level-gen replay does not model
+    # for the Wizard role.)  Modulus is immaterial for the ISAAC64 state advance.
+    vendor_rng, _ = _rn2(vendor_rng, jnp.int32(7))
+    vendor_rng, _ = _rn2(vendor_rng, jnp.int32(3))
+
+    # nocreate chain state (STRANGE_OBJECT sentinel = -1 so a real otyp 0 can
+    # never match an unset slot).
+    NC0 = jnp.int32(-1)
+    nc, nc2, nc3, nc4 = NC0, NC0, NC0, NC0
+
+    # --- 0. QUARTERSTAFF (known weapon) mksobj cascade (trspe=1/trbless=1) ---
+    vendor_rng, _qs_bless = _mksobj_weapon_cascade(vendor_rng)
+    # --- 1. CLOAK_OF_MAGIC_RESISTANCE (known armor) mksobj cascade ---
+    vendor_rng, cloak_bless = _mksobj_armor_cascade(vendor_rng)
+
+    # --- 2. random WAND ---
+    def _wand_cascade(rng_roll, otyp):
+        r, r5 = rn2_jax(rng_roll, jnp.int32(5))              # rn1(5, off) charge
+        safe = jnp.clip(otyp, 0, _WIZ["wand_off"].shape[0] - 1)
+        spe = r5 + _WIZ["wand_off"][safe]
+        r, _ = _mksobj_blessorcurse(r, 17)                   # mkobj.c:1025
+        return r, spe, jnp.bool_(False)
+    vendor_rng, wand_otyp, wand_spe, _ = _wiz_pick_item(
+        vendor_rng, _WIZ["class_wand"], nc, nc2, nc3, nc4, is_orc, False,
+        _wand_cascade)
+    nc, nc2, nc3, nc4 = _wiz_update_nocreate(wand_otyp, nc, nc2, nc3, nc4,
+                                             jnp.bool_(False))
+
+    # --- 3. random RING x2 ---
+    ring_otyp = [jnp.int32(0), jnp.int32(0)]
+    ring_spe = [jnp.int32(0), jnp.int32(0)]
+    ring_bless = [jnp.bool_(False), jnp.bool_(False)]
+    for k in range(2):
+        vendor_rng, rot, rspe, rbl = _wiz_pick_item(
+            vendor_rng, _WIZ["class_ring"], nc, nc2, nc3, nc4, is_orc, False,
+            _wiz_ring_cascade)
+        # u_init.c:1032 — charged ring with spe<=0 gets spe = rne(3).
+        safe = jnp.clip(rot, 0, _WIZ["charged"].shape[0] - 1)
+        is_ch = _WIZ["charged"][safe]
+        need_fix = jnp.logical_and(is_ch, rspe <= jnp.int32(0))
+        rng_fx, vfx = rne_jax(vendor_rng, jnp.int32(3))
+        vendor_rng = _mksobj_cadv(vendor_rng, rng_fx, need_fix)
+        rspe = jnp.where(need_fix, vfx, rspe)
+        ring_otyp[k], ring_spe[k], ring_bless[k] = rot, rspe, rbl
+        nc, nc2, nc3, nc4 = _wiz_update_nocreate(rot, nc, nc2, nc3, nc4,
+                                                 jnp.bool_(True))
+
+    # --- 4. random POTION x3 ---
+    def _pot_scr_cascade(rng_roll, otyp):
+        r, bl = _mksobj_blessorcurse(rng_roll, 4)            # mkobj.c:986
+        return r, jnp.int32(0), bl
+    pot_otyp, pot_bless = [], []
+    for _ in range(3):
+        vendor_rng, o, _, bl = _wiz_pick_item(
+            vendor_rng, _WIZ["class_potion"], nc, nc2, nc3, nc4, is_orc, False,
+            _pot_scr_cascade)
+        nc, nc2, nc3, nc4 = _wiz_update_nocreate(o, nc, nc2, nc3, nc4,
+                                                 jnp.bool_(False))
+        pot_otyp.append(o); pot_bless.append(bl)
+
+    # --- 5. random SCROLL x3 ---
+    scr_otyp, scr_bless = [], []
+    for _ in range(3):
+        vendor_rng, o, _, bl = _wiz_pick_item(
+            vendor_rng, _WIZ["class_scroll"], nc, nc2, nc3, nc4, is_orc, False,
+            _pot_scr_cascade)
+        nc, nc2, nc3, nc4 = _wiz_update_nocreate(o, nc, nc2, nc3, nc4,
+                                                 jnp.bool_(False))
+        scr_otyp.append(o); scr_bless.append(bl)
+
+    # --- 6. SPE_FORCE_BOLT (known spellbook) mksobj blessorcurse(17) ---
+    vendor_rng, _ = _mksobj_blessorcurse(vendor_rng, 17)
+
+    # --- 7. random SPBOOK x1 ---
+    def _spbook_cascade(rng_roll, otyp):
+        r, bl = _mksobj_blessorcurse(rng_roll, 17)           # mkobj.c:990
+        return r, jnp.int32(0), bl
+    vendor_rng, spb_otyp, _, spb_bless = _wiz_pick_item(
+        vendor_rng, _WIZ["class_spbook"], nc, nc2, nc3, nc4, is_orc, True,
+        _spbook_cascade)
+
+    # --- 8. bonus cascade — u_init.c:792-795 ---
+    #   if (!rn2(5)) ini_inv(Magicmarker);   (MAGIC_MARKER: spe=rn1(70,30))
+    #   if (!rn2(5)) ini_inv(Blindfold);     (BLINDFOLD: no draws)
+    vendor_rng, g1 = rn2_jax(vendor_rng, jnp.int32(5))
+    pick_marker = g1 == jnp.int32(0)
+    rng_mm, mm_spe = rn1_jax(vendor_rng, jnp.int32(70), jnp.int32(30))
+    vendor_rng = _mksobj_cadv(vendor_rng, rng_mm, pick_marker)
+    vendor_rng, g2 = rn2_jax(vendor_rng, jnp.int32(5))
+    pick_blindfold = g2 == jnp.int32(0)
+
+    # --- 9. elf instrument — u_init.c:815-819 (rn2(6) trotyp pick, no mksobj) ---
+    rng_instr, i6 = rn2_jax(vendor_rng, jnp.int32(6))
+    vendor_rng = _mksobj_cadv(vendor_rng, rng_instr, jnp.bool_(is_elf))
+    instr_otyp = _WIZ["instruments"][jnp.clip(i6, 0, 5)]
+
+    # =====================================================================
+    # Assemble inventory (creation order -> addinv merge -> compact letters).
+    # =====================================================================
+    def _mk(cat, otyp, buc, qty=1, ench=0, charges=0):
+        it = make_item(category=int(cat), type_id=jnp.int16(otyp), quantity=qty,
+                       weight=1, buc_status=buc, enchantment=ench,
+                       identified=True, bknown=True, dknown=True, rknown=True)
+        if charges is not None:
+            it = it.replace(charges=jnp.asarray(charges, dtype=jnp.int8))
+        return it
+
+    IC = ItemCategory
+    quarterstaff = items_list[0]
+    cloak = _mk(IC.ARMOR, jnp.int32(items_list[1].type_id),
+                jnp.where(cloak_bless, _BLESSED, _UNCURSED))
+    forcebolt = _spellbook(ObjType.SPE_FORCE_BOLT, buc=_BUC_BLESSED)
+
+    def _ring_item(o, spe, bl):
+        safe = jnp.clip(o, 0, _WIZ["charged"].shape[0] - 1)
+        is_ch = _WIZ["charged"][safe]
+        return _mk(IC.RING, o, jnp.where(bl, _BLESSED, _UNCURSED),
+                   ench=jnp.where(is_ch, spe.astype(jnp.int8), jnp.int8(0)))
+
+    def _bl(x):
+        return jnp.where(x, _BLESSED, _UNCURSED)
+
+    wand_item = _mk(IC.WAND, wand_otyp, _UNCURSED,
+                    charges=wand_spe.astype(jnp.int8))
+    ring_items = [_ring_item(ring_otyp[k], ring_spe[k], ring_bless[k])
+                  for k in range(2)]
+    pot_items = [_mk(IC.POTION, pot_otyp[k], _bl(pot_bless[k])) for k in range(3)]
+    scr_items = [_mk(IC.SCROLL, scr_otyp[k], _bl(scr_bless[k])) for k in range(3)]
+    spb_item = _mk(IC.SPBOOK, spb_otyp, _bl(spb_bless))
+    marker_item = _mk(IC.TOOL, jnp.int32(_WIZ["MAGIC_MARKER"]), _UNCURSED,
+                      charges=mm_spe.astype(jnp.int8))
+    blindfold_item = _mk(IC.TOOL, jnp.int32(_WIZ["BLINDFOLD"]), _UNCURSED)
+    instr_item = _mk(IC.TOOL, instr_otyp, _UNCURSED)
+
+    # addinv merge among the 3 potions and the 3 scrolls (same otyp+buc).
+    def _merge3(items, otyps, blesses):
+        def eq(a, b):
+            return jnp.logical_and(otyps[a] == otyps[b], blesses[a] == blesses[b])
+        m01 = eq(1, 0)
+        m02 = eq(2, 0)
+        m12 = jnp.logical_and(eq(2, 1), jnp.logical_not(m02))
+        q0 = jnp.int32(1) + m01.astype(jnp.int32) + m02.astype(jnp.int32)
+        p1 = jnp.logical_not(m01)
+        q1 = jnp.int32(1) + jnp.logical_and(m12, p1).astype(jnp.int32)
+        p2 = jnp.logical_and(jnp.logical_not(m02),
+                             jnp.logical_not(jnp.logical_and(m12, p1)))
+        qtys = [q0, q1, jnp.int32(1)]
+        present = [jnp.bool_(True), p1, p2]
+        out = []
+        for k in range(3):
+            out.append(items[k].replace(quantity=qtys[k].astype(jnp.int16)))
+        return out, present
+
+    pot_items, pot_present = _merge3(pot_items, pot_otyp, pot_bless)
+    scr_items, scr_present = _merge3(scr_items, scr_otyp, scr_bless)
+
+    T = jnp.bool_(True)
+    cands = ([quarterstaff, cloak, wand_item]
+             + ring_items + pot_items + scr_items
+             + [forcebolt, spb_item, instr_item, marker_item, blindfold_item])
+    present = ([T, T, T, T, T]
+               + pot_present + scr_present
+               + [T, T, jnp.bool_(is_elf), pick_marker, pick_blindfold])
+
+    # Stable compaction: dest slot = exclusive prefix-sum of present.
+    present_i = jnp.stack([p.astype(jnp.int32) for p in present])
+    dest = jnp.cumsum(present_i) - present_i           # exclusive prefix sum
+
+    empty = make_empty_item()
+    # Start from a fully-empty inventory of MAX_INVENTORY_SLOTS.
+    items = InventoryState.from_items([empty]).items
+    letters = jnp.zeros((MAX_INVENTORY_SLOTS,), dtype=jnp.int8)
+    for k, cand in enumerate(cands):
+        slot = dest[k]
+        write = present[k]
+        items = jax.tree_util.tree_map(
+            lambda arr, cval, s=slot, w=write: arr.at[s].set(
+                jnp.where(w, jnp.asarray(cval, arr.dtype), arr[s])),
+            items, cand)
+        letters = letters.at[slot].set(
+            jnp.where(write, (jnp.int8(ord('a')) + slot.astype(jnp.int8)),
+                      letters[slot]))
+
+    inv_state = inv_state.replace(items=items, letters=letters)
+    return vendor_rng, inv_state
+
+
+_INI_INV_ROLE_DRAWS[Role.WIZARD] = _consume_ini_inv_wizard_draws
 
 
 # ---------------------------------------------------------------------------

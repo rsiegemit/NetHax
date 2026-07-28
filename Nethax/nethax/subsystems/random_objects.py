@@ -178,16 +178,29 @@ def _build_type_roll_decoder() -> jnp.ndarray:
     """
     decoder = [[0] * 1001 for _ in range(_NUM_CLASSES)]
     for c in range(_NUM_CLASSES):
-        otyps = []
-        probs = []
+        # Contiguous class range [first, last) as vendor o_init.c:134-139 walks
+        # it, so classes whose static oc_prob sums to 0 (rings, amulets) get
+        # the runtime-computed distribution below over ALL entries in range.
+        first = None
+        last = None
         for otyp, entry in enumerate(OBJECTS):
-            if int(entry.class_) == c and entry.prob > 0:
-                otyps.append(otyp)
-                probs.append(int(entry.prob))
-        if not otyps:
+            if int(entry.class_) == c:
+                if first is None:
+                    first = otyp
+                last = otyp + 1
+        if first is None:
             continue
+        static_sum = sum(int(OBJECTS[i].prob) for i in range(first, last))
+        otyps = list(range(first, last))
+        if static_sum > 0:
+            probs = [int(OBJECTS[i].prob) for i in otyps]
+        else:
+            # vendor o_init.c:168-171 — sum==0 -> equal-ish distribution:
+            #   objects[i].oc_prob = (1000 + i - first) / (last - first)
+            span = last - first
+            probs = [(1000 + (i - first)) // span for i in otyps]
         # Walk: for roll r in [1..total], otyp = otyps[k] where k is smallest
-        # index with sum(probs[0..k]) >= r.
+        # index with sum(probs[0..k]) >= r.  Zero-prob entries are skipped.
         cum = 0
         k = 0
         for r in range(1, 1001):
@@ -791,43 +804,87 @@ def _build_ring_charged_table() -> jnp.ndarray:
 _RING_CHARGED_TABLE = _build_ring_charged_table()
 
 
+def _blessorcurse_sign_jax(rng: Isaac64State, chance: int):
+    """Consume ``blessorcurse(chance)`` draws AND return the resulting bcsign.
+
+    Same draw structure as ``_blessorcurse_jax`` (mkobj.c:1370-1385) but also
+    reports ``bcsign`` (vendor mkobj.h): +1 blessed, -1 cursed, 0 uncursed.
+    Vendor: ``if (!rn2(chance)) { if (!rn2(2)) curse; else bless; }`` so
+    blessed iff outer==0 and inner!=0; cursed iff outer==0 and inner==0.
+    Returns ``(rng, sign)`` with ``sign`` an int32 scalar in {-1, 0, 1}.
+    """
+    rng, hit = rn2_jax(rng, chance)                         # mkobj.c:1377
+    outer0 = hit == jnp.int32(0)
+    rng_inner, inner = rn2_jax(rng, jnp.int32(2))           # mkobj.c:1378
+    rng = lax.cond(outer0, lambda r: rng_inner, lambda r: r, rng)
+    sign = jnp.where(
+        outer0,
+        jnp.where(inner != jnp.int32(0), jnp.int32(1), jnp.int32(-1)),
+        jnp.int32(0),
+    )
+    return rng, sign
+
+
 def _ring_draws_charged(rng: Isaac64State) -> Isaac64State:
     """RING_CLASS (charged path) — vendor mkobj.c:1029-1042.
 
     Vendor source::
 
         if (objects[otmp->otyp].oc_charged) {
-            blessorcurse(otmp, 3);               // 1-2 draws
-            switch (rn2(9)) {                     // 1 draw, always
-            case 0:
-                break;                            // +0 draws
-            case 1: case 2: case 3: case 4:
-                otmp->spe = rne(3);              // +rne(3) draws
-                break;
-            case 5:
-                otmp->spe = -rne(3);             // +rne(3) draws
-                ...; break;
-            case 6: case 7: case 8:
-                ...; otmp->spe = -rne(3);        // +rne(3) draws
-                break;
+            blessorcurse(otmp, 3);                    // A: 1-2 draws
+            if (rn2(10)) {                            // X1: 1 draw always
+                if (rn2(10) && bcsign(otmp))          // X2: 1 draw if X1!=0
+                    otmp->spe = bcsign(otmp) * rne(3); //   rne(3) if X2!=0 & sign!=0
+                else
+                    otmp->spe = rn2(2) ? rne(3) : -rne(3); // rn2(2)+rne(3) otherwise
             }
+            if (otmp->spe == 0)
+                otmp->spe = rn2(4) - rn2(3);          // 2 draws iff spe==0
+            if (otmp->spe < 0 && rn2(5))              // rn2(5) iff spe<0
+                curse(otmp);
         }
 
-    Total per-spawn draw cost:
-        blessorcurse(3)        : 1 or 2 draws
-        rn2(9)                  : 1 draw       (always)
-        rne(3) for r in 1..8    : 1+ draws    (case 0 has 0 rne(3) calls)
+    The earlier port modelled this as ``switch (rn2(9))`` (a single rn2 + one
+    rne(3)); that mis-counts the ISAAC64 stream.  This faithful port tracks
+    ``spe`` so the data-dependent ``spe==0`` / ``spe<0`` follow-up draws fire
+    exactly as vendor does.  Returns rng only (spe discarded here; the
+    character.py Wizard ini_inv replay computes spe for display separately).
 
     Cite: vendor/nle/src/mkobj.c:1029-1042.
     """
-    rng = _blessorcurse_jax(rng, 3)                          # mkobj.c:1031
-    rng, r9 = rn2_jax(rng, 9)                                # mkobj.c:1032
-    # All non-zero cases (1..8) call exactly one rne(3); case 0 calls none.
+    rng, sign = _blessorcurse_sign_jax(rng, 3)               # mkobj.c:1030
+    rng, x1 = rn2_jax(rng, 10)                               # mkobj.c:1031
+
+    def _x1_taken(r):
+        r, x2 = rn2_jax(r, 10)                               # mkobj.c:1032
+        inner_a = (x2 != jnp.int32(0)) & (sign != jnp.int32(0))
+
+        def _spe_signed(rr):                                 # mkobj.c:1033
+            rr, v = rne_jax(rr, 3)
+            return rr, sign * v
+
+        def _spe_rn2(rr):                                    # mkobj.c:1035
+            rr, b = rn2_jax(rr, 2)
+            rr, v = rne_jax(rr, 3)
+            return rr, jnp.where(b != jnp.int32(0), v, -v)
+
+        return lax.cond(inner_a, _spe_signed, _spe_rn2, r)
+
+    rng, spe = lax.cond(
+        x1 != jnp.int32(0), _x1_taken, lambda r: (r, jnp.int32(0)), rng,
+    )
+
+    # spe == 0 -> rn2(4) - rn2(3)  (mkobj.c:1038-1039)
+    def _spe_zero(r):
+        r, a = rn2_jax(r, 4)
+        r, b = rn2_jax(r, 3)
+        return r, a - b
+
+    rng, spe = lax.cond(spe == jnp.int32(0), _spe_zero, lambda r: (r, spe), rng)
+
+    # spe < 0 -> rn2(5) curse check  (mkobj.c:1041)
     rng = lax.cond(
-        r9 != jnp.int32(0),
-        lambda r: rne_jax(r, 3)[0],                          # mkobj.c:1036/1039/1042
-        lambda r: r,
-        rng,
+        spe < jnp.int32(0), lambda r: rn2_jax(r, 5)[0], lambda r: r, rng,
     )
     return rng
 
