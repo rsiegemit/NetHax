@@ -3813,6 +3813,44 @@ def _quest_builder(difficulty: str) -> Callable[[LevelGenerator], None]:
     return build
 
 
+def _wrap_quest_inv(
+    factory: Callable[[jax.Array], "EnvState"],
+) -> Callable[[jax.Array], "EnvState"]:
+    """Auto-pick-up the two blessed quest items placed on the hero's cell.
+
+    quest_easy.des / quest_medium.des both open with (vendor coords):
+
+        OBJECT:('/',"cold"),(2,2),blessed       # wand of cold
+        OBJECT:('(',"frost horn"),(2,2),blessed  # frost horn
+        BRANCH:(2,2,2,2),(0,0,0,0)               # hero starts on (2,2)
+
+    Both envs pass ``autopickup=True`` (skills_quest.py:11,18), so at level
+    entry the hero auto-picks both items into inventory (unidentified,
+    appearance-only).  The des lists the wand first and the horn second; the
+    floor pile is LIFO, so the horn (placed last, on top) is picked up first
+    and takes the earlier inventory letter — matching vendor's observed order
+    ('a horn' before 'a tin wand').  BUC is blessed but unrevealed at pickup
+    (``bknown=False`` -> no "blessed" prefix), so we carry with buc_status=3.
+    """
+    from Nethax.minihax.level_generator import _OBJECT_NAME_TO_IDX as _NAME2IDX
+
+    horn_idx = _NAME2IDX.get("frost horn")
+    wand_idx = _NAME2IDX.get("wand of cold", _NAME2IDX.get("cold"))
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        # LIFO floor pile -> horn (des-last) picked up first, then wand.
+        if horn_idx is not None:
+            state = _carry_starting_inventory_item(state, int(horn_idx),
+                                                   buc_status=3)
+        if wand_idx is not None:
+            state = _carry_starting_inventory_item(state, int(wand_idx),
+                                                   buc_status=3)
+        return state
+
+    return wrapped
+
+
 def _register_quest_envs(register_fn) -> None:
     """Register Quest envs.
 
@@ -3821,6 +3859,11 @@ def _register_quest_envs(register_fn) -> None:
     references a ``Minotaur`` monster the Minihax MONSTERS table does
     not yet include; the _des_factory probe-build catches that and
     falls back to the LG builder.  See MINIHAX_PARSER_GAPS.md.
+
+    Easy/Medium place two blessed quest items (wand of cold + frost horn)
+    on the hero's start cell with ``autopickup=True`` -> carried at reset;
+    ``_wrap_quest_inv`` replays that pickup.  Hard uses a random-object
+    (IF/ELSE) selection at a random cell and is not wrapped.
     """
     for env_id, diff, des_name in [
         ("MiniHack-Quest-Easy-v0",   "easy",   "quest_easy.des"),
@@ -3829,6 +3872,8 @@ def _register_quest_envs(register_fn) -> None:
     ]:
         fallback = _make_factory(_quest_builder(diff), w=25, h=10)
         factory = _des_factory(des_name, fallback=fallback)
+        if diff in ("easy", "medium"):
+            factory = _wrap_quest_inv(factory)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=1000, category="Quest")
 
