@@ -116,8 +116,8 @@ def vendor_dump_char(env_id, seed, charstr):
     return d
 
 
-def minihax_dump_char(env_id, seed, role, race, al):
-    with bootstrap_character(role, race, al):
+def minihax_dump_char(env_id, seed, role, race, al, gender=0):
+    with bootstrap_character(role, race, al, gender):
         env = MinihaxEnv(env_id)
         state, _ = env.reset(jax.random.key(seed))
         obs = build_nle_observation(state)
@@ -178,28 +178,21 @@ def main():
     def _compare(v, m):
         return cmp_inv(v, m) if args.inv_only else H.diff_dumps(v, m)
 
+    _GENDER_INT = {"mal": 0, "fem": 1}
+
     npass = nfail = nerr = 0
     fails = []
     for (role, race, al) in combos:
-        # Minihax bootstrap is gender-agnostic (bootstrap_character has no
-        # gender arg), so the minihax dump is computed once per combo and
-        # compared against BOTH vendor genders — any male/female divergence in
-        # the vendor reset obs therefore surfaces as a minihax mismatch.
-        try:
-            m = minihax_dump_char(args.env, args.seed, role, race, al)
-        except Exception as e:
-            nerr += len(genders)
-            base = f"{_ROLE_ABBR[role]}-{_RACE_ABBR[race]}-{_ALIGN_ABBR[al]}"
-            print(f"  {base:20s} MINIHAX ERROR {type(e).__name__}: {e}")
-            continue
         for g in genders:
             charstr = (f"{_ROLE_ABBR[role]}-{_RACE_ABBR[race]}-"
                        f"{_ALIGN_ABBR[al]}-{g}")
             try:
                 v = vendor_dump_char(args.env, args.seed, charstr)
+                m = minihax_dump_char(args.env, args.seed, role, race, al,
+                                      _GENDER_INT[g])
             except Exception as e:
                 nerr += 1
-                print(f"  {charstr:20s} VENDOR ERROR {type(e).__name__}: {e}")
+                print(f"  {charstr:20s} ERROR {type(e).__name__}: {e}")
                 continue
             reason = _compare(v, m)
             if reason is None:

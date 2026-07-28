@@ -204,6 +204,7 @@ class EnvState:
     player_role: jax.Array      # int8   Role enum value
     player_race: jax.Array      # int8   Race enum value
     player_align: jax.Array     # int8   Alignment enum value
+    player_gender: jax.Array    # int8   0=male, 1=female (flags.female)
     player_str: jax.Array       # int16  raw strength (0..125)
     player_dex: jax.Array       # int8
     player_con: jax.Array       # int8
@@ -449,6 +450,7 @@ class EnvState:
             player_role=jnp.int8(0),
             player_race=jnp.int8(0),
             player_align=jnp.int8(0),
+            player_gender=jnp.int8(0),
             player_str=jnp.int16(18),
             player_dex=jnp.int8(10),
             player_con=jnp.int8(10),

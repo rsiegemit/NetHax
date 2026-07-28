@@ -2677,8 +2677,19 @@ def build_glyphs(env_state, fast: bool = False) -> jnp.ndarray:
         [327, 328, 329, 331, 332, 333, 334, 336, 337, 338, 339, 340, 341],
         dtype=jnp.int32,
     )
+    # Female player-monster index.  Vendor `u.umonnum = flags.female ?
+    # urole.femalenum : urole.malenum` (u_init.c:628).  Only two roles have a
+    # distinct female player-monster in mons[]: CAVEMAN->CAVEWOMAN (329->330)
+    # and PRIEST->PRIESTESS (334->335); every other role's femalenum equals its
+    # malenum.  Cite: vendor/nle/src/mons.c (caveman/cavewoman, priest/priestess).
+    _ROLE_TO_FEMALE_MON_IDX = jnp.array(
+        [327, 328, 330, 331, 332, 333, 335, 336, 337, 338, 339, 340, 341],
+        dtype=jnp.int32,
+    )
     role_idx = jnp.clip(jnp.int32(env_state.player_role), 0, 12)
-    base_mon = _ROLE_TO_MON_IDX[role_idx]
+    is_female = jnp.int32(env_state.player_gender) == jnp.int32(1)
+    base_mon = jnp.where(is_female, _ROLE_TO_FEMALE_MON_IDX[role_idx],
+                         _ROLE_TO_MON_IDX[role_idx])
 
     # If polymorphed, use the polymorph form instead.
     is_poly = env_state.polymorph.is_polymorphed

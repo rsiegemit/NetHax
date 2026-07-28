@@ -83,6 +83,7 @@ class NethaxEnv:
         role: "Role | None" = None,
         race: "Race | None" = None,
         alignment: int = 0,
+        gender: int = 0,
         disp_seed: int | None = None,
         fast_reset: bool = False,
     ) -> Tuple[EnvState, Dict[str, jax.Array]]:
@@ -350,6 +351,10 @@ class NethaxEnv:
             vendor_rng=state.vendor_rng if use_vendor_rng() else None,
         )
         state = state.replace(**char_fields)
+        # Hero gender (flags.female).  Affects the display player-monster glyph
+        # for the two gendered roles (Caveman->Cavewoman, Priest->Priestess);
+        # gender is specified by the character string, so it consumes no RNG.
+        state = state.replace(player_gender=jnp.int8(int(gender)))
 
         # Vendor u_init.c:670-675 Archeologist bonus-item cascade is now
         # consumed inside ``create_character`` (immediately after

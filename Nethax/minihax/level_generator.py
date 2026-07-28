@@ -67,16 +67,17 @@ _BOOTSTRAP_CHARACTER: Optional[Tuple[Any, Any, int]] = None
 
 
 @contextlib.contextmanager
-def bootstrap_character(role: Any, race: Any, alignment: int):
+def bootstrap_character(role: Any, race: Any, alignment: int, gender: int = 0):
     """Temporarily override the NLE_BYTEPARITY reset bootstrap character.
 
     ``role``/``race`` are ``Role``/``Race`` enum values; ``alignment`` is
-    0=lawful, 1=neutral, 2=chaotic.  Restores the previous value on exit so
-    the default (Archeologist) applies to every other env.
+    0=lawful, 1=neutral, 2=chaotic; ``gender`` is 0=male, 1=female (only
+    affects the display @-glyph for Caveman/Priest).  Restores the previous
+    value on exit so the default (Archeologist) applies to every other env.
     """
     global _BOOTSTRAP_CHARACTER
     prev = _BOOTSTRAP_CHARACTER
-    _BOOTSTRAP_CHARACTER = (role, race, int(alignment))
+    _BOOTSTRAP_CHARACTER = (role, race, int(alignment), int(gender))
     try:
         yield
     finally:
@@ -1348,16 +1349,19 @@ def _apply_directives(
         # role_init -> init_dungeons -> u_init so descr_idx + inventory
         # remain byte-aligned with vendor MiniHack.
         if _BOOTSTRAP_CHARACTER is not None:
-            _boot_role, _boot_race, _boot_align = _BOOTSTRAP_CHARACTER
+            _boot_role, _boot_race, _boot_align, _boot_gender = (
+                _BOOTSTRAP_CHARACTER
+            )
         else:
-            _boot_role, _boot_race, _boot_align = (
-                _Role.ARCHEOLOGIST, _Race.HUMAN, 0,
+            _boot_role, _boot_race, _boot_align, _boot_gender = (
+                _Role.ARCHEOLOGIST, _Race.HUMAN, 0, 0,
             )
         state, _ = _engine.reset(
             _raw_key,
             role=_boot_role,
             race=_boot_race,
             alignment=_boot_align,
+            gender=_boot_gender,
             fast_reset=True,
         )
         # NethaxEnv.reset populated the state with a full vendor dungeon
