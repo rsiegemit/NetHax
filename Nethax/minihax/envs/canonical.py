@@ -1141,6 +1141,76 @@ def _wrap_corridor_room_placement(
     return wrapped
 
 
+def _wrap_corridorbattle_placement(
+    factory: Callable[[jax.Array], "EnvState"],
+    *,
+    dx: int,
+    dy: int,
+    lit: bool,
+) -> Callable[[jax.Array], "EnvState"]:
+    """Wrap the CorridorBattle base factory so the hero cell is derived from
+    the vendor ISAAC64 stream instead of the hardcoded ``map (3,2)`` (which
+    only matches seed 0).
+
+    Vendor ``fightcorridor.des`` runs, at MKLEV_BEGIN (ground-truthed against
+    the NETHAX_RND traces for seeds 0/1/2, ``.test_runs/cb_stream_lit1_*``):
+
+      1. ``shuffle_alignments``  rn2(3), rn2(2)           [discarded]
+      2. six ``MONSTER:"giant rat",(fixed)`` — each a fixed-species makemon
+         draw: rn2(3) induced_align, d(1,8) newmonhp, rn2(2) female,
+         rn2(50)/rn2(100) m_initinv tail, rn2(100) saddle
+         (:func:`level_generator._makemon_fixed_draws`).
+      3. hero ``BRANCH:(1,1,3,3),(0,0,0,0)`` -> ``place_lregion`` over the 3x3
+         start rect: x = rn1(3,1) = rn2(3)+1, y = rn1(3,1) = rn2(3)+1.  Every
+         cell of the rect is ROOM floor, so the first try always succeeds
+         (exactly two draws, no retry loop — confirmed for all three seeds).
+
+    The base factory already stamps the (static) map / six giant rats / down
+    stair; this wrapper only consumes the exact draw stream and repins the
+    hero, then re-seeds FOV from the new cell.
+    """
+    from Nethax.nethax import vendor_rng as _vr
+    from Nethax.minihax.level_generator import (
+        seed_hero_fov as _seed_hero_fov,
+        _makemon_fixed_draws as _mfixed,
+        _MON_BY_NAME as _mon_by_name,
+    )
+    import jax.numpy as _jnp
+
+    GIANT_RAT = _mon_by_name.get("giant rat")
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+
+        def rn2(n):
+            nonlocal vrng
+            vrng, v = _vr.rn2_jax(vrng, _jnp.int32(n))
+            return int(v)
+
+        # 1. shuffle_alignments (discarded).
+        rn2(3); rn2(2)
+        # 2. six giant-rat makemon draws (fixed species, Knight is Lawful).
+        for _ in range(6):
+            vrng = _mfixed(vrng, GIANT_RAT, 1)
+        # 3. hero placement over BRANCH start rect (map (1,1)-(3,3)); x first.
+        hx = 1 + rn2(3)
+        hy = 1 + rn2(3)
+        px, py = hx + dx, hy + dy
+
+        state = state.replace(
+            vendor_rng=vrng,
+            player_pos=_jnp.array([py, px], dtype=_jnp.int16),
+            explored=_jnp.zeros_like(state.explored),
+            visible=_jnp.zeros_like(state.visible),
+            last_seen_terrain=_jnp.full_like(state.last_seen_terrain, -1),
+        )
+        state = _seed_hero_fov(state, lit)
+        return state
+
+    return wrapped
+
+
 def _register_corridor_envs(register_fn) -> None:
     """Register Corridor-R2/R3/R5 + CorridorBattle envs (Group A).
 
@@ -1239,8 +1309,12 @@ def _register_corridor_envs(register_fn) -> None:
     def corridorbattle_builder(lit: bool):
         def build(lg: LevelGenerator) -> None:
             lg.set_map(_CB_GRID)
-            # Vendor start_rect (1,1)-(3,3) + BRANCH -> hero at map (3,2)
-            # (the accepted branch cell, verified from vendor render).
+            # Placeholder hero cell.  Vendor's ``set_start_rect((1,1),(3,3))``
+            # emits ``BRANCH:(1,1,3,3),(0,0,0,0)``; the hero lands on a random
+            # cell of that 3x3 start rect via ``place_lregion`` — reproduced
+            # from the ISAAC64 stream in ``_wrap_corridorbattle_placement``.
+            # In the (non-byte-parity) default path this placeholder stands
+            # (map (3,2), the seed-0 accepted cell).
             lg.set_start_pos(3 + _cb_dx, 2 + _cb_dy)
             # Six giant rats at fixed map cells (30..31, 1..3).
             for mx in (30, 31):
@@ -1251,12 +1325,19 @@ def _register_corridor_envs(register_fn) -> None:
             lg.add_stair_down(x=32 + _cb_dx, y=2 + _cb_dy)
         return build
 
+    from Nethax.nethax.parity_mode import use_vendor_rng as _use_vendor_rng_cb
     for env_id, lit in [
         ("MiniHack-CorridorBattle-v0", True),
         ("MiniHack-CorridorBattle-Dark-v0", False),
     ]:
-        factory = _make_factory(corridorbattle_builder(lit),
-                                w=80, h=21, fill=" ", lit=lit)
+        base = _make_factory(corridorbattle_builder(lit),
+                             w=80, h=21, fill=" ", lit=lit)
+        if _use_vendor_rng_cb():
+            factory = _wrap_corridorbattle_placement(
+                base, dx=_cb_dx, dy=_cb_dy, lit=lit,
+            )
+        else:
+            factory = base
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=1000, category="Corridor")
 

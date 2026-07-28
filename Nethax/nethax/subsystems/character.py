@@ -4614,17 +4614,22 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
             items=_arc_new_items, letters=_arc_new_letters,
         )
 
-    # --- NLE_BYTEPARITY: newhp()/newpw() pre-role-switch ISAAC64 draws (Monk) ---
+    # --- NLE_BYTEPARITY: newhp()/newpw() pre-role-switch ISAAC64 draws ---
     # Vendor u_init.c:636-637 rolls newhp()/newpw() BEFORE the role switch, so
     # their rnd() draws precede the role's first ini_inv draw.  The engine's
     # _ini_hpwp_vendor derives HP/Pw from a separate Threefry key and does NOT
-    # advance the ISAAC64 stream, so the Monk M_spell rn2(90) (first ini_inv
-    # draw) read one word too early — masked on seed 0 by the /30 spellbook
-    # bucketing, but wrong on seeds 1/2.  Consume the missing rnd() words here,
-    # gated to Monk so arc/hea/kni/etc stay byte-identical.  Monk-Human draws a
-    # single rnd(2) (enadv.inrnd=2); vendor RND idx 282 confirms.
+    # advance the ISAAC64 stream, so the role's first ini_inv draw read one word
+    # too early for every role whose newhp/newpw rolls a die (enadv/hpadv
+    # inrnd > 0).  Consume the missing rnd() words here.
+    #
+    # Monk-Human draws a single rnd(2) (enadv.inrnd=2).  Knight-Human draws a
+    # single rnd(4) (enadv.inrnd=4): without it the Knight ini_inv weapon/armor
+    # mksobj cascade reads a stream shifted by one word — self-correcting on
+    # CorridorBattle seeds 1/2 (buc rolls happen to land uncursed either way)
+    # but leaving the mklev stream 2 draws short on seed 0, which mislands the
+    # hero cell (glyphs div at y=9,x=44).  Vendor RND idx 282 (mod 4) confirms.
     # Cite: vendor/nle/src/u_init.c:636-637; attrib.c:987-990; exper.c:47-72.
-    if vendor_rng is not None and role == Role.MONK:
+    if vendor_rng is not None and role in (Role.MONK, Role.KNIGHT):
         vendor_rng = _consume_newhp_newpw_draws(vendor_rng, role, race)
 
     # --- NLE_BYTEPARITY: per-role ini_inv mkobj draws (non-Archeologist) ---

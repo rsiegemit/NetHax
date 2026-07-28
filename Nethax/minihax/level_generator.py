@@ -584,13 +584,13 @@ def _m_initinv_draws(vrng, idx: int, mlev: int):
     return vrng
 
 
-def _hidenseek_monster_draws(vrng, class_sym: int, player_align: int = 1):
-    """Replay the full ``MONSTER: <class>, <coord>, hostile`` ISAAC64 draw
-    stream and return ``(vrng, idx)`` for the placed species.
+def _makemon_species_draws(vrng, idx: int, player_align: int = 1):
+    """Replay the ``makemon()`` draw stream for a *known* species ``idx`` at
+    dungeon depth 1, from ``newmonhp`` through the saddle probe (i.e. every
+    draw AFTER the ``induced_align`` amask and the optional ``mkclass``
+    species pick).  Returns the advanced ``vrng``.
 
-    Draw order (vendor create_monster -> mk_roamer -> makemon):
-      1. ``induced_align(80)`` -> ``rn2(3)``  (amask; no dungeon align flag)
-      2. ``mkclass()``                          (:func:`_mkclass_pick`)
+    Draw order (vendor makemon.c):
       3. ``newmonhp()``                         (:func:`_newmonhp_draws`)
       4. female ``rn2(2)`` unless M2_MALE/M2_FEMALE
       5. ``peace_minded()`` co-aligned tail (only when the species' maligntyp
@@ -601,11 +601,6 @@ def _hidenseek_monster_draws(vrng, class_sym: int, player_align: int = 1):
       9. saddle ``rn2(100)`` (short-circuits before is_domestic)
     """
     S_NYMPH, S_JABBERWOCK = 14, 37
-    # 1. induced_align(80): no special-level / dungeon align flag in MiniHack,
-    #    so the two rn2(100) probes are skipped and al = rn2(3) - 1.
-    vrng, _ = _rn2(vrng, 3)
-    # 2. mkclass.
-    vrng, idx = _mkclass_pick(vrng, class_sym)
     m = MONSTERS[idx]
     sym = int(m.symbol)
     f2 = int(m.flags2)
@@ -616,7 +611,7 @@ def _hidenseek_monster_draws(vrng, class_sym: int, player_align: int = 1):
     if not (f2 & (_M2_MALE | _M2_FEMALE)):
         vrng, _ = _rn2(vrng, 2)
     # 5. peace_minded co-aligned tail (makemon.c:2039-2041).  For the always-
-    #    hostile-forced HideNSeek monster this draw still fires during makemon
+    #    hostile-forced MONSTER directive this draw still fires during makemon
     #    when the species is co-aligned with the hero (the result is later
     #    overridden).  u.ualign.record == 0 at game start.
     def _sgn(v):
@@ -628,8 +623,8 @@ def _hidenseek_monster_draws(vrng, class_sym: int, player_align: int = 1):
     # 6. makemon mlet-switch sleep.
     if sym in (S_NYMPH, S_JABBERWOCK):
         vrng, _ = _rn2(vrng, 5)
-    # (in_mklev sleep / longworm initworm / angel emin never fire for the six
-    #  HideNSeek classes at depth 1.)
+    # (in_mklev sleep / longworm initworm / angel emin never fire for the
+    #  species reached by the MiniHack MONSTER directives at depth 1.)
     # 7. m_initweap (armed only).
     is_armed = any(int(a[0]) == 254 for a in m.attacks)   # AT_WEAP == 254
     if is_armed:
@@ -638,6 +633,40 @@ def _hidenseek_monster_draws(vrng, class_sym: int, player_align: int = 1):
     vrng = _m_initinv_draws(vrng, idx, mlev)
     # 9. saddle: rn2(100) evaluated for every monster (C short-circuit).
     vrng, _ = _rn2(vrng, 100)
+    return vrng
+
+
+def _makemon_fixed_draws(vrng, idx: int, player_align: int = 1):
+    """Replay the full ``MONSTER: <name>, <coord>, hostile`` ISAAC64 draw
+    stream for a *fixed-species* directive (placed by name, so no ``mkclass``
+    pick) and return the advanced ``vrng``.
+
+    Draw order (vendor create_monster -> makemon):
+      1. ``induced_align(80)`` -> ``rn2(3)``  (amask; no dungeon align flag)
+      2. species body                          (:func:`_makemon_species_draws`)
+    """
+    # 1. induced_align(80): no special-level / dungeon align flag in MiniHack,
+    #    so the two rn2(100) probes are skipped and al = rn2(3) - 1.
+    vrng, _ = _rn2(vrng, 3)
+    return _makemon_species_draws(vrng, idx, player_align)
+
+
+def _hidenseek_monster_draws(vrng, class_sym: int, player_align: int = 1):
+    """Replay the full ``MONSTER: <class>, <coord>, hostile`` ISAAC64 draw
+    stream and return ``(vrng, idx)`` for the placed species.
+
+    Draw order (vendor create_monster -> mk_roamer -> makemon):
+      1. ``induced_align(80)`` -> ``rn2(3)``  (amask; no dungeon align flag)
+      2. ``mkclass()``                          (:func:`_mkclass_pick`)
+      3. species body                          (:func:`_makemon_species_draws`)
+    """
+    # 1. induced_align(80): no special-level / dungeon align flag in MiniHack,
+    #    so the two rn2(100) probes are skipped and al = rn2(3) - 1.
+    vrng, _ = _rn2(vrng, 3)
+    # 2. mkclass.
+    vrng, idx = _mkclass_pick(vrng, class_sym)
+    # 3-9. species body.
+    vrng = _makemon_species_draws(vrng, idx, player_align)
     return vrng, idx
 
 
