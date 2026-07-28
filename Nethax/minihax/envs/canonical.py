@@ -2927,11 +2927,62 @@ def _sokoban_builder(des_name: str) -> Callable[[LevelGenerator], None]:
             lg.add_stair_down(x=sx + dx, y=sy + dy)
         for (bx, by) in parsed["boulders"]:
             lg.add_boulder(place=(bx + dx, by + dy))
-        for (tname, tx, ty) in parsed["traps"]:
-            lg.add_trap(name=tname, place=(tx + dx, ty + dy))
+        # Traps are NOT routed through ``lg.add_trap`` here: under
+        # ``NLE_BYTEPARITY`` the LevelGenerator's ``_resolve_trap`` ignores an
+        # explicit ``place`` and drops every trap onto the same RNG-placeholder
+        # cell (that path exists for Room-Trap's RNG-driven ``mktrap``).  The
+        # vendor Sokoban des gives each pit/hole an exact coordinate that
+        # consumes no RNG, so we stamp them straight into the trap layer in
+        # ``_stamp_sokoban_traps`` (wired in ``_register_sokoban_envs``).
         for (state, dxi, dyi) in parsed["doors"]:
             lg.add_door(state, place=(dxi + dx, dyi + dy))
     return build
+
+
+def _sokoban_trap_cells(des_name: str) -> list[tuple[int, int, int]]:
+    """Absolute ``(row, col, trap_type)`` cells for a Sokoban des's traps.
+
+    Applies the same ``GEOMETRY:center,center`` offset ``_sokoban_builder``
+    uses so the trap layer lines up with the stamped MAP.
+    """
+    from Nethax.nethax.subsystems.traps import TrapType as _TrapType
+    _name_to_type = {
+        "pit": int(_TrapType.PIT),
+        "hole": int(_TrapType.HOLE),
+    }
+    parsed = _parse_sokoban_des(_read_vendor_des(des_name))
+    map_rows = parsed["map_rows"]
+    w = max(len(r) for r in map_rows)
+    h = len(map_rows)
+    dx, dy = _vendor_geometry_center_wh(w, h)
+    cells: list[tuple[int, int, int]] = []
+    for (tname, tx, ty) in parsed["traps"]:
+        ttype = _name_to_type.get(tname)
+        if ttype is None:
+            continue
+        cells.append((ty + dy, tx + dx, ttype))
+    return cells
+
+
+def _stamp_sokoban_traps(
+    base: Callable[[jax.Array], EnvState], des_name: str,
+) -> Callable[[jax.Array], EnvState]:
+    """Stamp the des ``TRAP:"pit"``/``"hole"`` cells into the trap layer.
+
+    Vendor renders these as S_pit / S_hole glyphs at reset (Sokoban is
+    ``premapped``); ``_premapped_factory`` marks them revealed so the
+    ``build_glyphs`` trap overlay emits ``cmap_to_glyph(S_arrow_trap+ttyp-1)``.
+    """
+    trap_cells = _sokoban_trap_cells(des_name)
+
+    def factory(rng: jax.Array) -> EnvState:
+        state = base(rng)
+        tt = state.traps.trap_type
+        for (row, col, ttype) in trap_cells:
+            tt = tt.at[0, row, col].set(jnp.int8(ttype))
+        return state.replace(traps=state.traps.replace(trap_type=tt))
+
+    return factory
 
 
 def _register_sokoban_envs(register_fn) -> None:
@@ -2956,6 +3007,7 @@ def _register_sokoban_envs(register_fn) -> None:
         base = _make_factory(
             _sokoban_builder(des_name), w=80, h=21, fill=" ",
         )
+        base = _stamp_sokoban_traps(base, des_name)
         factory = _premapped_factory(base)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=400, category="Sokoban")
@@ -2974,6 +3026,13 @@ def _premapped_factory(base: Callable[[jax.Array], EnvState],
     ``terrain`` into ``last_seen_terrain`` so ``build_glyphs`` renders the
     whole map (see ``Nethax/nethax/obs/nle_obs.py::build_glyphs`` three-way
     visibility split).
+
+    Premapped also reveals every placed trap: vendor Sokoban shows its pit /
+    hole glyphs at reset (the des ``TRAP:"pit"``/``"hole"`` cells), unlike a
+    hidden Room-Trap.  The trap overlay in ``build_glyphs`` gates on
+    ``traps.revealed``, so we mark each trap cell (``trap_type != 0``) on the
+    starting level as revealed.  Room-Trap does NOT route through this wrapper,
+    so its hidden traps stay ``revealed=False``.
     """
     from Nethax.nethax.constants.tiles import TileType as _TT
 
@@ -2989,10 +3048,15 @@ def _premapped_factory(base: Callable[[jax.Array], EnvState],
                       state.last_seen_terrain[0, 0])
         )
         new_visible = state.visible | mapped
+        trap_present = state.traps.trap_type[0] != jnp.int8(0)
+        new_trap_revealed = state.traps.revealed.at[0].set(
+            state.traps.revealed[0] | trap_present
+        )
         return state.replace(
             explored=new_explored,
             last_seen_terrain=new_lst,
             visible=new_visible,
+            traps=state.traps.replace(revealed=new_trap_revealed),
         )
 
     return factory
