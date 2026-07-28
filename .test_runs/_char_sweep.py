@@ -103,6 +103,7 @@ def vendor_dump_char(env_id, seed, charstr):
     obs = r[0] if isinstance(r, tuple) else r
     d = {
         "glyphs": np.asarray(obs["glyphs"]),
+        "chars": np.asarray(obs["chars"]),
         "agent_yx": H._agent_yx_from_blstats(np.asarray(obs["blstats"])),
         "inv_glyphs": np.asarray(obs["inv_glyphs"]),
         "inv_letters": np.asarray(obs["inv_letters"]),
@@ -122,6 +123,7 @@ def minihax_dump_char(env_id, seed, role, race, al):
         obs = build_nle_observation(state)
     return {
         "glyphs": np.asarray(obs["glyphs"]),
+        "chars": np.asarray(obs["chars"]),
         "agent_yx": H._agent_yx_from_blstats(np.asarray(obs["blstats"])),
         "inv_glyphs": np.asarray(obs["inv_glyphs"]),
         "inv_letters": np.asarray(obs["inv_letters"]),
@@ -160,34 +162,58 @@ def main():
     ap.add_argument("--env", default="MiniHack-Room-5x5-v0")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--role", default=None, help="3-letter abbrev to filter")
+    ap.add_argument("--gender", default="both", choices=["mal", "fem", "both"],
+                    help="Which gender(s) to sweep (default both).")
+    ap.add_argument("--inv-only", action="store_true",
+                    help="Compare only hero glyph + inventory (legacy). Default "
+                         "compares the FULL reset obs: map glyphs/chars + agent "
+                         "+ inventory (i.e. does NOT isolate inventory).")
     args = ap.parse_args()
 
     combos = valid_combos()
     if args.role:
         combos = [c for c in combos if _ROLE_ABBR[c[0]] == args.role.lower()]
+    genders = ["mal", "fem"] if args.gender == "both" else [args.gender]
+
+    def _compare(v, m):
+        return cmp_inv(v, m) if args.inv_only else H.diff_dumps(v, m)
 
     npass = nfail = nerr = 0
     fails = []
     for (role, race, al) in combos:
-        charstr = f"{_ROLE_ABBR[role]}-{_RACE_ABBR[race]}-{_ALIGN_ABBR[al]}-mal"
+        # Minihax bootstrap is gender-agnostic (bootstrap_character has no
+        # gender arg), so the minihax dump is computed once per combo and
+        # compared against BOTH vendor genders — any male/female divergence in
+        # the vendor reset obs therefore surfaces as a minihax mismatch.
         try:
-            v = vendor_dump_char(args.env, args.seed, charstr)
             m = minihax_dump_char(args.env, args.seed, role, race, al)
         except Exception as e:
-            nerr += 1
-            print(f"  {charstr:20s} ERROR {type(e).__name__}: {e}")
+            nerr += len(genders)
+            base = f"{_ROLE_ABBR[role]}-{_RACE_ABBR[race]}-{_ALIGN_ABBR[al]}"
+            print(f"  {base:20s} MINIHAX ERROR {type(e).__name__}: {e}")
             continue
-        reason = cmp_inv(v, m)
-        if reason is None:
-            npass += 1
-            print(f"  {charstr:20s} PASS")
-        else:
-            nfail += 1
-            fails.append((charstr, reason))
-            print(f"  {charstr:20s} FAIL  {reason}")
+        for g in genders:
+            charstr = (f"{_ROLE_ABBR[role]}-{_RACE_ABBR[race]}-"
+                       f"{_ALIGN_ABBR[al]}-{g}")
+            try:
+                v = vendor_dump_char(args.env, args.seed, charstr)
+            except Exception as e:
+                nerr += 1
+                print(f"  {charstr:20s} VENDOR ERROR {type(e).__name__}: {e}")
+                continue
+            reason = _compare(v, m)
+            if reason is None:
+                npass += 1
+                print(f"  {charstr:20s} PASS")
+            else:
+                nfail += 1
+                fails.append((charstr, reason))
+                print(f"  {charstr:20s} FAIL  {reason}")
 
-    print(f"\n[char-sweep] env={args.env} seed={args.seed}  "
-          f"PASS={npass} FAIL={nfail} ERR={nerr}  (of {len(combos)} combos)")
+    mode = "inv-only" if args.inv_only else "FULL-obs"
+    print(f"\n[char-sweep] env={args.env} seed={args.seed} mode={mode} "
+          f"gender={args.gender}  PASS={npass} FAIL={nfail} ERR={nerr}  "
+          f"(of {len(combos) * len(genders)} role x race x gender)")
     if fails:
         print("[char-sweep] FAILS:")
         for cs, r in fails:
