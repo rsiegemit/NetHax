@@ -3181,6 +3181,81 @@ def _stamp_sokoban_traps(
     return factory
 
 
+def _sokoban_shuffle_stair_cell(
+    parsed: dict, vrng,
+) -> tuple[int, int]:
+    """Reproduce the vendor des ``SHUFFLE: $place`` → ``STAIR:$place[0],down``.
+
+    ``soko4a``/``soko4b`` declare a 3-element ``$place`` array and shuffle it,
+    then place the down-stair at the post-shuffle ``$place[0]``.  NetHack builds
+    the special level with ``shuffle_alignments`` first (``rn2(3); rn2(2)``,
+    discarded — the same preamble consumed by the HideNSeek des SHUFFLE port in
+    :func:`_wrap_hidenseek_placement`), then ``lspo_shuffle_array`` runs a
+    Fisher-Yates over the index array ``[0..n-1]`` consuming ``rn2(n)``,
+    ``rn2(n-1)``, … , ``rn2(2)`` (for n=3: ``rn2(3)``, ``rn2(2)``).  The element
+    left in slot ``[0]`` selects the real stair candidate.
+
+    Returns the winning ``(map_x, map_y)`` (des MAP-relative, no offset).
+    """
+    from Nethax.nethax import vendor_rng as _vr
+    place = parsed["shuffle_place"]
+    n = len(place)
+
+    def rn2(nn: int) -> int:
+        nonlocal vrng
+        vrng, v = _vr.rn2_jax(vrng, jnp.int32(nn))
+        return int(v)
+
+    # shuffle_alignments preamble (discarded).
+    rn2(3)
+    rn2(2)
+    # SHUFFLE $place — Fisher-Yates over the index array.
+    idx = list(range(n))
+    for i in range(n - 1, 0, -1):
+        j = rn2(i + 1)
+        idx[i], idx[j] = idx[j], idx[i]
+    return place[idx[0]]
+
+
+def _stamp_sokoban_shuffle_stair(
+    base: Callable[[jax.Array], EnvState], des_name: str,
+) -> Callable[[jax.Array], EnvState]:
+    """Reposition the ``soko4a``/``soko4b`` down-stair onto its RNG-shuffled cell.
+
+    The static :func:`_sokoban_builder` stamps a stand-in stair at
+    ``$place[0]`` (the un-shuffled first candidate).  For the shuffle variants
+    the real cell is chosen by the des ``SHUFFLE: $place`` at level-build time,
+    so this wrapper — inserted before :func:`_premapped_factory` so the
+    premapped copy reflects the corrected terrain — clears the stand-in cell
+    back to floor and stamps ``STAIRCASE_DOWN`` at the shuffled cell derived
+    from ``state.vendor_rng`` (see :func:`_sokoban_shuffle_stair_cell`).
+    """
+    parsed = _parse_sokoban_des(_read_vendor_des(des_name))
+    if not (parsed["stair_is_shuffle"] and parsed["shuffle_place"]):
+        return base
+    from Nethax.nethax.constants.tiles import TileType as _T
+    FLOOR = int(_T.FLOOR)
+    STAIR = int(_T.STAIRCASE_DOWN)
+    map_rows = parsed["map_rows"]
+    w = max(len(r) for r in map_rows)
+    h = len(map_rows)
+    dx, dy = _vendor_geometry_center_wh(w, h)
+    stand_x, stand_y = parsed["shuffle_place"][0]
+
+    def factory(rng: jax.Array) -> EnvState:
+        state = base(rng)
+        mx, my = _sokoban_shuffle_stair_cell(parsed, state.vendor_rng)
+        terr = state.terrain
+        # Clear the stand-in stair (builder stamped $place[0]) back to floor,
+        # then stamp the real shuffled down-stair.  When the shuffle leaves
+        # $place[0] in place (e.g. seeds 1/2) the two ops target the same cell.
+        terr = terr.at[0, 0, stand_y + dy, stand_x + dx].set(jnp.int8(FLOOR))
+        terr = terr.at[0, 0, my + dy, mx + dx].set(jnp.int8(STAIR))
+        return state.replace(terrain=terr)
+
+    return factory
+
+
 def _register_sokoban_envs(register_fn) -> None:
     # Every vendor MiniHack-Sokoban<N><a|b>-v0 has a matching static
     # ``soko<N><a|b>.des`` under vendor/minihack/minihack/dat/, fed via
@@ -3204,6 +3279,7 @@ def _register_sokoban_envs(register_fn) -> None:
             _sokoban_builder(des_name), w=80, h=21, fill=" ",
         )
         base = _stamp_sokoban_traps(base, des_name)
+        base = _stamp_sokoban_shuffle_stair(base, des_name)
         factory = _premapped_factory(base)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=400, category="Sokoban")
