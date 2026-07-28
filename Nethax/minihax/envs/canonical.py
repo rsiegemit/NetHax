@@ -4035,9 +4035,10 @@ def _wod_builder(difficulty: str) -> Callable[[LevelGenerator], None]:
 
     Hard (:125-148) additionally uses a random ``set_start_rect((1,1),(5,5))``
     hero and a random ``add_object_area($safe_room)`` wand inside the 5x5
-    safe-room; those RNG-placed cells are not yet replayed here, so Hard stamps
-    the static map + fixed minotaur + goal stair only (structural parity), with
-    the hero pinned to the safe-room corner as a deterministic stand-in.
+    safe-room.  This builder stamps the static map + fixed minotaur + goal
+    stair and drops the wand at a placeholder cell; the RNG-placed hero and
+    wand cells are replayed off ``state.vendor_rng`` by
+    :func:`_wrap_wod_hard_placement` (registered only for the Hard variants).
 
     The stamp uses internal (odd-forced) ``GEOMETRY:center`` coords — minihax's
     own obs renderer applies NLE's -1 glyph-column shift downstream (see the
@@ -4059,8 +4060,10 @@ def _wod_builder(difficulty: str) -> Callable[[LevelGenerator], None]:
         goal_xy = (27, 1)
     else:  # hard
         rows = _WOD_HARD_MAP
-        start_xy = (1, 1)         # random set_start_rect; corner stand-in
-        wand_xy = None            # random add_object_area($safe_room)
+        start_xy = (1, 1)         # placeholder; _wrap_wod_hard_placement pins
+                                  # the real set_start_rect(BRANCH) hero cell
+        wand_xy = (1, 1)          # placeholder; the wrapper relocates this
+                                  # add_object_area($safe_room) wand entry
         minotaur_xy = (26, 1)
         minotaur_args = ()
         goal_xy = (27, 1)
@@ -4114,6 +4117,162 @@ def _wod_pro_builder() -> Callable[[LevelGenerator], None]:
     return build
 
 
+def _wrap_wod_hard_placement(
+    factory: Callable[[jax.Array], "EnvState"],
+) -> Callable[[jax.Array], "EnvState"]:
+    """Replay the two RNG-placed pieces of MiniHack-WoD-Hard — the
+    ``set_start_rect((1,1),(5,5))`` hero (``place_lregion(LR_BRANCH)``) and the
+    ``add_object_area($safe_room)`` blessed wand of death — off
+    ``state.vendor_rng``.
+
+    Vendor ``MiniHackWoDHard`` (vendor/minihack/minihack/envs/skills_wod.py
+    :125-148) is a static ``LevelGenerator(map=..., lit=True)`` level whose
+    ``get_des()`` footer runs, in order: ``set_start_rect((1,1),(5,5))`` (BRANCH
+    hero), ``add_goal_pos((27,1))`` (fixed stair), ``add_object_area($safe_room
+    = fillrect(1,1,5,5))`` (blessed WAN_DEATH) and ``add_monster("minotaur",
+    (26,1))`` (fixed).  ``_wod_builder("hard")`` already stamps the MAP, the goal
+    stair, the fixed minotaur and a *placeholder* wand ground entry byte-exact;
+    this wrapper supplies the two RNG-driven cells.
+
+    The mklev ISAAC64 draw sequence — verified bit-exact against the NETHAX_RND
+    traces (.test_runs/full_rnd_stream_MiniHack_WoD_Hard_Full_v0_seed{0,1,2}.txt,
+    MKLEV section) — consumed from ``state.vendor_rng`` at MKLEV_BEGIN is:
+
+      * ``rn2(3)``, ``rn2(2)``       mklev flip prologue (reseed=False -> no
+                                     coordinate flip; values discarded)
+      * ``rn2(25)``                  ``rndcoord($safe_room)`` for the wand: the
+                                     ``fillrect(1,1,5,5)`` selection is walked
+                                     x-major, so idx -> MAP ``(col, row) =
+                                     (1+idx//5, 1+idx%5)``
+      * ``rn2(5)`` + ``blessorcurse(17)``   ``mksobj(WAN_DEATH)`` init (spe +
+                                     bless/curse; the des forces blessed after)
+      * minotaur ``makemon`` (fixed cell (26,1); draws only):
+          - ``rn2(3)``              create_monster ``induced_align(80)``
+          - ``d(14, 8)``            ``newmonhp`` (``adj_lev(15)==14``)
+          - ``rn2(2)``              gender (minotaur is not M2_MALE/M2_FEMALE)
+          - (no ``peace_minded`` draw: minotaur maligntyp 0 vs lawful hero ->
+            ``sgn`` differ -> early FALSE)
+          - ``rn2(3)`` gate         ``m_initinv`` S_GIANT/minotaur branch
+            (makemon.c:707-710): ``!rn2(3)`` grants ``mongets(WAN_DIGGING)`` ==
+            ``rn2(5)`` + ``blessorcurse(17)``
+          - ``rn2(50)``, ``rn2(100)``   ``m_initinv`` defensive/misc tail
+            (minotaur is not M2_GREEDY -> no gold rn2(5))
+          - ``rn2(100)``            makemon saddle gate (short-circuits: minotaur
+                                    is not domestic)
+      * ``rn2(5)``, ``rn2(5)``       ``place_lregion(LR_BRANCH)`` (mkmaze.c
+                                     :300-308): ``x = rn1(5,1) = 1+rn2(5)``,
+                                     ``y = rn1(5,1) = 1+rn2(5)`` over the start
+                                     rect ``(1,1)-(5,5)``.  ``bad_location``
+                                     rejects non-ROOM cells (the ``y==5`` wall
+                                     row) and the ``(0,0)`` exclusion, retrying.
+
+    We relocate the builder's placeholder wand ground entry to the vendor cell,
+    pin ``player_pos`` to the accepted branch cell, and re-seed the lit-room
+    hero FOV from a cleared slate so no placeholder-cell FOV leaks in.
+    """
+    from Nethax.nethax import vendor_rng as _vendor_rng
+    from Nethax.nethax.constants.tiles import TileType as _TileType
+    from Nethax.minihax.level_generator import (
+        seed_hero_fov as _seed_hero_fov,
+        _newmonhp_draws,
+        _mksobj_init_draws,
+        _OBJECT_NAME_TO_IDX,
+        _MONSTER_NAME_TO_IDX,
+    )
+
+    rows = _WOD_HARD_MAP
+    w = max(len(r) for r in rows)
+    h = len(rows)
+    dx, dy = _static_center_geometry(w, h)
+    _WAN_DEATH = _OBJECT_NAME_TO_IDX["death"]
+    _WAN_DIGGING = _OBJECT_NAME_TO_IDX["digging"]
+    _MINOTAUR = _MONSTER_NAME_TO_IDX["minotaur"]
+
+    def _is_floor(mx: int, my: int) -> bool:
+        return (
+            0 <= my < h and 0 <= mx < len(rows[my]) and rows[my][mx] == "."
+        )
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        vrng = state.vendor_rng
+
+        def rn2(v, n):
+            return _vendor_rng.rn2_jax(v, jnp.int32(n))
+
+        # mklev flip prologue (reseed=False -> no flip; discard the two draws).
+        vrng, _ = rn2(vrng, 3)
+        vrng, _ = rn2(vrng, 2)
+        # add_object_area($safe_room) wand cell: rndcoord over fillrect(1,1,5,5)
+        # walked x-major -> MAP (col = 1+idx//5, row = 1+idx%5).
+        vrng, widx = rn2(vrng, 25)
+        wi = int(widx)
+        wand_col, wand_row = 1 + wi // 5, 1 + wi % 5
+        # mksobj(WAN_DEATH) init draws (spe rn2(5) + blessorcurse(17)).
+        vrng = _mksobj_init_draws(vrng, _WAN_DEATH)
+        # minotaur makemon (fixed cell; draws advance the stream only).
+        vrng, _ = rn2(vrng, 3)                        # induced_align(80)
+        vrng, _ = _newmonhp_draws(vrng, _MINOTAUR)    # d(14, 8)
+        vrng, _ = rn2(vrng, 2)                        # gender
+        vrng, gate = rn2(vrng, 3)                     # m_initinv WAN_DIGGING gate
+        if int(gate) == 0:
+            vrng = _mksobj_init_draws(vrng, _WAN_DIGGING)
+        vrng, _ = rn2(vrng, 50)                       # m_initinv defensive
+        vrng, _ = rn2(vrng, 100)                      # m_initinv misc
+        vrng, _ = rn2(vrng, 100)                       # makemon saddle gate
+        # place_lregion(LR_BRANCH): first accepted (1+rn2(5), 1+rn2(5)) cell
+        # that is ROOM floor and not the (0,0) exclusion.
+        hero_rc = None
+        for _ in range(200):
+            vrng, hx = rn2(vrng, 5)
+            vrng, hy = rn2(vrng, 5)
+            mx, my = 1 + int(hx), 1 + int(hy)
+            if (mx, my) != (0, 0) and _is_floor(mx, my):
+                hero_rc = (dy + my, dx + mx)
+                break
+        if hero_rc is None:
+            # Deterministic fallback (mkmaze.c:311-315): first valid cell.
+            for my in range(h):
+                for mx in range(w):
+                    if (mx, my) != (0, 0) and _is_floor(mx, my):
+                        hero_rc = (dy + my, dx + mx)
+                        break
+                if hero_rc is not None:
+                    break
+
+        # Relocate the placeholder wand ground entry to the vendor cell.
+        gi = state.ground_items
+        tid = gi.items.type_id[0, 0]
+        cat = gi.items.category[0, 0]
+        pos = gi.pos
+        wr, wc = dy + wand_row, dx + wand_col
+        for k in range(int(tid.shape[0])):
+            if int(tid[k]) == int(_WAN_DEATH) and int(cat[k]) != 0:
+                pos = pos.at[0, 0, k, 0].set(jnp.int16(wr))
+                pos = pos.at[0, 0, k, 1].set(jnp.int16(wc))
+                break
+
+        state = state.replace(
+            vendor_rng=vrng,
+            ground_items=gi.replace(pos=pos),
+            player_pos=jnp.stack(
+                [jnp.int16(hero_rc[0]), jnp.int16(hero_rc[1])]
+            ),
+            # Clear the placeholder set_start_pos FOV seed so seed_hero_fov
+            # rebuilds visibility from the real branch cell alone.
+            visible=jnp.zeros_like(state.visible),
+            explored=state.explored.at[0, 0].set(
+                jnp.zeros_like(state.explored[0, 0])
+            ),
+            last_seen_terrain=state.last_seen_terrain.at[0, 0].set(
+                jnp.full_like(state.last_seen_terrain[0, 0], -1)
+            ),
+        )
+        return _seed_hero_fov(state, default_lit=True)
+
+    return wrapped
+
+
 def _register_wod_envs(register_fn) -> None:
     # Only the Easy variants carry a kill-event RewardManager in vendor
     # (skills_wod.py:29-34, :59-60); Medium/Hard/Pro use add_goal_pos with
@@ -4134,6 +4293,10 @@ def _register_wod_envs(register_fn) -> None:
             # Static-stamp Easy/Medium/Hard on the full 80x21 dungeon (VOID
             # fill) exactly like WoD-Pro / Labyrinth.
             factory = _make_factory(_wod_builder(diff), w=80, h=21, fill=" ")
+            if diff == "hard":
+                # Replay the RNG-placed hero (set_start_rect BRANCH) + wand
+                # (add_object_area) off state.vendor_rng.
+                factory = _wrap_wod_hard_placement(factory)
         rm = (_skill_wod_kill_rm() if diff == "easy"
               else _default_goal_reward_manager())
         register_fn(env_id, factory, rm,
