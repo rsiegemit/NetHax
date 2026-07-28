@@ -397,8 +397,28 @@ def _m_initweap_draws(vrng, idx):
     m = MONSTERS[idx]
     sym = int(m.symbol)
     S_KOBOLD, S_ORC = 11, 15
+    S_GIANT, S_OGRE, S_TROLL = 34, 41, 46
     O = _OBJ_BY_NAME.get
-    if sym == S_KOBOLD:
+    if sym == S_GIANT:
+        # vendor makemon.c:183-186 — if (rn2(2)) mongets(ETTIN ? CLUB : BOULDER)
+        vrng, r = _rn2(vrng, 2)
+        if r:
+            vrng = _mksobj_draws(
+                vrng, O("club") if m.name == "ettin" else O("boulder")
+            )
+    elif sym == S_OGRE:
+        # vendor makemon.c:433-437 — !rn2(king?3:lord?6:12) picks BATTLE_AXE else CLUB
+        mod = 3 if m.name == "ogre king" else 6 if m.name == "ogre lord" else 12
+        vrng, r = _rn2(vrng, mod)
+        vrng = _mksobj_draws(vrng, O("battle-axe") if r == 0 else O("club"))
+    elif sym == S_TROLL:
+        # vendor makemon.c:439-454 — if (!rn2(2)) switch(rn2(4)) polearm grant
+        vrng, r = _rn2(vrng, 2)
+        if r == 0:
+            vrng, w = _rn2(vrng, 4)
+            _pole = {0: "ranseur", 1: "partisan", 2: "glaive", 3: "spetum"}[w]
+            vrng = _mksobj_draws(vrng, O(_pole))
+    elif sym == S_KOBOLD:
         vrng, r = _rn2(vrng, 4)
         if r == 0:
             vrng = _m_initthrow_draws(vrng, O("dart"), 12)
@@ -427,6 +447,197 @@ def _m_initweap_draws(vrng, idx):
     # always false; rnd_offensive_item's internal draws are not ported (would
     # only fire for higher-level armed monsters, absent from these envs).
     return vrng
+
+
+# ---------------------------------------------------------------------------
+# HideNSeek MONSTER directive — full faithful makemon draw replay
+# ---------------------------------------------------------------------------
+# Vendor sp_lev.c create_monster() -> mkclass() -> mk_roamer() -> makemon()
+# for ``MONSTER: <class-letter>, <coord>, hostile``.  The class-letter monster
+# is placed at a fixed coordinate (no somexy retry) and ``anymon`` is FALSE, so
+# no m_initgrp group spawning fires.  The draw stream is ground-truthed against
+# NETHAX_RND captures (.test_runs/hns_stream_*_seed{0,1,2}.txt): the rock-troll
+# (HideNSeek seed 2), plain-troll+granted-polearm (Lava seed 2) and dragon
+# (seed 0) makemon streams reproduce byte-for-byte.
+from Nethax.nethax.constants.monsters import (
+    M2_MALE as _M2_MALE, M2_FEMALE as _M2_FEMALE, M2_STRONG as _M2_STRONG,
+    M2_GREEDY as _M2_GREEDY,
+)
+
+_G_UNIQ = 0x1000
+_G_FREQ = 0x0007
+_PM_GRAY_DRAGON = _MON_BY_NAME.get("gray dragon")
+_PM_LONG_WORM = _MON_BY_NAME.get("long worm")
+_PM_GIANT_EEL = _MON_BY_NAME.get("giant eel")
+_PM_WUMPUS = _MON_BY_NAME.get("wumpus")
+# mkclass placeholders (vendor mondata.h:163 is_placeholder): the class "base"
+# pseudo-monsters that mkclass() skips.
+_MKCLASS_PLACEHOLDERS = frozenset(
+    n for n in ("giant", "orc", "elf", "human") if n in _MON_BY_NAME
+)
+
+
+def _mkclass_pick(vrng, class_sym: int):
+    """Vendor ``mkclass_aligned(class, G_NOGEN, A_NONE)`` at dungeon depth 1.
+
+    Returns ``(vrng, idx)`` for the chosen species.  ``maxmlev`` =
+    ``level_difficulty() >> 1`` = 0 at depth 1, so every candidate is
+    ``toostrong`` and the strictly-increasing-difficulty ``rn2(2)`` break
+    check fires per gen-ok member (after the first) whose difficulty exceeds
+    the array-previous class member's.  Frequency-weighted ``rnd(num)`` then
+    picks the species.  Cite: vendor/nle/src/makemon.c:1643-1712.
+    """
+    maxmlev = 0
+    members = [i for i, m in enumerate(MONSTERS) if int(m.symbol) == class_sym]
+    nums: dict = {}
+    num = 0
+    prev_diff = None
+    for idx in members:
+        m = MONSTERS[idx]
+        diff = int(m.difficulty)
+        geno = int(m.generation_mask)
+        gen_ok = (not (geno & _G_UNIQ)) and (m.name not in _MKCLASS_PLACEHOLDERS)
+        if gen_ok:
+            if num and (diff > maxmlev) and (prev_diff is not None
+                                             and diff > prev_diff):
+                vrng, br = _rn2(vrng, 2)
+                if br:
+                    break
+            kf = geno & _G_FREQ
+            if kf > 0:
+                alev = _adj_lev_depth1(int(m.level))
+                nums[idx] = kf + 1 - (1 if alev > 2 else 0)  # u.ulevel*2 == 2
+                num += nums[idx]
+        prev_diff = diff
+    if num == 0:
+        return vrng, members[0]
+    vrng, rr = _rn2(vrng, num)               # rnd(num) == rn2(num) + 1
+    val = rr + 1
+    for idx in members:
+        if idx not in nums:
+            continue
+        val -= nums[idx]
+        if val <= 0:
+            return vrng, idx
+    return vrng, members[0]
+
+
+def _newmonhp_draws(vrng, idx: int):
+    """Vendor ``newmonhp(mon, mndx)`` (makemon.c:983-1015) HP-roll draws at
+    depth 1.  Returns ``(vrng, m_lev)`` where ``m_lev = adj_lev(ptr)``."""
+    m = MONSTERS[idx]
+    sym = int(m.symbol)
+    mlev = _adj_lev_depth1(int(m.level))
+    # is_golem: fixed golemhp (no draw); is_rider: d(10,8); mlevel>49: fixed.
+    from Nethax.nethax.dungeon.spawning import (
+        _IS_GOLEM, _IS_RIDER,
+    )
+    is_golem = bool(_IS_GOLEM[idx]) if 0 <= idx < _IS_GOLEM.shape[0] else False
+    is_rider = bool(_IS_RIDER[idx]) if 0 <= idx < _IS_RIDER.shape[0] else False
+    if is_golem:
+        return vrng, mlev                    # golemhp() is deterministic
+    if is_rider:
+        for _ in range(10):
+            vrng, _ = _rn2(vrng, 8)          # d(10, 8)
+        return vrng, mlev
+    if int(m.level) > 49:
+        return vrng, mlev                    # "special" fixed hp, no draw
+    is_adult_dragon = (
+        sym == 30 and _PM_GRAY_DRAGON is not None and idx >= _PM_GRAY_DRAGON
+    )
+    if is_adult_dragon:
+        for _ in range(mlev):
+            vrng, _ = _rn2(vrng, 4)          # 4*m_lev + d(m_lev, 4)
+        return vrng, mlev
+    if mlev == 0:
+        vrng, _ = _rn2(vrng, 4)              # rnd(4)
+        return vrng, mlev
+    for _ in range(mlev):
+        vrng, _ = _rn2(vrng, 8)              # d(m_lev, 8)
+    return vrng, mlev
+
+
+def _m_initinv_draws(vrng, idx: int, mlev: int):
+    """Vendor ``m_initinv(mtmp)`` (makemon.c:590-801): mlet-keyed inventory
+    grants plus the unconditional ``rn2(50)/rn2(100)`` defensive/misc tail and
+    the ``!rn2(5)`` greedy-gold gate.  Faithful for the mlets the HideNSeek
+    classes reach (S_NYMPH); other mlets carry no prefix draws at depth 1."""
+    m = MONSTERS[idx]
+    sym = int(m.symbol)
+    f2 = int(m.flags2)
+    O = _OBJ_BY_NAME.get
+    S_NYMPH = 14
+    if sym == S_NYMPH:
+        # makemon.c:762-766 — !rn2(2) MIRROR, !rn2(2) POT_OBJECT_DETECTION
+        vrng, a = _rn2(vrng, 2)
+        if a == 0:
+            vrng = _mksobj_draws(vrng, O("mirror"))
+        vrng, b = _rn2(vrng, 2)
+        if b == 0:
+            vrng = _mksobj_draws(vrng, O("potion of object detection"))
+    # makemon.c:794-800 — defensive + misc + (greedy) gold tail.
+    vrng, _ = _rn2(vrng, 50)
+    vrng, _ = _rn2(vrng, 100)
+    if f2 & _M2_GREEDY:
+        vrng, _ = _rn2(vrng, 5)
+    return vrng
+
+
+def _hidenseek_monster_draws(vrng, class_sym: int, player_align: int = 1):
+    """Replay the full ``MONSTER: <class>, <coord>, hostile`` ISAAC64 draw
+    stream and return ``(vrng, idx)`` for the placed species.
+
+    Draw order (vendor create_monster -> mk_roamer -> makemon):
+      1. ``induced_align(80)`` -> ``rn2(3)``  (amask; no dungeon align flag)
+      2. ``mkclass()``                          (:func:`_mkclass_pick`)
+      3. ``newmonhp()``                         (:func:`_newmonhp_draws`)
+      4. female ``rn2(2)`` unless M2_MALE/M2_FEMALE
+      5. ``peace_minded()`` co-aligned tail (only when the species' maligntyp
+         sign matches the hero's; two rn2 with C short-circuit)
+      6. makemon mlet-switch sleep — S_NYMPH/S_JABBERWOCK ``rn2(5)``
+      7. ``m_initweap`` (if is_armed)           (:func:`_m_initweap_draws`)
+      8. ``m_initinv``                          (:func:`_m_initinv_draws`)
+      9. saddle ``rn2(100)`` (short-circuits before is_domestic)
+    """
+    S_NYMPH, S_JABBERWOCK = 14, 37
+    # 1. induced_align(80): no special-level / dungeon align flag in MiniHack,
+    #    so the two rn2(100) probes are skipped and al = rn2(3) - 1.
+    vrng, _ = _rn2(vrng, 3)
+    # 2. mkclass.
+    vrng, idx = _mkclass_pick(vrng, class_sym)
+    m = MONSTERS[idx]
+    sym = int(m.symbol)
+    f2 = int(m.flags2)
+    mal = int(m.alignment)
+    # 3. newmonhp.
+    vrng, mlev = _newmonhp_draws(vrng, idx)
+    # 4. female.
+    if not (f2 & (_M2_MALE | _M2_FEMALE)):
+        vrng, _ = _rn2(vrng, 2)
+    # 5. peace_minded co-aligned tail (makemon.c:2039-2041).  For the always-
+    #    hostile-forced HideNSeek monster this draw still fires during makemon
+    #    when the species is co-aligned with the hero (the result is later
+    #    overridden).  u.ualign.record == 0 at game start.
+    def _sgn(v):
+        return (v > 0) - (v < 0)
+    if _sgn(mal) == _sgn(player_align):
+        vrng, r1 = _rn2(vrng, 16)            # 16 + max(record,-15) == 16
+        if r1:
+            vrng, _ = _rn2(vrng, 2 + abs(mal))
+    # 6. makemon mlet-switch sleep.
+    if sym in (S_NYMPH, S_JABBERWOCK):
+        vrng, _ = _rn2(vrng, 5)
+    # (in_mklev sleep / longworm initworm / angel emin never fire for the six
+    #  HideNSeek classes at depth 1.)
+    # 7. m_initweap (armed only).
+    is_armed = any(int(a[0]) == 254 for a in m.attacks)   # AT_WEAP == 254
+    if is_armed:
+        vrng = _m_initweap_draws(vrng, idx)
+    # 8. m_initinv.
+    vrng = _m_initinv_draws(vrng, idx, mlev)
+    # 9. saddle: rn2(100) evaluated for every monster (C short-circuit).
+    vrng, _ = _rn2(vrng, 100)
+    return vrng, idx
 
 
 # ---------------------------------------------------------------------------

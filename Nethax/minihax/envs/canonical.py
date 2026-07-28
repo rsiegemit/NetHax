@@ -1566,13 +1566,18 @@ def _wrap_hidenseek_placement(
     glyphs via ``nle_obs._TILE_TO_CMAP``.
 
     Hero placement mirrors ``fixup_special`` -> ``place_lregion(LR_BRANCH)``
-    on region ``(0,0,0,0)`` = cell ``(34,7)`` with del-area ``(1,1,1,1)`` =
-    ``(35,8)``: if that cell is floor (and not the monster / del cell) the hero
-    lands there (2 rn2(1) draws) — seeds 0 and 1.  If it is a tree/cloud the
-    branch fails all 200 probabilistic tries and a whole-level random search
-    (``rn2(79), rn2(21)`` accept-first-floor) picks the cell — seed 2 — but
-    that path additionally depends on the exact ``makemon`` draw count, which
-    is NOT reproduced here, so seed 2's hero is a documented residual.
+    on the single-cell region translated from ``BRANCH:(0,0,0,0)`` = internal
+    ``(XSTART,YSTART)`` with del-area ``(1,1,1,1)``: the ``oneshot`` loop draws
+    two ``rn2(1)`` per try.  If the branch cell is ROOM floor (and not the
+    monster / del cell) the hero lands there on the first try (2 draws) — seeds
+    0 and 1.  If it is a tree/cloud all 200 tries fail (400 ``rn2(1)``), the
+    deterministic single-cell rescan fails, ``sstairs`` stays unset, and
+    ``u_on_sstairs`` -> ``u_on_rndspot`` -> ``place_lregion(0,0,0,0,LR_DOWNTELE)``
+    runs a whole-level ``(rn2(79)+1, rn2(21))`` accept-first-floor search — seed
+    2.  That fallback depends on the exact ``MONSTER`` makemon draw count, which
+    is now reproduced by ``level_generator._hidenseek_monster_draws`` (full
+    induced_align + mkclass + newmonhp + m_initweap/initinv replay), so seed 2's
+    hero is byte-exact.
     """
     from Nethax.nethax import vendor_rng as _vr
     from Nethax.nethax.constants.tiles import TileType as _T
@@ -1666,13 +1671,43 @@ def _wrap_hidenseek_placement(
 
         for (a, b) in randlines:
             carve(a, b)
+        # ``TERRAIN:randline`` reverts cells to floor across the WHOLE level, not
+        # just the 11x9 map: the walker (setp) clamps only to level bounds.  In-
+        # map carved cells revert cloud/tree back to floor; carved cells that
+        # wander OUTSIDE the map become real ROOM floor too.  Vendor's
+        # ``REGION:...,lit`` grows its lit rect by one cell in every direction
+        # (light_region), so a carved floor cell one row/col past the map edge is
+        # lit and enters the hero's FOV — collect those as ``extra_floor`` so
+        # they are stamped and revealed (else they stay dark stone; e.g.
+        # HideNSeek-Lava seed 2 leaks a 3-cell row above the map).
+        extra_floor = set()
         for (cx, cy) in carved:
             lx, ly = cx - XSTART, cy - YSTART
             if 0 <= lx < W and 0 <= ly < H:
                 grid[ly][lx] = 'F'
-        # 5. SHUFFLE $monster (6-elem, discarded — type needs makemon).
-        for i in range(5, 0, -1):
-            rn2(i + 1)
+            else:
+                extra_floor.add((cx, cy))
+        # 5. SHUFFLE $monster (6-elem Fisher-Yates).  Vendor $monster =
+        #    { 'L','N','H','O','D','T' } are monster-CLASS defchars; the
+        #    shuffled [0] element feeds the ``MONSTER: $monster[0], $place[0],
+        #    hostile`` directive.  Track the array so makemon can pick the real
+        #    species (its draw count drives the hero placement stream).
+        _CLASS_SYM = {'L': 38, 'N': 40, 'H': 34, 'O': 41, 'D': 30, 'T': 46}
+        monster = ['L', 'N', 'H', 'O', 'D', 'T']
+        for i in range(len(monster) - 1, 0, -1):
+            j = rn2(i + 1)
+            monster[i], monster[j] = monster[j], monster[i]
+
+        # 6. MONSTER: $monster[0], $place[0], hostile — full makemon draw
+        #    replay (induced_align + mkclass + newmonhp + m_initweap/initinv).
+        #    Consumes the exact ISAAC64 offsets between $monster shuffle and the
+        #    BRANCH hero placement so the whole-level fallback search lands the
+        #    hero on vendor's cell.  Ground-truthed against the NETHAX_RND
+        #    streams (.test_runs/hns_stream_*).
+        from Nethax.minihax.level_generator import (
+            _hidenseek_monster_draws as _hns_monster_draws,
+        )
+        vrng, _mon_idx = _hns_monster_draws(vrng, _CLASS_SYM[monster[0]])
 
         # --- stamp terrain ---
         terr = _np.asarray(state.terrain).copy()
@@ -1693,28 +1728,70 @@ def _wrap_hidenseek_placement(
                 terr[0, 0, y + YSTART, x + XSTART] = _CELL_TO_TILE.get(
                     grid[y][x], VOID
                 )
+        # Carved floor cells that wandered outside the 11x9 map (see
+        # ``extra_floor`` above) — stamp them as real FLOOR so seed_hero_fov's
+        # (default_lit) lit mask reveals them exactly like vendor's grown lit
+        # region.  Stamped before the stair so the stair cell always wins.
+        for (cx, cy) in extra_floor:
+            if 0 <= cy < ROWNO and 0 <= cx < COLNO:
+                terr[0, 0, cy, cx] = FLOOR
         # down-stair at $place[2].
         sx, sy = place[2]
         terr[0, 0, sy + YSTART, sx + XSTART] = STAIR
 
-        # --- hero (place_lregion LR_BRANCH) ---
-        # Branch cell (34,7) = map (0,0); del cell (35,8) = map (1,1);
-        # monster cell = $place[0].
+        # --- hero (place_lregion LR_BRANCH -> u_on_sstairs) ---
+        # Vendor BRANCH:(0,0,0,0),(1,1,1,1) translates (get_location) to a
+        # single-cell region at map (0,0) = internal (XSTART,YSTART), del-area
+        # at map (1,1).  place_lregion(LR_BRANCH) is ``oneshot`` (lx==hx,
+        # ly==hy): it draws rn1(1,x)/rn1(1,y) == two rn2(1) per try for up to
+        # 200 tries, all landing on the same branch cell.  put_lregion_here
+        # accepts iff bad_location is false — the cell is ROOM floor, not in the
+        # del-area, not occupied by the just-placed monster.
+        #
+        #  * branch cell floor (seeds 0/1): first try succeeds -> hero there,
+        #    two rn2(1) draws; place_branch sets sstairs so the hero lands on it.
+        #  * branch cell tree/cloud (seed 2): all 200 tries fail (400 rn2(1)),
+        #    the deterministic single-cell rescan also fails, so sstairs stays
+        #    unset and u_on_sstairs -> u_on_rndspot -> place_lregion(0,0,0,0,
+        #    LR_DOWNTELE): a whole-level (lx=1..COLNO-1, ly=0..ROWNO-1) search
+        #    drawing (rn2(79)+1, rn2(21)) per try, accepting the first ROOM
+        #    floor cell that is unoccupied.  Cite vendor mkmaze.c:275-319,
+        #    dungeon.c:1227-1266.
         mon_x, mon_y = place[0]
-        hx, hy = XSTART, YSTART
-        branch_ok = (grid[0][0] == 'F' and (mon_x, mon_y) != (0, 0))
-        if not branch_ok:
-            # seed-2 whole-level fallback (exact stream not reproduced here):
-            # deterministic first-floor scan keeps the hero on a real floor
-            # cell so FOV is sane; the true cell is a documented residual.
-            found = False
-            for yy in range(H):
-                for xx in range(W):
-                    if grid[yy][xx] == 'F':
-                        hx, hy = xx + XSTART, yy + YSTART
-                        found = True
-                        break
-                if found:
+        mon_cell = (mon_x + XSTART, mon_y + YSTART)
+        del_cell = (XSTART + 1, YSTART + 1)
+        stair_cell = (sx + XSTART, sy + YSTART)
+
+        def _is_room_floor(ax, ay):
+            if (ax, ay) == stair_cell:
+                return False               # STAIRS typ, not ROOM
+            lx, ly = ax - XSTART, ay - YSTART
+            if 0 <= lx < W and 0 <= ly < H:
+                return grid[ly][lx] == 'F'  # cloud/tree/lava are not ROOM
+            # carved floor that wandered outside the map is still ROOM floor.
+            return (ax, ay) in extra_floor
+
+        bx, by = XSTART, YSTART
+        branch_valid = (
+            _is_room_floor(bx, by)
+            and (bx, by) != del_cell
+            and (bx, by) != mon_cell
+        )
+        hx, hy = bx, by
+        if branch_valid:
+            rn2(1)                          # rn1(1, x) -> x == bx
+            rn2(1)                          # rn1(1, y) -> y == by
+        else:
+            for _t in range(200):           # oneshot loop, all cells == (bx,by)
+                rn2(1)
+                rn2(1)
+            # deterministic single-cell rescan draws nothing and also fails;
+            # fall through to the whole-level LR_DOWNTELE search.
+            for _t in range(200):
+                cx = rn2(79) + 1            # rn1((COLNO-1)-1+1, 1)
+                cy = rn2(21)                # rn1((ROWNO-1)-0+1, 0)
+                if _is_room_floor(cx, cy) and (cx, cy) != mon_cell:
+                    hx, hy = cx, cy
                     break
 
         # Clear spurious monsters the base factory placed (their glyph/type is
