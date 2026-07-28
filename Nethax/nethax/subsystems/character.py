@@ -1402,6 +1402,24 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
 
 
 # ---------------------------------------------------------------------------
+# Per-role ini_inv mkobj-draw registry (NLE_BYTEPARITY).
+#
+# Vendor ``ini_inv(role_trobj)`` (u_init.c) builds each starting item via
+# ``mksobj``, which consumes ISAAC64 draws (spe via rn1/rn2, quantity via
+# rn2 for stacked objects, blessorcurse rn2(5)[+rn2(2)] for UNDEF-BUC items,
+# appearance already fixed by the descr_idx shuffle).  Those draws both (a)
+# set the item's rendered spe/quantity/BUC and (b) advance the shared stream
+# so the downstream level-gen stays byte-aligned.  Archeologist is handled by
+# the dedicated inline block below (kept as-is); every OTHER role registers a
+# ``fn(vendor_rng, inv_state, items_list) -> (vendor_rng, inv_state)`` here.
+# Populated by the per-role ini_inv ports further down this module.  An empty
+# registry (role absent) means "no mkobj draws modelled yet" -> that role's
+# inventory content + downstream stream may diverge (see .test_runs/_char_sweep.py).
+# ---------------------------------------------------------------------------
+_INI_INV_ROLE_DRAWS = {}
+
+
+# ---------------------------------------------------------------------------
 # _consume_ini_inv_archeologist_draws  — vendor ISAAC64 ini_inv replay for Arc
 # ---------------------------------------------------------------------------
 
@@ -2067,6 +2085,19 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         inv_state = inv_state.replace(
             items=_arc_new_items, letters=_arc_new_letters,
         )
+
+    # --- NLE_BYTEPARITY: per-role ini_inv mkobj draws (non-Archeologist) ---
+    # Runs at the SAME stream position vendor's ini_inv does (after the items
+    # are built from the trobj table, before init_attr).  Archeologist uses the
+    # dedicated inline block above; all other roles dispatch through the
+    # registry.  A role absent from the registry consumes no draws (its
+    # inventory content / downstream stream is not yet modelled).
+    if vendor_rng is not None and role != Role.ARCHEOLOGIST:
+        _ini_inv_fn = _INI_INV_ROLE_DRAWS.get(role)
+        if _ini_inv_fn is not None:
+            vendor_rng, inv_state = _ini_inv_fn(
+                vendor_rng, inv_state, items_list,
+            )
 
     # --- Stat rolls (vendor init_attr(75) parity) ---
     # NLE_BYTEPARITY: vendor runs init_attr AFTER ini_inv + bonus cascade.
