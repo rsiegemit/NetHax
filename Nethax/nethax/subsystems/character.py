@@ -2155,8 +2155,6 @@ def _wiz_pick_item(vendor_rng, class_id, nc, nc2, nc3, nc4, orc, is_spbook,
     pr = _WIZ["poison_res"]
     sp_level = _WIZ["sp_level"]
 
-    import os as _os
-    _dbg = _os.environ.get("WIZDBG")
     accepted = jnp.bool_(False)
     otyp_out = jnp.int32(0)
     spe_out = jnp.int32(0)
@@ -2164,8 +2162,6 @@ def _wiz_pick_item(vendor_rng, class_id, nc, nc2, nc3, nc4, orc, is_spbook,
     for _att in range(_WIZ_MAX_ATTEMPTS):
         active = jnp.logical_not(accepted)
         rng_roll, roll = rnd_jax(vendor_rng, jnp.int32(1000))
-        if _dbg and _att < 3:
-            print(f"DBG cls={class_id} att={_att} roll={int(roll)}")
         otyp = decode_picked_otyp(jnp.int32(class_id), roll).astype(jnp.int32)
         rng_after, spe, blessed = cascade(rng_roll, otyp)
         vendor_rng = _mksobj_cadv(vendor_rng, rng_after, active)
