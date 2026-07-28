@@ -2252,16 +2252,39 @@ def _mkobj_food_isaac(vrng):
         i += 1
     otyp = i
     quan = 1
+    spe = 0
+    corpsenm = -1
     if otyp == 241:                       # EGG
         vrng, e = rn2_jax(vrng, jnp.int32(3))
         # int(e)==0 -> typed-egg rndmonnum loop (not modelled; unreached for
         # seeds 0-2 which roll generic eggs).
         vrng, r = rn2_jax(vrng, jnp.int32(6))
         quan = 2 if int(r) == 0 else 1
-    elif otyp == 271:                     # TIN (spinach path only)
+    elif otyp == 271:                     # TIN — mkobj.c:849-863
+        # corpsenm = NON_PM; if (!rn2(6)) set_tin_variety(SPINACH_TIN) -> spe=1;
+        # else pick a random corpse: undead_to_corpse(rndmonnum()) retried until
+        # the species leaves an edible corpse (cnutrit && !G_NOCORPSE).
         vrng, _t = rn2_jax(vrng, jnp.int32(6))
+        if int(_t) == 0:
+            spe = 1                       # SPINACH_TIN -> otmp->spe = 1
+        else:
+            # RANDOM_TIN.  rndmonnum() == monsndx(rndmonst()); at char-init
+            # (Dlvl 1, u.ulevel 1) rndmonst's difficulty window is [0,1], which
+            # excludes every undead species, so undead_to_corpse() is the
+            # identity here.  pick_monster_for_level(depth=1, vendor_rng=...)
+            # replays rndmonst byte-exactly (one rnd(choice_count) per call).
+            from Nethax.nethax.dungeon.spawning import pick_monster_for_level
+            from Nethax.nethax.constants.monsters import MONSTERS, G_NOCORPSE
+            for _ in range(200):
+                vrng, m = pick_monster_for_level(None, 1, vendor_rng=vrng)
+                mndx = int(m)
+                ent = MONSTERS[mndx]
+                if int(ent.nutrition) and not (
+                        int(ent.generation_mask) & G_NOCORPSE):
+                    corpsenm = mndx
+                    break
         vrng = _blessorcurse_eager(vrng, 10)
-        vrng, r = rn2_jax(vrng, jnp.int32(6))
+        vrng, r = rn2_jax(vrng, jnp.int32(6))  # generic FOOD tail (mkobj.c:880)
         quan = 2 if int(r) == 0 else 1
     elif otyp == 250:                     # KELP_FROND: quan = rnd(2)
         vrng, k = rn2_jax(vrng, jnp.int32(2))
@@ -2271,10 +2294,11 @@ def _mkobj_food_isaac(vrng):
     else:                                 # simple foods: tail rn2(6)
         vrng, r = rn2_jax(vrng, jnp.int32(6))
         quan = 2 if int(r) == 0 else 1
-    return vrng, otyp, quan
+    return vrng, otyp, quan, spe, corpsenm
 
 
-def _orc_add_food(inv_state, otyp: int, quan: int):
+def _orc_add_food(inv_state, otyp: int, quan: int, spe: int = 0,
+                  corpsenm: int = -1):
     """addinv one FOOD object (eager): merge into an existing same-otyp FOOD
     stack, else place at the first empty slot with the positional letter.
     Cite: vendor/nle/src/invent.c::addinv (mergable by otyp for plain food)."""
@@ -2298,6 +2322,17 @@ def _orc_add_food(inv_state, otyp: int, quan: int):
         return inv_state.replace(items=items.replace(quantity=q))
     slot = empty_slot
     new_item = _food(otyp, quan)
+    if spe:
+        # TIN spinach content (set_tin_variety(SPINACH_TIN) -> spe=1); inv_strs
+        # renders "tin of spinach" off enchantment==1.  Cite: eat.c:1248-1262.
+        new_item = new_item.replace(
+            enchantment=jnp.asarray(spe, dtype=new_item.enchantment.dtype))
+    if corpsenm >= 0:
+        # RANDOM_TIN corpse content -> inv_strs renders "tin of <monster> meat"
+        # off corpse_entry_idx (the monster index).  Cite: mkobj.c:853-862.
+        new_item = new_item.replace(
+            corpse_entry_idx=jnp.asarray(
+                corpsenm, dtype=new_item.corpse_entry_idx.dtype))
     new_items = jax.tree_util.tree_map(
         lambda arr, val: arr.at[slot].set(val), items, new_item,
     )
@@ -2311,10 +2346,10 @@ def _orc_xtra_food(vrng, inv_state):
     objects (trquan=2 stacking loop), each racially substituted (cram/lembas
     -> tripe) and addinv-merged.  Cite: u_init.c:853, 1057-1073, 1155."""
     for _ in range(2):
-        vrng, otyp, quan = _mkobj_food_isaac(vrng)
+        vrng, otyp, quan, spe, corpsenm = _mkobj_food_isaac(vrng)
         if otyp in (267, 266):            # CRAM_RATION / LEMBAS_WAFER
             otyp = 239                    # -> TRIPE_RATION (orc inv_sub)
-        inv_state = _orc_add_food(inv_state, otyp, quan)
+        inv_state = _orc_add_food(inv_state, otyp, quan, spe, corpsenm)
     return vrng, inv_state
 
 
@@ -2737,6 +2772,13 @@ def _consume_ini_inv_barbarian_draws(vendor_rng, inv_state, items_list, race=Non
     # Optional OIL_LAMP bonus (u_init.c:686-687) at the next slot (4).
     inv_state = _add_bonus_item(inv_state, 4, take_lamp,
                                 _make_oil_lamp(lamp_blessed))
+
+    # Orc non-wizard Xtra_food (u_init.c:850-853) — drawn in the PM_ORC race
+    # switch AFTER the role switch's ini_inv + Lamp gate, so it lands here at
+    # the end of the Barbarian stream.  Appends 2 racially-substituted foods.
+    from Nethax.nethax.constants.races import Race
+    if race == Race.ORC:
+        vendor_rng, inv_state = _orc_xtra_food(vendor_rng, inv_state)
     return vendor_rng, inv_state
 
 
@@ -3168,6 +3210,18 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         items_list = list(items_list)
         items_list[6] = make_empty_item()
     inv_state  = InventoryState.from_items(items_list)
+
+    # --- NLE_BYTEPARITY: orc Rogue racial subs + Xtra_food ---
+    # Rogue is handled inline (not via _INI_INV_ROLE_DRAWS), so it never reaches
+    # the registry's _apply_race_inv_subs / orc-food path.  For orc Rogues apply
+    # both here: the pure otyp inv_subs (SHORT_SWORD/DAGGER -> orcish variants,
+    # u_init.c inv_subs[]) and the non-wizard Xtra_food (u_init.c:850-853), which
+    # vendor draws in the PM_ORC race switch AFTER ini_inv(Rogue) + the rn2(5)
+    # BLINDFOLD gate (already consumed above as blindfold_roll) — so it lands at
+    # this stream position.  Human Rogue (no inv_subs entry) is untouched.
+    if vendor_rng is not None and role == Role.ROGUE and race == Race.ORC:
+        inv_state = _apply_race_inv_subs(inv_state, race)
+        vendor_rng, inv_state = _orc_xtra_food(vendor_rng, inv_state)
 
     # --- NLE_BYTEPARITY: Archeologist ini_inv per-item mksobj draws ---
     # Consume the 18 ISAAC64 draws emitted by mksobj for the 8 Arc starting
