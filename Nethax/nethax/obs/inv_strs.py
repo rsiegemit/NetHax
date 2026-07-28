@@ -421,6 +421,16 @@ _CLASS_HAS_PREFIX: jnp.ndarray = jnp.array(
     [s != "" for s in _CLASS_PREFIX_STRS], dtype=jnp.bool_,
 )  # bool[18]
 
+# When a class prefix ("spellbook of ", "amulet of ", ...) is the first word
+# written, the a/an article must follow the CLASS noun, not the object-specific
+# tail (e.g. "a spellbook of identify", NOT "an ...").  Only "amulet" begins
+# with a vowel among the prefix nouns.  Cite: vendor objnam.c just_an() keys off
+# the first prefix token.
+_CLASS_PREFIX_USE_AN: jnp.ndarray = jnp.array(
+    [bool(s) and s[:1].lower() in "aeiou" for s in _CLASS_PREFIX_STRS],
+    dtype=jnp.bool_,
+)  # bool[18]
+
 # Prefix applies only when the item is IDENTIFIED (showing true name).
 # For unidentified items with appearances, no prefix (just "orange potion", etc.)
 # For identified items with class prefix: show "potion of healing" etc.
@@ -1190,8 +1200,17 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
         (jnp.clip(_oeroded2_art, 0, 3) > jnp.int32(0)) | _oerodeproof_art
     )
     consonant_prefix = enchant_shown | erosion_shown
-    noun_or_prefix_use_an = jnp.where(consonant_prefix, jnp.bool_(False),
-                                      noun_use_an)
+    # When the identified name carries a class prefix ("potion of ",
+    # "spellbook of ", "amulet of ", ...) and no +N/erosion word precedes it,
+    # the article follows the CLASS noun (only "amulet" -> "an"), not the
+    # object-specific tail: "a spellbook of identify", "an amulet of ...".
+    _cls_art_safe = jnp.clip(_obj_cls_art, 0, 17)
+    class_prefix_shown = identified & _CLASS_HAS_PREFIX[_cls_art_safe]
+    noun_or_prefix_use_an = jnp.where(
+        consonant_prefix, jnp.bool_(False),
+        jnp.where(class_prefix_shown,
+                  _CLASS_PREFIX_USE_AN[_cls_art_safe], noun_use_an),
+    )
     article_use_an = jnp.where(buc_shown, buc_use_an, noun_or_prefix_use_an)
 
     def render_nonempty(args):

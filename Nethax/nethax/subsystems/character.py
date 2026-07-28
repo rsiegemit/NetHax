@@ -650,10 +650,13 @@ STARTING_INVENTORY: dict = {
         _food(ObjType.FORTUNE_COOKIE, 3),
     ],
     # Pri: mace+1 (BLESSED — vendor trbless=1), robe+0, small shield+0,
-    #      4 holy water (BLESSED), clove of garlic, sprig of wolfsbane.
-    # u_init.c Priest[] (114-123): MACE spe=1 trbless=1, POT_WATER trbless=1,
-    # CLOVE_OF_GARLIC, SPRIG_OF_WOLFSBANE.  Two random spellbooks also in
-    # vendor — deferred (random-spellbook init not wired).
+    #      4 holy water (BLESSED), clove of garlic, sprig of wolfsbane, and
+    #      TWO random spellbooks (slots 6/7, type + BUC overridden under
+    #      NLE_BYTEPARITY by _consume_ini_inv_priest_draws).  A bonus
+    #      MAGIC_MARKER / OIL_LAMP may be appended at slot 8 (u_init.c:728-733
+    #      rn2(10)/rn2(10) cascade).
+    # u_init.c Priest[] (100-108): MACE spe=1 trbless=1, POT_WATER trbless=1,
+    # CLOVE_OF_GARLIC, SPRIG_OF_WOLFSBANE, UNDEF_TYP SPBOOK_CLASS trquan=2.
     # Audit L #20: added missing garlic + wolfsbane.
     Role.PRIEST: [
         _weapon(ObjType.MACE, enchant=1, buc=_BUC_BLESSED),
@@ -662,6 +665,8 @@ STARTING_INVENTORY: dict = {
         _potion(ObjType.POT_WATER, 4, buc=_BUC_BLESSED),   # holy water
         _food(ObjType.CLOVE_OF_GARLIC, 1),
         _food(ObjType.SPRIG_OF_WOLFSBANE, 1),
+        _spellbook(ObjType.SPE_HEALING),   # type/BUC overridden by draws
+        _spellbook(ObjType.SPE_HEALING),   # type/BUC overridden by draws
     ],
     # Ran: dagger+1, bow+1, arrow+2 x50, arrow+0 x30..39, cloak+2, 4 cram rations.
     # u_init.c Ranger[] (124-132):  DAGGER spe=1, BOW spe=1, ARROW spe=2 qty=50..59,
@@ -1883,6 +1888,286 @@ def _consume_ini_inv_monk_draws(vendor_rng, inv_state, items_list, race=None):
 
 
 _INI_INV_ROLE_DRAWS[Role.MONK] = _consume_ini_inv_monk_draws
+
+
+# ---------------------------------------------------------------------------
+# _consume_ini_inv_priest_draws  — vendor ISAAC64 ini_inv replay for Priest
+# ---------------------------------------------------------------------------
+
+# Reject set for the two UNDEF_TYP SPBOOK_CLASS slots (u_init.c Priest[] line
+# 107 → ini_inv reject loop u_init.c:1000-1027).  A drawn spellbook is rejected
+# when it is SPE_BLANK_PAPER, or ``objects[otyp].oc_level > 3``, or
+# ``restricted_spell_discipline(otyp)`` (a discipline outside the Priest skill
+# list Skill_P, u_init.c:372-395 → only P_HEALING/P_DIVINATION/P_CLERIC spells
+# are allowed).  The values below are Nethax objects.py otyp indices (the space
+# ``decode_picked_otyp(SPBOOK_CLASS, .)`` returns, 340..380), derived by reading
+# each SPELL(...) entry's discipline + level arg from vendor/nle/src/objects.c
+# (lines 909-1001).  The 14 *kept* books are the healing/divination/cleric
+# spells with level<=3: light(346) detect_monsters(347) healing(348)
+# cure_blindness(352) create_monster(356) detect_food(357) clairvoyance(359)
+# cure_sickness(360) detect_unseen(363) extra_healing(365) remove_curse(369)
+# identify(371) protection(377) stone_to_flesh(379).  Everything else rejects:
+_PRIEST_SPBOOK_REJECT = (
+    340,  # dig            (P_MATTER,      level 5)
+    341,  # magic missile  (P_ATTACK,      level 2)
+    342,  # fireball       (P_ATTACK,      level 4)
+    343,  # cone of cold   (P_ATTACK,      level 4)
+    344,  # sleep          (P_ENCHANTMENT, level 1)
+    345,  # finger of death(P_ATTACK,      level 7)
+    349,  # knock          (P_MATTER,      level 1)
+    350,  # force bolt     (P_ATTACK,      level 1)
+    351,  # confuse monster(P_ENCHANTMENT, level 2)
+    353,  # drain life     (P_ATTACK,      level 2)
+    354,  # slow monster   (P_ENCHANTMENT, level 2)
+    355,  # wizard lock    (P_MATTER,      level 2)
+    358,  # cause fear     (P_ENCHANTMENT, level 3)
+    361,  # charm monster  (P_ENCHANTMENT, level 3)
+    362,  # haste self     (P_ESCAPE,      level 3)
+    364,  # levitation     (P_ESCAPE,      level 4)
+    366,  # restore ability(P_HEALING,     level 4)  — allowed disc but level>3
+    367,  # invisibility   (P_ESCAPE,      level 4)
+    368,  # detect treasure(P_DIVINATION,  level 4)  — allowed disc but level>3
+    370,  # magic mapping  (P_DIVINATION,  level 5)  — allowed disc but level>3
+    372,  # turn undead    (P_CLERIC,      level 6)  — allowed disc but level>3
+    373,  # polymorph      (P_MATTER,      level 6)
+    374,  # teleport away  (P_ESCAPE,      level 6)
+    375,  # create familiar(P_CLERIC,      level 6)  — allowed disc but level>3
+    376,  # cancellation   (P_MATTER,      level 7)
+    378,  # jumping        (P_ESCAPE,      level 1)
+    380,  # blank paper    (P_NONE,        level 0)
+)
+_PRIEST_SPBOOK_MAX_ATTEMPTS = 40
+
+
+def _consume_ini_inv_priest_draws(vendor_rng, inv_state, items_list, race=None):
+    """Replay the ISAAC64 draws vendor emits for the Priest starting kit and
+    write the two rolled spellbook types / stack quantities / BUC and optional
+    bonus item into ``inv_state``.
+
+    Vendor order (u_init.c:100-108 Priest[] → ini_inv, then bonus cascade
+    u_init.c:728-733).  ``ini_inv`` processes each trobj in order, re-looping
+    ``trquan`` times via ``if (--trquan) continue`` (u_init.c:1156) for the
+    POT_WATER stack and the two spellbooks:
+
+      0. MACE   (WEAPON_CLASS, trspe=1, trbless=1) — mksobj weapon cascade
+             consumed; slot 0 forced +1 BLESSED (cascade BUC discarded).
+      1. ROBE          (ARMOR_CLASS)  — armor bless cascade -> slot 1 BUC.
+      2. SMALL_SHIELD  (ARMOR_CLASS)  — armor bless cascade -> slot 2 BUC.
+      3. POT_WATER x4  (POTION_CLASS, trbless=1) — 4x blessorcurse(4) consumed;
+             slot 3 forced BLESSED holy water, quan=4.
+      4. CLOVE_OF_GARLIC   (FOOD_CLASS) — rn2(6) stack-double -> slot 4 qty.
+      5. SPRIG_OF_WOLFSBANE(FOOD_CLASS) — rn2(6) stack-double -> slot 5 qty.
+      6. spellbook #1 (UNDEF_TYP SPBOOK_CLASS) — mkobj reject loop: each
+             attempt = rnd(1000) type-pick + blessorcurse(17); reject while
+             otyp in ``_PRIEST_SPBOOK_REJECT`` -> slots 6 type/BUC.
+      7. spellbook #2 (UNDEF_TYP SPBOOK_CLASS) — same reject loop with book #1's
+             otyp added to the reject set (nocreate4, u_init.c:1057) -> slot 7.
+      8. bonus cascade: ``if (!rn2(10)) Magicmarker; else if (!rn2(10)) Lamp``
+             MAGIC_MARKER mksobj = rn1(70,30) spe; OIL_LAMP mksobj =
+             rn1(500,1000) age + blessorcurse(5).
+
+    trspe pins MACE=+1 (static table); trbless=1 forces MACE + the 4 holy
+    waters BLESSED regardless of the consumed cascade.  The spellbooks are
+    trbless=UNDEF so their BUC comes from blessorcurse(17) (cursed wiped to
+    uncursed by ini_inv u_init.c:1094).  ``initialspell`` (u_init.c:1153) draws
+    no RNG.  Returns ``(vendor_rng, inv_state)``.
+
+    Citations
+    ---------
+    vendor/nle/src/u_init.c:100-108, 728-733 — Priest[] trobj + bonus cascade
+    vendor/nle/src/u_init.c:1000-1027        — UNDEF_TYP SPBOOK reject loop
+    vendor/nle/src/u_init.c:372-395, 908-966 — Skill_P + restricted_spell_disc.
+    vendor/nle/src/objects.c:909-1001        — SPELL() disciplines + oc_level
+    vendor/nle/src/mkobj.c:264-266           — rnd(1000) type-pick walk
+    vendor/nle/src/mkobj.c:879-882           — FOOD_CLASS stack doubling
+    vendor/nle/src/mkobj.c:981-991           — POTION/SPBOOK blessorcurse
+    vendor/nle/src/mkobj.c:932-934           — MAGIC_MARKER rn1(70,30) spe
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax, rn1_jax, rnd_jax
+    from Nethax.nethax.subsystems.random_objects import decode_picked_otyp
+    from Nethax.nethax.constants.objects import ObjectClass
+    from Nethax.nethax.subsystems.inventory import make_item, make_empty_item
+
+    _SPBOOK_CLASS = jnp.int32(int(ObjectClass.SPBOOK_CLASS))
+
+    # Pre-ini_inv role draws that precede ini_inv(Priest) in the vendor stream
+    # but are not consumed by the general reset path (unlike Monk, whose leader
+    # has a fixed gender and whose M_spell rn2(90) sits in this slot):
+    #   a. role_init() deity pick — the Priest has no fixed pantheon
+    #      (role.c:288 "deities from a randomly chosen other role"), so
+    #      role_init draws rn2(SIZE(roles)) == rn2(13) to borrow another
+    #      role's gods.  Cite: vendor/nle/src/role.c role_init.
+    #   b. newpw() Pw roll — u_init runs newhp()/newpw() before the role
+    #      switch; Priest hpadv.inrnd == 0 (no HP draw) and enadv.inrnd == 3
+    #      (+ human/elf race enadv.inrnd == 0), so newpw draws a single
+    #      rnd(3).  Cite: vendor/nle/src/exper.c::newpw; role.c Priest enadv.
+    # Only the ISAAC advance matters here (the picked pantheon / Pw value are
+    # not part of the compared observation), so the results are discarded.
+    vendor_rng, _ = rn2_jax(vendor_rng, jnp.int32(13))
+    vendor_rng, _ = rnd_jax(vendor_rng, jnp.int32(3))
+
+    # 0. MACE — weapon bless cascade consumed; result discarded (slot 0 is
+    #    forced +1 BLESSED by trspe=1/trbless=1, already in the static table).
+    vendor_rng, _ = _mksobj_weapon_cascade(vendor_rng)
+
+    # 1-2. ROBE, SMALL_SHIELD armor bless cascades.
+    vendor_rng, robe_blessed = _mksobj_armor_cascade(vendor_rng)
+    vendor_rng, shield_blessed = _mksobj_armor_cascade(vendor_rng)
+
+    # 3. POT_WATER x4 — 4x blessorcurse(4) consumed; slot 3 forced BLESSED.
+    for _ in range(4):
+        vendor_rng, _ = _mksobj_blessorcurse(vendor_rng, 4)
+
+    # 4-5. Food stacks (CLOVE_OF_GARLIC x1, SPRIG_OF_WOLFSBANE x1).
+    vendor_rng, garlic_qty = _mksobj_food_stack_qty(vendor_rng, 1)
+    vendor_rng, wolfsbane_qty = _mksobj_food_stack_qty(vendor_rng, 1)
+
+    # 6-7. Two random spellbooks — mkobj(SPBOOK_CLASS) reject loop.  Each active
+    #      attempt draws rnd(1000) (type pick) + blessorcurse(17).  Book #2's
+    #      reject set also excludes book #1's otyp (nocreate4 no-dup).
+    reject = jnp.asarray(_PRIEST_SPBOOK_REJECT, dtype=jnp.int32)
+
+    def _draw_spellbook(vrng, extra_reject):
+        accepted = jnp.bool_(False)
+        otyp_out = jnp.int32(0)
+        blessed_out = jnp.bool_(False)
+        for _ in range(_PRIEST_SPBOOK_MAX_ATTEMPTS):
+            active = jnp.logical_not(accepted)
+            rng_roll, roll = rnd_jax(vrng, jnp.int32(1000))
+            otyp = decode_picked_otyp(_SPBOOK_CLASS, roll)
+            rng_bc, bless = _mksobj_blessorcurse(rng_roll, 17)
+            vrng = _mksobj_cadv(vrng, rng_bc, active)
+            is_rejected = jnp.logical_or(
+                jnp.any(otyp == reject), otyp == extra_reject,
+            )
+            newly = jnp.logical_and(active, jnp.logical_not(is_rejected))
+            otyp_out = jnp.where(newly, otyp, otyp_out)
+            blessed_out = jnp.where(newly, bless, blessed_out)
+            accepted = jnp.logical_or(accepted, newly)
+        return vrng, otyp_out, blessed_out
+
+    vendor_rng, book1_otyp, book1_blessed = _draw_spellbook(
+        vendor_rng, jnp.int32(-1),
+    )
+    vendor_rng, book2_otyp, book2_blessed = _draw_spellbook(
+        vendor_rng, book1_otyp,
+    )
+
+    # 8. Bonus item cascade — Magicmarker (rn2(10)==0) else Lamp (rn2(10)==0).
+    vendor_rng, b10a = rn2_jax(vendor_rng, jnp.int32(10))
+    pick_marker = b10a == jnp.int32(0)
+    not_marker = jnp.logical_not(pick_marker)
+    # MAGIC_MARKER mksobj: rn1(70, 30) spe (only when marker picked).
+    rng_mm, mm_spe = rn1_jax(vendor_rng, jnp.int32(70), jnp.int32(30))
+    vendor_rng = _mksobj_cadv(vendor_rng, rng_mm, pick_marker)
+    # Lamp gate: rn2(10) (only when marker NOT picked).
+    rng_b10b, b10b = rn2_jax(vendor_rng, jnp.int32(10))
+    vendor_rng = _mksobj_cadv(vendor_rng, rng_b10b, not_marker)
+    b10b = jnp.where(not_marker, b10b, jnp.int32(1))
+    pick_lamp = jnp.logical_and(not_marker, b10b == jnp.int32(0))
+    # OIL_LAMP mksobj: rn1(500,1000) age + blessorcurse(5) (only when lamp).
+    rng_l1, _ = rn1_jax(vendor_rng, jnp.int32(500), jnp.int32(1000))
+    vendor_rng = _mksobj_cadv(vendor_rng, rng_l1, pick_lamp)
+    rng_l2, _ = _mksobj_blessorcurse(vendor_rng, 5)
+    vendor_rng = _mksobj_cadv(vendor_rng, rng_l2, pick_lamp)
+
+    # --- Apply to inv_state (static Priest slot order 0..7, bonus -> 8) ---
+    items = inv_state.items
+    _BLESSED = jnp.asarray(_BUC_BLESSED, dtype=items.buc_status.dtype)
+    _UNCURSED = jnp.asarray(_BUC_UNCURSED, dtype=items.buc_status.dtype)
+
+    type_id = items.type_id
+    type_id = type_id.at[6].set(book1_otyp.astype(type_id.dtype))
+    type_id = type_id.at[7].set(book2_otyp.astype(type_id.dtype))
+
+    buc = items.buc_status
+    buc = buc.at[1].set(jnp.where(robe_blessed, _BLESSED, _UNCURSED))
+    buc = buc.at[2].set(jnp.where(shield_blessed, _BLESSED, _UNCURSED))
+    buc = buc.at[6].set(jnp.where(book1_blessed, _BLESSED, _UNCURSED))
+    buc = buc.at[7].set(jnp.where(book2_blessed, _BLESSED, _UNCURSED))
+
+    q = items.quantity
+    q = (q.at[4].set(garlic_qty.astype(q.dtype))
+          .at[5].set(wolfsbane_qty.astype(q.dtype)))
+
+    items = items.replace(type_id=type_id, buc_status=buc, quantity=q)
+
+    # Bonus item at slot 8 (MAGIC_MARKER=217, OIL_LAMP=202) + letter 'i'.
+    marker = make_item(category=int(ItemCategory.TOOL), type_id=217, quantity=1,
+                       weight=2, buc_status=_BUC_UNCURSED, identified=True,
+                       bknown=True, dknown=True, rknown=True)
+    lamp = make_item(category=int(ItemCategory.TOOL), type_id=202, quantity=1,
+                     weight=20, buc_status=_BUC_UNCURSED, identified=True,
+                     bknown=True, dknown=True, rknown=True)
+    empty = make_empty_item()
+    bonus = jax.tree_util.tree_map(
+        lambda m, l, e: jnp.where(pick_marker, m, jnp.where(pick_lamp, l, e)),
+        marker, lamp, empty,
+    )
+    items = jax.tree_util.tree_map(lambda arr, val: arr.at[8].set(val), items, bonus)
+    # MAGIC_MARKER "(0:spe)" charge suffix (only when marker picked).
+    ch = jnp.where(pick_marker, mm_spe.astype(items.charges.dtype), items.charges[8])
+    items = items.replace(charges=items.charges.at[8].set(ch))
+
+    any_bonus = jnp.logical_or(pick_marker, pick_lamp)
+
+    # Elf Priest: the PM_ELF race case (u_init.c:809-819) grants a
+    # non-warrior elf (Priest/Wizard) ONE random instrument, chosen by
+    # ``trotyp[rn2(6)]`` over {WOODEN_FLUTE 222, TOOLED_HORN 224,
+    # WOODEN_HARP 228, BELL 230, BUGLE 231, LEATHER_DRUM 232} then
+    # ``ini_inv(Instrument)``.  These plain instruments hit no TOOL_CLASS
+    # case in mkobj.c, so mksobj draws NOTHING beyond the rn2(6) type pick.
+    # It runs after the role's ini_inv + bonus cascade, so it lands on the
+    # next free slot: 8 when no bonus item was placed, else 9.  Placed BEFORE
+    # the Priest BUC mask below so it inherits the uncursed-word suppression.
+    # ``race`` is a concrete Python arg, so this branch is trace-static.
+    is_elf = (race == Race.ELF)
+    if is_elf:
+        vendor_rng, _instr_idx = rn2_jax(vendor_rng, jnp.int32(6))
+        _INSTR_OTYP = jnp.asarray([222, 224, 228, 230, 231, 232],
+                                  dtype=items.type_id.dtype)
+        _instr = make_item(
+            category=int(ItemCategory.TOOL), type_id=222, quantity=1,
+            weight=30, buc_status=_BUC_UNCURSED, identified=True,
+            bknown=True, dknown=True, rknown=True,
+        )
+        _instr_slot = jnp.where(any_bonus, jnp.int32(9), jnp.int32(8))
+        items = jax.tree_util.tree_map(
+            lambda arr, val: arr.at[_instr_slot].set(val), items, _instr,
+        )
+        items = items.replace(
+            type_id=items.type_id.at[_instr_slot].set(_INSTR_OTYP[_instr_idx]),
+        )
+
+    # Priest BUC display: vendor sets ``bknown = 1`` on every Priest item
+    # (objnam.c:454 — Priests always sense BUC) but then strips the leading
+    # "uncursed " word from the rendered name (objnam.c:785-786), so uncursed
+    # items render with no BUC word while blessed/cursed keep theirs.  Our
+    # inv_strs renderer has no Priest hook, so emulate the visible result by
+    # marking only blessed/cursed items ``bknown`` (uncursed -> suppressed BUC
+    # word).  ini_inv wipes cursed -> uncursed (u_init.c:1094), so in practice
+    # only the blessed mace / holy water / any blessed spellbook surface a BUC
+    # word; the mace's "blessed" and the "holy water" name both still render.
+    bknown = (items.buc_status == _BLESSED)
+    items = items.replace(bknown=bknown.astype(items.bknown.dtype))
+
+    # Letters: slot 8 is lettered 'i' when the bonus fired OR (for elf) the
+    # instrument sits there (no bonus); slot 9 is lettered 'j' only when elf
+    # AND the bonus pushed the instrument to slot 9.
+    slot8_present = jnp.logical_or(any_bonus, jnp.bool_(bool(is_elf)))
+    letters = inv_state.letters.at[8].set(
+        jnp.where(slot8_present, jnp.int8(ord('a') + 8), jnp.int8(0)),
+    )
+    if is_elf:
+        letters = letters.at[9].set(
+            jnp.where(any_bonus, jnp.int8(ord('a') + 9), jnp.int8(0)),
+        )
+
+    inv_state = inv_state.replace(items=items, letters=letters)
+    return vendor_rng, inv_state
+
+
+_INI_INV_ROLE_DRAWS[Role.PRIEST] = _consume_ini_inv_priest_draws
 
 
 # ---------------------------------------------------------------------------
