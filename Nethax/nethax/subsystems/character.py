@@ -531,6 +531,22 @@ def _wand(type_id: int, buc: int = _BUC_UNCURSED) -> "Item":
                      bknown=True, dknown=True, rknown=True)
 
 
+def _coin(qty: int = 0) -> "Item":
+    """Build a COIN-class (gold) starting item — rendered as "N gold pieces".
+
+    Vendor sets ``u.umoney0`` (u_init.c role_init) and the gold object heads
+    the ``invent`` list, so NLE's inventory obs shows it as slot 0 with the
+    special letter ``$``.  ``type_id`` 410 = "gold piece" (objects.py:8384,
+    COIN_CLASS).  Coins are excluded from the BUC prefix (objnam.c:1318), so
+    ``buc_status`` is cosmetic here.  ``qty`` is a placeholder overwritten by
+    the per-role ini_inv replay's ``rnd(1000)`` draw.
+    """
+    from Nethax.nethax.subsystems.inventory import make_item
+    return make_item(category=ItemCategory.COIN, type_id=410, quantity=qty,
+                     weight=0, buc_status=_BUC_UNCURSED, identified=True,
+                     bknown=True, dknown=True, rknown=True)
+
+
 # ---------------------------------------------------------------------------
 # STARTING_INVENTORY
 # Each entry is a list of Item objects (pre-built, not names).
@@ -692,11 +708,32 @@ STARTING_INVENTORY: dict = {
         _weapon(ObjType.YA, 26),
         _armor(ObjType.SPLINT_MAIL),
     ],
-    # Tou: darts+2 x21, 2 extra healing potions, 4 scrolls of magic mapping,
-    #      Hawaiian shirt+0, expensive camera, credit card
-    # u_init.c Tourist[]:  DART spe=2.
+    # Tou: $ gold, darts+2 x21..40, 10 RANDOM foods, 2 extra healing potions,
+    #      4 scrolls of magic mapping, Hawaiian shirt+0, expensive camera,
+    #      credit card.  u_init.c Tourist[] (141-151) + PM_TOURIST (768-780):
+    #        Tourist[T_DARTS].trquan = rn1(20,21);  u.umoney0 = rnd(1000);
+    #        ini_inv(Tourist): DART, {UNDEF_TYP FOOD ×10}, POT_EXTRA_HEALING ×2,
+    #        SCR_MAGIC_MAPPING ×4, HAWAIIAN_SHIRT, EXPENSIVE_CAMERA, CREDIT_CARD.
+    #   Gold heads the invent list -> obs slot 0 ('$', not a lettered slot);
+    #   darts auto-quiver ("(at the ready)").  The 10 random foods are
+    #   mkobj(FOOD) rolls (rn2(1000) otyp-walk, addinv-merged by otyp into a
+    #   SEED-DYNAMIC number of stacks), so the whole inventory is rebuilt
+    #   compactly by _consume_ini_inv_tourist_draws in NLE_BYTEPARITY mode.
+    #   The 10 FOOD_RATION entries below are placeholders for those random
+    #   foods (types/quantities come from the mksobj replay, not this table).
     Role.TOURIST: [
-        _weapon(ObjType.DART, 21, enchant=2),
+        _coin(0),                                    # $ gold (qty = rnd(1000))
+        _weapon(ObjType.DART, 21, enchant=2),        # qty = rn1(20,21)
+        _food(ObjType.FOOD_RATION, 1),               # random-food placeholder 1
+        _food(ObjType.FOOD_RATION, 1),               # random-food placeholder 2
+        _food(ObjType.FOOD_RATION, 1),               # random-food placeholder 3
+        _food(ObjType.FOOD_RATION, 1),               # random-food placeholder 4
+        _food(ObjType.FOOD_RATION, 1),               # random-food placeholder 5
+        _food(ObjType.FOOD_RATION, 1),               # random-food placeholder 6
+        _food(ObjType.FOOD_RATION, 1),               # random-food placeholder 7
+        _food(ObjType.FOOD_RATION, 1),               # random-food placeholder 8
+        _food(ObjType.FOOD_RATION, 1),               # random-food placeholder 9
+        _food(ObjType.FOOD_RATION, 1),               # random-food placeholder 10
         _potion(ObjType.POT_EXTRA_HEALING, 2),
         _scroll(ObjType.SCR_MAGIC_MAPPING, 4),
         _armor(ObjType.HAWAIIAN_SHIRT),
@@ -845,7 +882,11 @@ _WORN_ARMOR_BY_ROLE: dict = {
     Role.RANGER:       {ArmorSlot.CLOAK: 4},
     Role.ROGUE:        {ArmorSlot.BODY: 2},
     Role.SAMURAI:      {ArmorSlot.BODY: 4},
-    Role.TOURIST:      {ArmorSlot.BODY: 3},
+    # HAWAIIAN_SHIRT is worn in the SHIRT slot (W_ARMU); index 14 in the
+    # static list (gold 0, dart 1, food 2-11, potion 12, scroll 13, shirt 14).
+    # In NLE_BYTEPARITY the shirt's real slot is dynamic, so
+    # _consume_ini_inv_tourist_draws sets worn_armor itself (see create_character).
+    Role.TOURIST:      {ArmorSlot.SHIRT: 14},
     Role.VALKYRIE:     {ArmorSlot.SHIELD: 2},
     Role.WIZARD:       {ArmorSlot.CLOAK: 1},
 }
@@ -2282,6 +2323,13 @@ def _mkobj_food_isaac(vrng):
                 if int(ent.nutrition) and not (
                         int(ent.generation_mask) & G_NOCORPSE):
                     corpsenm = mndx
+                    # set_tin_variety(RANDOM_TIN) (eat.c:1269-1272): draws
+                    # r = rn2(TTSZ - 1) = rn2(15) for the tin-variety spe.  The
+                    # ROTTEN->HOMEMADE remap for non-rotting corpses makes no
+                    # extra draw; spe isn't surfaced in the inv string (the
+                    # "tin of <corpse> meat" name comes from corpsenm), but the
+                    # draw MUST be consumed or every later food desyncs.
+                    vrng, _tv = rn2_jax(vrng, jnp.int32(15))
                     break
         vrng = _blessorcurse_eager(vrng, 10)
         vrng, r = rn2_jax(vrng, jnp.int32(6))  # generic FOOD tail (mkobj.c:880)
@@ -2473,6 +2521,217 @@ def _ini_inv_ranger(vendor_rng, inv_state, items_list, race):
 
 _INI_INV_ROLE_DRAWS[Role.KNIGHT] = _ini_inv_knight
 _INI_INV_ROLE_DRAWS[Role.RANGER] = _ini_inv_ranger
+
+
+def _consume_ini_inv_tourist_draws(vendor_rng, inv_state, items_list, race):
+    """PM_TOURIST ini_inv replay — u_init.c:141-151 (Tourist[]) + 768-780.
+
+    Vendor draw order::
+
+        role_init:  Tourist[T_DARTS].trquan = rn1(20, 21);   # dart stack qty
+                    u.umoney0               = rnd(1000);      # starting gold $
+        ini_inv(Tourist):  # trobj order
+          0  DART  (WEAPON, multigen+poisonable) -> _mksobj_weapon_draws(T, T);
+               spe forced +2 (trspe=2); opoisoned wiped (neutral, u_init.c:1095);
+               auto-quivered (is_missile -> setuqwep, u_init.c:1143-1145).
+          1  {UNDEF_TYP, FOOD_CLASS, 10} -> 10x mkobj(FOOD) = 10x
+               _mkobj_food_isaac (rn2(1000) otyp-walk + tin/egg/kelp tails),
+               addinv-merged by otyp -> SEED-DYNAMIC stack count.
+          2  POT_EXTRA_HEALING x2 -> 2x blessorcurse(4).
+          3  SCR_MAGIC_MAPPING x4 -> 4x blessorcurse(4).
+          4  HAWAIIAN_SHIRT (ARMOR) -> _mksobj_armor_draws; worn (W_ARMU).
+          5  EXPENSIVE_CAMERA (TOOL) -> spe = rn1(70, 30) (charges; trspe UNDEF
+               so kept, rendered "(0:spe)").
+          6  CREDIT_CARD (TOOL) -> no mksobj draws.
+        bonus cascade (u_init.c:772-779):  short-circuit rn2(25) chain ->
+          Tinopener / Leash / Towel / Magicmarker(rn1(70,30) spe).
+
+    Gold heads the invent list (obs slot 0, letter ``$`` which does NOT consume
+    an a-z letter); darts are slot 1 / letter ``a`` / "(at the ready)".  Because
+    the gold slot plus the seed-variable number of food stacks shift every
+    later item's position, the whole inventory is rebuilt compactly here rather
+    than patched into the static STARTING_INVENTORY placeholders.  Eager
+    (Python-int) — byte-parity char init runs single-seed under NETHAX_EAGER,
+    matching _orc_xtra_food / _mkobj_food_isaac.
+
+    Returns ``(vendor_rng, inv_state)``.
+
+    Citations
+    ---------
+    vendor/nle/src/u_init.c:141-151, 768-780   — Tourist[] trobj + PM_TOURIST
+    vendor/nle/src/u_init.c:1083-1145          — ini_inv coin/weapon/quiver
+    vendor/nle/src/mkobj.c:803-935, 879-885    — weapon/armor/tool/food mksobj
+    """
+    from Nethax.nethax.vendor_rng import rn1_jax, rnd_jax, rn2_jax
+    from Nethax.nethax.subsystems.inventory import (
+        InventoryState, MAX_INVENTORY_SLOTS, ArmorSlot as _AS,
+    )
+
+    _BLESSED = _BUC_BLESSED
+    _UNCURSED = _BUC_UNCURSED
+
+    # --- role_init pre-ini_inv draws (u_init.c:769-770) ---
+    vendor_rng, dq = rn1_jax(vendor_rng, jnp.int32(20), jnp.int32(21))  # 21..40
+    dart_qty = int(dq)
+    vendor_rng, gv = rnd_jax(vendor_rng, jnp.int32(1000))               # 1..1000
+    gold = int(gv)
+
+    # --- ini_inv(Tourist) mksobj draws (trobj order) ---
+    # 0. DART — multigen + poisonable weapon cascade.
+    vendor_rng, dart_blessed = _mksobj_weapon_draws(vendor_rng, True, True)
+
+    # 1. 10 random foods — replayed in draw order and addinv-merged by full
+    #    identity (otyp + spe + corpsenm), first-seen order.  Merging by otyp
+    #    ALONE is wrong: two tins with different corpse contents (e.g. "tin of
+    #    jackal meat" vs "tin of lichen", both otyp TIN) are distinct objects
+    #    and stay in separate stacks (vendor invent.c::merged).
+    foods = []  # [otyp, quan, spe, corpsenm]
+    for _ in range(10):
+        vendor_rng, otyp, quan, spe, corpsenm = _mkobj_food_isaac(vendor_rng)
+        for f in foods:
+            if f[0] == otyp and f[2] == spe and f[3] == corpsenm:
+                f[1] += quan
+                break
+        else:
+            foods.append([otyp, quan, spe, corpsenm])
+
+    # 2. POT_EXTRA_HEALING x2 — blessorcurse(4) each.
+    pot_bless = []
+    for _ in range(2):
+        vendor_rng, bl = _mksobj_blessorcurse(vendor_rng, 4)
+        pot_bless.append(bool(bl))
+
+    # 3. SCR_MAGIC_MAPPING x4 — blessorcurse(4) each.
+    scr_bless = []
+    for _ in range(4):
+        vendor_rng, bl = _mksobj_blessorcurse(vendor_rng, 4)
+        scr_bless.append(bool(bl))
+
+    # 4. HAWAIIAN_SHIRT — armor cascade.
+    vendor_rng, shirt_blessed = _mksobj_armor_draws(vendor_rng)
+
+    # 5. EXPENSIVE_CAMERA — spe = rn1(70, 30) (kept as charges).
+    vendor_rng, cam_v = rn1_jax(vendor_rng, jnp.int32(70), jnp.int32(30))
+    cam_spe = int(cam_v)
+
+    # 6. CREDIT_CARD — no mksobj draws.
+
+    # --- bonus cascade (short-circuit rn2(25) chain) ---
+    bonus = None  # (type_id, spe)
+    vendor_rng, b1 = rn2_jax(vendor_rng, jnp.int32(25))
+    if int(b1) == 0:
+        bonus = (214, 0)                       # TIN_OPENER
+    else:
+        vendor_rng, b2 = rn2_jax(vendor_rng, jnp.int32(25))
+        if int(b2) == 0:
+            bonus = (211, 0)                   # LEASH
+        else:
+            vendor_rng, b3 = rn2_jax(vendor_rng, jnp.int32(25))
+            if int(b3) == 0:
+                bonus = (209, 0)               # TOWEL
+            else:
+                vendor_rng, b4 = rn2_jax(vendor_rng, jnp.int32(25))
+                if int(b4) == 0:
+                    vendor_rng, mmv = rn1_jax(
+                        vendor_rng, jnp.int32(70), jnp.int32(30))
+                    bonus = (217, int(mmv))    # MAGIC_MARKER (spe kept)
+
+    # --- rebuild the compact inventory (eager) ---
+    # slot 0 = gold ($), slot 1 = darts (a), then food stacks, potions,
+    # scrolls, shirt, camera, credit card, optional bonus.
+    gold_item = _coin(gold)
+    dart_item = _weapon(
+        ObjType.DART, dart_qty, enchant=2,
+        buc=_BLESSED if bool(dart_blessed) else _UNCURSED,
+    )
+    inv_state = InventoryState.from_items([gold_item, dart_item])
+
+    def _append(inv_st, item):
+        its = inv_st.items
+        empty = 0
+        for j in range(MAX_INVENTORY_SLOTS):
+            if int(its.category[j]) == 0:
+                empty = j
+                break
+        ni = jax.tree_util.tree_map(
+            lambda a, v: a.at[empty].set(v), its, item)
+        return inv_st.replace(items=ni), empty
+
+    def _stacks(bless_list):
+        """Group per-object blessed flags into addinv stacks (merge same BUC,
+        first-seen order); cursed is wiped so BUC is BLESSED or UNCURSED."""
+        groups = []  # [qty, buc]
+        for bl in bless_list:
+            buc = _BLESSED if bool(bl) else _UNCURSED
+            for g in groups:
+                if g[1] == buc:
+                    g[0] += 1
+                    break
+            else:
+                groups.append([1, buc])
+        return groups
+
+    # Food stacks (already merged by identity), in first-seen order.
+    for (otyp, quan, spe, corpsenm) in foods:
+        fitem = _food(otyp, quan)
+        if spe:
+            fitem = fitem.replace(
+                enchantment=jnp.asarray(spe, dtype=fitem.enchantment.dtype))
+        if corpsenm >= 0:
+            fitem = fitem.replace(
+                corpse_entry_idx=jnp.asarray(
+                    corpsenm, dtype=fitem.corpse_entry_idx.dtype))
+        inv_state, _ = _append(inv_state, fitem)
+
+    for qty, buc in _stacks(pot_bless):
+        inv_state, _ = _append(inv_state, _potion(283, qty, buc))  # POT_EXTRA_HEALING
+    for qty, buc in _stacks(scr_bless):
+        inv_state, _ = _append(inv_state, _scroll(312, qty, buc))  # SCR_MAGIC_MAPPING
+
+    shirt = _armor(
+        115, enchant=0,  # HAWAIIAN_SHIRT
+        buc=_BLESSED if bool(shirt_blessed) else _UNCURSED,
+    )
+    inv_state, shirt_slot = _append(inv_state, shirt)
+
+    camera = _tool(204)  # EXPENSIVE_CAMERA
+    camera = camera.replace(
+        charges=jnp.asarray(cam_spe, dtype=camera.charges.dtype),
+        enchantment=jnp.asarray(cam_spe, dtype=camera.enchantment.dtype),
+    )
+    inv_state, _ = _append(inv_state, camera)
+
+    inv_state, _ = _append(inv_state, _tool(198))  # CREDIT_CARD
+
+    if bonus is not None:
+        b_item = _tool(bonus[0])
+        if bonus[0] == 217:  # MAGIC_MARKER "(0:spe)" charges
+            b_item = b_item.replace(
+                charges=jnp.asarray(bonus[1], dtype=b_item.charges.dtype),
+                enchantment=jnp.asarray(bonus[1], dtype=b_item.enchantment.dtype),
+            )
+        inv_state, _ = _append(inv_state, b_item)
+
+    # --- letters (slot0='$', occupied slot k>=1 -> 'a'+(k-1)), quiver, worn ---
+    cats = inv_state.items.category
+    letters = inv_state.letters
+    for j in range(MAX_INVENTORY_SLOTS):
+        if int(cats[j]) == 0:
+            lv = 0
+        elif j == 0:
+            lv = ord('$')
+        else:
+            lv = ord('a') + (j - 1)
+        letters = letters.at[j].set(jnp.int8(lv))
+    worn = jnp.full((7,), -1, dtype=jnp.int8)
+    worn = worn.at[int(_AS.SHIRT)].set(jnp.int8(shirt_slot))
+    inv_state = inv_state.replace(
+        letters=letters, quiver=jnp.int8(1), worn_armor=worn,
+    )
+    return vendor_rng, inv_state
+
+
+_INI_INV_ROLE_DRAWS[Role.TOURIST] = _consume_ini_inv_tourist_draws
 
 
 # ---------------------------------------------------------------------------
@@ -3453,14 +3712,21 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         inv_state = inv_state.replace(swap_weapon=jnp.int8(1), quiver=jnp.int8(2))
 
     # --- Wear starting armor ---
-    worn_armor = jnp.full((7,), -1, dtype=jnp.int8)
-    armor_map  = _WORN_ARMOR_BY_ROLE.get(role, {})
-    for armor_slot, item_idx in armor_map.items():
-        if item_idx < len(items_list):
-            item = items_list[item_idx]
-            if int(item.category) == int(ItemCategory.ARMOR):
-                worn_armor = worn_armor.at[int(armor_slot)].set(jnp.int8(item_idx))
-    inv_state = inv_state.replace(worn_armor=worn_armor)
+    # NLE_BYTEPARITY Tourist: the Hawaiian shirt's worn slot is dynamic (the
+    # gold slot 0 + seed-variable food-stack count shift it), so
+    # _consume_ini_inv_tourist_draws already set worn_armor — preserve it
+    # instead of the static-index map.
+    if vendor_rng is not None and role == Role.TOURIST:
+        worn_armor = inv_state.worn_armor
+    else:
+        worn_armor = jnp.full((7,), -1, dtype=jnp.int8)
+        armor_map  = _WORN_ARMOR_BY_ROLE.get(role, {})
+        for armor_slot, item_idx in armor_map.items():
+            if item_idx < len(items_list):
+                item = items_list[item_idx]
+                if int(item.category) == int(ItemCategory.ARMOR):
+                    worn_armor = worn_armor.at[int(armor_slot)].set(jnp.int8(item_idx))
+        inv_state = inv_state.replace(worn_armor=worn_armor)
 
     # --- Compute AC ---
     player_ac = compute_ac(inv_state.items, worn_armor)
