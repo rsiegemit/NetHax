@@ -707,7 +707,8 @@ STARTING_INVENTORY: dict = {
     # (u_init.c Valkyrie[] 160-166).  trbless=UNDEF_BLESS for all → UNCURSED.
     # Audit L #25: added the missing FOOD_RATION×1.
     Role.VALKYRIE: [
-        _weapon(ObjType.SPEAR, enchant=1),
+        # Vendor Valkyrie[0] is LONG_SWORD spe=1 (not spear); glyph 1943.
+        _weapon(ObjType.LONG_SWORD, enchant=1),
         _weapon(ObjType.DAGGER),
         _armor(ObjType.SMALL_SHIELD, enchant=3),
         _food(ObjType.FOOD_RATION, 1),
@@ -2440,6 +2441,468 @@ _INI_INV_ROLE_DRAWS[Role.RANGER] = _ini_inv_ranger
 
 
 # ---------------------------------------------------------------------------
+# Per-role ini_inv mkobj-draw ports — Barbarian / Valkyrie / Samurai.
+#
+# One contiguous block: shared vmap-safe mksobj draw helpers, then the three
+# role functions, then the ``_INI_INV_ROLE_DRAWS`` registrations.  Every helper
+# mirrors the conditional-advance style of ``_consume_ini_inv_archeologist_draws``
+# / ``_consume_ini_inv_rogue_draws`` above: each vendor branch's ISAAC64 draw is
+# computed unconditionally and adopted only when its predicate holds, so the
+# byte stream advances by exactly the vendor draw count under both eager and
+# vmap execution.  Draw sequences were confirmed against live NETHAX_RN2_TRACE
+# captures of the vendor MiniHack reset (bar/val/sam, seed 0).
+#
+# Registry contract: ``fn(vendor_rng, inv_state, items_list) -> (vendor_rng,
+# inv_state)``.  Runs at the same stream position vendor's ``ini_inv`` does
+# (after items are built from the trobj table, before init_attr).
+# ---------------------------------------------------------------------------
+
+def _ini_inv_cadv(rng_orig, rng_advanced, take):
+    """Adopt ``rng_advanced`` iff ``take`` (vmap-safe short-circuit)."""
+    return jax.tree_util.tree_map(
+        lambda a, o: jnp.where(take, a, o), rng_advanced, rng_orig,
+    )
+
+
+def _mksobj_weapon_class(vrng, is_multigen: bool, is_poisonable: bool):
+    """Consume the ISAAC64 draws of ``mksobj(otyp, TRUE, FALSE)`` for a
+    WEAPON_CLASS item and return ``(vrng, blessed_bool)``.
+
+    Faithful port of vendor mkobj.c:803-814::
+
+        otmp->quan = is_multigen(otmp) ? rn1(6, 6) : 1L;   // rn2(6) if multigen
+        if (!rn2(11)) {          otmp->spe = rne(3); otmp->blessed = rn2(2); }
+        else if (!rn2(10)) {     curse; otmp->spe = -rne(3); }
+        else                     blessorcurse(otmp, 10);   // rn2(10)[+ rn2(2)]
+        if (is_poisonable(otmp) && !rn2(100)) otmp->opoisoned = 1;   // rn2(100)
+
+    ``artif`` is FALSE in ini_inv so the trailing ``rn2(20)`` never fires.  The
+    ``blessed`` flag is what ini_inv keeps for trbless==UNDEF_BLESS items; the
+    curse branch is wiped to uncursed by ini_inv (u_init.c:1094), so it maps to
+    ``blessed=False``.
+    Cite: vendor/nle/src/mkobj.c:803-814; vendor/nle/include/obj.h:197-204.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax, rne_jax
+
+    # Multigen quantity draw (rn1(6,6) → rn2(6)); value discarded because
+    # ini_inv overrides WEAPON_CLASS quan from trquan (u_init.c:1098).
+    if is_multigen:
+        vrng, _ = rn2_jax(vrng, jnp.int32(6))
+
+    vrng, x1 = rn2_jax(vrng, jnp.int32(11))
+    path_a = (x1 == jnp.int32(0))
+    not_a = jnp.logical_not(path_a)
+
+    # Path A: spe = rne(3); blessed = rn2(2).
+    vr_a, _ = rne_jax(vrng, jnp.int32(3))
+    vr_a, a_bless = rn2_jax(vr_a, jnp.int32(2))
+    vr_a = _ini_inv_cadv(vrng, vr_a, path_a)
+
+    # Not-A: x2 = rn2(10), drawn only when x1 != 0.
+    vr_x2, x2_raw = rn2_jax(vrng, jnp.int32(10))
+    vr_x2 = _ini_inv_cadv(vrng, vr_x2, not_a)
+    x2 = jnp.where(not_a, x2_raw, jnp.int32(1))
+    path_b = jnp.logical_and(not_a, x2 == jnp.int32(0))
+    path_c = jnp.logical_and(not_a, x2 != jnp.int32(0))
+
+    # Path B: spe = -rne(3) (curse → wiped to uncursed).
+    vr_b, _ = rne_jax(vr_x2, jnp.int32(3))
+    # Path C: blessorcurse(10) → rn2(10) [+ rn2(2) if 0].
+    vr_c, bc1 = rn2_jax(vr_x2, jnp.int32(10))
+    vr_c2, bc2 = rn2_jax(vr_c, jnp.int32(2))
+    vr_c = _ini_inv_cadv(vr_c, vr_c2, bc1 == jnp.int32(0))
+    c_bless = jnp.logical_and(bc1 == jnp.int32(0), bc2 != jnp.int32(0))
+
+    vr_bc = _ini_inv_cadv(vr_x2, vr_b, path_b)
+    vr_bc = _ini_inv_cadv(vr_bc, vr_c, path_c)
+    vrng = _ini_inv_cadv(vr_bc, vr_a, path_a)
+
+    blessed = jnp.logical_or(
+        jnp.logical_and(path_a, a_bless != jnp.int32(0)),
+        jnp.logical_and(path_c, c_bless),
+    )
+
+    # is_poisonable → rn2(100) (result discarded; opoisoned not tracked for the
+    # starting kit, and ini_inv wipes opoisoned for non-chaotic anyway).
+    if is_poisonable:
+        vrng, _ = rn2_jax(vrng, jnp.int32(100))
+
+    return vrng, blessed
+
+
+def _mksobj_armor_class(vrng):
+    """Consume the ISAAC64 draws of ``mksobj`` for an ARMOR_CLASS item that is
+    NOT one of the special-cursed helms/boots/gauntlets, and return
+    ``(vrng, blessed_bool)``.
+
+    Faithful port of vendor mkobj.c:992-1004 (the special-item disjunct is
+    inert for RING_MAIL / SMALL_SHIELD / SPLINT_MAIL)::
+
+        if (rn2(10) && !rn2(11)) {   curse; otmp->spe = -rne(3); }
+        else if (!rn2(10)) {         otmp->blessed = rn2(2); otmp->spe = rne(3); }
+        else                         blessorcurse(otmp, 10);
+
+    Short-circuit: X1=rn2(10) always; X2=rn2(11) only if X1!=0.
+    Cite: vendor/nle/src/mkobj.c:992-1004.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax, rne_jax
+
+    vrng, X1 = rn2_jax(vrng, jnp.int32(10))
+    X1_nz = (X1 != jnp.int32(0))
+    vr_x2, X2_raw = rn2_jax(vrng, jnp.int32(11))
+    vrng = _ini_inv_cadv(vrng, vr_x2, X1_nz)
+    X2 = jnp.where(X1_nz, X2_raw, jnp.int32(1))
+    path_a = jnp.logical_and(X1_nz, X2 == jnp.int32(0))
+    not_a = jnp.logical_not(path_a)
+
+    # Path A: spe = -rne(3) (curse → wiped to uncursed).
+    vr_a, _ = rne_jax(vrng, jnp.int32(3))
+    vr_a = _ini_inv_cadv(vrng, vr_a, path_a)
+
+    # Not-A: X3 = rn2(10).
+    vr_x3, X3_raw = rn2_jax(vrng, jnp.int32(10))
+    vr_x3 = _ini_inv_cadv(vrng, vr_x3, not_a)
+    X3 = jnp.where(not_a, X3_raw, jnp.int32(1))
+    path_b = jnp.logical_and(not_a, X3 == jnp.int32(0))
+    path_c = jnp.logical_and(not_a, jnp.logical_not(path_b))
+
+    # Path B: blessed = rn2(2); spe = rne(3).
+    vr_b, b_bless = rn2_jax(vr_x3, jnp.int32(2))
+    vr_b, _ = rne_jax(vr_b, jnp.int32(3))
+    # Path C: blessorcurse(10) → rn2(10) [+ rn2(2) if 0].
+    vr_c, bc1 = rn2_jax(vr_x3, jnp.int32(10))
+    vr_c2, bc2 = rn2_jax(vr_c, jnp.int32(2))
+    vr_c = _ini_inv_cadv(vr_c, vr_c2, bc1 == jnp.int32(0))
+
+    vr_bc = _ini_inv_cadv(vr_x3, vr_b, path_b)
+    vr_bc = _ini_inv_cadv(vr_bc, vr_c, path_c)
+    vrng = _ini_inv_cadv(vr_bc, vr_a, path_a)
+
+    blessed = jnp.logical_or(
+        jnp.logical_and(path_b, b_bless != jnp.int32(0)),
+        jnp.logical_and(path_c,
+                        jnp.logical_and(bc1 == jnp.int32(0), bc2 != jnp.int32(0))),
+    )
+    return vrng, blessed
+
+
+def _mksobj_food_ration(vrng):
+    """Consume the single ``rn2(6)`` a FOOD_RATION mksobj call emits and return
+    ``(vrng, quan)`` where ``quan`` is 2 iff ``!rn2(6)`` else 1.
+
+    FOOD_RATION hits none of the CORPSE/EGG/TIN/SLIME/KELP inner cases and is
+    not a pudding, so mkobj.c:880-883 (``!rn2(6) -> quan = 2``) is the only
+    draw.  ini_inv does NOT override FOOD quan (only WEAPON/TOOL), so the
+    rolled 1/2 is the stack size.  Cite: vendor/nle/src/mkobj.c:819-884.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax
+    vrng, r = rn2_jax(vrng, jnp.int32(6))
+    quan = jnp.where(r == jnp.int32(0), jnp.int32(2), jnp.int32(1))
+    return vrng, quan
+
+
+def _mksobj_oil_lamp(vrng):
+    """Consume the ISAAC64 draws for ``mksobj(OIL_LAMP)`` (Lamp bonus item) and
+    return ``(vrng, blessed_bool)``.
+
+    Vendor mkobj.c:909-913: ``otmp->age = rn1(500, 1000)`` → rn2(500); then
+    ``blessorcurse(otmp, 5)`` → rn2(5) [+ rn2(2) if 0].
+    Cite: vendor/nle/src/mkobj.c:909-913.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax
+    vrng, _ = rn2_jax(vrng, jnp.int32(500))       # rn1(500,1000) age
+    vrng, bc1 = rn2_jax(vrng, jnp.int32(5))        # blessorcurse(5)
+    vr_bonus, bc2 = rn2_jax(vrng, jnp.int32(2))
+    vrng = _ini_inv_cadv(vrng, vr_bonus, bc1 == jnp.int32(0))
+    blessed = jnp.logical_and(bc1 == jnp.int32(0), bc2 != jnp.int32(0))
+    return vrng, blessed
+
+
+def _add_bonus_item(inv_state, slot: int, take, item):
+    """Conditionally place ``item`` (a scalar Item pytree) at inventory ``slot``
+    with inventory letter ``chr(ord('a') + slot)``, gated on ``take``
+    (vmap-safe).  When ``take`` is False the slot is left empty.
+
+    Mirrors the Archeologist bonus-item placement: all prior slots are filled
+    so the letter is simply ``'a' + slot``.  Cite: vendor/nle/src/u_init.c
+    ini_inv appends optional items after the fixed trobj list.
+    """
+    from Nethax.nethax.subsystems.inventory import make_empty_item
+    empty = make_empty_item()
+    chosen = jax.tree_util.tree_map(
+        lambda it, em: jnp.where(take, it, em), item, empty,
+    )
+    new_items = jax.tree_util.tree_map(
+        lambda arr, val: arr.at[slot].set(val), inv_state.items, chosen,
+    )
+    letter = jnp.where(take, jnp.int8(ord('a') + slot), jnp.int8(0))
+    new_letters = inv_state.letters.at[slot].set(letter)
+    return inv_state.replace(items=new_items, letters=new_letters)
+
+
+def _make_oil_lamp(blessed):
+    """Build the OIL_LAMP bonus Item (type 202).  BUC from the rolled
+    blessorcurse(5) (ini_inv keeps it — Lamp trbless is 0 only for the fixed
+    quan, blessorcurse sets the bit).  Cite: vendor/nle/src/u_init.c:182."""
+    from Nethax.nethax.subsystems.inventory import make_item
+    buc = jnp.where(blessed, jnp.int32(_BUC_BLESSED), jnp.int32(_BUC_UNCURSED))
+    return make_item(
+        category=int(ItemCategory.TOOL), type_id=202, quantity=1, weight=20,
+        buc_status=buc, identified=True, bknown=True, dknown=True, rknown=True,
+    )
+
+
+def _make_blindfold():
+    """Build the BLINDFOLD bonus Item (type 208).  Blindfold trbless is 0 →
+    always uncursed.  Cite: vendor/nle/src/u_init.c:184."""
+    from Nethax.nethax.subsystems.inventory import make_item
+    return make_item(
+        category=int(ItemCategory.TOOL), type_id=208, quantity=1, weight=2,
+        buc_status=_BUC_UNCURSED, identified=True,
+        bknown=True, dknown=True, rknown=True,
+    )
+
+
+def _apply_buc_blessed(inv_state, slot: int, blessed):
+    """Set inv slot ``slot`` buc_status to BLESSED iff ``blessed`` else UNCURSED
+    (both bknown, matching ini_inv u_init.c:1088-1094)."""
+    buc = inv_state.items.buc_status
+    val = jnp.where(blessed,
+                    jnp.asarray(_BUC_BLESSED, dtype=buc.dtype),
+                    jnp.asarray(_BUC_UNCURSED, dtype=buc.dtype))
+    new_items = inv_state.items.replace(buc_status=buc.at[slot].set(val))
+    return inv_state.replace(items=new_items)
+
+
+def _consume_ini_inv_barbarian_draws(vendor_rng, inv_state, items_list, race=None):
+    """ini_inv(Barbarian) port — u_init.c:680-691.
+
+    Sequence (confirmed by NETHAX_RN2_TRACE, seed 0)::
+
+        rn2(100)                         # >= 50 -> BATTLE_AXE/SHORT_SWORD variant
+        ini_inv(Barbarian):
+          weapon0 (2H-sword | battle-axe)  WEAPON_CLASS  (melee: no multigen/poison)
+          weapon1 (axe | short sword)      WEAPON_CLASS
+          RING_MAIL                        ARMOR_CLASS
+          FOOD_RATION x1                   FOOD_CLASS -> rn2(6)
+        rn2(6)                           # !rn2(6) -> ini_inv(Lamp)
+
+    Rewrites slots 0/1 to the rolled weapon variant (glyph 1934 = BATTLE_AXE
+    on the >=50 branch), applies the per-item blessed bits, and the rolled
+    FOOD_RATION quantity.  All trspe are fixed (0), so enchantment is unchanged.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax
+
+    # rn2(100) variant-selection roll (BEFORE ini_inv).  u_init.c:681.
+    vendor_rng, sel = rn2_jax(vendor_rng, jnp.int32(100))
+    variant_hi = (sel >= jnp.int32(50))
+
+    # mksobj draws for the four Barbarian items, in trobj order.  The weapon
+    # draw sequence is identical for either variant (all four melee weapons are
+    # non-multigen / non-poisonable), so the swap does not change draw counts.
+    vendor_rng, w0_blessed = _mksobj_weapon_class(vendor_rng, False, False)
+    vendor_rng, w1_blessed = _mksobj_weapon_class(vendor_rng, False, False)
+    vendor_rng, rm_blessed = _mksobj_armor_class(vendor_rng)
+    vendor_rng, food_qty = _mksobj_food_ration(vendor_rng)
+
+    # rn2(6) Lamp gate + conditional OIL_LAMP mksobj draws (u_init.c:686-687).
+    vendor_rng, lamp_gate = rn2_jax(vendor_rng, jnp.int32(6))
+    take_lamp = (lamp_gate == jnp.int32(0))
+    vr_lamp, lamp_blessed = _mksobj_oil_lamp(vendor_rng)
+    vendor_rng = _ini_inv_cadv(vendor_rng, vr_lamp, take_lamp)
+
+    # Rewrite slots 0/1 to the BATTLE_AXE/SHORT_SWORD variant when rolled.
+    items = inv_state.items
+    tid = items.type_id
+    wt = items.weight
+    tid = tid.at[0].set(jnp.where(
+        variant_hi, jnp.asarray(ObjType.BATTLE_AXE, dtype=tid.dtype), tid[0]))
+    tid = tid.at[1].set(jnp.where(
+        variant_hi, jnp.asarray(ObjType.SHORT_SWORD, dtype=tid.dtype), tid[1]))
+    wt = wt.at[0].set(jnp.where(
+        variant_hi,
+        jnp.asarray(_WEAPON_WEIGHT[ObjType.BATTLE_AXE], dtype=wt.dtype), wt[0]))
+    wt = wt.at[1].set(jnp.where(
+        variant_hi,
+        jnp.asarray(_WEAPON_WEIGHT[ObjType.SHORT_SWORD], dtype=wt.dtype), wt[1]))
+    # FOOD_RATION rolled quantity -> slot 3.
+    quantity = items.quantity.at[3].set(food_qty.astype(items.quantity.dtype))
+    inv_state = inv_state.replace(
+        items=items.replace(type_id=tid, weight=wt, quantity=quantity))
+
+    # Per-item blessed bits (trbless == UNDEF_BLESS for weapons + ring mail).
+    inv_state = _apply_buc_blessed(inv_state, 0, w0_blessed)
+    inv_state = _apply_buc_blessed(inv_state, 1, w1_blessed)
+    inv_state = _apply_buc_blessed(inv_state, 2, rm_blessed)
+    # Optional OIL_LAMP bonus (u_init.c:686-687) at the next slot (4).
+    inv_state = _add_bonus_item(inv_state, 4, take_lamp,
+                                _make_oil_lamp(lamp_blessed))
+    return vendor_rng, inv_state
+
+
+def _consume_ini_inv_valkyrie_draws(vendor_rng, inv_state, items_list, race=None):
+    """ini_inv(Valkyrie) port — u_init.c:782-785.
+
+    Sequence (confirmed by NETHAX_RN2_TRACE, seed 0)::
+
+        ini_inv(Valkyrie):
+          LONG_SWORD    WEAPON_CLASS
+          DAGGER        WEAPON_CLASS   (daggers are NOT is_poisonable here)
+          SMALL_SHIELD  ARMOR_CLASS
+          FOOD_RATION x1 FOOD_CLASS -> rn2(6)
+        rn2(6)          # !rn2(6) -> ini_inv(Lamp)
+
+    Applies the per-item blessed bits and the rolled FOOD_RATION quantity.
+    The LONG_SWORD spe=1 / SMALL_SHIELD spe=3 come from trspe (static table).
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax
+
+    vendor_rng, ls_blessed = _mksobj_weapon_class(vendor_rng, False, False)
+    vendor_rng, dg_blessed = _mksobj_weapon_class(vendor_rng, False, False)
+    vendor_rng, sh_blessed = _mksobj_armor_class(vendor_rng)
+    vendor_rng, food_qty = _mksobj_food_ration(vendor_rng)
+
+    vendor_rng, lamp_gate = rn2_jax(vendor_rng, jnp.int32(6))
+    take_lamp = (lamp_gate == jnp.int32(0))
+    vr_lamp, lamp_blessed = _mksobj_oil_lamp(vendor_rng)
+    vendor_rng = _ini_inv_cadv(vendor_rng, vr_lamp, take_lamp)
+
+    items = inv_state.items
+    quantity = items.quantity.at[3].set(food_qty.astype(items.quantity.dtype))
+    inv_state = inv_state.replace(items=items.replace(quantity=quantity))
+    inv_state = _apply_buc_blessed(inv_state, 0, ls_blessed)
+    inv_state = _apply_buc_blessed(inv_state, 1, dg_blessed)
+    inv_state = _apply_buc_blessed(inv_state, 2, sh_blessed)
+    # Optional OIL_LAMP bonus (u_init.c:784-785) at the next slot (4).
+    inv_state = _add_bonus_item(inv_state, 4, take_lamp,
+                                _make_oil_lamp(lamp_blessed))
+    return vendor_rng, inv_state
+
+
+def _consume_ini_inv_samurai_draws(vendor_rng, inv_state, items_list, race=None):
+    """ini_inv(Samurai) port — u_init.c:759-763.
+
+    Sequence (confirmed by NETHAX_RN2_TRACE, seed 0)::
+
+        rn2(20)                         # YA quantity = rn1(20,26) = rn2(20)+26
+        ini_inv(Samurai):
+          KATANA        WEAPON_CLASS
+          SHORT_SWORD   WEAPON_CLASS   (rendered "wakizashi" via inv_strs)
+          YUMI          WEAPON_CLASS   (a bow: NOT multigen)
+          YA            WEAPON_CLASS   (multigen + poisonable: rn2(6)+cascade+rn2(100))
+          SPLINT_MAIL   ARMOR_CLASS
+        rn2(5)          # !rn2(5) -> ini_inv(Blindfold)
+
+    Applies the per-item blessed bits and the rolled YA stack quantity (slot 3).
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax
+
+    # YA quantity = rn1(20, 26) (BEFORE ini_inv).  u_init.c:760.
+    vendor_rng, ya_roll = rn2_jax(vendor_rng, jnp.int32(20))
+    ya_qty = ya_roll + jnp.int32(26)
+
+    vendor_rng, k_blessed = _mksobj_weapon_class(vendor_rng, False, False)   # KATANA
+    vendor_rng, w_blessed = _mksobj_weapon_class(vendor_rng, False, False)   # wakizashi
+    vendor_rng, y_blessed = _mksobj_weapon_class(vendor_rng, False, False)   # YUMI (bow)
+    vendor_rng, a_blessed = _mksobj_weapon_class(vendor_rng, True, True)     # YA (ammo)
+    vendor_rng, sm_blessed = _mksobj_armor_class(vendor_rng)                 # SPLINT_MAIL
+
+    # rn2(5) Blindfold gate (BLINDFOLD is a plain tool → no mksobj draws).
+    vendor_rng, blind_gate = rn2_jax(vendor_rng, jnp.int32(5))
+    take_blindfold = (blind_gate == jnp.int32(0))
+
+    items = inv_state.items
+    quantity = items.quantity.at[3].set(ya_qty.astype(items.quantity.dtype))
+    # weight tracks quantity for ammo (per-unit YA weight = static/26).
+    inv_state = inv_state.replace(items=items.replace(quantity=quantity))
+    inv_state = _apply_buc_blessed(inv_state, 0, k_blessed)
+    inv_state = _apply_buc_blessed(inv_state, 1, w_blessed)
+    inv_state = _apply_buc_blessed(inv_state, 2, y_blessed)
+    inv_state = _apply_buc_blessed(inv_state, 3, a_blessed)
+    inv_state = _apply_buc_blessed(inv_state, 4, sm_blessed)
+
+    # Lacquered armor for Samurai: SPLINT_MAIL (slot 4) is made erosion-proof
+    # and its rustproofing is known at character start (moves <= 1), rendering
+    # "rustproof".  Cite: vendor/nle/src/mkobj.c:1007-1013.
+    its = inv_state.items
+    inv_state = inv_state.replace(items=its.replace(
+        oerodeproof=its.oerodeproof.at[4].set(jnp.bool_(True)),
+        rknown=its.rknown.at[4].set(jnp.bool_(True)),
+    ))
+    # Optional BLINDFOLD bonus (u_init.c:762-763) at the next slot (5).
+    inv_state = _add_bonus_item(inv_state, 5, take_blindfold, _make_blindfold())
+    return vendor_rng, inv_state
+
+
+_INI_INV_ROLE_DRAWS[Role.BARBARIAN] = _consume_ini_inv_barbarian_draws
+_INI_INV_ROLE_DRAWS[Role.VALKYRIE] = _consume_ini_inv_valkyrie_draws
+_INI_INV_ROLE_DRAWS[Role.SAMURAI] = _consume_ini_inv_samurai_draws
+
+
+# Race-based initial-inventory substitutions — vendor u_init.c:203-232 inv_subs[].
+# ini_inv swaps the object type for non-human races (mkobj.c:1057-1071) as a
+# pure otyp change with NO extra ISAAC64 draws.  {Race: [(from_otyp, to_otyp)]};
+# otyp values are the canonical vendor object ids (see constants/objects.py).
+# Applied (via _apply_race_inv_subs) only for the roles this module ports below;
+# it never touches roles it does not special-case.
+_INV_SUBS_BY_RACE = {
+    Race.ELF: [
+        (17, 18),    # DAGGER -> ELVEN_DAGGER
+        (10, 11),    # SPEAR -> ELVEN_SPEAR
+        (29, 30),    # SHORT_SWORD -> ELVEN_SHORT_SWORD
+        (65, 66),    # BOW -> ELVEN_BOW
+        (1, 2),      # ARROW -> ELVEN_ARROW
+        (78, 71),    # HELMET -> ELVEN_LEATHER_HELM
+        (128, 118),  # CLOAK_OF_DISPLACEMENT -> ELVEN_CLOAK
+        (267, 266),  # CRAM_RATION -> LEMBAS_WAFER
+    ],
+    Race.ORC: [
+        (17, 19),    # DAGGER -> ORCISH_DAGGER
+        (10, 12),    # SPEAR -> ORCISH_SPEAR
+        (29, 31),    # SHORT_SWORD -> ORCISH_SHORT_SWORD
+        (65, 67),    # BOW -> ORCISH_BOW
+        (1, 3),      # ARROW -> ORCISH_ARROW
+        (78, 72),    # HELMET -> ORCISH_HELM
+        (129, 132),  # SMALL_SHIELD -> ORCISH_SHIELD
+        (111, 112),  # RING_MAIL -> ORCISH_RING_MAIL
+        (107, 108),  # CHAIN_MAIL -> ORCISH_CHAIN_MAIL
+        (267, 239),  # CRAM_RATION -> TRIPE_RATION
+        (266, 239),  # LEMBAS_WAFER -> TRIPE_RATION
+    ],
+    Race.DWARF: [
+        (10, 13),    # SPEAR -> DWARVISH_SPEAR
+        (29, 32),    # SHORT_SWORD -> DWARVISH_SHORT_SWORD
+        (78, 73),    # HELMET -> DWARVISH_IRON_HELM
+        (266, 267),  # LEMBAS_WAFER -> CRAM_RATION
+    ],
+    Race.GNOME: [
+        (65, 70),    # BOW -> CROSSBOW
+        (1, 6),      # ARROW -> CROSSBOW_BOLT
+    ],
+}
+
+
+def _apply_race_inv_subs(inv_state, race):
+    """Apply vendor's race-based initial-inventory otyp substitutions to the
+    already-built inventory (vendor u_init.c inv_subs[] / mkobj.c:1057-1071).
+
+    Pure otyp swap — no ISAAC64 draws — so it runs after the mksobj-draw port.
+    ``race`` is a concrete Race enum (create_character's Python arg), so the
+    per-race sub list is chosen at trace-build time; the per-slot swap is a
+    vmap-safe ``jnp.where`` over the ``type_id`` array (glyph + rendered name
+    both derive from type_id).  Human (no entry) is a no-op.
+    """
+    subs = _INV_SUBS_BY_RACE.get(race)
+    if not subs:
+        return inv_state
+    tid = inv_state.items.type_id
+    for frm, to in subs:
+        tid = jnp.where(tid == jnp.asarray(frm, dtype=tid.dtype),
+                        jnp.asarray(to, dtype=tid.dtype), tid)
+    return inv_state.replace(items=inv_state.items.replace(type_id=tid))
+
+
+# ---------------------------------------------------------------------------
 # _consume_attr_variation_draws  — vendor u_init.c:887-894 post-init_attr loop
 # ---------------------------------------------------------------------------
 
@@ -2874,6 +3337,10 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
             vendor_rng, inv_state = _ini_inv_fn(
                 vendor_rng, inv_state, items_list, race,
             )
+            # Vendor race-based otyp substitution (u_init.c inv_subs[]) —
+            # a pure post-mksobj type swap for non-human races.  Scoped to
+            # roles that define _apply_race_inv_subs subs (arc/rog untouched).
+            inv_state = _apply_race_inv_subs(inv_state, race)
 
     # --- Stat rolls (vendor init_attr(75) parity) ---
     # NLE_BYTEPARITY: vendor runs init_attr AFTER ini_inv + bonus cascade.
@@ -2919,6 +3386,10 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     # PICK_AXE lives at slot 4 in STARTING_INVENTORY[ARCHEOLOGIST].
     if role == Role.ARCHEOLOGIST:
         inv_state = inv_state.replace(swap_weapon=jnp.int8(4))
+    # Samurai: YA (ammo) is auto-quivered by ini_inv (u_init.c:1143-1145
+    # setuqwep).  YA lives at slot 3 in STARTING_INVENTORY[SAMURAI].
+    if role == Role.SAMURAI:
+        inv_state = inv_state.replace(quiver=jnp.int8(3))
     # Caveman: CLUB wielded (slot 0), SLING is the swap weapon (slot 1), and
     # FLINT (slot 2, sling ammo) is auto-quivered via setuqwep.  ROCK (slot 3)
     # is not quivered (uquiver already taken by FLINT) so it renders bare.

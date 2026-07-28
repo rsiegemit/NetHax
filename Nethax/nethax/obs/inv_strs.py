@@ -188,6 +188,7 @@ _EQUIP_STRS = [
     "(being worn)",        # shirt / cloak (all non-ring/non-weapon armor)
     "(in quiver pouch)",   # vendor objnam.c:1644 Qtyp==2
     "(at the ready)",      # vendor objnam.c:1645 Qtyp==3
+    "(weapon in hands)",   # bimanual wielded weapon (vendor objnam.c:1192-1196)
 ]
 _EQUIP_BYTES: jnp.ndarray = jnp.array(
     [_pad_bytes(s, _MAX_EQUIP_LEN) for s in _EQUIP_STRS],
@@ -631,6 +632,10 @@ def pluralize(word: str) -> str:
     for sing, plur in _WORD_IRREGULARS:
         if lower == sing or lower.endswith(" " + sing) or lower.endswith("-" + sing):
             return word[: len(word) - len(sing)] + plur
+    # "ya" (Japanese arrow) is a no-change plural — vendor makeplural
+    # objnam.c:2373-2375 (`len==2 && "ya"` or trailing " ya").
+    if lower == "ya" or lower.endswith(" ya"):
+        return word
     # Sibilant endings require 'es'.
     if (
         lower.endswith("s")
@@ -686,6 +691,50 @@ _OBJECT_NAMES_BYTES_PADDED: jnp.ndarray = jnp.array(
     [_pad_bytes(obj.name, _MAX_PLURAL_NAME_LEN) for obj in OBJECTS],
     dtype=jnp.uint8,
 )  # uint8[NUM_OBJECTS, _MAX_PLURAL_NAME_LEN]
+
+# --- Samurai (PM_SAMURAI) Japanese object-name substitution --------------
+# Vendor objnam.c:48-60 Japanese_items[]: when Role_if(PM_SAMURAI), the
+# "actual name" (nn) of these object types is replaced by its Japanese name
+# (objnam.c:117-118, 436-437 via Japanese_item_name()).  The glyph is
+# unchanged; only the rendered noun differs.  KATANA/YUMI/YA already carry
+# their Japanese names as the canonical object name, so only the entries in
+# this table need a role-gated override.  Keyed by canonical object name.
+# Cite: vendor/nle/src/objnam.c:48-60, 117-118, 4139-4150.
+_JAPANESE_ITEM_NAMES: dict = {
+    "short sword":    "wakizashi",
+    "broadsword":     "ninja-to",
+    "flail":          "nunchaku",
+    "glaive":         "naginata",
+    "lock pick":      "osaku",
+    "wooden harp":    "koto",
+    "knife":          "shito",
+    "plate mail":     "tanko",
+    "helmet":         "kabuto",
+    "leather gloves": "yugake",
+    "food ration":    "gunyoki",
+    "booze":          "sake",
+}
+
+
+def _samurai_name(obj) -> str:
+    return _JAPANESE_ITEM_NAMES.get(obj.name, obj.name)
+
+
+# Per-object singular/plural name rows + a/an flag under the Samurai role.
+# Identical to the base tables except for the Japanese_items overrides.
+_SAMURAI_NAMES_BYTES_PADDED: jnp.ndarray = jnp.array(
+    [_pad_bytes(_samurai_name(obj), _MAX_PLURAL_NAME_LEN) for obj in OBJECTS],
+    dtype=jnp.uint8,
+)  # uint8[NUM_OBJECTS, _MAX_PLURAL_NAME_LEN]
+_SAMURAI_NAME_PLURAL_BYTES: jnp.ndarray = jnp.array(
+    [_pad_bytes(_pluralize_phrase(_samurai_name(obj)), _MAX_PLURAL_NAME_LEN)
+     for obj in OBJECTS],
+    dtype=jnp.uint8,
+)  # uint8[NUM_OBJECTS, _MAX_PLURAL_NAME_LEN]
+_SAMURAI_USE_AN: jnp.ndarray = jnp.array(
+    [_compute_use_an(_samurai_name(obj)) for obj in OBJECTS],
+    dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS] — a/an choice for the Samurai-substituted noun
 
 # Plural-appearance table -- pluralize the last word of the description so
 # "wooden" -> "wooden" (no last word change needed; an "s" comes via the class
@@ -871,8 +920,13 @@ def _equip_status_idx(inv_state, slot_idx: jax.Array,
     """
     i8 = slot_idx.astype(jnp.int8)
 
-    # Wielded weapon
+    # Wielded weapon.  Bimanual (two-handed) weapons render "(weapon in hands)"
+    # (idx 10) instead of "(weapon in hand)" (idx 1) — vendor objnam.c:1192-1196
+    # makeplural(body_part(HAND)) when bimanual(obj).
     is_wielded = inv_state.wielded == i8
+    _safe_slot = jnp.clip(slot_idx.astype(jnp.int32), 0, MAX_INVENTORY_SLOTS - 1)
+    is_bimanual = inv_state.items.is_two_handed[_safe_slot]
+    wielded_idx = jnp.where(is_bimanual, jnp.int32(10), jnp.int32(1))
 
     # Worn armor -- any of the 7 slots
     # worn_armor[j] == slot_idx  means slot is worn in armor position j
@@ -914,7 +968,7 @@ def _equip_status_idx(inv_state, slot_idx: jax.Array,
     result = jnp.where(is_ring_r,     jnp.int32(4), result)
     result = jnp.where(is_ring_l,     jnp.int32(3), result)
     result = jnp.where(is_armor_worn, jnp.int32(2), result)
-    result = jnp.where(is_wielded,    jnp.int32(1), result)
+    result = jnp.where(is_wielded,    wielded_idx, result)
     return result
 
 
@@ -924,7 +978,8 @@ def _equip_status_idx(inv_state, slot_idx: jax.Array,
 
 def _render_slot(inv_state, id_state, slot_idx: jax.Array,
                   two_weapon: jax.Array, alt_slot: jax.Array,
-                  swap_weapon: jax.Array, descr_idx: jax.Array) -> jax.Array:
+                  swap_weapon: jax.Array, descr_idx: jax.Array,
+                  is_samurai: jax.Array = None) -> jax.Array:
     """Render one inventory slot as an 80-byte uint8 string.
 
     Empty slots (category == 0) return all-zero buffers.
@@ -941,6 +996,9 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     """
     buf    = jnp.zeros((NLE_STR_LEN,), dtype=jnp.uint8)
     cursor = jnp.int32(0)
+    if is_samurai is None:
+        is_samurai = jnp.bool_(False)
+    is_samurai = jnp.asarray(is_samurai, dtype=jnp.bool_)
 
     # Clamp to valid item-array range (slots 52-54 don't exist in items[52])
     safe_idx = jnp.clip(slot_idx, 0, MAX_INVENTORY_SLOTS - 1).astype(jnp.int32)
@@ -1014,7 +1072,11 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     #   - Otherwise, the noun/appearance is first.
     # Vendor: doname_base objnam.c:1686-1692 calls just_an() on the first
     # non-article word in the prefix buffer (BUC word when present, else name).
-    noun_use_an = jnp.where(show_app, _APP_USE_AN[app_type], _OBJECT_USE_AN[safe_type])
+    # Samurai role substitutes the object's actual name (objnam.c:117-118), so
+    # the a/an choice for the identified noun follows the substituted name.
+    _id_use_an = jnp.where(is_samurai, _SAMURAI_USE_AN[safe_type],
+                           _OBJECT_USE_AN[safe_type])
+    noun_use_an = jnp.where(show_app, _APP_USE_AN[app_type], _id_use_an)
     buc_use_an  = _BUC_USE_AN[buc_row]
     # Implicit-uncursed suppression (vendor objnam.c:1328-1348): omit the
     # "uncursed" word for an identified oc_charged item that is NOT armor/ring
@@ -1030,23 +1092,33 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
     show_uncursed_word = (~identified) | (~is_oc_charged) | is_armor_cls | is_ring_cls
     suppress_uncursed = is_uncursed & ~show_uncursed_word
     buc_shown = buc_known & ~suppress_uncursed
-    # When BUC is suppressed but an enchantment "+N" prefix WILL be shown
-    # (identified weapon/armor/charged-ring/weptool), the first prefix word is
-    # the "+N" token, so just_an() keys off '+'/digit -> always "a" (never
-    # "an").  This fixes vowel-initial enchanted weapon names, e.g.
-    # "a +1 elven dagger" (not "an ...").  Cite: vendor objnam.c doname_base +
-    # just_an (the number prefix precedes the noun).
-    _art_oc = _OBJECT_CLASS[safe_type]
+    # When no BUC word is shown, the a/an choice follows the FIRST token still
+    # written before the noun: the enchantment "+N" (weapons/armor/charged
+    # rings/weptools) or an erosion word ("rustproof"/"rusty"/...).  Both begin
+    # with a consonant ('+', 'r', 'c', ...), so the article is "a".  Only when
+    # no such token precedes the noun does the noun itself drive the choice.
+    # Vendor: objnam.c doname_base runs just_an() on the first prefix token.
+    _obj_cls_art     = _OBJECT_CLASS[safe_type].astype(jnp.int32)
+    _is_weptool_art  = _OBJECT_IS_WEPTOOL[safe_type]
+    _is_chgring_art  = _OBJECT_IS_CHARGED[safe_type]
     enchant_shown = identified & (
-        (_art_oc == jnp.uint8(_WEAPON_CLASS_VAL)) |
-        (_art_oc == jnp.uint8(_ARMOR_CLASS_VAL))  |
-        ((_art_oc == jnp.uint8(_RING_CLASS_VAL)) & _OBJECT_IS_CHARGED[safe_type]) |
-        _OBJECT_IS_WEPTOOL[safe_type]
+        (_obj_cls_art == jnp.int32(_WEAPON_CLASS_VAL)) |
+        (_obj_cls_art == jnp.int32(_ARMOR_CLASS_VAL))  |
+        ((_obj_cls_art == jnp.int32(_RING_CLASS_VAL)) & _is_chgring_art) |
+        _is_weptool_art
     )
-    article_use_an = jnp.where(
-        buc_shown, buc_use_an,
-        jnp.where(enchant_shown, jnp.bool_(False), noun_use_an),
+    _oeroded_art  = inv_state.items.oeroded[safe_idx].astype(jnp.int32)
+    _oeroded2_art = inv_state.items.oeroded2[safe_idx].astype(jnp.int32)
+    _oerodeproof_art = inv_state.items.oerodeproof[safe_idx]
+    _emat_art = _OBJECT_EROSION_CLASS[safe_type].astype(jnp.int32)
+    erosion_shown = (_emat_art > jnp.int32(0)) & (
+        (jnp.clip(_oeroded_art, 0, 3) > jnp.int32(0)) |
+        (jnp.clip(_oeroded2_art, 0, 3) > jnp.int32(0)) | _oerodeproof_art
     )
+    consonant_prefix = enchant_shown | erosion_shown
+    noun_or_prefix_use_an = jnp.where(consonant_prefix, jnp.bool_(False),
+                                      noun_use_an)
+    article_use_an = jnp.where(buc_shown, buc_use_an, noun_or_prefix_use_an)
 
     def render_nonempty(args):
         b, c = args
@@ -1231,7 +1303,7 @@ def _render_slot(inv_state, id_state, slot_idx: jax.Array,
             lambda bc: _write_true_name(bc[0], bc[1], safe_type, obj_class,
                                         quantity, category, type_id,
                                         buc_status, identified, enchantment,
-                                        corpse_idx),
+                                        corpse_idx, is_samurai),
             (b, c),
         )
 
@@ -1452,7 +1524,7 @@ def _write_appearance(buf, cursor, safe_type, quantity):
 
 def _write_true_name(buf, cursor, safe_type, obj_class, quantity,
                      category, type_id, buc_status, identified,
-                     enchantment, corpse_idx):
+                     enchantment, corpse_idx, is_samurai=None):
     """Write class prefix (if any) + canonical object name.
 
     Handles special cases (host-side Python control flow OK per spec):
@@ -1468,6 +1540,8 @@ def _write_true_name(buf, cursor, safe_type, obj_class, quantity,
     cls_int = obj_class.astype(jnp.int32)
     cls_safe = jnp.clip(cls_int, 0, 17).astype(jnp.int32)
     is_plural = quantity > jnp.int32(1)
+    _is_sam = (jnp.bool_(False) if is_samurai is None
+               else jnp.asarray(is_samurai, dtype=jnp.bool_))
 
     # --- Special case: holy / unholy water (vendor objnam.c:841-843) ---
     # Identified blessed POT_WATER -> "holy water" (no "blessed " prefix).
@@ -1573,9 +1647,12 @@ def _write_true_name(buf, cursor, safe_type, obj_class, quantity,
 
         # Step 3: canonical name (singular or pluralised).  For set-of dragon
         # scales the singular row is used unconditionally (vendor objnam.c:722
-        # writes actualn directly).
-        sing_row = _OBJECT_NAMES_BYTES_PADDED[safe_type]
-        plur_row = _NAME_PLURAL_BYTES[safe_type]
+        # writes actualn directly).  Under the Samurai role the actual name is
+        # the Japanese substitution (objnam.c:117-118) when one exists.
+        sing_row = jnp.where(_is_sam, _SAMURAI_NAMES_BYTES_PADDED[safe_type],
+                             _OBJECT_NAMES_BYTES_PADDED[safe_type])
+        plur_row = jnp.where(_is_sam, _SAMURAI_NAME_PLURAL_BYTES[safe_type],
+                             _NAME_PLURAL_BYTES[safe_type])
         name_src = jnp.where(is_plural & ~is_set, plur_row, sing_row)
         b, c = _write_fixed(b, c, name_src, _MAX_PLURAL_NAME_LEN)
         return b, c
@@ -1753,12 +1830,24 @@ def build_inv_strs(state) -> jnp.ndarray:
         descr_idx = jnp.arange(_MAX_OBJ, dtype=jnp.int32)
     descr_idx_i32 = jnp.asarray(descr_idx).astype(jnp.int32)
 
+    # Samurai role gates the Japanese object-name substitution (vendor
+    # objnam.c:117-118).  player_role holds the Role enum value; graceful
+    # default False for minimal-state callers without the field.
+    from Nethax.nethax.constants.roles import Role as _Role
+    _player_role = getattr(state, "player_role", None)
+    if _player_role is None:
+        is_samurai = jnp.bool_(False)
+    else:
+        is_samurai = jnp.asarray(_player_role).astype(jnp.int32) == jnp.int32(
+            int(_Role.SAMURAI))
+
     # vmap over slot indices [0..54]
     slot_indices = jnp.arange(NLE_INV_SLOTS, dtype=jnp.int32)
 
     def render_one(slot_idx):
         return _render_slot(inv_state, id_state, slot_idx, two_weapon,
-                            alt_slot_i32, swap_weapon_i32, descr_idx_i32)
+                            alt_slot_i32, swap_weapon_i32, descr_idx_i32,
+                            is_samurai)
 
     # lax.map applies render_one SEQUENTIALLY (55-deep scan, ~230k serial op-
     # executions) for low memory.  Under NETHAX_VEC_MONSTERS (training-speed mode)
