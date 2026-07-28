@@ -1160,6 +1160,37 @@ def _ini_hpwp_vendor(
     return hp, pw
 
 
+def _consume_newhp_newpw_draws(vendor_rng, role, race):
+    """Advance the ISAAC64 stream past the ``rnd()`` draws vendor's
+    ``newhp()`` / ``newpw()`` emit for the freshly created hero (u.ulevel == 0).
+
+    Vendor ``u_init()`` calls ``newhp()`` then ``newpw()`` at
+    vendor/nle/src/u_init.c:636-637 — BEFORE the role switch (and thus before
+    the role's ``ini_inv`` draws).  Each of ``newhp`` (attrib.c:987-990) and
+    ``newpw`` (exper.c:47-72) rolls ``rnd(role.<adv>.inrnd)`` then
+    ``rnd(race.<adv>.inrnd)`` when the corresponding ``inrnd`` is > 0:
+
+        newhp: rnd(role.hpadv.inrnd), rnd(race.hpadv.inrnd)
+        newpw: rnd(role.enadv.inrnd), rnd(race.enadv.inrnd)
+
+    Each ``rnd(n>0)`` consumes exactly one ISAAC64 word (the modulus only
+    shapes the discarded value, not the stream position).  The starting HP/Pw
+    display is still derived by ``_ini_hpwp_vendor`` from its own key; this
+    helper exists purely to keep the ISAAC64 byte-stream aligned so the role's
+    first ``ini_inv`` draw lands at the vendor offset.
+
+    Cite: vendor/nle/src/u_init.c:636-637; attrib.c:987-990; exper.c:47-72.
+    """
+    from Nethax.nethax.vendor_rng import rnd_jax
+    r_entry = get_role(role)
+    race_entry = get_race(race)
+    for n in (int(r_entry.hpadv.inrnd), int(race_entry.hpadv.inrnd),
+              int(r_entry.enadv.inrnd), int(race_entry.enadv.inrnd)):
+        if n > 0:
+            vendor_rng, _ = rnd_jax(vendor_rng, jnp.int32(n))
+    return vendor_rng
+
+
 # ---------------------------------------------------------------------------
 # consume_init_attr_draws  — vendor ISAAC64 init_attr replay
 # ---------------------------------------------------------------------------
@@ -4582,6 +4613,19 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
         inv_state = inv_state.replace(
             items=_arc_new_items, letters=_arc_new_letters,
         )
+
+    # --- NLE_BYTEPARITY: newhp()/newpw() pre-role-switch ISAAC64 draws (Monk) ---
+    # Vendor u_init.c:636-637 rolls newhp()/newpw() BEFORE the role switch, so
+    # their rnd() draws precede the role's first ini_inv draw.  The engine's
+    # _ini_hpwp_vendor derives HP/Pw from a separate Threefry key and does NOT
+    # advance the ISAAC64 stream, so the Monk M_spell rn2(90) (first ini_inv
+    # draw) read one word too early — masked on seed 0 by the /30 spellbook
+    # bucketing, but wrong on seeds 1/2.  Consume the missing rnd() words here,
+    # gated to Monk so arc/hea/kni/etc stay byte-identical.  Monk-Human draws a
+    # single rnd(2) (enadv.inrnd=2); vendor RND idx 282 confirms.
+    # Cite: vendor/nle/src/u_init.c:636-637; attrib.c:987-990; exper.c:47-72.
+    if vendor_rng is not None and role == Role.MONK:
+        vendor_rng = _consume_newhp_newpw_draws(vendor_rng, role, race)
 
     # --- NLE_BYTEPARITY: per-role ini_inv mkobj draws (non-Archeologist) ---
     # Runs at the SAME stream position vendor's ini_inv does (after the items
