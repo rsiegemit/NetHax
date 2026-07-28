@@ -3834,28 +3834,93 @@ def _register_memento_envs(register_fn) -> None:
 # ---------------------------------------------------------------------------
 # WoD envs (Wand of Death — Group A)
 # ---------------------------------------------------------------------------
+# Vendor WoD (Wand-of-Death) static MAP blocks, verbatim from
+# vendor/minihack/minihack/envs/skills_wod.py.  Despite the "WoD" name these
+# are DRY rooms (no water/lava): a lit room holding a blessed wand of death
+# ("/") and a (usually asleep) minotaur target.  Each vendor variant is a
+# static ``LevelGenerator(map=..., lit=True)`` level whose MAP is stamped
+# ``GEOMETRY:center,center`` on the 80x21 dungeon — the same static-stamp
+# pattern as Labyrinth / WoD-Pro.  Ragged Hard rows are space-padded to the
+# widest line exactly as minihack's LevelGenerator pads them (VOID fill).
+_WOD_EASY_MAP = (
+    "|----------",
+    "|.........+",
+    "|----------",
+)
+_WOD_MEDIUM_MAP = (
+    "|---------------------------|",
+    "|...........................|",
+    "|---------------------------|",
+)
+_WOD_HARD_MAP = (
+    "|---------------------------|",
+    "|...........................|",
+    "|.....|---------------------|",
+    "|.....|                      ",
+    "|.....|                      ",
+    "|-----|                      ",
+)
+
+
 def _wod_builder(difficulty: str) -> Callable[[LevelGenerator], None]:
+    """Stamp the vendor WoD Easy/Medium/Hard static MAP at its centered origin.
+
+    Easy (skills_wod.py:10-34) and Medium (:74-93) are fully deterministic:
+    fixed ``set_start_pos``, fixed blessed ``add_object("death","/")`` and a
+    fixed asleep ``add_monster("minotaur")``.  Easy has ``autopickup=True`` and
+    drops the wand on the hero's own start cell, so on reset the wand is
+    auto-picked into inventory (slot j) rather than shown on the ground; Medium
+    leaves it on the floor two cells right of the hero, where it renders as the
+    wand glyph 2295.
+
+    Hard (:125-148) additionally uses a random ``set_start_rect((1,1),(5,5))``
+    hero and a random ``add_object_area($safe_room)`` wand inside the 5x5
+    safe-room; those RNG-placed cells are not yet replayed here, so Hard stamps
+    the static map + fixed minotaur + goal stair only (structural parity), with
+    the hero pinned to the safe-room corner as a deterministic stand-in.
+
+    The stamp uses internal (odd-forced) ``GEOMETRY:center`` coords — minihax's
+    own obs renderer applies NLE's -1 glyph-column shift downstream (see the
+    note on ``_vendor_geometry_center``), so no manual shift is needed here.
+    """
+    if difficulty == "easy":
+        rows = _WOD_EASY_MAP
+        start_xy = (1, 1)
+        wand_xy = (1, 1)          # on the hero's cell -> auto-picked up
+        minotaur_xy = (9, 1)
+        minotaur_args = ("asleep",)
+        goal_xy = None
+    elif difficulty == "medium":
+        rows = _WOD_MEDIUM_MAP
+        start_xy = (1, 1)
+        wand_xy = (2, 1)          # on the ground, two cells right of hero
+        minotaur_xy = (26, 1)
+        minotaur_args = ("asleep",)
+        goal_xy = (27, 1)
+    else:  # hard
+        rows = _WOD_HARD_MAP
+        start_xy = (1, 1)         # random set_start_rect; corner stand-in
+        wand_xy = None            # random add_object_area($safe_room)
+        minotaur_xy = (26, 1)
+        minotaur_args = ()
+        goal_xy = (27, 1)
+
+    w = max(len(r) for r in rows)
+    h = len(rows)
+    dx, dy = _static_center_geometry(w, h)
+
     def build(lg: LevelGenerator) -> None:
-        lg.add_room(x=1, y=1, w=15, h=8)
-        lg.set_start_pos(2, 2)
-        lg.add_stair_down(x=14, y=7)
-        # Drop the wand of death near the start.  Vendor places a blessed
-        # "death" wand (skills_wod.py:22-24,:86-88,:108-110,:142-143,:213).
-        try:
-            lg.add_object("death", "/", place=(3, 3))
-        except KeyError:
-            lg.add_object("random", place=(3, 3))
-        # Vendor always places a minotaur target (skills_wod.py:25, :89,
-        # :144, :212); the Easy RM rewards killing it by name.
-        try:
-            lg.add_monster("minotaur", place=(12, 6))
-        except (KeyError, TypeError):
-            lg.add_monster()
-        if difficulty == "hard":
-            lg.add_monster()
-        if difficulty == "pro":
-            for _ in range(3):
-                lg.add_monster()
+        lg.set_map(rows, xstart=dx, ystart=dy)
+        if start_xy is not None:
+            lg.set_start_pos(start_xy[0] + dx, start_xy[1] + dy)
+        if goal_xy is not None:
+            lg.add_stair_down(x=goal_xy[0] + dx, y=goal_xy[1] + dy)
+        if wand_xy is not None:
+            lg.add_object("death", "/", cursestate="blessed",
+                          place=(wand_xy[0] + dx, wand_xy[1] + dy))
+        lg.add_monster("minotaur",
+                       place=(minotaur_xy[0] + dx, minotaur_xy[1] + dy),
+                       args=minotaur_args)
     return build
 
 
@@ -3906,7 +3971,9 @@ def _register_wod_envs(register_fn) -> None:
         if diff == "pro":
             factory = _make_factory(_wod_pro_builder(), w=80, h=21, fill=" ")
         else:
-            factory = _make_factory(_wod_builder(diff), w=17, h=10)
+            # Static-stamp Easy/Medium/Hard on the full 80x21 dungeon (VOID
+            # fill) exactly like WoD-Pro / Labyrinth.
+            factory = _make_factory(_wod_builder(diff), w=80, h=21, fill=" ")
         rm = (_skill_wod_kill_rm() if diff == "easy"
               else _default_goal_reward_manager())
         register_fn(env_id, factory, rm,

@@ -149,9 +149,13 @@ def _env_id_to_vendor_cls(env_id: str):
         "MiniHack-Labyrinth-Big-v0":           _lab_mod.MiniHackLabyrinth,
         "MiniHack-Labyrinth-Small-v0":         _lab_mod.MiniHackLabyrinthSmall,
         "MiniHack-WoD-Easy-Full-v0":           _wod_mod.MiniHackWoDEasy,
+        "MiniHack-WoD-Easy-Restricted-v0":     _wod_mod.MiniHackWoDEasyRestrictedActions,
         "MiniHack-WoD-Medium-Full-v0":         _wod_mod.MiniHackWoDMedium,
+        "MiniHack-WoD-Medium-Restricted-v0":   _wod_mod.MiniHackWoDMediumRestrictedActions,
         "MiniHack-WoD-Hard-Full-v0":           _wod_mod.MiniHackWoDHard,
+        "MiniHack-WoD-Hard-Restricted-v0":     _wod_mod.MiniHackWoDHardRestrictedActions,
         "MiniHack-WoD-Pro-Full-v0":            _wod_mod.MiniHackWoDPro,
+        "MiniHack-WoD-Pro-Restricted-v0":      _wod_mod.MiniHackWoDProRestrictedActions,
         "MiniHack-Quest-Medium-v0":        _quest_mod.MiniHackQuestMedium,
         "MiniHack-Levitate-Boots-Full-v0":       _levit_mod.MiniHackLevitateBoots,
         "MiniHack-Levitate-Boots-Restricted-v0":
