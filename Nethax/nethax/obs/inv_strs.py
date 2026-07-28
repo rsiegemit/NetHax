@@ -30,7 +30,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from Nethax.nethax.constants.objects import OBJECTS, ObjectClass, Material
-from Nethax.nethax.constants.monsters import MONSTERS
+from Nethax.nethax.constants.monsters import MONSTERS, MonsterSymbol
 from Nethax.nethax.subsystems.items import BUCStatus
 from Nethax.nethax.subsystems.inventory import (
     MAX_INVENTORY_SLOTS,
@@ -342,6 +342,36 @@ _MONSTER_NAME_BYTES: jnp.ndarray = jnp.array(
     dtype=jnp.uint8,
 )  # uint8[NUM_MONSTERS, _MAX_MONSTER_NAME_LEN]
 
+
+def _is_vegetarian_monster(m) -> bool:
+    """Vendor mondata.h ``vegetarian(ptr)`` — its corpse is vegetarian food, so
+    ``tin_details`` (eat.c) names the tin "tin of <mon>" with NO " meat".
+
+        vegan = mlet in {BLOB,JELLY,FUNGUS,VORTEX,LIGHT}
+                | (ELEMENTAL & !stalker) | (GOLEM & !flesh/leather golem)
+                | noncorporeal(==S_GHOST)
+        vegetarian = vegan | (PUDDING & !black pudding)
+    """
+    if m is None:
+        return False
+    s = int(m.symbol)
+    nm = (m.name or "").lower()
+    _MS = MonsterSymbol
+    vegan = (
+        s in (int(_MS.S_BLOB), int(_MS.S_JELLY), int(_MS.S_FUNGUS),
+              int(_MS.S_VORTEX), int(_MS.S_LIGHT))
+        or (s == int(_MS.S_ELEMENTAL) and nm != "stalker")
+        or (s == int(_MS.S_GOLEM)
+            and nm not in ("flesh golem", "leather golem"))
+        or s == int(_MS.S_GHOST)
+    )
+    return vegan or (s == int(_MS.S_PUDDING) and nm != "black pudding")
+
+
+_MONSTER_VEGETARIAN: jnp.ndarray = jnp.array(
+    [_is_vegetarian_monster(m) for m in MONSTERS], dtype=jnp.bool_,
+)  # bool[NUM_MONSTERS] — True -> "tin of <mon>" (no " meat" suffix)
+
 # "empty " prefix — vendor objnam.c:1301-1316.
 # Emitted when cknown && Is_container(obj) && !Has_contents(obj).
 # We proxy cknown with item.identified (vendor u_init.c marks all starting
@@ -365,6 +395,10 @@ _CORPSE_SUFFIX_BYTES: jnp.ndarray = jnp.array(
 )  # uint8[8]
 _TIN_OF_BYTES: jnp.ndarray = jnp.array(
     _pad_bytes("tin of ", 8), dtype=jnp.uint8,
+)  # uint8[8]
+# Plural "tins of " (vendor makeplural pluralizes the "tin" head noun).
+_TINS_OF_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes("tins of ", 8), dtype=jnp.uint8,
 )  # uint8[8]
 _SPINACH_BYTES: jnp.ndarray = jnp.array(
     _pad_bytes("spinach", 8), dtype=jnp.uint8,
@@ -1708,16 +1742,33 @@ def _write_true_name(buf, cursor, safe_type, obj_class, quantity,
 
     def write_spinach_tin(bc):
         b, c = bc
-        b, c = _write_fixed(b, c, _TIN_OF_BYTES, 8)
+        b, c = lax.cond(
+            is_plural,
+            lambda x: _write_fixed(x[0], x[1], _TINS_OF_BYTES, 8),
+            lambda x: _write_fixed(x[0], x[1], _TIN_OF_BYTES, 8),
+            (b, c),
+        )
         b, c = _write_fixed(b, c, _SPINACH_BYTES, 8)
         return b, c
 
     def write_monster_tin(bc):
         b, c = bc
-        b, c = _write_fixed(b, c, _TIN_OF_BYTES, 8)
+        b, c = lax.cond(
+            is_plural,
+            lambda x: _write_fixed(x[0], x[1], _TINS_OF_BYTES, 8),
+            lambda x: _write_fixed(x[0], x[1], _TIN_OF_BYTES, 8),
+            (b, c),
+        )
         mon_src = _MONSTER_NAME_BYTES[safe_monster_idx]
         b, c = _write_fixed(b, c, mon_src, _MAX_MONSTER_NAME_LEN)
-        b, c = _write_fixed(b, c, _MEAT_BYTES, 6)
+        # Vendor tin_details (eat.c): "<mon> meat" unless the corpse is
+        # vegetarian, in which case it is just "<mon>" (e.g. "tin of lichen").
+        b, c = lax.cond(
+            _MONSTER_VEGETARIAN[safe_monster_idx],
+            lambda x: x,
+            lambda x: _write_fixed(x[0], x[1], _MEAT_BYTES, 6),
+            (b, c),
+        )
         return b, c
 
     # --- Normal path: class prefix + canonical name ---
