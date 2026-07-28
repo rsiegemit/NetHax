@@ -140,8 +140,12 @@ def _env_id_to_vendor_cls(env_id: str):
     from minihack.envs import exploremaze as _em_mod
     from minihack.envs import lab as _lab_mod
     from minihack.envs import skills_wod as _wod_mod
+    from minihack.envs import memento as _memento_mod
 
     table = {
+        "MiniHack-Memento-Short-F2-v0":    _memento_mod.MiniHackMementoShortF2,
+        "MiniHack-Memento-F2-v0":          _memento_mod.MiniHackMementoF2,
+        "MiniHack-Memento-F4-v0":          _memento_mod.MiniHackMementoF4,
         "MiniHack-ExploreMaze-Easy-v0":        _em_mod.MiniHackExploreMazeEasy,
         "MiniHack-ExploreMaze-Easy-Mapped-v0": _em_mod.MiniHackExploreMazeEasyMapped,
         "MiniHack-ExploreMaze-Hard-v0":        _em_mod.MiniHackExploreMazeHard,
