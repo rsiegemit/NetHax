@@ -396,6 +396,31 @@ _CLASS_PREFIX_BYTES: jnp.ndarray = jnp.array(
     dtype=jnp.uint8,
 )  # uint8[18, _MAX_PREFIX_LEN]
 
+# Plural class-of prefix.  Vendor objnam.c makeplural pluralizes the HEAD noun
+# before " of ": "potion of healing" -> "potions of healing", "scroll of X" ->
+# "scrolls of X".  For a plural stack we emit this pluralized prefix and keep
+# the object-specific tail ("healing") singular — see _write_true_name step 3.
+_CLASS_PREFIX_PLURAL_STRS = [""] * 18
+_CLASS_PREFIX_PLURAL_STRS[_POTION_CLASS_VAL] = "potions of "
+_CLASS_PREFIX_PLURAL_STRS[_SCROLL_CLASS_VAL] = "scrolls of "
+_CLASS_PREFIX_PLURAL_STRS[_SPBOOK_CLASS_VAL] = "spellbooks of "
+_CLASS_PREFIX_PLURAL_STRS[_RING_CLASS_VAL]   = "rings of "
+_CLASS_PREFIX_PLURAL_STRS[_AMULET_CLASS_VAL] = "amulets of "
+
+_MAX_PREFIX_PLURAL_LEN = 16  # "spellbooks of \0" = 15 bytes
+_CLASS_PREFIX_PLURAL_BYTES: jnp.ndarray = jnp.array(
+    [_pad_bytes(s, _MAX_PREFIX_PLURAL_LEN) for s in _CLASS_PREFIX_PLURAL_STRS],
+    dtype=jnp.uint8,
+)  # uint8[18, _MAX_PREFIX_PLURAL_LEN]
+
+# True iff the class carries a "class of X" naming form (gets the class-of
+# prefix).  For these the plural pluralizes the CLASS noun (the prefix), and
+# the object-specific "X" tail stays singular — so the singular name row is
+# written even when quantity > 1.
+_CLASS_HAS_PREFIX: jnp.ndarray = jnp.array(
+    [s != "" for s in _CLASS_PREFIX_STRS], dtype=jnp.bool_,
+)  # bool[18]
+
 # Prefix applies only when the item is IDENTIFIED (showing true name).
 # For unidentified items with appearances, no prefix (just "orange potion", etc.)
 # For identified items with class prefix: show "potion of healing" etc.
@@ -480,6 +505,55 @@ _CLASS_NOUN_BYTES: jnp.ndarray = jnp.array(
     [_pad_bytes(s, _MAX_CLASS_NOUN_LEN) for s in _CLASS_NOUN_STRS],
     dtype=jnp.uint8,
 )  # uint8[18, _MAX_CLASS_NOUN_LEN]
+
+# ---------------------------------------------------------------------------
+# Identified GEM_CLASS " stone" suffix.
+# Vendor objnam.c:713-716 (identified-gem branch) appends " stone" when the
+# GemStone(typ) macro (objnam.c:41-47) is true:
+#   Strcpy(buf, actualn); if (GemStone(typ)) Strcat(buf, " stone");
+# GemStone(typ) == (typ == FLINT)
+#              || (objects[typ].oc_material == GEMSTONE
+#                  && typ not in {DILITHIUM_CRYSTAL, RUBY, DIAMOND, SAPPHIRE,
+#                                 BLACK_OPAL, EMERALD, OPAL}).
+# So "flint" -> "flint stone" and the semi-precious gemstones (jacinth, agate,
+# turquoise, ...) -> "<gem> stone"; precious gems + worthless glass + the other
+# gray stones (luckstone/loadstone/touchstone/rock, whose names already carry
+# "stone" or are MINERAL non-flint) get nothing.  Nethax's OBJECTS.material
+# stores the *appearance* material (GLASS) for real gems, so we reproduce the
+# macro by vendor NAME membership rather than the (appearance) material field.
+# Cite: vendor/nle/src/objnam.c:41-47, 713-716; vendor/nle/src/objects.c GEM().
+_VENDOR_GEMSTONE_NAMES = frozenset({
+    "dilithium crystal", "diamond", "ruby", "jacinth", "sapphire",
+    "black opal", "emerald", "turquoise", "citrine", "aquamarine",
+    "amber", "topaz", "jet", "opal", "chrysoberyl", "garnet",
+    "amethyst", "jasper", "fluorite", "obsidian", "agate", "jade",
+})
+_GEM_STONE_EXCLUDE = frozenset({
+    "dilithium crystal", "diamond", "ruby", "sapphire",
+    "black opal", "emerald", "opal",
+})
+
+
+def _gem_add_stone(obj) -> bool:
+    if obj.class_ != ObjectClass.GEM_CLASS:
+        return False
+    if obj.name == "flint":
+        return True
+    return obj.name in _VENDOR_GEMSTONE_NAMES and obj.name not in _GEM_STONE_EXCLUDE
+
+
+_GEM_ADD_STONE: jnp.ndarray = jnp.array(
+    [_gem_add_stone(obj) for obj in OBJECTS], dtype=jnp.bool_,
+)  # bool[NUM_OBJECTS]
+
+# " stone" (singular) / " stones" (plural) suffix.  makeplural pluralizes the
+# trailing "stone" word, so the gem name itself stays singular ("flint stones").
+_STONE_SUFFIX_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes(" stone", 7), dtype=jnp.uint8,
+)  # uint8[7]
+_STONES_SUFFIX_BYTES: jnp.ndarray = jnp.array(
+    _pad_bytes(" stones", 8), dtype=jnp.uint8,
+)  # uint8[8]
 
 
 # ---------------------------------------------------------------------------
@@ -1556,10 +1630,30 @@ def _write_true_name(buf, cursor, safe_type, obj_class, quantity,
     is_holy   = is_water_special & (buc_status == jnp.int32(BUCStatus.BLESSED))
     is_unholy = is_water_special & (buc_status == jnp.int32(BUCStatus.CURSED))
 
+    # Holy/unholy water render with the "potion of " class prefix, like any
+    # other potion: vendor xname (objnam.c:622-632) writes "potion of " then
+    # "holy "/"unholy " + actualn ("water").  BUC is encoded in "holy"/"unholy"
+    # (the BUC word is suppressed upstream in _render_slot step 3).  Plural
+    # pluralizes the CLASS noun: "potions of holy water".  POT_WATER is
+    # POTION_CLASS, so reuse the potion class-prefix rows.
+    def _write_potion_prefix(bc):
+        return lax.cond(
+            is_plural,
+            lambda x: _write_fixed(x[0], x[1],
+                                   _CLASS_PREFIX_PLURAL_BYTES[_POTION_CLASS_VAL],
+                                   _MAX_PREFIX_PLURAL_LEN),
+            lambda x: _write_fixed(x[0], x[1],
+                                   _CLASS_PREFIX_BYTES[_POTION_CLASS_VAL],
+                                   _MAX_PREFIX_LEN),
+            bc,
+        )
+
     def write_holy(bc):
+        bc = _write_potion_prefix(bc)
         return _write_fixed(bc[0], bc[1], _HOLY_WATER_BYTES, 11)
 
     def write_unholy(bc):
+        bc = _write_potion_prefix(bc)
         return _write_fixed(bc[0], bc[1], _UNHOLY_WATER_BYTES, 13)
 
     # --- Special case: corpse name (vendor objnam.c:1824) ---
@@ -1635,26 +1729,50 @@ def _write_true_name(buf, cursor, safe_type, obj_class, quantity,
             (b, c),
         )
 
-        # Step 2: class-of prefix ("ring of ", "potion of ", ...).  Only when
-        # singular (vendor: makeplural pluralizes the head noun, not the prefix).
-        pfx_src = _CLASS_PREFIX_BYTES[cls_safe]
+        # Step 2: class-of prefix ("ring of ", "potion of ", ...).  Vendor
+        # makeplural pluralizes the CLASS head noun and keeps " of "
+        # ("potions of healing"), so for a plural stack we emit the pluralized
+        # prefix and keep the object-specific tail singular; singular stacks
+        # emit the singular prefix.  Non-prefixed classes have empty rows in
+        # both tables (write nothing).  Cite: vendor objnam.c makeplural.
+        has_prefix = _CLASS_HAS_PREFIX[cls_safe]
+        pfx_src  = _CLASS_PREFIX_BYTES[cls_safe]
+        pfx_plur = _CLASS_PREFIX_PLURAL_BYTES[cls_safe]
         b, c = lax.cond(
             is_plural,
-            lambda _bc: _bc,
+            lambda _bc: _write_fixed(_bc[0], _bc[1], pfx_plur, _MAX_PREFIX_PLURAL_LEN),
             lambda _bc: _write_fixed(_bc[0], _bc[1], pfx_src, _MAX_PREFIX_LEN),
             (b, c),
         )
 
-        # Step 3: canonical name (singular or pluralised).  For set-of dragon
-        # scales the singular row is used unconditionally (vendor objnam.c:722
-        # writes actualn directly).  Under the Samurai role the actual name is
-        # the Japanese substitution (objnam.c:117-118) when one exists.
+        # Step 3: canonical name.  The SINGULAR name row is used for: set-of
+        # dragon scales (vendor objnam.c:722 writes actualn directly), class-of
+        # prefixed items (the "X" in "<class>s of X" stays singular), and gem
+        # " stone" items (makeplural pluralizes the trailing "stone", not the
+        # gem name).  Otherwise the pluralized name row is used when plural.
+        # Under the Samurai role the actual name is the Japanese substitution
+        # (objnam.c:117-118) when one exists.
+        is_gem_stone = _GEM_ADD_STONE[safe_type]
         sing_row = jnp.where(_is_sam, _SAMURAI_NAMES_BYTES_PADDED[safe_type],
                              _OBJECT_NAMES_BYTES_PADDED[safe_type])
         plur_row = jnp.where(_is_sam, _SAMURAI_NAME_PLURAL_BYTES[safe_type],
                              _NAME_PLURAL_BYTES[safe_type])
-        name_src = jnp.where(is_plural & ~is_set, plur_row, sing_row)
+        use_sing = is_set | has_prefix | is_gem_stone
+        name_src = jnp.where(is_plural & ~use_sing, plur_row, sing_row)
         b, c = _write_fixed(b, c, name_src, _MAX_PLURAL_NAME_LEN)
+
+        # Step 4: identified GEM " stone"/" stones" suffix (vendor GemStone).
+        b, c = lax.cond(
+            is_gem_stone,
+            lambda _bc: lax.cond(
+                is_plural,
+                lambda x: _write_fixed(x[0], x[1], _STONES_SUFFIX_BYTES, 8),
+                lambda x: _write_fixed(x[0], x[1], _STONE_SUFFIX_BYTES, 7),
+                _bc,
+            ),
+            lambda _bc: _bc,
+            (b, c),
+        )
         return b, c
 
     # Dispatch: water_special > corpse > spinach_tin > monster_tin > normal.
