@@ -1513,6 +1513,12 @@ def _register_mazewalk_envs(register_fn) -> None:
     for env_id, w, h, ms in variants:
         base = _make_factory(_mazewalk_builder(w, h), w=w, h=h, fill=" ")
         factory = _wrap_mazewalk_placement(base, w=w, h=h)
+        # The -Mapped variants carry vendor FLAGS:premapped: the maze RNG
+        # (walkfrom) is identical to the non-Mapped variant, only the reveal
+        # differs (whole maze shown at reset vs. hero-FOV).  Wrap the byte-exact
+        # placement factory with the same premapped full-reveal Sokoban uses.
+        if "-Mapped-" in env_id:
+            factory = _premapped_factory(factory)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=ms, category="MazeWalk")
 
@@ -5660,6 +5666,25 @@ def _wrap_exploremaze_placement(
         if 0 <= stair_row < _H and 0 <= stair_col < _W:
             terr[stair_row, stair_col] = _STAIR
 
+        # Vendor wallification -> wall_cleanup (mkmaze.c:130): "change walls
+        # surrounded by rock to rock" — a WALL cell whose all 8 neighbours are
+        # solid (STONE or wall, is_solid() mkmaze.c:66) reverts to STONE.  The
+        # des MAP border '-'/'|' segments that sit over the un-carved stone gaps
+        # between the corridors are therefore STONE in the finished vendor
+        # level, not walls.  The non-Mapped variant hides this (those border
+        # cells are off-FOV, rendered as unexplored stone in both); the
+        # premapped full-reveal exposes them, so replicate the conversion.
+        def _is_solid(yy, xx):
+            if yy < 0 or yy >= _H or xx < 0 or xx >= _W:
+                return True        # beyond-map reads as STONE (is_solid)
+            return terr[yy, xx] == _WALL or terr[yy, xx] == _VOID
+        wall_ys, wall_xs = _np.where(terr == _WALL)
+        for yy, xx in zip(wall_ys.tolist(), wall_xs.tolist()):
+            if all(_is_solid(yy + dy, xx + dx)
+                   for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                   if not (dy == 0 and dx == 0)):
+                terr[yy, xx] = _VOID
+
         terrain = state.terrain.at[0, 0].set(
             jnp.asarray(terr, dtype=jnp.int8)
         )
@@ -5688,13 +5713,21 @@ def _register_exploremaze_envs(register_fn) -> None:
         register_fn(env_id, factory, _exploremaze_rm(),
                     max_steps=500, category="ExploreMaze")
 
+    # The -Mapped variants carry vendor FLAGS:premapped and use the SAME
+    # (non-premapped) MAP + DOUBLE-MAZEWALK level-gen as their base Easy/Hard
+    # variants — only the reveal differs.  Route them through the identical
+    # byte-exact _wrap_exploremaze_placement, then apply the full-reveal.
     mapped = [
-        ("MiniHack-ExploreMaze-Easy-Mapped-v0", False, "exploremazeeasy_premapped.des"),
-        ("MiniHack-ExploreMaze-Hard-Mapped-v0", True,  "exploremazehard_premapped.des"),
+        ("MiniHack-ExploreMaze-Easy-Mapped-v0", False, "exploremazeeasy.des"),
+        ("MiniHack-ExploreMaze-Hard-Mapped-v0", True,  "exploremazehard.des"),
     ]
     for env_id, hard, des_name in mapped:
-        fallback = _make_factory(_exploremaze_builder(hard), w=22, h=14)
-        factory = _des_factory(des_name, fallback=fallback)
+        map_rows = _extract_des_map(des_name)
+        base = _make_factory(lambda lg: None,
+                             w=len(map_rows[0]), h=len(map_rows), fill=" ")
+        factory = _premapped_factory(
+            _wrap_exploremaze_placement(base, map_rows, hard)
+        )
         register_fn(env_id, factory, _exploremaze_rm(),
                     max_steps=500, category="ExploreMaze")
 
