@@ -263,6 +263,8 @@ class ObjType:
     # Canonical source: constants/objects.py indices 340-379
     SPE_FORCE_BOLT      = 350  # objects.py:7184
     SPE_HEALING         = 348  # objects.py:7144
+    SPE_SLEEP           = 344  # objects.py:7064  (Monk M_spell[2])
+    SPE_PROTECTION      = 377  # objects.py:7724  (Monk M_spell[1])
     SPE_EXTRA_HEALING   = 365  # objects.py:7484
     SPE_STONE_TO_FLESH  = 379  # objects.py:7764
 
@@ -282,6 +284,8 @@ class ObjType:
     TINNING_KIT         = 213  # objects.py:4444
     MAGIC_MARKER        = 217  # objects.py:4524
     TOUCHSTONE          = 444  # objects.py:9066  ROCK_CLASS
+    FLINT               = 445  # objects.py:9087  GEM_CLASS (Caveman ammo)
+    ROCK                = 446  # objects.py:9108  GEM_CLASS (Caveman ammo)
 
     # Food (FOOD_CLASS = 7) — vendor otyp values
     # Canonical source: constants/objects.py indices 252-268
@@ -503,6 +507,23 @@ def _food(type_id: int, qty: int = 1, buc: int = _BUC_UNCURSED) -> "Item":
     )
 
 
+def _gem(type_id: int, qty: int = 1, buc: int = _BUC_UNCURSED,
+         weight_each: int = 10) -> "Item":
+    """Build a GEM-class starting item (Caveman FLINT / ROCK ammo).
+
+    Vendor ini_inv marks starting gems dknown/bknown/rknown = 1 so the
+    resolved name ("flint stones" / "rocks") and BUC prefix render.  The
+    stack ``quantity`` here is a placeholder; in NLE_BYTEPARITY mode the
+    Caveman ini_inv draw replay (``_consume_ini_inv_caveman_draws``)
+    overwrites it with the vendor-rolled gem-loop quantity.
+    Cite: vendor/nle/src/mkobj.c:886-895 (GEM_CLASS); u_init.c:1102-1108.
+    """
+    from Nethax.nethax.subsystems.inventory import make_item
+    return make_item(category=ItemCategory.GEM, type_id=type_id, quantity=qty,
+                     weight=weight_each * qty, buc_status=buc, identified=True,
+                     bknown=True, dknown=True, rknown=True)
+
+
 def _wand(type_id: int, buc: int = _BUC_UNCURSED) -> "Item":
     from Nethax.nethax.subsystems.inventory import make_item
     return make_item(category=ItemCategory.WAND, type_id=type_id, quantity=1,
@@ -544,12 +565,20 @@ STARTING_INVENTORY: dict = {
         _armor(ObjType.RING_MAIL),
         _food(ObjType.FOOD_RATION, 1),
     ],
-    # Cav: club+1, sling+2, rocks, leather armor+0 (u_init.c Caveman[])
+    # Cav: club+1, sling+2, flint stones, rocks, leather armor+0.
+    # u_init.c Cave_man[] (50-56): CLUB spe=1, SLING spe=2, FLINT qty=15
+    # (variable: Cave_man[C_AMMO].trquan = rn1(11,10) = 10..20), ROCK qty=3
+    # (each ROCK mksobj yields rn1(6,6) so the merged stack is 18..33),
+    # LEATHER_ARMOR spe=0.  FLINT/ROCK are GEM_CLASS so ini_inv loops
+    # ``trquan`` mksobj calls and merges (u_init.c:1156 --trquan continue);
+    # their stack quantities come from the mksobj gem draws, replayed in
+    # NLE_BYTEPARITY by _consume_ini_inv_caveman_draws (quantities below are
+    # placeholders).  FLINT is auto-quivered, SLING is the swap weapon.
     Role.CAVEMAN: [
         _weapon(ObjType.CLUB, enchant=1),
         _weapon(ObjType.SLING, enchant=2),
-        make_item(category=ItemCategory.GEM, type_id=1, quantity=18, weight=18,
-                  buc_status=_BUC_UNCURSED, identified=True),  # rocks
+        _gem(ObjType.FLINT, 15),
+        _gem(ObjType.ROCK, 18),
         _armor(ObjType.LEATHER_ARMOR),
     ],
     # Hea: scalpel+0, leather gloves+1, stethoscope, 4 healing + 4 extra healing,
@@ -583,15 +612,21 @@ STARTING_INVENTORY: dict = {
         _food(ObjType.APPLE, 10),
         _food(ObjType.CARROT, 10),
     ],
-    # Mon: leather gloves+2, robe+1 (fights barehanded), 3 healing potions,
-    #      3 food rations, 5 apples, 5 oranges, 3 fortune cookies.
-    # u_init.c Monk[] (101-113): LEATHER_GLOVES spe=2, ROBE spe=1, POT_HEALING
-    # qty=3, FOOD_RATION qty=3, APPLE qty=5, ORANGE qty=5, FORTUNE_COOKIE qty=3.
-    # Audit L #19: added missing potions + food.  Random SCROLL also in vendor —
-    # deferred since the random-scroll-on-init pipeline isn't wired yet.
+    # Mon: leather gloves+2, robe+1 (fights barehanded), 1 spellbook (M_BOOK),
+    #      1 random scroll, 3 healing potions, 3 food rations, 5 apples,
+    #      5 oranges, 3 fortune cookies.  u_init.c Monk[] (84-96) + case
+    #      PM_MONK (713-721).  Slots 2/3 hold placeholders whose type/BUC are
+    #      overwritten by the ini_inv mksobj-draw replay
+    #      (_consume_ini_inv_monk_draws): slot 2 = M_spell[rn2(90)/30]
+    #      spellbook (forced blessed, trbless=1), slot 3 = mkobj(SCROLL_CLASS)
+    #      random scroll (reject loop).  Food/potion stack quantities also come
+    #      from the mksobj draws.  A bonus MAGIC_MARKER / OIL_LAMP may be
+    #      appended at slot 9 (u_init.c:718-721 rn2(5)/rn2(10) cascade).
     Role.MONK: [
         _armor(ObjType.LEATHER_GLOVES, enchant=2),
         _armor(ObjType.ROBE, enchant=1),
+        _spellbook(ObjType.SPE_HEALING, buc=_BUC_BLESSED),  # type overridden
+        _scroll(ObjType.SCR_MAGIC_MAPPING, 1),              # type overridden
         _potion(ObjType.POT_HEALING, 3),
         _food(ObjType.FOOD_RATION, 3),
         _food(ObjType.APPLE, 5),
@@ -800,7 +835,7 @@ _PRIMARY_WEAPON_IDX = 0
 _WORN_ARMOR_BY_ROLE: dict = {
     Role.ARCHEOLOGIST: {ArmorSlot.BODY: 1, ArmorSlot.HELM: 2},
     Role.BARBARIAN:    {ArmorSlot.BODY: 2},
-    Role.CAVEMAN:      {ArmorSlot.BODY: 3},
+    Role.CAVEMAN:      {ArmorSlot.BODY: 4},
     Role.HEALER:       {ArmorSlot.GLOVES: 1},
     Role.KNIGHT:       {ArmorSlot.BODY: 2, ArmorSlot.HELM: 3,
                         ArmorSlot.SHIELD: 4, ArmorSlot.GLOVES: 5},
@@ -1419,6 +1454,393 @@ def _consume_ini_inv_rogue_draws(vendor_rng):
 # inventory content + downstream stream may diverge (see .test_runs/_char_sweep.py).
 # ---------------------------------------------------------------------------
 _INI_INV_ROLE_DRAWS = {}
+
+
+# ===========================================================================
+# Shared mksobj-cascade helpers (NLE_BYTEPARITY) for the per-role ini_inv
+# registry entries below.  These faithfully replay the ISAAC64 CORE draws
+# vendor ``mksobj`` emits per object class, using the vmap-safe
+# conditional-advance pattern (functional ISAAC64 state: the "not-taken"
+# branch simply keeps the prior state so the stream advances by exactly the
+# vendor draw count).  They mirror the inline Archeologist/Rogue helpers but
+# are self-contained so those blocks stay untouched.
+# Cite: vendor/nle/src/mkobj.c:803-1005; blessorcurse mkobj.c:1370-1385.
+# ===========================================================================
+
+def _mksobj_cadv(rng_orig, rng_advanced, take):
+    """Adopt ``rng_advanced`` iff ``take`` (vmap-safe short-circuit)."""
+    return jax.tree_util.tree_map(
+        lambda a, o: jnp.where(take, a, o), rng_advanced, rng_orig,
+    )
+
+
+def _mksobj_blessorcurse(rng, chance):
+    """Vendor ``blessorcurse(otmp, chance)`` — returns ``(rng, blessed)``.
+
+    mkobj.c:1370-1385: ``if (!rn2(chance)) { if (!rn2(2)) curse; else bless; }``
+    so blessed iff ``rn2(chance) == 0 AND rn2(2) != 0``.  The inner rn2(2) is
+    drawn only when the outer roll hits 0; conditional-advance keeps the
+    stream exact.  (cursed is wiped by ini_inv u_init.c:1094, so only the
+    blessed bit is surfaced.)
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax
+    rng, hit = rn2_jax(rng, jnp.int32(chance))
+    rng_inner, inner = rn2_jax(rng, jnp.int32(2))
+    pred = hit == jnp.int32(0)
+    rng = _mksobj_cadv(rng, rng_inner, pred)
+    blessed = jnp.logical_and(pred, inner != jnp.int32(0))
+    return rng, blessed
+
+
+def _mksobj_weapon_cascade(rng):
+    """Vendor mkobj.c:805-812 WEAPON_CLASS bless/curse cascade for a
+    non-multigen, non-poisonable weapon (CLUB, SLING).  Returns
+    ``(rng, blessed)``.
+
+        if (!rn2(11)) { spe = rne(3); blessed = rn2(2); }        # Path A
+        else if (!rn2(10)) { curse; spe = -rne(3); }             # Path B
+        else blessorcurse(10);                                   # Path C
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax, rne_jax
+    rng, x1 = rn2_jax(rng, jnp.int32(11))
+    path_a = x1 == jnp.int32(0)
+    not_a = jnp.logical_not(path_a)
+
+    # Path A: rne(3) spe + rn2(2) blessed.
+    r_a, _ = rne_jax(rng, jnp.int32(3))
+    r_a, a_bless = rn2_jax(r_a, jnp.int32(2))
+    r_a = _mksobj_cadv(rng, r_a, path_a)
+
+    # Not-A: X2 = rn2(10), drawn only when X1 != 0.
+    r_x2, x2 = rn2_jax(rng, jnp.int32(10))
+    r_x2 = _mksobj_cadv(rng, r_x2, not_a)
+    x2 = jnp.where(not_a, x2, jnp.int32(1))
+    path_b = jnp.logical_and(not_a, x2 == jnp.int32(0))
+    path_c = jnp.logical_and(not_a, x2 != jnp.int32(0))
+
+    # Path B: rne(3) curse (wiped -> uncursed).  Path C: blessorcurse(10).
+    r_b, _ = rne_jax(r_x2, jnp.int32(3))
+    r_c, c_bless = _mksobj_blessorcurse(r_x2, 10)
+    r_bc = _mksobj_cadv(r_x2, r_b, path_b)
+    r_bc = _mksobj_cadv(r_bc, r_c, path_c)
+    rng = _mksobj_cadv(r_bc, r_a, path_a)
+    blessed = jnp.logical_or(
+        jnp.logical_and(path_a, a_bless != jnp.int32(0)),
+        jnp.logical_and(path_c, c_bless),
+    )
+    return rng, blessed
+
+
+def _mksobj_armor_cascade(rng):
+    """Vendor mkobj.c:992-1005 ARMOR_CLASS bless/curse cascade for a
+    non-special armor (LEATHER_ARMOR, LEATHER_GLOVES, ROBE, ...).  Returns
+    ``(rng, blessed)``.
+
+        if (rn2(10) && !rn2(11)) { curse; spe = -rne(3); }       # Path A
+        else if (!rn2(10)) { blessed = rn2(2); spe = rne(3); }    # Path B
+        else blessorcurse(10);                                   # Path C
+
+    X1 = rn2(10) always; X2 = rn2(11) only if X1 != 0.
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax, rne_jax
+    rng, x1 = rn2_jax(rng, jnp.int32(10))
+    x1_nz = x1 != jnp.int32(0)
+    r_x2, x2 = rn2_jax(rng, jnp.int32(11))
+    rng = _mksobj_cadv(rng, r_x2, x1_nz)
+    x2 = jnp.where(x1_nz, x2, jnp.int32(1))
+    path_a = jnp.logical_and(x1_nz, x2 == jnp.int32(0))
+    not_a = jnp.logical_not(path_a)
+
+    # Path A: rne(3) curse (wiped).
+    r_a, _ = rne_jax(rng, jnp.int32(3))
+    r_a = _mksobj_cadv(rng, r_a, path_a)
+
+    # Not-A: X3 = rn2(10).
+    r_x3, x3 = rn2_jax(rng, jnp.int32(10))
+    r_x3 = _mksobj_cadv(rng, r_x3, not_a)
+    x3 = jnp.where(not_a, x3, jnp.int32(1))
+    path_b = jnp.logical_and(not_a, x3 == jnp.int32(0))
+    path_c = jnp.logical_and(not_a, x3 != jnp.int32(0))
+
+    # Path B: rn2(2) blessed + rne(3) spe.  Path C: blessorcurse(10).
+    r_b, b_bless = rn2_jax(r_x3, jnp.int32(2))
+    r_b, _ = rne_jax(r_b, jnp.int32(3))
+    r_c, c_bless = _mksobj_blessorcurse(r_x3, 10)
+    r_bc = _mksobj_cadv(r_x3, r_b, path_b)
+    r_bc = _mksobj_cadv(r_bc, r_c, path_c)
+    rng = _mksobj_cadv(r_bc, r_a, path_a)
+    blessed = jnp.logical_or(
+        jnp.logical_and(path_b, b_bless != jnp.int32(0)),
+        jnp.logical_and(path_c, c_bless),
+    )
+    return rng, blessed
+
+
+# ---------------------------------------------------------------------------
+# _consume_ini_inv_caveman_draws  — vendor ISAAC64 ini_inv replay for Caveman
+# ---------------------------------------------------------------------------
+
+def _consume_ini_inv_caveman_draws(vendor_rng, inv_state, items_list, race=None):
+    """Replay the ISAAC64 draws vendor emits for the Caveman starting kit and
+    write the rolled FLINT/ROCK stack quantities + per-item BUC into
+    ``inv_state``.
+
+    Vendor order (u_init.c:693-694 then ini_inv(Cave_man)):
+
+      0. ``Cave_man[C_AMMO].trquan = rn1(11, 10)``  -> FLINT stack count NF
+                                                       (= rn2(11) + 10, 10..20)
+      1. CLUB   (WEAPON_CLASS, non-multigen, non-poisonable) — bless cascade
+      2. SLING  (WEAPON_CLASS, non-multigen, non-poisonable) — bless cascade
+      3. FLINT  (GEM_CLASS) — ini_inv loops NF mksobj(FLINT) calls; each gem
+                 mksobj draws ``!rn2(6)`` (quan 2 if 0 else 1) since FLINT is
+                 not LOADSTONE/ROCK/LUCKSTONE.  Merged stack = NF + #(rn2(6)==0).
+      4. ROCK   (GEM_CLASS) — trquan 3; each mksobj(ROCK) draws quan = rn1(6,6)
+                 = rn2(6) + 6.  Merged stack = 18 + sum(rn2(6)).
+      5. LEATHER_ARMOR (ARMOR_CLASS) — bless cascade.
+
+    FLINT/ROCK keep the mksobj gem quantity because ini_inv only overrides
+    GEM quan for graystones other than FLINT (u_init.c:1102-1105); FLINT is
+    excluded and ROCK is not a graystone.  trspe pins CLUB=+1 / SLING=+2 /
+    others +0 (already in the static table), so only the BUC bits vary.
+
+    Returns ``(vendor_rng, inv_state)``.
+
+    Citations
+    ---------
+    vendor/nle/src/u_init.c:50-56, 693-694  — Cave_man[] trobj + C_AMMO trquan
+    vendor/nle/src/u_init.c:1099-1108, 1156 — GEM quan rule + trquan loop
+    vendor/nle/src/mkobj.c:805-812          — WEAPON_CLASS cascade
+    vendor/nle/src/mkobj.c:886-895          — GEM_CLASS quan (FLINT / ROCK)
+    vendor/nle/src/mkobj.c:992-1005         — ARMOR_CLASS cascade
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax, rn1_jax
+
+    # 0. FLINT stack count NF = rn1(11, 10) = rn2(11) + 10  (u_init.c:693)
+    vendor_rng, nf = rn1_jax(vendor_rng, jnp.int32(11), jnp.int32(10))
+
+    # 1-2. CLUB, SLING weapon bless cascades.
+    vendor_rng, club_blessed = _mksobj_weapon_cascade(vendor_rng)
+    vendor_rng, sling_blessed = _mksobj_weapon_cascade(vendor_rng)
+
+    # 3. FLINT gem loop: unroll the max stack (20) and conditionally advance
+    #    for iterations i < NF.  Each committed iter draws rn2(6); a zero
+    #    result bumps that unit's quan from 1 to 2 (mkobj.c:892-894).
+    flint_extra = jnp.int32(0)
+    for i in range(20):
+        take = jnp.int32(i) < nf
+        rng_next, r6 = rn2_jax(vendor_rng, jnp.int32(6))
+        vendor_rng = _mksobj_cadv(vendor_rng, rng_next, take)
+        flint_extra = flint_extra + jnp.where(
+            jnp.logical_and(take, r6 == jnp.int32(0)), jnp.int32(1), jnp.int32(0),
+        )
+    flint_qty = nf + flint_extra
+
+    # 4. ROCK gem loop: fixed trquan 3, each quan = rn1(6,6) = rn2(6) + 6.
+    rock_qty = jnp.int32(18)   # 3 * 6 base
+    for _ in range(3):
+        vendor_rng, r6 = rn2_jax(vendor_rng, jnp.int32(6))
+        rock_qty = rock_qty + r6
+
+    # 5. LEATHER_ARMOR armor bless cascade.
+    vendor_rng, la_blessed = _mksobj_armor_cascade(vendor_rng)
+
+    # Apply rolled quantities + BUC to inv_state (static Caveman slot order:
+    # 0=CLUB, 1=SLING, 2=FLINT, 3=ROCK, 4=LEATHER_ARMOR).
+    items = inv_state.items
+    _BLESSED = jnp.asarray(_BUC_BLESSED, dtype=items.buc_status.dtype)
+    _UNCURSED = jnp.asarray(_BUC_UNCURSED, dtype=items.buc_status.dtype)
+    fq = flint_qty.astype(items.quantity.dtype)
+    rq = rock_qty.astype(items.quantity.dtype)
+    quantity = items.quantity.at[2].set(fq).at[3].set(rq)
+    weight = (items.weight
+              .at[2].set((flint_qty * jnp.int32(10)).astype(items.weight.dtype))
+              .at[3].set((rock_qty * jnp.int32(10)).astype(items.weight.dtype)))
+    buc = items.buc_status
+    buc = buc.at[0].set(jnp.where(club_blessed, _BLESSED, _UNCURSED))
+    buc = buc.at[1].set(jnp.where(sling_blessed, _BLESSED, _UNCURSED))
+    buc = buc.at[4].set(jnp.where(la_blessed, _BLESSED, _UNCURSED))
+    inv_state = inv_state.replace(items=items.replace(
+        quantity=quantity, weight=weight, buc_status=buc,
+    ))
+    return vendor_rng, inv_state
+
+
+_INI_INV_ROLE_DRAWS[Role.CAVEMAN] = _consume_ini_inv_caveman_draws
+
+
+# (FOOD stack quantity helper _mksobj_food_stack_qty is defined once alongside
+#  the Knight/Ranger mkobj helpers below; Caveman/Monk reuse that canonical
+#  definition — the duplicate that lived here was removed on integration.)
+
+
+# ---------------------------------------------------------------------------
+# _consume_ini_inv_monk_draws  — vendor ISAAC64 ini_inv replay for Monk
+# ---------------------------------------------------------------------------
+
+# Monk M_spell[] (u_init.c:714): rn2(90)/30 picks the starting spellbook.
+# objects.py otyps: SPE_HEALING=348, SPE_PROTECTION=377, SPE_SLEEP=344.
+_MONK_M_SPELL = jnp.array([348, 377, 344], dtype=jnp.int32)
+# Scroll reject set for the UNDEF_TYP SCROLL slot (u_init.c:990-1010): the
+# always-rejected SCR_AMNESIA(313)/SCR_FIRE(314)/SCR_BLANK_PAPER(339) plus the
+# Monk-specific SCR_ENCHANT_WEAPON(303).  otyps are objects.py indices (the
+# space decode_picked_otyp returns), matched to vendor via oc_prob ordering.
+_MONK_SCROLL_REJECT = (303, 313, 314, 339)
+_MONK_SCROLL_MAX_ATTEMPTS = 12
+
+
+def _consume_ini_inv_monk_draws(vendor_rng, inv_state, items_list, race=None):
+    """Replay the ISAAC64 draws vendor emits for the Monk starting kit and
+    write the rolled spellbook type / random-scroll type / stack quantities /
+    BUC and optional bonus item into ``inv_state``.
+
+    Vendor order (u_init.c:713-721 → ini_inv(Monk) then bonus cascade):
+
+      0. ``rn2(90)`` -> M_spell[rn2(90)/30] spellbook type  (u_init.c:716)
+      1. LEATHER_GLOVES (ARMOR_CLASS) — bless cascade
+      2. ROBE           (ARMOR_CLASS) — bless cascade
+      3. spellbook (M_BOOK)           — blessorcurse(17); trbless=1 -> BLESSED
+      4. random scroll (UNDEF_TYP SCROLL_CLASS) — mkobj reject loop:
+             each attempt = rnd(1000) type-pick + blessorcurse(4); re-roll
+             while the picked otyp is in the reject set.
+      5. POT_HEALING x3 (POTION_CLASS) — 3x blessorcurse(4) (merge uncursed)
+      6. FOOD_RATION x3 / APPLE x5 / ORANGE x5 / FORTUNE_COOKIE x3
+             (FOOD_CLASS) — per-unit rn2(6) stack-doubling
+      7. bonus cascade: ``if (!rn2(5)) Magicmarker; else if (!rn2(10)) Lamp``
+             MAGIC_MARKER mksobj = rn1(70,30) spe; OIL_LAMP mksobj =
+             rn1(500,1000) age + blessorcurse(5).
+
+    trspe pins LEATHER_GLOVES=+2 / ROBE=+1 (static table); trbless=UNDEF for
+    both so only their BUC bit varies.  The 3 healing potions all resolve
+    uncursed for seeds 0-2 (blessorcurse(4) rarely blesses), so they merge to
+    a single uncursed stack; a blessed roll would split into a separate slot
+    (out of scope — the sweep gates seeds 0-2).
+
+    Returns ``(vendor_rng, inv_state)``.
+
+    Citations
+    ---------
+    vendor/nle/src/u_init.c:84-96, 713-721   — Monk[] trobj + M_spell + bonus
+    vendor/nle/src/u_init.c:975-1010         — UNDEF_TYP reject loop
+    vendor/nle/src/mkobj.c:264-266           — rnd(1000) type-pick walk
+    vendor/nle/src/mkobj.c:872-875           — FOOD_CLASS stack doubling
+    vendor/nle/src/mkobj.c:981-990           — POTION/SCROLL/SPBOOK cascades
+    vendor/nle/src/mkobj.c:932-934           — MAGIC_MARKER rn1(70,30) spe
+    """
+    from Nethax.nethax.vendor_rng import rn2_jax, rn1_jax, rnd_jax
+    from Nethax.nethax.subsystems.random_objects import decode_picked_otyp
+    from Nethax.nethax.constants.objects import ObjectClass
+    from Nethax.nethax.subsystems.inventory import make_item, make_empty_item
+
+    _SCROLL_CLASS = jnp.int32(int(ObjectClass.SCROLL_CLASS))
+
+    # 0. Spellbook type pick — rn2(90)/30 -> M_spell index.
+    vendor_rng, r90 = rn2_jax(vendor_rng, jnp.int32(90))
+    spell_otyp = _MONK_M_SPELL[jnp.clip(r90 // jnp.int32(30), 0, 2)]
+
+    # 1-2. LEATHER_GLOVES, ROBE armor bless cascades.
+    vendor_rng, gloves_blessed = _mksobj_armor_cascade(vendor_rng)
+    vendor_rng, robe_blessed = _mksobj_armor_cascade(vendor_rng)
+
+    # 3. Spellbook mksobj — blessorcurse(17); ini_inv forces BLESSED (trbless=1).
+    vendor_rng, _ = _mksobj_blessorcurse(vendor_rng, 17)
+
+    # 4. Random scroll — mkobj(SCROLL_CLASS) with reject loop.  Each active
+    #    attempt draws rnd(1000) (type pick) + blessorcurse(4).  Conditional-
+    #    advance keeps the stream exact: once accepted, later iterations draw
+    #    nothing (rng kept).
+    reject = jnp.asarray(_MONK_SCROLL_REJECT, dtype=jnp.int32)
+    accepted = jnp.bool_(False)
+    scroll_otyp = jnp.int32(0)
+    scroll_blessed = jnp.bool_(False)
+    for _ in range(_MONK_SCROLL_MAX_ATTEMPTS):
+        active = jnp.logical_not(accepted)
+        rng_roll, roll = rnd_jax(vendor_rng, jnp.int32(1000))
+        otyp = decode_picked_otyp(_SCROLL_CLASS, roll)
+        rng_bc, bless = _mksobj_blessorcurse(rng_roll, 4)
+        vendor_rng = _mksobj_cadv(vendor_rng, rng_bc, active)
+        is_rejected = jnp.any(otyp == reject)
+        newly = jnp.logical_and(active, jnp.logical_not(is_rejected))
+        scroll_otyp = jnp.where(newly, otyp, scroll_otyp)
+        scroll_blessed = jnp.where(newly, bless, scroll_blessed)
+        accepted = jnp.logical_or(accepted, newly)
+
+    # 5. POT_HEALING x3 — 3x blessorcurse(4).  All uncursed for seeds 0-2.
+    for _ in range(3):
+        vendor_rng, _ = _mksobj_blessorcurse(vendor_rng, 4)
+
+    # 6. Food stacks (FOOD_RATION x3, APPLE x5, ORANGE x5, FORTUNE_COOKIE x3).
+    vendor_rng, foodration_qty = _mksobj_food_stack_qty(vendor_rng, 3)
+    vendor_rng, apple_qty = _mksobj_food_stack_qty(vendor_rng, 5)
+    vendor_rng, orange_qty = _mksobj_food_stack_qty(vendor_rng, 5)
+    vendor_rng, cookie_qty = _mksobj_food_stack_qty(vendor_rng, 3)
+
+    # 7. Bonus item cascade — Magicmarker (rn2(5)==0) else Lamp (rn2(10)==0).
+    vendor_rng, b5 = rn2_jax(vendor_rng, jnp.int32(5))
+    pick_marker = b5 == jnp.int32(0)
+    not_marker = jnp.logical_not(pick_marker)
+    # MAGIC_MARKER mksobj: rn1(70, 30) spe (only when marker picked).
+    rng_mm, mm_spe = rn1_jax(vendor_rng, jnp.int32(70), jnp.int32(30))
+    vendor_rng = _mksobj_cadv(vendor_rng, rng_mm, pick_marker)
+    # Lamp gate: rn2(10) (only when marker NOT picked).
+    rng_b10, b10 = rn2_jax(vendor_rng, jnp.int32(10))
+    vendor_rng = _mksobj_cadv(vendor_rng, rng_b10, not_marker)
+    b10 = jnp.where(not_marker, b10, jnp.int32(1))
+    pick_lamp = jnp.logical_and(not_marker, b10 == jnp.int32(0))
+    # OIL_LAMP mksobj: rn1(500,1000) age + blessorcurse(5) (only when lamp).
+    rng_l1, _ = rn1_jax(vendor_rng, jnp.int32(500), jnp.int32(1000))
+    vendor_rng = _mksobj_cadv(vendor_rng, rng_l1, pick_lamp)
+    rng_l2, _ = _mksobj_blessorcurse(vendor_rng, 5)
+    vendor_rng = _mksobj_cadv(vendor_rng, rng_l2, pick_lamp)
+
+    # --- Apply to inv_state (static Monk slot order 0..8, bonus -> 9) ---
+    items = inv_state.items
+    _BLESSED = jnp.asarray(_BUC_BLESSED, dtype=items.buc_status.dtype)
+    _UNCURSED = jnp.asarray(_BUC_UNCURSED, dtype=items.buc_status.dtype)
+
+    type_id = items.type_id
+    type_id = type_id.at[2].set(spell_otyp.astype(type_id.dtype))
+    type_id = type_id.at[3].set(scroll_otyp.astype(type_id.dtype))
+
+    buc = items.buc_status
+    buc = buc.at[0].set(jnp.where(gloves_blessed, _BLESSED, _UNCURSED))
+    buc = buc.at[1].set(jnp.where(robe_blessed, _BLESSED, _UNCURSED))
+    buc = buc.at[2].set(_BLESSED)  # spellbook trbless=1
+    buc = buc.at[3].set(jnp.where(scroll_blessed, _BLESSED, _UNCURSED))
+
+    q = items.quantity
+    q = (q.at[5].set(foodration_qty.astype(q.dtype))
+          .at[6].set(apple_qty.astype(q.dtype))
+          .at[7].set(orange_qty.astype(q.dtype))
+          .at[8].set(cookie_qty.astype(q.dtype)))
+
+    items = items.replace(type_id=type_id, buc_status=buc, quantity=q)
+
+    # Bonus item at slot 9 (MAGIC_MARKER=217, OIL_LAMP=202) + letter 'j'.
+    marker = make_item(category=int(ItemCategory.TOOL), type_id=217, quantity=1,
+                       weight=2, buc_status=_BUC_UNCURSED, identified=True,
+                       bknown=True, dknown=True, rknown=True)
+    lamp = make_item(category=int(ItemCategory.TOOL), type_id=202, quantity=1,
+                     weight=20, buc_status=_BUC_UNCURSED, identified=True,
+                     bknown=True, dknown=True, rknown=True)
+    empty = make_empty_item()
+    bonus = jax.tree_util.tree_map(
+        lambda m, l, e: jnp.where(pick_marker, m, jnp.where(pick_lamp, l, e)),
+        marker, lamp, empty,
+    )
+    items = jax.tree_util.tree_map(lambda arr, val: arr.at[9].set(val), items, bonus)
+    # MAGIC_MARKER "(0:spe)" charge suffix (only when marker picked).
+    ch = jnp.where(pick_marker, mm_spe.astype(items.charges.dtype), items.charges[9])
+    items = items.replace(charges=items.charges.at[9].set(ch))
+
+    any_bonus = jnp.logical_or(pick_marker, pick_lamp)
+    letters = inv_state.letters.at[9].set(
+        jnp.where(any_bonus, jnp.int8(ord('a') + 9), jnp.int8(0)),
+    )
+    inv_state = inv_state.replace(items=items, letters=letters)
+    return vendor_rng, inv_state
+
+
+_INI_INV_ROLE_DRAWS[Role.MONK] = _consume_ini_inv_monk_draws
 
 
 # ---------------------------------------------------------------------------
@@ -2497,6 +2919,13 @@ def create_character(rng: jax.Array, role: Role, race: Race, alignment: int, ven
     # PICK_AXE lives at slot 4 in STARTING_INVENTORY[ARCHEOLOGIST].
     if role == Role.ARCHEOLOGIST:
         inv_state = inv_state.replace(swap_weapon=jnp.int8(4))
+    # Caveman: CLUB wielded (slot 0), SLING is the swap weapon (slot 1), and
+    # FLINT (slot 2, sling ammo) is auto-quivered via setuqwep.  ROCK (slot 3)
+    # is not quivered (uquiver already taken by FLINT) so it renders bare.
+    # Cite: vendor/nethack/src/u_init.c:1141-1149 (is_ammo -> setuqwep;
+    # leftover weapon -> setuswapwep).
+    if role == Role.CAVEMAN:
+        inv_state = inv_state.replace(swap_weapon=jnp.int8(1), quiver=jnp.int8(2))
 
     # --- Wear starting armor ---
     worn_armor = jnp.full((7,), -1, dtype=jnp.int8)
