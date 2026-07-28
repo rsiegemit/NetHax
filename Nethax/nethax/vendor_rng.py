@@ -817,17 +817,21 @@ def rne_jax(rng: "Isaac64State", x, ulevel: int = 0) -> Tuple["Isaac64State", ja
     utmp = jnp.int32(5 if ulevel < 15 else ulevel // 3)
 
     def cond(carry):
-        _rng, tmp = carry
-        return tmp < utmp
+        _rng, tmp, cont = carry
+        return jnp.logical_and(tmp < utmp, cont)
 
     def body(carry):
-        _rng, tmp = carry
+        _rng, tmp, cont = carry
         new_rng, v = rn2_jax(_rng, x)
-        # stop incrementing when rn2(x) != 0 by jumping to utmp (terminates cond)
-        new_tmp = jax.lax.cond(v == jnp.int32(0), lambda: tmp + jnp.int32(1), lambda: utmp)
-        return new_rng, new_tmp
+        # vendor: `while (tmp < utmp && !rn2(x)) tmp++;` — increment only on a
+        # zero draw; a non-zero draw stops the loop WITHOUT bumping tmp, so the
+        # return value is the count of leading zeros + 1 (not the utmp cap).
+        iszero = v == jnp.int32(0)
+        new_tmp = jnp.where(iszero, tmp + jnp.int32(1), tmp)
+        return new_rng, new_tmp, iszero
 
-    rng_out, tmp_out = jax.lax.while_loop(cond, body, (rng, jnp.int32(1)))
+    rng_out, tmp_out, _ = jax.lax.while_loop(
+        cond, body, (rng, jnp.int32(1), jnp.bool_(True)))
     return rng_out, tmp_out
 
 
