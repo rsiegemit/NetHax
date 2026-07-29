@@ -4047,10 +4047,41 @@ def _quest_builder(difficulty: str) -> Callable[[LevelGenerator], None]:
     return build
 
 
+def _strip_random_monsters(src: str) -> str:
+    """Drop ``MONSTER:random,random`` directives from a .des source.
+
+    Quest-Easy places two random-species / random-cell monsters
+    (``quest_easy.des``).  The des_parser resolves those via the LG's
+    ``add_monster`` path, which prepends a spurious Room-style ``mkstairs``
+    4-draw prefix (level_generator ``_apply_directives`` lines gated on
+    ``has_monster_dir``) that a des/sp_lev level never draws — shifting the
+    ISAAC64 stream so the monster species+cells miss vendor.  We strip the
+    ``MONSTER:random`` lines here and replay them faithfully in
+    :func:`_wrap_quest_inv` (``n_random_monsters``) off ``state.vendor_rng``
+    via :func:`level_generator._resolve_monster`, the same makemon template the
+    ``-Distr`` skill wrappers use (both are the identical ``MONSTER:random,random``
+    directive).  Explicit-cell monsters (Quest-Medium's giant rats) are left in
+    place — those hit ``_resolve_monster``'s fixed-coordinate branch and draw no
+    placement RNG.
+    """
+    out = []
+    for line in src.splitlines():
+        compact = line.strip().replace(" ", "")
+        if compact.startswith("MONSTER:random,random"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _wrap_quest_inv(
     factory: Callable[[jax.Array], "EnvState"],
+    *,
+    n_random_monsters: int = 0,
+    region_wh: Optional[Tuple[int, int]] = None,
+    hero_rel: Tuple[int, int] = (2, 2),
 ) -> Callable[[jax.Array], "EnvState"]:
-    """Auto-pick-up the two blessed quest items placed on the hero's cell.
+    """Auto-pick-up the two blessed quest items placed on the hero's cell, and
+    (Easy) replay the stripped ``MONSTER:random,random`` distractors.
 
     quest_easy.des / quest_medium.des both open with (vendor coords):
 
@@ -4065,6 +4096,17 @@ def _wrap_quest_inv(
     and takes the earlier inventory letter — matching vendor's observed order
     ('a horn' before 'a tin wand').  BUC is blessed but unrevealed at pickup
     (``bknown=False`` -> no "blessed" prefix), so we carry with buc_status=3.
+
+    ``n_random_monsters`` > 0 (Quest-Easy): after the map/objects are built —
+    but the des ``MONSTER:random`` lines were stripped by
+    :func:`_strip_random_monsters` — place that many random monsters via
+    :func:`level_generator._resolve_monster`, consuming ``state.vendor_rng`` in
+    des-directive order (the two monsters come before the BRANCH/STAIR).  The
+    placement region is the des ``REGION`` rect: ``region_wh`` gives its
+    (width, height); its top-left is derived from the hero's fixed
+    BRANCH-relative offset (``hero_rel``), so no cell is hardcoded.  Species and
+    cells fall out of the ISAAC64 draws (``pick_monster_for_level`` +
+    somexy retry), exactly like the ``-Distr`` skill monsters.
     """
     from Nethax.minihax.level_generator import _OBJECT_NAME_TO_IDX as _NAME2IDX
 
@@ -4080,6 +4122,57 @@ def _wrap_quest_inv(
         if wand_idx is not None:
             state = _carry_starting_inventory_item(state, int(wand_idx),
                                                    buc_status=3)
+
+        if n_random_monsters > 0 and region_wh is not None:
+            from Nethax.minihax.level_generator import (
+                _resolve_monster as _resolve_monster,
+                _write_monster as _write_monster,
+                _MonsterDirective as _MonsterDirective,
+                _mksobj_init_draws as _mksobj_init_draws,
+            )
+            from Nethax.nethax import vendor_rng as _vendor_rng
+            # Vendor ``create_object`` runs ``mksobj`` on the two blessed quest
+            # items (wand of cold otyp 403, frost horn otyp 225) BEFORE the des
+            # MONSTER directives; those init draws (charge/blessorcurse rolls)
+            # advance the ISAAC64 stream even though the appearance/BUC are des-
+            # fixed.  Minihax stamps the named objects at their fixed cell and
+            # skips those draws, so replay them here in des order to reach the
+            # same offset vendor's monster somexy consumes.
+            _vrng = state.vendor_rng
+            # Vendor per-level setup prefix (rn2(3), rn2(2)) that precedes the
+            # des object/monster placement — the same 2-draw prefix the -Distr
+            # skill wrapper consumes (``_wrap_skill_placement`` step (1)).
+            _vrng, _ = _vendor_rng.rn2_jax(_vrng, jnp.int32(3))
+            _vrng, _ = _vendor_rng.rn2_jax(_vrng, jnp.int32(2))
+            for _otyp in (403, 225):
+                _vrng = _mksobj_init_draws(_vrng, _otyp)
+            state = state.replace(vendor_rng=_vrng)
+            _H = int(state.terrain.shape[2])
+            _W = int(state.terrain.shape[3])
+            _hy = int(state.player_pos[0])
+            _hx = int(state.player_pos[1])
+            # BRANCH:(2,2,2,2) places the hero at region-relative (hero_rel);
+            # the REGION rect origin is therefore hero - hero_rel.
+            _ry1 = _hy - int(hero_rel[1])
+            _rx1 = _hx - int(hero_rel[0])
+            _rw, _rh = int(region_wh[0]), int(region_wh[1])
+            _rooms = {
+                "__quest__": (_ry1, _rx1, _ry1 + _rh - 1, _rx1 + _rw - 1),
+            }
+            _occ: set = set()
+            for _ in range(n_random_monsters):
+                (_mrow, _mcol), _midx, state, _members = _resolve_monster(
+                    _MonsterDirective(
+                        name="random", symbol=None, place=None, args=(),
+                    ),
+                    state.terrain, _W, _H, _rooms, None, state,
+                    occupied=_occ, stair_cell=None,
+                )
+                state = _write_monster(state, (_mrow, _mcol), _midx)
+                _occ.add((_mrow, _mcol))
+                for _mp, _mi in _members:
+                    state = _write_monster(state, _mp, _mi)
+                    _occ.add(_mp)
         return state
 
     return wrapped
@@ -4105,9 +4198,26 @@ def _register_quest_envs(register_fn) -> None:
         ("MiniHack-Quest-Hard-v0",   "hard",   "quest_hard.des"),
     ]:
         fallback = _make_factory(_quest_builder(diff), w=25, h=10)
-        factory = _des_factory(des_name, fallback=fallback)
-        if diff in ("easy", "medium"):
+        if diff == "easy":
+            # quest_easy.des: strip the two ``MONSTER:random,random`` lines and
+            # replay them faithfully in the wrapper (region rect (0,0,28,6) ->
+            # 29x7).  Medium's monsters are explicit-cell giant rats (no
+            # placement RNG) so it uses the des directives as-is.
+            try:
+                with open(_vendor_des_path(des_name), "r",
+                          encoding="utf-8", errors="replace") as _fh:
+                    _src = _strip_random_monsters(_fh.read())
+                factory = _des_factory_from_source(_src, fallback=fallback)
+            except OSError:
+                factory = fallback
+            factory = _wrap_quest_inv(
+                factory, n_random_monsters=2, region_wh=(29, 7),
+            )
+        elif diff == "medium":
+            factory = _des_factory(des_name, fallback=fallback)
             factory = _wrap_quest_inv(factory)
+        else:
+            factory = _des_factory(des_name, fallback=fallback)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=1000, category="Quest")
 
