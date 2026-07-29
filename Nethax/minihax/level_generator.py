@@ -775,6 +775,26 @@ class _ReplaceTerrainDirective:
 
 
 @dataclasses.dataclass
+class _IfChanceDirective:
+    """Deferred des ``IF [pct%] { ... } ELSE { ... }`` branch selection.
+
+    Vendor compiles ``IF [pct%]`` to ``push pct; push 100; SPO_RN2; SPO_JG``
+    (vendor/nle/util/lev_comp.y:881-886 ``comparestmt``) — i.e. the THEN body
+    runs iff ``pct > rn2(100)`` (equivalently ``rn2(100) < pct``).  That
+    ``rn2(100)`` is drawn off the SAME ISAAC64 stream as the level's monster /
+    trap placement, at the point the interpreter reaches the IF.  We therefore
+    defer the branch pick to materialisation time (``_apply_directives``) so it
+    consumes ``state.vendor_rng`` in the right sequence position, instead of a
+    seed-decoupled Python RNG at des-parse time.  ``then_dirs`` / ``else_dirs``
+    hold the already-compiled sub-directive lists (which may themselves contain
+    nested ``_IfChanceDirective`` for e.g. memento_hard).
+    """
+    chance: int                    # 0..100
+    then_dirs: List[Any]
+    else_dirs: List[Any]
+
+
+@dataclasses.dataclass
 class _StartPosDirective:
     x: int
     y: int
@@ -1010,6 +1030,22 @@ class LevelGenerator:
         """Spawn a monster on the level."""
         self._directives.append(_MonsterDirective(
             name=name, symbol=symbol, place=place, args=tuple(args),
+        ))
+
+    def add_if_chance(
+        self, chance: int, then_dirs: List[Any], else_dirs: List[Any],
+    ) -> None:
+        """Record a deferred ``IF [chance%]`` branch (see _IfChanceDirective).
+
+        The des parser captures the THEN / ELSE directive spans and hands them
+        here so the branch pick draws ``rn2(100)`` off the vendor ISAAC64 stream
+        at materialisation time (byte-faithful) rather than a decoupled Python
+        RNG at parse time.
+        """
+        self._directives.append(_IfChanceDirective(
+            chance=int(chance),
+            then_dirs=list(then_dirs),
+            else_dirs=list(else_dirs),
         ))
 
     def add_trap(self, name: str = "teleport", place: Place = None) -> None:
@@ -1541,7 +1577,22 @@ def _apply_directives(
     # makemon does.  Single-room + has-monster matches Room-Monster and
     # Room-Ultimate; Trap/Random/Dark wrappers handle the prefix
     # themselves and don't have monster directives.
-    has_monster_dir = any(isinstance(d, _MonsterDirective) for d in directives)
+    def _contains_monster_dir(dlist: List[Any]) -> bool:
+        # Monsters may be nested inside a deferred _IfChanceDirective (des IF
+        # branch), so recurse to keep the monster-gating below (stair prefix,
+        # trap-placeholder skip) behaving as it did when monsters were emitted
+        # top-level.
+        for _d in dlist:
+            if isinstance(_d, _MonsterDirective):
+                return True
+            if isinstance(_d, _IfChanceDirective) and (
+                _contains_monster_dir(_d.then_dirs)
+                or _contains_monster_dir(_d.else_dirs)
+            ):
+                return True
+        return False
+
+    has_monster_dir = _contains_monster_dir(directives)
     # Room envs carve via _FillTerrainDirective (not _RoomDirective) so
     # ``resolved_rooms`` is empty.  Derive the room bbox from the FLOOR-fill
     # directive's rect (the fill is applied later in pass 2, so we can't
@@ -1585,8 +1636,43 @@ def _apply_directives(
         state = state.replace(vendor_rng=vrng)
         _mklev_stair_cell = (ry1 + int(_stair_yoff), rx1 + int(_stair_xoff))
 
-    # Pass 2: everything else.
-    for d in directives:
+    # Vendor ``sp_level_coder`` (vendor/nle/src/sp_lev.c:5343) calls
+    # ``shuffle_alignments()`` ONCE, before executing any des opcode.  That
+    # function (sp_lev.c:658-673) draws ``rn2(3)`` then ``rn2(2)`` off the same
+    # ISAAC64 stream the level's placement uses.  Our fast_reset bootstrap skips
+    # mklev/load_special, so this 2-draw prefix is missing from ``vendor_rng``.
+    # It only matters when a later draw is glyph-observable — i.e. a des ``IF
+    # [pct%]`` branch pick (_IfChanceDirective).  Consume it here, once, right
+    # before the worklist so the IF's ``rn2(100)`` lands at vendor's stream
+    # offset (Memento F2/F4/Short).  Scoped to IF-bearing levels so non-IF des
+    # envs keep their current byte offsets unchanged.
+    if any(isinstance(d, _IfChanceDirective) for d in directives):
+        from Nethax.nethax import vendor_rng as _vendor_rng
+        _vsa = state.vendor_rng
+        _vsa, _ = _vendor_rng.rn2_jax(_vsa, jnp.int32(3))   # rn2(3)
+        _vsa, _ = _vendor_rng.rn2_jax(_vsa, jnp.int32(2))   # rn2(2)
+        state = state.replace(vendor_rng=_vsa)
+
+    # Pass 2: everything else.  Use an explicit worklist (not a plain for-loop)
+    # so a deferred des ``IF`` (_IfChanceDirective) can splice its chosen branch
+    # directives inline at the point its rn2(100) is drawn — preserving vendor's
+    # draw order (the IF's rn2(100) immediately precedes that branch's monster /
+    # trap placement draws), including nested IFs (memento_hard).
+    _worklist = list(directives)
+    _wi = 0
+    while _wi < len(_worklist):
+        d = _worklist[_wi]
+        _wi += 1
+        if isinstance(d, _IfChanceDirective):
+            from Nethax.nethax import vendor_rng as _vendor_rng
+            vrng = state.vendor_rng
+            vrng, _roll = _vendor_rng.rn2_jax(vrng, jnp.int32(100))
+            state = state.replace(vendor_rng=vrng)
+            # Vendor ``pct > rn2(100)`` (lev_comp.y comparestmt) => THEN taken
+            # iff ``rn2(100) < chance``.
+            _chosen = d.then_dirs if int(_roll) < d.chance else d.else_dirs
+            _worklist[_wi:_wi] = list(_chosen)
+            continue
         if isinstance(d, _RoomDirective):
             continue   # already handled
         elif isinstance(d, _SetMapDirective):

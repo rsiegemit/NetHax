@@ -1714,7 +1714,32 @@ def _emit_stmt(lg: Any, stmt: Any, env: dict, rng_state: dict) -> None:
         return
 
     if isinstance(stmt, IfElse):
-        # Evaluate chance at compile time using the seeded RNG.
+        # A percentage ``IF [pct%]`` maps to vendor ``pct > rn2(100)`` drawn off
+        # the ISAAC64 level-gen stream (vendor/nle/util/lev_comp.y:881-886).  If
+        # the real LevelGenerator supports deferred branches, capture the THEN /
+        # ELSE directive spans and hand them to ``add_if_chance`` so the branch
+        # pick consumes ``state.vendor_rng`` in the correct sequence position at
+        # materialisation time — byte-faithful across seeds.  Otherwise fall
+        # back to the seed-decoupled Python RNG (mock LG / symbolic conditions).
+        inner = getattr(lg, "_inner", None)
+        dirs = getattr(inner, "_directives", None) if inner is not None else None
+        if (
+            stmt.chance is not None
+            and dirs is not None
+            and hasattr(inner, "add_if_chance")
+        ):
+            base = len(dirs)
+            for sub in stmt.then_body:
+                _emit_stmt(lg, sub, env, rng_state)
+            then_dirs = dirs[base:]
+            del dirs[base:]
+            for sub in stmt.else_body:
+                _emit_stmt(lg, sub, env, rng_state)
+            else_dirs = dirs[base:]
+            del dirs[base:]
+            inner.add_if_chance(int(stmt.chance), then_dirs, else_dirs)
+            return
+        # Evaluate chance at compile time using the seeded RNG (fallback).
         if stmt.chance is None:
             branch = stmt.then_body
         else:
