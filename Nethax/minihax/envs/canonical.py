@@ -4602,32 +4602,142 @@ def _register_wod_envs(register_fn) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Boxoban envs (Group A — Sokoban variants from procedural Boxoban set)
+# Boxoban envs (Group A — Sokoban-style boulder puzzles from the Boxoban set)
 # ---------------------------------------------------------------------------
-def _boxoban_builder(difficulty: str) -> Callable[[LevelGenerator], None]:
-    n = {"unfiltered": 2, "medium": 3, "hard": 4}.get(difficulty, 2)
-    def build(lg: LevelGenerator) -> None:
-        lg.add_room(x=1, y=1, w=10, h=8)
-        lg.set_start_pos(2, 2)
-        lg.add_stair_down(x=9, y=7)
-        for i in range(n):
-            x = 3 + (i * 2) % 6
-            y = 3 + (i // 3)
-            try:
-                lg.add_object("boulder", "`", place=(x, y))
-            except KeyError:
-                lg.add_object("random", place=(x, y))
-            lg.fill_terrain("{", 6 + i, 5, 6 + i, 5)
-    return build
+# Vendor ``BoxoHack`` (vendor/minihack/minihack/envs/boxohack.py) reads every
+# ``*.txt`` under ``dat/boxoban-levels-master/<set>/<mode>/`` — each file holds
+# many 10x10 puzzles separated by blank lines, the 0th line of each block being
+# a level NUMBER that is dropped — into one flat list (``os.listdir`` order),
+# then picks ONE puzzle with ``random.choice(self._levels)`` where Python's
+# global ``random`` was seeded by the parity harness (``random.seed(seed)``)
+# BEFORE the env is constructed.  The chosen puzzle is stamped verbatim, lit +
+# premapped: ``$``->boulder, ``.``->fountain, ``@``->hero start (cell -> floor),
+# `` ``->floor, ``#``->IRONBARS ('F', S_bars).  No RNG beyond the single pick,
+# no down-stair (the goal is boulders-on-fountains).
+#
+# We reproduce the pick faithfully: ``random.Random(seed)`` drives the same
+# CPython MT19937 + ``_randbelow`` rejection sampler as the harness's global
+# ``random.seed(seed)`` (verified byte-identical for the target seeds).  Vendor
+# actually draws TWICE per env: ``BoxoHack.__init__`` calls ``get_lvl_gen`` once
+# (its des seeds the C level), then ``BoxoHack.reset`` calls it AGAIN — and the
+# reset draw is the level the observation renders (traced: exactly two
+# ``random.choice(self._levels)`` calls, no other ``random`` consumption).  So we
+# take the SECOND ``choice``.  The integer ``seed`` is recovered from the reset
+# key (``jax.random.key(seed)`` -> key_data ``[0, seed]``); the level list is
+# loaded with the exact vendor ``load_boxoban_levels`` logic + ``os.listdir``
+# order so our flat index matches vendor's.
+
+_BOXOBAN_LEVELS_ROOT = os.path.join(_VENDOR_DAT_DIR, "boxoban-levels-master")
+_BOXOBAN_LEVEL_CACHE: dict = {}
+
+
+def _load_boxoban_levels(cur_levels_path: str) -> list:
+    """Verbatim port of vendor ``load_boxoban_levels`` (boxohack.py).
+
+    Reads every ``*.txt`` in ``os.listdir`` order; each file is split on blank
+    lines into puzzle blocks; block[0] (the level number) is dropped and the
+    remaining map lines are joined into one level string.
+    """
+    levels: list = []
+    for file in os.listdir(cur_levels_path):
+        if file.endswith(".txt"):
+            with open(os.path.join(cur_levels_path, file)) as f:
+                cur_lines = f.readlines()
+            cur_level: list = []
+            for el in cur_lines:
+                if el != "\n":
+                    cur_level.append(el)
+                else:
+                    levels.append("".join(cur_level[1:]))
+                    cur_level = []
+    return levels
+
+
+def _boxoban_levels_for(level_set: str, level_mode: str) -> list:
+    key = (level_set, level_mode)
+    if key not in _BOXOBAN_LEVEL_CACHE:
+        path = os.path.join(_BOXOBAN_LEVELS_ROOT, level_set, level_mode)
+        _BOXOBAN_LEVEL_CACHE[key] = _load_boxoban_levels(path)
+    return _BOXOBAN_LEVEL_CACHE[key]
+
+
+def _boxoban_factory(level_set: str, level_mode: str,
+                     ) -> Callable[[jax.Array], EnvState]:
+    """Seed-dependent Boxoban factory (premapped + lit).
+
+    Recovers the integer seed from ``rng``, reproduces the vendor
+    ``random.choice`` puzzle pick, and stamps the 10x10 puzzle at its
+    ``GEOMETRY:center,center`` origin on the 80x21 dungeon — the same static
+    map/boulder path :func:`_sokoban_builder` uses.
+    """
+    import random as _random
+
+    def make_state(rng: jax.Array) -> EnvState:
+        try:
+            kd = jax.random.key_data(rng)
+        except Exception:
+            kd = rng
+        seed = int(jnp.asarray(kd).reshape(-1)[-1])
+
+        levels = _boxoban_levels_for(level_set, level_mode)
+        rng_py = _random.Random(seed)
+        rng_py.choice(levels)              # draw #1 (vendor __init__, discarded)
+        chosen = rng_py.choice(levels)     # draw #2 (vendor reset, rendered)
+        rows_src = chosen.split("\n")[:-1]  # drop the trailing "" (vendor level[:-1])
+
+        map_rows: list = []
+        boulders: list = []
+        player = None
+        for ry, line in enumerate(rows_src):
+            out = []
+            for cx, ch in enumerate(line):
+                if ch == "#":
+                    out.append("F")          # IRONBARS (S_bars)
+                elif ch == ".":
+                    out.append("{")          # FOUNTAIN (vendor add_fountain)
+                elif ch == "$":
+                    out.append(".")          # floor; boulder object on top
+                    boulders.append((cx, ry))
+                elif ch == "@":
+                    out.append(".")          # hero stands on plain floor
+                    player = (cx, ry)
+                else:                        # space -> floor (solidfill parity)
+                    out.append(".")
+            map_rows.append("".join(out))
+
+        w = max(len(r) for r in map_rows)
+        h = len(map_rows)
+        dx, dy = _vendor_geometry_center_wh(w, h)
+
+        grid: list = []
+        for gy in range(21):
+            row = [" "] * 80
+            my = gy - dy
+            if 0 <= my < h:
+                for cx, ch in enumerate(map_rows[my]):
+                    ax = cx + dx
+                    if 0 <= ax < 80:
+                        row[ax] = ch
+            grid.append("".join(row))
+
+        lg = LevelGenerator(w=80, h=21, fill=" ", lit=True)
+        lg.set_map(grid)
+        if player is not None:
+            lg.set_start_pos(player[0] + dx, player[1] + dy)
+        for (bx, by) in boulders:
+            lg.add_boulder(place=(bx + dx, by + dy))
+        return lg.get_factory()(rng)
+
+    return _premapped_factory(make_state)
 
 
 def _register_boxoban_envs(register_fn) -> None:
-    for env_id, diff in [
-        ("MiniHack-Boxoban-Unfiltered-v0", "unfiltered"),
-        ("MiniHack-Boxoban-Medium-v0",     "medium"),
-        ("MiniHack-Boxoban-Hard-v0",       "hard"),
+    for env_id, level_set, level_mode in [
+        ("MiniHack-Boxoban-Unfiltered-v0", "unfiltered", "train"),
+        ("MiniHack-Boxoban-Medium-v0",     "medium",     "train"),
+        ("MiniHack-Boxoban-Hard-v0",       "hard",       ""),
     ]:
-        factory = _make_factory(_boxoban_builder(diff), w=12, h=10)
+        factory = _boxoban_factory(level_set, level_mode)
         register_fn(env_id, factory, _default_goal_reward_manager(),
                     max_steps=1000, category="Boxoban")
 
