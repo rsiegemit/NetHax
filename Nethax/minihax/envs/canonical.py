@@ -541,17 +541,42 @@ def _wrap_random_room_placement(
         # ROOM ↔ terrain == FLOOR in minihax).  See
         # .test_runs/vendor_placement_model.md for full derivation.
         # Eager-mode break supersedes lax.cond — JIT-safety is a followup.
+        import numpy as _np
         from Nethax.nethax.constants.tiles import TileType as _TT
-        terrain_l0 = new_terrain[0, 0]
         _FLOOR = int(_TT.FLOOR)
+        _terr_np = _np.asarray(new_terrain[0, 0])
+        _H, _W = _terr_np.shape
+        _ok = (_terr_np == _FLOOR)
+        acc_x_i = int(acc_x)
+        acc_y_i = int(acc_y)
+        _accepted = False
         for _ in range(200):
             vrng, raw_x = _vendor_rng.rn2_jax(vrng, jnp.int32(79))
             vrng, cand_y = _vendor_rng.rn2_jax(vrng, jnp.int32(21))
-            cand_x = raw_x + jnp.int32(1)
-            if int(terrain_l0[cand_y, cand_x]) == _FLOOR:
-                acc_x = cand_x
-                acc_y = cand_y
+            cx = int(raw_x) + 1
+            cy = int(cand_y)
+            if 0 <= cy < _H and 0 <= cx < _W and bool(_ok[cy, cx]):
+                acc_x_i, acc_y_i = cx, cy
+                _accepted = True
                 break
+        # Vendor place_lregion deterministic fallback (mkmaze.c:311-316): when
+        # all 200 probabilistic tries miss (≈5% of 5x5 seeds — the tiny room
+        # rect rarely gets hit by rn2(79)/rn2(21) draws), vendor scans
+        # column-major (x=lx..hx, y=ly..hy) for the first !bad_location cell.
+        # Without this the wrapper fell back to room-center, diverging from
+        # vendor's top-left-ish corner at exactly those seeds (Room-Random /
+        # Room-Dark 5x5 seeds 19/32/58).
+        if not _accepted:
+            for sx in range(1, _W):
+                for sy in range(0, _H):
+                    if bool(_ok[sy, sx]):
+                        acc_x_i, acc_y_i = sx, sy
+                        _accepted = True
+                        break
+                if _accepted:
+                    break
+        acc_x = jnp.int32(acc_x_i)
+        acc_y = jnp.int32(acc_y_i)
         state = state.replace(
             vendor_rng=vrng,
             terrain=new_terrain,
