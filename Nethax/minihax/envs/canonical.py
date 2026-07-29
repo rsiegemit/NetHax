@@ -6110,6 +6110,13 @@ def _wrap_exploremaze_placement(
 
     _FLOOR = int(_TileType.FLOOR)
     _WALL = int(_TileType.WALL)
+    # des mapchar keeps the authored horizontal/vertical wall typ: '-' -> HWALL,
+    # '|' -> VWALL (vendor sp_lev.c mapchar / rm.h HWALL,VWALL).  fix_wall_spines
+    # LEAVES this typ untouched for a free-standing wall (spine bits == 0,
+    # mkmaze.c:217-219), so a border '-' cell that wall_cleanup isolates renders
+    # S_hwall — not the generic S_vwall default (ExploreMaze-Hard-Mapped (3,17)).
+    _HWALL = int(_TileType.HWALL)
+    _VWALL = int(_TileType.VWALL)
     _STAIR = int(_TileType.STAIRCASE_DOWN)
     _VOID = 0
     D = _exploremaze_directives(hard)
@@ -6146,8 +6153,10 @@ def _wrap_exploremaze_placement(
                 ix = XS + dx
                 if ix >= _W:
                     break
-                if ch in "-|":
-                    terr[iy, ix] = _WALL
+                if ch == "-":
+                    terr[iy, ix] = _HWALL
+                elif ch == "|":
+                    terr[iy, ix] = _VWALL
                 elif ch == ".":
                     terr[iy, ix] = _FLOOR
 
@@ -6239,11 +6248,15 @@ def _wrap_exploremaze_placement(
         # level, not walls.  The non-Mapped variant hides this (those border
         # cells are off-FOV, rendered as unexplored stone in both); the
         # premapped full-reveal exposes them, so replicate the conversion.
+        # HWALL/VWALL are des-authored walls (IS_WALL true); they count as walls
+        # for both the is_solid() test and the wall_cleanup scan set exactly like
+        # the generic WALL, so the VOID'd cell set is byte-identical to before.
+        _WALLS = (_WALL, _HWALL, _VWALL)
         def _is_solid(yy, xx):
             if yy < 0 or yy >= _H or xx < 0 or xx >= _W:
                 return True        # beyond-map reads as STONE (is_solid)
-            return terr[yy, xx] == _WALL or terr[yy, xx] == _VOID
-        wall_ys, wall_xs = _np.where(terr == _WALL)
+            return terr[yy, xx] in _WALLS or terr[yy, xx] == _VOID
+        wall_ys, wall_xs = _np.where(_np.isin(terr, _WALLS))
         for yy, xx in zip(wall_ys.tolist(), wall_xs.tolist()):
             if all(_is_solid(yy + dy, xx + dx)
                    for dy in (-1, 0, 1) for dx in (-1, 0, 1)
