@@ -1982,6 +1982,33 @@ def seed_hero_fov(
         & (jnp.abs(cols_g - pc) <= jnp.int32(1))
     )
     vis = couldsee & (lit_mask | within_light)
+
+    # Vendor ``vision_recalc`` dark-hallway wall/door rule (vision.c:745-770).
+    # ``view_from`` sets ``could_see`` for the whole opaque run of a wall (its
+    # "jump to the far side of a stone wall" pass), so a lit wall/door whose
+    # facing floor is a DARK corridor would over-reveal.  Vendor guards this:
+    # for a ``could_see`` + lit cell that is a DOOR/SDOOR/WALL and opaque
+    # (``!viz_clear``) and NOT already in the hero's own 3x3 (which is always
+    # IN_SIGHT), it is shown ONLY if the cell one step TOWARD the hero
+    # (dx=sign(ux-col), dy=sign(uy-row)) is lit; otherwise ``goto
+    # not_in_sight`` — the wall is at the end of a dark hallway and stays
+    # stone.  Iron bars / open doorways / trees are transparent or non-wall
+    # (vendor "else" path) so they are excluded here.
+    walldoor = (
+        (terrain_l0 == jnp.int8(int(TileType.WALL)))
+        | (terrain_l0 == jnp.int8(int(TileType.CLOSED_DOOR)))
+        | (terrain_l0 == jnp.int8(int(TileType.HWALL)))
+        | (terrain_l0 == jnp.int8(int(TileType.VWALL)))
+    )
+    toward_dy = jnp.sign(pr - rows_g).astype(jnp.int32)  # step toward hero row
+    toward_dx = jnp.sign(pc - cols_g).astype(jnp.int32)  # step toward hero col
+    neigh_r = jnp.clip(rows_g + toward_dy, 0, _h_g - 1)
+    neigh_c = jnp.clip(cols_g + toward_dx, 0, _w_g - 1)
+    neigh_lit = lit_mask[neigh_r, neigh_c]
+    hide_dark_wall = (
+        walldoor & lit_mask & (~within_light) & (~neigh_lit)
+    )
+    vis = vis & (~hide_dark_wall)
     old_lst = state.last_seen_terrain[0, 0]
     new_lst = jnp.where(vis, terrain_l0.astype(jnp.int8), old_lst)
     new_explored = state.explored.at[0, 0].set(
