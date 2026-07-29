@@ -747,22 +747,38 @@ def _wrap_trap_room_placement(
         # + ONE untraced rnd(4) — confirmed identical for size=5 and
         # size=15 against the full NETHAX_RND stream
         # (.test_runs/full_rnd_stream_*_Trap_{5x5,15x15}_*_seed0.txt).
-        for _ in range(n_trap):
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
-            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))
-        # Faithful vendor place_lregion (mkmaze.c:275-319): 200-try loop
-        # x=rn2(79)+1, y=rn2(21); accept first cell where !bad_location =
-        # tile==ROOM (FLOOR) AND not occupied (stair / trap).  Then a
-        # deterministic row-major scan if all 200 reject.  With the rnd(4)
-        # alignment above, the player accepts at vendor's exact cell
-        # (Trap-5x5 seed0: pair 12 -> (40,13) internal).
+        # Vendor create_trap -> get_free_room_loc (sp_lev.c:1042) draws a
+        # room-relative (rn2(size), rn2(size)) cell and REDRAWS while the
+        # cell typ != ROOM — i.e. it re-rolls only when the draw lands on the
+        # (already-stamped) stair or a wall; a cell that already holds a trap
+        # keeps typ==ROOM and is accepted (maketrap just reuses it).  mktrap
+        # then consumes ONE untraced kind draw (rnd, position-irrelevant).
+        # maketrap marks the cell as a trap so the hero place_lregion below
+        # rejects it (vendor bad_location -> occupied -> t_at).
         import numpy as _np
         _floor_int = int(_TileType.FLOOR)
         _terr_np = _np.asarray(new_terrain[0, 0])
-        _trap_np = _np.asarray(state.traps.trap_type[0])
         _H, _W = _terr_np.shape
-        _ok = (_terr_np == _floor_int) & (_trap_np == 0)
+        _trap_mask = _np.zeros((_H, _W), dtype=bool)
+        for _ in range(n_trap):
+            _tx = _ty = -1
+            for _try in range(101):  # get_location_coord + up to 100 re-rolls
+                vrng, ox = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+                vrng, oy = _vendor_rng.rn2_jax(vrng, jnp.int32(size))
+                cx = int(x1) + int(ox)
+                cy = int(y1) + int(oy)
+                if (0 <= cy < _H and 0 <= cx < _W
+                        and _terr_np[cy, cx] == _floor_int):
+                    _tx, _ty = cx, cy
+                    break
+            vrng, _ = _vendor_rng.rn2_jax(vrng, jnp.int32(4))  # mktrap kind
+            if _tx >= 0:
+                _trap_mask[_ty, _tx] = True
+        # Faithful vendor place_lregion (mkmaze.c:275-319): 200-try loop
+        # x=rn2(79)+1, y=rn2(21); accept first cell where !bad_location =
+        # tile==ROOM (FLOOR) AND not occupied (stair / trap).  Then a
+        # deterministic row-major scan if all 200 reject.
+        _ok = (_terr_np == _floor_int) & (~_trap_mask)
         acc_x_i = int(acc_x)
         acc_y_i = int(acc_y)
         _accepted = False
