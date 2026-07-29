@@ -1076,16 +1076,19 @@ def _wrap_corridor_room_placement(
         lx, ly = int(hero_room["lx"]), int(hero_room["ly"])
         hx, hy = int(hero_room["hx"]), int(hero_room["hy"])
 
-        # Carve the hero room bounding box (interior + 1-cell wall ring) by
-        # mapping the engine's sentinel typ codes onto Nethax TileTypes.  NLE
-        # glyph column shift (obs col = internal col - 1) is applied downstream
-        # by build_glyphs, so we write at internal [y, x].
-        for x in range(lx - 1, hx + 2):
-            if not (0 <= x < 80):
-                continue
-            for y in range(ly - 1, hy + 2):
-                if not (0 <= y < 21):
-                    continue
+        # Carve the ENTIRE engine grid (all rooms + connecting corridors +
+        # doors), not just the hero's room, by mapping the engine's sentinel
+        # typ codes onto Nethax TileTypes.  The full layout is required so a
+        # far room the hero can see THROUGH a corridor via line-of-sight
+        # (seed_hero_fov's view_from) renders correctly instead of as stone
+        # (e.g. Corridor-R3 seed 5: a doorway + floor fragment of a second room
+        # is LOS-visible down the corridor at reset).  Cells the hero cannot
+        # see (dark corridors, unseen far rooms) are left unlit and hidden by
+        # FOV, so carving them is safe.  NLE glyph column shift (obs col =
+        # internal col - 1) is applied downstream by build_glyphs, so we write
+        # at internal [y, x].
+        for x in range(0, 80):
+            for y in range(0, 21):
                 t = int(typ[x][y])
                 if t == 0 or t == _SCORR_T:
                     continue
@@ -1136,7 +1139,20 @@ def _wrap_corridor_room_placement(
                 [jnp.int16(py), jnp.int16(px)]
             ),
         )
-        return _seed_hero_fov(state, True)
+        # Every ROOM directive is ``lit`` (build_room rlit=1); the RANDOM_CORRIDORS
+        # between them are dark.  Pass each room rect (interior; seed_hero_fov
+        # grows it +1 to light its walls) as a lit region so only room cells are
+        # lit and the connecting corridors stay dark — matching vendor, where the
+        # hero sees the lit far-room fragment down a corridor but not the dark
+        # corridor cells themselves.  (Coords: engine typ is [col=x][row=y]; a
+        # lit_region is (row, col, height, width).)
+        lit_regions = [
+            (int(rm["ly"]), int(rm["lx"]),
+             int(rm["hy"]) - int(rm["ly"]) + 1,
+             int(rm["hx"]) - int(rm["lx"]) + 1)
+            for rm in lev.rooms
+        ]
+        return _seed_hero_fov(state, False, lit_regions)
 
     return wrapped
 
