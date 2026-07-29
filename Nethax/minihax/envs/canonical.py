@@ -4540,6 +4540,34 @@ def _wrap_wod_hard_placement(
     return wrapped
 
 
+def _wrap_wod_easy_wand(
+    factory: Callable[[jax.Array], "EnvState"],
+) -> Callable[[jax.Array], "EnvState"]:
+    """MiniHack-WoD-Easy: auto-pick the blessed wand of death into inventory.
+
+    Vendor ``MiniHackWoDEasy`` (skills_wod.py:10-34) builds the level with
+    ``autopickup=True`` and drops the blessed wand of death on the hero's own
+    start cell.  On level entry vendor auto-picks it up, so at reset the wand is
+    carried in the next free slot (letter ``j``) — rendered "an ebony wand"
+    (unidentified appearance, glyph 2295) — and NOT shown on the floor (the
+    hero glyph already occludes its start cell either way).
+
+    The wand cell is fixed (no rndcoord), so no ``vendor_rng`` draws are
+    consumed; we only append the carried item via the shared
+    :func:`_carry_starting_inventory_item` helper (blessed => ``buc_status=3``,
+    appearance-only: ``bknown=False`` so no "blessed" prefix leaks).
+    """
+    from Nethax.minihax.level_generator import _OBJECT_NAME_TO_IDX
+    wand_idx = _OBJECT_NAME_TO_IDX["death"]
+
+    def wrapped(rng: jax.Array):
+        state = factory(rng)
+        return _carry_starting_inventory_item(state, int(wand_idx),
+                                              buc_status=3)
+
+    return wrapped
+
+
 def _register_wod_envs(register_fn) -> None:
     # Only the Easy variants carry a kill-event RewardManager in vendor
     # (skills_wod.py:29-34, :59-60); Medium/Hard/Pro use add_goal_pos with
@@ -4564,6 +4592,9 @@ def _register_wod_envs(register_fn) -> None:
                 # Replay the RNG-placed hero (set_start_rect BRANCH) + wand
                 # (add_object_area) off state.vendor_rng.
                 factory = _wrap_wod_hard_placement(factory)
+            elif diff == "easy":
+                # autopickup=True drops the wand on the hero cell -> carried.
+                factory = _wrap_wod_easy_wand(factory)
         rm = (_skill_wod_kill_rm() if diff == "easy"
               else _default_goal_reward_manager())
         register_fn(env_id, factory, rm,

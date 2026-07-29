@@ -107,7 +107,14 @@ TERRAIN_CHAR_TO_TILE: dict = {
     # map, so they keep deriving their variant purely from the spine pass.
     "-": TileType.HWALL,
     "|": TileType.VWALL,
-    "+": TileType.CLOSED_DOOR,
+    # A bare '+' in a MAP...ENDMAP block is a DOOR cell whose doormask is
+    # cleared to 0 == D_NODOOR by the map loader (vendor sp_lev.c:5010 sets
+    # levl[][].flags = 0, and `doormask` is a #define alias of `flags`; only
+    # SDOOR gets forced to D_CLOSED at :5021).  A D_NODOOR door renders as the
+    # doorless doorway S_ndoor (glyph 2371), NOT a closed door.  An explicit
+    # DOOR:state,(x,y) directive still overrides this cell to the requested
+    # CLOSED/OPEN door tile via `_place_door`.
+    "+": TileType.DOORWAY,
     "}": TileType.WATER,
     "P": TileType.WATER,
     "W": TileType.WATER,
