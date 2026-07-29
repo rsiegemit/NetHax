@@ -2581,6 +2581,34 @@ def build_glyphs(env_state, fast: bool = False) -> jnp.ndarray:
     cmap_idx = jnp.where(_is_corr_cell & _corr_lit,
                          jnp.int16(_S_litcorr), cmap_idx)
 
+    # Dark-room shade pass — vendor renders a *remembered* (explored) lit ROOM
+    # floor cell that is OUT of the hero's current sight and is occupied by a
+    # monster as ``S_darkroom`` instead of ``S_room``.  With NLE's default
+    # ``dark_room`` option ON (+use_color), a monster on the cell triggers a
+    # ``newsym`` re-evaluation whose out-of-sight branch rewrites the remembered
+    # ``S_room`` glyph to ``DARKROOMSYM`` (= ``S_darkroom``); a plain premapped
+    # floor cell with no monster keeps ``S_room`` because ``newsym`` is never
+    # re-run there (premap_detect left it as ``S_room``).  Cite
+    # vendor/nle/src/display.c:878-882 (newsym out-of-sight ROOM->DARKROOMSYM)
+    # and vendor/nethack/src/detect.c::premap_detect (map_background -> S_room).
+    #
+    # This fires only where ``explored & ~visible`` is non-empty (premapped
+    # levels whose ``visible`` frame is true LOS) AND a live monster sits on the
+    # cell — i.e. HideNSeek-Mapped's far-corner monster.  Non-premapped resets
+    # have ``explored == visible`` (empty ~visible), and the Sokoban-style
+    # ``_premapped_factory`` forces ``visible`` over the whole map (empty
+    # ~visible), so neither can trigger it.
+    _dm_mai = env_state.monster_ai
+    _dm_rows = jnp.clip(_dm_mai.pos[:, 0].astype(jnp.int32), 0, 20)
+    _dm_cols_state = _dm_mai.pos[:, 1].astype(jnp.int32)
+    _dm_oncol0 = _dm_cols_state <= jnp.int32(0)
+    _dm_cols = jnp.clip(_dm_cols_state - jnp.int32(1), 0, 78)     # obs-col space
+    _dm_write = (_dm_mai.alive & (~_dm_oncol0)).astype(jnp.int32)
+    _dm_occ = (jnp.zeros((21, 79), dtype=jnp.int32)
+               .at[_dm_rows, _dm_cols].add(_dm_write)) > jnp.int32(0)
+    _dm_darken = (cmap_idx == jnp.int16(_S_room)) & explored & (~visible) & _dm_occ
+    cmap_idx = jnp.where(_dm_darken, jnp.int16(_S_darkroom), cmap_idx)
+
     # Terrain glyph IDs
     terrain_glyphs = (cmap_idx + jnp.int16(GLYPH_CMAP_OFF)).astype(jnp.int16)
 

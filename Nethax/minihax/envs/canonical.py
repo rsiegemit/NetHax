@@ -1950,11 +1950,41 @@ def _wrap_hidenseek_placement(
         if premapped:
             # hidenseek_mapped.des carries FLAGS:...,premapped: NetHack maps
             # the whole level's terrain on entry.  Reveal every non-VOID cell
-            # (explored + last_seen_terrain) exactly like _premapped_factory,
-            # while seed_hero_fov's LOS-limited ``visible`` frame is preserved.
+            # (explored + last_seen_terrain), while seed_hero_fov's LOS-limited
+            # ``visible`` frame is PRESERVED as-is (the true per-hero sight).
+            #
+            # We must NOT OR ``mapped`` into ``visible``: vendor only *maps*
+            # (remembers) the terrain on premap — it does not make the whole
+            # level currently-visible.  Keeping ``visible`` = true LOS is what
+            # lets ``build_glyphs`` shade the monster's out-of-sight floor cell
+            # as S_darkroom (see below), matching vendor.
             terr2 = state.terrain[0, 0]
             mapped = terr2 != _jnp.int8(VOID)
+            # Place the vendor hostile monster on its far-corner cell
+            # (``$place[0]`` = ``mon_cell``).  It is out of the hero's FOV on
+            # every traced seed, so it is never drawn as a monster glyph, but
+            # its presence reproduces vendor's dark-room shade: NLE runs
+            # ``newsym`` on a monster's cell, and with the default ``dark_room``
+            # option ON that re-eval rewrites the remembered lit S_room floor to
+            # S_darkroom for an out-of-sight cell (vendor/nle/src/display.c
+            # :878-882).  ``build_glyphs`` mirrors this via a monster-occupancy
+            # dark-room pass.  ``_mon_idx`` is the mkclass-picked species so the
+            # glyph is faithful should the cell ever fall in view.
+            _mrow = _jnp.int16(mon_cell[1])
+            _mcol = _jnp.int16(mon_cell[0])
+            _pmai = state.monster_ai
+            new_mai = _pmai.replace(
+                alive=_pmai.alive.at[0].set(True),
+                pos=_pmai.pos.at[0].set(_jnp.array([_mrow, _mcol],
+                                                   dtype=_pmai.pos.dtype)),
+                entry_idx=_pmai.entry_idx.at[0].set(_jnp.int16(_mon_idx)),
+                orig_entry_idx=_pmai.orig_entry_idx.at[0].set(
+                    _jnp.int16(_mon_idx)),
+                tame=_pmai.tame.at[0].set(False),
+                mtame=_pmai.mtame.at[0].set(_jnp.int8(0)),
+            )
             state = state.replace(
+                monster_ai=new_mai,
                 explored=state.explored.at[0, 0].set(
                     state.explored[0, 0] | mapped
                 ),
@@ -1962,7 +1992,6 @@ def _wrap_hidenseek_placement(
                     _jnp.where(mapped, terr2.astype(_jnp.int8),
                                state.last_seen_terrain[0, 0])
                 ),
-                visible=state.visible | mapped,
             )
         return state
 
