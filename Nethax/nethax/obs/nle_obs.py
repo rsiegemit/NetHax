@@ -2320,12 +2320,19 @@ def _apply_wall_angle(display_terrain: jnp.ndarray,
     CLOSED = jnp.int16(int(TileType.CLOSED_DOOR))
     OPEN = jnp.int16(int(TileType.OPEN_DOOR))
     DOORWAY = jnp.int16(int(TileType.DOORWAY))
+    IRONBARS = jnp.int16(int(TileType.IRONBARS))
 
-    # A neighbour counts as a wall-continuation when it is WALL or any door
-    # (closed, open, or a doorless DOORWAY).  Vendor iswall() (mkmaze.c:44-55)
-    # treats walls + doors as connected segments, so a doorless doorway carved
-    # into a wall run still lets the adjacent room corner resolve to the correct
-    # corner variant.
+    # A neighbour counts as a wall-continuation when it is WALL, any door
+    # (closed, open, or a doorless DOORWAY), or IRONBARS.  Vendor iswall()
+    # (mkmaze.c:44-55) treats walls + doors + iron bars as connected segments
+    # (``IS_WALL || IS_DOOR || ... || IRONBARS``), so a doorless doorway carved
+    # into a wall run — or a stretch of iron bars set into a wall — still lets
+    # the adjacent room corner resolve to the correct corner variant.  Iron bars
+    # embedded in a wall (Memento vault) grow a spine into the neighbouring wall
+    # exactly like a door does; omitting it mis-named the wall as a corner.
+    # (Vendor iswall also lists LAVAWALL/WATER/SDOOR, but those either have no
+    # minihax TileType or would perturb River/LavaCross rendering, so only the
+    # bars — the one continuation kind exercised here — are added.)
     VOID = jnp.int16(0)
     H, W = t.shape
     zero_row = jnp.zeros((1, W), dtype=jnp.bool_)
@@ -2346,7 +2353,8 @@ def _apply_wall_angle(display_terrain: jnp.ndarray,
         plus the raw orthogonal wall-continuation planes (e, w) for door
         orientation.
         """
-        wallish = (terr == WALL) | (terr == CLOSED) | (terr == OPEN) | (terr == DOORWAY)
+        wallish = ((terr == WALL) | (terr == CLOSED) | (terr == OPEN)
+                   | (terr == DOORWAY) | (terr == IRONBARS))
         solid = (terr == VOID) | wallish
         n = jnp.concatenate([zero_row, wallish[:-1, :]], axis=0)   # north
         s = jnp.concatenate([wallish[1:, :], zero_row], axis=0)    # south
