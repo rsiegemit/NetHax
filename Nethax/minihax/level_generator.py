@@ -2854,6 +2854,21 @@ _MKOBJPROBS = (
     (1,  int(ObjectClass.AMULET_CLASS)),
 )
 
+# Box-content class probabilities (mkobj.c:41-49 ``boxiprobs``).  Used by
+# ``mkbox_cnts`` to pick the class of each object generated inside a
+# chest / large box.
+_MKBOX_IPROBS = (
+    (18, int(ObjectClass.GEM_CLASS)),
+    (15, int(ObjectClass.FOOD_CLASS)),
+    (18, int(ObjectClass.POTION_CLASS)),
+    (18, int(ObjectClass.SCROLL_CLASS)),
+    (12, int(ObjectClass.SPBOOK_CLASS)),
+    (7,  int(ObjectClass.COIN_CLASS)),
+    (6,  int(ObjectClass.WAND_CLASS)),
+    (5,  int(ObjectClass.RING_CLASS)),
+    (1,  int(ObjectClass.AMULET_CLASS)),
+)
+
 
 def _build_mkobj_prob_tables():
     """bases[class] (first otyp of each class) and the effective oc_prob table.
@@ -2924,6 +2939,64 @@ _ARMOR_CURSE_SPECIALS = frozenset({148, 149, 80, 137})  # fumble/levit boots,
 # Amulets that curse when rn2(10) is nonzero (mkobj.c:1062-1066).
 _AMULET_CURSE_SPECIALS = frozenset({180, 183, 181})  # strangulation/change/
 #   restful sleep.
+
+
+def _mkbox_cnts_draws(vrng, box_otyp: int, olocked: bool):
+    """Consume the ISAAC64 draws of vendor ``mkbox_cnts`` (mkobj.c:275-349).
+
+    A freshly-made chest / large box is filled with ``rn2(n+1)`` random
+    contents, where ``n`` depends on the box type and its locked state
+    (chest: locked?7:5; large box: locked?5:3).  Each content is a
+    ``boxiprobs``-weighted class pick (``rnd(100)``) followed by
+    ``mkobj(iclass)`` — which draws its own ``rnd(1000)`` otyp roll then the
+    class ``mksobj`` init draws.  Coin contents instead roll
+    ``rnd(level_difficulty()+2) * rnd(75)`` (2 draws) for their quantity.
+
+    Only draw *consumption* matters here (box contents are never rendered in
+    the reset observation); getting the count exact keeps the downstream
+    ISAAC64 stream — the hero ``place_lregion`` — aligned with vendor.
+    """
+    from Nethax.nethax import vendor_rng as _vr
+    OC = ObjectClass
+    _CHEST, _LARGE_BOX = 190, 189
+    if box_otyp == _CHEST:
+        n = 7 if olocked else 5
+    elif box_otyp == _LARGE_BOX:
+        n = 5 if olocked else 3
+    else:
+        n = 0
+    v = vrng
+    v, cnt = _vr.rn2_jax(v, jnp.int32(n + 1))
+    cnt = int(cnt)
+    coin_cls = int(OC.COIN_CLASS)
+    for _ in range(cnt):
+        # boxiprobs class pick: tprob = rnd(100).
+        v, tprob_v = _vr.rn2_jax(v, jnp.int32(100))
+        tprob = int(tprob_v) + 1
+        iclass = _MKBOX_IPROBS[-1][1]
+        for p, c in _MKBOX_IPROBS:
+            tprob -= p
+            if tprob <= 0:
+                iclass = c
+                break
+        # mkobj(iclass): prob = rnd(1000) then otyp walk within class.
+        v, prob_v = _vr.rn2_jax(v, jnp.int32(1000))
+        prob = int(prob_v) + 1
+        i = _MKOBJ_BASES[iclass]
+        while True:
+            prob -= _MKOBJ_EFF_PROB[i]
+            if prob <= 0:
+                break
+            i += 1
+        content_otyp = i
+        if iclass == coin_cls:
+            # mkbox_cnts COIN special: quan = rnd(level_difficulty()+2)*rnd(75).
+            # level_difficulty()==1 on the depth-1 MiniHack skill level.
+            v, _ = _vr.rn2_jax(v, jnp.int32(3))
+            v, _ = _vr.rn2_jax(v, jnp.int32(75))
+        else:
+            v = _mksobj_init_draws(v, content_otyp)
+    return v
 
 
 def _mksobj_init_draws(vrng, otyp: int):
@@ -3078,9 +3151,9 @@ def _mksobj_init_draws(vrng, otyp: int):
         elif otyp == 203:                    # magic lamp
             v, _ = blessorcurse(v, 2)
         elif otyp in (190, 189):             # chest / large box
-            v, _ = rn2(v, 5)                 # olocked
-            v, _ = rn2(v, 10)                # otrapped
-            v, _ = rn2(v, 1)                 # mkbox_cnts: rn2(n+1) content roll
+            v, r_lock = rn2(v, 5)            # olocked = !!(rn2(5))
+            v, _ = rn2(v, 10)                # otrapped = !(rn2(10))
+            v = _mkbox_cnts_draws(v, otyp, r_lock != 0)  # fill contents
         elif otyp in (191, 192, 193, 194):   # ice box / sack / oilskin / boh
             v, _ = rn2(v, 1)                 # mkbox_cnts content roll (n small)
         elif otyp in (204, 213, 217):        # camera / tinning kit / marker
