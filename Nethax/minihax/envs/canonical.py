@@ -1545,13 +1545,15 @@ def _wrap_mazewalk_placement(
         # FOV reveals it when standing on the row-19 corridor.  9x9/15x15 are
         # centered with margin (maxy<19), never touch row 20, and have no
         # wall terrain at all (verified against the -Mapped premapped reveal).
-        # Cols span the maze region [minx, maxx] in the internal frame (the
-        # MAP border is one col west of the +X_OFF-shifted floor).
+        # Cols span the maze region [minx, maxx] shifted into the internal
+        # frame by the same +X_OFF the carved floor uses, so the bottom
+        # boundary wall sits directly under the floor columns (vendor's
+        # surviving HWALL row aligns with the maze floor, not one col west).
         _Y_MAZE_MAX = 20
         if maxy + 1 == _Y_MAZE_MAX:
-            terrain = terrain.at[0, 0, _Y_MAZE_MAX, minx:maxx + 1].set(
-                jnp.int8(_WALL)
-            )
+            terrain = terrain.at[
+                0, 0, _Y_MAZE_MAX, minx + X_OFF:maxx + 1 + X_OFF
+            ].set(jnp.int8(_WALL))
 
         # --- (3) STAIR:random,down --------------------------------------
         # get_location(DRY): loop rn2(MAP)/rn2(MAP) over the MAP region,
