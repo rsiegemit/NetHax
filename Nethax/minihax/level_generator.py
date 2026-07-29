@@ -2756,6 +2756,20 @@ def _resolve_monster(
             _cpt += 1
             if _ok or _cpt >= 100:
                 break
+        # makemon.c:1146-1152 — vendor get_location's somexy does NOT avoid
+        # monster-occupied cells; makemon() post-checks ``MON_AT(x,y)`` and, when
+        # the somexy cell already holds an earlier monster, relocates via
+        # ``enexto`` (consuming rn2(num_good)) BEFORE ``rndmonst`` picks the
+        # species.  Replay that collision relocation so a later monster whose
+        # somexy lands on an earlier monster's (or its group member's) cell
+        # consumes the same draw and shifts the stream identically (Quest-Easy /
+        # River-Monster seed 5: monster 2 somexy hits monster 1's group leader).
+        if occupied and (yi, xi) in occupied:
+            _reloc, vrng = _enexto(
+                terrain_np, set(occupied), xi, yi, w, h, vrng,
+            )
+            if _reloc is not None:
+                yi, xi = int(_reloc[0]), int(_reloc[1])
         # The untraced rnd(21) IS vendor's rndmonst monster pick:
         # MONSTER:random -> create_monster(class=0) -> makemon(NULL) ->
         # rndmonst() draws rnd(choice_count) (choice_count==21 at depth 1,

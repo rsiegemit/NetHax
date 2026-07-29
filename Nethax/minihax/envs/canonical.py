@@ -4175,6 +4175,7 @@ def _wrap_quest_inv(
     n_random_monsters: int = 0,
     region_wh: Optional[Tuple[int, int]] = None,
     hero_rel: Tuple[int, int] = (2, 2),
+    stair_goal_rect: Optional[Tuple[int, int, int, int]] = None,
 ) -> Callable[[jax.Array], "EnvState"]:
     """Auto-pick-up the two blessed quest items placed on the hero's cell, and
     (Easy) replay the stripped ``MONSTER:random,random`` distractors.
@@ -4269,6 +4270,34 @@ def _wrap_quest_inv(
                 for _mp, _mi in _members:
                     state = _write_monster(state, _mp, _mi)
                     _occ.add(_mp)
+
+            # STAIR:rndcoord($goal_room),down — the des draws the down-stair
+            # cell AFTER the two MONSTER directives (BRANCH consumes no RNG), so
+            # its ``rndcoord`` (selection_rndcoord, sp_lev.c:3793) lands at the
+            # post-monster ISAAC64 offset.  The des-factory build stamped it
+            # earlier off the JAX key stream (wrong cell); the STAIR line was
+            # stripped from the source so no stray stamp remains.  Replay it here
+            # off ``state.vendor_rng`` at its true des-order offset.
+            if stair_goal_rect is not None:
+                from Nethax.nethax.constants.tiles import TileType as _TT
+                _gx1r, _gy1r, _gx2r, _gy2r = stair_goal_rect
+                _gcols = _gx2r - _gx1r + 1
+                _grows = _gy2r - _gy1r + 1
+                _vrng2 = state.vendor_rng
+                _vrng2, _sc = _vendor_rng.rn2_jax(
+                    _vrng2, jnp.int32(_gcols * _grows)
+                )
+                _sc = int(_sc)
+                # selection_rndcoord walks x-outer, y-inner: the c-th set cell is
+                # at col-offset c//rows, row-offset c%rows within the rect.
+                _stair_col = _rx1 + _gx1r + _sc // _grows
+                _stair_row = _ry1 + _gy1r + _sc % _grows
+                _new_terrain = state.terrain.at[
+                    0, 0, _stair_row, _stair_col
+                ].set(jnp.int8(int(_TT.STAIRCASE_DOWN)))
+                state = state.replace(
+                    vendor_rng=_vrng2, terrain=_new_terrain,
+                )
         return state
 
     return wrapped
@@ -4303,11 +4332,21 @@ def _register_quest_envs(register_fn) -> None:
                 with open(_vendor_des_path(des_name), "r",
                           encoding="utf-8", errors="replace") as _fh:
                     _src = _strip_random_monsters(_fh.read())
+                # Also strip the ``STAIR:rndcoord($goal_room),down`` line: the
+                # des draws its cell AFTER the two monsters, so the build-time
+                # stamp (off the JAX key stream) lands at the wrong offset.  The
+                # wrapper replays it off ``state.vendor_rng`` at the true offset.
+                _src = "\n".join(
+                    _l for _l in _src.splitlines()
+                    if not _l.strip().replace(" ", "").startswith(
+                        "STAIR:rndcoord")
+                )
                 factory = _des_factory_from_source(_src, fallback=fallback)
             except OSError:
                 factory = fallback
             factory = _wrap_quest_inv(
                 factory, n_random_monsters=2, region_wh=(29, 7),
+                stair_goal_rect=(25, 2, 27, 4),
             )
         elif diff == "medium":
             factory = _des_factory(des_name, fallback=fallback)
