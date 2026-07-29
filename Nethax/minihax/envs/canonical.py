@@ -1506,6 +1506,25 @@ def _wrap_mazewalk_placement(
                 return False
             return not carved[y, x]
 
+        # spo_mazewalk pre-walkfrom carve (sp_lev.c:4747-4791), dir=EAST.
+        # Before walkfrom, vendor advances the MAP-center one step east and
+        # carves that cell (line 4765-4768), then odd-parity-forces the x
+        # coord — carving the bumped cell too when x is even (line 4775-4784)
+        # — and finally y-bumps (no carve) so walkfrom starts on odd/odd.
+        # The port's geometry already lands ``(sx, sy)`` on that forced start,
+        # but the intermediate east-step cell(s) were never carved.  They sit
+        # on bridge parity (never a walkfrom destination, so they don't perturb
+        # the rn2 draw stream), which is why every failing seed diverged by
+        # exactly this one stone cell directly below the maze start.  Internal
+        # column maps to the carve (display) frame as ``internal - 1``.
+        _cx = _xstart + mapw // 2          # MAP-center col (carve frame)
+        _cy = _ystart + maph // 2          # MAP-center row
+        _px = _cx + 1                      # east step (internal frame)
+        carved[_cy, _px - 1] = True        # line 4766 (east-step cell)
+        if _px % 2 == 0:                   # internal x even -> bump east again
+            _px += 1
+            carved[_cy, _px - 1] = True    # line 4782 (parity-force cell)
+
         # Iterative walkfrom (recursion depth can exceed CPython's limit for
         # the 45×19 maze).  Mirrors mkmaze.c::walkfrom (non-MICRO) exactly:
         # at each cell collect the valid dirs, pick rn2(q), carve the bridge
@@ -1573,20 +1592,34 @@ def _wrap_mazewalk_placement(
             )
 
         # --- (4) hero start placement -----------------------------------
-        # place_lregion(LR_UPSTAIR): loop rn2(79)/rn2(21), accept the first
-        # floor cell.  Internal hero column = rn2(79) + 1 (same +1 as the
-        # Room placement wrappers); the down-stair cell is non-floor so it
-        # is skipped.
+        # place_lregion(LR_UPSTAIR) (mkmaze.c:275-318): 200 probabilistic
+        # tries — rn2(79)/rn2(21), accept the first floor cell (internal hero
+        # column = rn2(79) + 1, same +1 as the Room placement wrappers; the
+        # down-stair cell is non-floor so it is skipped) — then, if every try
+        # failed (bad_location for all 200 picks), a DETERMINISTIC column-major
+        # scan (mkmaze.c:313-316: ``for x=1..COLNO-1 for y=0..ROWNO-1``) places
+        # the hero on the first floor cell.  Sparse mazes (e.g. 9x9 seed 12)
+        # routinely exhaust the 200 random tries and rely on this scan; the old
+        # maze-start fallback diverged from vendor there.
         _terr_np = _np.asarray(terrain[0, 0])
         _floor_mask = (_terr_np == _FLOOR)
-        acc_x = int(sx) + X_OFF           # fallback: maze start (always floor)
-        acc_y = int(sy)
+        acc_x, acc_y = None, None
         for _ in range(200):
             rx = rn2(79) + X_OFF
             ry = rn2(21)
             if 0 <= ry < _H and 0 <= rx < _W and bool(_floor_mask[ry, rx]):
-                acc_x, acc_y = rx, ry
+                acc_x, acc_y = rx, ry   # vendor returns on first success
                 break
+        else:
+            # all 200 probabilistic tries failed -> deterministic scan for the
+            # first floor cell in column-major order (x outer, y inner).
+            for cx in range(1, _W):
+                col_floor = _np.nonzero(_floor_mask[:, cx])[0]
+                if col_floor.size:
+                    acc_x, acc_y = cx, int(col_floor[0])
+                    break
+        if acc_x is None:                # ultimate fallback: maze start
+            acc_x, acc_y = int(sx) + X_OFF, int(sy)
 
         state = state.replace(
             vendor_rng=vrng[0],
