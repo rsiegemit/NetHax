@@ -94,8 +94,19 @@ TERRAIN_CHAR_TO_TILE: dict = {
     " ": TileType.VOID,
     "#": TileType.CORRIDOR,
     ".": TileType.FLOOR,
-    "-": TileType.WALL,
-    "|": TileType.WALL,
+    # A des MAP authors wall orientation with the '-' / '|' char.  Vendor
+    # fix_wall_spines KEEPS this authored typ (HWALL / VWALL) when the wall has
+    # no orthogonal wall neighbours (spine bitmask == 0), and OVERRIDES it with
+    # a corner / T / cross variant when it does.  We stamp the authored typ here
+    # so a free-standing des wall (e.g. Sokoban interior stub, ExploreMaze pillar)
+    # renders S_hwall / S_vwall byte-exact; the render-time spine pass
+    # (nle_obs::_apply_wall_angle) treats HWALL / VWALL as ordinary WALL
+    # continuations and re-derives the variant whenever bits != 0, so walls in a
+    # run are unaffected.  Procedurally-generated Room walls are stamped as the
+    # generic ``WALL`` directly (branches.py / _carve_room), NOT through this
+    # map, so they keep deriving their variant purely from the spine pass.
+    "-": TileType.HWALL,
+    "|": TileType.VWALL,
     "+": TileType.CLOSED_DOOR,
     "}": TileType.WATER,
     "P": TileType.WATER,
@@ -2192,7 +2203,12 @@ def _place_stair(
     # the stamp so we don't punch a stair through a wall.
     if 0 <= row < h and 0 <= col < w:
         _existing = int(terrain_np[0, 0, row, col])
-        if _existing in (int(TileType.WALL), int(TileType.VOID)):
+        # HWALL / VWALL are des-authored walls that behave exactly like the
+        # generic WALL here: a STAIR whose coord lands on any wall (e.g.
+        # memento_short.des ``STAIR:(1,5),up`` on the '-' border) is NOT
+        # materialised, so vendor renders the underlying wall terrain.
+        if _existing in (int(TileType.WALL), int(TileType.HWALL),
+                         int(TileType.VWALL), int(TileType.VOID)):
             return terrain_np, (col, row)
     terrain_np = _set_tile(terrain_np, row, col, tile, w, h)
     return terrain_np, (col, row)

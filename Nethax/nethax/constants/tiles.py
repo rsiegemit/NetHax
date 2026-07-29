@@ -103,6 +103,29 @@ class TileType(IntEnum):
                        # (vision.c:167-168), so the hero cannot see past the
                        # river.  River's reset FOV also occludes it explicitly
                        # (canonical.py _wrap_river_placement).
+    HWALL = 27         # Horizontally-authored free-standing wall — the des MAP
+                       # '-' mapchar.  DISTINCT from the generic ``WALL`` (index
+                       # 3) only at GEN time: it records the vendor-authored
+                       # ``typ`` (HWALL, rm.h line 57) so a wall the des map draws
+                       # with '-' but that has NO orthogonal wall neighbours
+                       # (fix_wall_spines bits==0) renders S_hwall, matching
+                       # vendor which KEEPS the authored typ when the spine
+                       # bitmask is empty (mkmaze.c::fix_wall_spines /
+                       # xy_set_wall_state).  When such a wall DOES have wall
+                       # neighbours the render-time spine pass (nle_obs::
+                       # _apply_wall_angle) OVERRIDES this authored typ exactly as
+                       # vendor does, so an HWALL inside a wall run still resolves
+                       # to the correct corner / T / cross variant.  Procedurally
+                       # -generated Room walls stay generic ``WALL`` and keep
+                       # deriving their variant from the spine pass.  Behaves
+                       # EXACTLY like WALL for movement (SOLID_TILES) and line-of-
+                       # sight (OPAQUE_TILES).  Appended at the tail so indices
+                       # 0..26 are unchanged (gate-neutral).
+    VWALL = 28         # Vertically-authored free-standing wall — the des MAP '|'
+                       # mapchar.  Mirror of HWALL for the vendor VWALL typ (rm.h
+                       # line 56); free-standing (bits==0) renders S_vwall.  Both
+                       # HWALL and VWALL are treated as ``WALL`` continuations by
+                       # the spine pass and are SOLID + OPAQUE.
 
 
 NUM_TILE_TYPES: int = len(TileType)
@@ -169,7 +192,10 @@ VENDOR_MAX_TYPE: int = 37
 
 # Tiles that block movement.
 SOLID_TILES = jnp.array(
-    [TileType.VOID, TileType.WALL, TileType.CLOSED_DOOR],
+    [TileType.VOID, TileType.WALL, TileType.CLOSED_DOOR,
+     # HWALL / VWALL are des-authored walls (rendering distinction only); they
+     # block movement exactly like the generic WALL.
+     TileType.HWALL, TileType.VWALL],
     dtype=jnp.int32,
 )
 
@@ -191,6 +217,10 @@ SOLID_TILES = jnp.array(
 # non-opaque.  (River-Lava's LAVA does NOT block and is deliberately absent.)
 OPAQUE_TILES = jnp.array(
     [TileType.VOID, TileType.WALL, TileType.CLOSED_DOOR,
-     TileType.TREE, TileType.CLOUD, TileType.DEEPWATER],
+     TileType.TREE, TileType.CLOUD, TileType.DEEPWATER,
+     # HWALL / VWALL are des-authored walls (rendering distinction only); they
+     # block line-of-sight exactly like the generic WALL, so a des map's room
+     # boundaries keep occluding the hero's FOV at reset.
+     TileType.HWALL, TileType.VWALL],
     dtype=jnp.int32,
 )

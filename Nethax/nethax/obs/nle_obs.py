@@ -196,6 +196,7 @@ NLE_OBSERVATION_DTYPES: dict[str, jnp.dtype] = {
 
 _S_stone    = _cmap.S_stone
 _S_vwall    = _cmap.S_vwall
+_S_hwall    = _cmap.S_hwall    # horizontal wall (cmap 2, char '-', glyph 2361)
 _S_room     = _cmap.S_room
 _S_darkroom = _cmap.S_darkroom
 _S_corr     = _cmap.S_corr
@@ -274,6 +275,15 @@ _TILE_TO_CMAP: jnp.ndarray = jnp.array([
     # that S_water so River's river column renders 2400 while pool/moat water
     # (TileType.WATER, index 8) stays 2391.
     _S_water,    # 26 DEEPWATER      S_water (cmap 41, char '}', glyph 2400)
+    # Des-authored free-standing walls (rendering distinction only).  These base
+    # entries are only used for the FREE-STANDING case (spine bitmask == 0):
+    # HWALL renders S_hwall (glyph 2361) and VWALL renders S_vwall (glyph 2360),
+    # matching vendor fix_wall_spines which keeps the authored typ when bits==0.
+    # When such a wall has wall neighbours, _apply_wall_angle OVERRIDES this with
+    # the corner / T / cross variant exactly as vendor does.  Appended at the
+    # tail so indices 0..26 above are unchanged (gate-neutral).
+    _S_hwall,    # 27 HWALL          S_hwall (cmap 2, char '-', glyph 2361)
+    _S_vwall,    # 28 VWALL          S_vwall (cmap 1, char '|', glyph 2360)
 ], dtype=jnp.int16)
 
 # ---------------------------------------------------------------------------
@@ -2321,6 +2331,11 @@ def _apply_wall_angle(display_terrain: jnp.ndarray,
     OPEN = jnp.int16(int(TileType.OPEN_DOOR))
     DOORWAY = jnp.int16(int(TileType.DOORWAY))
     IRONBARS = jnp.int16(int(TileType.IRONBARS))
+    # Des-authored free-standing walls: identical to WALL for spine derivation,
+    # but they carry the authored horizontal / vertical orientation used when the
+    # spine bitmask is empty (vendor keeps the authored typ; see below).
+    HWALL = jnp.int16(int(TileType.HWALL))
+    VWALL = jnp.int16(int(TileType.VWALL))
 
     # A neighbour counts as a wall-continuation when it is WALL, any door
     # (closed, open, or a doorless DOORWAY), or IRONBARS.  Vendor iswall()
@@ -2354,7 +2369,8 @@ def _apply_wall_angle(display_terrain: jnp.ndarray,
         orientation.
         """
         wallish = ((terr == WALL) | (terr == CLOSED) | (terr == OPEN)
-                   | (terr == DOORWAY) | (terr == IRONBARS))
+                   | (terr == DOORWAY) | (terr == IRONBARS)
+                   | (terr == HWALL) | (terr == VWALL))
         solid = (terr == VOID) | wallish
         n = jnp.concatenate([zero_row, wallish[:-1, :]], axis=0)   # north
         s = jnp.concatenate([wallish[1:, :], zero_row], axis=0)    # south
@@ -2412,8 +2428,33 @@ def _apply_wall_angle(display_terrain: jnp.ndarray,
 
     wall_variant = _WALL_ANGLE_TABLE[pattern]                     # int16[21,79]
 
-    # Only rewrite WALL cells with the corner/T-junction variant.
-    is_wall_cell = (t == WALL)
+    # Vendor fix_wall_spines (mkmaze.c) KEEPS the des-authored wall typ when the
+    # GEN-TIME spine bitmask is 0 (a free-standing wall with no wall neighbours),
+    # and OVERRIDES it with the corner / T / cross variant otherwise.  Our
+    # _WALL_ANGLE_TABLE already encodes the override for every non-zero pattern
+    # (including single-neighbour straights), and defaults pattern 0 to S_vwall.
+    # A des '|' (VWALL) or a procedural generic WALL therefore already render
+    # S_vwall when free-standing; only a des '-' (HWALL) needs its authored
+    # horizontal typ restored at the empty-bitmask case.
+    #
+    # The gate MUST use the FULL (gen-time) spine bitmask, not the display-reduced
+    # ``pattern`` above: fix_wall_spines runs on ``levl[x][y].typ`` at level-gen,
+    # so a des wall that IS part of a run (gen-time bits != 0) keeps its spine
+    # variant even when the hero has only seen part of it and the seenv reduction
+    # (full_count>=3) collapses the DISPLAYED pattern to 0.  Keying on the reduced
+    # ``pattern`` would spuriously stamp S_hwall on such a junction arm (e.g. a
+    # Memento vault HWALL whose far arms are unseen).
+    full_pattern = (fn.astype(jnp.int16)
+                    | (fs.astype(jnp.int16) << jnp.int16(1))
+                    | (fe.astype(jnp.int16) << jnp.int16(2))
+                    | (fw.astype(jnp.int16) << jnp.int16(3)))       # int16[21,79]
+    is_free = (full_pattern == jnp.int16(0))
+    wall_variant = jnp.where(is_free & (t == HWALL),
+                             jnp.int16(_S_hwall), wall_variant)
+
+    # Rewrite WALL / HWALL / VWALL cells with the resolved variant.  HWALL / VWALL
+    # are des-authored walls that behave exactly like WALL for the spine pass.
+    is_wall_cell = (t == WALL) | (t == HWALL) | (t == VWALL)
     cmap_idx = jnp.where(is_wall_cell, wall_variant, cmap_idx)
 
     # ---- Door orientation: vendor display.c:1737-1739 picks h*door vs v*door
