@@ -5235,8 +5235,14 @@ def _wrap_skill_placement(
             import numpy as _np
             terr_np = _np.asarray(new_terrain[0, 0])
             _H, _W = terr_np.shape
+            # Vendor bad_location (mkmaze.c:341) rejects a hero cell only when
+            # occupied() (mklev.c:1808 = trap|furniture|lava|pool) or non-ROOM
+            # terrain — a ground OBJECT does NOT make a cell bad, so the hero may
+            # stand on the object cell.  The FLOOR mask already excludes furniture
+            # features (altar/sink) since those retype the tile; do NOT exclude
+            # the object cell here (that mis-skips vendor's accepted hero cell at
+            # "hot" seeds where the first place_lregion draw hits the object).
             ok = (terr_np == _FLOOR)
-            ok[obj_row, obj_col] = False  # object cell is occupied
             acc_x = int((x1 + x1 + size - 1) // 2)
             acc_y = int((y1 + y1 + size - 1) // 2)
             accepted = False
@@ -5478,7 +5484,7 @@ def _wrap_skill_levitate_placement(
 
         terr_np = _np.asarray(state.terrain[0, 0])
         vrng, acc_x, acc_y = _levitate_place_player(
-            vrng, terr_np, {(obj_row, obj_col)}, x1, y1, size
+            vrng, terr_np, set(), x1, y1, size
         )
 
         state = state.replace(
@@ -5583,7 +5589,7 @@ def _wrap_skill_levitate_random(
 
         terr_np = _np.asarray(state.terrain[0, 0])
         vrng, acc_x, acc_y = _levitate_place_player(
-            vrng, terr_np, {(obj_row, obj_col)}, x1, y1, size
+            vrng, terr_np, set(), x1, y1, size
         )
 
         state = state.replace(
@@ -5697,7 +5703,7 @@ def _wrap_freeze_placement(
 
         terr_np = _np.asarray(state.terrain[0, 0])
         vrng, acc_x, acc_y = _levitate_place_player(
-            vrng, terr_np, {(obj_row, obj_col)}, x1, y1, size
+            vrng, terr_np, set(), x1, y1, size
         )
         state = state.replace(
             vendor_rng=vrng,
@@ -5748,7 +5754,7 @@ def _wrap_freeze_random(
 
         terr_np = _np.asarray(state.terrain[0, 0])
         vrng, acc_x, acc_y = _levitate_place_player(
-            vrng, terr_np, {(obj_row, obj_col)}, x1, y1, size
+            vrng, terr_np, set(), x1, y1, size
         )
         state = state.replace(
             vendor_rng=vrng,
