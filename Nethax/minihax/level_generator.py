@@ -2419,16 +2419,30 @@ def _enexto(terrain_np, occupied: set, xx: int, yy: int, w: int, h: int,
     vendor's m_initgrp consumes, so consuming it here keeps vrng aligned.
     """
     from Nethax.nethax import vendor_rng as _vendor_rng
-    floor = int(TileType.FLOOR)
     sub = terrain_np[0, 0]
     MAX_GOOD = 15
+    # Vendor ``goodpos`` (teleport.c) accepts any ACCESSIBLE(typ) cell —
+    # ``typ >= DOOR`` (rm.h:92) — i.e. floor, corridor, doorways, stairs AND
+    # furniture (altar/sink/fountain/throne/grave).  Restricting to FLOOR made
+    # ``enexto`` miss furniture cells that fall on the expanding-square border,
+    # under-counting ``rn2(num_good)`` and mis-selecting the cell (e.g. a
+    # -Distr group-monster member next to the room altar/sink).  Water / lava /
+    # pools are non-accessible (typ < DOOR) so they stay excluded, matching
+    # vendor's land-monster goodpos.
+    _ACCESSIBLE = frozenset(int(t) for t in (
+        TileType.FLOOR, TileType.CORRIDOR, TileType.OPEN_DOOR,
+        TileType.CLOSED_DOOR, TileType.DOORWAY, TileType.STAIRCASE_UP,
+        TileType.STAIRCASE_DOWN, TileType.ALTAR, TileType.FOUNTAIN,
+        TileType.THRONE, TileType.GRAVE, TileType.SHOP_FLOOR,
+        TileType.ICE_FLOOR, TileType.SINK, TileType.CLOUD,
+    ))
 
     def goodpos(x, y):
         if not (0 <= y < h and 0 <= x < w):
             return False
         if (y, x) in occupied:
             return False
-        return int(sub[y, x]) == floor
+        return int(sub[y, x]) in _ACCESSIBLE
 
     xmax0 = max(xx - 1, (w - 1) - xx)
     ymax0 = max(yy - 0, (h - 1) - yy)
