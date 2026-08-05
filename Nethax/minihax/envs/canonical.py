@@ -3956,6 +3956,48 @@ def _wrap_river_placement(
                     pos = pos.at[0, 0, k, 1].set(jnp.int16(bc))
                 b += 1
 
+        # Hero/monster collision (vendor allmain.c newgame -> u_on_upstairs):
+        # place_lregion drops the hero on the first FLOOR cell WITHOUT skipping a
+        # monster-occupied cell, so the hero can land on a MONSTER:random monster
+        # (e.g. a G_SGROUP leader whose somexy hit the same cell).  The
+        # immediately-following ``if (MON_AT(u.ux,u.uy)) mnexto(mtmp)`` then
+        # relocates that squatting monster to an adjacent ``enexto`` cell.  The
+        # ``rn2(num_good)`` mnexto draw lands AFTER the observation-relevant hero
+        # draws, so consuming it here from ``vrng`` keeps the stream faithful.
+        # No-op for the no-monster River / River-Lava variants.
+        if n_monster > 0 and hero_rc is not None:
+            import numpy as _np
+            from Nethax.minihax.level_generator import _enexto as _enx
+            mai = state.monster_ai
+            _alive = _np.asarray(mai.alive)
+            _mpos = _np.asarray(mai.pos)
+            _hit = -1
+            _occ = set()
+            for _si in _np.where(_alive)[0]:
+                _cell = (int(_mpos[_si, 0]), int(_mpos[_si, 1]))
+                _occ.add(_cell)
+                if _cell == (hero_rc[0], hero_rc[1]):
+                    _hit = int(_si)
+            # Vendor ``goodpos`` rejects boulder cells, so exclude the surviving
+            # (non-sunk) boulders from the enexto candidate set.
+            for _bi, (_br, _bc) in enumerate(boulder_cells):
+                if not boulder_sink[_bi]:
+                    _occ.add((_br, _bc))
+            if _hit >= 0:
+                _dest, vrng = _enx(
+                    state.terrain, _occ, hero_rc[1], hero_rc[0],
+                    w=80, h=21, vrng=vrng,
+                )
+                if _dest is not None:
+                    _mpos = _mpos.copy()
+                    _mpos[_hit, 0] = _dest[0]
+                    _mpos[_hit, 1] = _dest[1]
+                    state = state.replace(
+                        monster_ai=mai.replace(
+                            pos=jnp.asarray(_mpos, dtype=mai.pos.dtype),
+                        ),
+                    )
+
         state = state.replace(
             vendor_rng=vrng,
             ground_items=gi.replace(
